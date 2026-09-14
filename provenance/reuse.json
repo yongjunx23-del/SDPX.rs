@@ -1,0 +1,88 @@
+{
+  "description": "Source mapping for adapted SDPX Julia frontend and numerical contracts. Stable source preserved separately; these hashes identify the reused files, not the modified destinations.",
+  "license": "SDPX.jl-LICENSE",
+  "files": [
+    {
+      "source": "SDPX.jl/src/frontend/constraints.jl",
+      "destination": "julia/SDPX.jl/src/frontend/constraints.jl",
+      "original_sha256": "9124a8686641ea72072b8af309ea62df77f66626e0d1b97e1fc4313086083f45"
+    },
+    {
+      "source": "SDPX.jl/src/frontend/result.jl",
+      "destination": "julia/SDPX.jl/src/frontend/result.jl",
+      "original_sha256": "9c560c48fab1b246d5874750bf0539f33ae1c1237fac2be854755c4cbe7ae718"
+    },
+    {
+      "source": "SDPX.jl/src/frontend/api.jl",
+      "destination": "julia/SDPX.jl/src/frontend/api.jl",
+      "original_sha256": "cff1be2dacddcc30e5e410107220c0b66eacc3f76ce2b99c88898dd46707f872"
+    },
+    {
+      "source": "SDPX.jl/src/frontend/model.jl",
+      "destination": "julia/SDPX.jl/src/frontend/model.jl",
+      "original_sha256": "658237e992fb1d0129e3c57b6aa6110ebe756dd102f4a62f84332be57817074a"
+    },
+    {
+      "source": "SDPX.jl/src/frontend/refs.jl",
+      "destination": "julia/SDPX.jl/src/frontend/refs.jl",
+      "original_sha256": "974ac2c36c8601597e290f03b252bc6bed546cc0886e57f23847fe2c69a68f66"
+    },
+    {
+      "source": "SDPX.jl/src/frontend/starts.jl",
+      "destination": "julia/SDPX.jl/src/frontend/starts.jl",
+      "original_sha256": "08b156f6532222aa988eae2b826b241eb6091d17ff33024f0d114ebf508abb3f"
+    },
+    {
+      "source": "SDPX.jl/src/frontend/storage.jl",
+      "destination": "julia/SDPX.jl/src/frontend/storage.jl",
+      "original_sha256": "5c64d5e0d494977e0e7cd9ce0096fbb181ef36cffe75dcb1c8b3fe324571e385"
+    },
+    {
+      "source": "SDPX.jl/src/frontend/compile.jl",
+      "destination": "julia/SDPX.jl/src/frontend/compile.jl",
+      "original_sha256": "8ba00d50556149249191d783d84f50339586edf663dcd523b35a605aace84997"
+    },
+    {
+      "source": "SDPX.jl/src/frontend/domains.jl",
+      "destination": "julia/SDPX.jl/src/frontend/domains.jl",
+      "original_sha256": "d4137247095bbfcbae0337b0f90e525940e7bbe2aeb2b7ae119dd787b43c9005"
+    },
+    {
+      "source": "SDPX.jl/src/frontend/types.jl",
+      "destination": "julia/SDPX.jl/src/frontend/types.jl",
+      "original_sha256": "1cb45806367af54d913453f68b70940ef310b690c6799aace3350448d8e00795"
+    },
+    {
+      "source": "SDPX.jl/src/frontend/affine.jl",
+      "destination": "julia/SDPX.jl/src/frontend/affine.jl",
+      "original_sha256": "b89b1b6affb5996b845b968598f7d844b1f0996772e30c7f1abd3727710045c2"
+    },
+    {
+      "source": "SDPX.jl/src/frontend/legacy.jl",
+      "destination": "julia/SDPX.jl/src/frontend/legacy.jl",
+      "original_sha256": "6ba8715704884a108097d107463348ce8342498d569d8239e3e7c13a38c8e777"
+    },
+    {
+      "source": "SDPX.jl/src/moi/optimizer.jl",
+      "destination": "julia/SDPX.jl/src/moi/optimizer.jl",
+      "original_sha256": "170a6706b9a358fc81821af0d7df496e5ff3059bcceaf34e4292a999d6489c9c"
+    },
+    {
+      "source": "SDPX.jl/src/core/kktsystem.jl",
+      "destination": "crates/solver/src/solver/implementations/default/kktsystem.rs",
+      "original_sha256": "369240300fba57a6080ad61e35296179c7d91025f80e5a8986209bae09a5c1cd"
+    },
+    {
+      "source": "SDPX.jl/src/settings.jl",
+      "destination": "crates/solver/src/solver/implementations/default/settings.rs",
+      "original_sha256": "fbf5f0332a4ea7b0330166af08bcd61f03766b1b82142ef050d3f96d6e023932"
+    },
+    {
+      "source": "GenericLinearAlgebra.jl v0.4.0/src/svd.jl",
+      "reference": "https://github.com/JuliaLinearAlgebra/GenericLinearAlgebra.jl",
+      "destination": "crates/solver/src/algebra/dense/blas/mpfr.rs",
+      "original_sha256": "da91f271c5f88ac14952056680de5526180977f7d80d0e20948c09b28a7d9b90",
+      "license": "MIT, copyright Andreas Noack; notice retained beside ported code"
+    }
+  ]
+}

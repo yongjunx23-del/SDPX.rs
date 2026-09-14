@@ -1,0 +1,27 @@
+#!/bin/bash
+#PBS -N sdpx_rust_ising
+#PBS -q normal
+#PBS -l nodes=node7:ppn=8
+#PBS -l mem=48gb
+#PBS -l walltime=04:00:00
+#PBS -j oe
+set -euo pipefail
+export SDPX_CAMPAIGN_DEADLINE_EPOCH=$(( $(date +%s) + 13200 ))
+cd "$HOME/projects/sdpx-rust-ising-20260914-03"
+set +u
+source ./sdpb_env.sh
+source /public/software/profile.d/compiler_cmake-compiler-3.20.1.sh
+set -u
+sha256sum -c input.sha256 > input-verified.txt
+export CARGO_HOME="$PWD/cargo" RUSTUP_HOME="$HOME/projects/sdpx-rust-ising-20260914-01/rustup" RUSTUP_TOOLCHAIN=1.98.1 PATH="$PWD/cargo/bin:$PATH"
+export JULIA_DEPOT_PATH="$HOME/projects/SDPX.jl/depot:$HOME/.julia"
+export CMAKE_TOOLCHAIN_FILE="$PWD/benchmark/ising/pic.cmake" FFLAGS=-fPIC
+export CARGO_BUILD_JOBS=8 JULIA_NUM_THREADS=1 JULIA_NUM_GC_THREADS=1
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+mkdir -p build-logs
+rustc -Vv > build-logs/rust-version.txt
+cargo tree --locked --offline --manifest-path source/Cargo.toml -p sdpx-ffi --features sdp-netlib,faer-sparse >build-logs/cargo-tree.txt
+timeout --signal=TERM --kill-after=30s 2700 /usr/bin/time -v -o build-logs/time.txt cargo build --release --locked --offline --manifest-path source/Cargo.toml -p sdpx-ffi --features sdp-netlib,faer-sparse >build-logs/build.log 2>&1
+sha256sum source/target/release/libsdpx.so >build-logs/library.sha256
+ldd source/target/release/libsdpx.so >build-logs/ldd.txt
+python3 benchmark/ising/controller.py

@@ -1,0 +1,11 @@
+# Ising512 comparison
+
+This driver repeats the frozen SDPB Ising sampled problem using the Julia frontend and Rust core. `sampled/` and `audit_helpers.jl` preserve the prior compiler, provenance and original-coordinate audit. See `NUMERICAL_PLAN.md` for tolerances, thread budgets and timing scope.
+
+Prepare a fresh campaign directory with `source/`, the unchanged `common-sdp/` and `input.sha256`, a copied SDPB executable `sdpb` and its environment script, a pinned Julia `env/` containing this SDPX, JSON 0.21.4 and GenericLinearAlgebra, accepted prior `reference/sdpb1-audit.json` and `reference/input.json`, and `benchmark/ising/`. Record source hashes in `source-identity.json`. Adjust campaign/toolchain paths and a currently healthy PBS node in `comparison.pbs`. Fetch locked Cargo dependencies before submission; sustained builds run in PBS. `pic.cmake` supplies position-independent Fortran objects required by the shared library.
+
+The controller performs a small Linux gate, then serially runs SDPX 1/2/4/8-thread cells with one first call and three warmed fresh solves each. Every point must pass external audits and actual precision/KKT/cone-thread checks. It then runs three fresh SDPB references at each matching width. Any failed/incomplete stage stops subsequent work. The source, environment, inputs and loaded library must remain frozen throughout.
+
+Results under `results/<job>/` include raw points, audit JSON, exact commands, solver/API/compilation/process timings, immutable identities and private CPU metadata. `memory.json` reports the sampled peak sum of process-tree/MPI-rank RSS and individual process peaks, separately from GNU time's maximum RSS. Shared pages are counted once per process; aggregate RSS is not PSS. Compare native solver and process startup costs separately, and keep first-call and warmed timings distinct.
+
+This condensed MPFR configuration reports one QDLDL thread and the cone worker budget. Condensed scaling, operator applications and eligible Schur contributions share that pool; contribution caching is bounded and overlapping sums retain a fixed order. MPFR factorization remains serial. Linux Netlib/faer serves Float64; MPFR retains its high-precision arithmetic.

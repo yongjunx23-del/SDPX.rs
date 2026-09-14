@@ -1,0 +1,10 @@
+[package]
+name = "sdpx-arithmetic"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Owned fixed-precision MPFR arithmetic for SDPX"
+
+[dependencies]
+gmp-mpfr-sys = { version = "=1.6.8", default-features = false, features = ["mpfr"] }
+num-traits = "0.2"

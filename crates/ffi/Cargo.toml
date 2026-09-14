@@ -1,0 +1,16 @@
+[package]
+name = "sdpx-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+[lib]
+name = "sdpx"
+crate-type = ["cdylib", "rlib"]
+[dependencies]
+sdpx-solver = { path = "../solver", default-features = false, features = ["sdp"] }
+sdpx-arithmetic = { path = "../arithmetic" }
+[features]
+sdp-accelerate = ["sdpx-solver/sdp-accelerate"]
+sdp-openblas = ["sdpx-solver/sdp-openblas"]
+sdp-netlib = ["sdpx-solver/sdp-netlib"]
+faer-sparse = ["sdpx-solver/faer-sparse"]

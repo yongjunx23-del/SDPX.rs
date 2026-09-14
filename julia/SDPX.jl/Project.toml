@@ -1,0 +1,26 @@
+name = "SDPX"
+uuid = "4ae90aa0-7e87-4c4c-9f30-c484f5e70a7f"
+version = "0.1.0"
+authors = ["Yongjun Xu <yongjunx23@gmail.com>"]
+
+[deps]
+Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+MathOptInterface = "b8f27783-ece8-5eb3-8dc8-9495eed66fee"
+
+[weakdeps]
+PMP2SDP = "de1bf591-c9a6-4165-995a-99f8a70f060c"
+
+[extensions]
+SDPXPMP2SDPExt = "PMP2SDP"
+
+[compat]
+PMP2SDP = "0.1"
+julia = "1.12"
+MathOptInterface = "1.45"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+[targets]
+test = ["Test"]
