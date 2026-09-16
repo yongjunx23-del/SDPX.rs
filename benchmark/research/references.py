@@ -52,7 +52,7 @@ def dataset(data):
         if not name or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in name):
             raise ValueError('unsafe case name')
         path = (data / entry['json_path']).resolve()
-        if not path.is_relative_to(data) or common.sha(path) != entry['json_sha256']:
+        if not common._is_relative_to(path, data) or common.sha(path) != entry['json_sha256']:
             raise ValueError('input path or hash mismatch: ' + name)
     return manifest, entries
 
@@ -65,7 +65,7 @@ def run(args):
     protected = [args.workspace.resolve(), data]
     if args.source:
         protected.append(args.source.resolve())
-    if any(output.is_relative_to(p) for p in protected):
+    if any(common._is_relative_to(output, p) for p in protected):
         raise ValueError('output must be outside workspace, source and dataset')
     output.mkdir(parents=True, exist_ok=False)
     env = dict(os.environ)

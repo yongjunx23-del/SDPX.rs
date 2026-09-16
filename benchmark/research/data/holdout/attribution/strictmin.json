@@ -1,0 +1,40 @@
+{
+  "reservation": {
+    "name": "SOCP_strictmin_2D_43_dual",
+    "date": "2026-09-16",
+    "role": "holdout",
+    "source_url": "https://cblib.zib.de/download/all/strictmin_2D_43_dual.cbf.gz",
+    "source_sha256": "632c1941f803c71720f652e89b808292f0ceccbb37dda99be9a6521c6bf81aef",
+    "raw_sha256": "29e77bb5bb7c3bd8bf5a9a9622061e607894cd3001c72cced2165579262d6dda",
+    "selection": "continuous geometric ARAP SOCP; no integer/PSD/power cones; selected by source metadata before solving",
+    "exposure_search": "No strictmin or Levi2014 match in SDPX, sibling benchmark or benchmark-references; deleted history cannot be ruled out",
+    "solver_executed": false,
+    "timeout_seconds": 180,
+    "memory_mib": 4096
+  },
+  "conversion": [
+    {
+      "conversion": "MOI reader + standard bridges + SDPX affine/svec frontend; attach copies model only; no solver setup",
+      "frontend_sha256": "9c22ee0ed7b72cbfe5b355bcc614d29cceb1715bb86f92a9417de6d9a10b77a3",
+      "julia_version": "1.12.6",
+      "moi_version": "1.53.0",
+      "name": "SOCP_strictmin_2D_43_dual",
+      "sdpx_version": "0.1.0",
+      "source_objective_constant": 0.0,
+      "source_objective_from_json": "q'x + constant",
+      "source_sense": "MIN_SENSE"
+    }
+  ],
+  "validation": {
+    "seeds": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "objective_exact": true,
+    "cone_embedding_exact": true,
+    "equality_operator_equivalent": true,
+    "no_solver": true
+  }
+}

@@ -42,7 +42,14 @@ def main(argv):
             break
         except InterruptedError:
             continue
-    code = os.waitstatus_to_exitcode(status)
+    if hasattr(os, 'waitstatus_to_exitcode'):
+        code = os.waitstatus_to_exitcode(status)
+    elif os.WIFEXITED(status):
+        code = os.WEXITSTATUS(status)
+    elif os.WIFSIGNALED(status):
+        code = -os.WTERMSIG(status)
+    else:
+        code = 1
     # wait4 already reaped this exact child. Avoid Popen trying to wait again.
     process.returncode = code
     unit = 1 if sys.platform == 'darwin' else 1024

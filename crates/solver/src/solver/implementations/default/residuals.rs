@@ -27,7 +27,7 @@ pub struct DefaultResiduals<T> {
 
     // the product Px by itself. Required for infeasibilty checks
     pub(crate) Px: Vec<T>,
-    pub(super) sparse_parallel: Option<sparse_parallel::SparseParallel>,
+    pub(crate) sparse_parallel: Option<sparse_parallel::SparseParallel>,
     #[cfg(feature = "sdp")]
     pub(crate) sampled_workspace: Option<SampledWorkspace<T>>,
     #[cfg(feature = "sdp")]

@@ -252,6 +252,20 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
         assert!(pooled.solve(Some(&mut xp), Some(&mut zp), &settings));
         assert_eq!(xs, xp);
         assert_eq!(zs, zp);
+        // Verify both reused initial products and fresh post-correction products.
+        let full_rhs = [bx.as_slice(), bz.as_slice()].concat();
+        let full_solution = [xp.as_slice(), zp.as_slice()].concat();
+        a.gemv(&mut serial.workz, &xp, T::one(), T::zero());
+        for (v, b) in serial.workz.iter_mut().zip(&bz) { *v -= *b; }
+        pooled.workz.copy_from_slice(&serial.workz);
+        for reuse in [false, true] {
+            let mut rs = vec![T::nan(); full_rhs.len()];
+            let mut rp = rs.clone();
+            let ns = serial.residual(&mut rs, &full_rhs, &full_solution, reuse);
+            let np = pooled.residual(&mut rp, &full_rhs, &full_solution, reuse);
+            assert_eq!(rs, rp);
+            assert_eq!(ns, np);
+        }
         let mut ex = bx.clone();
         let mut ez = bz.clone();
         p.sym_up().symv(&mut ex, &xp, -T::one(), T::one());
@@ -287,6 +301,14 @@ fn pooled_condensed_f64() {
 #[test]
 fn pooled_condensed_mpfr256() {
     pooled_equivalence::<Bits256>(false);
+}
+#[test]
+fn pooled_condensed_mpfr512() {
+    pooled_equivalence::<sdpx_arithmetic::Bits512>(false);
+}
+#[test]
+fn overlapping_memory_fallback_mpfr512() {
+    pooled_equivalence::<sdpx_arithmetic::Bits512>(true);
 }
 #[test]
 fn overlapping_memory_fallback_f64() {
@@ -369,7 +391,9 @@ fn scaling_partitions_follow_cost_and_cover_zero_work() {
 }
 
 fn dominant_sparse_psd<T: FloatT>() {
-    let kinds = [SupportedConeT::PSDTriangleConeT(32)];
+    // The block dimension must clear the precision-scaled sparse-column
+    // threshold so the sparse pair path stays exercised at Float64 too.
+    let kinds = [SupportedConeT::PSDTriangleConeT(64)];
     let mut serial_cones = CompositeCone::new(&kinds);
     let mut pooled_cones = CompositeCone::new(&kinds);
     pooled_cones.configure_threads(8).unwrap();

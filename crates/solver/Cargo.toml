@@ -81,7 +81,10 @@ optional = true
 
 [target.'cfg(not(windows))'.dependencies.openblas-src]
 version = "0.10.11"
-features = ["static"]
+# `cache` shares the built OpenBLAS under ~/.local/share/openblas_build keyed
+# by build config: one networked build populates it, offline compute-node
+# jobs reuse it. Same source/version, only the location is shared.
+features = ["static", "cache"]
 optional = true
 
 [target.'cfg(windows)'.dependencies.openblas-src]

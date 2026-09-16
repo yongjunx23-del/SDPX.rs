@@ -42,3 +42,5 @@ pub(crate) use sparsevector::*;
 //configure tests of internals
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod sparse_parallel;

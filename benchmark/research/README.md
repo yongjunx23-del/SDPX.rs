@@ -2,7 +2,18 @@
 
 固定数据、评估器和数值契约，在独立源码副本中逐项尝试优化。每轮先检查正确性，再比较时间和内存；输出候选决策，不自动覆盖工作区源码。
 
-流程借鉴 [karpathy/autoresearch](https://github.com/karpathy/autoresearch) 的小步实验、固定评估、保留/丢弃和实验记录。求解器需要额外保留精度、失败覆盖率、各类问题退化及内存约束，不能只优化一个时间数字。供 coding agent 执行的说明在 [program.md](program.md)。
+流程借鉴 [karpathy/autoresearch](https://github.com/karpathy/autoresearch) 的小步实验、固定评估、保留/丢弃和实验记录。求解器需要额外保留精度、失败覆盖率、各类问题退化及内存约束，不能只优化一个时间数字。项目执行规则见 [AGENTS.md](../../AGENTS.md)。
+
+## 执行范围
+
+每次执行有明确的假设、输入、预算和结束条件；完成测试与候选决策后报告结果。
+默认由主 agent 完成，不自动启动后台研究或集群任务。
+
+`tree.py` 保留候选谱系和 `record/cut/merge/adopt` 状态管理功能；
+`hpc.py` 保留 PBS 提交、查询和结果获取功能。需要集群实验时，按用户指定
+范围使用这些工具：先检查现有作业和预算，冻结候选，再提交并收集结果。
+这些工具的容量上限不是必须消耗的资源配额。命令参数以 `--help` 为准。
+清理候选前先保留结果，并确认没有活动作业使用它。
 
 ## 数据库
 
@@ -12,13 +23,24 @@
 |---|---|---|
 | `smoke` | 3 个有解析最优解的 LP/SOCP/SDP | 检查完整接口与外部验算，不作为性能排名 |
 | `development` | 9 个历史实例，每类按规模选小/中/大各一个 | 日常反馈；选择依据是尺寸，不是求解结果 |
-| `regression` | 46 个去重后的历史公开实例 | 保留所有已暴露题目，包括原来的 holdout |
-| `holdout` | 新预留的 4 LP、2 SDP | 候选里程碑验收；本版尚无新 SOCP |
+| `regression` | 52 个公开实例和 3 个固定合成实例 | 保留所有已暴露题目，包括原来的 holdout |
+| `holdout` | LP_ship04s、SDP_copo14、混合锥 SDP_filter48_socp、SOCP_strictmin_2D_43_dual，均未求解 | ship、共正性、PAM 滤波器和几何 ARAP 家族；large SOCP 设 180 秒上限 |
 | `mpfr-dev` | 一个 orthant LP、两个 sampled SDP 配方 | 256/512 位及 1/2/4/8 线程的定向诊断 |
 
-历史题库复用相邻 `SDPX.jl/benchmark/data`，不再依赖某次 `/tmp` 历史任务。新保留集来自固定的 ClarabelBenchmarks revision `3679912c6bbd3f64c5c962f9d1c09d524561c412`；源 URL、原始/转换后 SHA256、转换信息和归属保留在目录中。六个压缩输入约 23 KB，原始来源与许可见 [data/holdout](data/holdout)。
+历史题库复用相邻 `SDPX.jl/benchmark/data`，不再依赖某次 `/tmp` 历史任务。原六项及 ship 来源为固定的 ClarabelBenchmarks revision `3679912c6bbd3f64c5c962f9d1c09d524561c412`；源 URL、原始/转换后 SHA256、转换信息和归属保留在目录中。六个压缩输入约 23 KB，原始来源与许可见 [data/holdout](data/holdout)。
 
-新实例与已盘点的历史名称/输入哈希不重合；这不是从未被任何人或任何 agent 看过的证明。选集时没有调用求解器或查看排名。已完成结构检查，**尚无这些新实例的求解准确性或速度结论**。它也不能单独证明 SOCP 泛化。后续应预先固定新版 CBLIB/Hypatia SOCP 与更大 SDP，并增加不同结构家族；同一个参数化家族应一起分组，不能把近似副本分进开发和保留两侧。
+9 月 16 日对比 MOSEK 后，原 6 个保留实例已转入回归，不再作为独立验收。
+另外加入两个固定种子的 SOCP 和一个 80 阶 PSD 合成问题，全部使用预先构造的
+可行、互补 primal/dual 点；它们是结构诊断，不能代表公开问题的总体表现。
+`selection_policy.refresh_20260916` 固定这次的 9 个成员。三个新输入可以运行
+`generate_planted.py --output /absolute/new-directory` 重建，目录中的压缩输入和
+catalog 哈希可逐字节核对。没有依据求解成功或速度删除、替换成员。
+新预留 `LP_ship04s`（1506 变量、1908 行、5906 非零元）仅做来源、转换和格式检查，
+没有运行求解器。原始/转换哈希与 180 秒、4096 MiB 的计划预算记录在 catalog；
+`run.py` 自动取题目 reservation、命令行和剩余总预算中的更小上限，并在每次 process 记录中写明实际时间/内存限制；更短的用户预算不会被延长。
+另预留 DIMACS 官方归档的 `copo14` 与 `filter48_socp`，原始/转换哈希及来源记录在 catalog 和 attribution/DIMACS.json。后者含 PSD48 和 SOC49，不能算纯 SOCP 保留集。
+`import_sedumi.py`（可选依赖 NumPy/SciPy）要求原始 MAT 文件 SHA256，将对称 PSD 变量映射为上三角 svec，保留全部等式和目标符号；不启动求解器。两题均只完成格式和独立算子检查，计划预算各 180 秒/4096 MiB。可见历史记录未发现同族暴露，但不据此声称覆盖已删除历史。纯 SOCP 几何 ARAP 家族已由 `strictmin_2D_43_dual` 补齐。`ss30` 因仍属已暴露的
+桁架家族未纳入；`db_shear_wall` 仅下载检查，较大规模需要独立验收预算。
 
 ```sh
 python3 benchmark/research/catalog.py list --suite development
@@ -86,7 +108,7 @@ python3 benchmark/research/run.py pair \
 
 当前主指标是 Julia API 的 fresh setup+solve+结果提取/清理时间；解析与外部检查在计时外。冷调用单列。RSS 是整个 Julia 子进程的 OS high-water，包含 JIT、输入和验算；不是单轮原生分配。原生 Rust 的比较使用已有 [build_kernel.py](../float64/build_kernel.py)，必须另外标注计时与内存范围。
 
-`--state/results.jsonl` 追加每次候选决策，保留失败；不自动 commit/reset、修改主目录或启动无限后台任务。
+`--state/results.jsonl` 追加每次候选决策并保留失败；完成预算内的实验后报告结果，不自动修改主目录或 Git 状态。
 
 ## 保留集与参考求解器
 
@@ -125,7 +147,7 @@ python3 -m unittest discover -s benchmark/research/tests -v
 
 The default per-experiment development loop is focused tests, then `run.py pair
 --profile screen` with the usual baseline/candidate/data/output arguments, then
-full `cap` only at milestones. `pair` itself retains `--profile full` by default.
+full qualification only at milestones. `pair` itself retains `--profile full` by default.
 Screen uses the pinned development cases LP_afiro, SOCP_sambal and SDP_truss1
 in catalog order, one thread, one cold plus one warmed fresh solve, and AB only.
 Only the development stage is allowed. Process timeout defaults to 120 seconds
@@ -141,3 +163,5 @@ and the affected integration test file. Reserve the full workspace suite,
 Julia 1.12/1.13 runs, and regression/holdout/MPFR/Ising protocols for milestone
 acceptance. This scheduling policy changes neither tolerances nor required
 milestone coverage.
+
+`SOCP_strictmin_2D_43_dual` 来源为 [CBLIB](https://cblib.zib.de/download/all/strictmin_2D_43_dual.cbf.gz)，保留全部连续变量、等式与二阶锥；101676 变量、111757 行。转换仅使用 MOI 文件读取及仿射导出，独立核对原始 CBF 系数与锥嵌入，未求解。来源、哈希、许可见 attribution/strictmin.json 和 CBLIB 许可文件 `data/holdout/attribution/CBLIB-README.md`。最终验收由 runner 自动封顶 180 秒、4096 MiB；超时作为结果保留，不用于开发调参。

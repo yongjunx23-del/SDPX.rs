@@ -149,10 +149,12 @@ class ReferenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'holdout'):
                 ref.dataset(args.data)
             data['suite']['role']='smoke'
-            held=next(c for c in ref.common.read(HERE/'catalog.json')['cases'] if 'holdout' in c['roles'])
+            held={'roles':['holdout'],'json_sha256':'e'*64}
             data['instances'][0]['json_sha256']=held['json_sha256']; ref.common.write(path,data)
-            with self.assertRaisesRegex(ValueError,'holdout'):
-                ref.dataset(args.data)
+            original_read=ref.common.read
+            with patch.object(ref.common,'read',side_effect=lambda p: {'cases':[held]} if p==HERE/'catalog.json' else original_read(p)):
+                with self.assertRaisesRegex(ValueError,'holdout'):
+                    ref.dataset(args.data)
 
     def test_help_and_thread_cap(self):
         result=subprocess.run([sys.executable,str(HERE/'references.py'),'--help'], capture_output=True,text=True)

@@ -39,10 +39,10 @@ class CatalogTests(unittest.TestCase):
 
     def test_exposed_sets_and_balanced_development(self):
         cases=c.select_cases(self.catalog,'regression')
-        self.assertEqual(len(cases),46)
+        self.assertEqual(len(cases),55)
         self.assertEqual(len({x['json_sha256'] for x in cases}),len(cases))
         self.assertEqual(set().union(*(set(x['legacy_sets']) for x in cases)),
-                         {'conic18','conic10','holdout','sdplib-scale3'})
+                         {'conic18','conic10','holdout','sdplib-scale3','refresh-20260916'})
         for family in ('LP','SOCP','SDP'):
             self.assertEqual(sum(x['family']==family for x in c.select_cases(self.catalog,'development')),3)
         for x in cases:self.assertNotIn('holdout',x['roles'])
@@ -98,21 +98,25 @@ class CatalogTests(unittest.TestCase):
                 c.materialize(dict(cases=[case]),workspace,root/'bad','smoke')
             self.assertFalse((root/'bad').exists())
 
-    def test_fresh_reservation_disjoint_and_compressed_integrity(self):
-        legacy=c.select_cases(self.catalog,'regression')
-        fresh=c.select_cases(self.catalog,'holdout')
-        self.assertEqual(len(fresh),6)
-        self.assertEqual({x['family'] for x in fresh},{'LP','SDP'})
-        for key in ('name','json_sha256','source_sha256'):
-            self.assertFalse({x[key] for x in legacy} & {x[key] for x in fresh})
+    def test_consumed_reservation_is_regression_and_compressed_integrity(self):
+        self.assertEqual([x['name'] for x in c.select_cases(self.catalog,'holdout')],['LP_ship04s','SDP_copo14','SDP_filter48_socp','SOCP_strictmin_2D_43_dual'])
         workspace=Path(__file__).resolve().parents[4]
+        exposed=[x for x in self.catalog['cases'] if x.get('exposure')]
+        self.assertEqual(len(exposed),9)
+        for case in exposed:
+            self.assertIn('legacy_regression',case['roles'])
+            self.assertNotIn('holdout',case['roles'])
+            self.assertEqual(c.digest(c._payload(case,workspace)),case['json_sha256'])
         with tempfile.TemporaryDirectory() as tmp:
-            manifest=c.materialize(self.catalog,workspace,Path(tmp)/'cache','holdout')
-            records=json.loads(manifest.read_text())['instances']
-            for case in records:
-                self.assertEqual(c.digest((manifest.parent/case['json_path']).read_bytes()),case['json_sha256'])
-                self.assertEqual(case['source']['compression'],'gzip')
-                self.assertIn('reservation',case)
+            reserved=c.materialize(self.catalog,workspace,Path(tmp)/'reserved','holdout')
+            manifest=json.loads(reserved.read_text())
+            self.assertEqual([x['name'] for x in manifest['instances']],['LP_ship04s','SDP_copo14','SDP_filter48_socp','SOCP_strictmin_2D_43_dual'])
+            for case in manifest['instances']:
+                self.assertNotIn('exposure',case)
+                self.assertEqual(c.digest(c._payload(case,workspace)),case['json_sha256'])
+            empty=dict(self.catalog,cases=[x for x in self.catalog['cases'] if 'holdout' not in x['roles']])
+            with self.assertRaisesRegex(ValueError,'no reserved cases'):
+                c.materialize(empty,workspace,Path(tmp)/'cache','holdout')
 
     def test_mpfr_recipes_have_no_fictional_input_hash(self):
         recipes=c.select_cases(self.catalog,'mpfr-dev')

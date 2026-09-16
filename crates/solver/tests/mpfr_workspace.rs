@@ -6,38 +6,42 @@ use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
 use provider::{XgesvdScalar, XsyevrScalar};
 use sdpx_arithmetic::{MpFloat, Scalar};
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
 
-// This test binary contains one sequential test. Count Rust scratch allocations;
+// Count this test thread only: included provider tests run concurrently.
+// Count Rust scratch allocations;
 // MPFR's own native arithmetic allocation is outside this counter's scope.
 struct Allocator;
-static COUNTING: AtomicBool = AtomicBool::new(false);
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+fn count_allocation() {
+    let _ = ALLOCATIONS.try_with(|count| {
+        if let Some(n) = count.get() {
+            count.set(Some(n + 1));
+        }
+    });
+}
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
+        count_allocation();
         System.alloc(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         System.dealloc(ptr, layout);
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
+        count_allocation();
         System.realloc(ptr, layout, size)
     }
 }
 #[global_allocator]
 static ALLOCATOR: Allocator = Allocator;
 fn without_rust_allocations(f: impl FnOnce()) {
-    ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    ALLOCATIONS.with(|count| count.set(Some(0)));
     f();
-    COUNTING.store(false, Ordering::Relaxed);
-    assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+    let allocations = ALLOCATIONS.with(|count| count.replace(None));
+    assert_eq!(allocations, Some(0));
 }
 type F<const N: usize> = MpFloat<N>;
 fn f<const N: usize>(i: usize) -> F<N> {

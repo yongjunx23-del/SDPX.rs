@@ -19,7 +19,6 @@ mod sampled;
 mod settings;
 mod solution;
 mod solver;
-mod sparse_parallel;
 mod variables;
 
 // export flattened

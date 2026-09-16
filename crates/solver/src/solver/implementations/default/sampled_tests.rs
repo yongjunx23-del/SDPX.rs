@@ -148,7 +148,9 @@ fn zero_basis_columns_and_input_structure() {
 // explicit Rinv*M*Rinv' products and Frobenius inner products. No Gram identity
 // or production svec conversion is used in this reference.
 fn schur_parity<T: FloatT>() {
-    let b = block::<T>(0, 0, 2);
+    schur_parity_block(block::<T>(0, 0, 2));
+}
+fn schur_parity_block<T: FloatT>(b: SampledBlock<T>) {
     let side = b.side();
     let mut r = Matrix::identity(side);
     for j in 0..side {
@@ -157,7 +159,7 @@ fn schur_parity<T: FloatT>() {
         }
     }
     let mut work = SampledSchurWorkspace::new(&b);
-    work.update(&b, &r);
+    work.update_with_pool(&b, &r, None);
     let mut transformed = Vec::new();
     let mut p = 0;
     for s in 0..b.dim {
@@ -233,7 +235,7 @@ fn analytic_schur<T: FloatT>() {
         weights: vec![c::<T>(2), c(-3)],
     };
     let mut work = SampledSchurWorkspace::new(&b);
-    work.update(&b, &Matrix::identity(2));
+    work.update_with_pool(&b, &Matrix::identity(2), None);
     assert_eq!(work.entry(&b, 0, 0), c(16));
     assert_eq!(work.entry(&b, 1, 1), c(36));
     assert_eq!(work.entry(&b, 0, 1), T::zero());
@@ -241,7 +243,7 @@ fn analytic_schur<T: FloatT>() {
     // no absolute-tolerance floor is used for this cancellation-sensitive cell.
     let delta = c::<T>(2).powi(-(T::precision_bits() as i32 / 4));
     let r = Matrix::from(&[[T::one(), T::zero()], [T::zero(), T::one() + delta]]);
-    work.update(&b, &r);
+    work.update_with_pool(&b, &r, None);
     let cross = -(c::<T>(2) * delta + delta * delta);
     let expected = -c::<T>(6) * cross * cross;
     let actual = work.entry(&b, 0, 1);
@@ -368,7 +370,7 @@ fn pooled_gram<T: FloatT>() {
             .build()
             .unwrap();
         rinv[(0, 0)] += c::<T>(1) / c(16);
-        serial.update(&b, &rinv);
+        serial.update_with_pool(&b, &rinv, None);
         pooled.update_with_pool(&b, &rinv, Some(&pool));
         assert_eq!(pooled.plan_threads, width);
         assert_eq!(pooled.v.data(), serial.v.data());
@@ -565,4 +567,59 @@ fn pooled_operators_mpfr256() {
 #[test]
 fn pooled_operators_mpfr512() {
     pooled_operators::<Bits512>();
+}
+
+fn duplicate_basis<T: FloatT>() {
+    let b = SampledBlock {
+        row_start: 0,
+        column_start: 0,
+        dim: 2,
+        basis_rows: 2,
+        basis_cols: 6,
+        basis: vec![
+            c(1),
+            c(2),
+            c(-1),
+            c(3),
+            c(1),
+            c(2),
+            c(0),
+            c(0),
+            c::<T>(1) + T::epsilon() * c(16),
+            c(2),
+            c(0),
+            c(0),
+        ],
+        weights: (0..18).map(|i| c::<T>(i % 7 - 3) / c(4)).collect(),
+    };
+    let mut work = SampledSchurWorkspace::new(&b);
+    assert_eq!(work.u.ncols(), 8); // Four exact vectors, including a near duplicate.
+    assert_eq!(work.gram.size(), (8, 8));
+    assert_eq!(work.pairs.len(), b.weights.len());
+    let mut pooled = SampledSchurWorkspace::new(&b);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let r = Matrix::identity(b.side());
+    work.update_with_pool(&b, &r, None);
+    pooled.update_with_pool(&b, &r, Some(&pool));
+    for p in 0..b.column_count() {
+        for q in 0..b.column_count() {
+            assert_eq!(work.entry(&b, p, q), pooled.entry(&b, p, q));
+        }
+    }
+    schur_parity_block(b);
+}
+#[test]
+fn sampled_duplicate_basis_f64() {
+    duplicate_basis::<f64>();
+}
+#[test]
+fn sampled_duplicate_basis_256() {
+    duplicate_basis::<Bits256>();
+}
+#[test]
+fn sampled_duplicate_basis_512() {
+    duplicate_basis::<Bits512>();
 }

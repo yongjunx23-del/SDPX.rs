@@ -20,10 +20,9 @@ pub(crate) struct PresolverRowReductionIndex {
 #[derive(Debug)]
 pub(crate) struct Presolver<T> {
     // original cones of the problem
-    // PJG: not currently used.  Here for future presolver
     pub(crate) _init_cones: Vec<SupportedConeT<T>>,
 
-    //record of reduced constraints for NN cones with inf bounds
+    // Original-row map for exact equality and infinite NN reductions
     pub(crate) reduce_map: Option<PresolverRowReductionIndex>,
 
     // size of original and reduced RHS, respectively
@@ -43,7 +42,7 @@ where
 {
     /// create a new presolver object
     pub(crate) fn new(
-        _A: &CscMatrix<T>,
+        A: &CscMatrix<T>,
         b: &[T],
         cones: &[SupportedConeT<T>],
         _settings: &DefaultSettings<T>,
@@ -54,7 +53,7 @@ where
         let init_cones = cones.to_vec();
         let mfull = b.len();
 
-        let (reduce_map, mreduced) = make_reduction_map(cones, b, infbound.as_T());
+        let (reduce_map, mreduced) = make_reduction_map(A, cones, b, infbound.as_T());
 
         Self {
             _init_cones: init_cones,
@@ -111,10 +110,17 @@ where
             let numel_cone = cone.nvars();
             let markers = keep_iter.by_ref().take(numel_cone);
 
-            if matches!(cone, SupportedConeT::NonnegativeConeT(_)) {
+            if matches!(
+                cone,
+                SupportedConeT::NonnegativeConeT(_) | SupportedConeT::ZeroConeT(_)
+            ) {
                 let nkeep = markers.filter(|&b| *b).count();
                 if nkeep > 0 {
-                    cones_new.push(SupportedConeT::NonnegativeConeT(nkeep));
+                    cones_new.push(if matches!(cone, SupportedConeT::ZeroConeT(_)) {
+                        SupportedConeT::ZeroConeT(nkeep)
+                    } else {
+                        SupportedConeT::NonnegativeConeT(nkeep)
+                    });
                 }
             } else {
                 //NB: take() is lazy, so must consume this block
@@ -141,13 +147,20 @@ where
         let map = self.reduce_map.as_ref().unwrap();
         let mut ctr = 0;
 
-        for (idx, &keep) in map.keep_logical.iter().enumerate() {
+        let zero_rows = self._init_cones.iter().flat_map(|c| {
+            std::iter::repeat_n(matches!(c, SupportedConeT::ZeroConeT(_)), c.nvars())
+        });
+        for ((idx, &keep), zero) in map.keep_logical.iter().enumerate().zip(zero_rows) {
             if keep {
                 solution.s[idx] = variables.s[ctr];
                 solution.z[idx] = variables.z[ctr];
                 ctr += 1;
             } else {
-                solution.s[idx] = self.infbound.as_T();
+                solution.s[idx] = if zero {
+                    T::zero()
+                } else {
+                    self.infbound.as_T()
+                };
                 solution.z[idx] = T::zero();
             }
         }
@@ -155,6 +168,7 @@ where
 }
 
 fn make_reduction_map<T>(
+    A: &CscMatrix<T>,
     cones: &[SupportedConeT<T>],
     b: &[T],
     infbound: T,
@@ -192,6 +206,13 @@ where
         }
     }
 
+    if let Some(redundant) = redundant_equalities(A, b, cones) {
+        for row in redundant {
+            keep_logical[row] = false;
+            mreduced -= 1;
+        }
+    }
+
     let outoption = {
         if mreduced < b.len() {
             Some(PresolverRowReductionIndex { keep_logical })
@@ -201,4 +222,169 @@ where
     };
 
     (outoption, mreduced)
+}
+
+// Prove dependence over exact input values, including RHS. Retained rows are
+// unchanged, so zero multipliers restore a valid dual in original coordinates.
+// A fixed work budget makes dense/ill-conditioned equality sets a safe no-op.
+fn redundant_equalities<T: FloatT>(
+    A: &CscMatrix<T>,
+    b: &[T],
+    cones: &[SupportedConeT<T>],
+) -> Option<Vec<usize>> {
+    use sdpx_arithmetic::Exact;
+    use std::collections::BTreeMap;
+    let mut ids = Vec::new();
+    let mut start = 0;
+    for cone in cones {
+        if matches!(cone, SupportedConeT::ZeroConeT(_)) {
+            ids.extend(start..start + cone.nvars());
+        }
+        start += cone.nvars();
+    }
+    if ids.is_empty() || ids.len() > 512 {
+        return None;
+    }
+    let mut lookup = vec![usize::MAX; b.len()];
+    let mut rows: Vec<BTreeMap<usize, Exact>> = (0..ids.len()).map(|_| BTreeMap::new()).collect();
+    for (i, &r) in ids.iter().enumerate() {
+        lookup[r] = i;
+        if b[r] != T::zero() {
+            rows[i].insert(A.n, b[r].exact()?);
+        }
+    }
+    let mut budget = 1_000_000usize;
+    for c in 0..A.n {
+        for k in A.colptr[c]..A.colptr[c + 1] {
+            let i = lookup[A.rowval[k]];
+            if i != usize::MAX && A.nzval[k] != T::zero() {
+                budget = budget.checked_sub(1)?;
+                // Do not prove rank from overwritten noncanonical CSC entries.
+                if rows[i].insert(c, A.nzval[k].exact()?).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+    let mut basis: BTreeMap<usize, BTreeMap<usize, Exact>> = BTreeMap::new();
+    let mut redundant = Vec::new();
+    for (id, mut row) in ids.into_iter().zip(rows) {
+        loop {
+            let Some((&pivot, value)) = row.first_key_value() else {
+                redundant.push(id);
+                break;
+            };
+            let factor = value.clone();
+            if let Some(previous) = basis.get(&pivot) {
+                budget = budget.checked_sub(previous.len())?;
+                for (&c, value) in previous {
+                    let entry = row.entry(c).or_default();
+                    entry.subtract_product(&factor, value);
+                    if !entry.bounded() {
+                        return None;
+                    }
+                    if entry.is_zero() {
+                        row.remove(&c);
+                    }
+                }
+            } else {
+                for value in row.values_mut() {
+                    value.divide(&factor);
+                    if !value.bounded() {
+                        return None;
+                    }
+                }
+                basis.insert(pivot, row);
+                break;
+            }
+        }
+    }
+    Some(redundant)
+}
+
+#[cfg(test)]
+mod exact_tests {
+    use super::*;
+    fn check<T: FloatT>() {
+        let one = T::one();
+        let two = one + one;
+        let zero = T::zero();
+        // Last row differs below f64 resolution in MPFR; it must be retained.
+        let delta = T::epsilon();
+        let a = CscMatrix::new(
+            5,
+            2,
+            vec![0, 4, 7],
+            vec![0, 1, 2, 4, 0, 1, 4],
+            vec![one, two, one, one, one, two, one + delta],
+        );
+        let b = vec![two, two + two, zero, zero, two];
+        let cones = vec![SupportedConeT::ZeroConeT(5)];
+        assert_eq!(redundant_equalities(&a, &b, &cones).unwrap(), vec![1, 3]);
+        let mut inconsistent = b.clone();
+        inconsistent[1] += delta * two * two * two;
+        assert!(!redundant_equalities(&a, &inconsistent, &cones)
+            .unwrap()
+            .contains(&1));
+    }
+    fn peeled_chain<T: FloatT>() {
+        // Rows 0..31 form a singleton cascade; the separate two-row component
+        // has one exact dependence. A nonzero RHS alone must not peel a row.
+        let n = 34;
+        let mut i = Vec::new();
+        let mut j = Vec::new();
+        let mut v = Vec::new();
+        for r in 0..32 {
+            i.push(r);
+            j.push(r);
+            v.push(T::one());
+            if r > 0 {
+                i.push(r);
+                j.push(r - 1);
+                v.push(T::one());
+            }
+        }
+        for r in 32..34 {
+            for c in 32..34 {
+                i.push(r);
+                j.push(c);
+                v.push(T::one());
+            }
+        }
+        let a = CscMatrix::new_from_triplets(n, n, i, j, v);
+        let mut b = vec![T::one(); n];
+        let cones = [SupportedConeT::ZeroConeT(n)];
+        assert_eq!(redundant_equalities(&a, &b, &cones).unwrap(), vec![33]);
+        b[33] += T::one();
+        assert!(redundant_equalities(&a, &b, &cones).unwrap().is_empty());
+    }
+    #[test]
+    fn singleton_cascade_f64() {
+        peeled_chain::<f64>();
+    }
+    #[test]
+    fn singleton_cascade_256() {
+        peeled_chain::<sdpx_arithmetic::Bits256>();
+    }
+    #[test]
+    fn singleton_cascade_512() {
+        peeled_chain::<sdpx_arithmetic::Bits512>();
+    }
+    #[test]
+    fn noncanonical_duplicates_skip_exact_reduction() {
+        let a = CscMatrix::new(2, 1, vec![0, 3], vec![0, 0, 1], vec![1., 2., 2.]);
+        assert!(redundant_equalities(&a, &[2., 2.], &[SupportedConeT::ZeroConeT(2)]).is_none());
+    }
+    #[test]
+    fn exact_rows_f64() {
+        check::<f64>();
+    }
+    #[test]
+    fn exact_rows_256() {
+        check::<sdpx_arithmetic::Bits256>();
+    }
+    #[test]
+    fn exact_rows_512() {
+        check::<sdpx_arithmetic::Bits512>();
+    }
 }

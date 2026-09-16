@@ -47,5 +47,5 @@ check. This comparison checks preservation, not an independent mathematical orac
 Compare warmed medians only after output equality; setup and first calls remain
 separate. Provider microbenchmark gains are **not** end-to-end solver gains.
 
-Preparation has static validation only until the coordinator compiles and runs
+Preparation has static validation only until the operator compiles and runs
 the harness. No numerical qualification is implied by successfully generating it.

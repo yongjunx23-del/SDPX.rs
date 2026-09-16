@@ -52,7 +52,7 @@ setprecision(BigFloat, 256) do
 end
 ```
 
-`prepare(...)`, `solve!(problem; q=..., b=...)` and `close(problem)` support repeated solves. Julia's reusable handles retain Ruiz but disable presolve and chordal rewriting so that the original input structure stays updateable. Direct `solve` / `solve_conic` and model optimization use all three defaults. See [Julia usage](julia/SDPX.jl/README.md) and the [PMP2SDP callback example](julia/SDPX.jl/test/pmp_callback.jl).
+`prepare(...)`, `solve!(problem; q=..., b=...)` and `close(problem)` support repeated solves. Julia's reusable handles retain Ruiz but disable presolve and chordal rewriting so that the original input structure stays updateable. Direct `solve` / `solve_conic` and model optimization use all three defaults. See the [PMP2SDP callback example](julia/SDPX.jl/test/pmp_callback.jl).
 
 ## Architecture
 
@@ -63,45 +63,76 @@ end
 | `crates/solver` | Homogeneous embedding, cones, KKT, refinement and termination |
 | `crates/arithmetic` | Independently owned fixed-precision MPFR values |
 
-Float64 uses native BLAS/LAPACK with QDLDL or optional multithreaded Faer for sparse KKT factorization. The condensed backend eliminates PSD/orthant rows, retains other cones and equalities, and preserves the structural Schur sparsity. PSD cones cache matrix-sized scaling factors instead of a dense Hessian over packed cone coordinates. Both formulations use the same embedding, accepted-iterate recovery and native linear-solve refinement.
+Float64 uses native BLAS/LAPACK with QDLDL or optional multithreaded Faer for sparse KKT factorization. Batched Schur assembly uses runtime-checked AVX2/FMA on supported x86 CPUs, with the same arithmetic implementation and a portable fallback. Auto selection can use dense block Cholesky for a near-dense positive block with a small negative border, retaining sparse fallback and refinement. The condensed backend eliminates PSD/orthant rows, retains other cones and equalities, and preserves the structural Schur sparsity. PSD cones cache matrix-sized scaling factors instead of a dense Hessian over packed cone coordinates. Both formulations use the same embedding, accepted-iterate recovery and native linear-solve refinement. Exact repeated coefficient columns share transforms across precisions; Float64 batches them, while MPFR streams them with bounded scratch. Presolve uses one bounded GMP rational elimination for exact redundant equalities, including their right-hand sides, and restores original-coordinate slacks and duals.
 
 Set `Limits(threads=...)` for independent cone work, eligible sparse residual products, sampled block operators and Float64 Faer factorization. MPFR uses serial QDLDL and a dense provider with Householder/bidiagonal-QR SVD and symmetric Jacobi eigenanalysis; cone blocks can execute in parallel. Large single orthants also split independent elementwise phases across the existing pool, preserving reduction order. `execution_plan(result)` reports the formulation, factorization width and cone pool size. These are configured capacities, not a count of busy cores. Native BLAS threads are configured separately; use one BLAS thread when measuring cone/Faer scaling and set `RAYON_NUM_THREADS` to the requested factorization width.
 
-An explicit `sampled_program` input retains shared basis factors and uses paired operators plus NT Gram Schur assembly. Ordinary CSC input keeps its existing semantics. Sampled input falls back to materialized CSC when structural preprocessing changes its blocks. The optional PMP2SDP extension supplies this representation without a mandatory frontend dependency. Float64 and 256/512-bit integration tests cover this path, including preprocessing fallback, updates, shared columns and deterministic threaded operator results. Dominant blocks can use the existing pool for MPFR matrix products, with triangular SYRK work balanced across tasks. More configured workers do not guarantee a whole-solve speedup.
+An explicit `sampled_program` input retains shared basis factors and uses paired operators plus NT Gram Schur assembly. Exactly equal basis vectors share Gram columns at the working precision; canonical variables and weights remain unchanged. Ordinary CSC input keeps its existing semantics. Exact equality and infinite-bound row reductions retain the factors and remap block offsets; chordal block rewriting uses the materialized fallback. The optional PMP2SDP extension supplies this representation without a mandatory frontend dependency. Float64 and 256/512-bit integration tests cover this path, including row recovery, chordal fallback, updates, shared columns and deterministic threaded operator results. Dominant blocks can use the existing pool for MPFR matrix products, with triangular SYRK work balanced across tasks. More configured workers do not guarantee a whole-solve speedup.
 
 BFLA/MFLA, CRT acceleration and MPI are not implemented as backends in this project. The stable sibling retains its existing capabilities. The Julia frontend and shared library must both use ABI 3; an older library is rejected explicitly.
 
 ## Verification
 
-The [benchmark library and research loop](benchmark/research/README.md) provide pinned development/regression inputs, separately reserved holdouts, paired time/RSS measurements and accuracy-first candidate decisions. See [the agent protocol](benchmark/research/program.md) for bounded optimization cycles; its checks stay outside solver timing.
+The [benchmark library and research loop](benchmark/research/README.md) provide pinned development/regression inputs, separately reserved holdouts, paired time/RSS measurements and accuracy-first candidate decisions. Experiments have explicit budgets and completion criteria; accuracy checks stay outside solver timing.
 
 ```sh
 cargo test --locked --release --workspace --features sdpx-ffi/sdp-accelerate,sdpx-ffi/faer-sparse -- --test-threads=1
 julia --project=julia/SDPX.jl julia/SDPX.jl/test/runtests.jl
 ```
 
-The frozen macOS candidate `a52c22f3366d` passes 376 Rust tests, 508 checks each on Julia 1.12.6 and 1.13.0, and 40 optional PMP2SDP callback/extension checks. Coverage includes upstream solver cases, MPFR ownership, dense decomposition residuals, all six precision modes, preprocessing and original-coordinate recovery, mixed-cone condensation, dependent equalities, Julia model/MOI conversions and serial/parallel consistency. PSD step-length eigenanalysis now shares the existing pool, retaining the original ordered step-bound reduction. These checks establish correctness for the tested cases, not performance parity.
+## Performance status
 
-The [Float64 benchmark driver](benchmark/float64/README.md) checks original-coordinate residuals outside timing. On the fixed conic10 and disjoint holdout15 suites, candidate `e5972b714552` passes 4/10 and 12/15 optimal-point gates; fresh MOSEK passes 7/10 and 12/15. Across 14 jointly accepted cases, SDPX's geometric-mean warmed end-to-end time is 1.54 times MOSEK's. Both use the same external gate; MOSEK's product-default internal tolerances differ. MOSEK's unvalidated `LP_agg` certificate is excluded from optimal-point comparisons.
+Performance parity is not established. On the retained Float64 conic10/holdout
+campaign, SDPX/MOSEK warmed API-time ratio was 1.54 across 14 jointly accepted
+cases; optimal-point counts were 4/10 and 12/15 for SDPX versus 7/10 and 12/15
+for MOSEK. Across 11 accepted Clarabel.rs holdout cases the ratio was 0.91,
+dominated by one SDP case. These historical observations do not establish broad
+superiority; native solver and frontend memory measurements have different scopes.
 
-Fresh default Clarabel.rs passes 11/15 holdout cases. On those 11 common accepted points, SDPX/Clarabel's geometric-mean time ratio is 0.91, largely driven by `SDP_arch0` (4.51 versus 18.36 s); several small LPs remain 4–18% slower. Two Clarabel cases have incomplete supervision/cleanup outcomes and no solver status or complete memory receipt; they earn no speed credit. Failed points, AlmostSolved and incomplete runs remain in the denominators. These observations do not establish broad superiority or a repeated 2% optimization gain.
+The medium dense SDP development case now has a 3.15 s native median versus
+3.34 s in a matched forward/reverse comparison (18 versus 19 iterations,
+one thread, unchanged 1e-6 tolerances and external gates). A bounded quadratic
+curve search reuses the existing predictor/corrector directions without extra
+KKT solves, building on compact Schur assembly and exact coefficient reuse.
+Five independent LP/SOCP/SDP cases and 344 Rust checks pass. At 1e-8 tolerances,
+both baseline and candidate return AlmostOptimal on medium, so that accuracy
+remains unqualified. Retained MOSEK is 1.89 s / 16 iterations; broad parity
+is not established. Current optimization is single-core; the curve is enabled
+only for Float64 symmetric cones, leaving high precision and nonsymmetric cones
+on their existing step strategy. Exact presolve now removes 14 redundant medium
+equalities without approximate rank tests; its matched timing is unchanged.
+The unified paths preserve the 512-bit Ising solution, but do not show a new
+Ising speedup. Enabling the curve at high precision was slower and was rejected.
+See [current priorities and evidence](PERFORMANCE_PLAN.md).
 
-Memory figures describe whole processes, including startup and external audits. On the 14 common MOSEK points, Julia/SDPX peak RSS is 658–739 MiB and Python/MOSEK is 63–164 MiB. The 11 accepted standalone Rust Clarabel holdout processes use 7–296 MiB. These different frontends prevent treating the figures as solver-kernel memory measurements. Timings exclude first-call compilation and use three warmed solves on conic10 and seven on holdout15.
+A matched historical Ising512 cluster campaign (source `a52c22f3366d`,
+job `212627.node220`, node7) measured SDPX/SDPB native medians of
+135/127, 74.17/69, 42.46/36 and 30.24/25 seconds at 1/2/4/8 cores.
+All 28 points passed the fixed 512-bit, external 1e-30 protocol.
+Later small-case changes do not qualify the larger Lambda11 case, which still
+failed its sampled dual-consistency gate. No large-SDP superiority is claimed.
 
-The matched Ising512 campaign `212627.node220` on `node7` measured the following native solver medians (three repetitions, 512-bit arithmetic, public tolerance `1e-42`, unchanged external tolerance `1e-30`). All 28 returned points passed the external audit. Both solvers ran sequentially within one cluster allocation; SDPX used threads and SDPB used MPI ranks pinned to the same physical-core budgets.
+## Julia API details
 
-| Cores | SDPX seconds | SDPB seconds |
-|---|---:|---:|
-| 1 | 135.00 | 127 |
-| 2 | 74.17 | 69 |
-| 4 | 42.46 | 36 |
-| 8 | 30.24 | 25 |
+PSD rows use upper-column svec packing with square-root-of-two off-diagonal
+scaling. `Model`, `variable!` and `constraint!` use ordinary symmetric matrices.
+MOI accepts Float64 models. BigFloat direct/model calls require matching
+`Settings(BigFloat; precision_bits=...)`. Prepared settings are fixed at creation;
+`solve_time` excludes Julia conversion and result copying.
 
-This campaign uses source `a52c22f3366d` and input SHA-256 `e4484eb8895e504a8f5c83651a5b964172e24c7060db24ddf09b737dcc78fddf`. SDPX took 50 iterations; SDPB's final logged iteration was 201. Eight-core scaling is 4.46× versus 5.08×; SDPX remains about 21% slower at eight cores. SDPB native time has whole-second resolution; the solvers' stopping norms and per-iteration work differ. SDPX whole-invocation RSS is 615–676 MiB; SDPB's sampled aggregate group peak reaches 521 MiB at eight ranks. Neither is a kernel-only memory figure.
+```julia
+p = prepare([1.0], sparse(reshape([-1.0], 1, 1)), [-1.0], [NonnegativeConeT(1)])
+try
+    result = solve!(p; b=[-2.0])
+finally
+    close(p)
+end
+```
 
-For this same small input on macOS, PSD step-length parallelism reduces eight-thread native medians from 36.55 to 17.07 s; reverse-order measurements give 36.38 versus 17.05 s (2.13–2.14× faster). Single-thread medians remain about 68 s. All 24 forward/reverse points pass the unchanged 512-bit accuracy protocol and return identical decimal vectors and iteration counts. These configured macOS thread budgets are separate from the physical-core cluster measurements above.
-
-The larger Lambda11 input has 28 PSD blocks of orders 36–43. Its 512-bit SDPB reference failed Cholesky positive-definiteness; a separate fixed-768-bit reference passed. SDPX's upstream normalization, with a denominator near `2.03e78`, initially accepted an inaccurate point. A separately declared SDPX feasibility tolerance `1e-140` produces 94 iterations and global residuals around `1e-65`, but sampled dual consistency remains `2.16e-22`, above the unchanged external `1e-30` gate. This run earns no speed credit; a qualified large-instance comparison remains unresolved. Both 768-bit experiments retain the same 512-bit-converted input bytes. SDPB keeps absolute internal tolerances `1e-42`; equal numeric internal tolerances do not imply equal accuracy across these solvers.
+Optional PMP2SDP tests use an isolated environment with that package developed
+alongside this frontend. Julia sources derive from the sibling's modeling,
+storage, compiler, result and MOI layers; their MIT notice remains in
+`julia/SDPX.jl/LICENSE`. The solver executes in Rust.
 
 ## References and license
 

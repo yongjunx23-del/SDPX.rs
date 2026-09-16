@@ -77,7 +77,8 @@ impl ConeThreading {
         // Contiguous lanes preserve original cone/data ordering and permit
         // safe slice splitting, without raw pointers or per-call job vectors.
         let orthant_chunk = single_orthant.then(|| cones[0].numel().div_ceil(workers));
-        let lanes = balanced_lanes(cones, &prefix, workers.min(cones.len()));
+        let task_budget = workers.saturating_mul(4).min((total / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
+        let lanes = balanced_lanes(cones, &prefix, task_budget.min(cones.len()));
         #[cfg(feature = "sdp")]
         let psd_step_lanes = {
             let mut prefix = Vec::with_capacity(cones.len() + 1);
@@ -92,7 +93,7 @@ impl ConeThreading {
                 };
                 prefix.push(prefix.last().unwrap().saturating_add(cost));
             }
-            let lanes = workers
+            let lanes = workers.saturating_mul(4)
                 .min(active)
                 .min((prefix.last().unwrap() / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
             if lanes > 1 {
@@ -289,7 +290,8 @@ mod tests {
     fn balanced_partition_and_joined_failure_own_each_row_once() {
         let kinds = vec![SupportedConeT::<f64>::NonnegativeConeT(4096); 4];
         let mut cones: Vec<_> = kinds.iter().map(make_cone).collect();
-        let threading = ConeThreading::new(&cones, 4).unwrap().unwrap();
+        let threading = ConeThreading::new(&cones, 2).unwrap().unwrap();
+        assert_eq!(threading.pool.current_num_threads(), 2);
         assert_eq!(threading.lanes.len(), 4);
         for (i, lane) in threading.lanes.iter().enumerate() {
             assert_eq!(lane.cone_start, i);

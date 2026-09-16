@@ -207,10 +207,30 @@ where
     #[cfg(feature = "sdp")]
     pub(crate) fn install_sampled(&mut self, mut operator: SampledOperator<T>) {
         self.sampled_input = true;
-        // A structural preprocessing result is a consistent, rounded lowering
-        // of the factor-defined model. Its whole solve uses the generic route.
-        if self.is_presolved() || self.is_chordal_decomposed() {
+        // Chordal lowering currently uses the generic route; row-only reductions
+        // preserve the authoritative factors and merely shift their row offsets.
+        if self.is_chordal_decomposed() {
             return;
+        }
+        if let Some(presolver) = &self.presolver {
+            let keep = &presolver.reduce_map.as_ref().unwrap().keep_logical;
+            if operator.blocks().iter().any(|b| {
+                keep[b.row_start..b.row_start + b.row_count()]
+                    .iter()
+                    .any(|v| !v)
+            }) {
+                return;
+            }
+            let mut prefix = vec![0; keep.len() + 1];
+            for (i, &retained) in keep.iter().enumerate() {
+                prefix[i + 1] = prefix[i] + usize::from(retained);
+            }
+            let mut blocks = operator.blocks().to_vec();
+            for block in &mut blocks {
+                block.row_start = prefix[block.row_start];
+            }
+            operator = SampledOperator::new(operator.linear().select_rows(keep), blocks)
+                .expect("presolve retains complete sampled blocks");
         }
         let mut row = 0;
         let ranges: Vec<_> = self

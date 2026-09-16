@@ -112,3 +112,58 @@ fn test_presolve_settable_bound() {
     default_infinity();
     assert_eq!(get_infinity(), default_bound);
 }
+
+#[test]
+fn exact_equalities_restore_original_dual_and_slack() {
+    let a = CscMatrix::<f64>::new(
+        4,
+        2,
+        vec![0, 3, 5],
+        vec![0, 1, 3, 2, 3],
+        vec![1., 2., 1., 1., 1.],
+    );
+    let b = vec![1., 2., 2., 3.];
+    let p = CscMatrix::identity(2);
+    let q = vec![0.; 2];
+    let cones = vec![ZeroConeT(4)];
+    let mut settings = DefaultSettings::default();
+    settings.verbose = false;
+    let mut solver = DefaultSolver::new(&p, &q, &a, &b, &cones, settings.clone()).unwrap();
+    assert_eq!(solver.variables.z.len(), 2);
+    solver.solve();
+    assert_eq!(solver.solution.status, SolverStatus::Solved);
+    assert!(solver.solution.x.dist(&[1., 2.]) < 1e-8);
+    assert_eq!(solver.solution.z[1], 0.);
+    assert_eq!(solver.solution.z[3], 0.);
+    assert_eq!(solver.solution.s, vec![0.; 4]);
+    let z = &solver.solution.z;
+    assert!((solver.solution.x[0] + z[0] + 2. * z[1] + z[3]).abs() < 1e-8);
+    assert!((solver.solution.x[1] + z[2] + z[3]).abs() < 1e-8);
+    settings.presolve_enable = false;
+    let untouched = DefaultSolver::new(&p, &q, &a, &b, &cones, settings).unwrap();
+    assert_eq!(untouched.variables.z.len(), 4);
+}
+
+#[test]
+fn inconsistent_equalities_preserve_infeasibility_ray() {
+    let a = CscMatrix::<f64>::new(3, 1, vec![0, 3], vec![0, 1, 2], vec![1., 2., 1.]);
+    let b = vec![1., 2., 3.];
+    let mut settings = DefaultSettings::default();
+    settings.verbose = false;
+    let mut solver = DefaultSolver::new(
+        &CscMatrix::zeros((1, 1)),
+        &[0.],
+        &a,
+        &b,
+        &[ZeroConeT(3)],
+        settings,
+    )
+    .unwrap();
+    assert_eq!(solver.variables.z.len(), 2);
+    solver.solve();
+    assert_eq!(solver.solution.status, SolverStatus::PrimalInfeasible);
+    let z = &solver.solution.z;
+    assert_eq!(z[1], 0.);
+    assert!((z[0] + 2. * z[1] + z[2]).abs() < 1e-8);
+    assert!(z[0] + 2. * z[1] + 3. * z[2] < -0.9);
+}

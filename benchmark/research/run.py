@@ -14,12 +14,50 @@ import shutil
 import subprocess
 import sys
 import time
-import tomllib
+try:
+    import tomllib
+except ImportError:  # cluster nodes run Python 3.6
+    tomllib = None
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 THREAD_ENV = ('OPENBLAS_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS', 'MKL_NUM_THREADS',
               'OMP_NUM_THREADS', 'NUMEXPR_NUM_THREADS')
+
+
+def _is_relative_to(path, base):
+    # Path.is_relative_to is 3.9+; cluster nodes run 3.6.
+    try:
+        Path(path).relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _manifest_path_deps(text):
+    # Fallback for Python <3.11 without tomllib: collect `path = "..."`
+    # lines under each `[[deps.NAME]]` or `[deps.NAME]` section of a Julia
+    # Manifest.toml.
+    deps, current = {}, None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.endswith(']]') and line.startswith('[[deps.'):
+            current = line[7:-2]
+            deps.setdefault(current, [])
+        elif line.endswith(']') and line.startswith('[deps.'):
+            inner = line[6:-1]
+            # Only `[deps.NAME]`; ignore `[deps]` and deeper tables.
+            current = inner if inner and '.' not in inner else None
+            if current is not None:
+                deps.setdefault(current, [])
+        elif line.startswith('['):
+            current = None  # any other section ends the deps block
+        elif current is not None and line.startswith('path'):
+            _, _, value = line.partition('=')
+            value = value.strip().strip('"').strip("'")
+            if value:
+                deps[current].append({'path': value})
+    return deps
 
 
 def read(path):
@@ -81,13 +119,18 @@ def arm_identity(config):
         text = text.replace(str(source / 'julia/SDPX.jl'), '<SDPX_SOURCE>/julia/SDPX.jl')
         environment[name] = text
     # Path dependencies are mutable even when Manifest.toml is unchanged.
-    parsed = tomllib.loads((project / 'Manifest.toml').read_text())
-    for packages in parsed.get('deps', {}).values():
+    if tomllib is not None:
+        parsed = tomllib.loads((project / 'Manifest.toml').read_text())
+        path_deps = parsed.get('deps', {})
+    else:
+        path_deps = _manifest_path_deps(
+            (project / 'Manifest.toml').read_text())
+    for packages in path_deps.values():
         for package in packages if isinstance(packages, list) else [packages]:
             if 'path' not in package:
                 continue
             path = (project / package['path']).resolve()
-            if path.is_relative_to(source):
+            if _is_relative_to(path, source):
                 continue
             for f in sorted(path.rglob('*')):
                 if f.is_file() and not {'.git', 'target', '__pycache__'} & set(f.relative_to(path).parts):
@@ -130,9 +173,15 @@ def slot(state):
 
 
 def group_rss_kib(pgid):
-    result = subprocess.run(['ps', '-axo', 'pgid=,rss='], capture_output=True, text=True, check=True)
-    return sum(int(fields[1]) for line in result.stdout.splitlines()
-               if len(fields := line.split()) == 2 and int(fields[0]) == pgid)
+    result = subprocess.run(['ps', '-axo', 'pgid=,rss='], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, universal_newlines=True,
+                            check=True)
+    total = 0
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and int(fields[0]) == pgid:
+            total += int(fields[1])
+    return total
 
 
 def supervisor():
@@ -210,11 +259,21 @@ def validate_catalog(manifest):
 def external_output(path, configs):
     path = path.resolve()
     protected = [ROOT.resolve()] + [Path(c['source']).resolve() for c in configs]
-    if any(path.is_relative_to(p) for p in protected):
+    if any(_is_relative_to(path, p) for p in protected):
         raise ValueError('experiment output must be outside project and source snapshots')
 
 
 def run_case(owned, config, identity, entry, data, bits, threads, block, out, timeout, memory, repetitions=4):
+    # Reservations may tighten the caller/campaign limits, never extend them.
+    budget = entry.get('reservation', {}).get('budget', {})
+    limits = [timeout, memory]
+    for index, key in enumerate(('process_seconds', 'memory_mib')):
+        if key in budget:
+            value = budget[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError('invalid reserved case limit: ' + key)
+            limits[index] = min(limits[index], value)
+    timeout, memory = limits
     name = entry['name']
     if not name or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in name):
         raise ValueError('case name must be a safe filename')
@@ -242,7 +301,8 @@ def run_case(owned, config, identity, entry, data, bits, threads, block, out, ti
     with prefix.with_suffix('.stdout').open('w') as stdout, prefix.with_suffix('.stderr').open('w') as stderr:
         receipt = owned(command, env=env, stdout=stdout, stderr=stderr,
                         timeout=timeout, memory_limit_mib=memory)
-    write(prefix.with_suffix('.process.json'), dict(receipt, command=command))
+    write(prefix.with_suffix('.process.json'), dict(receipt, command=command,
+          timeout_s=timeout, memory_limit_mib=memory))
     aggregate = {}
     runtime = {}
     if runner == 'float64':
@@ -468,7 +528,8 @@ def qualify(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest='action', required=True)
+    sub = parser.add_subparsers(dest='action')
+    sub.required = True
     fingerprint = sub.add_parser('fingerprint')
     fingerprint.add_argument('--config', type=Path, required=True)
     pair_parser = sub.add_parser('pair')

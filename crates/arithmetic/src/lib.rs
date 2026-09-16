@@ -15,6 +15,9 @@ use std::{
     str::FromStr,
 };
 
+mod exact;
+pub use exact::Exact;
+
 /// Operations required by the solver, without Float's 64-bit integer_decode.
 pub trait Scalar:
     'static
@@ -32,6 +35,10 @@ pub trait Scalar:
     + fmt::LowerExp
     + fmt::Debug
 {
+    /// Exact value for bounded structural presolve; unsupported types retain rows.
+    fn exact(&self) -> Option<Exact> {
+        None
+    }
     /// Number of significant binary digits in arithmetic.
     fn precision_bits() -> usize;
     fn epsilon() -> Self;
@@ -67,6 +74,9 @@ pub trait Scalar:
 macro_rules! primitive_scalar {
     ($t:ty) => {
         impl Scalar for $t {
+            fn exact(&self) -> Option<Exact> {
+                self.is_finite().then(|| Exact::from_f64(*self as f64))
+            }
             fn precision_bits() -> usize {
                 Self::MANTISSA_DIGITS as usize
             }
@@ -464,6 +474,19 @@ impl<const N: usize> ToPrimitive for MpFloat<N> {
     }
 }
 impl<const N: usize> Scalar for MpFloat<N> {
+    fn exact(&self) -> Option<Exact> {
+        if *self == Self::zero() {
+            return Some(Exact::default());
+        }
+        if !self.is_finite() || self.exponent.unsigned_abs() > 8192 || N * 64 > 8192 {
+            return None;
+        }
+        let mut value = Exact::default();
+        unsafe {
+            mpfr::get_q(&mut value.raw, &self.descriptor());
+        }
+        Some(value)
+    }
     fn precision_bits() -> usize {
         Self::PRECISION_BITS
     }

@@ -124,3 +124,53 @@ fn consuming_affine_mpfr256() {
 fn consuming_affine_mpfr512() {
     check::<sdpx_arithmetic::Bits512>();
 }
+
+fn curve_preserves<T: FloatT>() {
+    let (cones, point, affine) = fixture::<T>(1, false);
+    let mut cones = cones;
+    let mut combined = affine.new_like();
+    combined.copy_from(&affine);
+    combined.s.scale((0.2).as_T());
+    combined.z.scale((0.3).as_T());
+    let saved_s = affine.s.clone();
+    let saved_z = affine.z.clone();
+    let mut direction = affine.new_like();
+    let t: T = (0.25).as_T();
+    direction.interpolate(&affine, &combined, t);
+    let mut trial = point.new_like();
+    trial.copy_from(&point);
+    trial.add_step(&direction, t);
+    for ((got, base), (a, b)) in trial
+        .s
+        .iter()
+        .zip(&point.s)
+        .zip(affine.s.iter().zip(&combined.s))
+    {
+        let expected = *base + t * *a + t * t * (*b - *a);
+        assert!(
+            (*got - expected).abs() <= T::epsilon() * (64.).as_T() * (T::one() + expected.abs())
+        );
+    }
+    equal(&saved_s, &affine.s);
+    equal(&saved_z, &affine.z);
+    let settings = DefaultSettings::<T>::default();
+    let bound = point.calc_step_length(&direction, &mut cones, &settings, StepDirection::Combined);
+    trial.copy_from(&point);
+    trial.add_step(&direction, bound);
+    assert!(cones.margins(&mut trial.s, PrimalOrDualCone::PrimalCone).0 >= T::zero());
+    assert!(cones.margins(&mut trial.z, PrimalOrDualCone::DualCone).0 >= T::zero());
+    assert!(trial.τ > T::zero() && trial.κ > T::zero());
+}
+
+#[test]
+fn curve_f64() {
+    curve_preserves::<f64>();
+}
+#[test]
+fn curve_256() {
+    curve_preserves::<sdpx_arithmetic::Bits256>();
+}
+#[test]
+fn curve_512() {
+    curve_preserves::<sdpx_arithmetic::Bits512>();
+}

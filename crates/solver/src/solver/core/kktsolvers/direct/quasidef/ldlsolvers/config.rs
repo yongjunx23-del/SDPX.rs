@@ -53,6 +53,9 @@ macro_rules! primitive_configuration {
                 signs: &[i8],
                 settings: &CoreSettings<Self>,
             ) -> BoxedDirectLDLSolver<Self> {
+                if let Some(solver) = Self::dense_ldl(matrix, signs, settings) {
+                    return solver;
+                }
                 #[cfg(feature = "faer-sparse")]
                 {
                     super::auto::ldl_auto_select(matrix, signs, settings)
@@ -68,6 +71,13 @@ macro_rules! primitive_configuration {
 
 trait SpecializedLDL: FloatT {
     fn specialized_ldl(method: &str) -> (MatrixTriangle, LDLConstructor<Self>);
+    fn dense_ldl(
+        _matrix: &CscMatrix<Self>,
+        _signs: &[i8],
+        _settings: &CoreSettings<Self>,
+    ) -> Option<BoxedDirectLDLSolver<Self>> {
+        None
+    }
 }
 #[cfg(not(feature = "sdp-r"))]
 impl SpecializedLDL for f32 {
@@ -76,6 +86,22 @@ impl SpecializedLDL for f32 {
     }
 }
 impl SpecializedLDL for f64 {
+    fn dense_ldl(
+        matrix: &CscMatrix<Self>,
+        signs: &[i8],
+        settings: &CoreSettings<Self>,
+    ) -> Option<BoxedDirectLDLSolver<Self>> {
+        #[cfg(feature = "sdp")]
+        {
+            super::dense_block::DenseBlockSolver::try_new(matrix, signs, settings)
+                .map(|solver| Box::new(solver) as BoxedDirectLDLSolver<Self>)
+        }
+        #[cfg(not(feature = "sdp"))]
+        {
+            let _ = (matrix, signs, settings);
+            None
+        }
+    }
     fn specialized_ldl(method: &str) -> (MatrixTriangle, LDLConstructor<Self>) {
         match method {
             #[cfg(feature = "pardiso-mkl")]

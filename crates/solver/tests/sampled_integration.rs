@@ -386,8 +386,14 @@ fn structural_fallback<T: FloatT>(presolve: bool) {
     } else {
         assert!(sampled.data.m != m || sampled.data.n != h);
     }
-    assert_eq!(sampled.info.linsolver.name, "condensed_qdldl");
-    assert_eq!(sampled.info.linsolver.name, generic.info.linsolver.name);
+    assert_eq!(
+        sampled.info.linsolver.name,
+        if presolve {
+            "condensed_sampled_qdldl"
+        } else {
+            "condensed_qdldl"
+        }
+    );
     generic.solve();
     sampled.solve();
     audit(&p, &q, &original, &b, &cones, &generic.solution);
@@ -402,11 +408,11 @@ fn structural_fallback<T: FloatT>(presolve: bool) {
 }
 
 #[test]
-fn actual_presolve_fallback_f64() {
+fn actual_presolve_retains_factors_f64() {
     structural_fallback::<f64>(true);
 }
 #[test]
-fn actual_presolve_fallback_mpfr256() {
+fn actual_presolve_retains_factors_mpfr256() {
     structural_fallback::<sdpx_arithmetic::Bits256>(true);
 }
 #[test]

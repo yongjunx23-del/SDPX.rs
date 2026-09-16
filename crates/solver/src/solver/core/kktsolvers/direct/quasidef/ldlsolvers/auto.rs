@@ -33,14 +33,7 @@ where
         settings: &CoreSettings<T>,
         _perm: Option<Vec<usize>>,
     ) -> BoxedDirectLDLSolver<T> {
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "faer-sparse")] {
-                T::auto_ldlsolver(KKT, Dsigns, settings)
-            } else {
-                let solver = QDLDLDirectLDLSolver::<T>::new(KKT, Dsigns, settings, None);
-                Box::new(solver)
-            }
-        }
+        T::auto_ldlsolver(KKT, Dsigns, settings)
     }
 }
 

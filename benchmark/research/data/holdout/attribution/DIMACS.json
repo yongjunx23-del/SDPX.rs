@@ -1,0 +1,24 @@
+{
+  "collection": "Seventh DIMACS Challenge",
+  "source_page": "https://archive.dimacs.rutgers.edu/Challenges/Seventh/Instances/",
+  "files": [
+    {
+      "name": "copo14.mat.gz",
+      "url": "https://archive.dimacs.rutgers.edu/Challenges/Seventh/Instances/COPOS/copo14.mat.gz",
+      "compressed_sha256": "d74fd331c3b1edb9dd86acc25122fcc2c60501f371c1ef2124e5e40a906bafe6",
+      "raw_sha256": "a3f1e2b9eaddc4da4f3c18ebebeae11387800e3c7987dd08e9ca369de5df4f4d",
+      "bytes": 18419,
+      "solver_executed": false
+    },
+    {
+      "name": "filter48_socp.mat.gz",
+      "url": "https://archive.dimacs.rutgers.edu/Challenges/Seventh/Instances/FILTER/filter48_socp.mat.gz",
+      "compressed_sha256": "301e7c8992fc2be57b5609e22093613f149f6e2ddd09a55436f46b8b70eb296e",
+      "raw_sha256": "a553b21b979560c483ab3a3f20bd120a7b5923f2d3defc28cedceed421aa9550",
+      "bytes": 129321,
+      "solver_executed": false
+    }
+  ],
+  "conversion": "import_sedumi.py; retain original objective sense and all constraints",
+  "provenance": "Gabor Pataki and Stefan H. Schmieta, DIMACS test library; copositivity and PAM-filter families"
+}

@@ -12,6 +12,14 @@ SUITES = ('smoke', 'development', 'regression', 'holdout', 'mpfr-dev')
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
+def _is_relative_to(path, base):
+    # Path.is_relative_to is 3.9+; cluster nodes run 3.6.
+    try:
+        Path(path).relative_to(base)
+        return True
+    except ValueError:
+        return False
+
 def encoded(value):
     return (json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)+'\n').encode()
 
@@ -86,14 +94,14 @@ def select_cases(catalog, suite):
 def _payload(case, workspace):
     if case.get('runner','float64') != 'float64':
         source=(workspace/case['source']['path']).resolve()
-        if not source.is_relative_to(workspace) or digest(source.read_bytes()) != case['source']['sha256']:
+        if not _is_relative_to(source, workspace) or digest(source.read_bytes()) != case['source']['sha256']:
             raise ValueError(f"recipe source hash mismatch: {case['name']}")
         return None
     if case['source']['kind']=='generated':
         data=encoded(smoke_problem(case['family']))
     elif case['source']['kind']=='workspace':
         source=(workspace/case['source']['path']).resolve()
-        if not source.is_relative_to(workspace):
+        if not _is_relative_to(source, workspace):
             raise ValueError('input source escapes workspace')
         data=source.read_bytes()
         if case['source'].get('compression') == 'gzip':
@@ -118,7 +126,7 @@ def verify(catalog, workspace, suite):
 
 def materialize(catalog, workspace, output, suite):
     workspace, output=Path(workspace).resolve(),Path(output).resolve()
-    if output.is_relative_to(workspace):
+    if _is_relative_to(output, workspace):
         raise ValueError('materialization cache must be outside the workspace')
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ValueError('output must be an empty directory')

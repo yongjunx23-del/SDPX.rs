@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 const MIN_PARALLEL_WORK: u128 = 32768;
 
-pub(super) fn worthwhile<T: FloatT>(a: &CscMatrix<T>) -> bool {
+pub(crate) fn worthwhile<T: FloatT>(a: &CscMatrix<T>) -> bool {
     let words = T::precision_bits().div_ceil(64) as u128;
     (a.m > 1 || a.n > 1) && a.nnz() as u128 * words * words >= MIN_PARALLEL_WORK
 }
@@ -15,7 +15,7 @@ struct Entry {
     position: usize,
 }
 
-pub(super) struct SparseParallel {
+pub(crate) struct SparseParallel {
     rowptr: Vec<usize>,
     entries: Vec<Entry>,
     row_lanes: Vec<usize>,
@@ -25,10 +25,31 @@ pub(super) struct SparseParallel {
 }
 
 impl SparseParallel {
-    pub(super) fn new<T>(a: &CscMatrix<T>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn test_pool_and_storage(&self) -> (usize, usize) {
+        (self.pool.as_ref().map_or(1, |p| p.current_num_threads()), self.entries.as_ptr() as usize)
+    }
+
+    pub(crate) fn new<T>(a: &CscMatrix<T>) -> Self {
+        Self::build(a, false)
+    }
+
+    pub(crate) fn new_symmetric<T>(a: &CscMatrix<T>) -> Self {
+        assert_eq!(a.n, a.m);
+        Self::build(a, true)
+    }
+
+    fn build<T>(a: &CscMatrix<T>, symmetric: bool) -> Self {
         let mut rowptr = vec![0; a.m + 1];
         for &row in &a.rowval {
             rowptr[row + 1] += 1;
+        }
+        if symmetric {
+            for col in 0..a.n {
+                for p in a.colptr[col]..a.colptr[col+1] {
+                    if a.rowval[p] != col { rowptr[col+1] += 1; }
+                }
+            }
         }
         for i in 0..a.m {
             rowptr[i + 1] += rowptr[i];
@@ -39,7 +60,7 @@ impl SparseParallel {
                 column: 0,
                 position: 0
             };
-            a.nzval.len()
+            rowptr[a.m]
         ];
         // Scanning CSC in exactly its original order preserves the order of
         // every row's additions, including explicitly stored zeros.
@@ -48,6 +69,10 @@ impl SparseParallel {
                 let row = a.rowval[position];
                 entries[cursor[row]] = Entry { column, position };
                 cursor[row] += 1;
+                if symmetric && row != column {
+                    entries[cursor[column]] = Entry { column: row, position };
+                    cursor[column] += 1;
+                }
             }
         }
         Self {
@@ -60,7 +85,7 @@ impl SparseParallel {
         }
     }
 
-    pub(super) fn configure<T>(&mut self, a: &CscMatrix<T>, pool: Option<Arc<rayon::ThreadPool>>) {
+    pub(crate) fn configure<T>(&mut self, a: &CscMatrix<T>, pool: Option<Arc<rayon::ThreadPool>>) {
         let workers = pool.as_ref().map_or(1, |p| p.current_num_threads());
         self.pool = pool;
         if self.workers != workers {
@@ -70,7 +95,23 @@ impl SparseParallel {
         }
     }
 
-    pub(super) fn residual_products<T: FloatT>(
+    pub(crate) fn symv<T: FloatT>(&self, a: &CscMatrix<T>, uplo: MatrixTriangle,
+        y: &mut [T], x: &[T], alpha: T, beta: T) {
+        if let Some(pool) = &self.pool {
+            if self.row_lanes.len() > 1 {
+                y.scale(beta);
+                pool.install(|| split_outputs(y, &self.row_lanes, &|row, out| {
+                    for e in &self.entries[self.rowptr[row]..self.rowptr[row+1]] {
+                        *out += alpha * a.nzval[e.position] * x[e.column];
+                    }
+                }));
+                return;
+            }
+        }
+        a.sym(uplo).symv(y, x, alpha, beta);
+    }
+
+    pub(crate) fn residual_products<T: FloatT>(
         &self,
         a: &CscMatrix<T>,
         x: &[T],

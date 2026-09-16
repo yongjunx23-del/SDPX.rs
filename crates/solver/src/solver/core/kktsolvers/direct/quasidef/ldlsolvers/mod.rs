@@ -4,6 +4,8 @@ use amd::Info;
 pub mod auto;
 pub mod config;
 pub mod qdldl;
+#[cfg(feature = "sdp")]
+mod dense_block;
 
 #[cfg(feature = "faer-sparse")]
 pub mod faer_ldl;

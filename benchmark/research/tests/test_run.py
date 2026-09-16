@@ -59,6 +59,31 @@ class RunTests(unittest.TestCase):
             self.assertEqual(len(rows), 4)
             self.assertTrue(all(r['passed'] is False for r in rows))
 
+    def test_reservation_caps_reach_process_and_cannot_extend_campaign(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = catalog.materialize(catalog.load_catalog(), HERE.parents[2], root/'data', 'smoke')
+            entry = run.read(manifest)['instances'][0]
+            entry['reservation'] = {'budget': {'process_seconds': 180, 'memory_mib': 4096}}
+            config = dict(source=str(root), library=str(root/'lib'), julia=sys.executable,
+                          julia_project=str(root), blas='default')
+            observed = []
+            def owned(command, **kwargs):
+                observed.append((kwargs['timeout'], kwargs['memory_limit_mib']))
+                return dict(process_exit_code=1, cleanup_confirmed=True)
+            for index, requested in enumerate(((900,8192),(30,1024))):
+                run.run_case(owned, config, {'source_sha256':'a'*64}, entry, root/'data',
+                             53, 1, str(index), root, *requested)
+                receipt = run.read(root/f"{index}_{entry['name']}.process.json")
+                self.assertEqual((receipt['timeout_s'],receipt['memory_limit_mib']), observed[-1])
+            self.assertEqual(observed, [(180,4096),(30,1024)])
+            for invalid in (0, -1, float('nan'), float('inf'), True, '180'):
+                entry['reservation']['budget']['process_seconds'] = invalid
+                with self.assertRaisesRegex(ValueError, 'reserved case limit'):
+                    run.run_case(owned, config, {'source_sha256':'a'*64}, entry, root/'data',
+                                 53, 1, 'bad', root, 900, 8192)
+            self.assertEqual(len(observed), 2)
+
     def test_screen_configuration_and_catalog_restriction(self):
         args = SimpleNamespace(profile='screen', stage='development', threads=1,
                                timeout=None, budget_seconds=None)

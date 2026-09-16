@@ -507,20 +507,41 @@ pub struct SampledSchurWorkspace<T> {
 impl<T: FloatT> SampledSchurWorkspace<T> {
     /// Allocate NT Gram storage for a validated sampled block.
     pub fn new(b: &SampledBlock<T>) -> Self {
-        let rank = b.dim * b.basis_cols;
+        // Compare complete basis vectors at the working precision. Reuse only
+        // exact duplicates; weights and canonical primitive indices stay intact.
+        let basis = |k: usize| &b.basis[k * b.basis_rows..(k + 1) * b.basis_rows];
+        let mut order: Vec<usize> = (0..b.basis_cols).collect();
+        order.sort_by(|&i, &j| basis(i).partial_cmp(basis(j)).unwrap());
+        let mut unique = Vec::new();
+        let mut map = vec![0; b.basis_cols];
+        for k in order {
+            if unique.last().map_or(true, |&j| basis(k) != basis(j)) {
+                unique.push(k);
+            }
+            map[k] = unique.len() - 1;
+        }
+        // Preserve the existing layout on the usual all-distinct input.
+        if unique.len() == b.basis_cols {
+            for k in 0..b.basis_cols {
+                unique[k] = k;
+                map[k] = k;
+            }
+        }
+        let count = unique.len();
+        let rank = b.dim * count;
         let mut u = Matrix::zeros((b.side(), rank));
         let mut pairs = Vec::with_capacity(b.weights.len());
         for r in 0..b.dim {
-            for k in 0..b.basis_cols {
+            for (k, &original) in unique.iter().enumerate() {
                 for i in 0..b.basis_rows {
-                    u[(r * b.basis_rows + i, r * b.basis_cols + k)] = b.basis[i + k * b.basis_rows];
+                    u[(r * b.basis_rows + i, r * count + k)] = b.basis[i + original * b.basis_rows];
                 }
             }
         }
         for s in 0..b.dim {
             for r in 0..=s {
-                for k in 0..b.basis_cols {
-                    pairs.push((r * b.basis_cols + k, s * b.basis_cols + k));
+                for &k in &map {
+                    pairs.push((r * count + k, s * count + k));
                 }
             }
         }
@@ -561,9 +582,6 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
         T::precision_bits() > 64 && (self.gemm_tile > 0 || self.syrk_tile > 0)
     }
     /// Update using the NT inverse factor for the block supplied at construction.
-    pub(crate) fn update(&mut self, b: &SampledBlock<T>, rinv: &Matrix<T>) {
-        self.update_with_pool(b, rinv, None);
-    }
     pub(crate) fn update_with_pool(
         &mut self,
         b: &SampledBlock<T>,
@@ -571,14 +589,15 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
         pool: Option<&rayon::ThreadPool>,
     ) {
         assert_eq!(rinv.size(), (b.side(), b.side()));
-        assert_eq!(self.u.size(), (b.side(), b.dim * b.basis_cols));
+        assert_eq!(self.u.nrows(), b.side());
+        assert_eq!(self.pairs.len(), b.column_count());
         if b.basis_cols == 0 {
             return;
         }
         if let Some(pool) = pool {
             self.configure_parallel(pool.current_num_threads());
             let side = i32::try_from(b.side()).unwrap();
-            let rank = i32::try_from(b.dim * b.basis_cols).unwrap();
+            let rank = i32::try_from(self.u.ncols()).unwrap();
             T::xgemm_pool(
                 b'N',
                 b'N',

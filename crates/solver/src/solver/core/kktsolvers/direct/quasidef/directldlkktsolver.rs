@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 
 use super::*;
+use crate::algebra::sparse_parallel::SparseParallel;
 use crate::solver::core::kktsolvers::{HasLinearSolverInfo, KKTSolver, LinearSolverInfo};
 use crate::solver::core::{cones::*, CoreSettings};
 use std::iter::zip;
@@ -50,6 +51,7 @@ pub struct DirectLDLKKTSolver<T> {
 
     // the diagonal regularizer currently applied
     diagonal_regularizer: T,
+    residual_plan: Option<SparseParallel>,
 }
 
 impl<T> DirectLDLKKTSolver<T>
@@ -113,6 +115,7 @@ where
             KKTuplo: kktshape,
             ldlsolver,
             diagonal_regularizer,
+            residual_plan: None,
         }
     }
 }
@@ -131,6 +134,7 @@ where
     T: FloatT,
 {
     fn update(&mut self, cones: &CompositeCone<T>, settings: &CoreSettings<T>) -> bool {
+        self.set_residual_pool(cones.thread_pool());
         self.update_from_cones(cones.iter(), settings)
     }
 
@@ -283,6 +287,17 @@ where
         is_success
     }
 
+    pub(crate) fn set_residual_pool(&mut self, pool: Option<std::sync::Arc<rayon::ThreadPool>>) {
+        let words = T::precision_bits().div_ceil(64) as u128;
+        let work = self.KKT.nzval.len() as u128 * words * words;
+        let pool = pool.filter(|p| p.current_num_threads() > 1
+            && work >= 4096 * p.current_num_threads() as u128);
+        if pool.is_some() && self.residual_plan.is_none() {
+            self.residual_plan = Some(SparseParallel::new_symmetric(&self.KKT));
+        }
+        if let Some(plan) = &mut self.residual_plan { plan.configure(&self.KKT, pool); }
+    }
+
     fn iterative_refinement(&mut self, settings: &CoreSettings<T>) -> bool {
         let (x, b) = (&mut self.x, &self.b);
         let (e, dx) = (&mut self.work1, &mut self.work2);
@@ -296,10 +311,11 @@ where
         let KKT = &self.KKT;
         let KKTsym = KKT.sym(self.KKTuplo);
 
+        let plan = self.residual_plan.as_ref();
         let normb = b.norm_inf();
 
         //compute the initial error
-        let mut norme = _get_refine_error(e, b, &KKTsym, x);
+        let mut norme = _get_refine_error(e, b, &KKTsym, x, plan);
 
         if !norme.is_finite() {
             return false;
@@ -320,7 +336,7 @@ where
             // hold it for a check before applying to x
             dx.axpby(T::one(), x, T::one());
 
-            norme = _get_refine_error(e, b, &KKTsym, dx);
+            norme = _get_refine_error(e, b, &KKTsym, dx, plan);
 
             if !norme.is_finite() {
                 return false;
@@ -356,12 +372,17 @@ fn _get_refine_error<T: FloatT>(
     b: &[T],
     KKTsym: &Symmetric<CscMatrix<T>>,
     ξ: &mut [T],
+    plan: Option<&SparseParallel>,
 ) -> T {
     // Note that K is only triu data, so need to
     // be careful when computing the residual here
 
     e.copy_from(b);
-    KKTsym.symv(e, ξ, -T::one(), T::one()); //#  e = b - Kξ
+    if let Some(plan) = plan {
+        plan.symv(KKTsym.src, KKTsym.uplo, e, ξ, -T::one(), T::one());
+    } else {
+        KKTsym.symv(e, ξ, -T::one(), T::one());
+    }
 
     e.norm_inf()
 }
@@ -422,4 +443,49 @@ fn _fill_signs(signs: &mut [i8], m: usize, n: usize, map: &LDLDataMap) {
         signs[p..(p + thisp)].copy_from_slice(thismap.Dsigns());
         p += thisp;
     }
+}
+
+
+#[cfg(test)]
+mod parallel_residual_tests {
+    use super::*;
+    fn activation<T: FloatT>() {
+        let n=192;
+        let mut ptr=vec![0]; let mut rows=Vec::new(); let mut values=Vec::new();
+        for j in 0..n {
+            for i in 0..=j {
+                rows.push(i);
+                values.push(if i==j { T::from_f64(3.).unwrap() } else { T::from_f64(0.125).unwrap() });
+            }
+            ptr.push(rows.len());
+        }
+        let mut p=CscMatrix::new(n,n,ptr,rows,values);
+        let a=CscMatrix::zeros((0,n));
+        let cones=CompositeCone::<T>::new(&[]);
+        let mut settings=CoreSettings::<T>::default();
+        settings.direct_solve_method="qdldl".into();
+        let mut solver=DirectLDLKKTSolver::new(&p,&a,&cones,0,n,&settings);
+        assert!(solver.residual_plan.is_none());
+        let rhs=vec![T::one();n];
+        let mut x:Vec<_>=(0..n).map(|i|T::from_f64((i%7) as f64-3.).unwrap()).collect();
+        let mut storage=None;
+        for workers in [4,1,2,4] {
+            let pool=(workers>1).then(||std::sync::Arc::new(rayon::ThreadPoolBuilder::new().num_threads(workers).build().unwrap()));
+            solver.set_residual_pool(pool);
+            let plan=solver.residual_plan.as_ref().unwrap();
+            let (actual_workers,address)=plan.test_pool_and_storage();
+            assert_eq!(actual_workers,workers);
+            if let Some(previous)=storage { assert_eq!(previous,address); } else { storage=Some(address); }
+            p.nzval[0]+=T::from_f64(0.125).unwrap();
+            solver.update_P(&p);
+            let mut expected=vec![T::zero();n]; let mut actual=expected.clone();
+            let k=solver.KKT.sym(solver.KKTuplo);
+            let en=_get_refine_error(&mut expected,&rhs,&k,&mut x,None);
+            let an=_get_refine_error(&mut actual,&rhs,&k,&mut x,solver.residual_plan.as_ref());
+            assert_eq!(actual,expected); assert_eq!(an,en);
+        }
+    }
+    #[test] fn activation_f64(){activation::<f64>();}
+    #[test] fn activation_mpfr256(){activation::<sdpx_arithmetic::Bits256>();}
+    #[test] fn activation_mpfr512(){activation::<sdpx_arithmetic::Bits512>();}
 }

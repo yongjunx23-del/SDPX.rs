@@ -101,6 +101,11 @@ pub trait Variables<T: FloatT> {
     /// Initialize all conic variables to unit values.
     fn unit_initialization(&mut self, cones: &Self::C);
 
+    /// Independent scratch for a curve direction.
+    fn new_like(&self) -> Self;
+    /// Form (1-weight)*left + weight*right without changing either source.
+    fn interpolate(&mut self, left: &Self, right: &Self, weight: T);
+
     /// Overwrite values with those from another object
     fn copy_from(&mut self, src: &Self);
 

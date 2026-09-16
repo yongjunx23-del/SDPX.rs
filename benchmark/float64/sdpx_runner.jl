@@ -92,7 +92,8 @@ function settings_json(settings, result)
             error("native preprocessing receipt mismatch: $key")
     end
     factorization = result.info.factorization
-    factorization in (:qdldl, :condensed_qdldl, :faer, :condensed_faer) ||
+    factorization in (:qdldl, :condensed_qdldl, :faer, :condensed_faer,
+                      :dense_block, :condensed_dense_block) ||
         error("unsupported factorization thread receipt: $factorization")
     factor_threads = factorization in (:faer, :condensed_faer) ? SDPX_BENCH_THREADS : 1
     result.info.backend_threads == factor_threads || error("native factorization thread receipt mismatch")

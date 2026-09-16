@@ -161,3 +161,70 @@ fn sampled_blocks_must_cover_whole_psd_cones() {
     );
     assert!(result.is_err());
 }
+
+fn sampled_presolve<T: FloatT>() {
+    // Two exactly redundant equalities precede an authoritative PSD factor block.
+    let linear = CscMatrix::new(5, 2, vec![0, 0, 0], vec![], vec![]);
+    let block = SampledBlock {
+        row_start: 2,
+        column_start: 0,
+        dim: 1,
+        basis_rows: 2,
+        basis_cols: 2,
+        basis: vec![T::one(), number(0.25), number(0.25), T::one()],
+        weights: vec![-T::one(); 2],
+    };
+    let operator = SampledOperator::new(linear.clone(), vec![block.clone()]).unwrap();
+    let b = vec![T::zero(), T::zero(), -T::one(), T::zero(), -T::one()];
+    let mut settings = DefaultSettings::<T>::default();
+    settings.verbose = false;
+    settings.kkt_form = "condensed".into();
+    settings.direct_solve_method = "qdldl".into();
+    let tol = number::<T>(if T::precision_bits() > 53 {
+        1e-28
+    } else {
+        1e-8
+    });
+    settings.tol_feas = tol;
+    settings.tol_gap_abs = tol;
+    settings.tol_gap_rel = tol;
+    let mut solver = DefaultSolver::new_sampled(
+        &CscMatrix::zeros((2, 2)),
+        &vec![T::one(); 2],
+        &linear,
+        &b,
+        &[ZeroConeT(2), PSDTriangleConeT(2)],
+        vec![block],
+        settings,
+    )
+    .unwrap();
+    assert_eq!(solver.variables.z.len(), 3);
+    assert_eq!(solver.info.linsolver.name, "condensed_sampled_qdldl");
+    solver.solve();
+    assert_eq!(solver.solution.status, SolverStatus::Solved);
+    assert_eq!(&solver.solution.s[..2], &[T::zero(); 2]);
+    assert_eq!(&solver.solution.z[..2], &[T::zero(); 2]);
+    let mut residual = b.iter().map(|v| -*v).collect::<Vec<_>>();
+    operator.apply(
+        &mut residual,
+        &solver.solution.x,
+        T::one(),
+        T::one(),
+        &mut SampledWorkspace::new(&operator),
+    );
+    for (r, s) in residual.iter().zip(&solver.solution.s) {
+        assert!((*r + *s).abs() < number::<T>(128.) * tol);
+    }
+}
+#[test]
+fn sampled_presolve_f64() {
+    sampled_presolve::<f64>();
+}
+#[test]
+fn sampled_presolve_256() {
+    sampled_presolve::<sdpx_arithmetic::Bits256>();
+}
+#[test]
+fn sampled_presolve_512() {
+    sampled_presolve::<sdpx_arithmetic::Bits512>();
+}

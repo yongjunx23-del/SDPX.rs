@@ -242,6 +242,11 @@ where
 {
     fn solve(&mut self) {
         // various initializations
+        // The generic curve is validated at all precisions, but its extra PSD
+        // step searches regress the 512-bit Ising workload; retain the measured policy.
+        let use_curve = T::precision_bits() <= 53 && self.cones.is_symmetric();
+        let mut affine_direction = use_curve.then(|| self.variables.new_like());
+        let mut curve_direction = use_curve.then(|| self.variables.new_like());
         let mut iter: u32 = 0;
         let mut σ = T::one();
         let mut α = T::zero();
@@ -374,6 +379,9 @@ where
             // combined step only on affine step success
             if is_kkt_solve_success {
 
+                // Preserve the raw direction before prepared cone operations consume it.
+                if let Some(affine) = &mut affine_direction { affine.copy_from(&self.step_lhs); }
+
                 //calculate step length and centering parameter
                 // --------------
                 α = if iter > 1 {
@@ -429,6 +437,29 @@ where
             // compute final step length and update the current iterate
             // --------------
             α = self.get_step_length(StepDirection::Combined,scaling);
+
+            // Inspired by Hypatia curve search, using the two existing NT directions.
+            // Quadratic predictor-corrector curve: t*affine + t^2*(combined-affine).
+            // No new KKT solves. Trial bounds use the existing cone-interior margin.
+            if use_curve && α > T::zero() && α < (0.9).as_T() {
+                let original_alpha = α;
+                let affine = affine_direction.as_ref().unwrap();
+                let curve = curve_direction.as_mut().unwrap();
+                for fraction in [0.5, 0.25] {
+                    let t = original_alpha + (T::one()-original_alpha)*T::from_f64(fraction).unwrap();
+                    if t*(T::one()-σ*t) <= T::from_f64(1.01).unwrap()*original_alpha*(T::one()-σ) {
+                        continue;
+                    }
+                    curve.interpolate(affine, &self.step_lhs, t);
+                    let bound = self.variables.calc_step_length(curve, &mut self.cones,
+                        &self.settings, StepDirection::Combined);
+                    if t <= bound {
+                        self.step_lhs.copy_from(curve);
+                        α = t;
+                        break;
+                    }
+                }
+            }
 
             // check for undersized step and update strategy
             match self.strategy_checkpoint_small_step(α, scaling) {
