@@ -31,6 +31,13 @@ julia --project=julia/SDPX.jl -e 'using Pkg; Pkg.instantiate()'
 
 On Linux, use `sdp-openblas,faer-sparse` instead. OpenBLAS source builds also require a Fortran compiler. The dependency versions are pinned in `Cargo.lock`. Julia can invoke the build with `include("julia/SDPX.jl/deps/build.jl")`; `CARGO` selects the Cargo executable.
 
+For x86 backend evaluation, `sdpx-ffi` also forwards `sdp-mkl`,
+`pardiso-mkl`, and `pardiso-panua` to the Rust solver. Select one BLAS provider
+per build; PARDISO features select a sparse solver backend separately. These
+optional configurations require their native dependencies and are not qualified
+performance defaults. Changing Julia's BLAS alone does not change the BLAS linked
+into the Rust library.
+
 Start Julia with `--project=julia/SDPX.jl`. The package finds `target/release/libsdpx` automatically; `SDPX_LIBRARY` can select an explicitly built library.
 
 ```julia
@@ -52,7 +59,9 @@ setprecision(BigFloat, 256) do
 end
 ```
 
-`prepare(...)`, `solve!(problem; q=..., b=...)` and `close(problem)` support repeated solves. Julia's reusable handles retain Ruiz but disable presolve and chordal rewriting so that the original input structure stays updateable. Direct `solve` / `solve_conic` and model optimization use all three defaults. See the [PMP2SDP callback example](julia/SDPX.jl/test/pmp_callback.jl).
+`prepare(...)`, `solve!(problem; q=..., b=...)` and `close(problem)` support repeated solves.
+This reuses the prepared workspace, not a primal/dual warm-start point; each solve
+uses the core's default initialization. Explicit warm starts are unsupported. Julia's reusable handles retain Ruiz but disable presolve and chordal rewriting so that the original input structure stays updateable. Direct `solve` / `solve_conic` and model optimization use all three defaults. See the [PMP2SDP callback example](julia/SDPX.jl/test/pmp_callback.jl).
 
 ## Architecture
 
@@ -65,9 +74,9 @@ end
 
 Float64 uses native BLAS/LAPACK with QDLDL or optional multithreaded Faer for sparse KKT factorization. Batched Schur assembly uses runtime-checked AVX2/FMA on supported x86 CPUs, with the same arithmetic implementation and a portable fallback. Auto selection can use dense block Cholesky for a near-dense positive block with a small negative border, retaining sparse fallback and refinement. The condensed backend eliminates PSD/orthant rows, retains other cones and equalities, and preserves the structural Schur sparsity. PSD cones cache matrix-sized scaling factors instead of a dense Hessian over packed cone coordinates. Both formulations use the same embedding, accepted-iterate recovery and native linear-solve refinement. Exact repeated coefficient columns share transforms across precisions; Float64 batches them, while MPFR streams them with bounded scratch. Presolve uses one bounded GMP rational elimination for exact redundant equalities, including their right-hand sides, and restores original-coordinate slacks and duals.
 
-Set `Limits(threads=...)` for independent cone work, eligible sparse residual products, sampled block operators and Float64 Faer factorization. MPFR uses serial QDLDL and a dense provider with Householder/bidiagonal-QR SVD and symmetric Jacobi eigenanalysis; cone blocks can execute in parallel. Large single orthants also split independent elementwise phases across the existing pool, preserving reduction order. `execution_plan(result)` reports the formulation, factorization width and cone pool size. These are configured capacities, not a count of busy cores. Native BLAS threads are configured separately; use one BLAS thread when measuring cone/Faer scaling and set `RAYON_NUM_THREADS` to the requested factorization width.
+Set `Limits(threads=...)` for independent cone work, eligible sparse residual products, sampled block operators and Float64 Faer factorization. MPFR uses serial QDLDL and a dense provider with Householder/bidiagonal-QR SVD and symmetric Householder/QL eigenanalysis. NT scaling uses direct SVD at every precision; cone blocks can execute in parallel. Fused accumulation in the MPFR BLAS applies at every precision from 128 to 2048 bits. Large single orthants also split independent elementwise phases across the existing pool, preserving reduction order. `execution_plan(result)` reports the formulation, factorization width and cone pool size. These are configured capacities, not a count of busy cores; the reported cone pool size is the requested budget, so a request above the number of independent cones can be slower than a smaller one. Native BLAS threads are configured separately; use one BLAS thread when measuring cone/Faer scaling and set `RAYON_NUM_THREADS` to the requested factorization width.
 
-An explicit `sampled_program` input retains shared basis factors and uses paired operators plus NT Gram Schur assembly. Exactly equal basis vectors share Gram columns at the working precision; canonical variables and weights remain unchanged. Ordinary CSC input keeps its existing semantics. Exact equality and infinite-bound row reductions retain the factors and remap block offsets; chordal block rewriting uses the materialized fallback. The optional PMP2SDP extension supplies this representation without a mandatory frontend dependency. Float64 and 256/512-bit integration tests cover this path, including row recovery, chordal fallback, updates, shared columns and deterministic threaded operator results. Dominant blocks can use the existing pool for MPFR matrix products, with triangular SYRK work balanced across tasks. More configured workers do not guarantee a whole-solve speedup.
+An explicit `sampled_program` input retains shared basis factors and uses paired operators plus NT Gram Schur assembly. Exactly equal basis vectors share Gram columns at the working precision; canonical variables and weights remain unchanged. Ordinary CSC input keeps its existing semantics. Exact equality and infinite-bound row reductions retain the factors and remap block offsets; chordal block rewriting uses the materialized fallback. The optional PMP2SDP extension supplies this representation without a mandatory frontend dependency. Float64 and 256/512-bit integration tests cover this path, including row recovery, chordal fallback, updates, shared columns and deterministic threaded operator results. The ordinary CSC part of a sampled operator also uses the pool through row and column lanes, reproducing the serial product exactly. Dominant blocks can use the existing pool for MPFR matrix products, with triangular SYRK work balanced across tasks; every other block keeps the outer block level as its only parallel level. More configured workers do not guarantee a whole-solve speedup.
 
 BFLA/MFLA, CRT acceleration and MPI are not implemented as backends in this project. The stable sibling retains its existing capabilities. The Julia frontend and shared library must both use ABI 3; an older library is rejected explicitly.
 
@@ -116,7 +125,14 @@ failed its sampled dual-consistency gate. No large-SDP superiority is claimed.
 
 PSD rows use upper-column svec packing with square-root-of-two off-diagonal
 scaling. `Model`, `variable!` and `constraint!` use ordinary symmetric matrices.
-MOI accepts Float64 models. BigFloat direct/model calls require matching
+MOI accepts Float64 models with affine or quadratic objectives and nonnegative,
+zero, second-order, PSD triangle, exponential and power cone constraints.
+Constraint primal/dual getters recover original MOI coordinates, including PSD
+trace scaling, interval duals and infeasibility rays. Dual signs follow MOI's
+constraint convention for both minimization and maximization. Raw optimizer
+attributes accept writable `Settings` fields plus `threads`/`verbosity` aliases;
+`limits` and `tolerances` are constructor/read-only groups, not raw setters.
+BigFloat direct/model calls require matching
 `Settings(BigFloat; precision_bits=...)`. Prepared settings are fixed at creation;
 `solve_time` excludes Julia conversion and result copying.
 

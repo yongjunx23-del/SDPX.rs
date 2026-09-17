@@ -27,7 +27,10 @@ pub(crate) struct SparseParallel {
 impl SparseParallel {
     #[cfg(test)]
     pub(crate) fn test_pool_and_storage(&self) -> (usize, usize) {
-        (self.pool.as_ref().map_or(1, |p| p.current_num_threads()), self.entries.as_ptr() as usize)
+        (
+            self.pool.as_ref().map_or(1, |p| p.current_num_threads()),
+            self.entries.as_ptr() as usize,
+        )
     }
 
     pub(crate) fn new<T>(a: &CscMatrix<T>) -> Self {
@@ -46,8 +49,10 @@ impl SparseParallel {
         }
         if symmetric {
             for col in 0..a.n {
-                for p in a.colptr[col]..a.colptr[col+1] {
-                    if a.rowval[p] != col { rowptr[col+1] += 1; }
+                for p in a.colptr[col]..a.colptr[col + 1] {
+                    if a.rowval[p] != col {
+                        rowptr[col + 1] += 1;
+                    }
                 }
             }
         }
@@ -70,7 +75,10 @@ impl SparseParallel {
                 entries[cursor[row]] = Entry { column, position };
                 cursor[row] += 1;
                 if symmetric && row != column {
-                    entries[cursor[column]] = Entry { column: row, position };
+                    entries[cursor[column]] = Entry {
+                        column: row,
+                        position,
+                    };
                     cursor[column] += 1;
                 }
             }
@@ -95,16 +103,25 @@ impl SparseParallel {
         }
     }
 
-    pub(crate) fn symv<T: FloatT>(&self, a: &CscMatrix<T>, uplo: MatrixTriangle,
-        y: &mut [T], x: &[T], alpha: T, beta: T) {
+    pub(crate) fn symv<T: FloatT>(
+        &self,
+        a: &CscMatrix<T>,
+        uplo: MatrixTriangle,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+    ) {
         if let Some(pool) = &self.pool {
             if self.row_lanes.len() > 1 {
                 y.scale(beta);
-                pool.install(|| split_outputs(y, &self.row_lanes, &|row, out| {
-                    for e in &self.entries[self.rowptr[row]..self.rowptr[row+1]] {
-                        *out += alpha * a.nzval[e.position] * x[e.column];
-                    }
-                }));
+                pool.install(|| {
+                    split_outputs(y, &self.row_lanes, &|row, out| {
+                        for e in &self.entries[self.rowptr[row]..self.rowptr[row + 1]] {
+                            *out += alpha * a.nzval[e.position] * x[e.column];
+                        }
+                    })
+                });
                 return;
             }
         }
@@ -130,6 +147,25 @@ impl SparseParallel {
             a.t().gemv(rx, z, -T::one(), T::zero());
             a.gemv(rz, x, T::one(), T::one());
         }
+    }
+
+    /// True when the cached plan owns more than one output lane.
+    pub(crate) fn has_lanes(&self) -> bool {
+        self.row_lanes.len() > 1 || self.column_lanes.len() > 1
+    }
+
+    /// `y = alpha * op(A) * x + beta * y` on disjoint output lanes. Reuses the
+    /// CSC gemv scalar branches, so results match the serial product exactly.
+    pub(crate) fn product<T: FloatT>(
+        &self,
+        a: &CscMatrix<T>,
+        transpose: bool,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+    ) {
+        self.apply_in_pool(a, transpose, y, x, alpha, beta);
     }
 
     fn apply_in_pool<T: FloatT>(

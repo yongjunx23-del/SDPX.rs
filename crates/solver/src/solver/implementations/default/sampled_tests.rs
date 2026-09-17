@@ -365,10 +365,12 @@ fn pooled_gram<T: FloatT>() {
         rinv[(i, i)] = c(1);
     }
     for width in [1, 2, 4, 8, 1, 4] {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(width)
-            .build()
-            .unwrap();
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .unwrap(),
+        );
         rinv[(0, 0)] += c::<T>(1) / c(16);
         serial.update_with_pool(&b, &rinv, None);
         pooled.update_with_pool(&b, &rinv, Some(&pool));
@@ -475,10 +477,12 @@ fn pooled_operators<T: FloatT>() {
     };
     let mut saved = None;
     for width in [1, 2, 4, 8, 1, 4] {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(width)
-            .build()
-            .unwrap();
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .unwrap(),
+        );
         for (alpha, beta) in [
             (T::zero(), -c::<T>(2)),
             (T::one(), T::zero()),
@@ -542,10 +546,12 @@ fn pooled_operators<T: FloatT>() {
     )
     .unwrap();
     let mut tiny_work = SampledWorkspace::new(&tiny);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(8)
-        .build()
-        .unwrap();
+    let pool = std::sync::Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap(),
+    );
     tiny.apply_with_pool(
         &mut vec![T::zero(); 3],
         &[T::one()],
@@ -622,4 +628,96 @@ fn sampled_duplicate_basis_256() {
 #[test]
 fn sampled_duplicate_basis_512() {
     duplicate_basis::<Bits512>();
+}
+
+// The ordinary CSC block is the operator's only unbounded serial section. A
+// row/column plan must reproduce the serial product exactly, including the
+// zero-beta clearing and the alpha branches, once the pool engages.
+fn pooled_linear_products<T: FloatT>() {
+    // The two sampled blocks own the rows above the ordinary CSC part, which is
+    // the operator's only unbounded serial section.
+    let (ordinary_rows, cols_per_block) = (600usize, 80usize);
+    let block = SampledBlock {
+        row_start: 0,
+        column_start: 0,
+        dim: 4,
+        basis_rows: 12,
+        basis_cols: 8,
+        basis: (0..96).map(|i| c::<T>((i % 7) as i32 - 3) / c(4)).collect(),
+        weights: (0..80).map(|i| c::<T>((i % 5) as i32 - 2) / c(3)).collect(),
+    };
+    let rows_per_block = block.row_count();
+    let first = SampledBlock {
+        row_start: ordinary_rows,
+        ..block.clone()
+    };
+    let second = SampledBlock {
+        row_start: ordinary_rows + rows_per_block,
+        column_start: cols_per_block,
+        ..block.clone()
+    };
+    let (m, n) = (second.row_start + rows_per_block, 2 * cols_per_block);
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let (mut r, mut cidx, mut v) = (Vec::new(), Vec::new(), Vec::new());
+    for column in 0..n {
+        for _ in 0..400 {
+            r.push((next() % ordinary_rows as u64) as usize);
+            cidx.push(column);
+            v.push(c::<T>((next() % 19) as i32 - 9) / c(7));
+        }
+    }
+    let linear = CscMatrix::new_from_triplets(m, n, r, cidx, v);
+    assert!(linear.nnz() >= 32768);
+    let operator = SampledOperator::new(linear, vec![first, second]).unwrap();
+    let mut serial = SampledWorkspace::new(&operator);
+    let mut pooled = SampledWorkspace::new(&operator);
+    let x: Vec<_> = (0..n).map(|i| c::<T>(i as i32 % 11 - 5) / c(9)).collect();
+    let z: Vec<_> = (0..m).map(|i| c::<T>(i as i32 % 13 - 6) / c(5)).collect();
+    for width in [1, 2, 4, 8] {
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .unwrap(),
+        );
+        for (alpha, beta) in [
+            (T::zero(), T::zero()),
+            (T::zero(), -c::<T>(3)),
+            (T::one(), T::one()),
+            (-c::<T>(5) / c(2), c::<T>(2) / c(11)),
+        ] {
+            let mut ys = z.clone();
+            let mut yp = z.clone();
+            let mut ts = x.clone();
+            let mut tp = x.clone();
+            operator.apply(&mut ys, &x, alpha, beta, &mut serial);
+            operator.apply_with_pool(&mut yp, &x, alpha, beta, &mut pooled, Some(&pool));
+            operator.apply_transpose(&mut ts, &z, alpha, beta, &mut serial);
+            operator.apply_transpose_with_pool(&mut tp, &z, alpha, beta, &mut pooled, Some(&pool));
+            assert_eq!(ys, yp);
+            assert_eq!(ts, tp);
+        }
+        if width > 1 {
+            // The pooled path must own real lanes, not a serial fallback.
+            assert!(pooled.linear_plan_workers > 1 && pooled.linear_plan.has_lanes());
+        }
+    }
+}
+#[test]
+fn pooled_linear_products_f64() {
+    pooled_linear_products::<f64>();
+}
+#[test]
+fn pooled_linear_products_mpfr256() {
+    pooled_linear_products::<Bits256>();
+}
+#[test]
+fn pooled_linear_products_mpfr512() {
+    pooled_linear_products::<Bits512>();
 }

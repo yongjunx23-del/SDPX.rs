@@ -133,9 +133,10 @@ struct Column {
 }
 
 struct PsdBlock<T> {
+    // Fixed-precision immutable constant shared by serial and parallel assembly.
+    sqrt2: T,
     R: Matrix<T>,
     Rinv: Matrix<T>,
-    G: Matrix<T>,
     Ginv: Matrix<T>,
     mat1: Matrix<T>,
     mat2: Matrix<T>,
@@ -176,6 +177,7 @@ enum Scaling<T> {
     Orthant {
         w: Vec<T>,
         rows: Vec<Vec<(usize, usize)>>,
+        scaled_row: Vec<T>,
     },
     Zero,
     Soc {
@@ -267,6 +269,14 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     }
                     Scaling::Orthant {
                         w: c.w.clone(),
+                        scaled_row: vec![
+                            T::zero();
+                            if T::precision_bits() > 53 {
+                                entries.iter().map(Vec::len).max().unwrap_or(0)
+                            } else {
+                                0
+                            }
+                        ],
                         rows: entries,
                     }
                 }
@@ -531,6 +541,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                                 &mut output,
                                 &psd.sparse_column_lanes,
                                 psd.columns.len(),
+                                psd.sqrt2,
                             );
                         }
                         psd.compute_schur_selected(matrix_values, split_columns, |b, a, _, v| {
@@ -569,12 +580,34 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                         });
                     }
                 }
-                Scaling::Orthant { w, rows } => {
+                Scaling::Orthant {
+                    w,
+                    rows,
+                    scaled_row,
+                } => {
+                    if T::precision_bits() <= 53 {
+                        for (row, entries) in rows.iter().enumerate() {
+                            for (b, &(j, q)) in entries.iter().enumerate() {
+                                let aj = self.A.nzval[q] / w[row];
+                                for &(i, p) in &entries[..=b] {
+                                    let ai = self.A.nzval[p] / w[row];
+                                    let p = schur_position(&self.schur, i, j);
+                                    let v = &mut self.schur.nzval[p];
+                                    *v = ai.mul_add(aj, *v);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     for (row, entries) in rows.iter().enumerate() {
-                        for (b, &(j, q)) in entries.iter().enumerate() {
-                            let aj = self.A.nzval[q] / w[row];
-                            for &(i, p) in &entries[..=b] {
-                                let ai = self.A.nzval[p] / w[row];
+                        // Recompute after every scaling/data update. Each quotient and
+                        // the order of all Schur FMA updates match the uncached path.
+                        for (value, &(_, position)) in scaled_row.iter_mut().zip(entries) {
+                            *value = self.A.nzval[position] / w[row];
+                        }
+                        for (b, &(j, _)) in entries.iter().enumerate() {
+                            let aj = scaled_row[b];
+                            for (&(i, _), &ai) in entries[..=b].iter().zip(&scaled_row[..=b]) {
                                 let p = schur_position(&self.schur, i, j);
                                 let v = &mut self.schur.nzval[p];
                                 *v = ai.mul_add(aj, *v);
@@ -607,7 +640,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 T::one(),
                 T::one(),
                 work,
-                self.pool.as_deref(),
+                self.pool.as_ref(),
             );
         } else {
             self.A
@@ -631,7 +664,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 T::one(),
                 T::zero(),
                 work,
-                self.pool.as_deref(),
+                self.pool.as_ref(),
             );
         } else {
             self.A.gemv(&mut self.workz, x, T::one(), T::zero());
@@ -662,21 +695,22 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         // pool can fill block-tail idle time without changing either arithmetic
         // order or allocating another set of workers.
         let Self {
-            P, A, sampled, pool, workz, workh, blocks, scaling_lanes, ..
+            P,
+            A,
+            sampled,
+            pool,
+            workz,
+            workh,
+            blocks,
+            scaling_lanes,
+            ..
         } = self;
         let mut products = || {
             P.sym_up().symv(ex, x, -T::one(), T::one());
             if let Some((operator, work)) = sampled {
-                operator.apply_transpose_with_pool(
-                    ex,
-                    z,
-                    -T::one(),
-                    T::one(),
-                    work,
-                    pool.as_deref(),
-                );
+                operator.apply_transpose_with_pool(ex, z, -T::one(), T::one(), work, pool.as_ref());
                 if !reuse_forward {
-                    operator.apply_with_pool(ez, x, -T::one(), T::one(), work, pool.as_deref());
+                    operator.apply_with_pool(ez, x, -T::one(), T::one(), work, pool.as_ref());
                 }
             } else {
                 A.t().gemv(ex, z, -T::one(), T::one());
@@ -784,8 +818,12 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 (Scaling::Psd(p), SupportedCone::PSDTriangleCone(c)) => {
                     p.R.copy_from_slice(c.scaling_R().data());
                     p.Rinv.copy_from_slice(c.scaling_Rinv().data());
-                    let fast_apply = T::precision_bits() > 53;
                     if let Some(sampled) = &mut p.sampled {
+                        // One parallel level only. Fine inner lanes are reserved
+                        // for the single dominant block; handing the pool to every
+                        // block multiplies tiny GEMM/SYRK tiles and pair lanes by
+                        // the block count, which measured slower than the outer
+                        // block level it competes with.
                         sampled.work.update_with_pool(
                             &sampled.operator.blocks()[sampled.block],
                             &p.Rinv,
@@ -795,23 +833,11 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                                 None
                             },
                         );
-                        if fast_apply {
-                            p.Ginv
-                                .syrk(&p.Rinv.t(), T::one(), T::zero(), MatrixTriangle::Triu);
-                        }
                     } else {
                         p.Ginv
                             .syrk(&p.Rinv.t(), T::one(), T::zero(), MatrixTriangle::Triu);
                     }
-                    if fast_apply {
-                        p.G.syrk(&p.R, T::one(), T::zero(), MatrixTriangle::Triu);
-                        for j in 0..c.n {
-                            for i in j + 1..c.n {
-                                p.G[(i, j)] = p.G[(j, i)];
-                                p.Ginv[(i, j)] = p.Ginv[(j, i)];
-                            }
-                        }
-                    } else if p.sampled.is_none() {
+                    if p.sampled.is_none() {
                         for j in 0..c.n {
                             for i in j + 1..c.n {
                                 p.Ginv[(i, j)] = p.Ginv[(j, i)];
@@ -821,7 +847,6 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                     if !p.R.data().is_finite()
                         || !p.Rinv.data().is_finite()
                         || !p.Ginv.data().is_finite()
-                        || (fast_apply && !p.G.data().is_finite())
                     {
                         return false;
                     }
@@ -966,6 +991,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             }
             true
         })();
+
         self.b = b;
         self.x = x;
         self.error = error;
@@ -1099,9 +1125,9 @@ impl<T: FloatT> PsdBlock<T> {
             })
             .collect();
         Self {
+            sqrt2: if n > 1 { T::SQRT_2() } else { T::zero() },
             R: Matrix::zeros((n, n)),
             Rinv: Matrix::zeros((n, n)),
-            G: Matrix::zeros((n, n)),
             Ginv: Matrix::zeros((n, n)),
             mat1: Matrix::zeros((n, n)),
             mat2: Matrix::zeros((n, n)),
@@ -1284,7 +1310,7 @@ impl<T: FloatT> PsdBlock<T> {
                 for (a, left) in self.columns[..=target].iter().enumerate() {
                     let mut v = T::zero();
                     if right.sparse {
-                        v = sparse_schur_value(left, right, &self.Ginv, values);
+                        v = sparse_schur_value(left, right, &self.Ginv, values, self.sqrt2);
                     } else {
                         for e in &left.entries {
                             v = values[e.position]
@@ -1501,7 +1527,7 @@ impl<T: FloatT> PsdBlock<T> {
                 continue;
             }
             for (a, left) in self.columns[..=b].iter().enumerate() {
-                let v = sparse_schur_value(left, right, &self.Ginv, values);
+                let v = sparse_schur_value(left, right, &self.Ginv, values, self.sqrt2);
                 store(b, a, right.schur_positions[a], v);
             }
         }
@@ -1517,15 +1543,6 @@ impl<T: FloatT> PsdBlock<T> {
 
     fn apply(&mut self, y: &mut [T], x: &[T], inverse: bool) {
         svec_to_mat(&mut self.mat1, x);
-        if T::precision_bits() > 53 {
-            // Reassociated congruence: (RinvᵀRinv)·X·(RinvᵀRinv) equals the
-            // factorized four-product form up to the declared precision.
-            let m: &Matrix<T> = if inverse { &self.Ginv } else { &self.G };
-            self.mat2.mul(&self.mat1, m, T::one(), T::zero());
-            self.mat3.mul(m, &self.mat2, T::one(), T::zero());
-            mat_to_svec(y, &self.mat3);
-            return;
-        }
         if inverse {
             // H^-1 = W^-1 W^-T; retain the inverse factors in solve-time
             // applications rather than squaring them into Ginv.
@@ -1563,6 +1580,15 @@ fn coefficient_product<T: FloatT>(
     values: &[T],
 ) {
     let n = g.nrows();
+    let inv_sqrt2 = if T::precision_bits() <= 53
+        || plan.iter().any(|&(_, _, eidx)| {
+            let e = &column.entries[eidx as usize];
+            e.i != e.j
+        }) {
+        T::FRAC_1_SQRT_2()
+    } else {
+        T::zero()
+    };
     for q in 0..n {
         output[q * ld + offset..q * ld + offset + n].fill(T::zero());
     }
@@ -1571,7 +1597,7 @@ fn coefficient_product<T: FloatT>(
         let v = if e.i == e.j {
             values[e.position]
         } else {
-            values[e.position] * T::FRAC_1_SQRT_2()
+            values[e.position] * inv_sqrt2
         };
         let dst = &mut output[q as usize * ld + offset..q as usize * ld + offset + n];
         let src = &g.data()[p as usize * n..(p as usize + 1) * n];
@@ -1581,11 +1607,11 @@ fn coefficient_product<T: FloatT>(
     }
 }
 
-fn psd_entry<T: FloatT>(G: &Matrix<T>, a: Entry, b: Entry) -> T {
+fn psd_entry<T: FloatT>(G: &Matrix<T>, a: Entry, b: Entry, sqrt2: T) -> T {
     match (a.i == a.j, b.i == b.j) {
         (true, true) => G[(a.i, b.i)] * G[(a.i, b.i)],
-        (true, false) => T::SQRT_2() * G[(a.i, b.i)] * G[(a.i, b.j)],
-        (false, true) => T::SQRT_2() * G[(a.i, b.i)] * G[(a.j, b.i)],
+        (true, false) => sqrt2 * G[(a.i, b.i)] * G[(a.i, b.j)],
+        (false, true) => sqrt2 * G[(a.i, b.i)] * G[(a.j, b.i)],
         (false, false) => G[(a.i, b.i)] * G[(a.j, b.j)] + G[(a.i, b.j)] * G[(a.j, b.i)],
     }
 }
@@ -1733,11 +1759,12 @@ fn sparse_schur_value<T: FloatT>(
     right: &Column,
     ginv: &Matrix<T>,
     values: &[T],
+    sqrt2: T,
 ) -> T {
     let mut v = T::zero();
     for a in &left.entries {
         for b in &right.entries {
-            v += values[a.position] * values[b.position] * psd_entry(ginv, *a, *b);
+            v += values[a.position] * values[b.position] * psd_entry(ginv, *a, *b, sqrt2);
         }
     }
     v
@@ -1750,6 +1777,7 @@ fn split_sparse_columns<T: FloatT>(
     output: &mut [T],
     lanes: &[usize],
     end: usize,
+    sqrt2: T,
 ) {
     let begin = lanes[0];
     if lanes.len() == 1 {
@@ -1761,7 +1789,7 @@ fn split_sparse_columns<T: FloatT>(
             }
             for (a, left) in columns[..=b].iter().enumerate() {
                 output[triangular_number(b) + a - offset] =
-                    sparse_schur_value(left, right, ginv, values);
+                    sparse_schur_value(left, right, ginv, values, sqrt2);
             }
         }
     } else {
@@ -1769,8 +1797,8 @@ fn split_sparse_columns<T: FloatT>(
         let cut = lanes[mid];
         let (left, right) = output.split_at_mut(triangular_number(cut) - triangular_number(begin));
         rayon::join(
-            || split_sparse_columns(columns, ginv, values, left, &lanes[..mid], cut),
-            || split_sparse_columns(columns, ginv, values, right, &lanes[mid..], end),
+            || split_sparse_columns(columns, ginv, values, left, &lanes[..mid], cut, sqrt2),
+            || split_sparse_columns(columns, ginv, values, right, &lanes[mid..], end, sqrt2),
         );
     }
 }
@@ -1986,7 +2014,9 @@ mod tests {
                     p.compute_schur_dense_impl(&a.nzval, skip, |_, _, pos, v| generic[pos] = v);
                     // SAFETY: both CPU features were checked above.
                     unsafe {
-                        p.compute_schur_dense_fma(&a.nzval, skip, |_, _, pos, v| accelerated[pos] = v);
+                        p.compute_schur_dense_fma(&a.nzval, skip, |_, _, pos, v| {
+                            accelerated[pos] = v
+                        });
                     }
                     for (plain, fast) in generic.iter().zip(&accelerated) {
                         assert_eq!(plain.to_bits(), fast.to_bits());
@@ -2274,7 +2304,7 @@ mod tests {
             assert!(solver.residual(&mut fresh, &rhs, &point, false).is_finite());
             let rounding_bound = T::epsilon() * (256.).as_T() * rhs.norm_inf().max(T::one());
             for (&a, &b) in reused.iter().zip(&fresh) {
-                assert!((a-b).abs() <= rounding_bound);
+                assert!((a - b).abs() <= rounding_bound);
             }
             // A changed point must not read the previous raw forward product.
             point[0] += (0.125).as_T();
@@ -2504,3 +2534,71 @@ mod tests {
 #[cfg(test)]
 #[path = "condensed_parallel_tests.rs"]
 mod parallel_tests;
+
+#[cfg(test)]
+mod graded_action_tests {
+    use super::*;
+    use sdpx_arithmetic::MpFloat;
+    fn check<T: FloatT>() {
+        let a = T::FRAC_1_SQRT_2();
+        let t = T::epsilon();
+        let x = vec![a, -T::one(), a];
+        let expected = (((a * t) * t) * t) * t;
+        let mut failures = 0;
+        for inverse in [false, true] {
+            let mut p = PsdBlock::<T>::new(2, &CscMatrix::zeros((3, 0)), &(0..3));
+            if inverse {
+                p.Rinv = Matrix::from(&[[T::one(), T::one()], [T::zero(), t]]);
+                p.R = Matrix::from(&[[T::one(), -t.recip()], [T::zero(), t.recip()]]);
+            } else {
+                p.R = Matrix::from(&[[T::one(), T::zero()], [T::one(), t]]);
+                p.Rinv = Matrix::from(&[[T::one(), T::zero()], [-t.recip(), t.recip()]]);
+            }
+            p.Ginv
+                .syrk(&p.Rinv.t(), T::one(), T::zero(), MatrixTriangle::Triu);
+            p.Ginv[(1, 0)] = p.Ginv[(0, 1)];
+            let mut actual = vec![T::zero(); 3];
+            p.apply(&mut actual, &x, inverse);
+            let relative = (actual[2] - expected).abs() / expected;
+            let pass = relative <= T::epsilon() * T::from_usize(128).unwrap();
+            println!(
+                "GRADED bits={} inverse={} pass={}",
+                T::precision_bits(),
+                inverse,
+                pass
+            );
+            if !pass {
+                failures += 1;
+            }
+        }
+        assert_eq!(failures, 0);
+    }
+    #[test]
+    fn condensed_graded_f64() {
+        check::<f64>();
+    }
+    #[test]
+    fn condensed_graded_128() {
+        check::<MpFloat<2>>();
+    }
+    #[test]
+    fn condensed_graded_256() {
+        check::<MpFloat<4>>();
+    }
+    #[test]
+    fn condensed_graded_512() {
+        check::<MpFloat<8>>();
+    }
+    #[test]
+    fn condensed_graded_768() {
+        check::<MpFloat<12>>();
+    }
+    #[test]
+    fn condensed_graded_1024() {
+        check::<MpFloat<16>>();
+    }
+    #[test]
+    fn condensed_graded_2048() {
+        check::<MpFloat<32>>();
+    }
+}

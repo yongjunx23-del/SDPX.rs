@@ -11,12 +11,15 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     objective_constant::Float64
     # Variable mapping: MOI VariableIndex → SDPX variable index (1-based).
     var_idx::Vector{MOI.VariableIndex}
+    var_to_col::Dict{MOI.VariableIndex,Int}
+    constraint_rows::Dict{MOI.ConstraintIndex,UnitRange{Int}}
 
     function Optimizer()
         return new(
             MOI.Utilities.Model{Float64}(),
             nothing, 0.0, false, Inf, nothing, Dict{String,Any}(), 1.0, 0.0,
-            MOI.VariableIndex[],
+            MOI.VariableIndex[], Dict{MOI.VariableIndex,Int}(),
+            Dict{MOI.ConstraintIndex,UnitRange{Int}}(),
         )
     end
 end
@@ -32,11 +35,13 @@ MOI.empty!(o::Optimizer) = begin
     o.result = nothing
     o.solve_time_sec = 0.0
     empty!(o.var_idx)
+    empty!(o.var_to_col)
+    empty!(o.constraint_rows)
     return
 end
 
 function MOI.copy_to(dest::Optimizer, src::MOI.ModelLike)
-    MOI.is_empty(dest) || MOI.empty!(dest)
+    MOI.empty!(dest)
     for (F, S) in MOI.get(src, MOI.ListOfConstraintTypesPresent())
         MOI.supports_constraint(dest, F, S) ||
             throw(MOI.UnsupportedConstraint{F,S}())
@@ -44,6 +49,9 @@ function MOI.copy_to(dest::Optimizer, src::MOI.ModelLike)
     index_map = MOI.copy_to(dest.model, src)
     # Store the destination model's ordered variable list for primal extraction.
     dest.var_idx = MOI.get(dest.model, MOI.ListOfVariableIndices())
+    for (col, v) in enumerate(dest.var_idx)
+        dest.var_to_col[v] = col
+    end
     return index_map
 end
 
@@ -66,6 +74,8 @@ const _MOI_VECTOR_SETS = Union{
     MOI.Zeros,
     MOI.SecondOrderCone,
     MOI.PositiveSemidefiniteConeTriangle,
+    MOI.ExponentialCone,
+    MOI.PowerCone{Float64},
 }
 
 MOI.supports_constraint(::Optimizer, ::Type{MOI.VariableIndex}, ::Type{<:_MOI_SCALAR_SETS}) = true
@@ -94,30 +104,50 @@ end
 MOI.supports(::Optimizer, ::MOI.NumberOfThreads) = true
 MOI.get(o::Optimizer, ::MOI.NumberOfThreads) = o.num_threads
 function MOI.set(o::Optimizer, ::MOI.NumberOfThreads, v)
-    v === nothing && (o.num_threads = nothing; return nothing)
-    v >= 1 || throw(ArgumentError("NumberOfThreads must be >= 1"))
-    o.num_threads = Int(v)
+    if v === nothing
+        o.num_threads = nothing
+        delete!(o.options, "max_threads")
+        return nothing
+    end
+    threads = Limits(threads=v).threads
+    o.num_threads = threads
+    delete!(o.options, "max_threads")
     return nothing
 end
 
-MOI.supports(::Optimizer, a::MOI.RawOptimizerAttribute) = hasproperty(Settings(Float64), Symbol(a.name))
+# Grouped constructor/read-only properties (limits, tolerances) are not setters.
+_moi_setting_key(k::Symbol) = k === :threads ? :max_threads : k === :verbosity ? :verbose : k
+MOI.supports(::Optimizer, a::MOI.RawOptimizerAttribute) =
+    hasfield(Settings{Float64}, _moi_setting_key(Symbol(a.name)))
 function MOI.set(o::Optimizer, a::MOI.RawOptimizerAttribute, v)
     MOI.supports(o, a) || throw(MOI.UnsupportedAttribute(a))
     settings = Settings(Float64)
     setproperty!(settings, Symbol(a.name), v) # validate before storing
-    o.options[a.name] = v
-    a.name == "verbose" && (o.silent = !Bool(v))
-    a.name == "time_limit" && (o.time_limit = Float64(v))
-    a.name == "threads" && (o.num_threads = Int(v))
+    key = _moi_setting_key(Symbol(a.name))
+    o.options[string(key)] = deepcopy(getproperty(settings, key))
+    key === :verbose && (o.silent = !settings.verbose)
+    key === :time_limit && (o.time_limit = settings.time_limit)
+    key === :max_threads && (o.num_threads = settings.max_threads)
     return
 end
 function MOI.get(o::Optimizer, a::MOI.RawOptimizerAttribute)
     MOI.supports(o, a) || throw(MOI.UnsupportedAttribute(a))
-    return get(o.options, a.name, getproperty(Settings(Float64), Symbol(a.name)))
+    key = _moi_setting_key(Symbol(a.name))
+    val = if key === :verbose
+        !o.silent
+    elseif key === :time_limit
+        o.time_limit
+    elseif key === :max_threads
+        something(o.num_threads, Settings(Float64).max_threads)
+    else
+        get(o.options, string(key), getproperty(Settings(Float64), key))
+    end
+    return a.name == "verbosity" ? Int(val) : deepcopy(val)
 end
 MOI.supports(::Optimizer, ::MOI.ObjectiveSense) = true
 MOI.supports(::Optimizer, ::MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}) = true
 MOI.supports(::Optimizer, ::MOI.ObjectiveFunction{MOI.VariableIndex}) = true
+MOI.supports(::Optimizer, ::MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}}) = true
 MOI.get(o::Optimizer, ::MOI.ResultCount) = o.result === nothing ? 0 : 1
 MOI.get(o::Optimizer, ::MOI.RawStatusString) = o.result === nothing ? "NotStarted" : string(o.result.status)
 
@@ -181,13 +211,16 @@ function _moi_convert_to_conic(o::Optimizer)
         row += 1
     end
 
+    empty!(o.constraint_rows)
     # Iterate over constraint types in a deterministic order.
     for (F, S) in MOI.get(model, MOI.ListOfConstraintTypesPresent())
         cis = MOI.get(model, MOI.ListOfConstraintIndices{F,S}())
         for ci in cis
             func = MOI.get(model, MOI.ConstraintFunction(), ci)
             set = MOI.get(model, MOI.ConstraintSet(), ci)
+            first_row = row + 1
             _moi_emit_constraint!(emit!, cones, func, set, var_to_col)
+            o.constraint_rows[ci] = first_row:row
         end
     end
 
@@ -196,7 +229,21 @@ function _moi_convert_to_conic(o::Optimizer)
     q = zeros(nvars)
     obj_constant = 0.0
     obj_type = MOI.get(model, MOI.ObjectiveFunctionType())
-    if obj_type === MOI.ScalarAffineFunction{Float64}
+    pi = Int[]; pj = Int[]; pv = Float64[]
+    if sense === MOI.FEASIBILITY_SENSE
+        # Ignore any stored objective, including a quadratic one.
+    elseif obj_type === MOI.ScalarQuadraticFunction{Float64}
+        f = MOI.get(model, MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}}())
+        for term in f.affine_terms
+            q[var_to_col[term.variable]] += term.coefficient
+        end
+        for term in f.quadratic_terms
+            i, j = minmax(var_to_col[term.variable_1], var_to_col[term.variable_2])
+            # MOI diagonal terms already use the one-half convention.
+            push!(pi, i); push!(pj, j); push!(pv, term.coefficient)
+        end
+        obj_constant = f.constant
+    elseif obj_type === MOI.ScalarAffineFunction{Float64}
         obj_func = MOI.get(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}())
         for term in obj_func.terms
             q[var_to_col[term.variable]] += term.coefficient
@@ -210,7 +257,8 @@ function _moi_convert_to_conic(o::Optimizer)
     end
 
     A = sparse(a_rows, a_cols, a_vals, row, nvars)
-    return A, b, cones, q, sense, obj_constant
+    P = sparse(pi, pj, pv, nvars, nvars)
+    return P, A, b, cones, q, sense, obj_constant
 end
 
 function _moi_emit_constraint!(emit!, cones, func, set, var_to_col)
@@ -310,14 +358,23 @@ function _moi_cone_tag(set)
         return SecondOrderConeT(Int(set.dimension))
     elseif set isa MOI.PositiveSemidefiniteConeTriangle
         return PSDTriangleConeT(Int(set.side_dimension))
+    elseif set isa MOI.ExponentialCone
+        return ExponentialConeT()
+    elseif set isa MOI.PowerCone{Float64}
+        return PowerConeT(set.exponent)
     else
         error("unsupported MOI set: $(typeof(set))")
     end
 end
 
 function MOI.optimize!(o::Optimizer)
-    A, b, cones, q, sense, obj_constant = _moi_convert_to_conic(o)
-    sense === MOI.MAX_SENSE && (q = -q)
+    o.result = nothing
+    o.solve_time_sec = 0.0
+    P, A, b, cones, q, sense, obj_constant = _moi_convert_to_conic(o)
+    if sense === MOI.MAX_SENSE
+        P = -P
+        q = -q
+    end
 
     sense === MOI.FEASIBILITY_SENSE && fill!(q, 0.0)
     o.objective_sign = sense === MOI.MAX_SENSE ? -1.0 : 1.0
@@ -331,7 +388,7 @@ function MOI.optimize!(o::Optimizer)
     o.num_threads === nothing || (settings.threads = o.num_threads)
     o.result = nothing
     t0 = time()
-    o.result = solve(q, A, b, cones; settings=settings)
+    o.result = solve(P, q, A, b, cones; settings=settings)
     o.solve_time_sec = time() - t0
     return
 end
@@ -386,9 +443,53 @@ end
 
 function MOI.get(o::Optimizer, a::MOI.VariablePrimal, v::MOI.VariableIndex)
     MOI.check_result_index_bounds(o, a)
-    col = findfirst(==(v), o.var_idx)
-    col === nothing && throw(MOI.InvalidIndex(v))
+    col = get(o.var_to_col, v, 0)
+    col == 0 && throw(MOI.InvalidIndex(v))
     return value(o.result)[col]
+end
+
+function MOI.get(o::Optimizer, a::MOI.ConstraintPrimal, ci::MOI.ConstraintIndex)
+    MOI.check_result_index_bounds(o, a)
+    MOI.is_valid(o.model, ci) || throw(MOI.InvalidIndex(ci))
+    f = MOI.get(o.model, MOI.ConstraintFunction(), ci)
+    x(v) = o.result.x[o.var_to_col[v]]
+    # Certificates are directions, not points: omit affine constants.
+    ray = MOI.get(o, MOI.PrimalStatus(a.result_index)) == MOI.INFEASIBILITY_CERTIFICATE
+    if f isa MOI.VariableIndex
+        return x(f)
+    elseif f isa MOI.ScalarAffineFunction
+        return sum(t.coefficient * x(t.variable) for t in f.terms; init=0.0) +
+               (ray ? 0.0 : f.constant)
+    elseif f isa MOI.VectorOfVariables
+        return x.(f.variables)
+    else
+        out = ray ? zeros(length(f.constants)) : copy(f.constants)
+        for t in f.terms
+            out[t.output_index] += t.scalar_term.coefficient * x(t.scalar_term.variable)
+        end
+        return out
+    end
+end
+
+function MOI.get(o::Optimizer, a::MOI.ConstraintDual, ci::MOI.ConstraintIndex)
+    MOI.check_result_index_bounds(o, a)
+    MOI.is_valid(o.model, ci) || throw(MOI.InvalidIndex(ci))
+    set = MOI.get(o.model, MOI.ConstraintSet(), ci)
+    z = o.result.z[o.constraint_rows[ci]]
+    # MOI dual signs depend on the constraint, not on the objective sense.
+    if set isa MOI.GreaterThan
+        return only(z)
+    elseif set isa Union{MOI.LessThan,MOI.EqualTo}
+        return -only(z)
+    elseif set isa MOI.Interval
+        return z[1] - z[2]
+    elseif set isa MOI.Zeros
+        return -z
+    elseif set isa MOI.PositiveSemidefiniteConeTriangle
+        # Convert svec duals to the ordinary triangle with trace inner product.
+        return [z[i] / _moi_row_scale(set, i) for i in eachindex(z)]
+    end
+    return z
 end
 
 MOI.get(o::Optimizer, ::MOI.SolveTimeSec) = o.solve_time_sec

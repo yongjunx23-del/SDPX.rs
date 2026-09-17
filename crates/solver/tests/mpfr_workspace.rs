@@ -1,5 +1,7 @@
 //! Caller-owned MPFR decomposition scratch: queries, refresh, and Rust allocations.
 #![cfg(feature = "sdp")]
+// This test imports the whole provider but exercises only selected operations.
+#[allow(dead_code)]
 #[path = "../src/algebra/dense/blas/traits.rs"]
 mod provider;
 use num_traits::{FromPrimitive, One, ToPrimitive, Zero};

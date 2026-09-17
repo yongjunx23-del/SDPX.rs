@@ -293,34 +293,59 @@ fn sampled_factor_residuals_do_not_build_sparse_row_plan() {
 }
 #[cfg(test)]
 fn row_gather_parity<T: FloatT>() {
-    let cv=|x:f64|T::from_f64(x).unwrap();
+    let cv = |x: f64| T::from_f64(x).unwrap();
     // Upper triangle with duplicate entries, gaps, cancellation and zero.
-    let mut a=CscMatrix::new(4,4,vec![0,1,4,6,9],vec![0,0,0,1,0,2,1,2,3],
-        [1.,1e15,-1e15,0.,-0.125,3.,2.,-2.,0.25].map(cv).to_vec());
-    let x=[0.125,-2.,3.,-0.].map(cv);
+    let mut a = CscMatrix::new(
+        4,
+        4,
+        vec![0, 1, 4, 6, 9],
+        vec![0, 0, 0, 1, 0, 2, 1, 2, 3],
+        [1., 1e15, -1e15, 0., -0.125, 3., 2., -2., 0.25]
+            .map(cv)
+            .to_vec(),
+    );
+    let x = [0.125, -2., 3., -0.].map(cv);
     let mut k: CscMatrix<T> = a.t().into();
     // Both upper and lower storage must follow their respective CSC order.
-    for (matrix,uplo) in [(&mut a,MatrixTriangle::Triu),(&mut k,MatrixTriangle::Tril)] {
-        let mut plan=SparseParallel::new_symmetric(matrix);
-        for width in [1,2,4] {
-            let pool=Arc::new(rayon::ThreadPoolBuilder::new().num_threads(width).build().unwrap());
-            plan.configure(matrix,Some(pool));
-            for (alpha,beta) in [(1.,0.),(-1.,1.),(0.25,-2.),(0.,1.)] {
-                let mut expected=[-0.,1.,-2.,3.].map(cv).to_vec();
-                let mut actual=expected.clone();
-                matrix.sym(uplo).symv(&mut expected,&x,cv(alpha),cv(beta));
-                plan.symv(matrix,uplo,&mut actual,&x,cv(alpha),cv(beta));
-                assert_eq!(actual,expected);
-                for (a,b) in actual.iter().zip(&expected) { assert_eq!(a.is_sign_negative(),b.is_sign_negative()); }
+    for (matrix, uplo) in [
+        (&mut a, MatrixTriangle::Triu),
+        (&mut k, MatrixTriangle::Tril),
+    ] {
+        let mut plan = SparseParallel::new_symmetric(matrix);
+        for width in [1, 2, 4] {
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(width)
+                    .build()
+                    .unwrap(),
+            );
+            plan.configure(matrix, Some(pool));
+            for (alpha, beta) in [(1., 0.), (-1., 1.), (0.25, -2.), (0., 1.)] {
+                let mut expected = [-0., 1., -2., 3.].map(cv).to_vec();
+                let mut actual = expected.clone();
+                matrix
+                    .sym(uplo)
+                    .symv(&mut expected, &x, cv(alpha), cv(beta));
+                plan.symv(matrix, uplo, &mut actual, &x, cv(alpha), cv(beta));
+                assert_eq!(actual, expected);
+                for (a, b) in actual.iter().zip(&expected) {
+                    assert_eq!(a.is_sign_negative(), b.is_sign_negative());
+                }
             }
             // The same symbolic map must read changed values, not a copy.
-            matrix.nzval[0]+=cv(0.125);
+            matrix.nzval[0] += cv(0.125);
         }
     }
 }
 #[test]
-fn row_gather_f64(){row_gather_parity::<f64>();}
+fn row_gather_f64() {
+    row_gather_parity::<f64>();
+}
 #[test]
-fn row_gather_mpfr256(){row_gather_parity::<sdpx_arithmetic::Bits256>();}
+fn row_gather_mpfr256() {
+    row_gather_parity::<sdpx_arithmetic::Bits256>();
+}
 #[test]
-fn row_gather_mpfr512(){row_gather_parity::<sdpx_arithmetic::Bits512>();}
+fn row_gather_mpfr512() {
+    row_gather_parity::<sdpx_arithmetic::Bits512>();
+}

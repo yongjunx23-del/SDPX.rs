@@ -60,6 +60,10 @@ impl ConeThreading {
             prefix.push(prefix.last().unwrap().saturating_add(cone_cost(cone)));
         }
         let total = *prefix.last().unwrap();
+        // The requested budget is a contract: the cone worker count reported to
+        // callers must equal it. Sizing the pool below the request measured
+        // faster on a PSD problem with fewer cones than threads, but that needs
+        // a metadata and benchmark-gate change, so it is not applied here.
         let workers = budget
             .min(if single_orthant {
                 cones[0].numel()
@@ -77,7 +81,13 @@ impl ConeThreading {
         // Contiguous lanes preserve original cone/data ordering and permit
         // safe slice splitting, without raw pointers or per-call job vectors.
         let orthant_chunk = single_orthant.then(|| cones[0].numel().div_ceil(workers));
-        let task_budget = workers.saturating_mul(4).min((total / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
+        // Deliberate over-splitting: balanced lanes follow a structural cost
+        // model, so spare tasks are what lets work stealing absorb model error.
+        // Measured worse when reduced to one lane per worker (w8 13.35 -> 14.37,
+        // w16 12.47 -> 14.11), so the task budget stays as it was.
+        let task_budget = workers
+            .saturating_mul(4)
+            .min((total / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
         let lanes = balanced_lanes(cones, &prefix, task_budget.min(cones.len()));
         #[cfg(feature = "sdp")]
         let psd_step_lanes = {
@@ -93,9 +103,10 @@ impl ConeThreading {
                 };
                 prefix.push(prefix.last().unwrap().saturating_add(cost));
             }
-            let lanes = workers.saturating_mul(4)
+            let lanes = workers
+                .saturating_mul(4)
                 .min(active)
-                .min((prefix.last().unwrap() / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
+                .min((*prefix.last().unwrap() / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
             if lanes > 1 {
                 balanced_lanes(cones, &prefix, lanes)
             } else {

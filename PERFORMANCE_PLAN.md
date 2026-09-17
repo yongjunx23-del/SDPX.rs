@@ -4,6 +4,31 @@ Target: Float64 near or above Clarabel.rs/MOSEK and high-precision SDP near or
 above SDPB, without losing accuracy. These are measured targets, not promises.
 Contracts: [AGENTS.md](AGENTS.md). Evaluation: [benchmark/research](benchmark/research/README.md).
 
+## Local small-block elimination trial (2026-09-16)
+
+The user stopped the CSDR comparison: the stable Rust solve took 280.017 s
+(256 bits, 57 iterations, Optimal), while the legacy run was interrupted;
+there is no completed speed ratio. A shared Float64/MPFR candidate eliminated
+independent SOC3 / PSD2 blocks and retained the global border (48 variables
+for the m400-a3 structure), with original-KKT refinement and QDLDL fallback.
+Eight focused numerical tests passed, but a short 128-block / 8-equality
+Float64 case returned AlmostOptimal where the baseline returned Optimal at
+1e-12. Repeated timings were unstable. The candidate is **rejected for default
+integration**; production source and the stable release library are restored.
+No tolerance relaxation, approximate rank reduction, or full CSDR rerun.
+Candidate patch, library and receipts: `/tmp/sdpx-local-blocks-20260916/`.
+Next work must first recover the strict convergence gate, then show repeatable
+end-to-end gains. Sparse QDLDL already performs elimination; the smaller
+explicit border is not itself evidence of a speedup.
+
+Second trial: reviewed the historical `fixed_trace_q3.jl` Cholesky/TRSM/SYRK
+path and MFLA's scaled 2x2 solve, then replaced scalar Schur updates with one
+whitened-panel Gram contraction through the existing shared provider. Eight
+focused tests passed. Same-process ABBA short checks still rejected it:
+MPFR256 medians 0.067875→0.070556 s (8 equalities) and 0.253255→0.318860 s
+(45 equalities); Float64/8 retained the AlmostOptimal regression. No production
+integration or full CSDR rerun. Evidence: `/tmp/sdpx-local-gram-20260916/RESULT.md`.
+
 ## Continuous optimization objective
 
 Continue evidence-driven optimization without a preset end date. Each cycle:
@@ -40,6 +65,1355 @@ is paused. The old Goal's five-equation requirement and no-push restriction are
 superseded by current project instructions and explicit publication authorization.
 
 ## Current evidence — September 16, 2026
+
+September 17 provider assessment: keep MPFR/GMP scalar semantics and the existing
+small-block kernels. First compare high-precision factorization/TRSM/SVD against
+MPLAPACK and large Gram products against BFLA's existing exact FLINT bridge;
+include allocation and representation conversion in timings. The BFLA bridge
+currently uses text transport and serial restricted SYRK, so it is a reference,
+not a ready Rust production backend. Exact Gram rounded once need not match
+sequential MPFR accumulation. Arb approximate products or dropped ball radii do
+not establish the required accuracy. Elemental remains a distributed-backend
+evaluation, not an assumed single-core speedup.
+
+The medium batched second product in `compute_schur_dense_impl` reaches the BLAS
+provider; compare hardware-appropriate Float64 BLAS there before changing the
+algorithm. The previously rejected active-row tail GEMM remains rejected.
+FFI now forwards existing core `sdp-mkl`, `pardiso-mkl`, and `pardiso-panua`
+features without changing defaults or dependencies. Locked offline Cargo metadata
+validates all three mappings; locked offline feature resolution for
+`sdp-mkl,pardiso-mkl` passes. Receipts: `/tmp/sdpx-provider-metadata-20260917.json`
+and `/tmp/sdpx-provider-tree-20260917.txt`. Native MKL/PARDISO builds, provider
+numerical qualification, timing and memory comparisons are still pending;
+this wiring earns no performance credit. No full CSDR test was restarted.
+
+September 17 Float64 backend screen, PBS 213336 (completed, exit 0): existing
+OpenBLAS versus oneMKL on one pinned CPU, sequential ABBA processes, seven warmed
+samples of ten GEMMs each, after 120 ms warmup per shape. Shapes follow medium's
+PSD orders 57/59/60/116 and the current `(64*n,n)*(n,n)` batched product. Inputs
+are synthetic dyadic values with every first-call output checked against an
+exact integer-product oracle; these are not captured solver matrices or a
+solver numerical qualification. Both providers report one thread and symbol
+ownership is recorded. MKL speedups (AB / BA): 1.083/1.091, 1.074/1.084,
+1.281/1.207, 1.150/1.122. Process peak RSS: OpenBLAS 18,304–18,684 KiB;
+MKL 24,044 KiB. Host load and runtime-dispatched child-library identities were
+not exhaustively recorded, so this is a directional screen, not promotion.
+Evidence: `/tmp/sdpx-blas-screen-20260917/` (source/script hashes, library hashes,
+symbol ownership, raw samples, resource logs and summary). Next: frozen current
+solver builds using each provider, complete dependency identity, matched medium
+ABBA with original-coordinate accuracy and LP/SOCP/SDP regression checks. Keep
+the production provider unchanged until that comparison passes. High-precision
+MPLAPACK/FLINT experiments remain pending.
+
+The full medium provider comparison is prepared in
+`/tmp/sdpx-provider-solve-20260917/`: 218 current source files frozen with per-file
+hashes, identical source for both providers, existing original-coordinate audit,
+one cold and one warmed fresh solve per ABBA process, 240-second process limits,
+single CPU affinity, native/API timing, RSS and loaded-file identities. The
+existing cluster MKL runtime avoids downloading static MKL dependencies; both
+arms use the same provider-neutral Cargo features with explicit native linking.
+Python compilation and PBS shell syntax checks pass. Source upload was rejected
+by automatic approval review pending explicit payload/destination authorization
+for `hpc:~/projects/sdpx-provider-solve-20260917/`. Only the empty remote directory
+has been created; no full-solve PBS job has been submitted. See `handoff.json`
+for archive/script hashes and the precise pending state. No timing claim or
+production-provider change follows from this preparation.
+
+Independent local work while upload authorization is pending: borrowed-input
+MPFR FMA candidate in `/tmp/sdpx-borrowed-fma-20260917/`. A typed `mul_add_ref`
+borrows the three inputs and retains independent output limbs; GEMM's existing
+fused modes call it without changing precision, accumulation order or rounding.
+No production source change. Release locked/offline build passes; the existing
+GEMM/SYRK test binary passes all 14 tests (128 through 2048 bits, transposes,
+strides, cancellation and untouched padding). A same-binary local ABBA screen
+compares baseline and candidate provider modules on identical non-dyadic inputs,
+checking complete output equality after each arm. For 64-order GEMM, AB/BA
+speedups are 1.069/1.063 at 256 bits, 1.071/1.070 at 512 bits, 1.023/1.031 at
+1024 bits. The 16-order samples are noisier. Seven samples per arm follow
+100 ms warmup; macOS affinity/background load was not controlled, so these
+figures are screening evidence only. Scalar dot/cancellation checks also pass.
+Candidate patch, raw samples, build/test logs and hashes remain outside the
+repository. Next gate is a frozen complete high-precision solve comparison;
+no solver speedup, Ising improvement or adoption is established yet. This is
+distinct from the previously rejected in-place arithmetic-assignment candidate.
+
+Local full Ising512 comparison prepared in
+`/tmp/sdpx-borrowed-fma-solve-20260917/` using existing frozen sampled input,
+reference and macOS audit driver. Both current-source release libraries built;
+candidate has only the two borrowed-FMA file changes. A shared-target candidate
+build first reused stale arithmetic metadata and failed; rebuilding in an
+independent target succeeded. Preserve both build logs. All 483 frozen files
+are checked before/after runs. The first baseline process completed both solves
+and passed both external audits at 50 iterations, but `/usr/bin/time -l` failed
+on sandboxed `sysctl kern.clockrate`; the wrapper exit correctly invalidated the
+attempt and stopped before candidate execution. The repaired runner uses direct
+Julia plus `wait4` process RSS/CPU accounting, keeps a 240-second process-group
+timeout, and restarts ABBA under `retry-01/` without overwriting failed evidence.
+The repaired ABBA comparison completed: all eight first/warmed solves pass the
+original-coordinate audits, all have 50 iterations, and all returned x/s/z and
+statuses match exactly. The 483 frozen files remain unchanged. Warmed native
+times in ABBA order are 76.4565 / 55.7918 / 55.5693 / 56.2690 seconds; API times
+are 76.5386 / 55.8753 / 55.6521 / 56.3558 seconds. AB speedup is 1.3704 but BA
+is only 1.0126, below the 1.02 threshold. The first baseline is visibly unstable
+(first call 47.0993s, warmed 76.4565s); do not quote the pooled 1.1918 median
+ratio as a demonstrated gain. Process peak RSS in the same order is
+912064512 / 928071680 / 935657472 / 928907264 bytes. No OS affinity was enforced;
+a mid-run process inspection found no competing numerical solver, but does not
+establish controlled hardware conditions. Reject this candidate for insufficient
+repeatable full-solve benefit; keep it isolated, with no production adoption.
+`decision.json`, `retry-01/`, failed-attempt logs and `evidence.sha256` retain the
+complete evidence. Precision/tolerances/settings and gates were unchanged.
+
+September 17 next independent candidate: cache each orthant row's `A/w`
+quotients during condensed Schur assembly, reducing divisions from
+`d+d*(d+1)/2` to `d` per degree-d row while preserving each rounded quotient
+and the original FMA order. Scratch is sized once to the largest row per cone
+and overwritten every assembly, including after scaling/A updates. Isolated
+source and evidence: `/tmp/sdpx-orthant-division-20260917/`. Thirteen orthant
+tests pass, including new bitwise assembly comparisons at Float64/256/512 bits,
+nonunit weights, empty rows, repeated assembly and A updates. A separate ABBA
+row microkernel screen (degrees 8/64, seven samples, 100 calls per sample)
+shows 2.50–3.18x at 256/512 bits with exact output equality; Float64 shows no
+benefit and small rows regress. The microkernel excludes Schur index lookup,
+full assembly, factorization and solver work; do not extrapolate its speedup.
+Do not adopt the uniform cache. Next evaluate a precision-aware cost choice
+within the same assembly loop, retaining Float64's current computation, then
+measure complete MPFR assembly and a mixed orthant/SDP solve. Pure LP defaults
+do not select this condensed path, and no Ising improvement is claimed.
+
+Follow-up `/tmp/sdpx-orthant-assembly-20260917/`: MPFR-only row caching now
+retains the literal original Float64 row loop and allocates no Float64 row
+scratch. Fourteen orthant tests pass. Full assembly comparisons include Schur
+lookup, clearing, scattering and finiteness checks; MPFR speedups remain about
+2.5–2.8x. Float64 64-degree timings still vary around a small regression, so
+full Float64 solver regression remains required despite unchanged arithmetic.
+
+A single-binary ABBA full-solve diagnostic compares the original and cached
+assembly through a test-only switch. Its 32-variable, 256-NN-row, PSD32 problem
+has known unique optimum x=1; dense inactive NN rows repeat, so this is a
+structural stressor, not independent benchmark coverage. Default preprocessing
+and automatic KKT selection are retained, with actual condensed selection
+asserted. At 256/512 bits the internal tolerances are 1e-24/1e-42 and external
+original-coordinate primal/dual/gap and cone bounds are 1e-20/1e-30. All 24
+solves pass; returned x/s/z and iteration counts agree exactly within precision
+(17/26 iterations). Each arm has one first call and two warmed fresh solves.
+Warmed native ABBA medians: 256-bit 2.06256/1.93011/1.93282/2.07384s,
+512-bit 4.82749/4.46088/4.46990/4.82939s. AB/BA speed ratios are
+1.0686/1.0730 and 1.0822/1.0804, respectively. No affinity or per-solve RSS was
+measured, and separate production release arms remain unqualified. Retain this
+experimental candidate for independent mixed-cone, Float64 and Ising regression;
+do not adopt yet. The clean candidate patch excludes all test-only switching
+and duplicate reference assembly. Sources, binary hash, raw logs, summaries,
+assertion-based mathematical checks and limitations remain in the external
+directory. The production solver is unchanged.
+
+Nonrepeating-row follow-up `/tmp/sdpx-orthant-diverse-20260917/` verifies that
+all 224 dense NN rows are distinct even modulo positive scaling. This changes
+the synthetic coefficients, not the solver candidate, and retains the known
+x=1 optimum; it is not a new public holdout family. Float64 is added with
+1e-8 internal / 1e-6 external tolerances; MPFR gates remain unchanged. All 36
+ABBA fresh solves pass original-coordinate checks and exact point agreement
+within each precision (7/15/24 iterations at Float64/256/512). Warmed native
+ABBA medians are 2.00695/1.88055/1.88169/2.01535s at 256 bits and
+4.49895/4.14954/4.15171/4.50715s at 512 bits, giving AB/BA speed ratios
+1.0672/1.0710 and 1.0842/1.0856. Float64 passes correctness, but its 7–12 ms
+warmed samples show substantial startup drift; claim no Float64 speedup or
+qualified timing regression result. The same isolated binary passes 292 core
+tests (one benchmark filtered, one full-solve diagnostic ignored).
+
+Next release qualification is staged in `/tmp/sdpx-orthant-release-20260917/`.
+All current Cargo/crates/Julia files match the earlier frozen baseline source,
+allowing reuse of its traced baseline FFI library. A clean candidate containing
+only the production assembly patch, without the test-only reference/switch,
+is building in its own target directory. `source.json` and `baseline.json`
+record identities and build provenance. Separate-library Float64/medium/Ising
+timing and memory checks remain pending; production is not modified or published.
+
+Independent release candidate built successfully and matches its frozen source.
+The local library-level ABBA runner at `/tmp/sdpx-orthant-release-20260917/`
+uses direct Julia processes with wait4 RSS/CPU accounting, 240-second process
+timeouts, one first and one warmed fresh solve per cell, and file verification
+between cells. No competing numerical process was observed at launch; macOS
+affinity remains uncontrolled. Medium completed all eight original-coordinate
+gates at 18 iterations, with identical returned primal values, equality duals
+and matrix duals across both libraries. Warmed native ABBA times:
+2.95466/2.99322/2.99854/2.98568s; API:
+2.99448/3.02536/3.02583/3.01289s. Candidate regressions are 1.31%/0.43%, below
+the 2% screen limit; no Float64 speed credit. Peak process RSS:
+1102643200/1122074624/1101955072/1090748416 bytes (includes Julia/setup/audits
+and both solves, not per-solve native memory). Results and point-equality checks
+are under `results/medium-*`, `medium-summary.json`, `medium-points.json`.
+Ising512 ABBA completed: all eight solves pass at 50 iterations, with identical
+returned x/s/z and status. Warmed native times are
+36.50510/36.52823/36.50642/36.53842s; candidate/baseline ratios are
+1.00063/0.99912. This fixture has no orthant rows, so it earns regression credit
+only. All 295 frozen files remain unchanged; see `regression-summary.json`.
+Independent-release mixed orthant/PSD qualification subsequently passed all 24
+solves, including known optimum, original-coordinate primal/dual equations, gap
+and cone bounds. Every returned x/s/z, status and iteration count matches within
+each precision. Unique dense rows avoid the first fixture's repeated rows; this
+is still a synthetic structural fixture, not an independent public holdout.
+256-bit warmed native ABBA medians: 1.80655/1.69050/1.70042/1.84177s
+(15 iterations; AB/BA speedup 1.069/1.083). 512-bit:
+4.51174/4.19308/4.18047/4.53450s (24 iterations; 1.076/1.085).
+Each cell runs a first solve plus two warmed fresh solves, with a 120-second
+process timeout; process RSS is about 557/568 MB at 256/512 bits, including Julia
+and audits. All frozen files were reverified; source matched current production
+before integration. Evidence: `mixed-summary.json`, `mixed-frozen.json`,
+`mixed-results/` under `/tmp/sdpx-orthant-release-20260917/`.
+The precision-gated orthant row quotient cache is now integrated, preserving
+Float64's original loop and MPFR quotient/FMA order. Integrated release checks
+pass: 294 core tests and 23 LP/SOCP/SDP/mixed-conic/data-update tests. The final
+numerical source differs from the timed candidate only in whitespace and a
+pattern trailing comma; `integration-source.json` records that check and hashes.
+No public holdout or MOSEK/SDPB parity claim follows from this local improvement.
+
+Reproducing the archived Ising KKT instrumentation on current numerical sources
+produces identical instrumented files (`/tmp/sdpx-profile-provenance-20260917/`).
+The prior four-thread profile remains applicable: Schur assembly is only about
+0.051s of the 11.86s warmed solve. Complete profiling of cone scaling/SVD, step
+length and residual updates before selecting a replacement high-precision
+provider; do not add nested timing counters together.
+
+September 17 extended Ising phase diagnostic: frozen current source, isolated
+26-span instrumentation, 512 bits, one configured thread, one first and one
+warmed solve, 240-second process cap. All four instrumented/control solves pass
+the unchanged external audit at 50 iterations and return identical x/s/z.
+Instrumented first/warm: 72.869/69.794s; subsequent uninstrumented control:
+74.778/71.249s. This is a sequential diagnostic/control pair, not an ABBA speed
+claim. Both are much slower than the earlier 36.5s session; cause is unqualified,
+so historical times must not be used to infer an instrumentation regression.
+MPFR/GMP archive hashes and solver build features match the prior release.
+
+Warmed exclusive outer spans cover 68.622s of 69.794s: affine/combined KKT solves
+14.401/16.822s (44.7% together), KKT update 12.689s (18.2%), cone scaling 8.181s
+(11.7%), affine/combined bounds 6.367/6.197s (18.0% together), residual update
+2.541s (3.6%). Nested scaling eigensolve is 5.433s (7.8% of total); nested Schur
+assembly only 0.265s (0.38%). Do not add these nested counters to the outer spans.
+High precision actually uses an eigensolve of M-transpose-M for NT scaling;
+Float64 retains SVD. Thus prioritize direction/residual matrix operations and
+the common symmetric-eigensolver path used by scaling and step bounds, rather
+than assuming Gram assembly or global factorization is the largest opportunity.
+Next bounded hypothesis: exploit exact symmetry in MPFR Householder rank-two
+updates, comparing the original update order and eigenpair residuals before any
+full-solver timing. MPLAPACK comparison should include SYEVR, not just GESVD.
+No new numerical change is adopted by this diagnostic. Evidence and all frozen
+identities: `/tmp/sdpx-ising-phases-20260917/phases.json` and adjacent receipts.
+
+September 17 symmetric Householder update candidate (isolated, not adopted):
+compute the upper triangular rank-two update once and mirror it. MPFR nearest
+rounding, products, additions, reflectors and eigensolver stopping rules are
+unchanged. Exact comparisons of the packed matrix, diagonal, off-diagonal and
+reflectors pass at 256/512/1024 bits for n=0/1/2/3/12/16/32/64 with zero,
+repeated-diagonal, signed non-dyadic and scaled inputs (96 combinations).
+Same-binary sequential ABBA kernel screen uses two warmups and five samples of
+three calls per arm, 120-second cap. AB/BA speedups at n=12/16/32/64:
+256-bit 1.281/1.244, 1.268/1.348, 1.390/1.382, 1.431/1.438;
+512-bit 1.212/1.225, 1.285/1.281, 1.372/1.378, 1.404/1.413.
+These include resetting the input matrix and are kernel-only synthetic results;
+no full-solve credit. All 297 core tests and 25 dense-provider tests pass
+(the timing test is ignored in each correctness run). Independent release Ising
+ABBA completed: all eight solves pass at 50 iterations with identical x/s/z.
+Warmed native times 66.6210/65.1787/66.3656/65.5639s; AB speedup 1.0221,
+BA 0.9879. Reject for production: no repeatable >=2% full-solve improvement.
+RSS 915456000/954597376/932364288/957612032 bytes includes Julia and audits;
+all 268 frozen files reverified. Evidence, source and binary identities:
+`/tmp/sdpx-symmetric-update-20260917/`.
+
+Before the next arithmetic candidate, qualify NT scaling on graded SPD inputs:
+the current high-precision M-transpose-M route and negative-eigenvalue clamp
+need explicit conditioning coverage against same-precision direct SVD.
+This concern is now reproduced at 256 bits: delta=2^-160, t=2^-80,
+S=[[delta,t],[t,2]], Z=[[1,1-delta],[1-delta,1]] are SPD and both Cholesky
+factorizations succeed after the actual svec round trip. Direct SVD retains
+sigma_min=6.8422776578e-49, with singular-product/determinant relative error
+8.55e-50. The current Gram route returns success=true, lambda_min=0 and nonfinite
+R/Rinv; determinant relative error is 1. This is a cone-level counterexample,
+not a claim that the existing Ising benchmark fails. An isolated restoration of
+the common direct-SVD scaling path passes this counterexample and all 295 core
+tests (`fix-tests.log`). Independent-release Ising first-solve ABBA now passes
+all four unchanged external audits at 512 bits and 50 iterations; native times
+66.2612/70.1115/70.7975/66.2673s, API
+67.3419/72.0744/71.3190/66.7898s. The direct-SVD fix costs 5.81%/6.84% in AB/BA.
+Each cell is one fresh-process solve (no warmed sample), with a 180-second cap;
+points match within each arm, and all 268 frozen files reverify. Peak process RSS
+905953280/929480704/945242112/933576704 bytes includes Julia and audits.
+This is an accuracy fix with a measured cost, not a speedup. Float64 medium also
+passes first/warm original-coordinate audits at 18 iterations, with identical
+primal/equality-dual/matrix-dual values to the prior baseline (no new Float64
+speed claim). The direct-SVD path is now integrated; an expanded 128–2048-bit
+conditioning regression checks the singular-product/determinant identity and
+R-times-Rinv. All integrated checks pass: 295 core tests (including all six
+MPFR precision modes in the new regression), 23 LP/SOCP/SDP/mixed/update tests
+and 22 dense-provider tests. The numerical source exactly matches the qualified
+isolated release; `integration-source.json` records production file hashes.
+This candidate has a correctness justification independent of the performance
+retention threshold. See `solver-summary.json` and `results/` in the same folder.
+Evidence: `/tmp/sdpx-nt-conditioning-20260917/retry-check.log` and source snapshot.
+Also inspect native library
+implementations before assuming speedups: the pinned gmp-mpfr-sys 1.6.8 MPFR
+`src/dot.c` allocates n product temporaries at summed operand precision and calls
+`mpfr_sum`; it is not an allocation-free replacement for the hot FMA loop.
+
+September 17 live FMA accumulator experiment (isolated): keep one owned MPFR
+destination throughout an ordered dot product, borrowing input descriptors and
+rounding every FMA exactly as before. The pinned MPFR manual explicitly permits
+input/output reuse; its Rust custom-descriptor helpers are already inline, so
+reimplementing those helpers is not a useful optimization. Six arithmetic tests
+pass, including 128–2048-bit comparisons, cancellation, empty products, signed
+zero, infinity/NaN and unchanged inputs. Same-binary ABBA dot screens show about
+1.04–1.12x speedups across lengths 8/16/64/256 at 256/512/1024 bits; at 512 bits,
+length 16 is 1.109/1.118x. These are scalar-only results, not solver credit.
+GEMM retains existing FMA precision selection. All transpose/leading-dimension
+checks pass; 296 isolated core tests and 40 provider/parallel/workspace tests
+pass (timing tests ignored). Matrix AB/BA speedups at n=16/32/64 are
+256-bit 1.095/1.061, 1.052/1.074, 1.085/1.084;
+512-bit 1.071/1.060, 1.062/1.048, 1.012/1.020.
+The rebuilt, default-loaded production library first passed a 256-bit SDP smoke
+test, ensuring the direct-SVD correctness fix was present in the actual baseline.
+Independent-release Ising first-solve ABBA then passes all four unchanged audits
+at 50 iterations with identical x/s/z across both arms. Native times:
+39.23635/38.17474/38.11063/39.27043s (AB/BA 1.0278/1.0304x); API:
+40.03465/40.01321/38.40458/39.54388s. These are fresh-process first solves, not
+warmed timing. Historical ~70s sessions are not comparable; no affinity is
+enforced. RSS 907821056/916094976/892043264/910327808 bytes includes Julia and
+audits. All 268 frozen files reverified. The live accumulator and GEMM adapter
+are integrated. Final production checks pass: 6 arithmetic tests, 295 core
+tests and 37 provider/parallel/workspace tests. The default FFI library was
+rebuilt and its default-loader 256-bit SDP smoke test passes (14 iterations).
+A regression explicitly distinguishes ordered FMA from once-rounded exact dot
+and separate multiply/add. Evidence: `/tmp/sdpx-fma-accumulator-20260917/`.
+
+September 17 SYRK live-accumulator candidate (isolated, not adopted): reuse
+`dot_fma` for the existing fused precision modes, preserving ordered FMA and
+alpha/beta/triangle semantics. 1,080 baseline comparisons cover all six
+precisions, U/L, N/T/C, rectangular/empty products, padded leading dimensions,
+alpha/beta and serial/two-lane pool paths. All pass; 296 core tests pass, one
+ignored timing test. Same-binary ABBA (seven three-call samples, two warm calls)
+at 256/512 bits and orders 16/32/64 shows 1.034–1.089x kernel speedups across
+both transpose modes. This is not solver credit. Independent-library Ising
+ABBA native times were 44.25548/41.32696/37.96624/42.51806s (1.071/1.120x),
+but an additional BA confirmation was 42.80283/38.05422s (0.889x). All six
+unchanged original-coordinate audits pass, with identical x/s/z/status and 50
+iterations. All frozen identities were reverified. No affinity is enforced;
+large same-arm variability and gains disproportionate to the kernel screen
+make whole-solver attribution unreliable. Do not promote or repeat this timing
+campaign further. Production source is unchanged. Keep the isolated candidate
+for a future controlled-host comparison, without solver performance credit.
+Next: reprofile the current direct-SVD plus GEMM-accumulator baseline, because
+the earlier stage breakdown used the retired Gram-based NT scaling path;
+prioritize the resulting direction/scaling hotspots over more small-kernel
+screens. Evidence: `/tmp/sdpx-syrk-accumulator-20260917/`.
+
+September 17 current-baseline phase refresh (completed, isolated): current
+production includes direct SVD and the accepted GEMM accumulator, not the
+rejected SYRK candidate. Four original-coordinate audits pass; all returned
+x/s/z/status/iterations match. Control first/warm native 37.79753/37.80434s;
+profile 37.84738/37.83468s, 50 iterations. All frozen identities reverified.
+Warm outer phases: affine/combined solve 7.180/8.436s (41.3% combined), cone
+scaling 6.746s (17.8%), KKT update 6.311s (16.7%), affine/combined bounds
+3.319/3.228s (17.3%). Nested SVD is 5.730s (15.1%), with bidiagonal iteration
+4.656s (12.3%); Schur assembly only 0.137s (0.36%). Congruence calls total
+7.850s (20.7%), of which GEMMs are 4.370s (11.6%). Nested percentages overlap
+outer phases and must not be summed. Production is unchanged. Source review
+finds `svec_to_mat`/`mat_to_svec` reevaluate correctly rounded high-precision
+FRAC_1_SQRT_2 inside each off-diagonal element, and svec expansion repeats the
+same product for mirrored entries. Next hypothesis: hoist this unchanged
+constant once per conversion and reuse the mirrored product, without global
+mutable caches or changing MPFR rounding. Prioritize this conversion overhead,
+then SVD bidiagonal iteration; bulk Schur acceleration is not this Ising
+instance's leading opportunity. Evidence: `/tmp/sdpx-current-phases-20260917/`.
+The conversion-hoisting candidate is isolated in `/tmp/sdpx-svec-constant-20260917/`.
+Float64 plus all six MPFR precisions pass exact baseline comparisons at orders
+0/1/2/3/8/16. A 512-bit same-binary ABBA conversion-pair screen (two warmups,
+seven batches of 50 calls, immutable input) at orders 8/16/32 yields
+13.70/12.84x, 17.16/17.07x and 18.64/18.94x. These are conversion-only gains.
+296 core tests and 23 LP/SOCP/SDP/mixed/update tests pass; release FFI builds.
+Independent-library Ising ABBA native times are
+60.16795/48.80130/49.24649/58.26923s (1.233/1.183x; paired-arm medians
+59.21859 -> 49.02389s, 17.2% less native time). All four original-coordinate
+audits pass at 512 bits/50 iterations with identical x/s/z/status. Float64
+medium first/warm ABBA also passes all eight audits with identical points and
+18 iterations: warm 5.013875/4.995525/5.040042/5.013875s (1.0037/0.9948x),
+essentially unchanged. All 295 frozen identities were reverified. Native
+Ising/API/RSS raw receipts remain in the experiment; these same-session
+numbers must not be compared with earlier ~38s profiles. The candidate is
+accepted and its exact production source is integrated, preserving all unrelated
+source hashes. The default FFI library was rebuilt successfully and its
+256-bit default-loader SDP smoke passes at 14 iterations. Integration source
+and library identities are recorded and reverified. No global constant cache,
+new dependency, precision change or solver algorithm change.
+
+September 17 MPFR rotation candidate (isolated, not adopted): SVD's column
+rotations reuse coefficient descriptors and one owned scratch value, borrow
+inputs until both independently owned outputs are ready, and retain all four
+separately rounded products plus subtraction/addition. No FMA substitution.
+Six-precision scalar checks include cancellation distinguishing separate
+products from FMA, signed zeros, infinities/NaN and output independence. Full
+SVD comparisons pass for 72 shape/precision/conditioning combinations (tall,
+wide, square, rank-deficient and anisotropic diagonal matrices), including
+identical singular values and both vector matrices. Same-binary SVD ABBA
+(two warmups; seven three-call samples) at n=8/16/32 yields
+256-bit 1.064/1.086x, 1.112/1.106x, 1.120/1.134x;
+512-bit 1.072/1.072x, 1.104/1.087x, 1.114/1.173x.
+These are factorization-only gains. All 296 core and 23 dense checks pass
+(timing tests ignored). Full Ising ABBA against the accepted conversion-hoisting
+baseline is 49.64043/48.86401/49.71158/49.90513s (1.0159/1.0039x).
+All four external audits pass with identical x/s/z/status and 50 iterations;
+frozen identities reverify. Reject: the full-solver improvements do not reach
+the repeatable 2% retention threshold. No further sweep of this candidate.
+Production source hashes are unchanged; preserve the accepted conversion fix.
+Evidence: `/tmp/sdpx-rotation-20260917/`.
+A separate next hypothesis is MPFR 4.2.2's native `mpfr_hypot`: the pinned
+source uses three working values at guard precision and a rounding loop, so
+allocation cost must be timed rather than assuming a faster single API call.
+Its correctly rounded result differs from the current scaled multi-operation
+formula; qualification must use accuracy/residual tests, not require old-bit
+identity. No hypot change is included in this rotation experiment.
+
+September 17 native MPFR hypot candidate (isolated, not adopted): replace the
+provider's scaled multi-operation norm with the pinned MPFR 4.2.2 correctly
+rounded `mpfr_hypot`, using the existing owned binary-call wrapper. Fixed
+precision and RNDN are unchanged, but results can differ from the old formula.
+306 bounded-exponent-gap cases across 128–2048 bits and exponents -4096/0/4096
+match a certified rounding interval: exact promotion/square/sum at 8192 bits,
+directed square roots, and agreement of both endpoints rounded to the target.
+This oracle shares MPFR bindings but does not call hypot. Pythagorean triples,
+large operand gaps, signed zeros and Inf/NaN semantics also pass.
+Same-binary scalar ABBA (32 fixed pairs, 20 warm batches, seven 100-batch samples)
+shows 128-bit 1.139/1.070x, 256-bit 1.427/1.437x, 512-bit 1.692/1.692x,
+768-bit 1.883/1.876x, 1024-bit 2.117/2.150x, 2048-bit 2.738/2.736x.
+These are scalar-only gains. All 296 core and 23 dense tests pass, including
+explicit SVD reconstruction/left/right orthogonality at orders 8/16/32 across
+six precisions and the ill-conditioned NT regression. Full-SVD ABBA at
+256-bit n=8/16/32 is 1.039/1.057x, 1.036/1.053x, 1.023/1.010x;
+512-bit is 1.081/1.083x, 1.068/1.051x, 1.022/1.069x. The scalar gain does
+not translate proportionally to SVD. Full Ising ABBA is
+51.81860/50.10608/50.59220/51.25506s (1.0342/1.0131x; aggregate arm medians
+51.53683 -> 50.34914s). All four unchanged original-coordinate audits pass,
+all statuses are optimal and all iteration counts are 50. Repeats within each
+arm have identical points. Baseline/candidate scaled infinity differences are
+x 2.35e-120, s 8.16e-120, z 5.02e-103; these compare trajectories, not an
+independent accuracy oracle. All frozen identities reverify. Do not promote:
+the aggregate ~2.4% speed gain is marginal and the separate pairs do not both
+clear 2% on this unpinned host. No further local sweep; prioritize the known
+sampled-operator constant overhead. The rejected rotation helper is absent.
+Production source hashes are unchanged. Evidence: `/tmp/sdpx-hypot-20260917/`.
+Static follow-up: `SampledBlockWorkspace::forward_terms` and `adjoint_terms`
+still construct SQRT_2/FRAC_1_SQRT_2 inside element loops. They lie in the
+measured forward/transpose direction paths. Test per-call constant hoisting
+next, separately from hypot; retain both actual constant values and arithmetic
+association, including off-diagonal multiplicities and shared-column ordering.
+
+September 17 sampled-operator constant hoisting (accepted and integrated):
+`forward_terms` computes SQRT_2 and FRAC_1_SQRT_2 once per call only when its
+shape needs them; `adjoint_terms` similarly reuses FRAC_1_SQRT_2. Both constants
+still use their independently correctly rounded implementation. Multiplication
+association, authoritative factors and contribution order are unchanged; no
+cross-call cache or precision-specific solver path is added. All 378 baseline
+comparisons pass across Float64/six MPFR precisions, dimensions 1/2/3, basis
+rows 1/3/8, columns 0/1/5 and two alpha values, for both forward and adjoint.
+512-bit same-binary ABBA (dim 1/2, basis rows 8/16/32, 16 columns; two warmups,
+seven three-call samples) yields forward 1.21–1.41x, adjoint 1.44–1.70x.
+These are operator-only gains. All 296 core tests and 27 sampled
+solver/integration/update tests pass, including pooled-operator cases. The
+frozen-library Ising512 ABBA native times are 51.861781/48.923151/48.761441/
+51.061305s: AB/BA speedups 1.0601/1.0472, medians 51.461543 -> 48.842296s
+(5.09% less time). All four solves pass unchanged original-coordinate audits,
+with identical x/s/z/status and 50 iterations. Float64 medium passes all eight
+first/warm audits with identical returned points and 18 iterations. Warm AB/BA
+ratios are 1.0653/1.0026; no regression observed, but do not claim a repeatable
+Float64 gain on this unpinned host. Frozen source/library/input identities pass.
+The exact qualified production change is integrated; root FFI rebuilt and a
+256-bit sampled PSD4 default-loader smoke passes, exercising both off-diagonal
+constant branches and external original-coordinate residuals. Production source
+and library hashes reverify. Hypot/rotation/SYRK candidates remain absent.
+Evidence: `/tmp/sdpx-sampled-constants-20260917/` (solver-summary.json,
+integration-source.json, production-library.json and production-smoke.log).
+Further static audit finds inner-loop constants in ordinary SDP's
+`psd_entry`/sparse Schur contractions and dense Schur packing. Assess those on
+an independent non-sampled SDP family after this qualification; the Ising
+sampled path does not establish their end-to-end benefit. Setup materialization
+and two isolated SOC/Jacobi calls are lower priorities until measured.
+
+September 17 ordinary SDP coefficient-product constant screen (isolated):
+`coefficient_product` hoists FRAC_1_SQRT_2 once when the cached plan contains
+an off-diagonal coefficient; purely diagonal/empty plans skip its evaluation.
+FMA order, duplicate-coordinate plan and storage layout are unchanged. Exact
+baseline comparisons pass for 280 combinations: Float64 and all six MPFR
+precisions, orders 0/1/2/8/16, diagonal/mixed/dense/empty coefficients, offsets
+0/2 and padded leading dimensions. Frozen-source same-binary 512-bit ABBA
+(seven samples of five calls after three warmups) gives 1.32–2.23x for mixed
+and dense orders 8/16/32, with diagonal cases within approximately 1%.
+These are kernel-only, unpinned-host results. Production remains unchanged;
+do not infer whole-solver or Ising gains. Evidence:
+`/tmp/sdpx-coefficient-constants-20260917/` (source hashes, reference helper,
+screen log and summary). All 296 core tests pass (one timing test ignored).
+Full non-sampled SDP screening uses the 16-order dense pencil Q*diag(x-1)*Q',
+with a rational Householder Q constructed directly at 512 bits and known
+optimum x=1. Fixed tolerance 1e-42, external residual/gap/solution and PSD
+Gershgorin gates 1e-30, default preprocessing and single-thread condensed KKT.
+Twelve solves (ABBA processes, first plus two warm fresh solves each) pass;
+x/s/z/status/factorization and 24 iterations match exactly. Warm process medians
+are 1.517095/1.302430/1.267460/1.312772s, AB/BA speedups 1.1648/1.0357.
+The large between-process variation limits the speed estimate; no affinity was
+enforced. Inputs, source and both library hashes reverify; production unchanged.
+This exercises off-diagonal coefficient products, unlike the prior orthant
+fixture's diagonal PSD coefficients. Float64 medium and a second MPFR precision
+remain required before integration; do not claim broad SDP/Ising improvement.
+Receipts: ordinary.jl, frozen-solve.json, solve-summary.json and receipt-*.json
+in the same external experiment directory.
+
+September 17 coefficient-product qualification extension (not promoted):
+The same frozen libraries/input generator passed twelve 256-bit ordinary SDP
+solves at the unchanged 1e-42 tolerance and 1e-30 external gates. All returned
+points and 24 iterations match. Warm ABBA process medians are
+0.594515/0.565323/0.569262/0.602496s (1.0516/1.0584x).
+Float64 medium passes all eight first/warm audits with identical points and
+18 iterations, but warm ABBA times are 2.948915/6.116076/4.791032/4.575879s.
+Both pairs are slower (ratios 0.4822/0.9551), with substantial host variation.
+A late process snapshot showed the benchmark as the only CPU-heavy numerical
+process; it does not establish CPU affinity/frequency or explain the earlier
+variation. Do not attribute this entirely to noise or claim no regression.
+Production remains unchanged; no candidate adoption. Frozen identities reverify.
+Receipts: extended-summary.json, frozen-extended.json, ordinary256-*/ and
+medium-*/ under `/tmp/sdpx-coefficient-constants-20260917/`.
+Next candidate should avoid the new dynamic plan scan for hardware Float64,
+where the square-root constant is already compile-time constant. Keep one
+coefficient-product implementation with a scalar-capability branch, then test
+that revision separately; high-precision gains do not waive Float64 acceptance.
+
+September 17 coefficient-product revision 2 (accepted and integrated):
+The shared helper bypasses the new plan scan for hardware precision <=53 bits,
+where FRAC_1_SQRT_2 is constant; higher precision retains conditional per-call
+hoisting. Same arithmetic order, no new solver path/cache. All 280 exact
+Float64/128–2048-bit comparisons and 296 core tests pass. Frozen ABBA whole
+ordinary SDP runs at fixed 1e-42 tolerances and 1e-30 external gates pass all
+24 solves at 256/512 bits, with identical x/s/z/status and 24 iterations.
+512-bit warm medians: 1.410909/1.207939/1.159990/1.241474s (1.1680/1.0702x).
+256-bit warm medians: 0.888700/0.840186/0.862791/0.886167s (1.0577/1.0271x).
+Float64 medium passes all eight audits, exact returned points and 18 iterations;
+warm 4.621607/4.579073/4.524019/4.549596s (1.0093/1.0057x), essentially flat.
+Host is unpinned; these gains are fixture-specific, not broad library parity.
+Do not erase v1's regression or attribute it conclusively to the scan.
+Integrated the exact qualified production helper, rebuilt default FFI, and passed
+a 256-bit dense-coefficient SDP4 default-loader smoke with original-coordinate
+checks and known primal/dual optimum. Source/library identities reverified.
+Evidence: `/tmp/sdpx-coefficient-v2-20260917/` (screen/solve/extended summaries,
+integration-source.json, production-library.json, production-smoke.log).
+Next: independently qualify sparse Schur contractions' repeated SQRT_2, or
+profile the new baseline before a MPLAPACK SVD/provider experiment. Neither the
+ordinary dense pencil nor sampled Ising establishes sparse-path speed benefit.
+
+September 17 sparse Schur constant screen (isolated, not promoted):
+A first candidate computes SQRT_2 once per column-pair contraction after checking
+whether a diagonal/off-diagonal combination exists; Float64 skips classification.
+All 756 baseline comparisons pass (Float64/all six MPFR precisions, orders
+1/3/8, diagonal/off-diagonal/mixed columns, lengths 0/1/5/16). Same-binary
+512-bit ABBA shows approximately 1.76–1.98x on mixed/mixed lengths 4–32 and
+2.92–3.52x on diagonal/off-diagonal lengths 4–32. Single-entry off/off is
+4–7% slower; several pure-category samples also regress or vary. Nanosecond
+small cases are noisy, but do not dismiss the extra classification overhead.
+No full-solver gain or production adoption is claimed. Evidence:
+`/tmp/sdpx-sparse-constant-20260917/` (frozen source, screen-summary.json,
+core-tests.log and status.json). Revise toward once-per-block assembly constant
+preparation shared with parallel sparse lanes, removing per-pair scans before
+whole-solver qualification. Use a sparse invertible coefficient pencil with
+mixed diagonal/off-diagonal support; the dense Householder pencil from the
+previous experiment does not establish sparse-path benefit. Keep the accepted
+dense-coefficient and sampled-operator changes unchanged.
+
+September 17 sparse Schur revision 2 (isolated, not adopted):
+Replace per-pair classification by one immutable SQRT_2 owned by PsdBlock,
+initialized at that block's fixed precision (zero placeholder for orders <=1,
+where mixed coordinates cannot occur). Serial contractions and parallel sparse
+lanes receive this same scalar. No global cache or mutable shared scratch.
+All 756 exact baseline comparisons and 296 core tests pass, including existing
+parallel assembly/update coverage. Same-binary 512-bit ABBA shows 3.23–3.51x
+for diagonal/off-diagonal pairs (including one-entry pairs at 3.42/3.47x),
+1.78–2.22x for mixed/mixed lengths 4–32. Pure diagonal/off-diagonal categories
+are roughly flat (small fluctuations up to about 2%); no per-pair scan remains.
+The screen excludes one-time block setup and is not whole-solver evidence.
+Production remains unchanged. Source and screen identities reverify.
+Evidence: `/tmp/sdpx-sparse-v2-20260917/` (candidate.patch, screen-summary.json,
+core-tests.log, status.json). Next full fixture is prepared as sparse.jl:
+32-order Q*diag(x-1)*Q' using a sparse strictly diagonally dominant Q, known
+optimum x=1 and dual identity. Verify actual post-preprocessing sparse-path
+coverage and unchanged original-coordinate gates before timing/qualification.
+The script is prepared but not executed; full solver/Float64 regression pending.
+
+September 17 sparse Schur revision 2 full-solver screen (still isolated):
+The frozen 32-order sparse pencil ran with default Ruiz/presolve/chordal enabled.
+Verbose receipts show chordal expansion from 32 to 296 variables, 718 rows,
+1008 A entries and five PSD cones with svec lengths 78/406/78/78/78. Thus do
+not describe the timed problem as an untouched single 32-order block. The
+transformation introduces sparse separator columns, but exact per-block sparse
+contraction counts were not instrumented; no phase-level attribution is claimed.
+All twelve 512-bit solves pass fixed 1e-42 tolerances and 1e-30 external
+original-coordinate residual/gap/known-optimum/PSD gates. Returned x/s/z/status,
+factorization and 23 iterations match exactly. ABBA warm process medians are
+18.311634/17.512598/17.539860/17.934535s (1.0456/1.0225x). The candidate's
+whole-solver gain is much smaller than its kernel speedup. Source/input/library
+identities reverify; RSS is recorded and host affinity was not enforced.
+Evidence: `/tmp/sdpx-sparse-v2-20260917/` (frozen-solve.json, solve-summary.json,
+solve-*.log/json and receipt-*.json). Production is unchanged. Complete one
+second-precision leg and Float64 medium before adoption; use one first plus one
+warm solve per subsequent process to keep development time bounded rather than
+repeating this ~4-minute 512-bit screen. Keep the 120-second process timeout.
+
+September 17 sparse Schur revision 2 (accepted and integrated):
+Additional ABBA runs pass eight 256-bit sparse-pencil solves and eight Float64
+medium solves with exact x/s/z (or medium's original-coordinate points), statuses
+and iteration counts across arms. 256-bit warm times are
+8.289261/8.059643/12.671504/12.721206s (1.0285/1.0039x): substantial host drift,
+no repeatable >=2% gain at this precision. Float64 medium is essentially flat:
+4.557563/4.526983/4.557238/4.580696s (1.0068/1.0051x), 18 iterations. Retain
+for the preceding repeated 512-bit >2% gains, without extending that claim to
+256-bit or Float64. All frozen identities pass; 296 core tests and 756 exact
+kernel comparisons already cover the unchanged candidate. Integrated the exact
+qualified helper, rebuilt default FFI, and verified its Julia default loader.
+The new SDP8 loader smoke initially contained an invalid assertion requiring
+the particular dual identity solution, although dual optima are nonunique.
+Preserve that failed script/log. Replaced it with unchanged-tolerance external
+stationarity/gap and PSD checks; both frozen baseline and production pass with
+the same complete point hash and 16 iterations. Dual Gershgorin lower bound is
+0.578875 (>0), independently establishing PSD here. No solver tolerance or
+acceptance rule was relaxed. Production source/library identities reverify.
+Evidence: `/tmp/sdpx-sparse-v2-20260917/` (extended-summary.json,
+integration-source.json, production-library.json, both smoke logs and retained
+invalid-dual-oracle log). This closes the local constant-hoisting candidate,
+not provider replacement, large-scale accuracy or distributed qualification.
+
+September 17 MPLAPACK provider experiment (build/smoke only):
+Public upstream cloned to `/tmp/sdpx-mplapack-20260917/source`, frozen clean
+commit ddf3b4ba8ed65fa101245c472aecb8112ff32920. Built temporary MPC 1.3.1
+from the cached gmp-mpfr-sys source against the exact existing SDPX MPFR/GMP
+static libraries; project dependencies and production backend are unchanged.
+Configured CMake for MPFR only and built mplapack_mpfr_opt (1061 translation
+units); all other precision/GPU backends disabled. OpenMP is unavailable in
+this Apple Clang configuration: single-thread evidence only, no scaling claim.
+The standalone full-U/full-VT Rgesvd driver compiled/linked successfully.
+Four deterministic rational-matrix cases (256/512 bits, orders 8/16) pass
+independent Julia audits at twice the working precision: finite descending
+nonnegative singular values, relative reconstruction and U/VT orthogonality,
+threshold 1000*n*2^(1-bits). Input/output conversion is outside timing; two
+warmups and seven calls are recorded, but these are not an SDPX comparison.
+Do not infer a speedup from raw timings, which already show host/warmup drift.
+Identity/build/test receipts: identity.json, smoke-summary.json, status.json,
+configure/build logs and per-case audit logs in that directory. Next: current
+Rust provider on the exact same rounded inputs and matched ABBA scheduling,
+then ill-conditioned singular-value/NT regression and actual PSD shapes before
+any FFI/provider integration. Current smoke does not establish robust SVD or
+whole-solver equivalence. Public build documentation:
+https://github.com/nakatamaho/mplapack/blob/ddf3b4ba8ed65fa101245c472aecb8112ff32920/README.cmake.md
+
+September 17 MPLAPACK vs current Rust SVD screen (no provider change):
+Frozen current Rust provider and native MPLAPACK use identical rounded rational
+inputs, full U/VT, query-sized reused workspace, two warmups/seven measurements
+per process and sequential ABBA scheduling. Input reset/output conversion are
+outside timing; no affinity is enforced. Independent twice-precision audits
+verify exact cross-provider input equality and reconstruction/orthogonality for
+all 56 output sets: Rgesvd at 256/512 bits and orders 8/16/32/64 (32 sets),
+Rgesdd at both precisions and orders 16/32/64 (24 sets). Tests pass; this does
+not replace conditioning or whole-solver acceptance.
+For Rgesvd, current Rust is faster throughout this screen. On the less noisy
+16–64 orders Rust/native median ratios are 0.660–0.860 (roughly 14–34% less
+kernel time). The 256-bit order8 runs show marked host drift; no extra claim.
+Rgesdd improves the comparison only locally: 512-bit order32 Rust/native ratios
+1.1797/1.1475, while 256-bit order32 is only 1.0199/1.0187 and orders16/64
+remain slower than Rust. Do not select a production backend from one matrix
+family/order or assume larger matrices necessarily favor the native library.
+Evidence: `/tmp/sdpx-svd-compare-20260917/` (summary.json, summary-large.json,
+summary-dd.json, audit logs, frozen identities, provider-identity.json).
+Next capture representative actual PSD scaling matrices and test ill-conditioned
+singular values before considering a provider/algorithm switch. Production
+source/dependencies remain unchanged; no whole-solver speedup is established.
+
+September 17 SVD conditioning screen (no production change):
+Reproduce the existing graded NT fixture at each of 128/256/512/768/1024/2048
+bits: build SPD S/Z with delta=2^(-5*bits/8), apply the actual svec round-trip
+arithmetic, use current MPFR Cholesky/GEMM to construct Lz'*Ls, and export the
+rounded matrix. Compare current Rust SVD, MPLAPACK Rgesvd and Rgesdd on exactly
+that input. Also embed the block in identity32 at 256/512 bits to exercise a
+larger divided-and-conquer call. All 24 cases pass independent twice-precision
+checks: input equality, finite positive sorted singular values, reconstruction,
+U/VT orthogonality and smallest-singular-value relative error <2^(-bits/4).
+The small-value reference uses the exact rounded 2x2 input determinant and the
+stable formula sigma_min=abs(det)/sigma_max, not a working-precision Gram solve.
+The largest error/gate ratio is 1.319e-17 at 128 bits; other precisions have
+larger margins. This does not qualify native NT R/Rinv integration or arbitrary
+conditioning families. Runtime tolerances/providers are unchanged.
+Evidence: `/tmp/sdpx-svd-conditioning-20260917/` (frozen.json, build logs,
+summary.json, audit-summary.json and input/output files). First harness build
+failed on a missing Scalar trait import; corrected locally, preserving its log.
+Next: capture a small bounded set of real Ising scaling matrices at different
+iteration stages and compare those before any provider switch. Synthetic
+order32 speedups alone do not justify selecting a production dispatch threshold.
+
+September 17 actual Ising SVD capture/replay (no production change):
+Frozen production and isolated capture FFI each completed one full Ising512 solve:
+unchanged external audits pass, identical x/s/z/status and 50 iterations. The
+capture hook reads only nine predetermined non-query SVD calls (1/2/16/32/64/
+128/256/384/512), exports rounded input values, and is absent from production.
+These are call indices, not independently recorded iteration labels. Actual
+captured PSD orders are 12/13/15, so the synthetic order32 Rgesdd advantage does
+not describe this sample. No capture-run timing is a performance claim.
+Replay uses the uninstrumented frozen Rust provider, not the diagnostic routine,
+plus native Rgesvd and Rgesdd in R/V/D/D/V/R order, each with two warmups and
+seven timed calls. All 54 outputs pass independent twice-precision reconstruction
+and orthogonality audits, cross-provider input equality and positive-singular-
+value checks; cross-provider singular-value differences are recorded separately
+and are not an independent oracle. Rust/native timing ratios range approximately
+0.576–0.793 for Rgesvd and 0.582–0.784 for Rgesdd: Rust uses roughly 21–42%
+less kernel time throughout this sample. No affinity is enforced. Consequently
+do not pursue a blanket MPLAPACK SVD replacement for this Ising family. This
+says nothing about other routines, larger orders or distributed backends.
+Evidence: `/tmp/sdpx-svd-capture-20260917/` (capture-summary.json,
+replay-summary.json, singular-comparison.json, frozen identities and audit logs).
+Next prioritize remaining direction/residual costs or evaluate other provider
+kernels with measured relevance; retain actual SVD inputs for future algorithm
+work instead of repeatedly rerunning the full Ising solve. Production unchanged.
+
+September 17 refreshed current Ising512 profile (diagnostic only):
+Frozen current production includes the accepted svec, sampled, coefficient and
+sparse-Schur constant changes. Instrumentation-only deltas were recovered from
+hash-matched prior sources and applied with zero fuzz to the new snapshot;
+no old numerical source replaced current code. All 37 stage probes live outside
+the repository. Verified baseline library SHA256
+5d49d2a311e01f12bc989a501f1a5f1d3553396998ff20cbb34cb8251c980d77.
+Sequential baseline/profile processes each run first plus one warm solve, with
+240-second process caps, one thread and unchanged 512-bit/audit settings.
+All four external audits pass, 50 iterations and bit-identical x/s/z/status.
+Frozen files and production source identities pass after measurement.
+Baseline first/warm native times 29.172154/29.184779 seconds; diagnostic
+29.014780/28.966002 seconds. Unpinned host: these are phase measurements,
+not a speedup claim and not comparable with older sessions' absolute times.
+Warm profile: affine+combined direction solves 10.805392 seconds (37.3%);
+cone scaling 6.421652 (22.2%), KKT update 5.255722 (18.1%), and bounds
+4.523094 (15.6%). Nested SVD 5.720260 (19.7%), bidiagonal SVD iteration
+4.647028 (16.0%), congruence 4.331263 (15.0%), its GEMMs 4.135109 (14.3%),
+outer residual 4.031330 (13.9%), bound eigenvalues 2.464255 (8.5%).
+Do not sum nested stages with their parents. Cholesky 0.145308 (~0.5%) and
+Schur assembly 0.136748 (~0.5%) are low priorities for this particular sample;
+large-matrix Gram/FLINT and distributed hypotheses remain separate workloads.
+Next short screen: hoist immutable precision constants and sqrt(2) from the
+bidiagonal SVD loop/shift routine without changing operation association,
+deflation or convergence criteria. Replay captured actual matrices first,
+including tiny-singular-value conditioning checks; only a repeatable kernel
+benefit justifies a whole-solve candidate. Direction/congruence GEMMs remain
+the next substantial provider target, ahead of MPLAPACK Cholesky here.
+Evidence: /tmp/sdpx-refreshed-phases-20260917/ (instrumentation.patch,
+instrumentation-origins.json, source-before.json, frozen-run.json, build.log,
+summary.json and four original-coordinate audits). Production numerical source
+and dependencies unchanged; no backend promoted.
+
+September 17 SVD constant-hoisting screen rejected:
+External provider-only baseline/candidate harnesses freeze current source and
+reuse the nine actual Ising SVD inputs. Candidate computes epsilon, sqrt(epsilon)
+and sqrt(2) once per bidiagonal decomposition and passes sqrt(2) into small_shift;
+no reassociation, tolerance or deflation changes. Sequential ABBA, two warmups
+and seven measured calls per process, 30-second process caps. All 36 actual-input
+outputs are byte-identical across arms. Eight graded conditioning inputs add
+16 exact baseline/candidate outputs: 2x2 at all six 128–2048-bit precisions and
+embedded order32 at 256/512. All 52 outputs independently pass reconstruction,
+orthogonality and (for conditioning cases) tiny-singular-value relative checks
+at twice working precision. Frozen production source remains unchanged.
+Actual-input baseline/candidate timing ratios are 0.981–1.006 across the 18
+paired comparisons: no repeatable >=2% benefit; most slightly favor baseline.
+Reject the candidate without spending more full-solver timing. No production
+change. Do not infer an unmeasured code-generation or branching cause.
+The runner's final identity check mistakenly included its actively written
+run.log. Its failure is retained; finalize.py verifies every other frozen file,
+all completed per-process logs, exact outputs and all 52 independent audit
+records, then reconstructs summary.json without rerunning timing. This is a
+harness bookkeeping failure, not a numerical failure; no check was weakened.
+Evidence: /tmp/sdpx-svd-constants-20260917/ (setup.py, frozen.json, build.log,
+run.log, finalize.py, results, audit-captures.log, audit-conditioning.log,
+summary.json). Next investigate actual congruence GEMM shapes/data reuse or
+bound-eigen kernels; do not repeat this unchanged constant candidate.
+
+September 17 congruence/GEMM provider screen (no backend change):
+Source inspection rules out simply omitting the second GEMM's lower triangle:
+mat_to_svec deliberately combines upper and lower rounded entries. Replacing
+both with one triangle is not an operation-preserving optimization and requires
+its own numerical analysis, not an assumed symmetry shortcut.
+Frozen current MPFR GEMM versus the existing optimized MPLAPACK Rgemm build:
+256/512 bits, square orders12/15/32, NN/NT/TN, alpha=1/beta=0, bounded rational
+inputs constructed at working precision. Sequential Rust/native/native/Rust,
+two warmups plus seven measurements each, 30-second process caps. All72outputs
+pass twice-precision multiplication audits and exact cross-provider input checks.
+The Rust and native libmpfr.a/libgmp.a hashes match. Source and benchmark input/
+binary identities verify unchanged. Both kernels use declared working precision;
+accumulation implementations can differ, so output equality is not required.
+Across36paired comparisons Rust/native median ratios0.466–0.811: Rust uses
+about19–53%less kernel time throughout this screen. No native GEMM replacement
+is justified for these shapes. Synthetic square inputs, unpinned CPU, no setup/
+conversion timing: do not infer whole-Ising speedup or performance of large
+Schur products from this screen. Current production remains unchanged.
+Evidence: /tmp/sdpx-gemm-provider-20260917/ (frozen.json, source-before.json,
+provider-identity.json, build.log, native-build.log, run.log, audit.log,
+summary.json and72outputs). Next review reusable intermediate products in
+scaling/direction operations against mature implementations; avoid repeating
+unchanged MPLAPACK small-GEMM or constant-hoisting experiments.
+
+September 17 cached-Hessian action rejected on conditioning:
+Reviewed local Clarabel PSD mul_Hs: it retains W then W-transpose, four GEMMs;
+current SDPX follows that factored action. External candidate reuses upper-
+authoritative G=R*R-transpose, mirrors it into existing scratch, and applies
+G*X*G using two GEMMs, one implementation for every precision. The existing
+295 release core tests pass, but a new analytic directional regression rejects
+this candidate before any whole-solver timing.
+Use R=[[1,0],[1,t]], t=epsilon(T), and authoritative smat(x)=a*[[1,-1],[-1,1]],
+a=1/sqrt(2) rounded at working precision. The factored response's bottom-right
+entry is a*t^4 and is representable in every tested type. Rounded G loses t^2
+from 1+t^2, so the proposed action returns zero instead. All7precisions
+(Float64 and128/256/512/768/1024/2048) reproduce relative error1, while the
+factored reference passes the analytic relative bound. This is a directional
+conditioning test; an absolute error gate scaled by max(1,norm(y)) would hide it.
+Do not promote this candidate even though ordinary core tests pass. Add the
+seven analytic checks to production psd_hessian_tests.rs; runtime source remains
+unchanged. Evidence: /tmp/sdpx-hessian-action-20260917/ (source-before.json,
+setup.py, core-tests.log, graded-test.rs, graded-tests.log, numerical-source-
+verification.json). All seven production graded tests pass (release, both
+Accelerate and Faer features); see production-graded-tests.log.
+Next priority: the existing high-precision condensed PsdBlock::apply already
+uses a similar G/Ginv reassociation. This counterexample identifies a risk,
+not yet a demonstrated failure of a complete solve. Reproduce it specifically
+at that operator boundary and assess a conditioning-safe factored fallback;
+do not extend the shortcut or infer an Ising failure without evidence.
+Reference: https://docs.rs/clarabel/latest/src/clarabel/solver/core/cones/psdtrianglecone.rs.html
+
+September 17 condensed fixed-precision conditioning repair (accepted correctness):
+Reproduced the analytic counterexample at the actual PsdBlock::apply boundary,
+using consistent R/Rinv pairs, both forward and inverse actions. Float64 passes;
+all six MPFR precisions lose the tiny response on the existing two-GEMM Gram
+shortcut (12failed action checks). This is an operator-level correctness failure,
+not a claim that previous Ising results failed their original-coordinate audits.
+Restore the existing four-product factorized action at every precision. Delete
+the precision-specific fast path, the unused G cache and its update work, and
+avoid forming Ginv for sampled blocks that no longer consume it. Ordinary Schur
+assembly still uses its required Ginv and existing regularization/refinement;
+this repair does not establish that every ill-conditioned Schur problem is solved.
+Seven new regression tests exercise14directional cases including Float64. All
+309release core tests pass, including serial/pooled paths and the prior seven
+PSD Hessian regressions. One implementation now serves all precisions.
+Frozen same-session sequential baseline/candidate/candidate/baseline Ising512
+acceptance: all four original-coordinate audits pass,50iterations each. First
+solve native median28.979713→31.226579seconds (+7.75%); process caps240seconds,
+one thread, no affinity. Retain as a correctness repair, explicitly not a speedup.
+Source/dependency/input/library identities pass; exact point identity is not
+required for the changed arithmetic association. Production source now equals
+the tested candidate; matching FFI library installed from the frozen build.
+Evidence: /tmp/sdpx-condensed-conditioning-20260917/ (baseline-tests.log,
+candidate-tests.log, candidate-build.log, frozen-run.json, summary.json,
+source-before.json, integrate.py, production-library.json). Default-loader
+256-bit ordinary-SDP smoke passes: known primal optimum, PSD dual bound,
+stationarity, feasibility and gap at unchanged external tolerance;16iterations.
+See production-smoke.log; production-library.json identifies the current DLL.
+Use this repaired baseline for all further speed claims. Existing unmatched
+older benchmark numbers do not describe the repaired engine. Remaining broad
+accuracy/large-instance and cluster publication/scaling work stays open.
+
+September 17 Sturm-cache screen rejected for whole-solve performance:
+Confirmed step bounds already request eigenvalues only and indexed minimum at
+high precision; there is no unnecessary eigenvector construction to remove.
+Candidate caches the immutable tridiagonal tiny-pivot scale once and reuses
+unchanged endpoint Sturm counts during isolation. Existing RQI safeguards,
+final counts, 32-step budgets and QL fallback remain unchanged. No new tolerance,
+precision change or cache surviving a call. All309core tests pass.216comparisons
+at all six MPFR precisions, orders1/2/3/12/15/32, repeated/random spectra and
+first/middle/last indices preserve exact Option eigenvalues and both iteration
+counters. Same-binary512-bit kernel ABBA speedups: order12 1.332/1.287,
+order15 1.248/1.246, order32 1.378/1.386. Kernel screen includes10calls/sample,
+two warmups and five measured samples per arm; synthetic tridiagonals only.
+Full repaired-baseline Ising512 ABBA:53.385811/50.970108/51.989464/51.231799s.
+All4original-coordinate audits pass,50iterations and exactly equal x/s/z/status.
+Paired speedups1.0474/0.9854; median52.308805→51.479786s is only1.58%lower
+and not repeatable >=2%. Reject production integration; do not repeat unchanged.
+No affinity; do not compare these absolute times with earlier sessions. Source,
+inputs and binaries verify unchanged, and baseline DLL matches the accepted
+condensed-conditioning repair. Production source/library remain that repaired
+baseline. Evidence: /tmp/sdpx-sturm-cache-20260917/ (source-before.json,
+core-tests.log, screen-mpfr.rs, screen.log, screen-summary.json, frozen-run.json,
+ffi-build.log, summary.json and4raw/audited outputs). integrate.py was prepared
+with the paired threshold assertion but was not run.
+Next inspect availability of the larger Ising accuracy fixture and use a bounded
+screen of the repaired factorized path against its prior failure. This will
+inform accuracy work before further small-kernel optimization or multicore claims.
+
+September 17 larger Lambda11 saved-point scaling replay (no full solve):
+Old qualified input and iteration94point are locally available. Old768-bit,
+8-core solve used1287.85native seconds and failed the unchanged external audit;
+a fresh long solve is deferred until a bounded diagnostic supplies a hypothesis.
+At768bits, compile the unchanged sampled input, verify SHA
+bb1fa49da0d461ebba2b9539412222e5dc134553dfad8f7bc128b23acf61ed1d, and extract
+original-coordinate s/z into28PSD blocks of orders36–43. Record raw-point,
+fixture and current repaired source/binary hashes. This is not a replay of
+internal equilibrated solver state, previous step directions or the full solver.
+Current direct-SVD NT scaling succeeds on all28blocks; R/Rinv and84actions
+are finite. Probe each block with z, s and deterministic signed rational entries.
+Compare factorized Hs action with cached-G congruence and measure Hs*z versus s.
+Largest norm-relative action discrepancy2.200892e-167; largest NT identity
+residual2.314896e-167, both in block0/order36 with z. These norms do not bound
+all near-null directions and do not undo the analytic regression requiring the
+factorized path. Nor do they attribute the original external~2.16e-22 residual
+to scaling: no comparable scaling defect appears at this saved point.
+Diagnostic runtime7.8459seconds, peak process RSS25,198,592bytes,180-second cap.
+All frozen source/input/binary identities pass; production unchanged. Initial
+harness compilation lacked concrete num_traits imports; corrected, preserving
+build-initial.log. Evidence: /tmp/sdpx-lambda11-scaling-20260917/ (export.jl,
+input.json, source-before.json, frozen.json, replay.log, receipt.json,
+summary.json). This is new conditioning evidence, not new Lambda11 acceptance,
+performance credit or proof that the recent repair fixes its old failed solve.
+Next focus on the recorded gap between global normalized runtime residuals and
+component-relative sampled audits at enormous primal multipliers. Any exact
+model transformation or stricter-tolerance study must preserve original external
+gates and be labeled separately from the existing matched1e-42protocol; no
+retired independent runtime certificate or pointwise tolerance guarantee.
+
+September 17 exact variable-unit diagnostic (new hypothesis, not integration):
+Evaluate x=D*xhat, Ahat=A*D, qhat=D*q, unchanged b/s/z on the saved Lambda11
+point at768bits. Every D diagonal is a positive power of two derived from input
+coefficients, with no approximate rank change. Four choices: identity, uniform
+2^256, inverse column-norm exponent, inverse abs(q) exponent (zero q falls back
+to its A column norm). Recomputed sparse products verify exact Ahat*xhat=A*x,
+Ahat-transpose*z=D*(A-transpose*z), inverse variable mapping and objective dot
+product. All coefficients remain finite at working precision. Existing global
+feasibility formulas and1e-42tolerance are unchanged; norm reductions in this
+Julia diagnostic model the formula and are not a bitwise Rust runtime replay.
+Identity: dual6.4426e-142, passes. Uniform256: dual3.9533e-64, still passes.
+Column-norm scaling: dual7.7598e-122, still passes. Objective-based powers
+(exponents -3..305): dual1.737148e-24, rejects this previously accepted point;
+primal1.4172e-89 still passes. norm(xhat)8.0080e26, norm(qhat)1.9987 versus
+original norm(x)8.1775e78. This exposes one failure without adding a runtime
+certificate, changing a convergence test or tightening its tolerance.
+Important cost: maxabs(Ahat)=7.6339e67 versus10.1398original; objective-based
+units may damage factorization conditioning. This single saved-point result is
+not a guarantee of componentwise accuracy, better convergence or throughput.
+Do not set new defaults or tune exponents against the failed point. Next qualify
+exact sampled-factor scaling and bounded factorization/solve screens, followed
+by independent LP/SOCP/SDP holdouts before any production policy. Full Lambda11
+and matching SDPB acceptance remain outstanding.
+Evidence: /tmp/sdpx-lambda11-units-20260917/ (check.jl, frozen.json,
+summary.json, receipt.json);24.19seconds process wall, peak RSS2,299,543,552bytes,
+120-second cap. No new solve or production changes. Original input SHA and
+saved-point SHA are recorded; unchanged helper/runtime formula hashes verified.
+
+September 17 objective-unit cross-family/representation qualification:
+Use catalog-verified exposed development fixtures LP_afiro, SOCP_sambal and
+SDP_truss1; no reserved holdout consumed. The accepted repaired DLL and copied
+Julia frontend are frozen. Baseline/objective-power units each solve all3cases
+at Float64 (internal1e-8, external1e-6) and256bits (internal1e-42, external1e-30),
+with defaults on, one thread,200iterations,20-second native/40-second process
+caps. Map x back before checking returned-slack feasibility, primal/dual cones,
+stationarity and objective gap. P is confirmed zero; this experiment does not
+claim QP support. Objective dot products map exactly at returned points.
+All12effective cases pass. Iterations baseline→units: Float64 LP8→7, SOCP11→11,
+SDP11→11;256-bit LP25→24, SOCP46→46, SDP49→49. Exponents only -3..2 here;
+these small fixtures do not establish stability at Lambda11's -3..305 range.
+One sample per arm, no interleaving or per-process memory study: no performance
+or memory claim. Two original256-bit SDP audit executions failed because Julia
+BigFloat eigmin requested an unsupported indexed eigvals method. Keep those logs;
+audit v2 uses minimum(eigvals) at the same precision/gate. Only the two affected
+cases were rerun;10unaffected receipts reused,14total solver invocations. No
+numerical threshold weakened. Evidence: /tmp/sdpx-units-screen-20260917/
+(frozen.json, original summary/results, check-v2.jl, repair/, final-summary.json).
+
+Separately qualify Lambda11's Julia factor-authoritative representation: multiply
+linear CSC columns and each sampled block's weights by the same exact powers,
+leaving bases/rows/cones unchanged. At768bits, all28blocks and1099variables retain
+exact forward and adjoint products under the coordinate map for the saved point,
+deterministic signed probes and coordinate probes (three pairs). No approximate
+factor replacement or dense PSD input introduced. This tests Julia reference
+products only, not the Rust operator, KKT factorization or fresh solve. Runtime
+21.52seconds, peak RSS2,259,828,736bytes,120-second cap; all frozen helper/data
+identities pass. Evidence: /tmp/sdpx-units-factors-20260917/ (factor-products.jl,
+check.jl, frozen.json, summary.json, receipt.json). Production unchanged.
+The bounded native screen has now completed (768bits, one thread, default
+preprocessing, max_iter1, native30s/outer90s limits). Both processes exited0;
+44 frozen file identities revalidate unchanged. Baseline reports Solved at
+iteration0 in13.4702 native seconds, but original-coordinate infinity residuals
+are primal46.0155 and dual92.2868. Its returned primal vector has 2-norm2.0301e78;
+the internal normalized residuals are only5.5995e-76/2.5994e-76. This is not an
+accurate solve or a performance result. The convergence/is_solved bodies match
+the local Clarabel reference exactly, including the kappa/tau<=1 condition;
+do not replace those criteria with the retired independent runtime gates.
+
+Objective units terminate at iteration_limit1 in34.7785 native seconds, with
+original infinity residuals52534.4/32.6660 and internal dual residual1.5709e37.
+The native time limit is checked at solver boundaries, not a hard process cap;
+the90-second process cap was respected. Process peak RSS is3,192,750,080 and
+3,525,443,584bytes respectively, including Julia and external diagnostics.
+Neither arm earns accuracy or speed credit. Do not promote objective scaling:
+it avoids this immediate Solved outcome but has not established conditioning
+or convergence. Preserve the earlier path-resolution failures and both points.
+Evidence: /tmp/sdpx-units-native-20260917/ (summary.json, review.json, frozen.json,
+logs and raw points). Production remains unchanged. Next isolate initialization
+and input scaling against the authoritative sampled operator before any long
+Lambda11 or backend performance campaign; retain original-coordinate audits.
+
+External residual replay isolates the iteration0 anomaly further. At768bits,
+recompute both saved returned points using the Julia sampled-factor operator
+and separately the original CSC matrix. Baseline forward/adjoint infinity
+differences are1.55e-174/1.73e-228; objective-unit returned point differences
+are1.54e-171/2.89e-229. Both representations reproduce the large absolute
+residuals. Baseline factor-normalized residuals reproduce the native reported
+5.5995e-76/2.5994e-76 to rounding accuracy, while primal/dual costs both round
+to approximately-61.0083. Thus the observed outcome is explained by the large
+norm denominator and tiny objective gap, not a CSC-versus-factor discrepancy
+at these points. This is an external Julia replay, not general native-operator
+qualification. Candidate residuals in this replay use original variable units
+and must not be compared directly with its transformed native residuals.
+Runtime11.68seconds,90-second cap, frozen inputs/helpers unchanged; no solve or
+production change. Evidence: /tmp/sdpx-initial-residual-20260917/.
+
+Code review: symmetric default_start solves two KKT right-hand sides when P=0,
+then shifts s/z into cone interiors and sets tau=kappa=1. The existing unit
+initializer instead sets x=0 and cone unit s/z. Next isolated hypothesis:
+screen this existing unit initializer for the symmetric sampled problem to
+avoid the huge KKT-derived starting x, without changing stopping criteria,
+precision or the operator. A successful first step is insufficient: require
+bounded convergence plus original-coordinate acceptance and cross-family
+regression before considering any default initialization policy.
+
+Unit-start candidate screened in /tmp/sdpx-unit-start-20260917/: frozen current
+source, one isolated change replacing default_start with the existing unit
+initializer for all cones. Release core tests pass308/309. The dependent-equality
+bordered-refinement regression returns PrimalInfeasible but fails its external
+A' z ray-residual requirement (1e-8 times ||z||inf). The exact failing test
+reproduces twice in the same compiled binary. This is a QP with a PSD block and
+dependent equalities; it rules out unconditional unit initialization as a general
+default, not every possible LP-specific initialization policy. Preserve this
+regression and its gate. Build driver stopped before FFI construction, so there
+is no Lambda11 result for this candidate. All production source files still
+match the pre-experiment snapshot. Candidate patch, build/test logs, repeated
+failure logs and binary identity are retained with decision.json. Next study
+an initialization strategy specific to P=0, with this QP path unchanged, and
+qualify it on the full affected family before changing defaults.
+
+P=0-only initialization screen: /tmp/sdpx-linear-unit-start-20260917/ changes
+only solve_initial_point's linear-objective branch to zero x/s/z before the
+existing symmetric cone-interior shift. QP initialization and stopping rules
+are unchanged; initial identity KKT factorization is still performed. All309
+release core tests pass and FFI builds. The verbose Lambda11 run exposes an
+existing formatter panic: info_print.rs assumes LowerExp always contains 'e',
+whereas MpFloat delegates to Display (zero/nonfinite strings can lack 'e').
+Original failure scripts/logs/receipts are preserved in verbose-failure/.
+
+With only verbose disabled, the same candidate completes one iteration at
+768bits/one thread, status iteration_limit, finite point, native16.4632seconds,
+process26.3773seconds, RSS3,814,473,728bytes. Original infinity residuals are
+primal4.18362 and dual82.57425; relative gap1.99865. Internal residuals again
+become tiny (7.19e-76/8.99e-75), so avoiding iteration0 Solved has not repaired
+the normalization problem. No accuracy or speed credit and no production
+integration. Next fix the independently exposed diagnostic formatter, then
+use a bounded multi-iteration screen to test whether this initializer provides
+real convergence rather than merely delaying premature termination. Frozen
+identities passed; preserve both failed and successful process receipts.
+
+Follow-up: fixed the independent logging defect in production source by
+preserving exponent-free MPFR displays in _exp_str_reformat. Two focused release
+tests pass: real MpFloat768 formatting for signed zero/Inf/NaN and existing
+exponent sign/padding behavior. Initial test compilation used a private parsing
+helper; corrected to public FromStr, retaining both compile logs at
+/tmp/sdpx-formatting-tests[-retry]-20260917.log. No numerical behavior changes;
+the installed FFI library has not yet been rebuilt with this display-only fix.
+
+The frozen P=0 initialization candidate (still verbose=false and independent of
+the formatting patch) was screened at max_iter6/native60s/outer90s,768bits and
+one thread. It exceeded the outer cap and was terminated after90.1845seconds;
+process RSS3,752,624,128bytes. No result/point was returned, so neither iteration
+count nor residual progress is established. Preserve the timeout as a failed
+screen, not a solve-time estimate. Source/environment identities pass after
+termination. Evidence: /tmp/sdpx-linear-unit-multistep-20260917/ (summary.json,
+frozen.json, scripts and logs). Do not extend this unchanged long run: first
+add the qualified display fix to the isolated candidate and obtain bounded
+iteration-stage diagnostics. Initialization remains experimental and unmerged.
+
+Bounded stage diagnostic completed in /tmp/sdpx-unit-stage-20260917/. Same frozen
+P=0 candidate plus the qualified display fix and external-only elapsed probes;
+768bits/one thread, max_iter6/native60s/outer90s. Verbose iteration0 now prints
+without panic. Four steps complete before the90.1073s outer timeout; last event
+is scaling_begin at iteration4. No returned point or full-accuracy credit.
+RSS3,849,601,024bytes; all frozen identities pass. The log establishes forward
+progress, not a stuck factorization. Completed cone scalings after first step
+take3.60–3.72s; KKT updates for steps2–4 take6.11/2.95/6.20s, affine direction
+spans3.58/3.60/6.77s, affine bound spans~1.10s, residual products~0.65s.
+These are instrumented, unpinned observations, not interleaved speed evidence;
+stage counters omit combined-solve/bound separation. Relative gap progresses
+2.00,2.35,5.96,0.453 through steps1–4, while normalized residuals remain tiny.
+Unit initialization postpones the incorrect immediate acceptance but has not
+demonstrated convergence or solved original-coordinate accuracy. Do not keep
+repeating this screen unchanged. Review coefficient/variable-unit conditioning
+and mature initialization strategies before another full-size run; preserve
+the existing test gates. Receipt, parsed stages.json, source and raw logs remain
+outside the repository. Production initialization is still unchanged.
+
+Local reference review changes the next hypothesis. Hypatia initializes cone
+points and obtains x from QR/LSQR least squares (Solvers/process.jl), rather
+than using an all-zero x universally. Its optional numerical-rank preprocessing
+must not be copied under our no-approximate-rank-reduction contract. COSMO's
+Ruiz scaling follows a similar norm-based pattern and does not establish a
+cure for the huge legitimate Lambda11 multipliers. Existing sampled frontend
+also contains a Gram/free-variable formulation, but switching blindly would
+discard the compact sampled Schur advantage.
+
+Algebraic dual-orientation replay at768bits: take x_d=z, q_d=b,
+A_d=[A';-selector_PSD], b_d=[-q;0], s_d=[0;z_PSD], z_d=[-x;s_PSD].
+The zero-cone dual coordinates stay free; PSD coordinates are orthonormal svec.
+For the same iteration0 point, the equivalent dual's normalized primal residual
+is0.0936146 rather than2.5994e-76, so the unchanged Clarabel stopping criteria
+reject it. The objective-scaled returned point similarly gives2.66345e-4.
+Residual mapping identities pass; no full cone/solution audit or native solve.
+The equivalent dual has22,196variables and23,275constraints instead of1,099
+variables, so explicit generic dualization is not yet a performance proposal.
+This is a mathematical dual in svec units, not execution of the older Gram
+compiler (which stores unscaled upper triangles). A useful next design must
+preserve sampled block elimination while choosing a numerically appropriate
+orientation, rather than introduce another dense solve or relax accuracy gates.
+Replay12.10seconds under90-second cap, source hashes unchanged; returned-point
+hashes verified against the prior frozen replay receipt. Evidence:
+/tmp/sdpx-dual-form-replay-20260917/ (summary.json, reference-review.json,
+frozen.json, receipt.json, scripts). No production numerical change.
+
+Dual KKT elimination prototype: split original A=[B;C] into equality and PSD
+rows. For dual variables (u,v) and multipliers (lambda,eta), the unregularized
+Newton equations reduce to [0 B; B' -C'HC]*(u,lambda), with v/eta reconstructed
+by block actions. Thus the reduced order is n+k (Lambda11:1099+20), not the
+explicit dual's22,196-variable dimension. This is an algebraic feasibility
+result, not a new integrated backend or an established speedup.
+
+Diagonal regularization requires care. With primal shift dp and dual shift dd,
+J=H+dd*I, W=(I+dp*J)^(-1), T=J*W. The exact reduced matrix becomes
+[dp*I B; B' -(C'TC+dd*I)], with corresponding W/T RHS and backsubstitution.
+An external Julia prototype compares this elimination against full dense KKT
+LU for48cases (256/512/768bits, regularized/unregularized, ordinary and graded
+SPD metrics); all solution-difference and original-system RHS-residual checks
+pass at sqrt(eps) diagnostic bounds. It takes2.54seconds under60-second cap.
+No mixed precision, solver tolerance change or rank reduction. These synthetic
+kernel checks do not establish cone scaling or full conic convergence.
+
+Do not implement this by blindly swapping R/Rinv in SampledBlockWorkspace:
+T generally loses the congruence structure used by the primitive Gram formula.
+An exact rational 2x2 diagonal example G=diag(2,3), dp=1/16, dd=1/32 shows
+t(4)*t(9)!=t(6)^2, so a single diagonal congruence cannot represent T.
+Next resolve regularization/refinement at the reduced-system level while
+preserving original-operator accuracy and the current numerical contract before
+building a shared dual-orientation kernel. Evidence:
+/tmp/sdpx-dual-schur-20260917/ (check.jl, summary.json, receipt.json,
+regularized-congruence-counterexample.json). Production unchanged.
+
+Reduced-only regularization prototype now tested against original dual KKT
+residuals at the same working precision. Retain H and sampled congruence actions;
+factor only [delta*I B; B' -(C'HC+delta*I)], reuse that factor for correction
+solves, and evaluate the full unregularized operator for refinement. Diagnostic
+uses the existing MPFR linear-default scale sqrt(eps)*sqrt(sqrt(eps)), maximum
+10corrections and stop ratio5; no precision changes. This is an algebraic LU
+prototype, not native QDLDL/dynamic-pivot or solver-status qualification.
+
+Across48cases (256/512/768bits, four spectral grades and four RHS seeds), all24
+ordinary/moderately graded cases meet the linear residual target in0–1corrections.
+The24strongly graded cases stall. Crucially, a follow-up full-KKT LU comparison
+also fails the same strict RHS residual target on all24of those cases: do not
+attribute every failure to reduced regularization. At the extreme grade the
+regularized direction can still differ substantially from full LU, so common
+audit failure is not evidence of numerical equivalence or safe acceptance.
+This supports feasibility on well-resolved systems but does not qualify
+Lambda11, replace its original-coordinate audit, or authorize a new runtime
+gate. Next implement a bounded native operator/Schur orientation prototype with
+existing refinement and explicit ill-conditioned regression coverage; avoid
+assuming that regularization changes alone cure representational scaling.
+Evidence: /tmp/sdpx-dual-refinement-20260917/ (48case summary, histories,
+full-LU residuals, source identities and receipts). A script initially used
+BigInt for a negative power; corrected to BigFloat before completed measurements,
+with failed script/log preserved. Each completed run takes about2seconds under
+60-second caps; no production numerical change.
+
+Native orientation qualification: four isolated Rust tests pass for Float64,
+256/512/768bits, polynomial block dimensions1/2/3 with signed/zero weights and
+noncommuting SPD slack pairs. Build real NT cone scaling; compare every sampled
+Gram entry against materialized coefficient columns contracted with the native
+factored cone.mul_Hs action. The existing workspace needs L=R' for C'HC;
+passing R without transpose is deliberately tested and distinguished by every
+fixture. This validates reuse of the existing GEMM/SYRK/primitive-entry kernel,
+not complete dual Newton directions, severe conditioning or conic convergence.
+Evidence: /tmp/sdpx-dual-native-20260917/ (test.rs, test.log, source snapshot,
+source-before.json, review.json). Tests run0.01seconds after release compilation;
+all production source hashes match the snapshot. No new production backend.
+
+A simpler next native adapter may reuse CondensedKKTSolver itself. For original
+A=[B;C], construct surrogate PSD scaling H_surrogate=H_dual^(-1) by swapping
+the cone s/z inputs. Given dual RHS (r_u,r_v,r_lambda,r_eta), solve the existing
+system with bx=-r_lambda-C'*r_eta and bz=[r_u;r_v]. Its outputs (lambda,t_B,t_C)
+map to u=-t_B, v=-t_C-r_eta, eta=C*lambda-r_v. Algebra gives the exact
+unregularized dual Newton equations. Existing reduced regularization/refinement
+can remain shared, but the reconstructed original dual residual must be
+qualified externally; transformation can amplify rounding. Test this complete
+direction mapping before adding another solver class or promising a full
+Lambda11 improvement. In particular, the NT scaling swap and recovery signs
+need native fixed-precision checks, not inference from the Gram test alone.
+
+Complete native direction mapping now passes4tests/48direction cases: Float64,
+256/512/768bits; ordinary CSC and factor-authoritative sampled paths; two
+noncommuting PSD scaling updates and three known-solution RHS per path.
+Construct the same CondensedKKTSolver with zero P, swap s/z for its surrogate
+scaling, retain default regularization/refinement, transform RHS and recover
+(u,v,lambda,eta) as above. Check recovered directions against the generating
+solution and the original dual KKT equations at16*sqrt(eps) external test bounds.
+Both paths pass; test execution0.01s after release compilation. This supports
+sharing the existing factorization and refinement implementation rather than
+maintaining a second Schur solver. The prototype remains test-only, outside the
+repository: /tmp/sdpx-dual-direction-20260917/ (test.rs, test.log, source-before.json,
+source snapshot, review.json). All production source hashes remain unchanged.
+
+Remaining before dual-orientation integration: mapping the homogeneous embedding
+(tau/kappa, constant RHS and objectives), accepted-iterate/status/ray recovery,
+scaling and preprocessing coordinates, and preserving efficient sampled
+forward/adjoint application without constructing the large explicit dual A.
+The48direction cases do not prove any of those, severe-conditioning robustness,
+or full Lambda11 convergence. Start with small explicit primal/dual reference
+problems to verify embedding and recovery, then introduce the matrix-free
+orientation adapter while retaining this native direction test as an oracle.
+
+Explicit conic dual recovery screen passes15paired fixtures/30native solves:
+Float64/256/512bits; LP/SOCP/SDP with known optimum1, plus primal-infeasible
+and unbounded LP examples. Standard solver, default structural preprocessing
+and Ruiz, one thread, unchanged1e-8/1e-42 internal tolerances and1e-6/1e-30
+external gates; max150iterations/native5seconds per solve,60seconds total cap.
+For optimal dual results recover x=-z_d[equality], s=[0;z_d[cone]], z=x_d;
+check original affine equations, both cone memberships, objective gap and known
+optimum. For rays, swap primal/dual infeasibility interpretation and verify
+normalized original ray equations, cone membership and strictly signed objective.
+All mapped checks pass,4.50seconds total, frozen scripts/library unchanged;
+frontend/environment identities match the prior frozen receipt. No speed claim.
+Evidence: /tmp/sdpx-dual-conic-20260917/ (summary.json, frozen.json, receipt.json,
+environment-review.json, scripts and logs).
+
+This uses the explicit dual with the existing standard HSD solver; it validates
+these endpoint/recovery contracts, not a custom embedding, arbitrary infeasibility
+pathologies, or the compact sampled adapter. Original-arm statuses were checked;
+the detailed external checks here apply to the mapped dual outputs. No production
+dualization policy or source change. Next connect the already-tested mapped KKT
+solve to an orientation-aware data/operator representation, preserving physical
+cone coordinates, preprocessing reconstruction and accepted-iterate recovery.
+
+Adapter scaling prerequisite verified: explicit dual Ruiz can change the PSD
+selector from -I to -D with nonuniform positive diagonal D. Do not disable Ruiz
+or incorrectly treat that selector as identity. If the top equality block is
+[B';C'], absorb D into Cbar=D^(-1)C and solve the surrogate with Abar=[B;Cbar],
+bx=-r_lambda-Cbar'*r_eta, bz=[r_u;D^(-1)r_v]. Recover
+u=-t_B, v=D^(-1)(-t_C-r_eta), eta=Cbar*lambda-D^(-1)r_v.
+This preserves the PSD H action; no dense D^(-1)HD^(-1) representation is needed.
+
+Native nonuniform-diagonal direction tests pass4tests/48cases across Float64,
+256/512/768bits, ordinary/sampled paths, two scaling updates, identity,
+power-of-two and rational diagonals. Recovered directions and all four original
+KKT equation groups meet the same16*sqrt(eps) test bounds. No production source
+changes; execution0.00s after release build. Evidence:
+/tmp/sdpx-dual-diagonal-20260917/ (test.rs, test.log, snapshot, review.json).
+These are constructed diagonal fixtures, not actual Ruiz/preprocessing end-to-end
+qualification. The orientation adapter still needs connection to the standard
+solver loop; preserve this distinction from the earlier explicit-dual solves.
+
+First full-loop mapped adapter now implemented and passes an isolated screen:
+/tmp/sdpx-dual-adapter-20260917/. A test-only KKTSolver wrapper recognizes the
+explicit dual's leading equalities and diagonal PSD selector after the standard
+constructor's preprocessing/equilibration; reconstructs the small surrogate A;
+uses inverse NT factors from current cones; and delegates factorization and
+refinement to CondensedKKTSolver. DefaultKKTSystem, homogeneous embedding,
+initialization, step selection, convergence and solution recovery are unchanged.
+The private test-only scaling helper copies only factors consumed by condensed;
+it is not a generally initialized cone and must not escape to other consumers.
+
+Three tests/18complete solves compare standard versus mapped backend for a
+known-optimum2x2SDP across Float64/256/512bits, three positive selector scales
+and nonuniform variable units. Default Ruiz, presolve and chordal settings stay
+enabled. Both arms solve every case; paired iteration counts match (5–6 at
+Float64,22–23 at high precision). Original-coordinate equations, objective=-1,
+gap, recovered primal optimum1 and PSD membership checks pass at1e-6/1e-30
+external gates; internal tolerances remain1e-8/1e-42. Test execution0.04seconds
+after57.75s release compilation; not timing evidence. Initial build missed a
+CoreSettings import; corrected with initial-build-failure.log preserved.
+Production source hashes match pre-experiment identities; no adapter integrated.
+
+Limits: this prototype still materializes explicit dual data, covers only PSD
+selectors and fixed P=0, and explicitly rejects update_A rather than claiming
+prepared-update support. It has no large sampled input, multi-block/free-variable
+or adapter-specific ray qualification yet. Next expand those contracts on small
+fixtures, then connect factor-authoritative sampled operator metadata to avoid
+large explicit dual matrices. Do not count the18solves as Lambda11 qualification
+or a demonstrated performance improvement. Source, adapter.rs, test.log and
+review.json retain the exact implementation and results outside the repository.
+
+Mapped-adapter contracts expanded: three further tests/18complete solves pass
+for Float64/256/512bits. A two-block2x2SDP with a retained free dual variable
+and coupled primal equality has known optimum4; additional trace-inconsistent
+and improving-ray SDP fixtures test both infeasibility directions. Standard
+and mapped backends match statuses and iteration counts in every pair. Check
+original mapped affine/stationarity equations, gap, known optimum, PSD principal
+minors, and normalized ray equations plus strict objective sign. Assert the free
+variable survives preprocessing rather than silently testing only k=0. All
+default preprocessing/equilibration settings remain enabled;1e-6/1e-30 external
+gates unchanged. Execution0.06s after58.83s release build, no timing claim.
+
+Evidence: /tmp/sdpx-dual-adapter-contracts-20260917/ (extra.rs, source snapshot,
+test.log, review.json); initial Rust comparison-token typo preserved in
+initial-build-failure.log. Production source identities unchanged. These
+small PSD fixtures qualify more adapter contracts but not arbitrary cone types,
+prepared data updates, poor conditioning or large sampled problems. Next attach
+factor-authoritative operator metadata: dual forward/adjoint products should
+reuse original sampled transpose/forward products and selector operations,
+with equilibration represented explicitly. Do not regenerate approximate factors
+from rounded CSC or assume nonuniform dual-variable scaling preserves a simple
+PSD congruence inside the original sampled operator.
+
+Factor-authoritative dual product prototype implemented outside production:
+E*[A';-selector]*D reuses the original SampledOperator transpose for its upper
+forward rows and its forward product for the adjoint. Diagonal scaling and
+selector terms use persistent input/output scratch; original factors are never
+regenerated from CSC. No explicit dual matrix is built inside these products.
+The explicit CSC exists only in test reference construction. Four native tests
+pass at Float64/256/512/768bits:96forward/adjoint pairs and24adjoint identities,
+two overlapping-column PSD blocks, polynomial dimensions1/2/3, signed/zero
+weights, identity/nonuniform rational scaling, four alpha/beta combinations,
+and repeated workspace reuse with input immutability checks. External comparison
+uses the existing4096*eps scale bound; this is operator qualification, not
+bitwise equivalence to differently associated materialized arithmetic.
+
+Evidence: /tmp/sdpx-dual-operator-20260917/ (test.rs, test.log, snapshot,
+review.json). Execution0.00s after release compilation; production source
+identities unchanged. Arbitrary nonuniform row scales in these algebra fixtures
+do not authorize non-cone-preserving Ruiz scaling. Next connect the tested
+product metadata to DefaultResiduals and the mapped KKT adapter together;
+retain standard cone-compatible equilibration, preprocessing and solution
+recovery. A full solver that still uses CSC residuals must not be described
+as factor-authoritative merely because its Schur backend uses sampled factors.
+
+Combined factor-loop prototype now passes3tests/6complete solves at
+Float64/256/512bits. In the isolated source, DefaultResiduals receives the
+tested dual product workspace; forward/adjoint invocation counters confirm it
+is actually used. The mapped KKT wrapper's RHS/recovery products and its inner
+CondensedKKTSolver use a scaled copy of the same original sampled factors.
+Column factors are the dual equality-row equilibration; PSD row factors are
+inverse dual cone-row equilibration (verified uniform per block); free rows
+retain their dual variable scales. No factors are fitted to rounded CSC data.
+
+The fixture has one free dual coordinate, a2x2PSD block, nonorthogonal rank-one
+sample bases and a trace constraint with known original optimum1. Default
+preprocessing/Ruiz/chordal settings remain enabled and structural dimensions
+are asserted unchanged for this fixture. Standard versus factor-backed arms
+both pass original factor-operator equations, objective/gap and PSD checks at
+1e-6/1e-30; iteration counts match (5Float64,22at256/512bits). Internal gates
+remain1e-8/1e-42. Test execution0.02s after release build, no timing claim.
+Evidence: /tmp/sdpx-dual-factor-loop-20260917/ (test.rs, isolated residual/operator/
+adapter source, test.log, review.json). Production source hashes unchanged.
+
+The test still materializes explicit dual A for the standard setup/preprocessing
+and baseline; it does not establish end-to-end matrix-free setup or memory gains.
+The hooks are test-only and prepared data updates remain unsupported. Before
+large Lambda11, provide a bounded constructor path that installs the compact
+backend without first constructing an expensive generic dual KKT, then validate
+larger factor data with actual equilibration and original-coordinate audits.
 
 Accepted runtime dispatch preserves the arithmetic implementation and checks AVX2
 and FMA before entering the specialized kernel, retaining the portable fallback.
@@ -2059,3 +3433,182 @@ protocol/holdout updates and associated documentation; retain known accuracy,
 large-instance and distributed-scaling limitations above. No rejected candidate,
 local binary, temporary timing artifact, credential or sibling repository is
 included. Local logs: `/tmp/sdpx-publication-20260916-*.log`.
+
+
+### September 17 compact dual constructor: first real Lambda11 step
+
+The isolated constructor now selects the existing condensed solver through the
+mapped dual adapter before constructing a generic KKT backend. Constructor-only
+qualification passed3tests/6solves (Float64/256/512); evidence:
+`/tmp/sdpx-dual-constructor-20260917/test.log`. No production integration.
+
+The first real768-bit Lambda11 screen exposed non-bit-identical cumulative Ruiz
+row scales within PSD blocks. The strict uniform-factor assertion failed before
+solve; do not relax it or turn off Ruiz. Preserve the compile failure (missing
+One/Zero imports), successful retry and failed run in
+`/tmp/sdpx-dual-lambda11-native-20260917/`. Process7.083s, peakRSS2426732544bytes;
+all192frozen identities passed. This is a fixture/integration failure, not a
+solver convergence result.
+
+A separate isolated candidate follows existing install_sampled's exact uniform
+PSD row-scale convention: canonicalize each block's e/einv, rebuild dual A/b/q
+from original input and final scales before constructing KKT. Precision,
+regularization, refinement, Ruiz, presolve, chordal and stopping criteria remain
+unchanged. Nine adapter/factor/solution/ray tests pass atFloat64/256/512 in0.13s.
+
+Real input SHA bb1fa49da0d461ebba2b9539412222e5dc134553dfad8f7bc128b23acf61ed1d:
+1099original variables,20equalities,28PSD blocks; explicit dual22196variables,
+23275rows,1794016nonzeros. Uses factor-authoritative residual/RHS/recovery and
+sampled Schur; no fitted replacement for authoritative CSC data. Reduced KKT
+order1119; setup still materializes explicit matrices and has substantial memory.
+One thread,768bits,1e-42tolerances,max_iter1,native30s/outer90s. Completed with
+MaxIterations at1, native29.686906s/process32.601064s, peakRSS2572173312bytes.
+Initial internal primal residual6.58e-3 correctly prevents the previous iter0
+false acceptance; after one step it is2.4894e-5. Original factor-coordinate
+absolute residuals: primal23.5889, dual1.7191e-174; original objective-53.7639.
+Both operator directions were invoked twice. No full accuracy acceptance:
+primal feasibility remains poor, and this screen lacks full cone/gap audits.
+One unpinned execution establishes neither a speedup nor end-to-end convergence.
+
+Evidence: `/tmp/sdpx-dual-lambda11-uniform-20260917/` (review.json,test.log,
+frozen-run.json,run.log,result.json,receipt.json,decision.json). All192frozen
+identities and185production source/dependency identities pass. Only this plan
+is updated in production. Next run a bounded multistep screen exporting the
+original-coordinate point for independent cone/gap/equation audits; keep the
+prototype external until full numerical qualification. Provider substitutions
+remain lower priority than this unresolved large-instance correctness issue.
+
+
+### September 17 Lambda11 compact dual multistep: convergence remains unqualified
+
+External candidate is numerically identical to the one-step uniform-scaling
+prototype; the only source delta changes max_iter1->6, native time30->60seconds
+and exports original-coordinate x/s/z. Outer hard limit100seconds. Release build
+passes. No production numerical changes;185source/dependency identities match.
+
+At768bits/one thread/default preprocessing and unchanged1e-42internal tolerances,
+the run completes4iterations, exits MaxTime, native86.703857s/process90.705518s,
+peakRSS2604122112bytes. Native time is checked at iteration boundaries and is
+not a hard deadline; the external limit was not reached.192frozen identities
+pass. No wall-clock comparison or performance credit from this unpinned run.
+
+Independent Julia factor-operator audit parses the frozen768-bit input/point at
+768bits, then evaluates at1536bits, including56PSD eigensystems for28blocks.
+Audit7.926526s, peakRSS732397568bytes; input, point, helper and environment hashes
+unchanged. It does not change solver precision. Final original-coordinate values:
+
+- Primal absolute residual1.21684; scale-normalized residual8.83145e-3.
+- Dual absolute residual1.72066e-174; normalized1.29115e-175.
+- Relative objective gap1.25356e-2; primal objective-58.46163, dual-57.72878.
+- Primal PSD violation0; dual PSD violation1.17446e-2; equality slack0.
+
+The1e-30point gates fail. Internal dual-orientation primal residual2.14847e-6
+must not substitute for these original-coordinate results. Avoid interpreting
+four steps or small dual-equation residuals as full feasibility. Reference
+objective agreement and full sampled mapping qualification are still outstanding.
+Evidence: `/tmp/sdpx-dual-lambda11-multistep-20260917/` (frozen-run.json,run.log,
+result.json,point.json,receipt.json,audit-frozen.json,audit.json,audit-receipt.json,
+decision.json). The nine prior small tests are not rerun because only experiment
+limits/output changed. Next instrument bounded scaling/direction phases and
+inspect original cone/equation errors; do not rerun an unchanged longer campaign
+or promote this prototype on its internally reported residuals.
+
+
+### September 17 Lambda11 dual-path profile prioritizes inner directions
+
+Saved-point localization finds negative eigenvalues in all28original dual PSD
+blocks after4iterations; the worst normalized violation1.17446e-2 is block9,
+order38 (minimum eigenvalue-0.0144942). This early MaxTime point does not by itself
+prove a Newton-system defect. Evidence: multistep/localization.json.
+
+New isolated diagnostic keeps the same numerical method, limits to2iterations,
+and inserts11strictly matched outer-timer patch hunks plus mapped-backend spans.
+Release build passes; one768-bit/single-thread run completes MaxIterations2:
+native48.751996s, process52.710580s, peakRSS2604023808bytes. All192frozen identities
+and185production source/dependency identities pass. No full accuracy or speed
+acceptance; this is unpinned diagnostic phase attribution, not paired timing.
+
+Outer stages: affine direction8.581119s (17.60%), combined direction9.258156s
+(18.99%), cone scaling7.040953s (14.44%), KKT update6.653487s (13.65%), residual
+update1.995514s (4.09%), affine/combined bounds2.192070/2.193508s. Nested mapped
+solves include initialization:9calls22.230523s, of which inner condensed solve
+19.252998s; mapped RHS9calls1.387019s. Surrogate updates3calls2.309543s also include
+initialization. Do not sum these nested totals with outer stages or treat the
+internal update as all of the outer KKT-update time (which includes RHS solves).
+
+Next prioritize inner condensed solve_raw scaling/operator products and residual
+refinement, preferably capturing representative RHS/scaling for bounded replay.
+Existing original/refined direction checks remain unchanged; no removal of
+refinement or cached-G shortcut is authorized by this profile. SVD-library
+replacement and raw mapping overhead are lower priorities for this prototype.
+Evidence: `/tmp/sdpx-dual-lambda11-profile-20260917/` (setup-review.json,build.log,
+frozen-run.json,run.log,result.json,point.json,receipt.json,analyze.py,stages.json).
+Stable production numerical source remains unchanged; prototype qualification
+and large-instance accuracy remain outstanding.
+
+September 18 sampled ordinary-lane parallelization, single-parallel-level repair
+and all-precision GEMM/SYRK fusion (accepted):
+Measured on the frozen Ising512 sampled SDP, 512 bit, 50 iterations. The sampled
+operator's ordinary CSC part was the only unbounded serial section: apply and
+apply_transpose called linear.gemv on the calling thread over all ordinary
+nonzeros before any block work. Both now dispatch through the existing
+row/column SparseParallel plan, which reuses the CSC gemv scalar branches
+(scale_output and accumulate), so every output accumulates in the same order as
+the serial product and results are bit-identical; three new tests at Float64,
+256 and 512 bit assert exact equality at widths 1/2/4/8 and assert that the plan
+owns real lanes rather than a serial fallback. residuals.rs deliberately keeps
+its sampled-route plan disabled because that route reaches the operator, not
+the residual gemv.
+The condenser handed the pool to every sampled block whenever the pool exceeded
+the block count, so each block spawned its own GEMM/SYRK tiles and pair lanes on
+top of the outer block level. This contradicted the module's own
+single-parallel-level rule. The pool now reaches sampled inner work only for the
+dominant block; the outer block level is the only parallel level for the rest.
+Seven previously dead assertions were also found: the pooled split writers
+accumulated into w.forward/w.adjoint, which the workspace only zeroes when its
+length grows, so a second pooled call added to the first call's result. The
+split branches now clear their buffer; pooled_operators at Float64/256/512 bit
+reproduces the serial product exactly and had been failing before the fix.
+gemm and syrk still gated fused accumulation on matches!(N,4|8|12|16), so 128,
+384, 1536 and 2048 bit silently used the slower indexed product while 256, 512,
+768 and 1024 bit did not. Both gates are removed; the descriptor form is not
+specific to a limb count. Fourteen mpfr_gemm_syrk, fourteen mpfr_parallel, nine
+mpfr_workspace and twenty-two mpfr_dense checks pass, and the Julia suite covers
+128-2048 bit.
+Rejected in this round, with measurements kept as negative results.
+Whole-round cone lanes (one lane per worker instead of workers*4): measured
+worse, w8 13.35 -> 14.37 and w16 12.47 -> 14.11 seconds. Balanced lanes follow a
+structural cost model, so the spare tasks are what lets work stealing absorb
+model error; the deliberate over-splitting stays.
+Pool width capped by cone count: 15.39 -> 14.60 seconds at w64 with every audit
+passing, but the reported cone_threads became 23 instead of the requested 64 and
+the frozen benchmark plan gate requires cone_threads == width. Reverted; the
+frozen campaign is unchanged and the request remains a contract, not a hint.
+Order-preserving parallel QDLDL: the measured elimination tree of the 342-square
+reduced KKT is a single-root caterpillar with widest level 11 and depth 51, so
+subtree parallelism cannot exceed about eleven ways on a phase that costs 2.4
+percent. Not written.
+Cross-node: deferred by decision. The condensed Schur is n-by-n, so Ising512
+would reduce 322-square (6.6 MB, reducible once per iteration), but the 1483
+block instance is 14424-square, about 13 GB per iteration, which no allreduce
+serves. SDPB avoids the gather with Elemental's block-cyclic distributed
+Cholesky. A first-level rank sharding with replicated vectors and O(m+n)
+allreduce is feasible but changes the Schur assembly summation order, which is a
+contract decision, so no MPI backend was written.
+Scaling curve measured on node3 in one socket, 64 physical cores, all six cells
+accepted by the external original-coordinate audit: w1 60.52, w4 20.24, w8 13.35,
+w16 12.47, w64 14.60-15.5 seconds. The curve is flat from 8 to 16 threads and
+negative at 64, and the first 64 physical cores are one package, so the residual
+limit is lane count (23 cones) and phase barriers rather than serial code.
+Per-iteration accounting: 3.06 KKT solves per iteration, 3 congruence
+applications per solve (two in solve_raw, one in the residual), 9.2 applications
+per iteration; iterative refinement measured zero extra passes; one application
+costs 22 blocks times 4 GEMMs of n-cubed (sum 80738) in 38.1 ms, or 118 ns per
+fused multiply-add. Borrowable SDPB directions, none implemented here: batch the
+per-block congruences into large products so CRT plus hardware BLAS
+(BigInt_Shared_Memory_Syrk) has something to amortize, and replace the
+structural block cost model with measured block costs as allocate_blocks does.
+Evidence: local /tmp/sdpx-ising-local-124-20260917/ (final1, final4b, cnt1,
+etree3, ph1, ph4); cluster jobs 213439, 213452, 213461, 213462, 213463 under
+~/projects/sdpx-scaling-64-20260917/results/. Rust workspace 477 checks pass and
+the Julia suite reports 673 of 673.

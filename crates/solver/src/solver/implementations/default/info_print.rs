@@ -399,8 +399,10 @@ fn _print_conedims_by_type<T: FloatT>(
 // This matches the Julia output formatting.
 
 fn _exp_str_reformat(mut thestr: String) -> String {
-    // Safe to `unwrap` as `num` is guaranteed to contain `'e'`
-    let eidx = thestr.find('e').unwrap();
+    // MPFR zero and nonfinite values have no exponent; preserve their display.
+    let Some(eidx) = thestr.find('e') else {
+        return thestr;
+    };
     let has_sign = thestr.chars().nth(eidx + 1).unwrap() == '-';
 
     let has_short_exp = {
@@ -427,4 +429,31 @@ fn _exp_str_reformat(mut thestr: String) -> String {
     let shift = if has_sign { 2 } else { 1 };
     thestr.insert_str(eidx + shift, chars);
     thestr
+}
+
+#[cfg(test)]
+mod formatting_tests {
+    use super::_exp_str_reformat;
+    use sdpx_arithmetic::MpFloat;
+
+    #[test]
+    fn mpfr_zero_and_nonfinite_status_fields() {
+        for text in ["0", "-0", "inf", "-inf", "NaN"] {
+            let value: MpFloat<12> = text.parse().unwrap();
+            let displayed = format!("{:.3e}", value);
+            assert_eq!(_exp_str_reformat(displayed.clone()), displayed);
+        }
+    }
+
+    #[test]
+    fn exponent_padding_is_preserved() {
+        for (input, expected) in [
+            ("1.234e0", "1.234e+00"),
+            ("-1.234e-7", "-1.234e-07"),
+            ("1.234e42", "1.234e+42"),
+            ("1.234e-174", "1.234e-174"),
+        ] {
+            assert_eq!(_exp_str_reformat(input.into()), expected);
+        }
+    }
 }

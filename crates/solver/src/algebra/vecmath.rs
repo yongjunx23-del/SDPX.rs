@@ -81,7 +81,7 @@ impl<T: FloatT> VectorMath<T> for [T] {
     }
 
     fn dot(&self, y: &[T]) -> T {
-        zip(self, y).fold(T::zero(), |acc, (&x, &y)| acc + x * y)
+        zip(self, y).fold(T::zero(), |acc, (&x, &y)| x.mul_add(y, acc))
     }
 
     fn dot_shifted(z: &[T], s: &[T], dz: &[T], ds: &[T], α: T) -> T {
@@ -91,9 +91,9 @@ impl<T: FloatT> VectorMath<T> for [T] {
 
         let mut out = T::zero();
         for (&s, &ds, &z, &dz) in izip!(s, ds, z, dz) {
-            let si = s + α * ds;
-            let zi = z + α * dz;
-            out += si * zi;
+            let si = ds.mul_add(α, s);
+            let zi = dz.mul_add(α, z);
+            out = si.mul_add(zi, out);
         }
         out
     }

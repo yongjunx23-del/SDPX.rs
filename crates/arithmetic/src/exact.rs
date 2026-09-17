@@ -67,7 +67,6 @@ impl Exact {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::{Bits512, Scalar};
     #[test]
     fn exact_conversion_owns_storage_and_preserves_sub_f64_bits() {

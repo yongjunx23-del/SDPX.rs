@@ -13,4 +13,7 @@ sdpx-arithmetic = { path = "../arithmetic" }
 sdp-accelerate = ["sdpx-solver/sdp-accelerate"]
 sdp-openblas = ["sdpx-solver/sdp-openblas"]
 sdp-netlib = ["sdpx-solver/sdp-netlib"]
+sdp-mkl = ["sdpx-solver/sdp-mkl"]
 faer-sparse = ["sdpx-solver/faer-sparse"]
+pardiso-mkl = ["sdpx-solver/pardiso-mkl"]
+pardiso-panua = ["sdpx-solver/pardiso-panua"]

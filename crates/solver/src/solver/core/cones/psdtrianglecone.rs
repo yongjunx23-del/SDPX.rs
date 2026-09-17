@@ -182,53 +182,20 @@ where
         let tmp = &mut f.workmat1;
         tmp.mul(&L2.t(), L1, T::one(), T::zero());
 
-        if T::precision_bits() > 53 {
-            // High precision route: eigensolve MᵀM instead of an SVD of
-            // M = L2'*L1.  eig(MᵀM) = Σ² gives V directly; U is recovered
-            // as M·V·Σ⁻¹.  λ, R and Rinv are unchanged up to rounding.
-            let a = &mut f.workmat3;
-            a.syrk(&tmp.t(), T::one(), T::zero(), MatrixTriangle::Triu);
-            f.Eig.eigen(a).expect("Eig error");
-            let v = f.Eig.V.as_ref().unwrap();
+        // Direct SVD avoids squaring the condition number of L2' * L1.
+        f.SVD.factor(tmp).expect("SVD error");
 
-            // MᵀM is PSD by construction; clamp the O(eps) sign flips the
-            // eigensolver can produce on tiny eigenvalues, matching the
-            // SVD path's σ >= 0 guarantee.
-            f.λ.copy_from(&f.Eig.λ);
-            for x in f.λ.iter_mut() {
-                *x = T::max(*x, T::zero());
-            }
-            f.λ.sqrt();
-            f.Λisqrt.copy_from(&f.λ).sqrt().recip();
+        // assemble λ (diagonal), R and Rinv.
+        f.λ.copy_from(&f.SVD.s);
+        f.Λisqrt.copy_from(&f.λ).sqrt().recip();
 
-            //f.R = L1*V*f.Λisqrt
-            f.R.mul(L1, v, T::one(), T::zero());
-            f.R.rscale(&f.Λisqrt);
+        //f.R = L1*(f.SVD.V)*f.Λisqrt
+        f.R.mul(L1, &f.SVD.Vt.t(), T::one(), T::zero());
+        f.R.rscale(&f.Λisqrt);
 
-            // U = M·V·Σ⁻¹  (two rscale passes by Σ^{-1/2} = one by Σ⁻¹)
-            let u = &mut f.workmat2;
-            u.mul(tmp, v, T::one(), T::zero());
-            u.rscale(&f.Λisqrt);
-            u.rscale(&f.Λisqrt);
-
-            //f.Rinv .= f.Λisqrt*(U)'*L2'
-            f.Rinv.mul(&u.t(), &L2.t(), T::one(), T::zero());
-            f.Rinv.lscale(&f.Λisqrt);
-        } else {
-            f.SVD.factor(tmp).expect("SVD error");
-
-            // assemble λ (diagonal), R and Rinv.
-            f.λ.copy_from(&f.SVD.s);
-            f.Λisqrt.copy_from(&f.λ).sqrt().recip();
-
-            //f.R = L1*(f.SVD.V)*f.Λisqrt
-            f.R.mul(L1, &f.SVD.Vt.t(), T::one(), T::zero());
-            f.R.rscale(&f.Λisqrt);
-
-            //f.Rinv .= f.Λisqrt*(f.SVD.U)'*L2'
-            f.Rinv.mul(&f.SVD.U.t(), &L2.t(), T::one(), T::zero());
-            f.Rinv.lscale(&f.Λisqrt);
-        }
+        //f.Rinv .= f.Λisqrt*(f.SVD.U)'*L2'
+        f.Rinv.mul(&f.SVD.U.t(), &L2.t(), T::one(), T::zero());
+        f.Rinv.lscale(&f.Λisqrt);
 
         // Cache only the matrix defining the congruence X -> G X G.
         // Keeping its upper triangle authoritative preserves the original

@@ -159,14 +159,15 @@ where
     T: FloatT,
     S: AsRef<[T]> + AsMut<[T]>,
 {
+    let scale = if M.ncols() > 1 { T::FRAC_1_SQRT_2() } else { T::zero() };
     let mut idx = 0;
     for col in 0..M.ncols() {
         for row in 0..=col {
             if row == col {
                 M[(row, col)] = x[idx];
             } else {
-                M[(row, col)] = x[idx] * T::FRAC_1_SQRT_2();
-                M[(col, row)] = x[idx] * T::FRAC_1_SQRT_2();
+                M[(row, col)] = x[idx] * scale;
+                M[(col, row)] = M[(row, col)];
             }
             idx += 1;
         }
@@ -179,6 +180,7 @@ where
     MATM: DenseMatrix<T>,
     T: FloatT,
 {
+    let scale = if M.ncols() > 1 { T::FRAC_1_SQRT_2() } else { T::zero() };
     let mut idx = 0;
     for col in 0..M.ncols() {
         for row in 0..=col {
@@ -186,7 +188,7 @@ where
                 if row == col {
                     M[(row, col)]
                 } else {
-                    (M[(row, col)] + M[(col, row)]) * T::FRAC_1_SQRT_2()
+                    (M[(row, col)] + M[(col, row)]) * scale
                 }
             };
             idx += 1;

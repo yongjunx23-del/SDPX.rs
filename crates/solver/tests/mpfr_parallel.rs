@@ -1,5 +1,7 @@
 //! Pooled dense kernels retain every output's serial arithmetic and padding.
 #![cfg(feature = "sdp")]
+// This test imports the whole provider but exercises only selected operations.
+#[allow(dead_code)]
 #[path = "../src/algebra/dense/blas/traits.rs"]
 mod provider;
 use num_traits::{FromPrimitive, Zero};

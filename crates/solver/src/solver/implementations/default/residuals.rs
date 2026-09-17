@@ -162,7 +162,7 @@ where
                 -T::one(),
                 T::zero(),
                 work,
-                self.sampled_pool.as_deref(),
+                self.sampled_pool.as_ref(),
             );
             operator.apply_with_pool(
                 &mut self.rz_inf,
@@ -170,7 +170,7 @@ where
                 T::one(),
                 T::one(),
                 work,
-                self.sampled_pool.as_deref(),
+                self.sampled_pool.as_ref(),
             );
         } else {
             self.ordinary_products(variables, data);

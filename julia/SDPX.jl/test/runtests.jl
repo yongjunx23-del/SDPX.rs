@@ -24,6 +24,7 @@ import MathOptInterface as MOI
     @test !isdefined(SDPX,:SolverCore)
 end
 
+include("moi_contracts.jl")
 include("preprocessing.jl")
 include("sampled.jl")
 

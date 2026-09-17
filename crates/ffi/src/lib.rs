@@ -391,7 +391,7 @@ unsafe fn settings<T: Scalar>(s: &Settings) -> Result<DefaultSettings<T>> {
     v.tol_feas = parse(s.tol_feas)?;
     v.tol_infeas_abs = parse(s.tol_infeas_abs)?;
     v.tol_infeas_rel = parse(s.tol_infeas_rel)?;
-    v.tol_ktratio = tolerance;
+    // Keep the core's independent kappa/tau default; it is not tol_feas.
     // The reduced ("almost solved") tolerances keep the core defaults: Float64
     // gets upstream Clarabel's 5e-5/1e-4/5e-12 values and MPFR gets the
     // precision-scaled ones. Overwriting them with the strict tolerances made
@@ -797,6 +797,29 @@ mod tests {
             f64: v.as_ptr(),
             decimal: ptr::null(),
         }
+    }
+    #[test]
+    fn ffi_preserves_core_ktratio_defaults() {
+        fn check<T: Scalar>(bits: u32) {
+            let mut input = defaults();
+            input.precision_bits = bits;
+            let core = DefaultSettings::<T>::default();
+            let parsed = unsafe { settings::<T>(&input).unwrap() };
+            assert_eq!(parsed.tol_ktratio, core.tol_ktratio);
+            assert_eq!(parsed.reduced_tol_ktratio, core.reduced_tol_ktratio);
+            let custom = std::ffi::CString::new("1e-5").unwrap();
+            input.tol_feas = custom.as_ptr();
+            let parsed = unsafe { settings::<T>(&input).unwrap() };
+            assert_eq!(parsed.tol_feas, T::decimal("1e-5").unwrap());
+            assert_eq!(parsed.tol_ktratio, core.tol_ktratio);
+        }
+        check::<f64>(53);
+        check::<MpFloat<2>>(128);
+        check::<MpFloat<4>>(256);
+        check::<MpFloat<8>>(512);
+        check::<MpFloat<12>>(768);
+        check::<MpFloat<16>>(1024);
+        check::<MpFloat<32>>(2048);
     }
     fn lp() -> *mut Handle {
         lp_settings(defaults())

@@ -250,6 +250,20 @@ impl<const N: usize> MpFloat<N> {
         }
         result
     }
+    /// Accumulate products in iterator order, rounding each FMA at this precision.
+    /// The accumulator owns its storage and never aliases an input operand.
+    #[inline]
+    pub fn dot_fma<'a>(pairs: impl IntoIterator<Item = (&'a Self, &'a Self)>) -> Self {
+        Self::output(|r| {
+            for (a, b) in pairs {
+                let x = a.descriptor();
+                let y = b.descriptor();
+                // MPFR permits the destination to alias an input. Here only the
+                // previous accumulator is reused; input limb arrays stay read-only.
+                unsafe { mpfr::fma(r, &x, &y, r, ROUND); }
+            }
+        })
+    }
     fn unary(
         self,
         f: unsafe extern "C" fn(*mut mpfr::mpfr_t, *const mpfr::mpfr_t, mpfr::rnd_t) -> i32,
@@ -994,5 +1008,54 @@ mod tests {
             .unwrap();
         assert_ne!(a, T::one());
         assert_eq!(a.to_f64(), Some(1.0));
+    }
+    fn ordered_dot_fma<const N: usize>() {
+        type F<const N: usize> = MpFloat<N>;
+        let one = F::<N>::one();
+        let zero = F::<N>::zero();
+        let eps = F::<N>::epsilon();
+        let big = (one + one).powi((N * 64) as i32);
+        let a = [big, one, -big];
+        let b = [one; 3];
+        // A once-rounded exact dot gives 1; the required ordered FMAs give 0.
+        assert_eq!(F::dot_fma(a.iter().zip(&b)), zero);
+        assert_eq!(F::dot_fma(a[..0].iter().zip(&b[..0])).kind, mpfr::ZERO_KIND);
+        let a = [-one, one + eps];
+        let b = [one, one - eps];
+        // Separately rounded multiplication would lose this cancellation term.
+        assert_eq!(F::dot_fma(a.iter().zip(&b)), -(eps * eps));
+        let mut a: Vec<_> = (0..37).map(|i| F::<N>::from_i32(i - 18).unwrap() / F::from_i32(7).unwrap()).collect();
+        let b: Vec<_> = (0..37).map(|i| F::<N>::from_i32(i % 11 - 5).unwrap() / F::from_i32(13).unwrap()).collect();
+        let before = (a.clone(), b.clone());
+        let expected = a.iter().zip(&b).fold(zero, |v, (&x, &y)| x.mul_add(y, v));
+        let actual = F::dot_fma(a.iter().zip(&b));
+        assert_eq!(actual, expected);
+        assert_eq!((a.clone(), b.clone()), before);
+        a.fill(zero);
+        assert_eq!(actual, expected);
+        for (a, b) in [
+            (vec![-zero, zero], vec![one, one]),
+            (vec![F::infinity(), one], vec![one, one]),
+            (vec![F::infinity(), F::neg_infinity()], vec![one, one]),
+            (vec![F::nan(), one], vec![one, one]),
+        ] {
+            let expected = a.iter().zip(&b).fold(zero, |v, (&x, &y)| x.mul_add(y, v));
+            let actual = F::dot_fma(a.iter().zip(&b));
+            if expected.is_nan() {
+                assert!(actual.is_nan());
+            } else {
+                assert_eq!(actual, expected);
+                assert_eq!(actual.kind, expected.kind);
+            }
+        }
+    }
+    #[test]
+    fn ordered_dot_fma_all_precisions() {
+        ordered_dot_fma::<2>();
+        ordered_dot_fma::<4>();
+        ordered_dot_fma::<8>();
+        ordered_dot_fma::<12>();
+        ordered_dot_fma::<16>();
+        ordered_dot_fma::<32>();
     }
 }

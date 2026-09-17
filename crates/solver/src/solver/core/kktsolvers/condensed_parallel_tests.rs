@@ -256,7 +256,9 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
         let full_rhs = [bx.as_slice(), bz.as_slice()].concat();
         let full_solution = [xp.as_slice(), zp.as_slice()].concat();
         a.gemv(&mut serial.workz, &xp, T::one(), T::zero());
-        for (v, b) in serial.workz.iter_mut().zip(&bz) { *v -= *b; }
+        for (v, b) in serial.workz.iter_mut().zip(&bz) {
+            *v -= *b;
+        }
         pooled.workz.copy_from_slice(&serial.workz);
         for reuse in [false, true] {
             let mut rs = vec![T::nan(); full_rhs.len()];
@@ -625,4 +627,67 @@ fn many_small_sampled_blocks_keep_outer_plan() {
             assert!(!sampled.work.has_parallel_columns());
         }
     }
+}
+
+// Compare against the original assembly after changing both scaling and A.
+// Include non-dyadic quotients and an empty row to exercise cache reuse.
+fn cached_orthant_division<T: FloatT>() {
+    let kinds = [SupportedConeT::NonnegativeConeT(3)];
+    let mut cones = CompositeCone::new(&kinds);
+    cones.set_identity_scaling();
+    let p = CscMatrix::zeros((3, 3));
+    let a = CscMatrix::from(&[
+        [
+            num::<T>(1) / num::<T>(7),
+            num::<T>(2) / num::<T>(3),
+            -num::<T>(4),
+        ],
+        [T::zero(), num::<T>(3), num::<T>(5) / num::<T>(11)],
+        [T::zero(), T::zero(), T::zero()],
+    ]);
+    let settings = CoreSettings::default();
+    let mut solver = CondensedKKTSolver::new(&p, &a, &kinds, &cones, &settings);
+    for turn in 1..=3 {
+        if turn == 3 {
+            let mut changed = a.clone();
+            for v in &mut changed.nzval {
+                *v *= num::<T>(2);
+            }
+            solver.update_A(&changed);
+        }
+        for block in &mut solver.blocks {
+            if let Scaling::Orthant { w, .. } = &mut block.scaling {
+                w.fill(num::<T>(7) / num::<T>(turn + 1));
+            }
+        }
+        let mut expected = vec![T::zero(); solver.schur.nzval.len()];
+        for block in &solver.blocks {
+            if let Scaling::Orthant { w, rows, .. } = &block.scaling {
+                for (r, entries) in rows.iter().enumerate() {
+                    for (b, &(j, q)) in entries.iter().enumerate() {
+                        let aj = solver.A.nzval[q] / w[r];
+                        for &(i, k) in &entries[..=b] {
+                            let ai = solver.A.nzval[k] / w[r];
+                            let pos = schur_position(&solver.schur, i, j);
+                            expected[pos] = ai.mul_add(aj, expected[pos]);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(solver.assemble());
+        assert_eq!(solver.schur.nzval, expected);
+    }
+}
+#[test]
+fn cached_orthant_division_f64() {
+    cached_orthant_division::<f64>();
+}
+#[test]
+fn cached_orthant_division_256() {
+    cached_orthant_division::<Bits256>();
+}
+#[test]
+fn cached_orthant_division_512() {
+    cached_orthant_division::<sdpx_arithmetic::Bits512>();
 }

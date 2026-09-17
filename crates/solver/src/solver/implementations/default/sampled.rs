@@ -1,7 +1,9 @@
 //! Factor-authoritative sampled PSD coefficients. Materialization is a rounded
 //! view of these factors, not the definition of their operator.
+use crate::algebra::sparse_parallel::SparseParallel;
 use crate::algebra::*;
 use rayon::prelude::*;
+use std::sync::Arc;
 
 /// A sampled PSD row block with canonical columns `(s, r, k)`, r <= s.
 /// Each column is weight * svec(sym(e_r e_s') ⊗ q_k q_k').
@@ -35,6 +37,25 @@ fn checked_triangle(n: usize) -> Option<usize> {
 fn tri(n: usize) -> usize {
     n * (n + 1) / 2
 }
+fn tri_work(n: usize) -> u128 {
+    (n as u128) * (n as u128 + 1) / 2
+}
+
+impl<T: FloatT> SampledBlock<T> {
+    /// Structural scalar work in the limb-squared units already used by the
+    /// cone and sampled schedulers. It depends only on dimensions and on the
+    /// arithmetic precision, never on problem identity or runtime timing.
+    pub(crate) fn scheduled_work(&self) -> u128 {
+        if self.dim == 0 || self.basis_cols == 0 {
+            return 0;
+        }
+        let words = T::precision_bits().div_ceil(64) as u128;
+        tri_work(self.dim)
+            .saturating_mul((self.basis_rows as u128).pow(2))
+            .saturating_mul(self.basis_cols as u128)
+            .saturating_mul(words * words)
+    }
+}
 
 impl<T> SampledBlock<T> {
     /// PSD matrix side length: `dim * basis_rows`.
@@ -56,6 +77,7 @@ impl<T> SampledBlock<T> {
 pub struct SampledOperator<T> {
     linear: CscMatrix<T>,
     blocks: Vec<SampledBlock<T>>,
+    ordered_rows: bool,
 }
 
 impl<T: FloatT> SampledOperator<T> {
@@ -153,7 +175,12 @@ impl<T: FloatT> SampledOperator<T> {
         linear.colptr[linear.n] = write;
         linear.rowval.truncate(write);
         linear.nzval.truncate(write);
-        Ok(Self { linear, blocks })
+        let ordered_rows = blocks.windows(2).all(|w| w[0].row_start < w[1].row_start);
+        Ok(Self {
+            linear,
+            blocks,
+            ordered_rows,
+        })
     }
     /// Ordinary CSC coefficients outside sampled PSD row blocks.
     pub fn linear(&self) -> &CscMatrix<T> {
@@ -266,7 +293,7 @@ impl<T: FloatT> SampledOperator<T> {
         alpha: T,
         beta: T,
         work: &mut SampledWorkspace<T>,
-        pool: Option<&rayon::ThreadPool>,
+        pool: Option<&Arc<rayon::ThreadPool>>,
     ) {
         if !work.parallel_eligible(self, pool) || alpha == T::zero() {
             return self.apply(y, x, alpha, beta, work);
@@ -274,7 +301,15 @@ impl<T: FloatT> SampledOperator<T> {
         assert_eq!(y.len(), self.linear.m);
         assert_eq!(x.len(), self.linear.n);
         assert_eq!(work.blocks.len(), self.blocks.len());
-        self.linear.gemv(y, x, alpha, beta);
+        work.linear_product(self, false, y, x, alpha, beta, pool);
+        if self.ordered_rows {
+            let chunks = block_chunks(&self.blocks, pool);
+            pool.unwrap().install(|| {
+                forward_disjoint(&self.blocks, &mut work.blocks, y, 0, x, alpha, chunks);
+            });
+            return;
+        }
+        let chunks = block_chunks(&self.blocks, pool);
         pool.unwrap().install(|| {
             self.blocks
                 .par_iter()
@@ -285,7 +320,39 @@ impl<T: FloatT> SampledOperator<T> {
                     }
                     let mut terms = std::mem::take(&mut w.forward);
                     terms.resize(b.row_count(), T::zero());
-                    w.forward_terms(b, x, alpha, |i, term| terms[i] = term);
+                    if chunks > 1 {
+                        // The split writer accumulates, so the reused workspace
+                        // buffer must start from zero on every call.
+                        terms.fill(T::zero());
+                        let h = b.basis_rows;
+                        let kmax = b.basis_cols;
+                        let sqrt2 = if h > 1 { T::SQRT_2() } else { T::zero() };
+                        let inv_sqrt2 = if h > 0 && b.dim > 1 {
+                            T::FRAC_1_SQRT_2()
+                        } else {
+                            T::zero()
+                        };
+                        let q = BorrowedMatrix {
+                            size: (h, kmax),
+                            data: b.basis.as_slice(),
+                            phantom: std::marker::PhantomData,
+                        };
+                        forward_split_chunks(
+                            b,
+                            &q,
+                            x,
+                            alpha,
+                            0..b.dim,
+                            &mut terms[..],
+                            sqrt2,
+                            inv_sqrt2,
+                            chunks,
+                            &mut w.square,
+                            &mut w.panel,
+                        );
+                    } else {
+                        w.forward_terms(b, x, alpha, |i, term| terms[i] = term);
+                    }
                     w.forward = terms;
                 })
         });
@@ -306,7 +373,7 @@ impl<T: FloatT> SampledOperator<T> {
         alpha: T,
         beta: T,
         work: &mut SampledWorkspace<T>,
-        pool: Option<&rayon::ThreadPool>,
+        pool: Option<&Arc<rayon::ThreadPool>>,
     ) {
         if !work.parallel_eligible(self, pool) || alpha == T::zero() {
             return self.apply_transpose(y, x, alpha, beta, work);
@@ -314,7 +381,8 @@ impl<T: FloatT> SampledOperator<T> {
         assert_eq!(y.len(), self.linear.n);
         assert_eq!(x.len(), self.linear.m);
         assert_eq!(work.blocks.len(), self.blocks.len());
-        self.linear.t().gemv(y, x, alpha, beta);
+        work.linear_product(self, true, y, x, alpha, beta, pool);
+        let chunks = block_chunks(&self.blocks, pool);
         pool.unwrap().install(|| {
             self.blocks
                 .par_iter()
@@ -325,7 +393,37 @@ impl<T: FloatT> SampledOperator<T> {
                     }
                     let mut terms = std::mem::take(&mut w.adjoint);
                     terms.resize(b.column_count(), T::zero());
-                    w.adjoint_terms(b, x, alpha, |i, term| terms[i] = term);
+                    if chunks > 1 {
+                        // The split writer assigns into a reused workspace
+                        // buffer, so clear the previous call's contents first.
+                        terms.fill(T::zero());
+                        let h = b.basis_rows;
+                        let kmax = b.basis_cols;
+                        let inv_sqrt2 = if h > 0 && (h > 1 || b.dim > 1) {
+                            T::FRAC_1_SQRT_2()
+                        } else {
+                            T::zero()
+                        };
+                        let q = BorrowedMatrix {
+                            size: (h, kmax),
+                            data: b.basis.as_slice(),
+                            phantom: std::marker::PhantomData,
+                        };
+                        adjoint_split_chunks(
+                            b,
+                            &q,
+                            x,
+                            alpha,
+                            0..b.dim,
+                            &mut terms[..],
+                            inv_sqrt2,
+                            chunks,
+                            &mut w.square,
+                            &mut w.panel,
+                        );
+                    } else {
+                        w.adjoint_terms(b, x, alpha, |i, term| terms[i] = term);
+                    }
                     w.adjoint = terms;
                 })
         });
@@ -340,6 +438,304 @@ impl<T: FloatT> SampledOperator<T> {
             }
         }
     }
+}
+
+fn block_chunks<T: FloatT>(
+    blocks: &[SampledBlock<T>],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> usize {
+    let Some(pool) = pool else {
+        return 1;
+    };
+    let active = blocks.iter().filter(|b| b.basis_cols > 0).count().max(1);
+    pool.current_num_threads().div_ceil(active).max(1)
+}
+
+/// Work-balanced interior index for a contiguous block range. Cumulative
+/// structural work replaces the block count so that a tree of joins finishes
+/// near the true half-work point rather than near the half-count point.
+fn balanced_block_split<T: FloatT>(blocks: &[SampledBlock<T>]) -> usize {
+    debug_assert!(blocks.len() >= 2);
+    let total: u128 = blocks.iter().map(|b| b.scheduled_work()).sum();
+    if total == 0 {
+        return blocks.len() / 2;
+    }
+    let (mut acc, mut best, mut best_gap) = (0u128, 1, u128::MAX);
+    for (i, b) in blocks[..blocks.len() - 1].iter().enumerate() {
+        acc += b.scheduled_work();
+        let gap = acc.saturating_mul(2).abs_diff(total);
+        if gap < best_gap {
+            best_gap = gap;
+            best = i + 1;
+        }
+    }
+    best
+}
+
+/// Balanced interior split of an `s` level range. Level `s` owns `s + 1`
+/// `(s, r)` pairs, so the work of `[start, end)` is `tri(end) - tri(start)`.
+/// Pick the level that hands `left` of `total` shares to the left child.
+fn balanced_level_split(start: usize, end: usize, left: usize, total: usize) -> usize {
+    debug_assert!(end >= start + 2 && left > 0 && left < total);
+    let begin = tri_work(start);
+    let target = begin + (tri_work(end) - begin) * left as u128 / total as u128;
+    let mid = (((8 * target + 1).isqrt() - 1) / 2) as usize;
+    mid.clamp(start + 1, end - 1)
+}
+
+fn forward_split_chunks<T: FloatT>(
+    b: &SampledBlock<T>,
+    q: &BorrowedMatrix<'_, T>,
+    x: &[T],
+    alpha: T,
+    s_range: std::ops::Range<usize>,
+    out: &mut [T],
+    sqrt2: T,
+    inv_sqrt2: T,
+    chunks: usize,
+    square: &mut Matrix<T>,
+    panel: &mut Matrix<T>,
+) {
+    if chunks <= 1 || s_range.len() < 2 {
+        let h = b.basis_rows;
+        let kmax = b.basis_cols;
+        let s_offset = tri(s_range.start * h);
+        for s in s_range {
+            for r in 0..=s {
+                let p = (tri(s) + r) * kmax;
+                for k in 0..kmax {
+                    let weight = b.weights[p + k] * x[b.column_start + p + k];
+                    let q_col = &q.data()[k * h..(k + 1) * h];
+                    let p_col = &mut panel.data_mut()[k * h..(k + 1) * h];
+                    for i in 0..h {
+                        p_col[i] = q_col[i] * weight;
+                    }
+                }
+                let q_data = q.data();
+                let p_data = panel.data();
+                for j in 0..h {
+                    for i in 0..=j {
+                        let mut v = T::zero();
+                        for k in 0..kmax {
+                            v = p_data[i + k * h].mul_add(q_data[j + k * h], v);
+                        }
+                        square[(i, j)] = v;
+                        if r != s {
+                            square[(j, i)] = v;
+                        }
+                    }
+                }
+                for j in 0..h {
+                    for i in 0..if r == s { j + 1 } else { h } {
+                        let scale = if r != s {
+                            inv_sqrt2
+                        } else if i != j {
+                            sqrt2
+                        } else {
+                            T::one()
+                        };
+                        let idx = tri(s * h + j) + r * h + i - s_offset;
+                        out[idx] += alpha * scale * square[(i, j)];
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let h = b.basis_rows;
+    let kmax = b.basis_cols;
+    let mid = balanced_level_split(s_range.start, s_range.end, chunks / 2, chunks);
+    let split_idx = tri(mid * h) - tri(s_range.start * h);
+    let (left, right) = out.split_at_mut(split_idx);
+    let left_chunks = chunks / 2;
+    let right_chunks = chunks - left_chunks;
+    let mut local_square = Matrix::<T>::zeros((h, h));
+    let mut local_panel = Matrix::<T>::zeros((h, kmax));
+    rayon::join(
+        || {
+            forward_split_chunks(
+                b,
+                q,
+                x,
+                alpha,
+                s_range.start..mid,
+                left,
+                sqrt2,
+                inv_sqrt2,
+                left_chunks,
+                square,
+                panel,
+            )
+        },
+        || {
+            forward_split_chunks(
+                b,
+                q,
+                x,
+                alpha,
+                mid..s_range.end,
+                right,
+                sqrt2,
+                inv_sqrt2,
+                right_chunks,
+                &mut local_square,
+                &mut local_panel,
+            )
+        },
+    );
+}
+
+fn adjoint_split_chunks<T: FloatT>(
+    b: &SampledBlock<T>,
+    q: &BorrowedMatrix<'_, T>,
+    x: &[T],
+    alpha: T,
+    s_range: std::ops::Range<usize>,
+    out: &mut [T],
+    inv_sqrt2: T,
+    chunks: usize,
+    square: &mut Matrix<T>,
+    panel: &mut Matrix<T>,
+) {
+    if chunks <= 1 || s_range.len() < 2 {
+        let h = b.basis_rows;
+        let kmax = b.basis_cols;
+        let s_offset = tri(s_range.start) * kmax;
+        for s in s_range {
+            for r in 0..=s {
+                let p = (tri(s) + r) * kmax;
+                for j in 0..h {
+                    for i in 0..h {
+                        let (a, c) = if r == s && i > j {
+                            (r * h + j, s * h + i)
+                        } else {
+                            (r * h + i, s * h + j)
+                        };
+                        let scale = if a == c { T::one() } else { inv_sqrt2 };
+                        square[(i, j)] = x[b.row_start + tri(c) + a] * scale;
+                    }
+                }
+                panel.mul(square, q, T::one(), T::zero());
+                for k in 0..kmax {
+                    let q_col = &q.data()[k * h..(k + 1) * h];
+                    let p_col = &panel.data()[k * h..(k + 1) * h];
+                    let v = q_col.dot(p_col);
+                    let idx = p + k - s_offset;
+                    out[idx] = alpha * b.weights[p + k] * v;
+                }
+            }
+        }
+        return;
+    }
+    let h = b.basis_rows;
+    let kmax = b.basis_cols;
+    let mid = balanced_level_split(s_range.start, s_range.end, chunks / 2, chunks);
+    let split_idx = (tri(mid) - tri(s_range.start)) * kmax;
+    let (left, right) = out.split_at_mut(split_idx);
+    let left_chunks = chunks / 2;
+    let right_chunks = chunks - left_chunks;
+    let mut local_square = Matrix::<T>::zeros((h, h));
+    let mut local_panel = Matrix::<T>::zeros((h, kmax));
+    rayon::join(
+        || {
+            adjoint_split_chunks(
+                b,
+                q,
+                x,
+                alpha,
+                s_range.start..mid,
+                left,
+                inv_sqrt2,
+                left_chunks,
+                square,
+                panel,
+            )
+        },
+        || {
+            adjoint_split_chunks(
+                b,
+                q,
+                x,
+                alpha,
+                mid..s_range.end,
+                right,
+                inv_sqrt2,
+                right_chunks,
+                &mut local_square,
+                &mut local_panel,
+            )
+        },
+    );
+}
+
+// Row ranges were checked disjoint at construction. Preserve each row's
+// arithmetic order while allowing independent blocks to update in parallel.
+fn forward_disjoint<T: FloatT>(
+    blocks: &[SampledBlock<T>],
+    work: &mut [SampledBlockWorkspace<T>],
+    y: &mut [T],
+    row_start: usize,
+    x: &[T],
+    alpha: T,
+    chunks: usize,
+) {
+    if blocks.len() <= 1 {
+        if let Some(b) = blocks.first() {
+            if b.basis_cols > 0 {
+                let offset = b.row_start - row_start;
+                let h = b.basis_rows;
+                let kmax = b.basis_cols;
+                let sqrt2 = if h > 1 { T::SQRT_2() } else { T::zero() };
+                let inv_sqrt2 = if h > 0 && b.dim > 1 {
+                    T::FRAC_1_SQRT_2()
+                } else {
+                    T::zero()
+                };
+                let q = BorrowedMatrix {
+                    size: (h, kmax),
+                    data: b.basis.as_slice(),
+                    phantom: std::marker::PhantomData,
+                };
+                let y_slice = &mut y[offset..offset + b.row_count()];
+                if chunks > 1 {
+                    forward_split_chunks(
+                        b,
+                        &q,
+                        x,
+                        alpha,
+                        0..b.dim,
+                        y_slice,
+                        sqrt2,
+                        inv_sqrt2,
+                        chunks,
+                        &mut work[0].square,
+                        &mut work[0].panel,
+                    );
+                } else {
+                    work[0].forward_terms(b, x, alpha, |i, term| y_slice[i] += term);
+                }
+            }
+        }
+        return;
+    }
+    let mid = balanced_block_split(blocks);
+    let split = blocks[mid].row_start;
+    let (left_y, right_y) = y.split_at_mut(split - row_start);
+    let (left_work, right_work) = work.split_at_mut(mid);
+    rayon::join(
+        || {
+            forward_disjoint(
+                &blocks[..mid],
+                left_work,
+                left_y,
+                row_start,
+                x,
+                alpha,
+                chunks,
+            )
+        },
+        || forward_disjoint(&blocks[mid..], right_work, right_y, split, x, alpha, chunks),
+    );
 }
 
 struct SampledBlockWorkspace<T> {
@@ -364,6 +760,12 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
         if kmax == 0 {
             return;
         }
+        let sqrt2 = if h > 1 { T::SQRT_2() } else { T::zero() };
+        let inv_sqrt2 = if h > 0 && b.dim > 1 {
+            T::FRAC_1_SQRT_2()
+        } else {
+            T::zero()
+        };
         let q = BorrowedMatrix {
             size: (h, kmax),
             data: b.basis.as_slice(),
@@ -374,18 +776,32 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
             for r in 0..=s {
                 for k in 0..kmax {
                     let weight = b.weights[p + k] * x[b.column_start + p + k];
+                    let q_col = &q.data()[k * h..(k + 1) * h];
+                    let p_col = &mut self.panel.data_mut()[k * h..(k + 1) * h];
                     for i in 0..h {
-                        self.panel[(i, k)] = q[(i, k)] * weight;
+                        p_col[i] = q_col[i] * weight;
                     }
                 }
-                self.square
-                    .mul(&self.panel, &Adjoint { src: &q }, T::one(), T::zero());
+                let q_data = q.data();
+                let p_data = self.panel.data();
+                for j in 0..h {
+                    for i in 0..=j {
+                        let mut v = T::zero();
+                        for k in 0..kmax {
+                            v = p_data[i + k * h].mul_add(q_data[j + k * h], v);
+                        }
+                        self.square[(i, j)] = v;
+                        if r != s {
+                            self.square[(j, i)] = v;
+                        }
+                    }
+                }
                 for j in 0..h {
                     for i in 0..if r == s { j + 1 } else { h } {
                         let scale = if r != s {
-                            T::FRAC_1_SQRT_2()
+                            inv_sqrt2
                         } else if i != j {
-                            T::SQRT_2()
+                            sqrt2
                         } else {
                             T::one()
                         };
@@ -412,6 +828,11 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
         if kmax == 0 {
             return;
         }
+        let inv_sqrt2 = if h > 0 && (h > 1 || b.dim > 1) {
+            T::FRAC_1_SQRT_2()
+        } else {
+            T::zero()
+        };
         let q = BorrowedMatrix {
             size: (h, kmax),
             data: b.basis.as_slice(),
@@ -427,16 +848,15 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
                         } else {
                             (r * h + i, s * h + j)
                         };
-                        let scale = if a == c { T::one() } else { T::FRAC_1_SQRT_2() };
+                        let scale = if a == c { T::one() } else { inv_sqrt2 };
                         self.square[(i, j)] = x[b.row_start + tri(c) + a] * scale;
                     }
                 }
                 self.panel.mul(&self.square, &q, T::one(), T::zero());
                 for k in 0..kmax {
-                    let mut v = T::zero();
-                    for i in 0..h {
-                        v += q[(i, k)] * self.panel[(i, k)];
-                    }
+                    let q_col = &q.data()[k * h..(k + 1) * h];
+                    let p_col = &self.panel.data()[k * h..(k + 1) * h];
+                    let v = q_col.dot(p_col);
                     store(p + k, alpha * b.weights[p + k] * v);
                 }
                 p += kmax;
@@ -451,27 +871,56 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
 /// Mutable scratch is owned by one caller, independently of shared metadata.
 pub struct SampledWorkspace<T> {
     blocks: Vec<SampledBlockWorkspace<T>>,
+    // Row/column lanes for the ordinary CSC part. The plan is built once from
+    // the immutable pattern and reconfigured only when the pool width changes.
+    linear_plan: SparseParallel,
+    linear_plan_workers: usize,
 }
 impl<T: FloatT> SampledWorkspace<T> {
+    /// Configure the ordinary-product plan for the current pool width. Called
+    /// on every pooled product; the lane plan is rebuilt only on width changes.
+    fn linear_product(
+        &mut self,
+        operator: &SampledOperator<T>,
+        transpose: bool,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) {
+        let workers = pool.map_or(1, |p| p.current_num_threads());
+        if workers > self.linear_plan_workers {
+            self.linear_plan
+                .configure(&operator.linear, pool.map(Arc::clone));
+            self.linear_plan_workers = workers;
+        }
+        if self.linear_plan_workers > 1 && self.linear_plan.has_lanes() {
+            self.linear_plan
+                .product(&operator.linear, transpose, y, x, alpha, beta);
+            return;
+        }
+        if transpose {
+            operator.linear.t().gemv(y, x, alpha, beta);
+        } else {
+            operator.linear.gemv(y, x, alpha, beta);
+        }
+    }
+
     fn parallel_eligible(
         &self,
         operator: &SampledOperator<T>,
-        pool: Option<&rayon::ThreadPool>,
+        pool: Option<&Arc<rayon::ThreadPool>>,
     ) -> bool {
         if pool.map_or(1, |p| p.current_num_threads()) < 2 {
             return false;
         }
-        let words = T::precision_bits().div_ceil(64) as u128;
         let mut active = 0;
         let mut work = 0u128;
         for b in &operator.blocks {
             if b.basis_cols > 0 {
                 active += 1;
-                work += tri(b.dim) as u128
-                    * (b.basis_rows as u128).pow(2)
-                    * b.basis_cols as u128
-                    * words
-                    * words;
+                work += b.scheduled_work();
             }
         }
         active > 1 && work >= 8192
@@ -489,6 +938,8 @@ impl<T: FloatT> SampledWorkspace<T> {
                     square: Matrix::zeros((b.basis_rows, b.basis_rows)),
                 })
                 .collect(),
+            linear_plan: SparseParallel::new(&operator.linear),
+            linear_plan_workers: 0,
         }
     }
 }

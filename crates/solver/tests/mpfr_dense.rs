@@ -2,6 +2,8 @@
 #![cfg(feature = "sdp")]
 // The dense provider is crate-private. Compile the same trait/provider source
 // here to exercise its LAPACK boundary without expanding the public API.
+// This test imports the whole provider but exercises only selected operations.
+#[allow(dead_code)]
 #[path = "../src/algebra/dense/blas/traits.rs"]
 mod provider;
 use num_traits::{FromPrimitive, One, ToPrimitive, Zero};

@@ -217,19 +217,19 @@ fn gemm<const N: usize>(
         for i in 0..m as usize {
             let mut v = F::<N>::zero();
             if alpha != F::<N>::zero() {
-                for p in 0..k as usize {
-                    // Keep baseline accumulation outside the precision
-                    // modes selected for this provider experiment.
-                    if matches!(N, 4 | 8 | 12 | 16) {
-                        v = Scalar::mul_add(
-                            at(a, lda as usize, i, p, ta),
-                            at(b, ldb as usize, p, j, tb),
-                            v,
-                        );
-                    } else {
-                        v += at(a, lda as usize, i, p, ta) * at(b, ldb as usize, p, j, tb);
-                    }
-                }
+                // Fused accumulation at every precision; the descriptor form is
+                // not specific to any limb count.
+                let (a0, da) = if upper(ta) == b'N' {
+                    (i, lda as usize)
+                } else {
+                    (i * lda as usize, 1)
+                };
+                let (b0, db) = if upper(tb) == b'N' {
+                    (j * ldb as usize, 1)
+                } else {
+                    (j, ldb as usize)
+                };
+                v = F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &b[b0 + p * db])));
             }
             column[i] = axpby(alpha, v, beta, column[i]);
         }
@@ -319,9 +319,12 @@ impl<const N: usize> XgemvScalar for F<N> {
         for i in 0..r {
             let mut v = Self::zero();
             if alpha != Self::zero() {
-                for p in 0..k {
-                    v += at(a, lda as usize, i, p, t) * x[vi(p, k, incx)];
-                }
+                let (a0, da) = if upper(t) == b'N' {
+                    (i, lda as usize)
+                } else {
+                    (i * lda as usize, 1)
+                };
+                v = F::dot_fma((0..k).map(|p| (&a[a0 + p * da], &x[vi(p, k, incx)])));
             }
             let q = vi(i, r, incy);
             y[q] = axpby(alpha, v, beta, y[q]);
@@ -347,7 +350,7 @@ impl<const N: usize> XsymvScalar for F<N> {
             let mut v = Self::zero();
             if alpha != Self::zero() {
                 for p in 0..n {
-                    v += sym(a, lda as usize, i, p, u) * x[vi(p, n, incx)];
+                    v = sym(a, lda as usize, i, p, u).mul_add(x[vi(p, n, incx)], v);
                 }
             }
             let q = vi(i, n, incy);
@@ -385,18 +388,17 @@ fn syrk<const N: usize>(
             }
             let mut v = F::<N>::zero();
             if alpha != F::<N>::zero() {
-                for p in 0..k as usize {
-                    // Match GEMM's compile-time precision selection.
-                    if matches!(N, 4 | 8 | 12 | 16) {
-                        v = Scalar::mul_add(
-                            at(a, lda as usize, i, p, t),
-                            at(a, lda as usize, j, p, t),
-                            v,
-                        );
-                    } else {
-                        v += at(a, lda as usize, i, p, t) * at(a, lda as usize, j, p, t);
-                    }
-                }
+                let (a0, da) = if upper(t) == b'N' {
+                    (i, lda as usize)
+                } else {
+                    (i * lda as usize, 1)
+                };
+                let (b0, db) = if upper(t) == b'N' {
+                    (j, lda as usize)
+                } else {
+                    (j * lda as usize, 1)
+                };
+                v = F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &a[b0 + p * db])));
             }
             column[i] = axpby(alpha, v, beta, column[i]);
         }
@@ -514,7 +516,7 @@ impl<const N: usize> XpotrfScalar for F<N> {
                 } else {
                     a[k + j * ld]
                 };
-                d -= v * v;
+                d = (-v).mul_add(v, d);
             }
             a[j + j * ld] = d;
             if !d.is_finite() || d <= Self::zero() {
@@ -531,11 +533,12 @@ impl<const N: usize> XpotrfScalar for F<N> {
                 };
                 let mut v = a[q];
                 for k in 0..j {
-                    v -= if upper(u) == b'L' {
-                        a[i + k * ld] * a[j + k * ld]
+                    let (v1, v2) = if upper(u) == b'L' {
+                        (a[i + k * ld], a[j + k * ld])
                     } else {
-                        a[k + i * ld] * a[k + j * ld]
+                        (a[k + i * ld], a[k + j * ld])
                     };
+                    v = (-v1).mul_add(v2, v);
                 }
                 a[q] = v / d;
             }
@@ -576,22 +579,26 @@ impl<const N: usize> XpotrsScalar for F<N> {
             for i in 0..n {
                 let mut v = b[i + r * lb];
                 for k in 0..i {
-                    v -= if upper(u) == b'L' {
-                        a[i + k * ld] * b[k + r * lb]
+                    let a_val = if upper(u) == b'L' {
+                        a[i + k * ld]
                     } else {
-                        a[k + i * ld] * b[k + r * lb]
+                        a[k + i * ld]
                     };
+                    let b_val = b[k + r * lb];
+                    v = (-a_val).mul_add(b_val, v);
                 }
                 b[i + r * lb] = v / a[i + i * ld];
             }
             for i in (0..n).rev() {
                 let mut v = b[i + r * lb];
                 for k in i + 1..n {
-                    v -= if upper(u) == b'L' {
-                        a[k + i * ld] * b[k + r * lb]
+                    let a_val = if upper(u) == b'L' {
+                        a[k + i * ld]
                     } else {
-                        a[i + k * ld] * b[k + r * lb]
+                        a[i + k * ld]
                     };
+                    let b_val = b[k + r * lb];
+                    v = (-a_val).mul_add(b_val, v);
                 }
                 b[i + r * lb] = v / a[i + i * ld];
             }
