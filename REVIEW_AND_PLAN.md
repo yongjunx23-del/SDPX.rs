@@ -151,6 +151,48 @@ New tests: `orthant_step_lengths_{f64,mpfr256,mpfr512}` (chunk path +
 mixed symmetric lanes, bitwise vs serial incl. signed-zero caps); the
 renamed `psd_step_lengths_*` (now `sym_*` internals) still pass.
 
+### MPI rank-sharded cross-node parallelism (2800be0, 21b4cd1, 03b236d)
+
+Optional cross-node execution via dynamically loaded MPI (`mpi.rs`,
+`dlopen`/`dlsym` — no Cargo dependency, no lock change). A `World` is
+detected only when `mpiexec` advertises >1 rank or `SDPX_MPI` is set;
+otherwise every path falls back to the identical local code. MPI is
+initialised with `MPI_THREAD_MULTIPLE` and each collective site uses a
+dedicated duplicated communicator (`SITE_FORWARD/ADJOINT/SCALING/GRAM/
+RX/RZ`), because `residual_inner`'s `rayon::join(products, scaling)`
+can run collectives concurrently.
+
+Sharded work is partitioned by disjoint block/output ownership; each
+output is computed wholly on one rank, then republished by
+`MPI_Allgatherv` in deterministic block/row order — every value keeps
+the serial arithmetic, so results are bitwise identical across rank
+counts:
+
+- sampled operator forward/adjoint products (`sampled.rs`) — forward by
+  disjoint row spans; adjoint terms gathered per block in block order
+  (column ranges may overlap), empty blocks emit zero segments;
+- NT scaling products (`condensed_scaling.rs`) — block row spans;
+- sampled Gram updates (`condensed_kkt.rs`) — only the owning rank runs
+  `update_with_pool`, Grams republished in full-block-index order;
+- condensed-KKT sparse gemvs in `solve_raw`/`residual_inner`
+  (`condensed.rs` + `SparseParallel::product_sharded`) — the LP/SOCP
+  IR-residual cost, output-partitioned with rank-local pool splitting;
+- non-dominant Gram updates now also parallelise at block level locally
+  (03b236d), removing the inner_sampled serial tail.
+
+Verified on the cluster (OpenMPI 4.1.4, job 213606/213612):
+
+- Λ=11 768-bit: np=1 vs np=2 (2 nodes × 8 threads) — solution vectors
+  **bitwise identical** (sha256 of x/s/z), rank0 == rank1 identical.
+- Λ=15 768-bit: np=1/np=2/np=4 (4 nodes × 8 threads) — solution vectors
+  **bitwise identical** (sha256 `0aa72c2e…`).
+- Note: these SDPB Ising inputs converge at iteration 0 (initial-point
+  KKT solve is near-exact for this family — verified identical on the
+  pre-change 69a5f40 release), so iterated-work speedup is not visible
+  here; np=2 costs ~+9s of redundant setup/default_start + gather
+  latency at this size. Rank sharding pays off only when iterated
+  residuals/Gram products dominate.
+
 ## Pending
 
 - Unrelated pre-existing warnings (`cached_psd`, `prepared`, `has_lanes`,
