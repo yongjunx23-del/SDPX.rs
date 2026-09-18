@@ -8,7 +8,7 @@ SDPX solves
 \min_x \tfrac12 x^T P x + q^T x \quad\text{subject to}\quad Ax+s=b,\;s\in\mathcal K.
 ```
 
-The Rust engine is adapted from [Clarabel.rs](https://github.com/oxfordcontrol/Clarabel.rs). The Julia modeling interface reuses SDPX.jl. This project has its own directory and package identity; the existing stable solver remains available in the sibling `../SDPX.jl`.
+The Rust engine is adapted from [Clarabel.rs](https://github.com/oxfordcontrol/Clarabel.rs). The Julia modeling interface reuses the former SDPX.jl front end, which this package replaces: the legacy `SDPX.jl` package, its environments and its repository were retired on 2026-09-18, and `SDPX` v0.7.0 is the supported solver.
 
 ## Features
 
@@ -31,12 +31,10 @@ julia --project=julia/SDPX.jl -e 'using Pkg; Pkg.instantiate()'
 
 On Linux, use `sdp-openblas,faer-sparse` instead. OpenBLAS source builds also require a Fortran compiler. The dependency versions are pinned in `Cargo.lock`. Julia can invoke the build with `include("julia/SDPX.jl/deps/build.jl")`; `CARGO` selects the Cargo executable.
 
-For x86 backend evaluation, `sdpx-ffi` also forwards `sdp-mkl`,
-`pardiso-mkl`, and `pardiso-panua` to the Rust solver. Select one BLAS provider
-per build; PARDISO features select a sparse solver backend separately. These
-optional configurations require their native dependencies and are not qualified
-performance defaults. Changing Julia's BLAS alone does not change the BLAS linked
-into the Rust library.
+For x86 backend evaluation, `sdpx-ffi` also forwards `sdp-mkl` to the Rust
+solver. Select one BLAS provider per build; the MKL configuration requires its
+native dependencies and is not a qualified performance default. Changing Julia's
+BLAS alone does not change the BLAS linked into the Rust library.
 
 Start Julia with `--project=julia/SDPX.jl`. The package finds `target/release/libsdpx` automatically; `SDPX_LIBRARY` can select an explicitly built library.
 

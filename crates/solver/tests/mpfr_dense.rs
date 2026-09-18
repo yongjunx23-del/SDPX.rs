@@ -867,12 +867,46 @@ fn symmetric_eigen_512_general() {
     for (size, matrix, expected) in [
         (
             4usize,
-            vec![f(2), zero, zero, zero, zero, f(2), zero, zero, zero, zero, f(2), zero, zero, zero, zero, f(5)],
+            vec![
+                f(2),
+                zero,
+                zero,
+                zero,
+                zero,
+                f(2),
+                zero,
+                zero,
+                zero,
+                zero,
+                f(2),
+                zero,
+                zero,
+                zero,
+                zero,
+                f(5),
+            ],
             vec![f(2), f(2), f(2), f(5)],
         ),
         (
             4usize,
-            vec![f(3), f(2), f(4), zero, f(2), zero, f(2), zero, f(4), f(2), f(3), zero, zero, zero, zero, f(9)],
+            vec![
+                f(3),
+                f(2),
+                f(4),
+                zero,
+                f(2),
+                zero,
+                f(2),
+                zero,
+                f(4),
+                f(2),
+                f(3),
+                zero,
+                zero,
+                zero,
+                zero,
+                f(9),
+            ],
             vec![f(-1), f(-1), f(8), f(9)],
         ),
     ] {
@@ -960,9 +994,27 @@ fn single_index_eigen() {
     // The indexed path reserves extra scratch; size the workspace for it.
     let mut w1 = vec![zero; n];
     F::xsyevr(
-        b'N', b'I', b'U', n as i32, &mut a.clone(), n as i32, zero, zero, 1, 1,
-        zero, &mut count, &mut w1, &mut [], 1, &mut [], &mut work, -1, &mut iw,
-        -1, &mut info,
+        b'N',
+        b'I',
+        b'U',
+        n as i32,
+        &mut a.clone(),
+        n as i32,
+        zero,
+        zero,
+        1,
+        1,
+        zero,
+        &mut count,
+        &mut w1,
+        &mut [],
+        1,
+        &mut [],
+        &mut work,
+        -1,
+        &mut iw,
+        -1,
+        &mut info,
     );
     assert_eq!(info, 0);
     let lwork = work[0].to_i32().unwrap();
@@ -972,9 +1024,27 @@ fn single_index_eigen() {
     // Reference spectrum from the values-only full path.
     let mut wall = vec![zero; n];
     F::xsyevr(
-        b'N', b'A', b'U', n as i32, &mut a.clone(), n as i32, zero, zero, 0, 0,
-        zero, &mut count, &mut wall, &mut [], 1, &mut [], &mut work, lwork,
-        &mut iw, liwork, &mut info,
+        b'N',
+        b'A',
+        b'U',
+        n as i32,
+        &mut a.clone(),
+        n as i32,
+        zero,
+        zero,
+        0,
+        0,
+        zero,
+        &mut count,
+        &mut wall,
+        &mut [],
+        1,
+        &mut [],
+        &mut work,
+        lwork,
+        &mut iw,
+        liwork,
+        &mut info,
     );
     assert_eq!(info, 0);
     assert_eq!(count, n as i32);
@@ -982,9 +1052,27 @@ fn single_index_eigen() {
     for k in [1i32, 7, 14] {
         let mut w = vec![zero; n];
         F::xsyevr(
-            b'N', b'I', b'U', n as i32, &mut a.clone(), n as i32, zero, zero, k, k,
-            zero, &mut count, &mut w, &mut [], 1, &mut [], &mut work, lwork,
-            &mut iw, liwork, &mut info,
+            b'N',
+            b'I',
+            b'U',
+            n as i32,
+            &mut a.clone(),
+            n as i32,
+            zero,
+            zero,
+            k,
+            k,
+            zero,
+            &mut count,
+            &mut w,
+            &mut [],
+            1,
+            &mut [],
+            &mut work,
+            lwork,
+            &mut iw,
+            liwork,
+            &mut info,
         );
         assert_eq!(info, 0);
         assert_eq!(count, 1);
@@ -1001,9 +1089,27 @@ fn single_index_eigen() {
     for k in 1i32..=4 {
         let mut w = vec![zero; 4];
         F::xsyevr(
-            b'N', b'I', b'U', 4, &mut ad.clone(), 6, zero, zero, k, k, zero,
-            &mut count, &mut w, &mut [], 1, &mut [], &mut work, lwork, &mut iw,
-            liwork, &mut info,
+            b'N',
+            b'I',
+            b'U',
+            4,
+            &mut ad.clone(),
+            6,
+            zero,
+            zero,
+            k,
+            k,
+            zero,
+            &mut count,
+            &mut w,
+            &mut [],
+            1,
+            &mut [],
+            &mut work,
+            lwork,
+            &mut iw,
+            liwork,
+            &mut info,
         );
         assert_eq!(info, 0);
         assert_eq!(count, 1);

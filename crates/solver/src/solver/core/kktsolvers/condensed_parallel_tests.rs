@@ -390,7 +390,7 @@ fn wide_pool_splits_congruence_tiles<T: FloatT>() {
     let m = a.m;
     let mut settings = CoreSettings::<T>::default();
     settings.max_threads = 1;
-    
+
     settings.direct_solve_method = "qdldl".into();
     settings.iterative_refinement_abstol = T::epsilon() * num::<T>(1024);
     settings.iterative_refinement_reltol = settings.iterative_refinement_abstol;
@@ -479,8 +479,7 @@ fn pooled_orthant_preserves_fma_mpfr256() {
 fn scaling_dispatch_decouples_lanes_from_workers() {
     // The 3D Ising reduced system: 22 near-uniform PSD blocks at 512 bits.
     let dims = [
-        12usize, 12, 13, 12, 14, 13, 15, 14, 16, 15, 16, 15, 16, 15, 16, 15, 16, 15, 16, 15, 16,
-        15,
+        12usize, 12, 13, 12, 14, 13, 15, 14, 16, 15, 16, 15, 16, 15, 16, 15, 16, 15, 16, 15, 16, 15,
     ];
     let costs: Vec<u128> = dims.iter().map(|d| 4 * (*d as u128).pow(3)).collect();
     let total: u128 = costs.iter().sum();
@@ -490,7 +489,10 @@ fn scaling_dispatch_decouples_lanes_from_workers() {
     // and at the widths that matter it uses every block as its own lane.
     for workers in [2usize, 4, 8, 16] {
         let (lanes, _) = scaling_dispatch(&costs, workers);
-        assert!(lanes.len() <= costs.len().min(workers * 4), "workers={workers}");
+        assert!(
+            lanes.len() <= costs.len().min(workers * 4),
+            "workers={workers}"
+        );
         assert!(lanes.len() >= workers.min(costs.len()), "workers={workers}");
         let chosen = lpt_makespan(&lane_loads(&costs, &lanes), workers);
         let worker_partition = weighted_lanes(&costs, workers);
@@ -518,7 +520,12 @@ fn scaling_dispatch_tiles_the_dominant_block() {
     // A dominant block that outweighs an equal share of the pool must be split
     // into column tiles even when it already owns a lane, which is the case the
     // old lane-count gate left unsplit.
-    let costs = [4 * 64u128.pow(3), 4 * 8u128.pow(3), 4 * 8u128.pow(3), 4 * 8u128.pow(3)];
+    let costs = [
+        4 * 64u128.pow(3),
+        4 * 8u128.pow(3),
+        4 * 8u128.pow(3),
+        4 * 8u128.pow(3),
+    ];
     let (lanes, tiles) = scaling_dispatch(&costs, 8);
     assert_eq!(lanes.len(), costs.len());
     assert!(tiles >= 2, "tiles={tiles}");
@@ -898,7 +905,11 @@ fn solve_many_accounting<T: FloatT>() {
         let base = c * width;
         let mut single = vec![T::zero(); width];
         let (xl, zl) = single.split_at_mut(n);
-        KKTSolver::setrhs(&mut solver, &rhs[base..base + n], &rhs[base + n..base + width]);
+        KKTSolver::setrhs(
+            &mut solver,
+            &rhs[base..base + n],
+            &rhs[base + n..base + width],
+        );
         assert!(KKTSolver::solve(&mut solver, Some(xl), Some(zl), &settings));
         assert_eq!(
             &single[..],
@@ -914,7 +925,11 @@ fn solve_many_accounting<T: FloatT>() {
     }
     let mut mixed_out = vec![T::zero(); ncols * width];
     let flags = KKTSolver::solve_many(&mut solver, n, &mixed, &mut mixed_out, ncols, &settings);
-    assert_eq!(flags, vec![false, true, true], "failure must stay local to its column");
+    assert_eq!(
+        flags,
+        vec![false, true, true],
+        "failure must stay local to its column"
+    );
 }
 
 #[test]
@@ -931,4 +946,3 @@ fn solve_many_accounting_mpfr256() {
 fn solve_many_accounting_mpfr512() {
     solve_many_accounting::<sdpx_arithmetic::Bits512>();
 }
-

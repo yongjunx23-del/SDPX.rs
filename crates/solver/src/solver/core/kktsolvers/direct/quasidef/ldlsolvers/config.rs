@@ -1,6 +1,4 @@
 use super::{auto::AutoDirectLDLSolver, qdldl::QDLDLDirectLDLSolver};
-#[cfg(any(feature = "pardiso-mkl", feature = "pardiso-panua"))]
-use crate::solver::core::kktsolvers::direct::DirectLDLSolverReqs;
 use crate::{
     algebra::{CscMatrix, FloatT, MatrixTriangle},
     solver::{core::kktsolvers::direct::BoxedDirectLDLSolver, CoreSettings},
@@ -79,7 +77,6 @@ trait SpecializedLDL: FloatT {
         None
     }
 }
-#[cfg(not(feature = "sdp-r"))]
 impl SpecializedLDL for f32 {
     fn specialized_ldl(method: &str) -> (MatrixTriangle, LDLConstructor<Self>) {
         panic!("LDL backend {method:?} is unavailable for Float32")
@@ -103,22 +100,9 @@ impl SpecializedLDL for f64 {
         }
     }
     fn specialized_ldl(method: &str) -> (MatrixTriangle, LDLConstructor<Self>) {
-        match method {
-            #[cfg(feature = "pardiso-mkl")]
-            "mkl" => (
-                super::pardiso::MKLPardisoDirectLDLSolver::required_matrix_shape(),
-                |m, d, s, p| Box::new(super::pardiso::MKLPardisoDirectLDLSolver::new(m, d, s, p)),
-            ),
-            #[cfg(feature = "pardiso-panua")]
-            "panua" => (
-                super::pardiso::PanuaPardisoDirectLDLSolver::required_matrix_shape(),
-                |m, d, s, p| Box::new(super::pardiso::PanuaPardisoDirectLDLSolver::new(m, d, s, p)),
-            ),
-            _ => panic!("LDL backend {method:?} is unavailable for Float64"),
-        }
+        panic!("LDL backend {method:?} is unavailable for Float64")
     }
 }
-#[cfg(not(feature = "sdp-r"))]
 primitive_configuration!(f32);
 primitive_configuration!(f64);
 

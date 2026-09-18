@@ -3,16 +3,8 @@ use crate::solver::core::traits::Settings;
 use crate::{algebra::*, solver::core::SettingsError};
 use derive_builder::Builder;
 
-#[cfg(any(feature = "pardiso-mkl", feature = "pardiso-panua"))]
-use pardiso_wrapper::PardisoInterface;
 #[cfg(feature = "serde")]
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-
-#[cfg(all(
-    feature = "serde",
-    any(feature = "pardiso-mkl", feature = "pardiso-panua")
-))]
-use serde_big_array::BigArray;
 
 // PJG: Serialization is required for file in/out, but is also used to pass
 // settings structures between Rust and Julia (and possibly Python)
@@ -219,36 +211,6 @@ pub struct DefaultSettings<T: FloatT> {
     #[cfg(feature = "sdp")]
     #[builder(default = "true")]
     pub chordal_decomposition_complete_dual: bool,
-
-    /// Pardiso `iparm` parameter array.  Any values in this array (other
-    /// than iparm[0]) that are set to something other than i32::MIN will be
-    /// passed to the solver as is, with all other values taking appropriate
-    /// defaults.
-    ///
-    /// The parameter iparm[0] is used by pardiso to indicate that default
-    /// values should be used everywhere (if 0) or that the user has set
-    /// the values in the array (if 1).  Ths parameter will be set internally
-    /// to 1 by the solver if the user has passed any values other than i32::MIN.
-    ///
-    /// Caution: it is the responsibility of the user to ensure that the
-    /// values passed are valid for the intended use of Pardiso within the
-    /// Clarabel solver.   Failure to do so may result in side effects
-    /// ranging from benign to catastrophic.
-    ///
-    /// NB: depending on the documentation referred to, the 'iparm' array
-    /// may be documented using either 0-based (C style) or 1-based (Fortran)
-    /// style indexing.  The values in this array are treated as 0-based.
-    ///
-    /// Requires the "pardiso-mkl" or "pardiso-panua" feature.
-    #[cfg(any(feature = "pardiso-mkl", feature = "pardiso-panua"))]
-    #[builder(default = "[i32::MIN; 64]")]
-    #[cfg_attr(feature = "serde", serde(with = "BigArray"))]
-    pub pardiso_iparm: [i32; 64],
-
-    /// enable pardiso verbose output
-    #[cfg(any(feature = "pardiso-mkl", feature = "pardiso-panua"))]
-    #[builder(default = "false")]
-    pub pardiso_verbose: bool,
 }
 
 // Same precision policy as SDPX.jl/src/settings.jl. Primitive defaults retain
@@ -351,10 +313,6 @@ where
         #[cfg(feature = "sdp")]
         validate_chordal_decomposition_merge_method(&self.chordal_decomposition_merge_method)?;
 
-        // check the pardiso iparm settings.   Currently a no-op
-        #[cfg(any(feature = "pardiso-mkl", feature = "pardiso-panua"))]
-        validate_pardiso_iparm(&self.pardiso_iparm)?;
-
         Ok(())
     }
 
@@ -383,12 +341,6 @@ where
             check_immutable_setting!(self, prev, chordal_decomposition_merge_method);
             check_immutable_setting!(self, prev, chordal_decomposition_compact);
             check_immutable_setting!(self, prev, chordal_decomposition_complete_dual);
-        }
-
-        #[cfg(any(feature = "pardiso-mkl", feature = "pardiso-panua"))]
-        {
-            check_immutable_setting!(self, prev, pardiso_iparm);
-            check_immutable_setting!(self, prev, pardiso_verbose);
         }
 
         Ok(())
@@ -451,28 +403,6 @@ fn validate_direct_solve_method(direct_solve_method: &str) -> Result<(), Setting
         "qdldl" => Ok(()),
         #[cfg(feature = "faer-sparse")]
         "faer" => Ok(()),
-        #[cfg(feature = "pardiso-mkl")]
-        "mkl" => {
-            if pardiso_wrapper::MKLPardisoSolver::is_available() {
-                Ok(())
-            } else {
-                Err(SettingsError::LinearSolverProblem {
-                    solver: "mkl",
-                    problem: "not available",
-                })
-            }
-        }
-        #[cfg(feature = "pardiso-panua")]
-        "panua" => {
-            if pardiso_wrapper::PanuaPardisoSolver::is_available() {
-                Ok(())
-            } else {
-                Err(SettingsError::LinearSolverProblem {
-                    solver: "panua",
-                    problem: "not available",
-                })
-            }
-        }
         _ => Err(SettingsError::BadFieldValue("direct_solve_method")),
     }
 }
@@ -488,19 +418,6 @@ fn validate_chordal_decomposition_merge_method(
         _ => Err(SettingsError::BadFieldValue(
             "chordal_decomposition_merge_method",
         )),
-    }
-}
-
-#[cfg(any(feature = "pardiso-mkl", feature = "pardiso-panua"))]
-fn validate_pardiso_iparm(iparm: &[i32; 64]) -> Result<(), SettingsError> {
-    use crate::solver::core::kktsolvers::direct::ldlsolvers::pardiso::pardiso_iparm_is_valid;
-
-    // check for very bad parm parameters here
-
-    if pardiso_iparm_is_valid(iparm) {
-        Ok(())
-    } else {
-        Err(SettingsError::BadFieldValue("pardiso_iparm"))
     }
 }
 

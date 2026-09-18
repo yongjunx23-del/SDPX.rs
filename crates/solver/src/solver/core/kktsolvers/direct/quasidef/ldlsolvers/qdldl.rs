@@ -104,4 +104,8 @@ where
         self.factors.refactor().unwrap();
         self.factors.Dinv.is_finite()
     }
+
+    fn set_pool(&mut self, pool: Option<std::sync::Arc<rayon::ThreadPool>>) {
+        self.factors.set_pool(pool);
+    }
 }

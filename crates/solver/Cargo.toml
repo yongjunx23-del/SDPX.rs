@@ -18,7 +18,6 @@ cfg-if         = "1.0"
 itertools      = "0.11"
 derive_builder = "0.11"
 enum_dispatch  = "0.3.8"
-lazy_static    = "1.4"
 num-traits     = "0.2"
 sdpx-arithmetic = { path = "../arithmetic" }
 thiserror      = "1.0"
@@ -32,29 +31,20 @@ thiserror      = "1.0"
 default = ["serde"]
 
 # enable reading / writing of problems from json files 
-serde = ["dep:serde", "dep:serde_json", "dep:serde-big-array"]
+serde = ["dep:serde", "dep:serde_json"]
 
 # enables blas/lapack for SDP support, with blas/lapack src unspecified
 # also enable packages required for chordal decomposition 
 sdp = ["blas","lapack", "indexmap"]
-
-# enable detailed build info reporting 
-buildinfo = ["dep:vergen"]
 
 # explicit configuration options for different blas flavours
 sdp-accelerate = ["sdp", "blas-src/accelerate", "lapack-src/accelerate"]
 sdp-netlib     = ["sdp", "blas-src/netlib", "lapack-src/netlib", "netlib-src"]
 sdp-openblas   = ["sdp", "blas-src/openblas", "lapack-src/openblas", "openblas-src"]
 sdp-mkl        = ["sdp", "blas-src/intel-mkl", "lapack-src/intel-mkl","intel-mkl-src"]
-sdp-r          = ["sdp", "blas-src/r", "lapack-src/r"]
 
 # compile with faer supernodal solver option
 faer-sparse = ["dep:faer", "dep:faer-traits"]
-
-# various pardiso options
-pardiso-panua = ["pardiso-wrapper/panua"]
-pardiso-mkl = ["pardiso-wrapper/mkl"]
-pardiso = ["pardiso-panua", "pardiso-mkl"]
 
 # compile with more exhaustive benchmarking tests 
 bench = []
@@ -117,10 +107,6 @@ optional = true
 [dependencies.faer-traits]
 version = "0.21.5"
 optional = true 
-
-[dependencies.pardiso-wrapper]
-version = "0.1"
-optional = true
 
 
 # -------------------------------
@@ -197,10 +183,6 @@ features = ["float_roundtrip"]
 # used for display python objects.  Increases MSRV
 # to 1.75, so not used by default.
 
-[dependencies.serde-big-array]
-optional = true 
-version = "0.5"
-
 
 
 [lib]
@@ -221,14 +203,6 @@ web-time = "0.2.3"
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
 
-
-# ------------------------------
-# detailed build info
-# ------------------------------
-[build-dependencies.vergen]
-optional = true
-version = "9.0"
-features = ["build", "cargo", "rustc", "si"]
 
 # ------------------------------
 # testing, benchmarking etc 

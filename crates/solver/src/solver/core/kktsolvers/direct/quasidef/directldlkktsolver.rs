@@ -134,7 +134,9 @@ where
     T: FloatT,
 {
     fn update(&mut self, cones: &CompositeCone<T>, settings: &CoreSettings<T>) -> bool {
-        self.set_residual_pool(cones.thread_pool());
+        let pool = cones.thread_pool();
+        self.set_residual_pool(pool.clone());
+        self.set_factor_pool(pool);
         self.update_from_cones(cones.iter(), settings)
     }
 
@@ -152,12 +154,20 @@ where
         lhsz: Option<&mut [T]>,
         settings: &CoreSettings<T>,
     ) -> bool {
+        let __t0 = std::time::Instant::now();
         self.ldlsolver.solve(&self.KKT, &mut self.x, &mut self.b);
-
+        let __t_trsv = __t0.elapsed();
         let is_success = {
             if settings.iterative_refinement_enable {
-                self.iterative_refinement(settings)
+                let r = self.iterative_refinement(settings);
+                if std::env::var_os("SDPX_PROFILE").is_some() {
+                    eprintln!("PHASE trsv {:?} ir {:?}", __t_trsv, __t0.elapsed());
+                }
+                r
             } else {
+                if std::env::var_os("SDPX_PROFILE").is_some() {
+                    eprintln!("PHASE trsv {:?}", __t_trsv);
+                }
                 self.x.is_finite()
             }
         };
@@ -274,7 +284,11 @@ where
         }
 
         //refactor with new data
+        let __t0 = std::time::Instant::now();
         let is_success = self.ldlsolver.refactor(KKT);
+        if std::env::var_os("SDPX_PROFILE").is_some() {
+            eprintln!("PHASE refactor {:?}", __t0.elapsed());
+        }
 
         if settings.static_regularization_enable {
             // put our internal copy of the KKT matrix back the way
@@ -287,15 +301,24 @@ where
         is_success
     }
 
+    /// Forward the solver thread pool to the LDL factorisation kernels that
+    /// can use it (currently the elimination-tree parallel QDLDL path).
+    pub(crate) fn set_factor_pool(&mut self, pool: Option<std::sync::Arc<rayon::ThreadPool>>) {
+        self.ldlsolver.set_pool(pool);
+    }
+
     pub(crate) fn set_residual_pool(&mut self, pool: Option<std::sync::Arc<rayon::ThreadPool>>) {
         let words = T::precision_bits().div_ceil(64) as u128;
         let work = self.KKT.nzval.len() as u128 * words * words;
-        let pool = pool.filter(|p| p.current_num_threads() > 1
-            && work >= 4096 * p.current_num_threads() as u128);
+        let pool = pool.filter(|p| {
+            p.current_num_threads() > 1 && work >= 4096 * p.current_num_threads() as u128
+        });
         if pool.is_some() && self.residual_plan.is_none() {
             self.residual_plan = Some(SparseParallel::new_symmetric(&self.KKT));
         }
-        if let Some(plan) = &mut self.residual_plan { plan.configure(&self.KKT, pool); }
+        if let Some(plan) = &mut self.residual_plan {
+            plan.configure(&self.KKT, pool);
+        }
     }
 
     fn iterative_refinement(&mut self, settings: &CoreSettings<T>) -> bool {
@@ -445,47 +468,77 @@ fn _fill_signs(signs: &mut [i8], m: usize, n: usize, map: &LDLDataMap) {
     }
 }
 
-
 #[cfg(test)]
 mod parallel_residual_tests {
     use super::*;
     fn activation<T: FloatT>() {
-        let n=192;
-        let mut ptr=vec![0]; let mut rows=Vec::new(); let mut values=Vec::new();
+        let n = 192;
+        let mut ptr = vec![0];
+        let mut rows = Vec::new();
+        let mut values = Vec::new();
         for j in 0..n {
             for i in 0..=j {
                 rows.push(i);
-                values.push(if i==j { T::from_f64(3.).unwrap() } else { T::from_f64(0.125).unwrap() });
+                values.push(if i == j {
+                    T::from_f64(3.).unwrap()
+                } else {
+                    T::from_f64(0.125).unwrap()
+                });
             }
             ptr.push(rows.len());
         }
-        let mut p=CscMatrix::new(n,n,ptr,rows,values);
-        let a=CscMatrix::zeros((0,n));
-        let cones=CompositeCone::<T>::new(&[]);
-        let mut settings=CoreSettings::<T>::default();
-        settings.direct_solve_method="qdldl".into();
-        let mut solver=DirectLDLKKTSolver::new(&p,&a,&cones,0,n,&settings);
+        let mut p = CscMatrix::new(n, n, ptr, rows, values);
+        let a = CscMatrix::zeros((0, n));
+        let cones = CompositeCone::<T>::new(&[]);
+        let mut settings = CoreSettings::<T>::default();
+        settings.direct_solve_method = "qdldl".into();
+        let mut solver = DirectLDLKKTSolver::new(&p, &a, &cones, 0, n, &settings);
         assert!(solver.residual_plan.is_none());
-        let rhs=vec![T::one();n];
-        let mut x:Vec<_>=(0..n).map(|i|T::from_f64((i%7) as f64-3.).unwrap()).collect();
-        let mut storage=None;
-        for workers in [4,1,2,4] {
-            let pool=(workers>1).then(||std::sync::Arc::new(rayon::ThreadPoolBuilder::new().num_threads(workers).build().unwrap()));
+        let rhs = vec![T::one(); n];
+        let mut x: Vec<_> = (0..n)
+            .map(|i| T::from_f64((i % 7) as f64 - 3.).unwrap())
+            .collect();
+        let mut storage = None;
+        for workers in [4, 1, 2, 4] {
+            let pool = (workers > 1).then(|| {
+                std::sync::Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(workers)
+                        .build()
+                        .unwrap(),
+                )
+            });
             solver.set_residual_pool(pool);
-            let plan=solver.residual_plan.as_ref().unwrap();
-            let (actual_workers,address)=plan.test_pool_and_storage();
-            assert_eq!(actual_workers,workers);
-            if let Some(previous)=storage { assert_eq!(previous,address); } else { storage=Some(address); }
-            p.nzval[0]+=T::from_f64(0.125).unwrap();
+            let plan = solver.residual_plan.as_ref().unwrap();
+            let (actual_workers, address) = plan.test_pool_and_storage();
+            assert_eq!(actual_workers, workers);
+            if let Some(previous) = storage {
+                assert_eq!(previous, address);
+            } else {
+                storage = Some(address);
+            }
+            p.nzval[0] += T::from_f64(0.125).unwrap();
             solver.update_P(&p);
-            let mut expected=vec![T::zero();n]; let mut actual=expected.clone();
-            let k=solver.KKT.sym(solver.KKTuplo);
-            let en=_get_refine_error(&mut expected,&rhs,&k,&mut x,None);
-            let an=_get_refine_error(&mut actual,&rhs,&k,&mut x,solver.residual_plan.as_ref());
-            assert_eq!(actual,expected); assert_eq!(an,en);
+            let mut expected = vec![T::zero(); n];
+            let mut actual = expected.clone();
+            let k = solver.KKT.sym(solver.KKTuplo);
+            let en = _get_refine_error(&mut expected, &rhs, &k, &mut x, None);
+            let an =
+                _get_refine_error(&mut actual, &rhs, &k, &mut x, solver.residual_plan.as_ref());
+            assert_eq!(actual, expected);
+            assert_eq!(an, en);
         }
     }
-    #[test] fn activation_f64(){activation::<f64>();}
-    #[test] fn activation_mpfr256(){activation::<sdpx_arithmetic::Bits256>();}
-    #[test] fn activation_mpfr512(){activation::<sdpx_arithmetic::Bits512>();}
+    #[test]
+    fn activation_f64() {
+        activation::<f64>();
+    }
+    #[test]
+    fn activation_mpfr256() {
+        activation::<sdpx_arithmetic::Bits256>();
+    }
+    #[test]
+    fn activation_mpfr512() {
+        activation::<sdpx_arithmetic::Bits512>();
+    }
 }

@@ -5,8 +5,9 @@ description: Build or validate the SDPX Rust core and Julia frontend, including 
 
 # SDPX development
 
-Applies to the current Rust-backed project, not the stable sibling `SDPX.jl`.
-Follow [AGENTS.md](../../../AGENTS.md); do not load legacy solver/physics rules.
+Applies to the Rust-backed `SDPX` package (v0.7.0), which replaced the retired
+`SDPX.jl` package on 2026-09-18. No legacy Julia solver or physics rules apply.
+Follow [AGENTS.md](../../../AGENTS.md).
 
 ## Build and checks
 

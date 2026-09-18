@@ -1,5 +1,4 @@
 use crate::utils::atomic::{AtomicF64, Ordering};
-use lazy_static::lazy_static;
 
 /// Constant indicating that an inequality bound is to be treated as infinite.
 ///
@@ -12,9 +11,7 @@ use lazy_static::lazy_static;
 ///
 pub const INFINITY_DEFAULT: f64 = crate::_INFINITY_DEFAULT;
 
-lazy_static! {
-    static ref INFINITY: AtomicF64 = AtomicF64::new(INFINITY_DEFAULT);
-}
+static INFINITY: AtomicF64 = AtomicF64::new(INFINITY_DEFAULT);
 
 /// Revert internal infinity bound to its default value.   The default is [`INFINITY_DEFAULT`]
 ///

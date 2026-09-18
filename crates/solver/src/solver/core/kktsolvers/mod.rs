@@ -129,4 +129,3 @@ pub struct LinearSolverInfo {
     /// Number of nonzeros in the factored system
     pub nnzL: usize, // nnz in L for A = LDL^T
 }
-

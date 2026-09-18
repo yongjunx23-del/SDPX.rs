@@ -10,7 +10,7 @@ pub struct AtomicF64 {
     storage: AtomicU64,
 }
 impl AtomicF64 {
-    pub fn new(value: f64) -> Self {
+    pub const fn new(value: f64) -> Self {
         let as_u64 = value.to_bits();
         Self {
             storage: AtomicU64::new(as_u64),

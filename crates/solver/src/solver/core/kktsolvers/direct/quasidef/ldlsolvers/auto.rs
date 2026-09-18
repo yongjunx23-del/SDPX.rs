@@ -1,10 +1,10 @@
 #![allow(non_snake_case)]
+#[cfg(feature = "faer-sparse")]
+use crate::solver::core::kktsolvers::direct::ldlsolvers::qdldl::QDLDLDirectLDLSolver;
 use crate::{
     algebra::*,
     solver::core::{
-        kktsolvers::direct::{
-            ldlsolvers::qdldl::QDLDLDirectLDLSolver, BoxedDirectLDLSolver, DirectLDLSolverReqs,
-        },
+        kktsolvers::direct::{BoxedDirectLDLSolver, DirectLDLSolverReqs},
         CoreSettings,
     },
 };

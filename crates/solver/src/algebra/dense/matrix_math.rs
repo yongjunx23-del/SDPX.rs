@@ -159,7 +159,11 @@ where
     T: FloatT,
     S: AsRef<[T]> + AsMut<[T]>,
 {
-    let scale = if M.ncols() > 1 { T::FRAC_1_SQRT_2() } else { T::zero() };
+    let scale = if M.ncols() > 1 {
+        T::FRAC_1_SQRT_2()
+    } else {
+        T::zero()
+    };
     let mut idx = 0;
     for col in 0..M.ncols() {
         for row in 0..=col {
@@ -180,7 +184,11 @@ where
     MATM: DenseMatrix<T>,
     T: FloatT,
 {
-    let scale = if M.ncols() > 1 { T::FRAC_1_SQRT_2() } else { T::zero() };
+    let scale = if M.ncols() > 1 {
+        T::FRAC_1_SQRT_2()
+    } else {
+        T::zero()
+    };
     let mut idx = 0;
     for col in 0..M.ncols() {
         for row in 0..=col {

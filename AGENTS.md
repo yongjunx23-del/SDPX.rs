@@ -37,7 +37,7 @@ with repeatable ≥2% median improvement or a justified correctness/memory benef
 
 Read only the relevant entry:
 - [README](README.md): installation, API and architecture.
-- [Performance plan](PERFORMANCE_PLAN.md): current priorities and unqualified work.
+- [Review and plan](REVIEW_AND_PLAN.md): current priorities and unqualified work.
 - [sdpx-development](.agents/skills/sdpx-development/SKILL.md): build/test setup,
   precision ownership and benchmark routing.
 - [Benchmark protocol](benchmark/research/README.md): research experiments.

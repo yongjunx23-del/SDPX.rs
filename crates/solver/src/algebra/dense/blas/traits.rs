@@ -23,22 +23,12 @@ pub trait BlasFloatT:
     + XgesvScalar
 {}
 
-cfg_if::cfg_if! {
-  if #[cfg(not(feature="sdp-r"))] {
-	// R blas/lapack only provides double precision routines
 	impl BlasFloatT for f32 {}
-  }
-}
 impl BlasFloatT for f64 {}
 
 mod private {
   pub trait BlasFloatSealed {}
-  cfg_if::cfg_if! {
-	if #[cfg(not(feature="sdp-r"))] {
-	    // R blas/lapack only provides double precision routines
-	    impl BlasFloatSealed for f32 {}
-	}
-  }
+  impl BlasFloatSealed for f32 {}
   impl BlasFloatSealed for f64 {}
 }
 
@@ -74,12 +64,7 @@ macro_rules! impl_blas_xsyevr {
     };
 }
 
-cfg_if::cfg_if! {
-  if #[cfg(not(feature="sdp-r"))] {
-      // R blas/lapack only provides double precision routines
-      impl_blas_xsyevr!(f32, ssyevr);
-  }
-}
+impl_blas_xsyevr!(f32, ssyevr);
 impl_blas_xsyevr!(f64, dsyevr);
 
 // --------------------------------------
@@ -125,12 +110,7 @@ macro_rules! impl_blas_xpotrfs{
     };
 }
 
-cfg_if::cfg_if! {
-  if #[cfg(not(feature="sdp-r"))] {
-      // R blas/lapack only provides double precision routines
-      impl_blas_xpotrfs!(f32, spotrf, spotrs);
-  }
-}
+impl_blas_xpotrfs!(f32, spotrf, spotrs);
 impl_blas_xpotrfs!(f64, dpotrf, dpotrs);
 
 
@@ -164,12 +144,7 @@ macro_rules! impl_blas_xgesdd{
     };
 }
 
-cfg_if::cfg_if! {
-  if #[cfg(not(feature="sdp-r"))] {
-      // R blas/lapack only provides double precision routines
-      impl_blas_xgesdd!(f32, sgesdd);
-  }
-}
+impl_blas_xgesdd!(f32, sgesdd);
 impl_blas_xgesdd!(f64, dgesdd);
 
 
@@ -203,12 +178,7 @@ macro_rules! impl_blas_xgesvd{
     };
 }
 
-cfg_if::cfg_if! {
-  if #[cfg(not(feature="sdp-r"))] {
-      // R blas/lapack only provides double precision routines
-      impl_blas_xgesvd!(f32, sgesvd);
-  }
-}
+impl_blas_xgesvd!(f32, sgesvd);
 impl_blas_xgesvd!(f64, dgesvd);
 
 
@@ -249,12 +219,7 @@ macro_rules! impl_blas_gemm {
     };
 }
 
-cfg_if::cfg_if! {
-  if #[cfg(not(feature="sdp-r"))] {
-      // R blas/lapack only provides double precision routines
-      impl_blas_gemm!(f32, sgemm);
-  }
-}
+impl_blas_gemm!(f32, sgemm);
 impl_blas_gemm!(f64, dgemm);
 
 // --------------------------------------
@@ -286,12 +251,7 @@ macro_rules! impl_blas_gemv {
     };
 }
 
-cfg_if::cfg_if! {
-  if #[cfg(not(feature="sdp-r"))] {
-      // R blas/lapack only provides double precision routines
-      impl_blas_gemv!(f32, sgemv);
-  }
-}
+impl_blas_gemv!(f32, sgemv);
 impl_blas_gemv!(f64, dgemv);
 
 
@@ -324,12 +284,7 @@ macro_rules! impl_blas_gsymv {
     };
 }
 
-cfg_if::cfg_if! {
-  if #[cfg(not(feature="sdp-r"))] {
-      // R blas/lapack only provides double precision routines
-      impl_blas_gsymv!(f32, ssymv);
-  }
-}
+impl_blas_gsymv!(f32, ssymv);
 impl_blas_gsymv!(f64, dsymv);
 
 
@@ -368,12 +323,7 @@ macro_rules! impl_blas_gsyrk {
     };
 }
 
-cfg_if::cfg_if! {
-  if #[cfg(not(feature="sdp-r"))] {
-      // R blas/lapack only provides double precision routines
-      impl_blas_gsyrk!(f32, ssyrk);
-  }
-}
+impl_blas_gsyrk!(f32, ssyrk);
 impl_blas_gsyrk!(f64, dsyrk);
 
 // --------------------------------------
@@ -406,12 +356,7 @@ macro_rules! impl_blas_gsyr2k {
     };
 }
 
-cfg_if::cfg_if! {
-  if #[cfg(not(feature="sdp-r"))] {
-      // R blas/lapack only provides double precision routines
-      impl_blas_gsyr2k!(f32, ssyr2k);
-  }
-}
+impl_blas_gsyr2k!(f32, ssyr2k);
 impl_blas_gsyr2k!(f64, dsyr2k);
 
 
@@ -443,12 +388,7 @@ macro_rules! impl_blas_xgesv{
     };
 }
 
-cfg_if::cfg_if! {
-  if #[cfg(not(feature="sdp-r"))] {
-      // R blas/lapack only provides double precision routines
-      impl_blas_xgesv!(f32, sgesv);
-  }
-}
+impl_blas_xgesv!(f32, sgesv);
 impl_blas_xgesv!(f64, dgesv);
 // Inline MPFR precision modes share the dense provider boundary.
 #[path = "mpfr.rs"]

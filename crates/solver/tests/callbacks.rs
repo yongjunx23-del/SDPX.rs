@@ -3,10 +3,10 @@
 #[cfg(test)]
 mod callback_test {
 
+    use core::ffi::{c_int, c_void};
     use sdpx_solver::solver::default::ffi::DefaultInfoFFI;
     use sdpx_solver::solver::DefaultInfo;
     use sdpx_solver::{algebra::*, solver::*};
-    use core::ffi::{c_int, c_void};
 
     // setup a custom termination function
     fn callback_r(info: &DefaultInfo<f64>) -> bool {

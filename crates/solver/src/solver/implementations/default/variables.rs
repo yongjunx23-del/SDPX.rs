@@ -193,15 +193,17 @@ where
         self.κ = T::one();
     }
 
-    fn new_like(&self) -> Self { Self::new(self.x.len(), self.s.len()) }
+    fn new_like(&self) -> Self {
+        Self::new(self.x.len(), self.s.len())
+    }
     fn interpolate(&mut self, left: &Self, right: &Self, weight: T) {
         self.copy_from(left);
-        let a = T::one()-weight;
+        let a = T::one() - weight;
         self.x.axpby(weight, &right.x, a);
         self.s.axpby(weight, &right.s, a);
         self.z.axpby(weight, &right.z, a);
-        self.τ = a*left.τ + weight*right.τ;
-        self.κ = a*left.κ + weight*right.κ;
+        self.τ = a * left.τ + weight * right.τ;
+        self.κ = a * left.κ + weight * right.κ;
     }
 
     fn copy_from(&mut self, src: &Self) {

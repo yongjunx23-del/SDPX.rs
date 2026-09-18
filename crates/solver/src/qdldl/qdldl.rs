@@ -3,7 +3,12 @@ use crate::algebra::*;
 use core::cmp::{max, min};
 use derive_builder::Builder;
 use std::iter::zip;
+use std::sync::Arc;
 use thiserror::Error;
+
+#[path = "parallel.rs"]
+mod parallel;
+use parallel::ParallelPlan;
 
 /// Error codes returnable from [`QDLDLFactorisation`](QDLDLFactorisation) factor operations
 #[derive(Error, Debug)]
@@ -85,6 +90,11 @@ pub struct QDLDLFactorisation<T = f64> {
     workspace: QDLDLWorkspace<T>,
     /// true if factorisation is symbolic only
     is_symbolic: bool,
+    /// shared solver thread pool for elimination-tree parallelism
+    pool: Option<Arc<rayon::ThreadPool>>,
+    /// elimination-tree schedule for parallel factorisation/solve,
+    /// `None` when the symbolic pattern does not admit the scheme
+    plan: Option<ParallelPlan<T>>,
 }
 
 impl<T> QDLDLFactorisation<T>
@@ -111,6 +121,13 @@ where
         self.workspace.regularize_count
     }
 
+    /// Share the solver thread pool with the factorisation/solve kernels.
+    /// Elimination-tree parallelism is only used when the symbolic pattern
+    /// admits it; the serial kernels run otherwise.
+    pub fn set_pool(&mut self, pool: Option<Arc<rayon::ThreadPool>>) {
+        self.pool = pool;
+    }
+
     /// Solves Ax = b using LDL factors for A.
     /// Solves in place (x replaces b)
     pub fn solve(&mut self, b: &mut [T]) {
@@ -125,13 +142,27 @@ where
         permute(tmp, b, &self.perm);
 
         //solve in place with tmp as permuted RHS
-        _solve(
-            &self.L.colptr,
-            &self.L.rowval,
-            &self.L.nzval,
-            &self.Dinv,
-            tmp,
-        );
+        match (self.plan.as_mut(), self.pool.as_ref()) {
+            (Some(plan), Some(pool)) if plan.parallelisable() => {
+                plan.solve(
+                    pool.as_ref(),
+                    &self.L.colptr,
+                    &self.L.rowval,
+                    &self.L.nzval,
+                    &self.Dinv,
+                    tmp,
+                );
+            }
+            _ => {
+                _solve(
+                    &self.L.colptr,
+                    &self.L.rowval,
+                    &self.L.nzval,
+                    &self.Dinv,
+                    tmp,
+                );
+            }
+        }
 
         // inverse permutation to put unpermuted soln in b
         ipermute(b, tmp, &self.perm);
@@ -190,13 +221,39 @@ where
         // factorization since it will always be the same.  Calling
         // this function implies that we want a numerical factorization
         self.is_symbolic = false;
-        _factor(
-            &mut self.L,
-            &mut self.D,
-            &mut self.Dinv,
-            &mut self.workspace,
-            self.is_symbolic,
-        )
+        match (self.plan.as_mut(), self.pool.as_ref()) {
+            (Some(plan), Some(pool)) if plan.parallelisable() => {
+                let ws = &mut self.workspace;
+                let A = &ws.triuA;
+                let pos_d_count = plan.factor(
+                    pool.as_ref(),
+                    &A.colptr,
+                    &A.rowval,
+                    &A.nzval,
+                    &mut self.L.colptr,
+                    &mut self.L.rowval,
+                    &mut self.L.nzval,
+                    &mut self.D,
+                    &mut self.Dinv,
+                    &ws.Lnz,
+                    &ws.etree,
+                    &ws.Dsigns,
+                    ws.regularize_enable,
+                    ws.regularize_eps,
+                    ws.regularize_delta,
+                    &mut ws.regularize_count,
+                )?;
+                ws.positive_inertia = pos_d_count;
+                Ok(())
+            }
+            _ => _factor(
+                &mut self.L,
+                &mut self.D,
+                &mut self.Dinv,
+                &mut self.workspace,
+                self.is_symbolic,
+            ),
+        }
     }
 
     /// Returns the number of nonzeros in A for A = LDL^T
@@ -283,6 +340,29 @@ fn _qdldl_new<T: FloatT>(
     // factor the matrix into A = LDL^T
     _factor(&mut L, &mut D, &mut Dinv, &mut workspace, opts.logical)?;
 
+    // elimination-tree schedule for pool-based factorisation/solve; the
+    // serial kernels are used whenever this rejects the symbolic pattern
+    let plan = ParallelPlan::build(n, &workspace.etree, &workspace.Lnz, &L.colptr, &L.rowval);
+
+    if std::env::var_os("SDPX_PROFILE").is_some() {
+        static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            match &plan {
+                Some(p) => {
+                    let (g, t) = p.shape();
+                    eprintln!(
+                        "QDLDLSTRUCT n={} nnzA={} groups={} trunk={}",
+                        n,
+                        Ain.nnz(),
+                        g,
+                        t
+                    )
+                }
+                None => eprintln!("QDLDLSTRUCT n={} nnzA={} serial", n, Ain.nnz()),
+            }
+        }
+    }
+
     Ok(QDLDLFactorisation {
         perm,
         iperm,
@@ -291,6 +371,8 @@ fn _qdldl_new<T: FloatT>(
         Dinv,
         workspace,
         is_symbolic: opts.logical,
+        pool: None,
+        plan,
     })
 }
 

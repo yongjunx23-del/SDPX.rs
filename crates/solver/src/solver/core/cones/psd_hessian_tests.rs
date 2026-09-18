@@ -168,11 +168,20 @@ fn graded_nt_scaling<T: FloatT>() {
     let expected = (det_s * det_z).sqrt();
     let mut cone = PSDTriangleCone::<T>::new(2);
     assert!(cone.update_scaling(&s, &z, one, ScalingStrategy::PrimalDual));
-    assert!(cone.data.R.data().iter().chain(cone.data.Rinv.data()).all(|x| x.is_finite()));
+    assert!(cone
+        .data
+        .R
+        .data()
+        .iter()
+        .chain(cone.data.Rinv.data())
+        .all(|x| x.is_finite()));
     let relative = ((cone.data.λ[0] * cone.data.λ[1] - expected) / expected).abs();
     // The matrices consume about 5/8 of the precision through conditioning.
     let tolerance = two.powi(-bits / 4);
-    assert!(relative.is_finite() && relative < tolerance, "singular product: {relative}");
+    assert!(
+        relative.is_finite() && relative < tolerance,
+        "singular product: {relative}"
+    );
     let mut product = Matrix::<T>::zeros((2, 2));
     product.mul(&cone.data.R, &cone.data.Rinv, one, T::zero());
     for j in 0..2 {
@@ -196,33 +205,72 @@ fn graded_hessian_action<T: FloatT>() {
     let mut cone = PSDTriangleCone::<T>::new(2);
     cone.set_identity_scaling();
     let t = T::epsilon();
-    cone.data.R[(0,0)] = T::one();
-    cone.data.R[(0,1)] = T::zero();
-    cone.data.R[(1,0)] = T::one();
-    cone.data.R[(1,1)] = t;
+    cone.data.R[(0, 0)] = T::one();
+    cone.data.R[(0, 1)] = T::zero();
+    cone.data.R[(1, 0)] = T::one();
+    cone.data.R[(1, 1)] = t;
     cone.data.G.data_mut().fill(T::zero());
-    cone.data.G.syrk(&cone.data.R, T::one(), T::zero(), MatrixTriangle::Triu);
+    cone.data
+        .G
+        .syrk(&cone.data.R, T::one(), T::zero(), MatrixTriangle::Triu);
     // Authoritative smat(x) is exactly a*[1 -1; -1 1]. The tiny
     // Hessian response must survive even when rounded R*R' has rank one.
     let a = T::FRAC_1_SQRT_2();
     let x = vec![a, -T::one(), a];
-    let mut ref_work=vec![T::zero();3];
-    let mut expected=ref_work.clone();
-    cone.mul_W(MatrixShape::N,&mut ref_work,&x,T::one(),T::zero());
-    cone.mul_W(MatrixShape::T,&mut expected,&ref_work,T::one(),T::zero());
-    assert!(expected[2] > T::zero(), "factored action lost tiny response");
-    let analytic = ((a*t)*t)*t*t;
-    assert!((expected[2]-analytic).abs()/analytic <= T::epsilon()*T::from_usize(128).unwrap());
-    let mut actual=vec![T::zero();3];let mut work=actual.clone();
-    cone.mul_Hs(&mut actual,&x,&mut work);
-    let relative=(actual[2]-expected[2]).abs()/expected[2];
-    assert!(relative <= T::epsilon()*T::from_usize(128).unwrap(),
-        "bits={} tiny response relative error={}",T::precision_bits(),relative);
+    let mut ref_work = vec![T::zero(); 3];
+    let mut expected = ref_work.clone();
+    cone.mul_W(MatrixShape::N, &mut ref_work, &x, T::one(), T::zero());
+    cone.mul_W(
+        MatrixShape::T,
+        &mut expected,
+        &ref_work,
+        T::one(),
+        T::zero(),
+    );
+    assert!(
+        expected[2] > T::zero(),
+        "factored action lost tiny response"
+    );
+    let analytic = ((a * t) * t) * t * t;
+    assert!(
+        (expected[2] - analytic).abs() / analytic <= T::epsilon() * T::from_usize(128).unwrap()
+    );
+    let mut actual = vec![T::zero(); 3];
+    let mut work = actual.clone();
+    cone.mul_Hs(&mut actual, &x, &mut work);
+    let relative = (actual[2] - expected[2]).abs() / expected[2];
+    assert!(
+        relative <= T::epsilon() * T::from_usize(128).unwrap(),
+        "bits={} tiny response relative error={}",
+        T::precision_bits(),
+        relative
+    );
 }
-#[test] fn graded_hessian_f64(){graded_hessian_action::<f64>();}
-#[test] fn graded_hessian_128(){graded_hessian_action::<MpFloat<2>>();}
-#[test] fn graded_hessian_256(){graded_hessian_action::<MpFloat<4>>();}
-#[test] fn graded_hessian_512(){graded_hessian_action::<MpFloat<8>>();}
-#[test] fn graded_hessian_768(){graded_hessian_action::<MpFloat<12>>();}
-#[test] fn graded_hessian_1024(){graded_hessian_action::<MpFloat<16>>();}
-#[test] fn graded_hessian_2048(){graded_hessian_action::<MpFloat<32>>();}
+#[test]
+fn graded_hessian_f64() {
+    graded_hessian_action::<f64>();
+}
+#[test]
+fn graded_hessian_128() {
+    graded_hessian_action::<MpFloat<2>>();
+}
+#[test]
+fn graded_hessian_256() {
+    graded_hessian_action::<MpFloat<4>>();
+}
+#[test]
+fn graded_hessian_512() {
+    graded_hessian_action::<MpFloat<8>>();
+}
+#[test]
+fn graded_hessian_768() {
+    graded_hessian_action::<MpFloat<12>>();
+}
+#[test]
+fn graded_hessian_1024() {
+    graded_hessian_action::<MpFloat<16>>();
+}
+#[test]
+fn graded_hessian_2048() {
+    graded_hessian_action::<MpFloat<32>>();
+}

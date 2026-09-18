@@ -41,10 +41,6 @@ pub enum DirectSolveMethodsFFI {
     QDLDL = 1,
     #[cfg(feature = "faer-sparse")]
     FAER = 2,
-    #[cfg(feature = "pardiso-mkl")]
-    MKL = 3,
-    #[cfg(feature = "pardiso-panua")]
-    PANUA = 4,
 }
 
 impl From<DirectSolveMethodsFFI> for String {
@@ -54,10 +50,6 @@ impl From<DirectSolveMethodsFFI> for String {
             DirectSolveMethodsFFI::QDLDL => String::from("qdldl"),
             #[cfg(feature = "faer-sparse")]
             DirectSolveMethodsFFI::FAER => String::from("faer"),
-            #[cfg(feature = "pardiso-mkl")]
-            DirectSolveMethodsFFI::MKL => String::from("mkl"),
-            #[cfg(feature = "pardiso-panua")]
-            DirectSolveMethodsFFI::PANUA => String::from("panua"),
         }
     }
 }
@@ -69,10 +61,6 @@ impl From<String> for DirectSolveMethodsFFI {
             "qdldl" => DirectSolveMethodsFFI::QDLDL,
             #[cfg(feature = "faer-sparse")]
             "faer" => DirectSolveMethodsFFI::FAER,
-            #[cfg(feature = "pardiso-mkl")]
-            "mkl" => DirectSolveMethodsFFI::MKL,
-            #[cfg(feature = "pardiso-panua")]
-            "panua" => DirectSolveMethodsFFI::PANUA,
             _ => DirectSolveMethodsFFI::AUTO,
         }
     }

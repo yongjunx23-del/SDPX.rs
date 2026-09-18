@@ -23,4 +23,7 @@ pub trait DirectLDLSolver<T: FloatT>: DirectLDLSolverReqs + HasLinearSolverInfo 
     fn offset_values(&mut self, index: &[usize], offset: T, signs: &[i8]);
     fn solve(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T]);
     fn refactor(&mut self, kkt: &CscMatrix<T>) -> bool;
+    /// Share the solver thread pool with factorisation/solve kernels that
+    /// support it.  Solvers without a parallel path ignore the pool.
+    fn set_pool(&mut self, _pool: Option<std::sync::Arc<rayon::ThreadPool>>) {}
 }
