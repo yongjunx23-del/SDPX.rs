@@ -144,8 +144,14 @@ pub(super) struct ParallelPlan<T> {
     ws: Vec<GroupWs<T>>,
     /// Trunk scratch.
     tws: TrunkWs<T>,
-    /// Merge scratch for ordered replays.
-    merge_buf: Vec<(u32, T)>,
+    /// Per-path-position leaf contributions `(trunk row, delta)` used by the
+    /// ordered trunk replay in [`ParallelPlan::trunk_row`].
+    pos_delta: Vec<Vec<(u32, T)>>,
+    /// Per-path-position `D[k]` contributions from leaf columns.
+    pos_d: Vec<T>,
+    /// Per-column forward-solve contributions `(trunk row, delta)` for the
+    /// ordered replay in [`ParallelPlan::solve`].
+    solve_pos: Vec<Vec<(u32, T)>>,
 }
 
 const NO_GROUP: usize = usize::MAX;
@@ -277,7 +283,9 @@ impl<T: FloatT> ParallelPlan<T> {
             trunk_store,
             ws,
             tws,
-            merge_buf: Vec::new(),
+            pos_delta: Vec::new(),
+            pos_d: Vec::new(),
+            solve_pos: Vec::new(),
         })
     }
 
@@ -506,18 +514,16 @@ impl<T: FloatT> ParallelPlan<T> {
         }
 
         // Partition the path (processing order = reverse y_idx) into
-        // per-group leaf lists and the trunk list, tagging each column with
-        // its sequence position for the ordered replay.
+        // per-group leaf lists, tagging each column with its sequence
+        // position for the ordered replay.  Trunk columns are eliminated
+        // inline during the replay itself.
         for w in self.ws.iter_mut() {
             w.row_cols.clear();
         }
-        let mut trunk_cols: Vec<usize> = Vec::new();
         let mut seq = 0u32;
         for &c in self.tws.y_idx[..nnz_y].iter().rev() {
             let g = self.group_of[c];
-            if g == NO_GROUP {
-                trunk_cols.push(c);
-            } else {
+            if g != NO_GROUP {
                 self.ws[g].row_cols.push((seq, c));
             }
             seq += 1;
@@ -563,43 +569,49 @@ impl<T: FloatT> ParallelPlan<T> {
                 });
         });
 
-        // Replay trunk-position and D contributions in path order.
-        for rank in 0..ntrunk {
-            let j = self.trunk[rank];
-            self.merge_buf.clear();
-            for w in self.ws.iter() {
-                self.merge_buf.extend_from_slice(&w.trunk_delta[rank]);
-            }
-            self.merge_buf.sort_by_key(|&(s, _)| s);
-            for &(_, delta) in &self.merge_buf {
-                self.tws.y_vals[j] -= delta;
-            }
-        }
-        self.merge_buf.clear();
+        // Merge leaf contributions into per-position lists, then replay the
+        // path in exact serial order: at each position a leaf column's
+        // recorded trunk-row and D contributions are applied, and a trunk
+        // column is eliminated inline.  This keeps every shared-state update
+        // in the serial sequence even when leaf and trunk columns interleave
+        // inside a row's path.
+        self.pos_delta.clear();
+        self.pos_delta.resize_with(nnz_y, Vec::new);
+        self.pos_d.clear();
+        self.pos_d.resize(nnz_y, T::zero());
         for w in self.ws.iter() {
-            self.merge_buf.extend_from_slice(&w.d_delta);
-        }
-        self.merge_buf.sort_by_key(|&(s, _)| s);
-        for &(_, dd) in &self.merge_buf {
-            dk -= dd;
-        }
-
-        // Serial trunk-column elimination.
-        for &cidx in &trunk_cols {
-            let r = self.rank_of[cidx];
-            let tmp = self.trunk_store.next[r];
-            let y_c = self.tws.y_vals[cidx];
-            for idx in self.trunk_store.lp[r]..tmp {
-                let lxj = self.trunk_store.lx[idx];
-                let lij = self.trunk_store.li[idx];
-                self.tws.y_vals[lij] -= lxj * y_c;
+            for rank in 0..ntrunk {
+                for &(s, d) in &w.trunk_delta[rank] {
+                    self.pos_delta[s as usize].push((self.trunk[rank] as u32, d));
+                }
             }
-            let ltmp = y_c * dinv[cidx];
-            self.trunk_store.lx[tmp] = ltmp;
-            self.trunk_store.li[tmp] = k;
-            self.trunk_store.next[r] += 1;
-            dk -= y_c * ltmp;
-            self.tws.y_vals[cidx] = T::zero();
+            for &(s, d) in &w.d_delta {
+                self.pos_d[s as usize] = d;
+            }
+        }
+        for e in 0..nnz_y {
+            let cidx = self.tws.y_idx[nnz_y - 1 - e];
+            for &(row, delta) in &self.pos_delta[e] {
+                self.tws.y_vals[row as usize] -= delta;
+            }
+            if self.trunk_rank[cidx] != NO_GROUP {
+                let r = self.rank_of[cidx];
+                let tmp = self.trunk_store.next[r];
+                let y_c = self.tws.y_vals[cidx];
+                for idx in self.trunk_store.lp[r]..tmp {
+                    let lxj = self.trunk_store.lx[idx];
+                    let lij = self.trunk_store.li[idx];
+                    self.tws.y_vals[lij] -= lxj * y_c;
+                }
+                let ltmp = y_c * dinv[cidx];
+                self.trunk_store.lx[tmp] = ltmp;
+                self.trunk_store.li[tmp] = k;
+                self.trunk_store.next[r] += 1;
+                dk -= y_c * ltmp;
+                self.tws.y_vals[cidx] = T::zero();
+            } else {
+                dk -= self.pos_d[e];
+            }
         }
 
         d[k] = dk;
@@ -656,23 +668,31 @@ impl<T: FloatT> ParallelPlan<T> {
                 x[i] = w.xbuf[i];
             }
         }
-        // Trunk contributions in exact column order.
-        for rank in 0..self.trunk.len() {
-            let j = self.trunk[rank];
-            self.merge_buf.clear();
-            for w in self.ws.iter() {
-                self.merge_buf.extend_from_slice(&w.solve_delta[rank]);
-            }
-            self.merge_buf.sort_by_key(|&(c, _)| c);
-            for &(_, delta) in &self.merge_buf {
-                x[j] -= delta;
+        // Merge leaf contributions into per-column lists, then replay all
+        // columns in exact serial order: at column `i` a leaf column's
+        // recorded trunk-row contributions are applied and a trunk column
+        // scatters inline — the same shared-state order as `_lsolve` even
+        // when leaf and trunk columns interleave.
+        let n = self.trunk_rank.len();
+        self.solve_pos.clear();
+        self.solve_pos.resize_with(n, Vec::new);
+        for w in self.ws.iter() {
+            for rank in 0..self.trunk.len() {
+                for &(c, d) in &w.solve_delta[rank] {
+                    self.solve_pos[c as usize].push((self.trunk[rank] as u32, d));
+                }
             }
         }
-        // Trunk columns serially.
-        for &i in &self.trunk {
-            let xi = x[i];
-            for idx in lp[i]..lp[i + 1] {
-                x[li[idx]] -= lx[idx] * xi;
+        for i in 0..n {
+            if self.trunk_rank[i] != NO_GROUP {
+                let xi = x[i];
+                for idx in lp[i]..lp[i + 1] {
+                    x[li[idx]] -= lx[idx] * xi;
+                }
+            } else {
+                for &(row, delta) in &self.solve_pos[i] {
+                    x[row as usize] -= delta;
+                }
             }
         }
 
@@ -827,11 +847,13 @@ mod tests {
             let start = if c < nleaf { bs_of * bs } else { 0 };
             for r in start..=c {
                 rowval.push(r);
+                // Non-dyadic values: accumulation-order differences show up
+                // in the last bits, so the test detects ordering mistakes.
                 let v = if r == c {
-                    8.0 + (c % 7) as f64 * 0.25
+                    8.0 + (c % 7) as f64 * 0.3
                 } else {
                     let s = ((r * 3 + c * 5) % 4) as f64 - 1.5;
-                    s * 0.25
+                    s * 0.13 + 0.007
                 };
                 nzval.push(v);
             }
