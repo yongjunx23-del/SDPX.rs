@@ -151,12 +151,26 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             .unwrap_or(0..self.blocks.len());
         let owned = |i: usize| owned_range.contains(&i);
         let valid = if inner_sampled.is_some() {
-            self.blocks
-                .iter_mut()
-                .zip(cones.iter())
-                .enumerate()
-                .map(|(i, (b, c))| sync((b, c, owned(i))))
-                .fold(true, |a, b| a & b)
+            if let Some(pool) = &self.pool {
+                // Block-level parallelism is safe here: only the dominant
+                // block consumes inner pool lanes, the others update
+                // serially inside their own outer task.
+                pool.install(|| {
+                    self.blocks
+                        .par_iter_mut()
+                        .zip(cones.iter().as_slice().par_iter())
+                        .enumerate()
+                        .map(|(i, (b, c))| sync((b, c, owned(i))))
+                        .reduce(|| true, |a, b| a & b)
+                })
+            } else {
+                self.blocks
+                    .iter_mut()
+                    .zip(cones.iter())
+                    .enumerate()
+                    .map(|(i, (b, c))| sync((b, c, owned(i))))
+                    .fold(true, |a, b| a & b)
+            }
         } else if let Some(pool) = &self.pool {
             pool.install(|| {
                 self.blocks
