@@ -226,6 +226,7 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     inner_schur: bool,
     inner_sampled: Option<usize>,
     sampled: Option<(Arc<SampledOperator<T>>, SampledWorkspace<T>)>,
+    sparse_products: Option<crate::algebra::sparse_parallel::SparseParallel>,
     counters: crate::solver::core::kktsolvers::SolveCounters,
 }
 
@@ -497,10 +498,49 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             inner_schur: false,
             inner_sampled: None,
             sampled: None,
+            sparse_products: (crate::mpi::World::get().is_some()
+                && crate::algebra::sparse_parallel::worthwhile(A))
+            .then(|| crate::algebra::sparse_parallel::SparseParallel::new(A)),
             counters: Default::default(),
         };
+        if let Some(plan) = &mut solver.sparse_products {
+            plan.configure(A, solver.pool.clone());
+        }
         solver.refresh_parallel_plan();
         solver
+    }
+
+    /// `y = alpha * op(A) * x + beta * y`, rank-sharded when an MPI world
+    /// exists; identical arithmetic to the CSC gemv on every output.
+    fn sparse_gemv(
+        plan: Option<&crate::algebra::sparse_parallel::SparseParallel>,
+        a: &CscMatrix<T>,
+        transpose: bool,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+    ) {
+        if let (Some(world), Some(plan)) = (crate::mpi::World::get(), plan) {
+            plan.product_sharded(
+                a,
+                transpose,
+                y,
+                x,
+                alpha,
+                beta,
+                world,
+                if transpose {
+                    crate::mpi::SITE_RX
+                } else {
+                    crate::mpi::SITE_RZ
+                },
+            );
+        } else if transpose {
+            a.t().gemv(y, x, alpha, beta);
+        } else {
+            a.gemv(y, x, alpha, beta);
+        }
     }
 
     fn refresh_parallel_plan(&mut self) {
@@ -718,9 +758,15 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 self.pool.as_ref(),
             );
         } else {
-            self.A
-                .t()
-                .gemv(&mut self.workx, &self.workz, T::one(), T::one());
+            Self::sparse_gemv(
+                self.sparse_products.as_ref(),
+                &self.A,
+                true,
+                &mut self.workx,
+                &self.workz,
+                T::one(),
+                T::one(),
+            );
         }
         for (v, &row) in self.retained_rhs.iter_mut().zip(&self.retained_rows) {
             *v = bz[row];
@@ -742,7 +788,15 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 self.pool.as_ref(),
             );
         } else {
-            self.A.gemv(&mut self.workz, x, T::one(), T::zero());
+            Self::sparse_gemv(
+                self.sparse_products.as_ref(),
+                &self.A,
+                false,
+                &mut self.workz,
+                x,
+                T::one(),
+                T::zero(),
+            );
         }
         for (v, &b) in self.workz.iter_mut().zip(bz) {
             *v -= b;
@@ -795,6 +849,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             blocks,
             scaling_lanes,
             scaling_tiles,
+            sparse_products,
             ..
         } = self;
         let mut products = || {
@@ -811,6 +866,31 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     if std::env::var_os("SDPX_PROFILE").is_some() {
                         eprintln!("PHASE residual.fwd {:?}", __t.elapsed());
                     }
+                }
+            } else if let (Some(world), Some(plan)) =
+                (crate::mpi::World::get(), sparse_products.as_ref())
+            {
+                plan.product_sharded(
+                    A,
+                    true,
+                    ex,
+                    z,
+                    -T::one(),
+                    T::one(),
+                    world,
+                    crate::mpi::SITE_RX,
+                );
+                if !reuse_forward {
+                    plan.product_sharded(
+                        A,
+                        false,
+                        ez,
+                        x,
+                        -T::one(),
+                        T::one(),
+                        world,
+                        crate::mpi::SITE_RZ,
+                    );
                 }
             } else {
                 A.t().gemv(ex, z, -T::one(), T::one());
