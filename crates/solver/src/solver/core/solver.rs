@@ -289,10 +289,13 @@ where
 
             //update the residuals
             //--------------
+            timeit!{timers => "residual update"; {
             self.residuals.update_with_pool(&self.variables, &self.data, self.cones.thread_pool());
+            }}
 
             //calculate duality gap (scaled)
             //--------------
+            timeit!{timers => "mu+info"; {
             μ = self.variables.calc_mu(&self.residuals, &self.cones);
 
             // record scalar values from most recent iteration.
@@ -301,11 +304,13 @@ where
 
             // convergence check and printing
             // --------------
-            self.info.update(
+            self.info.update_with_pool(
                 &mut self.data,
                 &self.variables,
                 &self.residuals,
-                &timers);
+                &timers,
+                self.cones.thread_pool());
+            }}
 
             notimeit!{timers; {
                 self.info.print_status(&self.settings).unwrap();
@@ -360,8 +365,10 @@ where
 
             // calculate the affine step
             // --------------
+            timeit!{timers => "affine rhs"; {
             self.step_rhs
                 .affine_step_rhs(&self.residuals, &self.variables, &self.cones);
+            }}
 
             timeit!{timers => "kkt solve"; {
                 is_kkt_solve_success = is_kkt_solve_success &&
@@ -384,11 +391,13 @@ where
 
                 //calculate step length and centering parameter
                 // --------------
+                timeit!{timers => "affine step len"; {
                 α = if iter > 1 {
                     self.variables.prepare_affine_step_length(&mut self.step_lhs, &mut self.cones, &self.settings)
                 } else {
                     self.get_step_length(StepDirection::Affine, scaling)
                 };
+                }}
                 σ = self.centering_parameter(α);
 
                 // make a reduced Mehrotra correction in the first iteration
@@ -397,6 +406,7 @@ where
 
                 // calculate the combined step and length
                 // --------------
+                timeit!{timers => "combined rhs"; {
                 if iter > 1 {
                     self.step_rhs.combined_step_rhs_prepared(&self.residuals, &self.variables,
                         &mut self.cones, &mut self.step_lhs, σ, μ);
@@ -411,6 +421,7 @@ where
                     m
                 );
                 }
+                }}
 
                 timeit!{timers => "kkt solve" ; {
                     is_kkt_solve_success =
@@ -436,6 +447,7 @@ where
 
             // compute final step length and update the current iterate
             // --------------
+            timeit!{timers => "final step len"; {
             α = self.get_step_length(StepDirection::Combined,scaling);
 
             // Inspired by Hypatia curve search, using the two existing NT directions.
@@ -467,11 +479,15 @@ where
                 StrategyCheckpoint::Update(s) => {α = T::zero(); scaling = s; continue}
                 StrategyCheckpoint::Fail => {α = T::zero(); break}
             }
+            }} // end "final step len" timer
 
             // Copy previous iterate in case the next one is a dud
             self.info.save_prev_iterate(&self.variables,&mut self.prev_vars);
 
-            self.variables.add_step(&self.step_lhs, α);
+            timeit!{timers => "iterate update"; {
+            self.variables
+                .add_step_with_pool(&self.step_lhs, α, self.cones.thread_pool());
+            }}
 
         } //end loop
         // ----------
@@ -498,6 +514,10 @@ where
         //halt timers
         self.info.finalize(&mut timers);
         self.solution.finalize(&self.info);
+
+        if std::env::var_os("SDPX_PROFILE").is_some() {
+            timers.print();
+        }
 
         self.info.print_footer(&self.settings).unwrap();
 

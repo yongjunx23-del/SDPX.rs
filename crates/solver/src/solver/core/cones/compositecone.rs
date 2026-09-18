@@ -31,8 +31,7 @@ pub struct CompositeCone<T: FloatT = f64> {
     // the flag for symmetric cone check
     _is_symmetric: bool,
     threading: Option<ConeThreading>,
-    #[cfg(feature = "sdp")]
-    psd_step_bounds: Vec<(T, T)>,
+    sym_step_bounds: Vec<(T, T)>,
 }
 
 impl<T> CompositeCone<T>
@@ -89,8 +88,7 @@ where
             rng_blocks,
             _is_symmetric,
             threading: None,
-            #[cfg(feature = "sdp")]
-            psd_step_bounds: Vec::new(),
+            sym_step_bounds: Vec::new(),
         }
     }
 }
@@ -143,7 +141,7 @@ where
     fn fold_step_bounds(
         &mut self,
         αmax: T,
-        cached_psd: bool,
+        cached_sym: bool,
         mut evaluate: impl FnMut(&mut SupportedCone<T>, std::ops::Range<usize>, T) -> (T, T),
     ) -> (T, T) {
         let mut α = αmax;
@@ -154,11 +152,12 @@ where
                 if cone.is_symmetric() != symcond {
                     continue;
                 }
-                #[cfg(feature = "sdp")]
-                if cached_psd && matches!(cone, SupportedCone::PSDTriangleCone(_)) {
-                    let (boundz, bounds) = self.psd_step_bounds[_index];
-                    // Preserve each PSD component's clipping operand order,
+                if cached_sym && cone.is_symmetric() {
+                    let (boundz, bounds) = self.sym_step_bounds[_index];
+                    // Preserve each component's clipping operand order,
                     // including ties at signed zero, at the current cap.
+                    // Symmetric-cone step lengths are cap-insensitive, so
+                    // evaluating them at αmax folds to the same minimum.
                     let (nextαz, nextαs) = (T::min(boundz, α), T::min(bounds, α));
                     α = T::min(α, T::min(nextαz, nextαs));
                     continue;
@@ -265,15 +264,18 @@ where
             .any(|c| matches!(c, SupportedCone::PSDTriangleCone(_)))
         {
             let cached = if let Some(threading) = &self.threading {
-                if αmax.is_finite() && αmax > T::zero() && threading.psd_step_lanes.len() > 1 {
-                    self.psd_step_bounds.resize(self.cones.len(), (αmax, αmax));
+                if αmax.is_finite() && αmax > T::zero() && threading.sym_step_lanes.len() > 1 {
+                    self.sym_step_bounds.resize(self.cones.len(), (αmax, αmax));
                     threading.pool.install(|| {
                         cone_parallel::prepare_affine_bounds(
                             &mut self.cones,
-                            &mut self.psd_step_bounds,
-                            &threading.psd_step_lanes,
+                            &mut self.sym_step_bounds,
+                            &threading.sym_step_lanes,
                             dz,
                             ds,
+                            z,
+                            s,
+                            settings,
                             αmax,
                         )
                     });
@@ -548,15 +550,21 @@ where
         settings: &CoreSettings<T>,
         αmax: T,
     ) -> (T, T) {
-        #[cfg(feature = "sdp")]
-        let cached_psd = if let Some(threading) = &self.threading {
-            if αmax.is_finite() && αmax > T::zero() && threading.psd_step_lanes.len() > 1 {
-                self.psd_step_bounds.resize(self.cones.len(), (αmax, αmax));
+        let cached_sym = if let Some(threading) = &self.threading {
+            if let (Some(chunk), [SupportedCone::NonnegativeCone(cone)]) =
+                (threading.orthant_chunk, self.cones.as_mut_slice())
+            {
+                return threading
+                    .pool
+                    .install(|| cone.step_length_parallel(dz, ds, z, s, chunk, αmax));
+            }
+            if αmax.is_finite() && αmax > T::zero() && threading.sym_step_lanes.len() > 1 {
+                self.sym_step_bounds.resize(self.cones.len(), (αmax, αmax));
                 threading.pool.install(|| {
-                    cone_parallel::psd_step_bounds(
+                    cone_parallel::sym_step_bounds(
                         &mut self.cones,
-                        &mut self.psd_step_bounds,
-                        &threading.psd_step_lanes,
+                        &mut self.sym_step_bounds,
+                        &threading.sym_step_lanes,
                         dz,
                         ds,
                         z,
@@ -573,9 +581,7 @@ where
             false
         };
 
-        #[cfg(not(feature = "sdp"))]
-        let cached_psd = false;
-        self.fold_step_bounds(αmax, cached_psd, |cone, rows, cap| {
+        self.fold_step_bounds(αmax, cached_sym, |cone, rows, cap| {
             cone.step_length(
                 &dz[rows.clone()],
                 &ds[rows.clone()],

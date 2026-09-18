@@ -95,6 +95,18 @@ pub trait Variables<T: FloatT> {
     /// Update the variables in the given step direction, scaled by `α`.
     fn add_step(&mut self, step_lhs: &Self, α: T);
 
+    /// Elementwise step update on the current cone worker pool when
+    /// supported.  Every element is computed identically to
+    /// [`Variables::add_step`], so results are bitwise identical.
+    fn add_step_with_pool(
+        &mut self,
+        step_lhs: &Self,
+        α: T,
+        _pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    ) {
+        self.add_step(step_lhs, α);
+    }
+
     /// Bring the variables into the interior of the cone constraints.
     fn symmetric_initialization(&mut self, cones: &mut Self::C);
 
@@ -241,6 +253,21 @@ where
         residuals: &Self::R,
         timers: &Timers,
     );
+
+    /// Update using the current cone worker pool when supported.
+    /// Implementations run independent residual-norm scans concurrently;
+    /// every scan keeps its serial reduction order, so results are
+    /// bitwise identical to [`Info::update`].
+    fn update_with_pool(
+        &mut self,
+        data: &mut Self::D,
+        variables: &Self::V,
+        residuals: &Self::R,
+        timers: &Timers,
+        _pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    ) {
+        self.update(data, variables, residuals, timers);
+    }
 
     /// Return `true` if termination conditions have been reached.
     fn check_termination(&mut self, residuals: &Self::R, settings: &Self::SE, iter: u32) -> bool;

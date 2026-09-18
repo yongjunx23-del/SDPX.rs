@@ -5,6 +5,7 @@ use crate::solver::core::{
     traits::{Settings, Variables},
     ScalingStrategy, StepDirection,
 };
+use rayon::prelude::*;
 
 // ---------------
 // Variables type for default problem format
@@ -173,6 +174,45 @@ where
         self.x.axpby(α, &step.x, T::one());
         self.s.axpby(α, &step.s, T::one());
         self.z.axpby(α, &step.z, T::one());
+        self.τ += α * step.τ;
+        self.κ += α * step.κ;
+    }
+
+    fn add_step_with_pool(
+        &mut self,
+        step: &Self,
+        α: T,
+        pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    ) {
+        let Some(pool) = pool else {
+            self.add_step(step, α);
+            return;
+        };
+        // Elementwise axpby on disjoint chunks — every element uses the
+        // identical expression as the serial path, so results are bitwise
+        // identical.  The scalar τ/κ updates stay sequential.
+        const CHUNK: usize = 2048;
+        fn par_axpby<T: FloatT>(y: &mut [T], a: T, x: &[T], b: T) {
+            y.par_chunks_mut(CHUNK)
+                .zip(x.par_chunks(CHUNK))
+                .for_each(|(y, x)| {
+                    for (y, x) in y.iter_mut().zip(x) {
+                        *y = a * (*x) + b * (*y);
+                    }
+                });
+        }
+        let (x, s, z) = (&mut self.x, &mut self.s, &mut self.z);
+        pool.install(|| {
+            rayon::join(
+                || par_axpby(x, α, &step.x, T::one()),
+                || {
+                    rayon::join(
+                        || par_axpby(s, α, &step.s, T::one()),
+                        || par_axpby(z, α, &step.z, T::one()),
+                    )
+                },
+            );
+        });
         self.τ += α * step.τ;
         self.κ += α * step.κ;
     }

@@ -95,6 +95,62 @@ promoted after all gates passed (jobs 213600 validation + 213601 scaling):
 - Receipt: `releases/69a5f40…/metadata/acceptance.json`; raw logs in
   `results/213600.node220/` and `results/213601.node220-scaling/`.
 
+### Cone-pool extension to LP/SOCP + iteration-loop serial phases
+
+Following the full `timeit!` phase decomposition (IP iteration: kkt solve
+4.21s, kkt update 2.14s, scale cones 1.94s, step lengths 1.39s, mu+info
+0.28s, residual/combined/iterate ≈0.5s on Ising 512-bit):
+
+- `step_length` / `prepare_affine_bounds` now parallelise **all symmetric
+  cones** (PSD, SOC, Nonnegative, Zero), not only PSD: `psd_step_lanes` →
+  `sym_step_lanes`, bounds evaluated at the common cap and folded in cone
+  order — bitwise identical because symmetric-cone step lengths only use
+  the cap for clipping. Nonsymmetric cones (Exp/Pow/GenPow, cap-sensitive
+  iterative searches) stay serial in the fold's second pass. This was the
+  missing path for LP/SOCP — `step_length` was 100% serial for problems
+  without PSD cones.
+- Single large orthant (pure LP): `NonnegativeCone::step_length_parallel`
+  uses the existing `orthant_chunk` elementwise split; chunk partial minima
+  fold in index order (min is associative — bitwise identical). The fold
+  contract is one shared α = min(αz, αs) for both components.
+- `Info::update_with_pool`: the eight independent residual-norm scans
+  (`x/z/s/rx_inf/Px/rz_inf/rz/rx norm_scaled`) run concurrently on the cone
+  pool — each scan keeps its serial reduction order → bitwise identical.
+- `Variables::add_step_with_pool`: x/s/z axpby on disjoint elementwise
+  chunks — per-element identical expressions → bitwise identical.
+- `timeit!` sub-timers now cover the whole IP loop (residual update,
+  mu+info, affine/combined rhs, step lengths, iterate update) and
+  `SDPX_PROFILE=1` dumps the timer tree at solve end.
+
+Measured (this machine, 8 threads):
+
+- LP 512-bit, single orthant m=8000 (augmented KKT, QDLDL stays serial —
+  chain-like etree): 4.37s → 2.35s; mu+info 651→159ms, iterate update
+  129→23ms; w1/w8 solution vectors bitwise identical.
+- Ising Λ=11 512-bit: 11.05s → 10.77s; mu+info 275→68ms, iterate
+  57→24ms; solution bitwise identical.
+- float64 LP end-to-end identical at w1/w8 — all changes are `T`-generic;
+  the structural cost model (MIN_LANE_WORK scaled by limb count) limits
+  f64 parallelism to appropriately larger problems.
+
+Correctness fixes made during this round:
+
+- **Committed bug (69a5f40)**: `trunk_row` cleared per-group `trunk_delta`/
+  `d_delta` *after* the empty-`row_cols` early return — a leaf group absent
+  from a trunk row's path replayed stale sequence tags from earlier rows
+  (out-of-bounds panic or silent wrong-position accumulation). Buffers are
+  now reset for every group before path partitioning; detected by
+  `pooled_condensed`/`overlapping_memory_fallback` tests.
+- `cone_parallel::prepare_affine_bounds`: immutable `z`/`s` slices now
+  split alongside `dz`/`ds` on lane recursion (right-half lanes read wrong
+  rows otherwise; f64 masked it, MPFR exposed it).
+- `step_length_parallel` returns the shared `(α, α)` pair the caller's
+  fold contract requires.
+
+New tests: `orthant_step_lengths_{f64,mpfr256,mpfr512}` (chunk path +
+mixed symmetric lanes, bitwise vs serial incl. signed-zero caps); the
+renamed `psd_step_lengths_*` (now `sym_*` internals) still pass.
+
 ## Pending
 
 - Unrelated pre-existing warnings (`cached_psd`, `prepared`, `has_lanes`,

@@ -377,7 +377,7 @@ fn psd_steps<T: FloatT>() {
         pooled.configure_threads(width).unwrap();
         assert_eq!(pooled.cone_threads(), width);
         if width > 1 {
-            assert_eq!(pooled.threading.as_ref().unwrap().psd_step_lanes.len(), 2);
+            assert!(pooled.threading.as_ref().unwrap().sym_step_lanes.len() >= 2);
         }
         for case in 0..3 {
             let (mut dz, mut ds) = (vec![T::zero(); m], vec![T::zero(); m]);
@@ -430,20 +430,20 @@ fn psd_steps<T: FloatT>() {
                 assert_eq!(a.0.is_sign_negative(), b.0.is_sign_negative());
                 assert_eq!(a.1.is_sign_negative(), b.1.is_sign_negative());
                 if width > 1 {
-                    assert_eq!(pooled.psd_step_bounds.len(), kinds.len());
+                    assert_eq!(pooled.sym_step_bounds.len(), kinds.len());
                     if let Some(pointer) = saved_pointer {
-                        assert_eq!(pooled.psd_step_bounds.as_ptr(), pointer);
+                        assert_eq!(pooled.sym_step_bounds.as_ptr(), pointer);
                     } else {
-                        saved_pointer = Some(pooled.psd_step_bounds.as_ptr());
+                        saved_pointer = Some(pooled.sym_step_bounds.as_ptr());
                     }
                 }
             }
         }
         if let Some(pointer) = saved_pointer {
-            assert_eq!(pooled.psd_step_bounds.as_ptr(), pointer);
+            assert_eq!(pooled.sym_step_bounds.as_ptr(), pointer);
         }
     }
-    assert!(serial.psd_step_bounds.is_empty());
+    assert!(serial.sym_step_bounds.is_empty());
     // Outside the finite-positive cap domain, preserve the complete serial
     // path, including native min/NaN behavior and absence of cache writes.
     let kinds = [
@@ -471,7 +471,7 @@ fn psd_steps<T: FloatT>() {
                 assert_eq!(a.is_sign_negative(), b.is_sign_negative());
             }
         }
-        assert!(pooled.psd_step_bounds.is_empty());
+        assert!(pooled.sym_step_bounds.is_empty());
     }
 }
 #[cfg(feature = "sdp")]
@@ -488,4 +488,58 @@ fn psd_step_lengths_mpfr256() {
 #[test]
 fn psd_step_lengths_mpfr512() {
     psd_steps::<sdpx_arithmetic::Bits512>();
+}
+
+/// A single large orthant takes the elementwise-chunk path; every other
+/// cone mix takes the symmetric-lane bounds pass. Both must reproduce the
+/// serial step lengths exactly, including signed-zero caps.
+fn single_orthant_steps<T: FloatT>() {
+    let num = |n: i32| T::from_i32(n).unwrap();
+    let half = T::one() / num(2);
+    // Sizes clear the structural MIN_LANE_WORK threshold even at f64
+    // (one word per element), so both the chunk and the lane paths run.
+    for kinds in [
+        vec![SupportedConeT::NonnegativeConeT(32768)],
+        vec![
+            SupportedConeT::NonnegativeConeT(8192),
+            SupportedConeT::SecondOrderConeT(64),
+            SupportedConeT::ZeroConeT(8),
+        ],
+    ] {
+        let mut serial = CompositeCone::new(&kinds);
+        let mut pooled = CompositeCone::new(&kinds);
+        pooled.configure_threads(4).unwrap();
+        assert!(pooled.cone_threads() > 1);
+        let m = serial.numel();
+        let (mut z, mut s) = (vec![T::zero(); m], vec![T::zero(); m]);
+        serial.unit_initialization(&mut z, &mut s);
+        assert!(serial.update_scaling(&s, &z, T::one(), ScalingStrategy::Dual));
+        assert!(pooled.update_scaling(&s, &z, T::one(), ScalingStrategy::Dual));
+        let settings = crate::solver::CoreSettings::default();
+        for case in 0..3 {
+            let rate = [num(-2), -half, num(-16)][case];
+            let dz: Vec<_> = z.iter().map(|v| rate * *v).collect();
+            let ds: Vec<_> = s.iter().map(|v| rate * *v / num(2)).collect();
+            for cap in [T::one(), half, num(1) / num(128), T::zero(), -T::zero()] {
+                let a = serial.step_length(&dz, &ds, &z, &s, &settings, cap);
+                let b = pooled.step_length(&dz, &ds, &z, &s, &settings, cap);
+                assert_eq!(a, b, "case={case}, cap={cap}");
+                assert_eq!(a.0.is_sign_negative(), b.0.is_sign_negative());
+                assert_eq!(a.1.is_sign_negative(), b.1.is_sign_negative());
+            }
+        }
+    }
+}
+
+#[test]
+fn orthant_step_lengths_f64() {
+    single_orthant_steps::<f64>();
+}
+#[test]
+fn orthant_step_lengths_mpfr256() {
+    single_orthant_steps::<Bits256>();
+}
+#[test]
+fn orthant_step_lengths_mpfr512() {
+    single_orthant_steps::<sdpx_arithmetic::Bits512>();
 }

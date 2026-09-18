@@ -4,8 +4,10 @@ use crate::solver::SupportedConeT::*;
 
 fn equal<T: FloatT>(a: &[T], b: &[T]) {
     assert_eq!(a.len(), b.len());
-    for (a, b) in a.iter().zip(b) {
-        assert!(*a == *b || (a.is_nan() && b.is_nan()));
+    for (i, (a, b)) in a.iter().zip(b).enumerate() {
+        if !(*a == *b || (a.is_nan() && b.is_nan())) {
+            panic!("equal mismatch at index {i}: a={a:?} b={b:?}");
+        }
     }
 }
 fn fixture<T: FloatT>(

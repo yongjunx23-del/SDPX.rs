@@ -5,8 +5,7 @@ use super::*;
 pub(super) struct ConeThreading {
     pub(super) pool: std::sync::Arc<rayon::ThreadPool>,
     pub(super) lanes: Vec<Lane>,
-    #[cfg(feature = "sdp")]
-    pub(super) psd_step_lanes: Vec<Lane>,
+    pub(super) sym_step_lanes: Vec<Lane>,
     // A single large orthant uses disjoint elementwise chunks instead of
     // outer cone tasks. Never combine the two scheduling levels.
     pub(super) orthant_chunk: Option<usize>,
@@ -89,13 +88,17 @@ impl ConeThreading {
             .saturating_mul(4)
             .min((total / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
         let lanes = balanced_lanes(cones, &prefix, task_budget.min(cones.len()));
-        #[cfg(feature = "sdp")]
-        let psd_step_lanes = {
+        let sym_step_lanes = {
+            // Step-to-boundary bounds are cap-insensitive for symmetric
+            // cones (Nonnegative/SOC/PSD/Zero): every cone is evaluated at
+            // the same initial cap and the results fold into the running
+            // minimum, bitwise identical to the serial pass.  Nonsymmetric
+            // cones stay serial — their iterative searches use the cap.
             let mut prefix = Vec::with_capacity(cones.len() + 1);
             prefix.push(0u128);
             let mut active = 0usize;
             for cone in cones {
-                let cost = if matches!(cone, SupportedCone::PSDTriangleCone(k) if k.n > 0) {
+                let cost = if cone.is_symmetric() && cone.numel() > 0 {
                     active += 1;
                     cone_cost(cone)
                 } else {
@@ -119,8 +122,7 @@ impl ConeThreading {
         Ok(Some(Self {
             pool: std::sync::Arc::new(pool),
             lanes,
-            #[cfg(feature = "sdp")]
-            psd_step_lanes,
+            sym_step_lanes,
             orthant_chunk,
         }))
     }
@@ -227,10 +229,12 @@ where
     }
 }
 
-// The only shared inputs are immutable direction/state slices. Every PSD
-// retains its own EVD workspace and writes one disjoint cone-indexed pair.
-#[cfg(feature = "sdp")]
-pub(super) fn psd_step_bounds<T: FloatT>(
+// The only shared inputs are immutable direction/state slices. Every cone
+// writes one disjoint cone-indexed bound pair; symmetric cones evaluate
+// `step_length` at the common cap, which the ordered fold then reduces —
+// bitwise identical to the serial running-cap fold because their step
+// lengths are cap-insensitive.
+pub(super) fn sym_step_bounds<T: FloatT>(
     cones: &mut [SupportedCone<T>],
     bounds: &mut [(T, T)],
     lanes: &[Lane],
@@ -245,7 +249,7 @@ pub(super) fn psd_step_bounds<T: FloatT>(
         let mut row = lanes[0].row_start;
         for (cone, bound) in cones.iter_mut().zip(bounds) {
             let end = row + cone.numel();
-            if matches!(cone, SupportedCone::PSDTriangleCone(_)) {
+            if cone.is_symmetric() {
                 *bound = cone.step_length(
                     &dz[row..end],
                     &ds[row..end],
@@ -264,7 +268,7 @@ pub(super) fn psd_step_bounds<T: FloatT>(
         let (left_bounds, right_bounds) = bounds.split_at_mut(cut);
         rayon::join(
             || {
-                psd_step_bounds(
+                sym_step_bounds(
                     left,
                     left_bounds,
                     &lanes[..mid],
@@ -277,7 +281,7 @@ pub(super) fn psd_step_bounds<T: FloatT>(
                 )
             },
             || {
-                psd_step_bounds(
+                sym_step_bounds(
                     right,
                     right_bounds,
                     &lanes[mid..],
@@ -333,21 +337,44 @@ mod tests {
     }
 }
 
-#[cfg(feature = "sdp")]
 pub(super) fn prepare_affine_bounds<T: FloatT>(
     cones: &mut [SupportedCone<T>],
     bounds: &mut [(T, T)],
     lanes: &[Lane],
     dz: &mut [T],
     ds: &mut [T],
+    z: &[T],
+    s: &[T],
+    settings: &CoreSettings<T>,
     alpha: T,
 ) {
     if lanes.len() <= 1 {
         let mut row = 0;
         for (cone, bound) in cones.iter_mut().zip(bounds) {
             let end = row + cone.numel();
+            #[cfg(feature = "sdp")]
             if let SupportedCone::PSDTriangleCone(cone) = cone {
                 *bound = cone.prepare_affine_bounds(&mut dz[row..end], &mut ds[row..end], alpha);
+            } else if cone.is_symmetric() {
+                *bound = cone.step_length(
+                    &dz[row..end],
+                    &ds[row..end],
+                    &z[row..end],
+                    &s[row..end],
+                    settings,
+                    alpha,
+                );
+            }
+            #[cfg(not(feature = "sdp"))]
+            if cone.is_symmetric() {
+                *bound = cone.step_length(
+                    &dz[row..end],
+                    &ds[row..end],
+                    &z[row..end],
+                    &s[row..end],
+                    settings,
+                    alpha,
+                );
             }
             row = end;
         }
@@ -359,9 +386,11 @@ pub(super) fn prepare_affine_bounds<T: FloatT>(
         let (lb, rb) = bounds.split_at_mut(cut);
         let (lz, rz) = dz.split_at_mut(row);
         let (ls, rs) = ds.split_at_mut(row);
+        let (lv, rv) = z.split_at(row);
+        let (lw, rw) = s.split_at(row);
         rayon::join(
-            || prepare_affine_bounds(lc, lb, &lanes[..mid], lz, ls, alpha),
-            || prepare_affine_bounds(rc, rb, &lanes[mid..], rz, rs, alpha),
+            || prepare_affine_bounds(lc, lb, &lanes[..mid], lz, ls, lv, lw, settings, alpha),
+            || prepare_affine_bounds(rc, rb, &lanes[mid..], rz, rs, rv, rw, settings, alpha),
         );
     }
 }

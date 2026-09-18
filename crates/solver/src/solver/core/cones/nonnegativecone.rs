@@ -81,6 +81,50 @@ where
             });
     }
 
+    // Chunked step-to-boundary for the single-large-orthant path. Each
+    // chunk returns its own (αz, αs) minimum; folding chunk partials in
+    // index order is bitwise identical to the serial scan because min is
+    // associative and commutative.
+    pub(super) fn step_length_parallel(
+        &self,
+        dz: &[T],
+        ds: &[T],
+        z: &[T],
+        s: &[T],
+        chunk: usize,
+        αmax: T,
+    ) -> (T, T) {
+        let bounds: Vec<(T, T)> = dz
+            .par_chunks(chunk)
+            .zip(ds.par_chunks(chunk))
+            .zip(z.par_chunks(chunk))
+            .zip(s.par_chunks(chunk))
+            .map(|(((dz, ds), z), s)| {
+                let mut αz = αmax;
+                let mut αs = αmax;
+                for (dz, ds, z, s) in izip!(dz, ds, z, s) {
+                    if *dz < T::zero() {
+                        αz = T::min(αz, -*z / *dz);
+                    }
+                    if *ds < T::zero() {
+                        αs = T::min(αs, -*s / *ds);
+                    }
+                }
+                (αz, αs)
+            })
+            .collect();
+        let mut αz = αmax;
+        let mut αs = αmax;
+        for (bz, bs) in bounds {
+            αz = T::min(αz, bz);
+            αs = T::min(αs, bs);
+        }
+        // The caller's fold returns one shared α = min(αz, αs) for both
+        // components; match that contract exactly.
+        let α = T::min(αz, αs);
+        (α, α)
+    }
+
     pub fn new(dim: usize) -> Self {
         Self {
             dim,

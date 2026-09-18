@@ -71,6 +71,108 @@ where
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn update_impl(
+        &mut self,
+        data: &mut DefaultProblemData<T>,
+        variables: &DefaultVariables<T>,
+        residuals: &DefaultResiduals<T>,
+        timers: &Timers,
+        pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    ) {
+        // optimality termination check should be computed w.r.t
+        // the pre-homogenization x and z variables.
+        let τinv = T::recip(variables.τ);
+
+        // unscaled linear term norms
+        let normb = data.get_normb();
+        let normq = data.get_normq();
+
+        // shortcuts for the equilibration matrices
+        let d = &data.equilibration.d;
+        let e = &data.equilibration.e;
+        let dinv = &data.equilibration.dinv;
+        let einv = &data.equilibration.einv;
+        let cinv = T::recip(data.equilibration.c);
+
+        // primal and dual costs. dot products are invariant w.r.t
+        // equilibration, but we still need to back out the overall
+        // objective scaling term c
+
+        let xPx_τinvsq_over2 = residuals.dot_xPx * τinv * τinv / (2.).as_T();
+        self.cost_primal = (residuals.dot_qx * τinv + xPx_τinvsq_over2) * cinv;
+        self.cost_dual = (-residuals.dot_bz * τinv - xPx_τinvsq_over2) * cinv;
+
+        // Eight independent norm scans.  On a worker pool they run
+        // concurrently; every scan keeps its serial reduction order, so
+        // each value is bitwise identical to the sequential version.
+        let mut normx = T::zero();
+        let mut normz = T::zero();
+        let mut norms = T::zero();
+        let mut rx_inf_ns = T::zero();
+        let mut px_ns = T::zero();
+        let mut rz_inf_ns = T::zero();
+        let mut rz_ns = T::zero();
+        let mut rx_ns = T::zero();
+        if let Some(pool) = &pool {
+            pool.install(|| {
+                rayon::scope(|sc| {
+                    sc.spawn(|_| normx = variables.x.norm_scaled(d));
+                    sc.spawn(|_| normz = variables.z.norm_scaled(e));
+                    sc.spawn(|_| norms = variables.s.norm_scaled(einv));
+                    sc.spawn(|_| rx_inf_ns = residuals.rx_inf.norm_scaled(dinv));
+                    sc.spawn(|_| px_ns = residuals.Px.norm_scaled(dinv));
+                    sc.spawn(|_| rz_inf_ns = residuals.rz_inf.norm_scaled(einv));
+                    sc.spawn(|_| rz_ns = residuals.rz.norm_scaled(einv));
+                    sc.spawn(|_| rx_ns = residuals.rx.norm_scaled(dinv));
+                });
+            });
+        } else {
+            normx = variables.x.norm_scaled(d);
+            normz = variables.z.norm_scaled(e);
+            norms = variables.s.norm_scaled(einv);
+            rx_inf_ns = residuals.rx_inf.norm_scaled(dinv);
+            px_ns = residuals.Px.norm_scaled(dinv);
+            rz_inf_ns = residuals.rz_inf.norm_scaled(einv);
+            rz_ns = residuals.rz.norm_scaled(einv);
+            rx_ns = residuals.rx.norm_scaled(dinv);
+        }
+        normz *= cinv;
+
+        // variables norms, undoing the equilibration.  Do not unscale
+        // by τ yet because the infeasibility residuals are ratios of
+        // terms that have no affine parts anyway
+
+        // primal and dual infeasibility residuals.
+        self.res_primal_inf = (rx_inf_ns * cinv) / T::max(T::one(), normz);
+        self.res_dual_inf = T::max(
+            px_ns / T::max(T::one(), normx),
+            rz_inf_ns / T::max(T::one(), normx + norms),
+        );
+
+        // now back out the τ scaling so we can normalize the unscaled primal / dual errors
+        normx *= τinv;
+        normz *= τinv;
+        norms *= τinv;
+
+        // primal and dual relative residuals.
+        self.res_primal = rz_ns * τinv / T::max(T::one(), normb + normx + norms);
+        self.res_dual = rx_ns * τinv * cinv / T::max(T::one(), normq + normx + normz);
+
+        // absolute and relative gaps
+        self.gap_abs = T::abs(self.cost_primal - self.cost_dual);
+        self.gap_rel = self.gap_abs
+            / T::max(
+                T::one(),
+                T::min(T::abs(self.cost_primal), T::abs(self.cost_dual)),
+            );
+
+        // κ/τ ratio (scaled)
+        self.ktratio = variables.κ * τinv;
+
+        // solve time so far (includes setup)
+        self.solve_time = timers.total_time().as_secs_f64();
+    }
 }
 
 impl<T: FloatT> SolverFFI<Self> for DefaultInfo<T> {
@@ -116,67 +218,18 @@ where
         residuals: &DefaultResiduals<T>,
         timers: &Timers,
     ) {
-        // optimality termination check should be computed w.r.t
-        // the pre-homogenization x and z variables.
-        let τinv = T::recip(variables.τ);
+        self.update_impl(data, variables, residuals, timers, None);
+    }
 
-        // unscaled linear term norms
-        let normb = data.get_normb();
-        let normq = data.get_normq();
-
-        // shortcuts for the equilibration matrices
-        let d = &data.equilibration.d;
-        let e = &data.equilibration.e;
-        let dinv = &data.equilibration.dinv;
-        let einv = &data.equilibration.einv;
-        let cinv = T::recip(data.equilibration.c);
-
-        // primal and dual costs. dot products are invariant w.r.t
-        // equilibration, but we still need to back out the overall
-        // objective scaling term c
-
-        let xPx_τinvsq_over2 = residuals.dot_xPx * τinv * τinv / (2.).as_T();
-        self.cost_primal = (residuals.dot_qx * τinv + xPx_τinvsq_over2) * cinv;
-        self.cost_dual = (-residuals.dot_bz * τinv - xPx_τinvsq_over2) * cinv;
-
-        // variables norms, undoing the equilibration.  Do not unscale
-        // by τ yet because the infeasibility residuals are ratios of
-        // terms that have no affine parts anyway
-        let mut normx = variables.x.norm_scaled(d);
-        let mut normz = variables.z.norm_scaled(e) * cinv;
-        let mut norms = variables.s.norm_scaled(einv);
-
-        // primal and dual infeasibility residuals.
-        self.res_primal_inf = (residuals.rx_inf.norm_scaled(dinv) * cinv) / T::max(T::one(), normz);
-        self.res_dual_inf = T::max(
-            residuals.Px.norm_scaled(dinv) / T::max(T::one(), normx),
-            residuals.rz_inf.norm_scaled(einv) / T::max(T::one(), normx + norms),
-        );
-
-        // now back out the τ scaling so we can normalize the unscaled primal / dual errors
-        normx *= τinv;
-        normz *= τinv;
-        norms *= τinv;
-
-        // primal and dual relative residuals.
-        self.res_primal =
-            residuals.rz.norm_scaled(einv) * τinv / T::max(T::one(), normb + normx + norms);
-        self.res_dual =
-            residuals.rx.norm_scaled(dinv) * τinv * cinv / T::max(T::one(), normq + normx + normz);
-
-        // absolute and relative gaps
-        self.gap_abs = T::abs(self.cost_primal - self.cost_dual);
-        self.gap_rel = self.gap_abs
-            / T::max(
-                T::one(),
-                T::min(T::abs(self.cost_primal), T::abs(self.cost_dual)),
-            );
-
-        // κ/τ ratio (scaled)
-        self.ktratio = variables.κ * τinv;
-
-        // solve time so far (includes setup)
-        self.solve_time = timers.total_time().as_secs_f64();
+    fn update_with_pool(
+        &mut self,
+        data: &mut DefaultProblemData<T>,
+        variables: &DefaultVariables<T>,
+        residuals: &DefaultResiduals<T>,
+        timers: &Timers,
+        pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    ) {
+        self.update_impl(data, variables, residuals, timers, pool);
     }
 
     fn check_termination(

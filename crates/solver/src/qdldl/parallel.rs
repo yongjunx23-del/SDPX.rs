@@ -516,9 +516,17 @@ impl<T: FloatT> ParallelPlan<T> {
         // Partition the path (processing order = reverse y_idx) into
         // per-group leaf lists, tagging each column with its sequence
         // position for the ordered replay.  Trunk columns are eliminated
-        // inline during the replay itself.
+        // inline during the replay itself.  Contribution buffers must be
+        // reset for every group on every row — a group absent from this
+        // row's path still owns stale entries from earlier rows, and a
+        // stale sequence tag can alias a different position (or overrun
+        // the per-position lists entirely).
         for w in self.ws.iter_mut() {
             w.row_cols.clear();
+            for bucket in w.trunk_delta.iter_mut() {
+                bucket.clear();
+            }
+            w.d_delta.clear();
         }
         let mut seq = 0u32;
         for &c in self.tws.y_idx[..nnz_y].iter().rev() {
@@ -542,10 +550,6 @@ impl<T: FloatT> ParallelPlan<T> {
                     if w.row_cols.is_empty() {
                         return;
                     }
-                    for bucket in w.trunk_delta.iter_mut() {
-                        bucket.clear();
-                    }
-                    w.d_delta.clear();
                     for &(s, cidx) in &w.row_cols {
                         let r = rank_of[cidx];
                         let tmp = store.next[r];
