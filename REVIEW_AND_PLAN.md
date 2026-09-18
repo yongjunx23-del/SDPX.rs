@@ -43,10 +43,13 @@ blocks) converging on a 20-column trunk (equalities). Implemented
   + workspaces, serial order within a group → bit-identical).
 - Phase B: trunk rows run sequentially; each row's leaf-column segment is
   split per group (private `y_vals`, bucketed trunk deltas, D deltas with
-  sequence labels) and replayed in the serial `y_idx` order → bit-identical.
+  sequence labels) and replayed in the **exact serial `y_idx` order** —
+  per-position merge lists, trunk columns eliminated inline at their path
+  positions (bit-identical even for interleaved leaf/trunk trees, commit
+  69a5f40).
 - Forward solve: leaf groups in parallel, trunk contributions replayed in
-  column order, trunk tail serial. Backward solve: trunk serial first, leaf
-  groups in parallel.
+  exact serial column order with trunk columns scattering inline at their
+  positions. Backward solve: trunk serial first, leaf groups in parallel.
 - Pool wiring: `cones.thread_pool()` → `DirectLDLKKTSolver::set_factor_pool`
   → `ldlsolver.set_pool` → `QDLDLFactorisation` (default no-op `set_pool` on
   the `DirectLDLSolver` trait; other backends unaffected).
@@ -66,11 +69,34 @@ Tests: `parallel_factor_solve_bitwise_identical`,
 `parallel_fallback_and_fork` (qdldl::parallel::tests) — bitwise L/D/Dinv and
 solve equality vs serial, arrow and fork structures, serial fallback.
 
+### Cluster acceptance (UCAS HIAS, verified 2026-09-19)
+
+Release `69a5f40` deployed under `~/projects/SDPX.jl/releases/`, `current`
+promoted after all gates passed (jobs 213600 validation + 213601 scaling):
+
+- **Validation gates** (PBS compute node, 8 physical cores pinned):
+  Julia package tests 46s ✓, analytic 2×2 PSD ✓ (fixed stale driver —
+  Clarabel `Ax+s=b` convention + unscaled MOI triangle entries),
+  sampled Ising Λ=11 512-bit ✓.
+- **Ising thread scaling** (solve time, fresh process per width,
+  `OPENBLAS_NUM_THREADS=1`):
+
+  | threads | solve_s | speedup |
+  |---|---|---|
+  | 1 | 60.97 | 1.00× |
+  | 2 | 33.11 | 1.84× |
+  | 4 | 18.96 | 3.22× |
+  | 8 | 11.36 | 5.37× |
+
+- **Audits**: `accepted=true`, `optimal=true` at every width; gap 3.35e-43,
+  reference-objective agreement 4.6e-35 (gate 1e-30), 50 iterations.
+- **Cross-width determinism**: solution vectors bitwise identical at
+  1/2/4/8 threads (sha256 `251f8938ff9296d0` on x/y/s).
+- Receipt: `releases/69a5f40…/metadata/acceptance.json`; raw logs in
+  `results/213600.node220/` and `results/213601.node220-scaling/`.
+
 ## Pending
 
-- Cluster: deploy release build, run Ising Λ=11 512-bit acceptance
-  (`benchmark/ising/run.jl`, 1e-30 audits) at 1/2/4/8 threads; record
-  factorization/trsv phase timings and thread scaling.
 - Unrelated pre-existing warnings (`cached_psd`, `prepared`, `has_lanes`,
   `product` dead code) — not in scope, flag for follow-up.
 - `julia/SDPX.jl/deps/build.log` untracked artifact — hygiene.
