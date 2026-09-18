@@ -1482,6 +1482,13 @@ The stable runtime-FMA/residual-overlap version remains the publication candidat
 
 
 
+> **SUPERSEDED SPEED REFERENCE — do not quote.** The SDPX/SDPB seconds below come
+> from a different source revision, host and core set than the current tree, so they
+> are not comparable to each other or to current measurements. They are retained as
+> historical receipts only. The authoritative same-node 1..64-core comparison is
+> campaign `213524` (see the entry at the end of this file). This is the exact
+> cross-fixture conflation that section 1.2 of the engineering plan forbids.
+
 Latest matched high-precision evidence: at 512 bits and fixed 1e-42 internal /
 1e-30 external gates, Ising SDPX warm-native medians at 1/4/16 physical cores are
 71.19/22.81/13.26 s, versus SDPB per-iteration timer sums of 127.06/35.85/15.66 s.
@@ -3353,6 +3360,13 @@ is verified using the one-host PBS nodefile and each rank PID/start-time key in
 the locally sampled memory records. Five summary tests pass, including rejecting
 missing/locality-mismatched rank records. No numerical gates were changed.
 
+> **SUPERSEDED SPEED REFERENCE — do not quote.** The SDPX/SDPB seconds below come
+> from a different source revision, host and core set than the current tree, so they
+> are not comparable to each other or to current measurements. They are retained as
+> historical receipts only. The authoritative same-node 1..64-core comparison is
+> campaign `213524` (see the entry at the end of this file). This is the exact
+> cross-fixture conflation that section 1.2 of the engineering plan forbids.
+
 | Physical cores | SDPX warm native median (s) | SDPB iteration-time sum median (s) | SDPB process median (s) |
 |---|---:|---:|---:|
 |1|71.1920|127.056|129.5643|
@@ -3612,3 +3626,482 @@ Evidence: local /tmp/sdpx-ising-local-124-20260917/ (final1, final4b, cnt1,
 etree3, ph1, ph4); cluster jobs 213439, 213452, 213461, 213462, 213463 under
 ~/projects/sdpx-scaling-64-20260917/results/. Rust workspace 477 checks pass and
 the Julia suite reports 673 of 673.
+
+## September 18 plan execution: Phase 1 rejected on measurement, Phase 2 interface only
+
+Baseline `0c04025`; working diff `78a9d0e26f13beb8`. Full ledger and acceptance
+receipts: `PLAN_LEDGER_20260918.md`; the CRT decision is argued in
+`/tmp/sdpx-phase0/A13_decision.md`.
+
+**Reverted.** An earlier attempt in this round added a CRT modulus module, a
+serial "tiled dense" Cholesky, a knapsack block allocator and a
+`one_solve_per_iteration` switch. All four were removed before this work began:
+the CRT projection went through `to_f64()` (so it discarded every bit above 53 and
+was not precision-preserving), the "tiled" solver contained no tiling or
+parallelism and applied Cholesky to an indefinite KKT matrix, the allocator was
+never called, and the solve switch skipped the predictor without an equivalence
+argument. None of that code is in this tree.
+
+**Phase 1 (exact CRT dense backend): rejected on measurement.** A diagnostic copy
+recorded operand exponent spans over a full 512-bit Ising512 solve: 75,636 `gemm`
+calls at `16x31x16` with a 576-bit exponent span, plus 2,222 `syrk` calls. Signed
+CRT uniqueness (`prod(p) > 2B`) then needs about 81 twenty-bit moduli, because the
+integer image of a high-precision product is about `2*prec + span` bits wide, not
+`prec`. Projecting one kernel's 752 operands into those 81 moduli measured
+1.318 ms against 0.936 ms for the kernel's entire current MPFR FMA work. The
+projection alone loses, and it scales as `prec^2` against MPFR's ~`prec^1.6`.
+Root cause: CRT wins only when the contraction depth `k` amortizes `K`-fold
+projection, and this family has `k <= 16` against `K >= 56`. No dispatch, no auto
+path, no feature flag.
+
+**Kept as reference tools (additive, 20 tests).** `crates/arithmetic/src/dyadic.rs`
+gives an exact read-only dyadic view (sign, exponent, mantissa limbs, exact bit
+length) with no text round-trip; the limb order was measured, not assumed, and is
+pinned by `mantissa_layout_is_lsb_first_and_normalized`. `crates/arithmetic/src/integer.rs`
+builds exact product images with GMP, and reports `image_bound_bits`,
+`modulus_count` and `blas_panel_is_exact` so a future modulus plan can never
+hardcode a prime count.
+
+**Phase 2 (A21 only).** `KKTSolver` gained `solve_many` (default column loop, so
+every backend stays correct) and `SolveCounters`. Three tests per precision prove
+that one wave applies every column to the one factorization, reproduces each
+single-column solve bit for bit, and keeps a non-finite column's failure local
+(`[false, true, true]`). The compiler still reports `solve_many` as unused outside
+tests: this is interface and accounting only. The lazy-constant restructuring that
+would actually change the wave count (A22) was not attempted, and the earlier
+3.06 RHS applications per iteration stand.
+
+**Phases 3 and 4: no qualified target.** Ising512's QDLDL is 2.4% of the solve, so
+even a free decomposition caps at `1/(1-0.024) = 1.0246`. The 587-block CSDR
+instance does not converge from the default start and is time- rather than
+memory-bound, so it qualifies neither the component/border work nor MPI. A01's
+larger-Lambda11 dual-consistency failure (2.16e-22 at 768 bits against a 1e-30
+gate) remains open and blocks any large-model scalability claim.
+
+**Congruence column tiling (kept).** One block's congruence GEMM splits into
+disjoint output-column tiles when the pool is wider than the block count; at
+widths where the lanes already cover the pool it stays off, so narrow widths are
+unchanged. Bit-exact for f64/256/512.
+
+Cluster job 213475, all cells `accepted: true`:
+
+| width | 1 | 4 | 8 | 16 | 64 |
+|---|---|---|---|---|---|
+| previous candidate (213461) | 60.870 | 20.375 | 13.269 | 12.233 | 15.388 |
+| this tree | 60.381 | 20.119 | 13.230 | 12.181 | **14.381** |
+| speedup vs w1 | 1.00x | 3.00x | 4.56x | 4.96x | 4.20x |
+
+The 64-core cell improves 6.5%; the sub-1% deltas at widths <= 16 sit inside the
+noise band of a node shared with other tenants, and at those widths the tiling is
+inactive by construction. Local timing was excluded from evidence entirely: the
+agent harness held 75% of a 10-core host and the battery was at 4% charging.
+
+## September 18 static-review round: contract fixes, 3D Ising receipts, serial-LDL bound
+
+Source identity: the A90 working tree (`0c04025` plus the in-flight congruence
+tiling) plus this round's review fixes. Host: Apple M4 (10 cores, 16 GB), macOS,
+Julia 1.12.6, Rust 1.98.1. Local wall-clock only; no cluster cell was submitted.
+Measurements are sequential and no other work ran on the host during a timed
+point. The library under test is `libsdpx.dylib` built with
+`sdp-accelerate,faer-sparse`; its SHA256 is recorded in every receipt
+(`libsdpx-fixed.dylib` vs the pre-fix `libsdpx-prefix.dylib`).
+
+### Fixes landed (all validated)
+
+1. **MPFR reduced tolerances were identical to the strict ones.**
+   `accuracy_default` returns `sqrt(eps)` for every non-primitive type, so all
+   six `reduced_tol_*` defaults equalled their strict counterparts above 53 bits
+   and `check_convergence_almost` could never admit a point the strict gate had
+   already rejected: the `Almost*` statuses were unreachable at 128-2048 bits,
+   contradicting the intent documented in `crates/ffi/src/lib.rs`. Reduced
+   defaults now use `reduced_accuracy_default` (`eps^(1/4)`, one half-order
+   looser) and `reduced_margin_default` (`eps^(3/4)`, the smaller relaxed
+   infeasibility margin that mirrors upstream's `5e-12 < 1e-8`). Primitive
+   values are unchanged. New test
+   `reduced_tolerances_stay_distinct_from_full_accuracy_tolerances` asserts the
+   ordering at f64/256/512 bits; no previous test could observe it (the FFI test
+   compares against the same helper, and the swap-based test is f64-only).
+2. **Condensed setup scanned A once per eliminated block (O(blocks * nnz)).**
+   The constructor now publishes row ownership once and fills every PSD/orthant
+   local index structure from a single pass over A; `PsdBlock::from_columns`
+   took over the per-block constructor, which is now test-only. `SampledOperator`
+   replaced two per-block range probes with one sampled-row flag array.
+3. **Silent no-op API surface.** `Settings(working_precision_policy=:auto)` is
+   now rejected instead of accepted-and-ignored; `Outputs(history=true)` /
+   `trace=true` are rejected because the Rust core publishes neither; the dead
+   `recompile` keyword (a retired precision-ladder residue) is gone from
+   `_solve_program` and its two callers; `MOI.SolverVersion` reports
+   `pkgversion` instead of a frozen "0.6.1"; `Retention`'s docstring no longer
+   claims unselected values are dropped when the vector is merely zeroed.
+4. **Library panics replaced by errors** where a caller can trigger them
+   (`cones.numel != data.m` now returns `BadInputData`), inert A21 interface
+   annotated as such, and `solve_many_by_columns` rejects partial columns.
+
+Validation: `cargo test --locked --release --workspace --features
+sdpx-ffi/sdp-accelerate,sdpx-ffi/faer-sparse -- --test-threads=1` ->
+**498 passed, 0 failed** across all targets (321 solver-library unit tests and
+4 doc-tests included);
+`julia --project=julia/SDPX.jl julia/SDPX.jl/test/runtests.jl` -> **673 of 673**.
+Logs: `/tmp/sdpx-review-artifacts/rust-tests.log`, `julia-tests.log`.
+
+### 3D Ising (Lambda=11) benchmark
+
+Frozen sampled input `common-sdp` (input_sha256 `e4484eb8...`), 512-bit, n=322,
+m=2558, 22 PSD blocks of order 12-16, 50 iterations, tolerances 1e-42, condensed
+sampled QDLDL. Every point was audited outside solver timing against the frozen
+SDPB reference at 1e-30 (primal, dual, gap, PSD violations, sampled mapping,
+objective agreement): all accepted, objective
+`-0.28388466632834991310779120004428472...` identical in every cell.
+
+| width | pre-fix median (n) | fixed median (n) | ratio | speedup vs w1 |
+|---|---|---|---|---|
+| 1 | 58.61 s (6) | 58.33 s (6) | 0.995 | 1.00x |
+| 2 | 33.38 s (3) | 33.45 s (3) | 1.002 | 1.76x |
+| 4 | 19.63 s (6) | 19.67 s (6) | 1.002 | 2.99x |
+| 8 | 12.98 s (3) | 13.15 s (3) | 1.014 | 4.52x |
+
+The fixes are timing-neutral on this workload, as expected: they change setup
+complexity, tolerance semantics and API honesty, not the solve path. The 4- and
+8-worker speedups reproduce the cluster campaign (3.00x / 4.56x) on a different
+host, which is the useful part of this table. `prepare` is 0.44-0.45 s at every
+width, i.e. 0.75% of the single-thread solve.
+
+The setup fix cannot show on 22 blocks, so it was measured on the shape it
+targets: 200 PSD cones of order 20, n=800, nnz=1.68M, sparse column support
+(the regime where `prefer_condensed` selects this backend). `prepare` median
+falls from **0.6285 s to 0.5004 s (-20.4%)**, with the three fixed runs
+(0.506/0.500/0.498) entirely below the three pre-fix runs (0.615/0.655/0.629);
+the old path probed 336M block-range entries, the new one 1.68M.
+
+### Where the parallel time goes (measured, not inferred)
+
+Instrumented diagnostic copy (`benchmark/profile/instrument_iteration.py`
+`--ffi-timers`) plus temporary sub-timers inside `CondensedKKTSolver::update`.
+Per solve, 50 iterations:
+
+| phase | w1 | w4 | w8 | w1->w8 |
+|---|---|---|---|---|
+| kkt solve (2 solves/iteration, congruence + reduced solves) | 23.73 s | 8.10 s | 5.20 s | 4.56x |
+| scale cones (NT scaling, MPFR SVD) | 12.38 s | 3.66 s | 1.95 s | 6.36x |
+| kkt update | 9.87 s | 4.25 s | 3.31 s | 2.98x |
+| step lengths (affine + combined) | 8.72 s | 2.59 s | 1.38 s | 6.32x |
+| residual and info | 1.93 s | 0.88 s | 0.71 s | 2.72x |
+| default start | 0.35 s | 0.20 s | 0.18 s | 1.98x |
+| **IP iteration total** | **57.32 s** | **19.75 s** | **12.74 s** | 4.50x |
+
+`kkt update` decomposes exactly (same diagnostic run):
+
+| sub-phase | w1 | w8 | scaling |
+|---|---|---|---|
+| plan + per-block scaling sync | 3.55 s | 0.58 s | 6.2x |
+| Schur assembly and scatter | 0.53 s | 0.13 s | 4.2x |
+| **reduced `update_P`/`update_from_cones` (numeric LDL factorization)** | **3.03 s** | **3.00 s** | **1.00x** |
+| reduced triangular solves (inside `kkt solve`) | 4.33 s | 2.39 s | 1.81x |
+
+Consequences:
+
+- The reduced Schur LDL is the **only** large serial term: 3.00 + 2.39 = 5.39 s
+  of the 12.95 s eight-worker solve (**42%**), scaling 1.0x and 1.8x. Everything
+  else in the same solve scales 4.2-6.4x.
+- **The A30 premise is wrong for this route.** "Ising512 QDLDL is 2.4%" measured
+  the wrong quantity; at one worker the factorization is 3.03 s of 58.3 s (5.2%),
+  and because it does not scale it becomes 23% of the eight-worker solve. The
+  Amdahl cap for parallelizing it is therefore not 1.025 but roughly 1.7x at
+  eight workers, growing with width - which is also the clean explanation of the
+  cluster's 6.6% efficiency at 64 cores: a ~3 s thread-independent factorization
+  sits inside a 14.4 s cell.
+- Ranked parallel opportunities, by measured share: (1) parallel/blocked sparse
+  LDL for the reduced system, including level-scheduled triangular solves around
+  the existing elimination tree (~42% of the eight-worker solve, 1.0-1.8x today);
+  (2) the serial residual/norm fraction (0.71 s at w8, 2.72x scaling, ~5%);
+  (3) nothing else - cone scaling, congruence GEMMs, step lengths, assembly and
+  the per-block sync already scale 4.2-6.4x. Both remaining items change
+  summation order or factorization structure, so they need the full external
+  audit and a re-qualified campaign rather than a local timing win.
+- `scale cones` (NT scaling via MPFR SVD) is the largest single-thread cost after
+  the solves (21.6% at w1). It scales well, so it is an *algorithmic* target
+  (eigendecomposition instead of SVD, or caching `W^-1 W^-T`), not a parallel one.
+
+Artifacts: `/tmp/sdpx-review-artifacts/ising/results.jsonl` (36 points),
+`prepare_csc.jsonl`, `instr-w{1,4,8}.log`, `diag2-w{1,8}.log`,
+`/tmp/sdpx-review-artifacts/rust-tests.log`, `julia-tests.log`.
+
+## September 18 SDPB-referenced optimization round: corrected cost model
+
+Follows the static-review round above. Same host (Apple M4, 10 cores), same
+frozen 3D Ising Lambda=11 input, sequential measurements, no concurrent work
+during a timed point. Instrumentation lived in a throwaway source copy under
+`/tmp/sdpx-review-artifacts/prof*/`; the workspace tree carries only changes
+that were measured and kept.
+
+### What the solve actually costs (measured, not inferred)
+
+Per solve, 50 iterations, 512-bit, condensed + sampled QDLDL. Instrumented with
+`timeit!` phases (via `benchmark/profile/instrument_iteration.py --ffi-timers`)
+plus temporary sub-timers inside `CondensedKKTSolver::update`,
+`DirectLDLKKTSolver::solve/iterative_refinement` and QDLDL's numeric loop.
+
+| phase | w1 | w4 | w8 | w1->w8 |
+|---|---|---|---|---|
+| kkt solve (affine + combined) | 24.86 s | 8.10 s | 5.20 s | 4.78x |
+| scale cones (NT scaling, MPFR SVD) | 12.52 s | 3.66 s | 1.95 s | 6.42x |
+| kkt update | 10.22 s | 4.25 s | 3.31 s | 3.09x |
+| step lengths (affine + combined) | 8.72 s | 2.59 s | 1.38 s | 6.32x |
+| residual and info | 1.93 s | 0.88 s | 0.71 s | 2.72x |
+| default start | 0.35 s | 0.20 s | 0.18 s | 1.94x |
+
+`kkt update` decomposes exactly: per-block scaling sync 1.78 s (w1) / 0.58 s
+(w8, 6.2x), Schur assembly and scatter 0.26 / 0.13 s (4.2x), reduced-system
+value updates plus QDLDL numeric factorization 1.52 / 1.50 s (**1.00x**), and
+**the constant-term solve (`solve_constant_rhs`) ~6.6 / ~1.1 s** — a full third
+linear solve per iteration that the phase timer folds into `kkt update`. This
+matches the earlier A20 count of 3.06 right-hand-side applications per
+iteration: constant + affine + combined share one factorization.
+
+Reduced Schur system (n=342 including the 20 equality rows): 11,370 nonzeros,
+AMD-predicted factor nonzeros 11,218 of 58,653 dense (fill 0.191), 218,884
+predicted flops. Measured: 192,519 inner-loop iterations and 20.5-23.7 ms per
+numeric factorization, i.e. **~110 ns per inner iteration**. A 512-bit MPFR FMA
+in this provider costs about the same, so the sparse factorization is at the
+arithmetic's intrinsic per-operation cost rather than wrapper overhead.
+
+Corrected serial estimate at eight workers: reduced factorization 1.5 s (1.00x)
+plus the reduced solves 2.39 s (1.81x) plus the constant solve's serial part and
+the residual phase's serial part — roughly **21-25% of the 12.7 s cell**, not the
+42% stated in the review round above, which had attributed the whole of
+`kkt update` beyond sync/assemble to the factorization.
+
+### Candidates measured and rejected
+
+1. **Fused in-place MPFR accumulators** (`sub_mul_assign`/`add_mul_assign` on the
+   `Scalar` trait, single-rounding `mpfr_fma` with stack descriptors, applied to
+   QDLDL's factor and triangular-solve loops and to seven scalar loops in the
+   MPFR dense provider): implemented, unit-tested and measured. Interleaved A/B,
+   four points per arm: w1 baseline median 59.056 s vs fused 58.749 s (-0.5%,
+   ranges overlap); w8 13.130 s vs 13.422 s (one point at 19.91 s was contended
+   by a concurrent build; the two clean fused points, 12.93 and 13.07 s, equal
+   the baseline). **Neutral, therefore reverted**, because it also changes MPFR
+   rounding (two roundings become one) without a >=2% return.
+2. **Collapsing the factored inverse congruence to two gemms.** The measured
+   `PsdBlock::apply(inverse=true)` computes
+   `Rinv' * sym(Rinv * M * Rinv') * Rinv`, which equals `Ginv * M * Ginv` with
+   `Ginv = Rinv' Rinv` — already formed once per iteration for the Schur
+   assembly. Using it directly would replace four gemms with two in the phase
+   that dominates the solve (kkt solve 41% of the w8 cell). **Rejected without
+   implementing**: `graded_action_tests::condensed_graded_*` is a purpose-built
+   cancellation probe at every precision, and the source comment records the
+   factored form as a deliberate conditioning choice. Trading it for 2x on that
+   kernel would regress a guarded precision property, not a gate.
+3. **SDPB's `bigint_syrk` (CRT + double BLAS)** for the Schur SYRK. SDPB's own
+   precondition is `p^2 * k < 2^53` with `k = P.Height()`; on this input their
+   stacked `P = L^{-1}B` is about 2538 rows tall by 322 wide, so the projection
+   amortizes over a deep contraction. SDPX's kernels contract over the block
+   matrix dimension (12-16) or the sample basis (24-31), and the whole Schur
+   assembly is only 0.26 s (w1) / 0.13 s (w8). Consistent with the A13 rejection
+   and with the projection-vs-FMA measurement recorded there.
+4. **Dense border Cholesky** (SDPB's explicit `Q` plus `El::Cholesky`). The
+   reduced system has 19% factor fill: 219k sparse flops against 13.4M for a
+   dense factorization of the same 342 rows. With the sparse path measured at
+   the arithmetic's intrinsic cost, densifying is a loss at this size.
+
+### What remains, ranked, and what it would cost to land
+
+| # | change | expected at w8 | numerical impact | effort/risk |
+|---|---|---|---|---|
+| 1 | level-scheduled parallel QDLDL (factor and triangular sweeps) | up to ~2.0 s (~15%) | none: per-column arithmetic is unchanged, so results stay bit-identical | high: QDLDL's left-looking loop with dynamic regularization and its elimination-tree workspace must be re-derived |
+| 2 | batch the constant and affine right-hand sides (the deferred-A22 work) | ~2-4% | none per column; the column order is untouched | medium: iteration and `KKTSolver` plumbing, `solve_many` already exists and is tested |
+| 3 | pool the serial norm/dot fraction of `residual and info` | ~2-3% | none | low |
+| 4 | remove the per-block SVD from NT scaling (SDPB's dual scaling) | large (scale cones is 21.6% at w1) | changes iterates, primal recovery and convergence; outside the current algorithmic contract | research, needs a re-qualified campaign |
+| 5 | MPI, SDPB style | n/a here | none | SDPB needs ranks ~ blocks; this input has 22 blocks (larger-Lambda11: 28), so the ceiling is ~20-30 ranks, and the 587-block CSDR instance still does not converge |
+
+Items 1-3 preserve the arithmetic exactly; item 1 attacks the largest
+thread-independent term. Items 4-5 are algorithmic or architectural and are
+tracked, not attempted.
+
+### Certification after the round
+
+`cargo test --locked --release --workspace --features
+sdpx-ffi/sdp-accelerate,sdpx-ffi/faer-sparse -- --test-threads=1`: **498 passed,
+0 failed**; `julia --project=julia/SDPX.jl julia/SDPX.jl/test/runtests.jl`:
+**673 of 673**. 3D Ising re-confirmed on the final tree: 12.99 / 13.10 / 13.25 s
+at eight workers and 58.73 / 58.40 / 58.56 s at one worker, 50 iterations, every
+returned point accepted by the 1e-30 external audit, objective identical.
+
+Artifacts: `rust-tests{2,3}.log`, `julia-tests2.log`, `ising/certified.jsonl`,
+`ising/results-ab2.jsonl` (the fused-primitive A/B), `prof2/` (factor counters),
+`ising/diag3-w8.log`, `ising/instr-w{1,4,8}.log`.
+
+### SDPX versus SDPB scaling on the frozen Ising case: where the gap is
+
+Two independent receipts, both on the frozen 512-bit input, both sequential
+within their campaign. They must not be merged: the matched campaign below ran
+the same hosts, the same input and the same three widths for both solvers; the
+64-core cell is SDPX-only.
+
+**Matched same-node campaign** (`/tmp/sdpx-matched-20260916/final-summary.json`,
+job 212965, EPYC 7742, three repetitions per cell):
+
+| cores | SDPX native (50 it) | SDPX speedup / eff | SDPB iteration sum (201 it) | SDPB process | SDPB speedup / eff |
+|---|---|---|---|---|---|
+| 1 | 71.19 s | 1.00x / - | 127.06 s | 129.56 s | 1.00x / - |
+| 4 | 22.81 s | 3.12x / 78% | 35.85 s | 37.35 s | 3.54x / 88.6% |
+| 16 | 13.26 s | 5.37x / 33.6% | 15.66 s | 18.14 s | 8.11x / 50.7% |
+
+Per iteration: SDPX 1.424 s at one core and 0.265 s at 16; SDPB 0.632 s and
+0.0779 s. The SDPX/SDPB per-iteration ratio therefore worsens from 2.25x to
+3.40x as cores are added. SDPX nevertheless finishes first at 1-16 cores because
+it needs 50 iterations against SDPB's 201: the deficit is in **scaling and
+per-iteration cost**, not in total work at small widths.
+
+**Wide-width cell** (job 213475, 64 physical cores): SDPX medians
+60.381/20.119/13.230/12.181/**14.381** s at 1/4/8/16/64, i.e. 1.00/3.00/4.56/
+4.96/**4.20**x and 75%/57%/31%/**6.6%** efficiency. Beyond 16 cores the cell gets
+slower. SDPB has no local receipt above 16 cores: only 1/2/4/8 records exist
+locally, and the 1..64 comparison referenced as campaign 213524 lives on the
+cluster, so no SDPB wide-width number is quoted here.
+
+Three ceilings are already identified for this input:
+
+1. **Thread-independent work, measured at ~2.5-3 s per solve** at eight workers
+   (reduced factorization 1.5 s at 1.00x, the reduced solves, the constant-term
+   solve and the serial part of `residual and info`). That alone caps the cell
+   near 3-4 s regardless of width.
+2. **At most ~22-way parallelism inside the per-block phases** (22 PSD cones on
+   this input). The inner congruence tiling only fills the pool when lanes are
+   narrower than the worker count; with lanes = min(blocks, workers) a 64-worker
+   pool cannot be saturated by block work alone.
+3. **MPFR memory traffic**: a 512-bit value is 64 bytes, and the solve streams
+   the same blocks through congruence, Schur assembly, refinement and the
+   per-iteration RHS applications. The 16-to-64-core regression is consistent
+   with bandwidth and synchronisation cost rather than with the serial floor,
+   which would predict ~4 s rather than 14.4 s.
+
+The same block-count ceiling applies to SDPB: their own usage notes state that
+performance is best when the MPI rank count approaches the block count, so a
+22-block input is small for 64 ranks under either solver. Any wide-width claim
+for this input needs both solvers measured on the same quiet node.
+
+### Level-parallel sparse LDL rejected on its structural bound, not on a timing
+
+The first ranked item (level-parallel factorization and triangular sweeps of the
+reduced system) was retired before implementation by measuring the schedule it
+would produce. A diagnostic build dumped the reduced KKT matrix and its factor
+pattern at the first numerical factorization
+(`/tmp/sdpx-ldlprobe-20260918`, `SDPX_LDL_DUMP`; source is the certified tree
+plus an eight-line dump in `build_schedule`), giving `n = 342`, `nnz(L) = 11218`
+and 196,448 inner iterations of the two-term recurrence.
+
+Reconstructing the exact dependency DAG of the QDLDL numeric loop — column `k`
+depends on `j` when `row_lists[j] ∩ row_lists[k] ≠ ∅` (both write into the same
+column of `L`) or when `j ∈ row_lists[k]` (column `k` reads `Dinv[j]` and the
+filled prefix of column `j`; the same edge orders the transpose sweep) — yields
+51 levels, of which the first 24 have width 11 and the remaining 27 are single
+columns of the dense border. The weighted critical path is 158,575 of the
+196,448 inner iterations, so **no schedule of this factorization can exceed
+1.24x**, and a simulated level-synchronous schedule reaches 1.22x at eight
+workers and 1.24x at sixteen or more. The same DAG bound applies to the sweeps
+(forward push form, weight = row length): 7,095 of 11,218, i.e. 1.58x, and the
+transpose sweep is limited by the same 51-level chain.
+
+At the measured w8 share (factor 1.50 s of 19.6 s total, sweeps ~1.4 ms per
+right-hand side against a ~22 ms condensed apply) that bound is worth under
+1.5% at eight workers, below the 2% retention bar. The 130 lines of recording,
+schedule derivation and replay that had been written for it were therefore
+reverted; `crates/solver/src/qdldl/qdldl.rs` is byte-identical to its committed
+state and the built library is again the certified one. The isolation
+measurement stands as recorded: replaying a recorded elimination order instead
+of walking the elimination tree is neutral on its own (w8 +0.24%, i.e. slightly
+negative), so there is no partial change worth keeping.
+
+The structural reason is worth recording for other inputs: the AMD ordering of
+this reduced system is a trapezoid whose late columns carry most of the work
+(column heights reach 50, and the last 27 levels are width 1). A level-parallel
+LDL pays off on matrices with long, wide level fronts; this one does not have
+them, and neither the sweeps nor the factor can be rescued by a smarter
+schedule. Parallelism for this solve has to come from the block structure, not
+from the sparse factor.
+
+Ranked remaining optimizations, unchanged in arithmetic unless noted:
+
+| target | measured share | expected | notes |
+|---|---|---|---|
+| level-parallel sparse LDL (factor and triangular sweeps) | 1.5 s of 12.7 s at w8, 1.00x | **rejected: 1.24x structural bound** | measured critical path above; reverted |
+| decouple the lane count from the worker count in the block phases | kkt solve 5.20 s + kkt update 3.31 s + scale cones 1.95 s at w8 | **retained: -4.07% at w8, -3.39% at w16** | cluster job 213568, ABBA, 4 points per arm per width; lane imbalance 1.31x -> 1.09x at w8, 1.69x -> 1.26x at w16; see the section below |
+| batch the constant and affine right-hand sides | constant solve ~1.1 s of 12.7 s at w8 | **rejected: bounded by ~1.1 s of per-call overhead** | see below |
+| widen inner tiling for very wide pools | block phases | unknown | the current heuristic already enables inner tiling when lanes < workers (64 workers / 22 lanes gives 5 tiles), so this is not the 64-core cause |
+| remove the per-block NT-scaling SVD | 12.5 s at w1, 21.6% | large | changes iterates; SDPB's dual scaling is the reference |
+| MPI over blocks | - | capped at ~22-28 on this input | needs a decomposed instance with many blocks that still converges |
+
+### Lane dispatch decoupled from the worker count (retained on a cluster cell)
+
+The lane-parallel block phases (`apply_scaling_pool`, which owns the congruence
+applications inside `CondensedKKTSolver::solve` and `residual`) partitioned the
+blocks into exactly `workers` contiguous lanes and then walked them as a
+`rayon::join` tree. Two things follow from tying those two numbers together:
+
+* the leaves are dispatch units, not workers, so a finer partition is what lets
+  a work-stealing pool approach the LPT bound. On the Ising Lambda=11 reduced
+  system (22 PSD cones, `4 m^3` costs 6,912 .. 16,384) the worker-count
+  partition is off by 1.31x at eight workers, while one lane per block is off by
+  1.09x;
+* at sixteen workers the greedy contiguous partition is worse still: 1.69x,
+  against 1.26x for one lane per block. The old schedule therefore lost more at
+  sixteen workers than at eight, which is the opposite of what a wider pool
+  should do.
+
+`scaling_dispatch` replaces the worker-count call: it scores
+`{workers, 2*workers, 4*workers, blocks}` lane counts with the LPT makespan of
+their contiguous cost partition, picks the best (ties to fewer lanes), and
+derives the intra-block congruence tile count from how far the longest lane
+outweighs an equal share of the pool. The tile gate is no longer "lanes <
+workers": a dominant block is split whenever it alone would decide the
+makespan. The plan is still a pure function of the block dimensions and the
+worker count — no runtime timing feeds it — and `refresh_parallel_plan` still
+only rebuilds it when the pool width changes, so the lane vectors keep their
+addresses.
+
+Arithmetic is untouched: lanes only choose which worker applies a block, and the
+per-block congruence, the column tiles and the publish order are unchanged.
+Evidence for that: the 500-test release suite passes, including the fixtures
+that compare a serial solve against a 64-worker tiled solve element by element,
+and the two new `scaling_dispatch` tests pin the chosen partition against the
+worker-count partition it replaces.
+
+Retention rests on PBS job **213568**
+(`hpc:~/projects/sdpx-lane-dispatch-20260918-pair01`): one EPYC node, `ppn=64`,
+both arms built inside the job from a frozen 692-file source manifest, ABBA order
+in two rounds per width, one fresh Julia process per point, every point
+`taskset`-pinned to the first package's physical cores. Solver seconds, median of
+four points per arm:
+
+| width | baseline | candidate | change | paired rounds |
+|---|---|---|---|---|
+| 1 | 61.121 | 60.798 | -0.53% | -0.5%, -0.4% |
+| 8 | 13.627 | 13.073 | **-4.07%** | -3.4%, -4.5% |
+| 16 | 12.314 | 11.897 | **-3.39%** | -1.4%, -4.6% |
+| 32 | 13.127 | 13.206 | +0.60% | -0.1%, +1.2% |
+| 64 | 14.506 | 14.471 | -0.24% | -0.6%, -0.1% |
+
+At eight workers all four candidate points beat all four baseline points
+(13.01-13.14 s against 13.44-13.78 s). The one-worker cell is code-identical in
+both arms - one lane, one tile - so its -0.53% is the campaign's residual
+ordering offset, and the honest corrected figures are about -3.5% at eight
+workers and -2.9% at sixteen. Both clear the 2% bar; neither the 32- nor the
+64-worker cell moves, because at 22 blocks the lane count is already capped by
+the block count there, so the schedule those cells execute is unchanged.
+
+Arithmetic identity is confirmed end to end, not only in the unit tests: all 40
+points returned `optimal` in 50 iterations on the `condensed_sampled_qdldl`
+route, every external 1e-30 audit was accepted, the two arms' objective strings
+are bit-identical, and the two library hashes differ. Peak RSS was 0.70 GB and
+each eight-worker point took 28 s of wall time including the Julia front end.
+
+What this does not fix is the wide-pool ceiling: 64 workers remain slower than
+16 (14.5 s against 11.9 s). At 22 blocks the outer work simply cannot fill a
+64-worker pool, which is the block-count ceiling already recorded above, not a
+lane-partition defect.
+
+`block_chunks` in `sampled.rs` keeps its own rule (chunk the sampled basis
+multiplies only when the pool is wider than the active block count); the sampled
+operator's outer block loop is already one task per block, so the same
+finer-than-workers argument does not apply without restructuring that path.

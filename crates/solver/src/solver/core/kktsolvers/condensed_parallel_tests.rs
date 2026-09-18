@@ -5,6 +5,11 @@ use sdpx_arithmetic::Bits256;
 fn num<T: FloatT>(n: usize) -> T {
     T::from_usize(n).unwrap()
 }
+fn wide_pool_tiles() -> usize {
+    use std::sync::atomic::Ordering;
+    crate::solver::core::kktsolvers::condensed::POOLED_CONGRUENCE_TILES.load(Ordering::Relaxed)
+}
+
 fn close<T: FloatT>(actual: &[T], expected: &[T]) {
     let tolerance = num::<T>(65536) * T::epsilon() * (T::one() + expected.norm_inf());
     assert!(
@@ -200,6 +205,7 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
             apply_scaling_pool(
                 &serial.pool,
                 &serial.scaling_lanes,
+                serial.scaling_tiles,
                 &mut serial.blocks,
                 &mut ys,
                 &probe,
@@ -208,6 +214,7 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
             apply_scaling_pool(
                 &pooled.pool,
                 &pooled.scaling_lanes,
+                pooled.scaling_tiles,
                 &mut pooled.blocks,
                 &mut yp,
                 &probe,
@@ -215,6 +222,7 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
             );
             assert_eq!(ys, yp);
             assert!(yp.is_finite());
+
             let mut oracle = vec![T::zero(); m];
             let mut scratch = oracle.clone();
             if inverse {
@@ -358,15 +366,106 @@ fn orthant_fma<T: FloatT>() {
         apply_scaling_pool(
             &solver.pool,
             &solver.scaling_lanes,
+            solver.scaling_tiles,
             &mut solver.blocks,
             &mut y,
             &[ai],
             inverse,
         );
         assert_eq!(y, [ai]);
-        apply_scaling_pool::<T>(&solver.pool, &[], &mut [], &mut [], &[], inverse);
+        apply_scaling_pool::<T>(&solver.pool, &[], 1, &mut [], &mut [], &[], inverse);
     }
 }
+
+// The production case this exists for: a pool wider than the block count, where
+// the lane level alone cannot fill it. The fixture's cone sizing deliberately
+// caps its own pool, so this installs an explicit wide pool to reach the tiled
+// branch, then requires the widened schedule to reproduce the serial result
+// exactly and to actually take that branch.
+
+fn wide_pool_splits_congruence_tiles<T: FloatT>() {
+    let kinds = kinds::<T>(false);
+    let mut cones = CompositeCone::new(&kinds);
+    let (p, a, s, z) = data(&cones);
+    let m = a.m;
+    let mut settings = CoreSettings::<T>::default();
+    settings.max_threads = 1;
+    
+    settings.direct_solve_method = "qdldl".into();
+    settings.iterative_refinement_abstol = T::epsilon() * num::<T>(1024);
+    settings.iterative_refinement_reltol = settings.iterative_refinement_abstol;
+    assert!(cones.update_scaling(&s, &z, T::one(), ScalingStrategy::Dual));
+    let mut solver = CondensedKKTSolver::new(&p, &a, &kinds, &cones, &settings);
+    assert!(solver.update(&cones, &settings));
+    let psd_blocks = solver
+        .blocks
+        .iter()
+        .filter(|b| matches!(&b.scaling, Scaling::Psd(_)))
+        .count();
+    let workers = 64;
+    assert!(
+        psd_blocks < workers,
+        "fixture must have fewer PSD blocks than the pool to exercise tiling"
+    );
+    let probe: Vec<T> = (0..m)
+        .map(|i| num::<T>(i % 11 + 1) / num::<T>(32))
+        .collect();
+    let mut serial = vec![vec![T::nan(); m]; 2];
+    let mut wide = serial.clone();
+    for (slot, inverse) in serial.iter_mut().zip([false, true]) {
+        apply_scaling_pool(
+            &None,
+            &solver.scaling_lanes,
+            solver.scaling_tiles,
+            &mut solver.blocks,
+            slot,
+            &probe,
+            inverse,
+        );
+    }
+    solver.pool = Some(Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap(),
+    ));
+    // The plan follows the pool that exists when it is refreshed, so install
+    // the wider pool first and then recompute the dispatch.
+    solver.refresh_parallel_plan();
+    let before = wide_pool_tiles();
+    for (slot, inverse) in wide.iter_mut().zip([false, true]) {
+        apply_scaling_pool(
+            &solver.pool,
+            &solver.scaling_lanes,
+            solver.scaling_tiles,
+            &mut solver.blocks,
+            slot,
+            &probe,
+            inverse,
+        );
+    }
+    assert_eq!(serial, wide);
+    assert!(
+        wide_pool_tiles() > before,
+        "a pool wider than the block count must split congruence GEMMs into column tiles"
+    );
+}
+
+#[test]
+fn wide_pool_splits_congruence_tiles_f64() {
+    wide_pool_splits_congruence_tiles::<f64>();
+}
+
+#[test]
+fn wide_pool_splits_congruence_tiles_mpfr256() {
+    wide_pool_splits_congruence_tiles::<Bits256>();
+}
+
+#[test]
+fn wide_pool_splits_congruence_tiles_mpfr512() {
+    wide_pool_splits_congruence_tiles::<sdpx_arithmetic::Bits512>();
+}
+
 #[test]
 fn pooled_orthant_preserves_fma_f64() {
     orthant_fma::<f64>();
@@ -374,6 +473,64 @@ fn pooled_orthant_preserves_fma_f64() {
 #[test]
 fn pooled_orthant_preserves_fma_mpfr256() {
     orthant_fma::<Bits256>();
+}
+
+#[test]
+fn scaling_dispatch_decouples_lanes_from_workers() {
+    // The 3D Ising reduced system: 22 near-uniform PSD blocks at 512 bits.
+    let dims = [
+        12usize, 12, 13, 12, 14, 13, 15, 14, 16, 15, 16, 15, 16, 15, 16, 15, 16, 15, 16, 15, 16,
+        15,
+    ];
+    let costs: Vec<u128> = dims.iter().map(|d| 4 * (*d as u128).pow(3)).collect();
+    let total: u128 = costs.iter().sum();
+
+    // The chooser may not use more than four lanes per worker, but within that
+    // bound it must never be worse than the worker-count partition it replaces,
+    // and at the widths that matter it uses every block as its own lane.
+    for workers in [2usize, 4, 8, 16] {
+        let (lanes, _) = scaling_dispatch(&costs, workers);
+        assert!(lanes.len() <= costs.len().min(workers * 4), "workers={workers}");
+        assert!(lanes.len() >= workers.min(costs.len()), "workers={workers}");
+        let chosen = lpt_makespan(&lane_loads(&costs, &lanes), workers);
+        let worker_partition = weighted_lanes(&costs, workers);
+        let previous = lpt_makespan(&lane_loads(&costs, &worker_partition), workers);
+        assert!(
+            chosen <= previous,
+            "workers={workers}: chosen={chosen} previous={previous}"
+        );
+        // The whole point of the finer partition: at eight workers the
+        // worker-count schedule loses 1.31x while one lane per block reaches
+        // 1.09x, and no lane may exceed a single block's cost.
+        assert!(chosen <= total / workers as u128 * 5 / 2);
+        if workers >= 8 {
+            assert_eq!(lanes.len(), costs.len(), "workers={workers}");
+        }
+        if workers >= 8 {
+            let loads = lane_loads(&costs, &lanes);
+            assert_eq!(loads.iter().copied().max().unwrap(), 4 * 16u128.pow(3));
+        }
+    }
+}
+
+#[test]
+fn scaling_dispatch_tiles_the_dominant_block() {
+    // A dominant block that outweighs an equal share of the pool must be split
+    // into column tiles even when it already owns a lane, which is the case the
+    // old lane-count gate left unsplit.
+    let costs = [4 * 64u128.pow(3), 4 * 8u128.pow(3), 4 * 8u128.pow(3), 4 * 8u128.pow(3)];
+    let (lanes, tiles) = scaling_dispatch(&costs, 8);
+    assert_eq!(lanes.len(), costs.len());
+    assert!(tiles >= 2, "tiles={tiles}");
+    // Balanced blocks never tile.
+    let balanced = [1000u128, 1000, 1000, 1000];
+    let (_, tiles) = scaling_dispatch(&balanced, 4);
+    assert_eq!(tiles, 1);
+    // A serial plan has a single lane and no tiles.
+    let (lanes, tiles) = scaling_dispatch(&balanced, 1);
+    assert_eq!(lanes, vec![0]);
+    assert_eq!(tiles, 1);
+    assert_eq!(scaling_dispatch(&[], 8), (Vec::new(), 1));
 }
 
 #[test]
@@ -691,3 +848,87 @@ fn cached_orthant_division_256() {
 fn cached_orthant_division_512() {
     cached_orthant_division::<sdpx_arithmetic::Bits512>();
 }
+
+// A20/A21: a batched wave must apply every column to the one shared
+// factorization, must reproduce each single-column solve exactly, must isolate a
+// bad column instead of masking it, and must keep the accounting honest.
+fn solve_many_accounting<T: FloatT>() {
+    use crate::solver::core::kktsolvers::SolveCounters;
+    let kinds = kinds::<T>(false);
+    let mut cones = CompositeCone::new(&kinds);
+    let (p, a, s, z) = data(&cones);
+    let mut settings = CoreSettings::<T>::default();
+    settings.max_threads = 1;
+    settings.iterative_refinement_enable = true;
+    settings.iterative_refinement_abstol = T::epsilon() * num::<T>(1024);
+    settings.iterative_refinement_reltol = settings.iterative_refinement_abstol;
+    assert!(cones.update_scaling(&s, &z, T::one(), ScalingStrategy::Dual));
+    let mut solver = CondensedKKTSolver::new(&p, &a, &kinds, &cones, &settings);
+    assert!(solver.update(&cones, &settings));
+
+    let n = solver.n;
+    let width = a.m + n;
+    let counters = crate::solver::core::kktsolvers::KKTSolver::counters(&solver);
+    assert_eq!(
+        counters,
+        SolveCounters {
+            factorizations: 1,
+            rhs_applied: 0,
+            batches: 0
+        },
+        "one KKT update must produce exactly one factorization"
+    );
+
+    // Three independent right-hand sides.
+    let ncols = 3;
+    let rhs: Vec<T> = (0..ncols * width)
+        .map(|i| num::<T>(i % 13 + 1) / num::<T>(16))
+        .collect();
+    let mut batch = vec![T::zero(); ncols * width];
+    let ok = KKTSolver::solve_many(&mut solver, n, &rhs, &mut batch, ncols, &settings);
+    assert_eq!(ok, vec![true; ncols], "all three columns must solve");
+
+    let after = KKTSolver::counters(&solver);
+    assert_eq!(after.factorizations, 1, "batching must not refactorize");
+    assert_eq!(after.rhs_applied, ncols as u64);
+    assert_eq!(after.batches, 1, "the wave is one batch, not {ncols}");
+
+    // Every column must match the single-RHS path bit for bit.
+    for c in 0..ncols {
+        let base = c * width;
+        let mut single = vec![T::zero(); width];
+        let (xl, zl) = single.split_at_mut(n);
+        KKTSolver::setrhs(&mut solver, &rhs[base..base + n], &rhs[base + n..base + width]);
+        assert!(KKTSolver::solve(&mut solver, Some(xl), Some(zl), &settings));
+        assert_eq!(
+            &single[..],
+            &batch[base..base + width],
+            "column {c} differs between batched and single solve"
+        );
+    }
+
+    // A non-finite column must fail alone, leaving the good columns usable.
+    let mut mixed = rhs.clone();
+    for v in mixed[n..width].iter_mut() {
+        *v = T::nan();
+    }
+    let mut mixed_out = vec![T::zero(); ncols * width];
+    let flags = KKTSolver::solve_many(&mut solver, n, &mixed, &mut mixed_out, ncols, &settings);
+    assert_eq!(flags, vec![false, true, true], "failure must stay local to its column");
+}
+
+#[test]
+fn solve_many_accounting_f64() {
+    solve_many_accounting::<f64>();
+}
+
+#[test]
+fn solve_many_accounting_mpfr256() {
+    solve_many_accounting::<Bits256>();
+}
+
+#[test]
+fn solve_many_accounting_mpfr512() {
+    solve_many_accounting::<sdpx_arithmetic::Bits512>();
+}
+

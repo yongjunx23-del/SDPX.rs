@@ -1,6 +1,6 @@
 [package]
 name = "sdpx-solver"
-version = "0.1.0"
+version = "0.7.0"
 authors = ["Paul Goulart <paul.goulart@eng.ox.ac.uk>"]
 edition = "2021"
 rust-version = "1.85.0"

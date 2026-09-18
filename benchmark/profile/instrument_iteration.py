@@ -44,7 +44,7 @@ EXPECTED_MACRO = '''macro_rules! timeit {
     }
 }'''
 PHASES = [
-    ('diagnostic residual and info', '''            self.residuals.update(&self.variables, &self.data);
+    ('diagnostic residual and info', '''            self.residuals.update_with_pool(&self.variables, &self.data, self.cones.thread_pool());
 
             //calculate duality gap (scaled)
             //--------------
@@ -72,7 +72,11 @@ PHASES = [
                     μ,
                     m
                 );'''),
-    ('diagnostic affine step length', '''                α = self.get_step_length(StepDirection::Affine, scaling);'''),
+    ('diagnostic affine step length', '''                α = if iter > 1 {
+                    self.variables.prepare_affine_step_length(&mut self.step_lhs, &mut self.cones, &self.settings)
+                } else {
+                    self.get_step_length(StepDirection::Affine, scaling)
+                };'''),
     ('diagnostic combined step length', '''            α = self.get_step_length(StepDirection::Combined,scaling);'''),
     ('diagnostic iterate save and add', '''            self.info.save_prev_iterate(&self.variables,&mut self.prev_vars);
 
@@ -132,7 +136,12 @@ def main():
     if output.exists() or output.is_symlink():
         parser.error('output must not already exist')
     output = output.resolve()
-    if not source.is_dir() or output.is_relative_to(source) or source.is_relative_to(output):
+    # `Path.is_relative_to` needs Python 3.9; compute nodes here run 3.6.
+    def within(child, parent):
+        child, parent = str(child), str(parent).rstrip('/')
+        return child == parent or child.startswith(parent + '/')
+
+    if not source.is_dir() or within(output, source) or within(source, output):
         parser.error('source/output must be disjoint directories')
     before = identity(source)
     original = (source / TARGET).read_text()

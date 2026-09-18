@@ -26,7 +26,10 @@ assert len(cpus) == 8
 os.sched_setaffinity(0, set(cpus))
 os.environ.update(OPENBLAS_NUM_THREADS='1', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1',
     JULIA_NUM_GC_THREADS='1', SDPX_LIBRARY=str(B/'source/target/release/libsdpx.so'),
-    SDPX_FROZEN_ROOT=str(B/'source'), SDPX_REFERENCE_AUDIT=str(B/'reference/sdpb1-audit.json'))
+    SDPX_FROZEN_ROOT=str(B/'source'), SDPX_REFERENCE_AUDIT=str(B/'reference/sdpb1-audit.json'),
+    # The README describes the sampled problem; without this the harness silently
+    # falls back to the materialized CSC route and measures a different workload.
+    SDPX_ISING_SAMPLED='1')
 
 
 def write(path, value):

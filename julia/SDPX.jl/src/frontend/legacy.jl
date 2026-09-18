@@ -302,7 +302,7 @@ end
 value(r::LegacyResult)=deepcopy(r.x)
 function solve(problem::Union{SDPProblem,ConicProblem};settings=nothing)
     p=_legacy_compile(problem,settings)
-    raw=_solve_program(p;settings,recompile=bits -> _legacy_build(problem.source,eltype(problem),bits))
+    raw=_solve_program(p;settings)
     return _legacy_result(_legacy_recovery_program(problem,p,raw),raw)
 end
 optimize!(problem::Union{SDPProblem,ConicProblem};kwargs...)=solve(problem;kwargs...)

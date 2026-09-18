@@ -155,7 +155,13 @@ where
                 solver: "cone workers",
                 problem: "failed to create worker pool",
             })?;
-        assert_eq!(cones.numel, data.m);
+        // Report an inconsistent reduction as an input error instead of
+        // panicking: a panic at the ABI boundary poisons the caller's handle.
+        if cones.numel != data.m {
+            return Err(SolverError::BadInputData(
+                "cone dimensions do not match the reduced problem",
+            ));
+        }
         let variables = DefaultVariables::<T>::new(data.n,data.m);
         let mut residuals = DefaultResiduals::<T>::new(data.n,data.m);
 

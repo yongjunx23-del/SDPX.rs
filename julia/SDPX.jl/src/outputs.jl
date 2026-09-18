@@ -23,17 +23,17 @@ For the three raw-field groups (`primal`, `constraint_dual`,
 `objectives::Bool` retains primal/dual objective values.
 `diagnostics::Symbol` is `:none`,
 `:summary`, or `:full` (`:full` keeps the detailed planning/diagnostic
-payload).  `history::Bool` / `trace::Bool` retain iteration history and
-performance-trace payloads respectively.
+payload).
 
 This policy controls what is retained in the returned `Result`; it does not
 change the solver workspace or guarantee a lower peak allocation during the
-solve. Iteration-history availability is route-dependent, so a retained
-history may be empty when the selected core does not publish per-iteration
-records.
+solve.
 
 All fields are validated on construction and normalized by the public
-`normalize_outputs` entry point.
+`normalize_outputs` entry point. `history` and `trace` remain accepted for
+source compatibility with the SDPX.jl-derived API, but requesting them is an
+error: the Rust SDPX core publishes no per-iteration history or performance
+trace across the C ABI, so the fields can never be populated.
 """
 struct Outputs
     primal::Union{Symbol,Vector{VariableRef}}
@@ -148,6 +148,12 @@ function Outputs(
 )
     certificate in (nothing, :none) || throw(ArgumentError(
         "certificate output was removed; use residual/status accessors and external validation",
+    ))
+    history === false || throw(ArgumentError(
+        "iteration history is not published by the Rust SDPX core; use `diagnostics` and the per-solve metrics",
+    ))
+    trace === false || throw(ArgumentError(
+        "performance traces are not published by the Rust SDPX core; use `diagnostics` and `execution_plan`",
     ))
     validated = Outputs(
         primal,

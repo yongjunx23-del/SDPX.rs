@@ -15,6 +15,12 @@ use std::{
     str::FromStr,
 };
 
+mod dyadic;
+pub use dyadic::{DyadicKind, DyadicView};
+mod integer;
+pub use integer::{
+    exact_product, scale_by_power_of_two, ExactInteger, ExactProduct, ProductPlan, TermError,
+};
 mod exact;
 pub use exact::Exact;
 
@@ -170,9 +176,9 @@ const _: () = assert!(gmp::NUMB_BITS == 64 && std::mem::size_of::<gmp::limb_t>()
 
 #[derive(Clone, Copy)]
 pub struct MpFloat<const N: usize> {
-    limbs: [u64; N],
-    kind: i32,
-    exponent: mpfr::exp_t,
+    pub(crate) limbs: [u64; N],
+    pub(crate) kind: i32,
+    pub(crate) exponent: mpfr::exp_t,
 }
 pub type Bits128 = MpFloat<2>;
 pub type Bits256 = MpFloat<4>;
@@ -250,6 +256,16 @@ impl<const N: usize> MpFloat<N> {
         }
         result
     }
+    /// Adopt the value held by a native descriptor at this precision.
+    ///
+    /// Exact: the descriptor already carries `PRECISION_BITS` significant bits.
+    /// Used to return from a one-rounding integer conversion.
+    pub fn from_mpfr_descriptor(desc: &mpfr::mpfr_t) -> Self {
+        Self::output(|r| unsafe {
+            mpfr::set(r, desc, ROUND);
+        })
+    }
+
     /// Accumulate products in iterator order, rounding each FMA at this precision.
     /// The accumulator owns its storage and never aliases an input operand.
     #[inline]

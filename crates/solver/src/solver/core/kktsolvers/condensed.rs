@@ -222,9 +222,11 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     parallel_assembly: bool,
     plan_threads: usize,
     scaling_lanes: Vec<usize>,
+    scaling_tiles: usize,
     inner_schur: bool,
     inner_sampled: Option<usize>,
     sampled: Option<(Arc<SampledOperator<T>>, SampledWorkspace<T>)>,
+    counters: crate::solver::core::kktsolvers::SolveCounters,
 }
 
 impl<T: FloatT> CondensedKKTSolver<T> {
@@ -254,19 +256,100 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let mut retained_types = Vec::new();
         let mut rowmap = vec![usize::MAX; m];
         let mut blocks = Vec::with_capacity(cones.len());
+        // Route every row to its owning eliminated block once, then fill all
+        // block-local index structures from a single pass over A. Scanning A
+        // per block is O(blocks * nnz), which dominates setup on the
+        // many-block shapes this backend exists for (bound-heavy models and
+        // chordal/compact rewrites with hundreds of small cliques).
+        let mut row_psd = vec![u32::MAX; m];
+        let mut row_orthant = vec![u32::MAX; m];
+        let mut psd_starts: Vec<usize> = Vec::new();
+        let mut psd_numels: Vec<usize> = Vec::new();
+        let mut psd_coordinates: Vec<Vec<(usize, usize)>> = Vec::new();
+        let mut psd_columns: Vec<Vec<Column>> = Vec::new();
+        let mut orthant_starts: Vec<usize> = Vec::new();
+        let mut orthant_entries: Vec<Vec<Vec<(usize, usize)>>> = Vec::new();
+        // Pass 1: classify cones and publish row ownership.
         for (ci, (cone, rows)) in cones.iter().zip(&cones.rng_cones).enumerate() {
-            let scaling = match cone {
-                SupportedCone::PSDTriangleCone(c) => Scaling::Psd(PsdBlock::new(c.n, A, rows)),
-                SupportedCone::NonnegativeCone(c) => {
-                    let mut entries = vec![Vec::new(); rows.len()];
-                    for col in 0..n {
-                        for p in A.colptr[col]..A.colptr[col + 1] {
-                            let row = A.rowval[p];
-                            if rows.contains(&row) {
-                                entries[row - rows.start].push((col, p));
-                            }
+            match cone {
+                SupportedCone::PSDTriangleCone(c) => {
+                    let psd = psd_starts.len();
+                    row_psd[rows.clone()].fill(psd as u32);
+                    psd_starts.push(rows.start);
+                    psd_numels.push(rows.len());
+                    let mut coordinates = Vec::with_capacity(rows.len());
+                    for j in 0..c.n {
+                        for i in 0..=j {
+                            coordinates.push((i, j));
                         }
                     }
+                    psd_coordinates.push(coordinates);
+                    psd_columns.push(Vec::new());
+                }
+                SupportedCone::NonnegativeCone(_) => {
+                    let orthant = orthant_starts.len();
+                    row_orthant[rows.clone()].fill(orthant as u32);
+                    orthant_starts.push(rows.start);
+                    orthant_entries.push(vec![Vec::new(); rows.len()]);
+                }
+                _ => {
+                    retained_indices.push(ci);
+                    retained_types.push(types[ci].clone());
+                    for row in rows.clone() {
+                        rowmap[row] = retained_rows.len();
+                        retained_rows.push(row);
+                    }
+                }
+            }
+        }
+        // Pass 2: one scan of A fills every eliminated block's local indices.
+        let mut psd_last_column = vec![usize::MAX; psd_columns.len()];
+        for col in 0..n {
+            for p in A.colptr[col]..A.colptr[col + 1] {
+                let row = A.rowval[p];
+                let psd = row_psd[row];
+                if psd != u32::MAX {
+                    let psd = psd as usize;
+                    if psd_last_column[psd] != col {
+                        psd_columns[psd].push(Column {
+                            index: col,
+                            entries: Vec::new(),
+                            sparse: false,
+                            schur_positions: Vec::new(),
+                        });
+                        psd_last_column[psd] = col;
+                    }
+                    let (i, j) = psd_coordinates[psd][row - psd_starts[psd]];
+                    psd_columns[psd]
+                        .last_mut()
+                        .expect("column pushed above")
+                        .entries
+                        .push(Entry {
+                            position: p,
+                            i,
+                            j,
+                        });
+                    continue;
+                }
+                let orthant = row_orthant[row];
+                if orthant != u32::MAX {
+                    let orthant = orthant as usize;
+                    orthant_entries[orthant][row - orthant_starts[orthant]].push((col, p));
+                }
+            }
+        }
+        // Pass 3: materialize the per-cone scaling structures.
+        let mut psd_taken = psd_columns.into_iter().zip(psd_numels);
+        let mut orthant_taken = orthant_entries.into_iter();
+        for (ci, cone) in cones.iter().enumerate() {
+            let scaling = match cone {
+                SupportedCone::PSDTriangleCone(c) => {
+                    let (columns, numel) =
+                        psd_taken.next().expect("one column set per PSD cone");
+                    Scaling::Psd(PsdBlock::from_columns(c.n, numel, columns))
+                }
+                SupportedCone::NonnegativeCone(c) => {
+                    let entries = orthant_taken.next().expect("one entry set per orthant");
                     Scaling::Orthant {
                         w: c.w.clone(),
                         scaled_row: vec![
@@ -297,16 +380,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     mu: c.data.μ,
                 },
             };
-            if !matches!(scaling, Scaling::Psd(_) | Scaling::Orthant { .. }) {
-                retained_indices.push(ci);
-                retained_types.push(types[ci].clone());
-                for row in rows.clone() {
-                    rowmap[row] = retained_rows.len();
-                    retained_rows.push(row);
-                }
-            }
             blocks.push(Block {
-                rows: rows.clone(),
+                rows: cones.rng_cones[ci].clone(),
                 scaling,
             });
         }
@@ -423,9 +498,11 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             parallel_assembly,
             plan_threads: 0,
             scaling_lanes: Vec::new(),
+            scaling_tiles: 1,
             inner_schur: false,
             inner_sampled: None,
             sampled: None,
+            counters: Default::default(),
         };
         solver.refresh_parallel_plan();
         solver
@@ -445,7 +522,9 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 _ => block.rows.len() as u128,
             })
             .collect();
-        self.scaling_lanes = weighted_lanes(&costs, workers);
+        let (lanes, tiles) = scaling_dispatch(&costs, workers);
+        self.scaling_lanes = lanes;
+        self.scaling_tiles = tiles;
         let active_psd = self
             .blocks
             .iter()
@@ -627,6 +706,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         apply_scaling_pool(
             &self.pool,
             &self.scaling_lanes,
+            self.scaling_tiles,
             &mut self.blocks,
             &mut self.workz,
             bz,
@@ -675,6 +755,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         apply_scaling_pool(
             &self.pool,
             &self.scaling_lanes,
+            self.scaling_tiles,
             &mut self.blocks,
             z,
             &self.workz,
@@ -703,6 +784,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             workh,
             blocks,
             scaling_lanes,
+            scaling_tiles,
             ..
         } = self;
         let mut products = || {
@@ -728,7 +810,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             }
         };
         let mut scaling = || {
-            apply_scaling_pool(pool, scaling_lanes, blocks, workh, z, false);
+            apply_scaling_pool(pool, scaling_lanes, *scaling_tiles, blocks, workh, z, false);
         };
         if let Some(pool) = pool.as_ref().filter(|_| scaling_lanes.len() > 1) {
             pool.install(|| rayon::join(products, scaling));
@@ -914,6 +996,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             return false;
         }
         self.reduced.update_P(&self.schur);
+        self.counters.factorizations += 1;
         let retained = &self.retained_indices;
         self.reduced.update_from_cones(
             cones
@@ -930,6 +1013,26 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         self.b[self.n..].copy_from_slice(z);
     }
 
+    fn counters(&self) -> crate::solver::core::kktsolvers::SolveCounters {
+        self.counters
+    }
+
+    /// One wave carrying `ncols` columns. The default column loop applies every
+    /// column to the same factorization, so this adds only the wave accounting
+    /// that distinguishes "three RHS in two waves" from "three waves".
+    fn solve_many(
+        &mut self,
+        n: usize,
+        rhs: &[T],
+        out: &mut [T],
+        ncols: usize,
+        settings: &CoreSettings<T>,
+    ) -> Vec<bool> {
+        assert_eq!(n, self.n, "solve_many x-width must match the condensed system");
+        self.counters.batches += 1;
+        crate::solver::core::kktsolvers::solve_many_by_columns(self, n, rhs, out, ncols, settings)
+    }
+
     fn solve(
         &mut self,
         lhsx: Option<&mut [T]>,
@@ -939,6 +1042,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         // Move reusable buffers to keep operator scratch and refinement storage
         // disjoint. Sampled operator caches initialize on their first pooled use;
         // subsequent calls reuse them without precision conversion.
+        self.counters.rhs_applied += 1;
         let b = std::mem::take(&mut self.b);
         let mut x = std::mem::take(&mut self.x);
         let mut error = std::mem::take(&mut self.error);
@@ -1023,7 +1127,62 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
     }
 }
 
+// One block of the PSD congruence through the shared pool. `gemm.1` is the
+// desired number of column tiles; MPFR splits the output into disjoint tiles so
+// every entry keeps its scalar accumulation order and results are unchanged.
+// A single block cannot fill a wide pool on its own, so the outer lane level and
+// this inner level share one pool instead of leaving most workers idle.
+// Test-only proof that the tiled branch below actually runs: the equivalence
+// assertions are worthless if the wide-pool path is silently skipped.
+#[cfg(test)]
+pub(crate) static POOLED_CONGRUENCE_TILES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn pooled_gemm<T: FloatT, MATA, MATB>(
+    c: &mut Matrix<T>,
+    a: &MATA,
+    b: &MATB,
+    gemm: Option<(&rayon::ThreadPool, usize)>,
+) where
+    MATA: DenseMatrix<T>,
+    MATB: DenseMatrix<T>,
+{
+    let (m, n, k) = (a.nrows(), b.ncols(), a.ncols());
+    if let Some((pool, tiles)) = gemm.filter(|(p, t)| *t > 1 && p.current_num_threads() > 1) {
+        if n > 1 {
+            #[cfg(test)]
+            POOLED_CONGRUENCE_TILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tile = n.div_ceil(tiles.min(n));
+            let (ta, tb) = (a.shape().as_blas_char(), b.shape().as_blas_char());
+            let lda = if a.shape() == MatrixShape::N { m } else { k };
+            let ldb = if b.shape() == MatrixShape::N { k } else { n };
+            T::xgemm_pool(
+                ta,
+                tb,
+                i32::try_from(m).unwrap(),
+                i32::try_from(n).unwrap(),
+                i32::try_from(k).unwrap(),
+                T::one(),
+                a.data(),
+                i32::try_from(lda).unwrap(),
+                b.data(),
+                i32::try_from(ldb).unwrap(),
+                T::zero(),
+                c.data_mut(),
+                i32::try_from(m).unwrap(),
+                pool,
+                tile,
+            );
+            return;
+        }
+    }
+    c.mul(a, b, T::one(), T::zero());
+}
+
 impl<T: FloatT> PsdBlock<T> {
+    /// Single-block constructor used by tests. The solver routes one shared
+    /// pass over A through `from_columns` instead.
+    #[cfg(test)]
     fn new(n: usize, A: &CscMatrix<T>, rows: &Range<usize>) -> Self {
         let mut coordinates = Vec::with_capacity(rows.len());
         for j in 0..n {
@@ -1050,6 +1209,13 @@ impl<T: FloatT> PsdBlock<T> {
                 });
             }
         }
+        Self::from_columns(n, rows.len(), columns)
+    }
+
+    /// Build from pre-collected columns in increasing column order: exactly the
+    /// non-empty columns of this block's rows, each entry in CSC position
+    /// order. The shared A scan in `CondensedKKTSolver::new` produces this.
+    fn from_columns(n: usize, rows_len: usize, mut columns: Vec<Column>) -> Self {
         // Only the local assembly order changes; indices and CSC destinations
         // stay in the original coordinates. Sparse left coefficients occur in
         // more triangular dot products, reducing total dot work (MOSEK ISMP 2012).
@@ -1092,7 +1258,7 @@ impl<T: FloatT> PsdBlock<T> {
         // Cache its first local use, including stored zeros and sparse columns.
         let mut dense_row_first = Vec::new();
         if T::precision_bits() <= 53 {
-            dense_row_first.resize(rows.len(), columns.len());
+            dense_row_first.resize(rows_len, columns.len());
             for (ci, column) in columns.iter().enumerate() {
                 for e in &column.entries {
                     let pos = triangular_number(e.j) + e.i;
@@ -1134,7 +1300,7 @@ impl<T: FloatT> PsdBlock<T> {
             mat3: Matrix::zeros((n, n)),
             mat2c: Matrix::zeros((64 * n, n)),
             mat3c: Matrix::zeros((64 * n, n)),
-            vector: vec![T::zero(); rows.len()],
+            vector: vec![T::zero(); rows_len],
             columns,
             schur_values: Vec::new(),
             sampled: None,
@@ -1541,26 +1707,30 @@ impl<T: FloatT> PsdBlock<T> {
         }
     }
 
-    fn apply(&mut self, y: &mut [T], x: &[T], inverse: bool) {
+    fn apply(
+        &mut self,
+        y: &mut [T],
+        x: &[T],
+        inverse: bool,
+        gemm: Option<(&rayon::ThreadPool, usize)>,
+    ) {
         svec_to_mat(&mut self.mat1, x);
         if inverse {
             // H^-1 = W^-1 W^-T; retain the inverse factors in solve-time
             // applications rather than squaring them into Ginv.
-            self.mat2
-                .mul(&self.mat1, &self.Rinv.t(), T::one(), T::zero());
-            self.mat3.mul(&self.Rinv, &self.mat2, T::one(), T::zero());
+            pooled_gemm(&mut self.mat2, &self.mat1, &self.Rinv.t(), gemm);
+            pooled_gemm(&mut self.mat3, &self.Rinv, &self.mat2, gemm);
             mat_to_svec(&mut self.vector, &self.mat3);
             svec_to_mat(&mut self.mat1, &self.vector);
-            self.mat2
-                .mul(&self.Rinv.t(), &self.mat1, T::one(), T::zero());
-            self.mat3.mul(&self.mat2, &self.Rinv, T::one(), T::zero());
+            pooled_gemm(&mut self.mat2, &self.Rinv.t(), &self.mat1, gemm);
+            pooled_gemm(&mut self.mat3, &self.mat2, &self.Rinv, gemm);
         } else {
-            self.mat2.mul(&self.R.t(), &self.mat1, T::one(), T::zero());
-            self.mat3.mul(&self.mat2, &self.R, T::one(), T::zero());
+            pooled_gemm(&mut self.mat2, &self.R.t(), &self.mat1, gemm);
+            pooled_gemm(&mut self.mat3, &self.mat2, &self.R, gemm);
             mat_to_svec(&mut self.vector, &self.mat3);
             svec_to_mat(&mut self.mat1, &self.vector);
-            self.mat2.mul(&self.mat1, &self.R.t(), T::one(), T::zero());
-            self.mat3.mul(&self.R, &self.mat2, T::one(), T::zero());
+            pooled_gemm(&mut self.mat2, &self.mat1, &self.R.t(), gemm);
+            pooled_gemm(&mut self.mat3, &self.R, &self.mat2, gemm);
         }
         mat_to_svec(y, &self.mat3);
     }
@@ -1616,14 +1786,20 @@ fn psd_entry<T: FloatT>(G: &Matrix<T>, a: Entry, b: Entry, sqrt2: T) -> T {
     }
 }
 
-fn apply_scaling<T: FloatT>(blocks: &mut [Block<T>], y: &mut [T], x: &[T], inverse: bool) {
+fn apply_scaling<T: FloatT>(
+    blocks: &mut [Block<T>],
+    y: &mut [T],
+    x: &[T],
+    inverse: bool,
+    gemm: Option<(&rayon::ThreadPool, usize)>,
+) {
     y.fill(T::zero());
     let offset = blocks.first().map_or(0, |b| b.rows.start);
     for block in blocks {
         let rows = block.rows.start - offset..block.rows.end - offset;
         let (y, x) = (&mut y[rows.clone()], &x[rows]);
         match &mut block.scaling {
-            Scaling::Psd(p) => p.apply(y, x, inverse),
+            Scaling::Psd(p) => p.apply(y, x, inverse, gemm),
             Scaling::Orthant { w, .. } => {
                 for ((y, &x), &w) in y.iter_mut().zip(x).zip(w.iter()) {
                     *y = if inverse { (x / w) / w } else { w * (w * x) };
@@ -1678,9 +1854,78 @@ fn apply_scaling<T: FloatT>(blocks: &mut [Block<T>], y: &mut [T], x: &[T], inver
     }
 }
 
+/// Choose the dispatch granularity of the lane-parallel block phases.
+///
+/// Lanes are dispatch units, not workers. `split_scaling` walks them as a
+/// `rayon::join` tree whose leaves are work-stolen, so a finer partition lets a
+/// wide pool approach the LPT bound of the same cost array: on a 22-block
+/// uniform input the worker-count partition leaves a 1.31x lane imbalance at
+/// eight workers, while one lane per block reaches 1.09x. Candidate lane counts
+/// are scored by the LPT makespan of their contiguous cost partition, and the
+/// winner decides whether the longest block also needs intra-block column
+/// tiling so that the remaining workers can share it.
+///
+/// This is a structural cost model, not a runtime measurement: the plan stays a
+/// function of the matrix sizes and the worker count alone.
+fn scaling_dispatch(costs: &[u128], workers: usize) -> (Vec<usize>, usize) {
+    let workers = workers.max(1);
+    if costs.is_empty() || workers == 1 {
+        return (weighted_lanes(costs, 1), 1);
+    }
+    let fineness_cap = workers.saturating_mul(4).min(costs.len());
+    let mut best = (u128::MAX, 1usize);
+    for target in [workers, workers * 2, workers * 4, costs.len()] {
+        let target = target.clamp(1, fineness_cap);
+        let lanes = weighted_lanes(costs, target);
+        let makespan = lpt_makespan(&lane_loads(costs, &lanes), workers);
+        if makespan < best.0 || (makespan == best.0 && target < best.1) {
+            best = (makespan, target);
+        }
+    }
+    let lanes = weighted_lanes(costs, best.1);
+    let loads = lane_loads(costs, &lanes);
+    let total: u128 = costs.iter().sum();
+    // One task would decide the makespan whenever the longest lane outweighs an
+    // equal share of the pool; split its congruence GEMM into that many column
+    // tiles. Lanes already shorter than a share keep tiles == 1.
+    let share = (total / workers as u128).max(1);
+    let tiles = loads
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .div_ceil(share)
+        .clamp(1, 16) as usize;
+    (lanes, tiles)
+}
+
+fn lane_loads(costs: &[u128], lanes: &[usize]) -> Vec<u128> {
+    let mut loads = Vec::with_capacity(lanes.len());
+    for (i, &begin) in lanes.iter().enumerate() {
+        let end = lanes.get(i + 1).copied().unwrap_or(costs.len());
+        loads.push(costs[begin..end].iter().sum());
+    }
+    loads
+}
+
+/// Longest-processing-time makespan of `loads` on `workers` identical workers.
+fn lpt_makespan(loads: &[u128], workers: usize) -> u128 {
+    let mut busy = vec![0u128; workers.max(1)];
+    let mut order: Vec<u128> = loads.to_vec();
+    order.sort_unstable_by(|a, b| b.cmp(a));
+    for load in order {
+        let (_, slot) = busy
+            .iter_mut()
+            .enumerate()
+            .min_by_key(|(_, busy)| **busy)
+            .expect("nonempty worker list");
+        *slot += load;
+    }
+    busy.into_iter().max().unwrap_or(0)
+}
+
 // Cached contiguous partitions use structural work, never runtime timings.
-fn weighted_lanes(costs: &[u128], workers: usize) -> Vec<usize> {
-    if costs.is_empty() {
+fn weighted_lanes(costs: &[u128], workers: usize) -> Vec<usize> {    if costs.is_empty() {
         return Vec::new();
     }
     let workers = workers.max(1).min(costs.len());
@@ -1717,18 +1962,28 @@ fn weighted_lanes(costs: &[u128], workers: usize) -> Vec<usize> {
 fn apply_scaling_pool<T: FloatT>(
     pool: &Option<Arc<rayon::ThreadPool>>,
     lanes: &[usize],
+    tiles: usize,
     blocks: &mut [Block<T>],
     y: &mut [T],
     x: &[T],
     inverse: bool,
 ) {
+    // A pool wider than the lane count cannot be filled by the lane level
+    // alone: one congruence GEMM per block is a single task. `tiles` is derived
+    // from the cost model in `scaling_dispatch`, so a dominant block is split
+    // into disjoint column tiles even when the lane count already covers every
+    // worker. Tiles stay 1 whenever no lane outweighs an equal share of the
+    // pool, so narrow pools and balanced inputs keep the previous schedule.
+    let gemm = pool
+        .as_ref()
+        .map(|pool| (pool.as_ref(), tiles.max(1)));
     if let Some(pool) = pool {
         if lanes.len() > 1 {
-            pool.install(|| split_scaling(blocks, y, x, inverse, lanes));
+            pool.install(|| split_scaling(blocks, y, x, inverse, lanes, gemm));
             return;
         }
     }
-    apply_scaling(blocks, y, x, inverse);
+    apply_scaling(blocks, y, x, inverse, gemm);
 }
 
 fn split_scaling<T: FloatT>(
@@ -1737,9 +1992,10 @@ fn split_scaling<T: FloatT>(
     x: &[T],
     inverse: bool,
     lanes: &[usize],
+    gemm: Option<(&rayon::ThreadPool, usize)>,
 ) {
     if lanes.len() <= 1 {
-        apply_scaling(blocks, y, x, inverse);
+        apply_scaling(blocks, y, x, inverse, gemm);
         return;
     }
     let mid = lanes.len() / 2;
@@ -1749,8 +2005,8 @@ fn split_scaling<T: FloatT>(
     let (yl, yr) = y.split_at_mut(row);
     let (xl, xr) = x.split_at(row);
     rayon::join(
-        || split_scaling(left, yl, xl, inverse, &lanes[..mid]),
-        || split_scaling(right, yr, xr, inverse, &lanes[mid..]),
+        || split_scaling(left, yl, xl, inverse, &lanes[..mid], gemm),
+        || split_scaling(right, yr, xr, inverse, &lanes[mid..], gemm),
     );
 }
 
@@ -2558,7 +2814,7 @@ mod graded_action_tests {
                 .syrk(&p.Rinv.t(), T::one(), T::zero(), MatrixTriangle::Triu);
             p.Ginv[(1, 0)] = p.Ginv[(0, 1)];
             let mut actual = vec![T::zero(); 3];
-            p.apply(&mut actual, &x, inverse);
+            p.apply(&mut actual, &x, inverse, None);
             let relative = (actual[2] - expected).abs() / expected;
             let pass = relative <= T::epsilon() * T::from_usize(128).unwrap();
             println!(

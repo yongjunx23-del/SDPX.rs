@@ -46,7 +46,11 @@ function Settings(::Type{T}=Float64; precision_bits=precision(T), limits=Limits(
         equilibration=:ruiz, presolve_enable=true, chordal_decomposition_enable=true,
         kkt_form=:auto, working_precision_policy=:fixed, provider=:auto, kwargs...) where T<:AbstractFloat
     _check_precision(T,precision_bits)
-    working_precision_policy in (:fixed,:auto) || throw(ArgumentError("precision policy must be :fixed or :auto"))
+    # The Rust core is fixed-precision by contract: one predictor/corrector engine
+    # per handle and no precision ladder. Accepting `:auto` and then ignoring it
+    # would let a caller believe a mixed-precision policy is in force.
+    working_precision_policy===:fixed || throw(ArgumentError(
+        "only working_precision_policy=:fixed is supported; the Rust SDPX core keeps one fixed precision per handle"))
     provider===:auto || throw(ArgumentError("backend selection belongs to the Rust SDPX engine"))
     tolerances isa Tolerances{T} || throw(ArgumentError("tolerance arithmetic must match settings"))
     tolerances.primal !== nothing && tolerances.dual !== nothing && tolerances.primal != tolerances.dual &&

@@ -89,6 +89,11 @@ cargo test --locked --release --workspace --features sdpx-ffi/sdp-accelerate,sdp
 julia --project=julia/SDPX.jl julia/SDPX.jl/test/runtests.jl
 ```
 
+Measured counts on the reviewed tree: 498 Rust tests pass across all workspace
+targets (321 solver-library unit tests and 4 doc-tests included in that total),
+and the Julia suite reports 673 of 673. Quote these with the command above, not
+as a fixed project property.
+
 ## Performance status
 
 Performance parity is not established. On the retained Float64 conic10/holdout
@@ -103,7 +108,8 @@ The medium dense SDP development case now has a 3.15 s native median versus
 one thread, unchanged 1e-6 tolerances and external gates). A bounded quadratic
 curve search reuses the existing predictor/corrector directions without extra
 KKT solves, building on compact Schur assembly and exact coefficient reuse.
-Five independent LP/SOCP/SDP cases and 344 Rust checks pass. At 1e-8 tolerances,
+Five independent LP/SOCP/SDP cases and the 344 Rust checks of that round pass;
+[Verification](#verification) records the current count and its command. At 1e-8 tolerances,
 both baseline and candidate return AlmostOptimal on medium, so that accuracy
 remains unqualified. Retained MOSEK is 1.89 s / 16 iterations; broad parity
 is not established. Current optimization is single-core; the curve is enabled
@@ -114,12 +120,25 @@ The unified paths preserve the 512-bit Ising solution, but do not show a new
 Ising speedup. Enabling the curve at high precision was slower and was rejected.
 See [current priorities and evidence](PERFORMANCE_PLAN.md).
 
-A matched historical Ising512 cluster campaign (source `a52c22f3366d`,
-job `212627.node220`, node7) measured SDPX/SDPB native medians of
-135/127, 74.17/69, 42.46/36 and 30.24/25 seconds at 1/2/4/8 cores.
-All 28 points passed the fixed 512-bit, external 1e-30 protocol.
-Later small-case changes do not qualify the larger Lambda11 case, which still
-failed its sampled dual-consistency gate. No large-SDP superiority is claimed.
+On the local 3D Ising Lambda=11 sampled case (512-bit, 322 variables, 2558 rows,
+50 iterations, every returned point audited externally at 1e-30), native-solve
+medians are 58.6 s / 33.4 s / 19.6 s / 13.0 s at 1/2/4/8 cone workers, i.e.
+1.00x / 1.76x / 2.99x / 4.52x. Measured phase shares at eight workers are 41%
+KKT solves, 26% KKT update (of which the reduced MPFR factorization is a
+thread-independent 3.0 s), 15% cone scaling and 11% step lengths. The reduced
+Schur factorization and its triangular solves do not scale (1.0x and 1.8x at
+eight workers) and account for about 42% of that solve, so they are the current
+scaling barrier and the first target for any further parallel work; see the
+review round in [the performance plan](PERFORMANCE_PLAN.md).
+
+No SDPX-versus-SDPB speed claim is made here. Earlier campaigns ran on other
+sources, hosts and core counts than the current tree, so their seconds are not
+comparable and must not be quoted as current evidence. Scaling is re-measured on
+one node at a fixed core set before any such claim is restated; the receipts live
+in `PERFORMANCE_PLAN.md` under an explicit campaign identity.
+
+The larger Lambda11 case still fails its sampled dual-consistency gate, and no
+large-SDP superiority is claimed.
 
 ## Julia API details
 

@@ -284,7 +284,7 @@ function _solve_prepared_program!(h::PreparedCore{T},p;settings=nothing) where T
         _copy_result(h)
     end
 end
-function _solve_program(p;settings=nothing,recompile=nothing)
+function _solve_program(p;settings=nothing)
     h=_prepare_program(p;settings,reusable=false)
     try
         lock(h.lock) do

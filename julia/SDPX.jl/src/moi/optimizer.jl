@@ -152,7 +152,10 @@ MOI.get(o::Optimizer, ::MOI.ResultCount) = o.result === nothing ? 0 : 1
 MOI.get(o::Optimizer, ::MOI.RawStatusString) = o.result === nothing ? "NotStarted" : string(o.result.status)
 
 MOI.get(o::Optimizer, ::MOI.SolverName) = "SDPX"
-MOI.get(o::Optimizer, ::MOI.SolverVersion) = "0.6.1"
+# Report the package's own version rather than a frozen literal, so the MOI
+# attribute cannot drift from Project.toml.
+const _SDPX_VERSION = string(something(pkgversion(@__MODULE__), v"0.0.0"))
+MOI.get(o::Optimizer, ::MOI.SolverVersion) = _SDPX_VERSION
 
 MOI.get(o::Optimizer, ::MOI.NumberOfVariables) =
     MOI.get(o.model, MOI.NumberOfVariables())

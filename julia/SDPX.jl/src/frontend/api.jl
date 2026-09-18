@@ -3,7 +3,7 @@ function optimize!(model::Model{T}; settings=nothing, outputs::Union{Nothing,Out
     p=_frontend_compile(model,settings)
     outputs=_frontend_outputs(settings,outputs)
     _frontend_validate_outputs(_frontend_layout(p),outputs)
-    raw=_solve_program(p;settings=settings,recompile=bits -> compile_model(model,T,bits))
+    raw=_solve_program(p;settings=settings)
     recovery=_frontend_recovery_program(model,p,raw)
     return recover_result(recovery,raw;outputs=outputs)
 end

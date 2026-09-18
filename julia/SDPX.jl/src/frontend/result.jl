@@ -46,7 +46,10 @@ function _frontend_retain(values::Vector{T}, spec, layout, bits) where {T}
     spec === :none && return nothing
     mask=falses(length(values))
     spec === :all ? fill!(mask,true) : foreach(ref -> mask[_frontend_index(layout,ref)]=true,spec)
-    # Unselected values are discarded, including their mutable MPFR limbs.
+    # Unselected positions are *zeroed*, not dropped: the retained vector keeps
+    # one entry per solved coordinate so that reference indexing stays total,
+    # and `mask` is what makes an unselected access an error. Peak memory is
+    # therefore unchanged by the policy.
     data=[owned_arithmetic_copy(T,mask[i] ? values[i] : 0;precision_bits=bits) for i in eachindex(values)]
     return FrontendData(data,mask)
 end

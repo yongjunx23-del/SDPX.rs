@@ -145,11 +145,18 @@ impl<T: FloatT> SampledOperator<T> {
         if ranges.windows(2).any(|w| w[0].end > w[1].start) {
             return Err("overlapping sampled PSD rows".into());
         }
+        // Publish sampled-row membership once. Probing the block ranges per
+        // stored entry instead is O(nnz * blocks), which is quadratic on the
+        // many-block factorizations this route exists for.
+        let mut sampled_row = vec![false; linear.m];
+        for range in &ranges {
+            sampled_row[range.clone()].fill(true);
+        }
         if linear
             .rowval
             .iter()
             .zip(&linear.nzval)
-            .any(|(&r, &v)| v != T::zero() && ranges.iter().any(|b| b.contains(&r)))
+            .any(|(&r, &v)| v != T::zero() && sampled_row[r])
         {
             return Err("linear CSC must be zero on sampled PSD rows".into());
         }
@@ -164,7 +171,7 @@ impl<T: FloatT> SampledOperator<T> {
             linear.colptr[col] = write;
             for idx in start..end {
                 let row = linear.rowval[idx];
-                if !ranges.iter().any(|r| r.contains(&row)) {
+                if !sampled_row[row] {
                     linear.rowval[write] = row;
                     linear.nzval[write] = linear.nzval[idx];
                     write += 1;

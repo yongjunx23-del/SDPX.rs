@@ -72,27 +72,27 @@ pub struct DefaultSettings<T: FloatT> {
     // we are checking that we are this far into the interior of
     // an inequality when checking.   Smaller for this value means
     // "less margin required"
-    #[builder(default = "accuracy_default::<T>(5e-5)")]
+    #[builder(default = "reduced_accuracy_default::<T>(5e-5)")]
     pub reduced_tol_gap_abs: T,
 
     ///reduced relative duality gap tolerance
-    #[builder(default = "accuracy_default::<T>(5e-5)")]
+    #[builder(default = "reduced_accuracy_default::<T>(5e-5)")]
     pub reduced_tol_gap_rel: T,
 
     ///reduced feasibility check tolerance (primal and dual)
-    #[builder(default = "accuracy_default::<T>(1e-4)")]
+    #[builder(default = "reduced_accuracy_default::<T>(1e-4)")]
     pub reduced_tol_feas: T,
 
     ///reduced absolute infeasibility tolerance (primal and dual)
-    #[builder(default = "accuracy_default::<T>(5e-12)")]
+    #[builder(default = "reduced_margin_default::<T>(5e-12)")]
     pub reduced_tol_infeas_abs: T,
 
     ///reduced relative infeasibility tolerance (primal and dual)
-    #[builder(default = "accuracy_default::<T>(5e-5)")]
+    #[builder(default = "reduced_accuracy_default::<T>(5e-5)")]
     pub reduced_tol_infeas_rel: T,
 
     ///reduced κ/τ tolerance
-    #[builder(default = "accuracy_default::<T>(1e-4)")]
+    #[builder(default = "reduced_accuracy_default::<T>(1e-4)")]
     pub reduced_tol_ktratio: T,
 
     ///enable data equilibration pre-scaling
@@ -252,7 +252,9 @@ pub struct DefaultSettings<T: FloatT> {
 }
 
 // Same precision policy as SDPX.jl/src/settings.jl. Primitive defaults retain
-// the upstream values; MPFR defaults use the scalar's own epsilon.
+// the upstream values; MPFR defaults use the scalar's own epsilon, with the
+// reduced family kept strictly looser than the strict one (see
+// `reduced_accuracy_default` and `reduced_margin_default`).
 fn is_primitive<T: FloatT>() -> bool {
     use std::any::TypeId;
     TypeId::of::<T>() == TypeId::of::<f64>() || TypeId::of::<T>() == TypeId::of::<f32>()
@@ -262,6 +264,36 @@ fn accuracy_default<T: FloatT>(primitive: f64) -> T {
         primitive.as_T()
     } else {
         T::epsilon().sqrt()
+    }
+}
+/// Reduced ("almost") counterpart of [`accuracy_default`].
+///
+/// Primitive types keep upstream Clarabel's reduced values. MPFR cannot reuse
+/// `accuracy_default` here: it returns `sqrt(eps)` for *every* non-primitive
+/// type, so a reduced tolerance built from it is bit-identical to the strict
+/// one and `check_convergence_almost` can never admit a point that the strict
+/// gate already rejected, leaving the almost-statuses unreachable above 53
+/// bits. `eps^(1/4)` is exactly one half-order looser than the strict
+/// `eps^(1/2)`, and still far tighter than any binary64 tolerance.
+fn reduced_accuracy_default<T: FloatT>(primitive: f64) -> T {
+    if is_primitive::<T>() {
+        primitive.as_T()
+    } else {
+        T::epsilon().sqrt().sqrt()
+    }
+}
+/// Reduced infeasibility *margin* default.
+///
+/// The infeasibility trigger keeps upstream's direction: a relaxed margin is
+/// *smaller* than the strict one (`5e-12 < 1e-8` in binary64), because the test
+/// asks how far inside the interior the iterate is. MPFR therefore uses
+/// `eps^(3/4)`, one half-order below the strict `eps^(1/2)`.
+fn reduced_margin_default<T: FloatT>(primitive: f64) -> T {
+    if is_primitive::<T>() {
+        primitive.as_T()
+    } else {
+        let root = T::epsilon().sqrt();
+        root * root.sqrt()
     }
 }
 fn linear_default<T: FloatT>(primitive: f64) -> T {
@@ -532,4 +564,44 @@ fn test_settings_validate() {
         ..DefaultSettings::default()
     };
     assert!(newsettings.validate_as_update(&oldsettings).is_ok());
+}
+
+/// The reduced ("almost") gates must be *ordered* against the strict ones at
+/// every precision. A reduced value that equals its strict counterpart makes
+/// `check_convergence_almost` unreachable, which is how the MPFR defaults
+/// silently lost the almost-statuses before `reduced_accuracy_default` existed.
+#[test]
+fn reduced_tolerances_stay_distinct_from_full_accuracy_tolerances() {
+    fn check<T: FloatT>() {
+        let s = DefaultSettings::<T>::default();
+        let bits = T::precision_bits();
+        assert!(s.reduced_tol_gap_abs > s.tol_gap_abs, "gap_abs@{bits}");
+        assert!(s.reduced_tol_gap_rel > s.tol_gap_rel, "gap_rel@{bits}");
+        assert!(s.reduced_tol_feas > s.tol_feas, "feas@{bits}");
+        assert!(
+            s.reduced_tol_infeas_rel > s.tol_infeas_rel,
+            "infeas_rel@{bits}"
+        );
+        assert!(s.reduced_tol_ktratio > s.tol_ktratio, "ktratio@{bits}");
+        // A relaxed infeasibility margin is *smaller*: the test asks how far
+        // inside the interior the iterate is.
+        assert!(
+            s.reduced_tol_infeas_abs < s.tol_infeas_abs,
+            "infeas_abs@{bits}"
+        );
+        // Operands must stay strictly positive in the working arithmetic.
+        for value in [
+            s.reduced_tol_gap_abs,
+            s.reduced_tol_gap_rel,
+            s.reduced_tol_feas,
+            s.reduced_tol_infeas_abs,
+            s.reduced_tol_infeas_rel,
+            s.reduced_tol_ktratio,
+        ] {
+            assert!(value > T::zero() && value.is_finite());
+        }
+    }
+    check::<f64>();
+    check::<sdpx_arithmetic::Bits256>();
+    check::<sdpx_arithmetic::Bits512>();
 }
