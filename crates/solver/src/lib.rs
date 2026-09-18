@@ -10,6 +10,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod algebra;
 pub mod io;
+pub(crate) mod mpi;
 pub mod qdldl;
 pub mod solver;
 pub mod timers;

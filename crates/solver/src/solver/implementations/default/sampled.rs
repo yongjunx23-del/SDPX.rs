@@ -72,6 +72,35 @@ impl<T> SampledBlock<T> {
     }
 }
 
+/// Block-concatenated term offsets, len `blocks.len() + 1` with a trailing
+/// total. Deterministic on every rank since it depends only on structure.
+pub(crate) fn term_offsets<T>(
+    blocks: &[SampledBlock<T>],
+    count: impl Fn(&SampledBlock<T>) -> usize,
+) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(blocks.len() + 1);
+    offsets.push(0);
+    for b in blocks {
+        offsets.push(offsets.last().unwrap() + count(b));
+    }
+    offsets
+}
+
+/// `(min row_start, max row_end)` over a block slice; `(0, 0)` when empty.
+/// PSD row ranges are disjoint by operator construction.
+pub(crate) fn block_row_span<T>(blocks: &[SampledBlock<T>]) -> (usize, usize) {
+    let mut span = (usize::MAX, 0usize);
+    for b in blocks {
+        span.0 = span.0.min(b.row_start);
+        span.1 = span.1.max(b.row_start + b.row_count());
+    }
+    if span.0 > span.1 {
+        (0, 0)
+    } else {
+        span
+    }
+}
+
 /// Conic coefficient operator combining ordinary CSC entries and sampled factors.
 #[derive(Clone, Debug)]
 pub struct SampledOperator<T> {
@@ -311,16 +340,54 @@ impl<T: FloatT> SampledOperator<T> {
         work.linear_product(self, false, y, x, alpha, beta, pool);
         if self.ordered_rows {
             let chunks = block_chunks(&self.blocks, pool);
+            if let Some(world) = crate::mpi::World::get() {
+                // Rank-sharded forward pass. Each rank evaluates a contiguous
+                // block range on its own row segment; gathered segments
+                // reproduce the serial result bitwise.
+                let block_range = world.range(self.blocks.len());
+                let (row_begin, row_end) = block_row_span(&self.blocks[block_range.clone()]);
+                let gather_ranges: Vec<(usize, usize)> =
+                    crate::mpi::ranges(self.blocks.len(), world.size())
+                        .iter()
+                        .map(|&(b0, len)| {
+                            if len == 0 {
+                                (0, 0)
+                            } else {
+                                let (begin, end) =
+                                    block_row_span(&self.blocks[b0..b0 + len]);
+                                (begin, end - begin)
+                            }
+                        })
+                        .collect();
+                let mut local = y[row_begin..row_end].to_vec();
+                pool.unwrap().install(|| {
+                    forward_disjoint(
+                        &self.blocks[block_range.clone()],
+                        &mut work.blocks[block_range],
+                        &mut local,
+                        row_begin,
+                        x,
+                        alpha,
+                        chunks,
+                    );
+                });
+                world.gather_slice(crate::mpi::SITE_FORWARD, &local, &gather_ranges, y);
+                return;
+            }
             pool.unwrap().install(|| {
                 forward_disjoint(&self.blocks, &mut work.blocks, y, 0, x, alpha, chunks);
             });
             return;
         }
         let chunks = block_chunks(&self.blocks, pool);
+        let world = crate::mpi::World::get();
+        let active = world
+            .map(|w| w.range(self.blocks.len()))
+            .unwrap_or(0..self.blocks.len());
         pool.unwrap().install(|| {
-            self.blocks
+            self.blocks[active.clone()]
                 .par_iter()
-                .zip(work.blocks.par_iter_mut())
+                .zip(work.blocks[active.clone()].par_iter_mut())
                 .for_each(|(b, w)| {
                     if b.basis_cols == 0 {
                         return;
@@ -363,6 +430,38 @@ impl<T: FloatT> SampledOperator<T> {
                     w.forward = terms;
                 })
         });
+        if let Some(world) = world {
+            // Gather per-block terms in block order; column ranges may
+            // overlap, so the exchange layout is a per-block concatenation.
+            let offsets = term_offsets(&self.blocks, SampledBlock::row_count);
+            let gather_ranges: Vec<(usize, usize)> =
+                crate::mpi::ranges(self.blocks.len(), world.size())
+                    .iter()
+                    .map(|&(b0, len)| (offsets[b0], offsets[b0 + len] - offsets[b0]))
+                    .collect();
+            let (t0, t1) = (offsets[active.start], offsets[active.end]);
+            let mut local = Vec::with_capacity(t1 - t0);
+            for (b, w) in self.blocks[active.clone()].iter().zip(&work.blocks[active]) {
+                let n = b.row_count();
+                if b.basis_cols == 0 {
+                    local.resize(local.len() + n, T::zero());
+                } else {
+                    local.extend_from_slice(&w.forward[..n]);
+                }
+            }
+            debug_assert_eq!(local.len(), t1 - t0);
+            let mut all = vec![T::zero(); *offsets.last().unwrap()];
+            world.gather_slice(crate::mpi::SITE_FORWARD, &local, &gather_ranges, &mut all);
+            for (b, off) in self.blocks.iter().zip(&offsets) {
+                if b.basis_cols == 0 {
+                    continue;
+                }
+                for (i, &term) in all[*off..*off + b.row_count()].iter().enumerate() {
+                    y[b.row_start + i] += term;
+                }
+            }
+            return;
+        }
         for (b, w) in self.blocks.iter().zip(&work.blocks) {
             if b.basis_cols == 0 {
                 continue;
@@ -390,10 +489,14 @@ impl<T: FloatT> SampledOperator<T> {
         assert_eq!(work.blocks.len(), self.blocks.len());
         work.linear_product(self, true, y, x, alpha, beta, pool);
         let chunks = block_chunks(&self.blocks, pool);
+        let world = crate::mpi::World::get();
+        let active = world
+            .map(|w| w.range(self.blocks.len()))
+            .unwrap_or(0..self.blocks.len());
         pool.unwrap().install(|| {
-            self.blocks
+            self.blocks[active.clone()]
                 .par_iter()
-                .zip(work.blocks.par_iter_mut())
+                .zip(work.blocks[active.clone()].par_iter_mut())
                 .for_each(|(b, w)| {
                     if b.basis_cols == 0 {
                         return;
@@ -434,6 +537,38 @@ impl<T: FloatT> SampledOperator<T> {
                     w.adjoint = terms;
                 })
         });
+        if let Some(world) = world {
+            // Gather per-block adjoint terms in block order; column ranges
+            // may overlap, so the exchange layout is a concatenation.
+            let offsets = term_offsets(&self.blocks, SampledBlock::column_count);
+            let gather_ranges: Vec<(usize, usize)> =
+                crate::mpi::ranges(self.blocks.len(), world.size())
+                    .iter()
+                    .map(|&(b0, len)| (offsets[b0], offsets[b0 + len] - offsets[b0]))
+                    .collect();
+            let (t0, t1) = (offsets[active.start], offsets[active.end]);
+            let mut local = Vec::with_capacity(t1 - t0);
+            for (b, w) in self.blocks[active.clone()].iter().zip(&work.blocks[active]) {
+                let n = b.column_count();
+                if b.basis_cols == 0 {
+                    local.resize(local.len() + n, T::zero());
+                } else {
+                    local.extend_from_slice(&w.adjoint[..n]);
+                }
+            }
+            debug_assert_eq!(local.len(), t1 - t0);
+            let mut all = vec![T::zero(); *offsets.last().unwrap()];
+            world.gather_slice(crate::mpi::SITE_ADJOINT, &local, &gather_ranges, &mut all);
+            for (b, off) in self.blocks.iter().zip(&offsets) {
+                if b.basis_cols == 0 {
+                    continue;
+                }
+                for (i, &term) in all[*off..*off + b.column_count()].iter().enumerate() {
+                    y[b.column_start + i] += term;
+                }
+            }
+            return;
+        }
         // Descriptor order is authoritative even for unsorted rows and shared
         // variable ranges. Assigning terms avoids an extra rounded addition.
         for (b, w) in self.blocks.iter().zip(&work.blocks) {
@@ -717,6 +852,14 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
             gemm_tile: 0,
             syrk_tile: 0,
         }
+    }
+    /// The Gram contribution buffer for the rank-sharded exchange.
+    pub(crate) fn gram_slice(&self) -> &[T] {
+        self.gram.data()
+    }
+    /// Republish a gathered Gram into this block's workspace.
+    pub(crate) fn set_gram(&mut self, data: &[T]) {
+        self.gram.data_mut().copy_from_slice(data);
     }
     // Dimensions are fixed by construction; only the current pool width changes.
     pub(crate) fn configure_parallel(&mut self, workers: usize) -> u128 {

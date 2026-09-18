@@ -800,9 +800,17 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let mut products = || {
             P.sym_up().symv(ex, x, -T::one(), T::one());
             if let Some((operator, work)) = sampled {
+                let __t = std::time::Instant::now();
                 operator.apply_transpose_with_pool(ex, z, -T::one(), T::one(), work, pool.as_ref());
+                if std::env::var_os("SDPX_PROFILE").is_some() {
+                    eprintln!("PHASE residual.adj {:?}", __t.elapsed());
+                }
                 if !reuse_forward {
+                    let __t = std::time::Instant::now();
                     operator.apply_with_pool(ez, x, -T::one(), T::one(), work, pool.as_ref());
+                    if std::env::var_os("SDPX_PROFILE").is_some() {
+                        eprintln!("PHASE residual.fwd {:?}", __t.elapsed());
+                    }
                 }
             } else {
                 A.t().gemv(ex, z, -T::one(), T::one());
@@ -820,7 +828,11 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             }
         };
         let mut scaling = || {
+            let __t = std::time::Instant::now();
             apply_scaling_pool(pool, scaling_lanes, *scaling_tiles, blocks, workh, z, false);
+            if std::env::var_os("SDPX_PROFILE").is_some() {
+                eprintln!("PHASE residual.scale {:?}", __t.elapsed());
+            }
         };
         if let Some(pool) = pool.as_ref().filter(|_| scaling_lanes.len() > 1) {
             pool.install(|| rayon::join(products, scaling));

@@ -67,7 +67,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             });
         let inner_sampled = self.inner_sampled;
         let pool = &self.pool;
-        let sync = |(block, cone): (&mut Block<T>, &SupportedCone<T>)| {
+        let world = crate::mpi::World::get();
+        let sync = |(block, cone, owned): (&mut Block<T>, &SupportedCone<T>, bool)| {
             match (&mut block.scaling, cone) {
                 (Scaling::Psd(p), SupportedCone::PSDTriangleCone(c)) => {
                     p.R.copy_from_slice(c.scaling_R().data());
@@ -77,16 +78,20 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                         // for the single dominant block; handing the pool to every
                         // block multiplies tiny GEMM/SYRK tiles and pair lanes by
                         // the block count, which measured slower than the outer
-                        // block level it competes with.
-                        sampled.work.update_with_pool(
-                            &sampled.operator.blocks()[sampled.block],
-                            &p.Rinv,
-                            if inner_sampled == Some(block.rows.start) {
-                                pool.as_deref()
-                            } else {
-                                None
-                            },
-                        );
+                        // block level it competes with. Under MPI the Gram
+                        // update runs on the owning rank only; the gathered
+                        // Gram below republishes it to every rank.
+                        if owned {
+                            sampled.work.update_with_pool(
+                                &sampled.operator.blocks()[sampled.block],
+                                &p.Rinv,
+                                if inner_sampled == Some(block.rows.start) {
+                                    pool.as_deref()
+                                } else {
+                                    None
+                                },
+                            );
+                        }
                     } else {
                         p.Ginv
                             .syrk(&p.Rinv.t(), T::one(), T::zero(), MatrixTriangle::Triu);
@@ -140,27 +145,93 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             }
             true
         };
+        let __ts = std::time::Instant::now();
+        let owned_range = world
+            .map(|w| w.range(self.blocks.len()))
+            .unwrap_or(0..self.blocks.len());
+        let owned = |i: usize| owned_range.contains(&i);
         let valid = if inner_sampled.is_some() {
             self.blocks
                 .iter_mut()
                 .zip(cones.iter())
-                .map(sync)
+                .enumerate()
+                .map(|(i, (b, c))| sync((b, c, owned(i))))
                 .fold(true, |a, b| a & b)
         } else if let Some(pool) = &self.pool {
             pool.install(|| {
                 self.blocks
                     .par_iter_mut()
                     .zip(cones.iter().as_slice().par_iter())
-                    .map(sync)
+                    .enumerate()
+                    .map(|(i, (b, c))| sync((b, c, owned(i))))
                     .reduce(|| true, |a, b| a & b)
             })
         } else {
             self.blocks
                 .iter_mut()
                 .zip(cones.iter())
-                .map(sync)
+                .enumerate()
+                .map(|(i, (b, c))| sync((b, c, owned(i))))
                 .fold(true, |a, b| a & b)
         };
+        if let Some(world) = world {
+            // Republish each block's Gram to every rank. Only the owning
+            // rank ran `update_with_pool`; the concatenated block-ordered
+            // exchange reproduces the serial Grams bitwise. Ownership and
+            // layout both follow the `owned_range` block partition above.
+            let gram_lens: Vec<usize> = self
+                .blocks
+                .iter()
+                .map(|b| match &b.scaling {
+                    Scaling::Psd(p) => {
+                        p.sampled.as_ref().map_or(0, |s| s.work.gram_slice().len())
+                    }
+                    _ => 0,
+                })
+                .collect();
+            let mut offsets = Vec::with_capacity(self.blocks.len() + 1);
+            offsets.push(0usize);
+            for &n in &gram_lens {
+                offsets.push(offsets.last().unwrap() + n);
+            }
+            let gather_ranges: Vec<(usize, usize)> =
+                crate::mpi::ranges(self.blocks.len(), world.size())
+                    .iter()
+                    .map(|&(b0, len)| (offsets[b0], offsets[b0 + len] - offsets[b0]))
+                    .collect();
+            let (g0, g1) = (offsets[owned_range.start], offsets[owned_range.end]);
+            let mut local = Vec::with_capacity(g1 - g0);
+            for i in owned_range.clone() {
+                if let Scaling::Psd(p) = &self.blocks[i].scaling {
+                    if let Some(s) = &p.sampled {
+                        local.extend_from_slice(s.work.gram_slice());
+                    }
+                }
+            }
+            debug_assert_eq!(local.len(), g1 - g0);
+            let mut all = vec![T::zero(); *offsets.last().unwrap()];
+            world.gather_slice(crate::mpi::SITE_GRAM, &local, &gather_ranges, &mut all);
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                let n = gram_lens[i];
+                if n == 0 {
+                    continue;
+                }
+                if let Scaling::Psd(p) = &mut block.scaling {
+                    p.sampled
+                        .as_mut()
+                        .unwrap()
+                        .work
+                        .set_gram(&all[offsets[i]..offsets[i] + n]);
+                }
+            }
+        }
+        if std::env::var_os("SDPX_PROFILE").is_some() {
+            eprintln!(
+                "PHASE sync {:?} (inner_sampled={:?})",
+                __ts.elapsed(),
+                inner_sampled
+            );
+        }
         if !valid {
             return false;
         }
@@ -174,14 +245,19 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         self.reduced.update_P(&self.schur);
         self.counters.factorizations += 1;
         let retained = &self.retained_indices;
-        self.reduced.update_from_cones(
+        let __t1 = std::time::Instant::now();
+        let __r = self.reduced.update_from_cones(
             cones
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| retained.binary_search(i).is_ok())
                 .map(|(_, c)| c),
             settings,
-        )
+        );
+        if std::env::var_os("SDPX_PROFILE").is_some() {
+            eprintln!("PHASE cones_schur {:?}", __t1.elapsed());
+        }
+        __r
     }
 
     fn setrhs(&mut self, x: &[T], z: &[T]) {

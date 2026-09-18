@@ -136,6 +136,11 @@ impl SparseParallel {
         rx: &mut [T],
         rz: &mut [T],
     ) {
+        if let Some(world) = crate::mpi::World::get() {
+            self.product_sharded(a, true, rx, z, -T::one(), T::zero(), world, crate::mpi::SITE_RX);
+            self.product_sharded(a, false, rz, x, T::one(), T::one(), world, crate::mpi::SITE_RZ);
+            return;
+        }
         if let Some(pool) = &self.pool {
             // One entry into the pool for both products. Phases are joined;
             // no outer tasks compete with a nested full-budget product.
@@ -166,6 +171,73 @@ impl SparseParallel {
         beta: T,
     ) {
         self.apply_in_pool(a, transpose, y, x, alpha, beta);
+    }
+
+    /// Rank-sharded product. Every output is evaluated on exactly one rank in
+    /// its original accumulation order; the gathered outputs reproduce the
+    /// serial product bitwise.
+    pub(crate) fn product_sharded<T: FloatT>(
+        &self,
+        a: &CscMatrix<T>,
+        transpose: bool,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+        world: crate::mpi::World,
+        site: usize,
+    ) {
+        let count = if transpose { a.n } else { a.m };
+        let rank_lanes = partitions(
+            if transpose { &a.colptr } else { &self.rowptr },
+            world.size(),
+        );
+        // Lane starts with a trailing sentinel turn into per-rank ranges.
+        let gather_ranges: Vec<(usize, usize)> = (0..world.size())
+            .map(|r| {
+                let begin = rank_lanes.get(r).copied().unwrap_or(count);
+                let end = rank_lanes.get(r + 1).copied().unwrap_or(count);
+                (begin, end - begin)
+            })
+            .collect();
+        let (o0, len) = gather_ranges[world.rank()];
+        // The local segment inherits y's current values so `beta` applies to
+        // the same base as the serial product.
+        let mut local = y[o0..o0 + len].to_vec();
+        let ptr = if transpose { &a.colptr } else { &self.rowptr };
+        let compute = |output: usize, value: &mut T| {
+            scale_output(value, beta);
+            if alpha == T::zero() {
+                return;
+            }
+            if transpose {
+                for position in a.colptr[output]..a.colptr[output + 1] {
+                    accumulate(value, a.nzval[position], x[a.rowval[position]], alpha);
+                }
+            } else {
+                for entry in &self.entries[self.rowptr[output]..self.rowptr[output + 1]] {
+                    accumulate(value, a.nzval[entry.position], x[entry.column], alpha);
+                }
+            }
+        };
+        // Two-level parallelism: the rank's output span also splits across
+        // the thread pool; every output keeps its original order either way.
+        let workers = self.pool.as_ref().map_or(1, |p| p.current_num_threads());
+        if workers > 1 && len > 0 {
+            let lanes = partitions(&ptr[o0..o0 + len + 1], workers.min(len));
+            if let Some(pool) = &self.pool {
+                let base = o0;
+                pool.install(|| {
+                    split_outputs(&mut local, &lanes, &|offset, value| compute(base + offset, value))
+                });
+            }
+        } else {
+            for (i, value) in local.iter_mut().enumerate() {
+                compute(o0 + i, value);
+            }
+        }
+        y.fill(T::zero());
+        world.gather_slice(site, &local, &gather_ranges, y);
     }
 
     fn apply_in_pool<T: FloatT>(

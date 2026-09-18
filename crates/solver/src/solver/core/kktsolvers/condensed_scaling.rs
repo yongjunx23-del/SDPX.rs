@@ -240,6 +240,48 @@ pub(super) fn apply_scaling_pool<T: FloatT>(
     // worker. Tiles stay 1 whenever no lane outweighs an equal share of the
     // pool, so narrow pools and balanced inputs keep the previous schedule.
     let gemm = pool.as_ref().map(|pool| (pool.as_ref(), tiles.max(1)));
+    if let Some(world) = crate::mpi::World::get() {
+        // Rank-sharded scaling products. Block row ranges are disjoint, so
+        // each rank fills its own y segment; gathered segments reproduce the
+        // serial result bitwise.
+        let block_range = world.range(blocks.len());
+        let span = |slice: &[Block<T>]| {
+            let (s, e) = slice
+                .iter()
+                .map(|b| (b.rows.start, b.rows.end))
+                .fold((usize::MAX, 0usize), |(a0, a1), (s, e)| {
+                    (a0.min(s), a1.max(e))
+                });
+            if s > e {
+                (0, 0)
+            } else {
+                (s, e)
+            }
+        };
+        let (y0, y1) = span(&blocks[block_range.clone()]);
+        let gather_ranges: Vec<(usize, usize)> = crate::mpi::ranges(blocks.len(), world.size())
+            .iter()
+            .map(|&(b0, len)| {
+                if len == 0 {
+                    (0, 0)
+                } else {
+                    let (s, e) = span(&blocks[b0..b0 + len]);
+                    (s, e - s)
+                }
+            })
+            .collect();
+        let mut local = vec![T::zero(); y1 - y0];
+        apply_scaling(
+            &mut blocks[block_range],
+            &mut local,
+            &x[y0..y1],
+            inverse,
+            gemm,
+        );
+        y.fill(T::zero());
+        world.gather_slice(crate::mpi::SITE_SCALING, &local, &gather_ranges, &mut y[..]);
+        return;
+    }
     if let Some(pool) = pool {
         if lanes.len() > 1 {
             pool.install(|| split_scaling(blocks, y, x, inverse, lanes, gemm));

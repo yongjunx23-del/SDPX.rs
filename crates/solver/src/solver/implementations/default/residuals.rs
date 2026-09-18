@@ -78,7 +78,8 @@ where
         let is_sampled = false;
         if !is_sampled
             && self.sparse_parallel.is_none()
-            && pool.as_ref().is_some_and(|p| p.current_num_threads() > 1)
+            && (pool.as_ref().is_some_and(|p| p.current_num_threads() > 1)
+                || crate::mpi::World::get().is_some())
             && sparse_parallel::worthwhile(&data.A)
         {
             self.sparse_parallel = Some(sparse_parallel::SparseParallel::new(&data.A));
