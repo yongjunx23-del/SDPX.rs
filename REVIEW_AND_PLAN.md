@@ -257,8 +257,20 @@ audit **primal=3.2e-44 / dual=1.0e-41 / map=7.3e-11**, objective
 `-18.1686186450146` matching the independent reference exactly. The
 unit-interior start keeps the gap check honest, so iteration
 proceeds to real convergence. 328 lib tests pass (incl. detector
-unit test); Julia suite green. Sampled-route + Λ=15 acceptance
-running as job 213673; oracle column-scaling control as 213672.
+unit test); Julia suite green.
+
+**Sampled-factor route verified (job 213673):** `iters=69` on the
+production `sampled_program` path — same convergence, 423s vs 1223s
+materialized. Λ=15/Λ=19 sampled-route validation running (213674).
+
+**Solution-scale column scaling control (job 213672):** scaling
+columns by `max(|x̂_j|,1)` from a first-pass estimate makes the solver
+see an `x′~O(1)` problem — `status=optimal, iters=96`, audit
+**primal=4.8e-74 / gap=4.3e-76 / affine-map=6e-205**, ~30 orders
+tighter than the unscaled run's 3.2e-44 (honest feas criterion forces
+true absolute-residual convergence). Same objective to all digits.
+This is the benchmark-side high-precision route if tighter residuals
+are needed; the solver fix alone already passes the 1e-30 protocol.
 
 ## Pending
 
