@@ -642,6 +642,10 @@ where
             let mut buf = vec![T::zero(); 3 * n];
             let (sh, rest) = buf.split_at_mut(n);
             let (sz, ss) = rest.split_at_mut(n);
+            // step_z/step_s carry the affine directions as inputs in both
+            // prepared and unprepared modes; shift is pure scratch.
+            sz.copy_from_slice(&step_z[r.clone()]);
+            ss.copy_from_slice(&step_s[r]);
             Self::shift_one(cone, sh, sz, ss, σμ, prepared);
             buf
         });
