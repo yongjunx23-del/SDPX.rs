@@ -23,7 +23,6 @@ pub use integer::{
 };
 mod exact;
 pub use exact::Exact;
-mod widedot;
 
 /// Operations required by the solver, without Float's 64-bit integer_decode.
 pub trait Scalar:
@@ -66,15 +65,6 @@ pub trait Scalar:
         pairs
             .into_iter()
             .fold(Self::zero(), |acc, (x, y)| x.mul_add(*y, acc))
-    }
-    /// Dot product rounded once from the exact sum where the implementation
-    /// supports it; defaults to the ordered `dot_fma` accumulation.
-    fn dot_exact<'a, I>(pairs: I) -> Self
-    where
-        I: IntoIterator<Item = (&'a Self, &'a Self)>,
-        I::IntoIter: Clone,
-    {
-        Self::dot_fma(pairs)
     }
     fn ln(self) -> Self;
     fn exp(self) -> Self;
@@ -294,30 +284,6 @@ impl<const N: usize> MpFloat<N> {
                 let y = b.descriptor();
                 // MPFR permits the destination to alias an input. Here only the
                 // previous accumulator is reused; input limb arrays stay read-only.
-                unsafe { mpfr::fma(r, &x, &y, r, ROUND); }
-            }
-        })
-    }
-
-    /// Dot product with a single rounding of the exact sum: a wide fixed-point
-    /// window absorbs whole products when exponent spread and cancellation
-    /// permit, and rare boundary/deep-cancellation/special cases fall back to
-    /// the ordered FMA loop. Differs from `dot_fma` in the last few ulps;
-    /// callers must not rely on per-step rounding. Allocation-free.
-    #[inline]
-    pub fn dot_exact<'a, I>(pairs: I) -> Self
-    where
-        I: IntoIterator<Item = (&'a Self, &'a Self)>,
-        I::IntoIter: Clone,
-    {
-        let it = pairs.into_iter();
-        if let Some(v) = crate::widedot::wide_dot(it.clone(), it.clone()) {
-            return v;
-        }
-        Self::output(|r| {
-            for (a, b) in it {
-                let x = a.descriptor();
-                let y = b.descriptor();
                 unsafe { mpfr::fma(r, &x, &y, r, ROUND); }
             }
         })
@@ -616,13 +582,6 @@ impl<const N: usize> Scalar for MpFloat<N> {
     }
     fn dot_fma<'a>(pairs: impl IntoIterator<Item = (&'a Self, &'a Self)>) -> Self {
         MpFloat::dot_fma(pairs)
-    }
-    fn dot_exact<'a, I>(pairs: I) -> Self
-    where
-        I: IntoIterator<Item = (&'a Self, &'a Self)>,
-        I::IntoIter: Clone,
-    {
-        MpFloat::dot_exact(pairs)
     }
     fn ln(self) -> Self {
         self.unary(mpfr::log)

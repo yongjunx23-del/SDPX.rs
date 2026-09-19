@@ -640,7 +640,7 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
                 let p_data = self.panel.data();
                 for j in 0..h {
                     for i in 0..=j {
-                        let v = T::dot_exact(
+                        let v = T::dot_fma(
                             (0..kmax).map(|k| (&p_data[i + k * h], &q_data[j + k * h])),
                         );
                         self.square[(i, j)] = v;
@@ -701,7 +701,7 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
                     // precomputed `wdiag` — half the panel product's work.
                     for k in 0..kmax {
                         let w = &self.wdiag[k * trih..(k + 1) * trih];
-                        let v = T::dot_exact((0..h).flat_map(|j| {
+                        let v = T::dot_fma((0..h).flat_map(|j| {
                             (0..=j).map(move |i| {
                                 (
                                     &x[b.row_start + tri(r * h + j) + r * h + i],
@@ -723,7 +723,7 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
                     for k in 0..kmax {
                         let q_col = &q.data()[k * h..(k + 1) * h];
                         let p_col = &self.panel.data()[k * h..(k + 1) * h];
-                        let v = T::dot_exact(q_col.iter().zip(p_col.iter()));
+                        let v = T::dot_fma(q_col.iter().zip(p_col.iter()));
                         store(p + k, alpha * b.weights[p + k] * v);
                     }
                 }
