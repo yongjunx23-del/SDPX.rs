@@ -289,7 +289,7 @@ pub(super) fn apply_scaling_pool<T: FloatT>(
         // rank; a serial block walk would leave the pool idle between the
         // per-block GEMM tiles.
         if let Some(pool) = pool.as_ref().filter(|_| owned.len() > 1) {
-            let lanes: Vec<usize> = (0..=owned.len()).collect();
+            let lanes: Vec<usize> = (0..owned.len()).collect();
             pool.install(|| {
                 split_scaling(owned, &mut local, &x[y0..y1], inverse, &lanes, gemm)
             });
