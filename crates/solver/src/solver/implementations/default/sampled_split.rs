@@ -75,10 +75,9 @@ pub(super) fn forward_split_chunks<T: FloatT>(
                 let p_data = panel.data();
                 for j in 0..h {
                     for i in 0..=j {
-                        let mut v = T::zero();
-                        for k in 0..kmax {
-                            v = p_data[i + k * h].mul_add(q_data[j + k * h], v);
-                        }
+                        let v = T::dot_fma(
+                            (0..kmax).map(|k| (&p_data[i + k * h], &q_data[j + k * h])),
+                        );
                         square[(i, j)] = v;
                         if r != s {
                             square[(j, i)] = v;
@@ -171,13 +170,14 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
                     // identical because the `wdiag` weights fix the order.
                     for k in 0..kmax {
                         let w = &wdiag[k * trih..(k + 1) * trih];
-                        let mut v = T::zero();
-                        for j in 0..h {
-                            for i in 0..=j {
-                                v = x[b.row_start + tri(r * h + j) + r * h + i]
-                                    .mul_add(w[tri(j) + i], v);
-                            }
-                        }
+                        let v = T::dot_fma((0..h).flat_map(|j| {
+                            (0..=j).map(move |i| {
+                                (
+                                    &x[b.row_start + tri(r * h + j) + r * h + i],
+                                    &w[tri(j) + i],
+                                )
+                            })
+                        }));
                         let idx = p + k - s_offset;
                         out[idx] = alpha * b.weights[p + k] * v;
                     }
@@ -194,7 +194,7 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
                 for k in 0..kmax {
                     let q_col = &q.data()[k * h..(k + 1) * h];
                     let p_col = &panel.data()[k * h..(k + 1) * h];
-                    let v = q_col.dot(p_col);
+                    let v = T::dot_fma(q_col.iter().zip(p_col.iter()));
                     let idx = p + k - s_offset;
                     out[idx] = alpha * b.weights[p + k] * v;
                 }

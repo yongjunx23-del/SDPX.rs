@@ -385,6 +385,7 @@ fn mul_Wx_inner<T>(
     let (X, Y, tmp) = (workmat1, workmat2, workmat3);
     svec_to_mat(X, x);
 
+    let __ts = std::time::Instant::now();
     match is_transpose {
         MatrixShape::T => {
             // Y .= α*(R*X*R') + βY        #W^T*x,   or....
@@ -398,6 +399,9 @@ fn mul_Wx_inner<T>(
             tmp.mul(&Rx.t(), X, T::one(), T::zero());
             pooled_gemm_sym(Y, tmp, Rx, None);
         }
+    }
+    if std::env::var_os("SDPX_PROFILE").is_some() {
+        eprintln!("PHASE cone_wprod {:?}", __ts.elapsed());
     }
     if α == T::one() && β == T::zero() {
         mat_to_svec(y, Y);
