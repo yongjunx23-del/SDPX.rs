@@ -365,3 +365,34 @@ known safe algorithmic substitute (eig variants square κ or need two
 decompositions ≈ slower); `cone_eigmin` ~15s wall uses the proven
 Sturm+RQI minimum-eigenvalue path; residual/operator products continue
 to benefit from `dot_fma` accumulation.
+
+### SVD inner-loop FMA fusion (14f44ee) — neutral, retained
+
+`rotate`/`apply_reflectors`/`reduce_bidiagonal` element loops fused to
+single-rounding `mpfr_fma` (rotate 6→4 ops, rank-1 update mul+sub→fma).
+Λ=11: ~1s effect (≈0.3%) — per-op cost is dominated by `mpfr_fma`
+internals, not op count. Retained for the strictly better rounding.
+
+### Wide fixed-point dot (cedd1e9) — measured negative, reverted (2f15769)
+
+Single-rounding accumulation of each product's 2N-limb significand into
+a 4N+2-limb two's-complement window, falling back to ordered FMA on
+ambiguity. Local microbenchmarks showed 6–25× — **but only because every
+test operand came `from_f64` with ~2 nonzero limbs**; the inner loop's
+`ai == 0` skips hid the N² cost. With dense 768-bit significands the
+same code costs ~530–710ns/term vs `mpfr_fma`'s ~170–290ns (0.3–0.4×).
+Cluster A/B on one node, identical 69-iteration trajectory:
+cedd1e9 **1182.9s** vs 14f44ee control **345.6s** (~3.4× slower,
+degrading with iterate conditioning). `mpfr_fma`'s limb-level inner
+multiply-accumulate is already optimal for dense significands;
+a same-model accumulator cannot beat it. Reverted; benchmark rule:
+microbench operands must use full-precision dense significands, never
+`from_f64` values.
+
+**Next viable kernel lever is a different arithmetic model** — SDPB's
+RNS path (encode significands into residues mod ~N·64/62 machine primes,
+dot in u64, CRT-reconstruct once). Residue width needed ≈ window span
+(~50 primes at 768-bit) caps the gain at ~2–4× on dot kernels; operand
+encoding amortizes only when values are reused across many dots (gemm).
+High implementation complexity for a bounded win — revisit only if the
+dot kernels remain the bottleneck after profiling Λ=15.
