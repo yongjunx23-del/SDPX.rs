@@ -10,7 +10,7 @@
 use super::*;
 use num_traits::{One, ToPrimitive, Zero};
 use rayon::prelude::*;
-use sdpx_arithmetic::{MpFloat, Scalar};
+use sdpx_arithmetic::{EncodeSide, MpFloat, RnsPlan, Scalar};
 type F<const N: usize> = MpFloat<N>;
 
 fn upper(c: u8) -> u8 {
@@ -213,6 +213,17 @@ fn gemm<const N: usize>(
     if m == 0 || n == 0 {
         return;
     }
+    // Exact residue accumulation replaces the FMA chain when the operand
+    // window admits a plan; reconstruction rounds once at the destination.
+    let rns = (alpha != F::<N>::zero() && k > 0)
+        .then(|| RnsPlan::for_pair(a, b, k as usize))
+        .flatten()
+        .filter(|plan| plan.profitable(k as usize, m as usize * n as usize))
+        .and_then(|plan| {
+            plan.encode(a, EncodeSide::A)
+                .zip(plan.encode(b, EncodeSide::B))
+                .map(|(ra, rb)| (plan, ra, rb))
+        });
     let column = |j: usize, column: &mut [F<N>]| {
         for i in 0..m as usize {
             let mut v = F::<N>::zero();
@@ -229,7 +240,20 @@ fn gemm<const N: usize>(
                 } else {
                     (j, ldb as usize)
                 };
-                v = F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &b[b0 + p * db])));
+                v = match &rns {
+                    Some((plan, ra, rb)) => plan.reconstruct(&plan.dot_residues(
+                        ra,
+                        a0,
+                        da,
+                        rb,
+                        b0,
+                        db,
+                        k as usize,
+                    )),
+                    None => {
+                        F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &b[b0 + p * db])))
+                    }
+                };
             }
             column[i] = axpby(alpha, v, beta, column[i]);
         }
@@ -381,6 +405,12 @@ fn syrk<const N: usize>(
     if n == 0 {
         return;
     }
+    // Same operand on both sides: one encode serves both residue columns.
+    let rns = (alpha != F::<N>::zero() && k > 0)
+        .then(|| RnsPlan::for_pair(a, a, k as usize))
+        .flatten()
+        .filter(|plan| plan.profitable(k as usize, n as usize * (n as usize + 1) / 2))
+        .and_then(|plan| plan.encode(a, EncodeSide::A).map(|ra| (plan, ra)));
     let column = |j: usize, column: &mut [F<N>]| {
         for i in 0..n as usize {
             if (upper(u) == b'U' && i > j) || (upper(u) == b'L' && i < j) {
@@ -398,7 +428,20 @@ fn syrk<const N: usize>(
                 } else {
                     (j * lda as usize, 1)
                 };
-                v = F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &a[b0 + p * db])));
+                v = match &rns {
+                    Some((plan, ra)) => plan.reconstruct(&plan.dot_residues(
+                        ra,
+                        a0,
+                        da,
+                        ra,
+                        b0,
+                        db,
+                        k as usize,
+                    )),
+                    None => {
+                        F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &a[b0 + p * db])))
+                    }
+                };
             }
             column[i] = axpby(alpha, v, beta, column[i]);
         }

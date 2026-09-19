@@ -23,6 +23,8 @@ pub use integer::{
 };
 mod exact;
 pub use exact::Exact;
+mod rns;
+pub use rns::{EncodeSide, Residues, RnsPlan};
 
 /// Operations required by the solver, without Float's 64-bit integer_decode.
 pub trait Scalar:

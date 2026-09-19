@@ -794,6 +794,9 @@ where
                     let mut buf = vec![T::zero(); 2 * n + 2];
                     let (dz_i, rest) = buf.split_at_mut(n);
                     let (ds_i, tail) = rest.split_at_mut(n);
+                    // dz/ds are in/out: seed them with the affine directions.
+                    dz_i.copy_from_slice(&dz[r.clone()]);
+                    ds_i.copy_from_slice(&ds[r]);
                     let (αz, αs) = cone.prepare_affine_bounds(dz_i, ds_i, αmax);
                     tail[0] = αz;
                     tail[1] = αs;
