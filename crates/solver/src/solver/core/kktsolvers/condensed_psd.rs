@@ -407,7 +407,7 @@ impl<T: FloatT> PsdBlock<T> {
                     &self.axpy_plans[b],
                     values,
                 );
-                self.mat3.mul(&self.mat2, &self.Ginv, T::one(), T::zero());
+                pooled_gemm_sym(&mut self.mat3, &self.mat2, &self.Ginv, None);
                 mat_to_svec(&mut self.vector, &self.mat3);
             }
             // Stream one transform per exact representative at every precision.
