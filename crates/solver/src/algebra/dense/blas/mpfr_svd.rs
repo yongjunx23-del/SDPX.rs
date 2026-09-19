@@ -113,7 +113,7 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
         d[k] = beta;
         left[k] = tau;
         for j in k + 1..n {
-            let mut dot = F::dot_fma(
+            let mut dot = F::dot_exact(
                 x.iter().zip(&a[k + j * m..m + j * m]),
             );
             dot *= tau;
@@ -135,7 +135,7 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
             e[k] = beta;
             right[k] = tau;
             for i in k + 1..m {
-                let mut dot = F::dot_fma(
+                let mut dot = F::dot_exact(
                     (k + 1..n).map(|j| (&a[i + j * m], &x[j - k - 1])),
                 );
                 dot *= tau;
@@ -376,7 +376,7 @@ pub(super) fn apply_reflectors<const N: usize>(
 ) {
     for k in (0..n).rev() {
         for j in 0..uc {
-            let mut dot = F::dot_fma(
+            let mut dot = F::dot_exact(
                 (k + 1..m).map(|i| (&a[i + k * m], &u[i + j * m])),
             ) + u[k + j * m];
             dot *= left[k];
@@ -390,7 +390,7 @@ pub(super) fn apply_reflectors<const N: usize>(
     if !v.is_empty() {
         for k in (0..n.saturating_sub(1)).rev() {
             for j in 0..n {
-                let mut dot = F::dot_fma(
+                let mut dot = F::dot_exact(
                     (k + 2..n).map(|i| (&a[k + i * m], &v[i + j * n])),
                 ) + v[k + 1 + j * n];
                 dot *= right[k];

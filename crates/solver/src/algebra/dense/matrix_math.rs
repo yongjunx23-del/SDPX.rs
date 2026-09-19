@@ -232,7 +232,7 @@ pub(crate) fn pooled_gemm_sym<T: FloatT, MATA, MATB>(
     };
     let column = |j: usize, col: &mut [T]| {
         for i in 0..=j {
-            col[i] = T::dot_fma((0..k).map(|p| (ae(i, p), be(p, j))));
+            col[i] = T::dot_exact((0..k).map(|p| (ae(i, p), be(p, j))));
         }
     };
     if let Some((pool, tiles)) = gemm.filter(|(p, t)| *t > 1 && p.current_num_threads() > 1) {

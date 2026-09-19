@@ -229,7 +229,7 @@ fn gemm<const N: usize>(
                 } else {
                     (j, ldb as usize)
                 };
-                v = F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &b[b0 + p * db])));
+                v = F::dot_exact((0..k as usize).map(|p| (&a[a0 + p * da], &b[b0 + p * db])));
             }
             column[i] = axpby(alpha, v, beta, column[i]);
         }
@@ -324,7 +324,7 @@ impl<const N: usize> XgemvScalar for F<N> {
                 } else {
                     (i * lda as usize, 1)
                 };
-                v = F::dot_fma((0..k).map(|p| (&a[a0 + p * da], &x[vi(p, k, incx)])));
+                v = F::dot_exact((0..k).map(|p| (&a[a0 + p * da], &x[vi(p, k, incx)])));
             }
             let q = vi(i, r, incy);
             y[q] = axpby(alpha, v, beta, y[q]);
@@ -398,7 +398,7 @@ fn syrk<const N: usize>(
                 } else {
                     (j * lda as usize, 1)
                 };
-                v = F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &a[b0 + p * db])));
+                v = F::dot_exact((0..k as usize).map(|p| (&a[a0 + p * da], &a[b0 + p * db])));
             }
             column[i] = axpby(alpha, v, beta, column[i]);
         }
