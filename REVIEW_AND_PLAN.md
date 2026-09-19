@@ -186,12 +186,45 @@ Verified on the cluster (OpenMPI 4.1.4, job 213606/213612):
   **bitwise identical** (sha256 of x/s/z), rank0 == rank1 identical.
 - Λ=15 768-bit: np=1/np=2/np=4 (4 nodes × 8 threads) — solution vectors
   **bitwise identical** (sha256 `0aa72c2e…`).
-- Note: these SDPB Ising inputs converge at iteration 0 (initial-point
-  KKT solve is near-exact for this family — verified identical on the
-  pre-change 69a5f40 release), so iterated-work speedup is not visible
-  here; np=2 costs ~+9s of redundant setup/default_start + gather
-  latency at this size. Rank sharding pays off only when iterated
-  residuals/Gram products dominate.
+- Note: these SDPB Ising inputs report `optimal` at iteration 0, but
+  the independent audit **rejects** the returned point (Λ=11:
+  primal 0.352 / dual 0.874; Λ=15: 0.366 / 0.945; equality rows are
+  exact, PSD rows carry ~46 abs residual). So the runs verify MPI
+  bitwise determinism only — they are **not** acceptance evidence.
+  np=2 costs ~+9s of redundant setup/default_start + gather latency.
+  Rank sharding pays off only when iterated residuals/Gram products
+  dominate.
+
+### Λ=11/15 iter-0 false convergence — verified root cause
+
+External audits falsify the iter-0 "Solved" result. Verified chain:
+
+- The returned point **is** the internal iterate (equilibration off →
+  unscale is identity → same objective -22.59, same 0.335 residual).
+- `res_primal = ‖r‖/(‖b‖+‖x‖+‖s‖)` (Clarabel formula): ‖r‖₂ ≈ 3e3 but
+  ‖x‖₂ ≈ 2e78 — the initial-point KKT solve piles ~1e78 components
+  onto near-degenerate columns (input coefficients span ~1e-156…1e1),
+  so the relative residual collapses to ~1.5e-75 < any tolerance.
+  gap_abs ~1e-103 and res_dual collapse the same way; ktratio=1 →
+  `Solved` at iteration 0.
+- Ruled out by direct experiment: presolve OFF, equilibration OFF,
+  chordal OFF — all identical; materialized CSC route ≡ sampled-factor
+  route (same -20.2169 objective, same residuals); pre-change 69a5f40
+  and the prep01 audit show the same failure — **not a regression**
+  from the parallelisation/MPI work; the input was never truly
+  accepted (prep01 audit: accepted=False).
+- MPFR-768 `static_regularization_constant ≈ ε^(3/4) ≈ 1e-173` is far
+  below the degenerate data scale, so regularization does not bound
+  the initial point's ~1e78 components.
+- Local synthetic repro confirms both ends of the mechanism
+  (1e-80-col → iterates to dual_infeasible with x~1e80; ≤1e-120 →
+  regularization bounds x and it converges properly).
+- This is upstream-Clarabel-inherited normalization behaviour on
+  pathological conditioning, not an SDPX logic bug — do not "fix" by
+  loosening the termination formula (contract). The Λ=11/15/19
+  pmp2sdp conversions are outside the solver's current conditioning
+  envelope; acceptance must use inputs that iterate (587-class or
+  better-conditioned conversions).
 
 ## Pending
 
