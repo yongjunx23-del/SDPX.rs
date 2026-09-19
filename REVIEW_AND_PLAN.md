@@ -396,3 +396,58 @@ dot in u64, CRT-reconstruct once). Residue width needed ≈ window span
 encoding amortizes only when values are reused across many dots (gemm).
 High implementation complexity for a bounded win — revisit only if the
 dot kernels remain the bottleneck after profiling Λ=15.
+
+### Thread scaling and pool-bound SVD inner parallelism (a77acd8) — retained
+
+Λ=11 same-trajectory A/B (69 iters, one node, no code change between runs):
+8 threads 345.6s → 16 threads 219.7s → **32 threads 169.7s** → 64 threads
+172.2s. Scaling saturates near 32 threads (≈28 PSD blocks is the
+block-level parallelism unit). A thread-local gate
+(`sdpx_arithmetic::inner_parallel`) set inside `cone_parallel::apply`
+leaves lets `reduce_bidiagonal`/`apply_reflectors` re-offer independent
+column updates to the ambient solver pool (`par_chunks_mut`, ≥4-column
+threshold, serial fallback). Scratch extended m→2m for the right-reflector
+`ndot` buffer; 330 lib + all integration tests pass. Λ=15 t32 single-node:
+251.0s → **241.8s** (75 iters, `status=optimal`).
+
+### MPI dynamic loading — three bugs fixed, verified active; cross-node
+### optimization stopped at the transport/duplication wall
+
+`mpi.rs` runtime `dlopen` path had three latent bugs that silently disabled
+the MPI world in every prior run:
+
+1. `dlsym` probed `MpiComm_rank`-style names — real exports are
+   `MPI_Comm_rank` etc.; `load()` always failed.
+2. `resolve_handle` dereferenced `ompi_mpi_comm_world`/`ompi_mpi_byte`
+   globals one level too deep — OpenMPI handles are the globals' addresses.
+3. **`RTLD_LOCAL` was 4, which is `RTLD_NOLOAD`** — `dlopen` returned null
+   for not-yet-loaded `libmpi` without setting `dlerror` ("unknown"
+   diagnostic). RTLD_LOCAL is 0 on Linux. This was the decisive bug.
+
+With all three fixed (580506a, d979c6c), mpiexec ranks report `size=2`,
+`MPI_THREAD_MULTIPLE` granted, and per-site `mpi.gather*` timings appear.
+Λ=15 np=2 (2 nodes × 32 threads, `--bind-to none`): converged optimal in
+75 iters but **759.9s vs 241.8s single-node** — a net loss, dominated by
+~9s/rank/iter of `MPI_Allgatherv` waits across ~30 shard sites. Two
+structural causes, both measured:
+
+- Transport: ranks communicate over TCP/IPoIB (12.12.12.0/24), not native
+  verbs — OpenMPI 4.1.4 here has no UCX pml and the `openib` BTL does not
+  engage on mlx5 HDR; ~350ms per ~3MB gather.
+- Duplication: PSD cone SVD/W/eigmin, Schur assembly and KKT refactor run
+  identically on every rank (~65% of iteration work); only sampled
+  products, scaling and Gram updates are rank-sharded.
+
+Cross-node work stopped per direction: making np≥2 pay requires both a
+working verbs path and cone-state sharding (~12MB/iter exchange). The
+loader is now correct — MPI is functional for future campaigns on
+problems where per-rank compute dominates communication (e.g., Λ≥19) —
+but no scaling claim is made: activation verified, speedup not.
+
+### Cluster state at task close
+
+`SDPX.jl/current` → `releases/d979c6c…/source` (SVD inner parallelism,
+MPI loader fixes, gather timing under `SDPX_PROFILE`/`SDPX_MPI_DEBUG`);
+Julia loads and links the rebuilt `libsdpx.so`. Release workspace
+`sdpx-releases/580506a` carries the same source and built library.
+Best measured: Λ=11 169.7s (t32), Λ=15 241.8s (t32, np=1).
