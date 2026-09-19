@@ -38,6 +38,7 @@ pub(crate) const SITE_SCALING: usize = 2;
 pub(crate) const SITE_GRAM: usize = 3;
 pub(crate) const SITE_RX: usize = 4;
 pub(crate) const SITE_RZ: usize = 5;
+pub(crate) const SITE_CONES: usize = 6;
 const NSITES: usize = 8;
 
 #[derive(Clone, Copy)]
@@ -366,7 +367,6 @@ impl World {
     /// Maximum of `v` over all ranks on the world communicator. Order-free
     /// and deterministic; callers must not invoke it concurrently with other
     /// collectives on the same stream.
-    #[allow(dead_code)]
     pub(crate) fn allreduce_max_f64(&self, v: f64) -> f64 {
         let mut out = 0.0f64;
         let rc = unsafe {

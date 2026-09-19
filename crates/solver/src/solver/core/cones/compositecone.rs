@@ -3,6 +3,7 @@ use super::*;
 mod cone_parallel;
 use crate::algebra::triangular_number;
 use cone_parallel::ConeThreading;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::iter::zip;
 use std::ops::Range;
@@ -344,6 +345,102 @@ where
             0
         }
     }
+
+    /// Per-cone scaling-state size exchanged between ranks: only PSD
+    /// cones carry nontrivial state (R, Rinv, λ). Every other cone type
+    /// recomputes its (cheap, deterministic) update on all ranks.
+    fn scaling_state_len(cone: &SupportedCone<T>) -> usize {
+        match cone {
+            #[cfg(feature = "sdp")]
+            SupportedCone::PSDTriangleCone(c) => c.scaling_state_len(),
+            _ => 0,
+        }
+    }
+
+    fn pack_scaling_state(cone: &SupportedCone<T>, out: &mut Vec<T>) {
+        match cone {
+            #[cfg(feature = "sdp")]
+            SupportedCone::PSDTriangleCone(c) => c.pack_scaling_state(out),
+            _ => {}
+        }
+    }
+
+    fn unpack_scaling_state(cone: &mut SupportedCone<T>, src: &[T]) {
+        match cone {
+            #[cfg(feature = "sdp")]
+            SupportedCone::PSDTriangleCone(c) => c.unpack_scaling_state(src),
+            _ => {}
+        }
+    }
+
+    /// Rank-sharded scaling update: each rank factorizes only its block
+    /// range (the expensive SVD/W work), non-PSD cones still update on all
+    /// ranks, then the packed `[R, Rinv, λ]` states are gathered in block
+    /// order so every rank reconstructs the bitwise-serial cone state.
+    fn update_scaling_sharded(
+        &mut self,
+        world: crate::mpi::World,
+        s: &[T],
+        z: &[T],
+        μ: T,
+        scaling_strategy: ScalingStrategy,
+    ) -> bool {
+        let owned = world.range(self.cones.len());
+        let rng = &self.rng_cones;
+        let cones = &mut self.cones;
+        let update_one = |i: usize, cone: &mut SupportedCone<T>, inner: bool| -> bool {
+            if owned.contains(&i) || Self::scaling_state_len(cone) == 0 {
+                let _inner = inner.then(sdpx_arithmetic::inner_parallel::Guard::enter);
+                cone.update_scaling(&s[rng[i].clone()], &z[rng[i].clone()], μ, scaling_strategy)
+            } else {
+                true
+            }
+        };
+        let ok = match &self.threading {
+            Some(threading) => threading.pool.install(|| {
+                cones
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(i, cone)| update_one(i, cone, true))
+                    .reduce(|| true, |a, b| a & b)
+            }),
+            None => cones
+                .iter_mut()
+                .enumerate()
+                .map(|(i, cone)| update_one(i, cone, false))
+                .fold(true, |a, b| a & b),
+        };
+        // Scaling success must agree on every rank before any collective:
+        // a rank that returned early while another gathers would deadlock.
+        let failed = world.allreduce_max_f64(if ok { 0.0 } else { 1.0 }) > 0.0;
+        if failed {
+            return false;
+        }
+        let lens: Vec<usize> = self.cones.iter().map(Self::scaling_state_len).collect();
+        let mut offsets = Vec::with_capacity(self.cones.len() + 1);
+        offsets.push(0usize);
+        for &n in &lens {
+            offsets.push(offsets.last().unwrap() + n);
+        }
+        let gather_ranges: Vec<(usize, usize)> = crate::mpi::ranges(self.cones.len(), world.size())
+            .iter()
+            .map(|&(b0, len)| (offsets[b0], offsets[b0 + len] - offsets[b0]))
+            .collect();
+        let (g0, g1) = (offsets[owned.start], offsets[owned.end]);
+        let mut local = Vec::with_capacity(g1 - g0);
+        for i in owned.clone() {
+            Self::pack_scaling_state(&self.cones[i], &mut local);
+        }
+        debug_assert_eq!(local.len(), g1 - g0);
+        let mut all = vec![T::zero(); *offsets.last().unwrap()];
+        world.gather_slice(crate::mpi::SITE_CONES, &local, &gather_ranges, &mut all);
+        for (i, cone) in self.cones.iter_mut().enumerate() {
+            if lens[i] > 0 && !owned.contains(&i) {
+                Self::unpack_scaling_state(cone, &all[offsets[i]..offsets[i] + lens[i]]);
+            }
+        }
+        true
+    }
 }
 
 impl<T> Cone<T> for CompositeCone<T>
@@ -428,6 +525,15 @@ where
         μ: T,
         scaling_strategy: ScalingStrategy,
     ) -> bool {
+        if let Some(world) = crate::mpi::World::get() {
+            if self
+                .cones
+                .iter()
+                .any(|c| Self::scaling_state_len(c) > 0)
+            {
+                return self.update_scaling_sharded(world, s, z, μ, scaling_strategy);
+            }
+        }
         if let Some(threading) = &self.threading {
             if let (Some(chunk), [SupportedCone::NonnegativeCone(cone)]) =
                 (threading.orthant_chunk, self.cones.as_mut_slice())

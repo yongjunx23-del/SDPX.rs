@@ -77,6 +77,38 @@ where
     pub(crate) fn scaling_Rinv(&self) -> &Matrix<T> {
         &self.data.Rinv
     }
+
+    /// Number of `T` values the scaling state exchange carries per cone:
+    /// R and Rinv in full (n² each) plus λ. Λisqrt and G are derived from
+    /// them locally on receipt, bitwise identical to the owner's values.
+    pub(crate) fn scaling_state_len(&self) -> usize {
+        2 * self.n * self.n + self.n
+    }
+
+    /// Append this cone's scaling state to `out` in `[R, Rinv, λ]` order.
+    /// Called on the owning rank only, after `update_scaling`.
+    pub(crate) fn pack_scaling_state(&self, out: &mut Vec<T>) {
+        out.extend_from_slice(self.data.R.data());
+        out.extend_from_slice(self.data.Rinv.data());
+        out.extend_from_slice(&self.data.λ);
+    }
+
+    /// Install a scaling state produced by another rank's `update_scaling`,
+    /// then recompute the derived caches exactly as `update_scaling` does:
+    /// Λisqrt = sqrt(λ)⁻¹ and G = R·Rᵀ (authoritative upper triangle) are
+    /// deterministic functions of the packed values, so the result is
+    /// bitwise identical to running the update locally.
+    pub(crate) fn unpack_scaling_state(&mut self, src: &[T]) {
+        let n2 = self.n * self.n;
+        debug_assert_eq!(src.len(), self.scaling_state_len());
+        let f = &mut self.data;
+        f.R.data_mut().copy_from_slice(&src[..n2]);
+        f.Rinv.data_mut().copy_from_slice(&src[n2..2 * n2]);
+        f.λ.copy_from_slice(&src[2 * n2..]);
+        f.Λisqrt.copy_from(&f.λ).sqrt().recip();
+        f.G.data_mut().set(T::zero());
+        f.G.syrk(&f.R, T::one(), T::zero(), MatrixTriangle::Triu);
+    }
 }
 
 impl<T> Cone<T> for PSDTriangleCone<T>
