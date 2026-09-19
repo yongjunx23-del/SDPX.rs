@@ -79,11 +79,7 @@ fn pooled_gemm_sym<T: FloatT, MATA, MATB>(
     };
     let column = |j: usize, col: &mut [T]| {
         for i in 0..=j {
-            let mut v = T::zero();
-            for p in 0..k {
-                v = ae(i, p).mul_add(*be(p, j), v);
-            }
-            col[i] = v;
+            col[i] = T::dot_fma((0..k).map(|p| (ae(i, p), be(p, j))));
         }
     };
     if let Some((pool, tiles)) = gemm.filter(|(p, t)| *t > 1 && p.current_num_threads() > 1) {

@@ -58,6 +58,14 @@ pub trait Scalar:
     fn sqrt(self) -> Self;
     fn cbrt(self) -> Self;
     fn mul_add(self, a: Self, b: Self) -> Self;
+    /// Accumulate products in iterator order, rounding each FMA at this precision.
+    /// The default folds `mul_add`; owned high-precision types may reuse one
+    /// accumulator instead of producing a fresh result per product.
+    fn dot_fma<'a>(pairs: impl IntoIterator<Item = (&'a Self, &'a Self)>) -> Self {
+        pairs
+            .into_iter()
+            .fold(Self::zero(), |acc, (x, y)| x.mul_add(*y, acc))
+    }
     fn ln(self) -> Self;
     fn exp(self) -> Self;
     fn sin(self) -> Self;
@@ -571,6 +579,9 @@ impl<const N: usize> Scalar for MpFloat<N> {
         Self::output(|r| unsafe {
             mpfr::fma(r, &x, &y, &z, ROUND);
         })
+    }
+    fn dot_fma<'a>(pairs: impl IntoIterator<Item = (&'a Self, &'a Self)>) -> Self {
+        MpFloat::dot_fma(pairs)
     }
     fn ln(self) -> Self {
         self.unary(mpfr::log)
