@@ -243,8 +243,21 @@ pub(super) fn apply_scaling_pool<T: FloatT>(
     if let Some(world) = crate::mpi::World::get() {
         // Rank-sharded scaling products. Block row ranges are disjoint, so
         // each rank fills its own y segment; gathered segments reproduce the
-        // serial result bitwise.
-        let block_range = world.range(blocks.len());
+        // serial result bitwise. Ranks split by cost, not count: a PSD block's
+        // congruence product is ~n^3 while orthant rows are ~n.
+        let costs: Vec<u64> = blocks
+            .iter()
+            .map(|b| {
+                let n = (b.rows.end - b.rows.start) as f64;
+                match &b.scaling {
+                    Scaling::Psd(_) => n.powf(1.5).max(1.0) as u64,
+                    _ => n.max(1.0) as u64,
+                }
+            })
+            .collect();
+        let block_parts = crate::mpi::cost_ranges(&costs, world.size());
+        let (b0, blen) = block_parts[world.rank()];
+        let block_range = b0..b0 + blen;
         let span = |slice: &[Block<T>]| {
             let (s, e) = slice
                 .iter()
@@ -259,7 +272,7 @@ pub(super) fn apply_scaling_pool<T: FloatT>(
             }
         };
         let (y0, y1) = span(&blocks[block_range.clone()]);
-        let gather_ranges: Vec<(usize, usize)> = crate::mpi::ranges(blocks.len(), world.size())
+        let gather_ranges: Vec<(usize, usize)> = block_parts
             .iter()
             .map(|&(b0, len)| {
                 if len == 0 {

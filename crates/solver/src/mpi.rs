@@ -130,6 +130,16 @@ fn load() -> Option<Fns> {
                     }
                 }
             }
+            // Intel MPI needs its bundled libfabric reachable before libmpi
+            // resolves; it lives in a sibling directory of the MPI libdir.
+            for dep in ["../libfabric/lib/libfabric.so.1", "libfabric.so.1"] {
+                if let Ok(p) = CString::new(format!("{dir}/{dep}")) {
+                    let h = unsafe { dlopen(p.as_ptr(), RTLD_NOW | RTLD_LOCAL) };
+                    if debug && h.is_null() {
+                        eprintln!("mpi: dep preload {dep} failed");
+                    }
+                }
+            }
             for n in NAMES {
                 if let Ok(p) = CString::new(format!("{dir}/{n}")) {
                     candidates.push(p);
@@ -172,8 +182,10 @@ fn load() -> Option<Fns> {
                 allgatherv: sym!(lib, "MPI_Allgatherv"),
                 allreduce: sym!(lib, "MPI_Allreduce"),
                 comm_world: resolve_handle(lib, "ompi_mpi_comm_world", 0x4400_0000),
-                byte: resolve_handle(lib, "ompi_mpi_byte", 0x4c00_000d),
-                double: resolve_handle(lib, "ompi_mpi_double", 0x4c00_0011),
+                // MPICH/IntelMPI ABI constants (mpi.h): BYTE 0x4c00010d,
+                // DOUBLE 0x4c00080b, MAX 0x58000001.
+                byte: resolve_handle(lib, "ompi_mpi_byte", 0x4c00_010d),
+                double: resolve_handle(lib, "ompi_mpi_double", 0x4c00_080b),
                 max: resolve_handle(lib, "ompi_mpi_op_max", 0x5800_0001),
             });
         }
@@ -304,6 +316,15 @@ impl World {
         r.0..r.0 + r.1
     }
 
+    /// The `[begin, end)` range owned by this rank when items carry
+    /// heterogeneous costs. Collective callers must derive their exchange
+    /// layout from the same [`cost_ranges`] partition.
+    #[allow(dead_code)]
+    pub(crate) fn range_cost(&self, costs: &[u64]) -> std::ops::Range<usize> {
+        let (b, l) = cost_ranges(costs, self.size as usize)[self.rank as usize];
+        b..b + l
+    }
+
     /// Gather variable-length byte segments on the site's communicator.
     /// `ranges` lists every rank's `(offset, len)` position in `out`; `local`
     /// is this rank's segment. All ranks must agree on `ranges` and `out`.
@@ -396,6 +417,42 @@ pub(crate) fn ranges(count: usize, size: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Partition `costs` into `size` contiguous `(offset, len)` ranges of
+/// near-equal total cost. Boundaries sit at the prefix sum closest to each
+/// `rank * total / size` mark, so equal-cost items split exactly like
+/// [`ranges`]. Deterministic for a fixed cost array — every rank computes
+/// the identical partition. Empty ranges are allowed.
+pub(crate) fn cost_ranges(costs: &[u64], size: usize) -> Vec<(usize, usize)> {
+    let n = costs.len();
+    let size = size.max(1);
+    let mut prefix = Vec::with_capacity(n + 1);
+    prefix.push(0u128);
+    for &c in costs {
+        prefix.push(prefix.last().unwrap() + c as u128);
+    }
+    let total = prefix[n];
+    if total == 0 {
+        return ranges(n, size);
+    }
+    let mut out = Vec::with_capacity(size);
+    let mut begin = 0usize;
+    for rank in 1..size {
+        let target = total * rank as u128 / size as u128;
+        let mut end = begin;
+        while end < n && prefix[end + 1] <= target {
+            end += 1;
+        }
+        // prefix[end] <= target < prefix[end+1]; take the closer boundary.
+        if end < n && (prefix[end + 1] - target) < (target - prefix[end]) {
+            end += 1;
+        }
+        out.push((begin, end - begin));
+        begin = end;
+    }
+    out.push((begin, n - begin));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +473,27 @@ mod tests {
             ranges(28, 8),
             [(0, 4), (4, 4), (8, 4), (12, 4), (16, 3), (19, 3), (22, 3), (25, 3)]
         );
+    }
+
+    #[test]
+    fn cost_partition_covers_once_and_balances() {
+        for count in [0, 1, 5, 27, 28, 100] {
+            for size in 1..=8usize {
+                let costs = vec![1u64; count];
+                let mut seen = 0usize;
+                for (begin, len) in cost_ranges(&costs, size) {
+                    assert_eq!(begin, seen, "count={count} size={size}");
+                    seen += len;
+                }
+                assert_eq!(seen, count);
+            }
+        }
+        // Prefix boundary closest to total/2: [100,1,1]=102 vs [1,1,100]=102.
+        let costs = [100u64, 1, 1, 1, 1, 100];
+        let r = cost_ranges(&costs, 2);
+        assert_eq!(r, [(0, 3), (3, 3)]);
+        // Degenerate: all-zero costs split by count.
+        assert_eq!(cost_ranges(&[0; 6], 3), [(0, 2), (2, 2), (4, 2)]);
     }
 
     #[test]

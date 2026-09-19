@@ -146,8 +146,29 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             true
         };
         let __ts = std::time::Instant::now();
+        // Rank split follows block update cost (Gram entries for sampled
+        // blocks, ~n^3 proxy otherwise), not block count — a count split
+        // turns size skew into allgatherv wait on every collective.
+        let block_costs: Vec<u64> = self
+            .blocks
+            .iter()
+            .map(|b| {
+                let rows = (b.rows.end - b.rows.start) as f64;
+                match &b.scaling {
+                    Scaling::Psd(p) => p
+                        .sampled
+                        .as_ref()
+                        .map(|s| s.work.gram_slice().len().max(1) as u64)
+                        .unwrap_or_else(|| rows.powf(1.5).max(1.0) as u64),
+                    _ => rows.max(1.0) as u64,
+                }
+            })
+            .collect();
         let owned_range = world
-            .map(|w| w.range(self.blocks.len()))
+            .map(|w| {
+                let (b0, len) = crate::mpi::cost_ranges(&block_costs, w.size())[w.rank()];
+                b0..b0 + len
+            })
             .unwrap_or(0..self.blocks.len());
         let owned = |i: usize| owned_range.contains(&i);
         let valid = if inner_sampled.is_some() {
@@ -209,7 +230,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 offsets.push(offsets.last().unwrap() + n);
             }
             let gather_ranges: Vec<(usize, usize)> =
-                crate::mpi::ranges(self.blocks.len(), world.size())
+                crate::mpi::cost_ranges(&block_costs, world.size())
                     .iter()
                     .map(|&(b0, len)| (offsets[b0], offsets[b0 + len] - offsets[b0]))
                     .collect();

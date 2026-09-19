@@ -378,6 +378,25 @@ where
         }
     }
 
+    /// Shardable per-cone work ∝ n³ (SVD, congruence products, eig); svec
+    /// numel ~ n², so `numel^1.5` is the cost proxy. Stateless cones carry
+    /// unit cost — they run on every rank anyway.
+    fn mpi_work_cost(cone: &SupportedCone<T>) -> u64 {
+        let numel = cone.numel() as f64;
+        if Self::scaling_state_len(cone) > 0 {
+            numel.powf(1.5).max(1.0) as u64
+        } else {
+            1
+        }
+    }
+
+    /// Cost-balanced contiguous cone partition shared by every sharded
+    /// method and its field gather — all ranks derive identical bounds.
+    fn mpi_blocks(&self, world: crate::mpi::World) -> Vec<(usize, usize)> {
+        let costs: Vec<u64> = self.cones.iter().map(Self::mpi_work_cost).collect();
+        crate::mpi::cost_ranges(&costs, world.size())
+    }
+
     fn pack_scaling_state(cone: &SupportedCone<T>, out: &mut Vec<T>) {
         match cone {
             #[cfg(feature = "sdp")]
@@ -407,14 +426,15 @@ where
 
     /// Allgather packed per-cone fields over `world`. `widths[i]` is
     /// cone `i`'s field count in `T` elements (zero for cones that carry
-    /// no exchanged state); `fields` holds `(index, data)` pairs for
+    /// no exchanged state); `blocks` is the shared per-rank cone partition
+    /// (see [`Self::mpi_blocks`]); `fields` holds `(index, data)` pairs for
     /// this rank's owned cones in cone order. Returns every cone's
     /// fields concatenated in cone order, bitwise identical on all ranks.
     fn gather_fields(
         world: crate::mpi::World,
         ncones: usize,
         widths: &[usize],
-        owned: &std::ops::Range<usize>,
+        blocks: &[(usize, usize)],
         fields: &[(usize, Vec<T>)],
     ) -> Vec<T> {
         let mut offsets = Vec::with_capacity(ncones + 1);
@@ -422,14 +442,15 @@ where
         for &w in widths {
             offsets.push(offsets.last().unwrap() + w);
         }
-        let gather_ranges: Vec<(usize, usize)> = crate::mpi::ranges(ncones, world.size())
+        let gather_ranges: Vec<(usize, usize)> = blocks
             .iter()
             .map(|&(b0, len)| (offsets[b0], offsets[b0 + len] - offsets[b0]))
             .collect();
-        let (g0, g1) = (offsets[owned.start], offsets[owned.end]);
+        let owned = blocks[world.rank()];
+        let (g0, g1) = (offsets[owned.0], offsets[owned.0 + owned.1]);
         let mut local = Vec::with_capacity(g1 - g0);
         for &(i, ref data) in fields {
-            if !owned.contains(&i) || widths[i] == 0 {
+            if !(owned.0..owned.0 + owned.1).contains(&i) || widths[i] == 0 {
                 continue;
             }
             debug_assert_eq!(data.len(), widths[i]);
@@ -497,7 +518,11 @@ where
         μ: T,
         scaling_strategy: ScalingStrategy,
     ) -> bool {
-        let owned = world.range(self.cones.len());
+        let blocks = self.mpi_blocks(world);
+        let owned = {
+            let (b0, len) = blocks[world.rank()];
+            b0..b0 + len
+        };
         let rng = &self.rng_cones;
         let cones = &mut self.cones;
         let update_one = |i: usize, cone: &mut SupportedCone<T>, inner: bool| -> bool {
@@ -537,7 +562,7 @@ where
                 (i, data)
             })
             .collect();
-        let all = Self::gather_fields(world, self.cones.len(), &lens, &owned, &fields);
+        let all = Self::gather_fields(world, self.cones.len(), &lens, &blocks, &fields);
         let offsets = Self::field_offsets(&lens);
         for (i, cone) in self.cones.iter_mut().enumerate() {
             if lens[i] > 0 && !owned.contains(&i) {
@@ -551,7 +576,11 @@ where
     /// cones (two congruence products each) plus every stateless cone,
     /// then exchanges the `y` slices so all ranks hold the full output.
     fn mul_Hs_sharded(&mut self, world: crate::mpi::World, y: &mut [T], x: &[T]) {
-        let owned = world.range(self.cones.len());
+        let blocks = self.mpi_blocks(world);
+        let owned = {
+            let (b0, len) = blocks[world.rank()];
+            b0..b0 + len
+        };
         let results = self.mpi_eval_cones(&owned, |_i, cone, r| {
             let mut buf = vec![T::zero(); r.len()];
             let mut w = vec![T::zero(); r.len()];
@@ -569,7 +598,7 @@ where
                 }
             })
             .collect();
-        let all = Self::gather_fields(world, self.cones.len(), &widths, &owned, &results);
+        let all = Self::gather_fields(world, self.cones.len(), &widths, &blocks, &results);
         let offsets = Self::field_offsets(&widths);
         for (i, data) in results {
             if widths[i] == 0 {
@@ -592,7 +621,11 @@ where
         ds: &[T],
         z: &[T],
     ) {
-        let owned = world.range(self.cones.len());
+        let blocks = self.mpi_blocks(world);
+        let owned = {
+            let (b0, len) = blocks[world.rank()];
+            b0..b0 + len
+        };
         let results = self.mpi_eval_cones(&owned, |_i, cone, r| {
             let mut buf = vec![T::zero(); r.len()];
             let mut w = vec![T::zero(); r.len()];
@@ -610,7 +643,7 @@ where
                 }
             })
             .collect();
-        let all = Self::gather_fields(world, self.cones.len(), &widths, &owned, &results);
+        let all = Self::gather_fields(world, self.cones.len(), &widths, &blocks, &results);
         let offsets = Self::field_offsets(&widths);
         for (i, data) in results {
             if widths[i] == 0 {
@@ -636,7 +669,11 @@ where
         σμ: T,
         prepared: bool,
     ) {
-        let owned = world.range(self.cones.len());
+        let blocks = self.mpi_blocks(world);
+        let owned = {
+            let (b0, len) = blocks[world.rank()];
+            b0..b0 + len
+        };
         let results = self.mpi_eval_cones(&owned, |_i, cone, r| {
             let n = r.len();
             let mut buf = vec![T::zero(); 3 * n];
@@ -660,7 +697,7 @@ where
                 }
             })
             .collect();
-        let all = Self::gather_fields(world, self.cones.len(), &widths, &owned, &results);
+        let all = Self::gather_fields(world, self.cones.len(), &widths, &blocks, &results);
         let offsets = Self::field_offsets(&widths);
         let mut scatter = |i: usize, data: &[T], this: &mut Self| {
             let r = this.rng_cones[i].clone();
@@ -689,7 +726,11 @@ where
         z: &[T],
         pd: PrimalOrDualCone,
     ) -> (T, T) {
-        let owned = world.range(self.cones.len());
+        let blocks = self.mpi_blocks(world);
+        let owned = {
+            let (b0, len) = blocks[world.rank()];
+            b0..b0 + len
+        };
         let results = self.mpi_eval_cones(&owned, |_i, cone, r| {
             let mut zi = z[r].to_vec();
             let (αi, βi) = cone.margins(&mut zi, pd);
@@ -700,7 +741,7 @@ where
             .iter()
             .map(|c| usize::from(Self::scaling_state_len(c) > 0) * 2)
             .collect();
-        let all = Self::gather_fields(world, self.cones.len(), &widths, &owned, &results);
+        let all = Self::gather_fields(world, self.cones.len(), &widths, &blocks, &results);
         let offsets = Self::field_offsets(&widths);
         let mut per_cone: Vec<Option<(T, T)>> = vec![None; self.cones.len()];
         for (i, data) in &results {
@@ -733,7 +774,11 @@ where
         ds: &[T],
         α: T,
     ) -> T {
-        let owned = world.range(self.cones.len());
+        let blocks = self.mpi_blocks(world);
+        let owned = {
+            let (b0, len) = blocks[world.rank()];
+            b0..b0 + len
+        };
         let results = self.mpi_eval_cones(&owned, |_i, cone, r| {
             vec![cone.compute_barrier(&z[r.clone()], &s[r.clone()], &dz[r.clone()], &ds[r], α)]
         });
@@ -742,7 +787,7 @@ where
             .iter()
             .map(|c| usize::from(Self::scaling_state_len(c) > 0))
             .collect();
-        let all = Self::gather_fields(world, self.cones.len(), &widths, &owned, &results);
+        let all = Self::gather_fields(world, self.cones.len(), &widths, &blocks, &results);
         let offsets = Self::field_offsets(&widths);
         let mut per_cone: Vec<Option<T>> = vec![None; self.cones.len()];
         for (i, data) in &results {
@@ -782,7 +827,11 @@ where
         αmax: T,
         prepared: bool,
     ) -> Vec<(usize, Vec<T>, Vec<T>)> {
-        let owned = world.range(self.cones.len());
+        let blocks = self.mpi_blocks(world);
+        let owned = {
+            let (b0, len) = blocks[world.rank()];
+            b0..b0 + len
+        };
         let results = self.mpi_eval_cones(&owned, |_i, cone, r| {
             if !cone.is_symmetric() {
                 return Vec::new();
@@ -828,7 +877,7 @@ where
                 }
             })
             .collect();
-        let all = Self::gather_fields(world, self.cones.len(), &widths, &owned, &results);
+        let all = Self::gather_fields(world, self.cones.len(), &widths, &blocks, &results);
         let offsets = Self::field_offsets(&widths);
         self.sym_step_bounds.resize(self.cones.len(), (αmax, αmax));
         let mut writes = Vec::new();
