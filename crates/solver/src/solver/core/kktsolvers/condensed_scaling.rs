@@ -271,13 +271,18 @@ pub(super) fn apply_scaling_pool<T: FloatT>(
             })
             .collect();
         let mut local = vec![T::zero(); y1 - y0];
-        apply_scaling(
-            &mut blocks[block_range],
-            &mut local,
-            &x[y0..y1],
-            inverse,
-            gemm,
-        );
+        let owned = &mut blocks[block_range];
+        // One lane per owned block keeps block-level parallelism inside the
+        // rank; a serial block walk would leave the pool idle between the
+        // per-block GEMM tiles.
+        if let Some(pool) = pool.as_ref().filter(|_| owned.len() > 1) {
+            let lanes: Vec<usize> = (0..=owned.len()).collect();
+            pool.install(|| {
+                split_scaling(owned, &mut local, &x[y0..y1], inverse, &lanes, gemm)
+            });
+        } else {
+            apply_scaling(owned, &mut local, &x[y0..y1], inverse, gemm);
+        }
         y.fill(T::zero());
         world.gather_slice(crate::mpi::SITE_SCALING, &local, &gather_ranges, &mut y[..]);
         return;
