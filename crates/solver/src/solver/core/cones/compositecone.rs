@@ -211,6 +211,9 @@ where
         σμ: T,
         prepared: bool,
     ) {
+        if let Some(world) = self.mpi_world() {
+            return self.combined_shift_sharded(world, shift, step_z, step_s, σμ, prepared);
+        }
         if let Some(threading) = &self.threading {
             if let (Some(chunk), [SupportedCone::NonnegativeCone(cone)]) =
                 (threading.orthant_chunk, self.cones.as_mut_slice())
@@ -264,6 +267,24 @@ where
             .iter()
             .any(|c| matches!(c, SupportedCone::PSDTriangleCone(_)))
         {
+            if let Some(world) = self.mpi_world() {
+                let writes = self.mpi_step_bounds(world, dz, ds, z, s, settings, αmax, true);
+                for (i, wz, ws) in writes {
+                    let r = self.rng_cones[i].clone();
+                    dz[r.clone()].copy_from_slice(&wz);
+                    ds[r].copy_from_slice(&ws);
+                }
+                return self.fold_step_bounds(αmax, true, |cone, rows, cap| {
+                    cone.step_length(
+                        &dz[rows.clone()],
+                        &ds[rows.clone()],
+                        &z[rows.clone()],
+                        &s[rows],
+                        settings,
+                        cap,
+                    )
+                });
+            }
             let cached = if let Some(threading) = &self.threading {
                 if αmax.is_finite() && αmax > T::zero() && threading.sym_step_lanes.len() > 1 {
                     self.sym_step_bounds.resize(self.cones.len(), (αmax, αmax));
@@ -373,6 +394,97 @@ where
         }
     }
 
+    /// The shared MPI world when the problem has at least one PSD cone
+    /// (the only cone type worth sharding). Stateless cones still run on
+    /// every rank, so the gate is identical on all ranks.
+    fn mpi_world(&self) -> Option<crate::mpi::World> {
+        crate::mpi::World::get().filter(|_| {
+            self.cones
+                .iter()
+                .any(|c| Self::scaling_state_len(c) > 0)
+        })
+    }
+
+    /// Allgather packed per-cone fields over `world`. `widths[i]` is
+    /// cone `i`'s field count in `T` elements (zero for cones that carry
+    /// no exchanged state); `fields` holds `(index, data)` pairs for
+    /// this rank's owned cones in cone order. Returns every cone's
+    /// fields concatenated in cone order, bitwise identical on all ranks.
+    fn gather_fields(
+        world: crate::mpi::World,
+        ncones: usize,
+        widths: &[usize],
+        owned: &std::ops::Range<usize>,
+        fields: &[(usize, Vec<T>)],
+    ) -> Vec<T> {
+        let mut offsets = Vec::with_capacity(ncones + 1);
+        offsets.push(0usize);
+        for &w in widths {
+            offsets.push(offsets.last().unwrap() + w);
+        }
+        let gather_ranges: Vec<(usize, usize)> = crate::mpi::ranges(ncones, world.size())
+            .iter()
+            .map(|&(b0, len)| (offsets[b0], offsets[b0 + len] - offsets[b0]))
+            .collect();
+        let (g0, g1) = (offsets[owned.start], offsets[owned.end]);
+        let mut local = Vec::with_capacity(g1 - g0);
+        for &(i, ref data) in fields {
+            if !owned.contains(&i) || widths[i] == 0 {
+                continue;
+            }
+            debug_assert_eq!(data.len(), widths[i]);
+            local.extend_from_slice(data);
+        }
+        debug_assert_eq!(local.len(), g1 - g0);
+        let mut all = vec![T::zero(); *offsets.last().unwrap()];
+        world.gather_slice(crate::mpi::SITE_CONES, &local, &gather_ranges, &mut all);
+        all
+    }
+
+    /// Prefix offsets matching `gather_fields`' layout, so callers can
+    /// locate cone `i`'s fields inside the returned buffer.
+    fn field_offsets(widths: &[usize]) -> Vec<usize> {
+        let mut offsets = Vec::with_capacity(widths.len() + 1);
+        offsets.push(0usize);
+        for &w in widths {
+            offsets.push(offsets.last().unwrap() + w);
+        }
+        offsets
+    }
+
+    /// Runs `eval` on every cone this rank is responsible for under MPI —
+    /// the owned range plus all stateless cones, which are cheap and
+    /// needed locally on every rank — collecting `(index, fields)` pairs.
+    /// `eval` receives the cone's slice range inside the shared vectors.
+    fn mpi_eval_cones(
+        &mut self,
+        owned: &std::ops::Range<usize>,
+        eval: impl Fn(usize, &mut SupportedCone<T>, std::ops::Range<usize>) -> Vec<T> + Sync,
+    ) -> Vec<(usize, Vec<T>)> {
+        let mask = |i: usize, c: &SupportedCone<T>| {
+            owned.contains(&i) || Self::scaling_state_len(c) == 0
+        };
+        let pool = self.threading.as_ref().map(|t| t.pool.clone());
+        let rng = &self.rng_cones;
+        let cones = &mut self.cones;
+        match pool {
+            Some(pool) => pool.install(|| {
+                cones
+                    .par_iter_mut()
+                    .enumerate()
+                    .filter(|(i, c)| mask(*i, c))
+                    .map(|(i, c)| (i, eval(i, c, rng[i].clone())))
+                    .collect()
+            }),
+            None => cones
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, c)| mask(*i, c))
+                .map(|(i, c)| (i, eval(i, c, rng[i].clone())))
+                .collect(),
+        }
+    }
+
     /// Rank-sharded scaling update: each rank factorizes only its block
     /// range (the expensive SVD/W work), non-PSD cones still update on all
     /// ranks, then the packed `[R, Rinv, λ]` states are gathered in block
@@ -417,29 +529,331 @@ where
             return false;
         }
         let lens: Vec<usize> = self.cones.iter().map(Self::scaling_state_len).collect();
-        let mut offsets = Vec::with_capacity(self.cones.len() + 1);
-        offsets.push(0usize);
-        for &n in &lens {
-            offsets.push(offsets.last().unwrap() + n);
-        }
-        let gather_ranges: Vec<(usize, usize)> = crate::mpi::ranges(self.cones.len(), world.size())
-            .iter()
-            .map(|&(b0, len)| (offsets[b0], offsets[b0 + len] - offsets[b0]))
+        let fields: Vec<(usize, Vec<T>)> = owned
+            .clone()
+            .map(|i| {
+                let mut data = Vec::with_capacity(lens[i]);
+                Self::pack_scaling_state(&self.cones[i], &mut data);
+                (i, data)
+            })
             .collect();
-        let (g0, g1) = (offsets[owned.start], offsets[owned.end]);
-        let mut local = Vec::with_capacity(g1 - g0);
-        for i in owned.clone() {
-            Self::pack_scaling_state(&self.cones[i], &mut local);
-        }
-        debug_assert_eq!(local.len(), g1 - g0);
-        let mut all = vec![T::zero(); *offsets.last().unwrap()];
-        world.gather_slice(crate::mpi::SITE_CONES, &local, &gather_ranges, &mut all);
+        let all = Self::gather_fields(world, self.cones.len(), &lens, &owned, &fields);
+        let offsets = Self::field_offsets(&lens);
         for (i, cone) in self.cones.iter_mut().enumerate() {
             if lens[i] > 0 && !owned.contains(&i) {
                 Self::unpack_scaling_state(cone, &all[offsets[i]..offsets[i] + lens[i]]);
             }
         }
         true
+    }
+
+    /// Rank-sharded `mul_Hs`: each rank evaluates only its owned PSD
+    /// cones (two congruence products each) plus every stateless cone,
+    /// then exchanges the `y` slices so all ranks hold the full output.
+    fn mul_Hs_sharded(&mut self, world: crate::mpi::World, y: &mut [T], x: &[T]) {
+        let owned = world.range(self.cones.len());
+        let results = self.mpi_eval_cones(&owned, |_i, cone, r| {
+            let mut buf = vec![T::zero(); r.len()];
+            let mut w = vec![T::zero(); r.len()];
+            cone.mul_Hs(&mut buf, &x[r], &mut w);
+            buf
+        });
+        let widths: Vec<usize> = self
+            .cones
+            .iter()
+            .map(|c| {
+                if Self::scaling_state_len(c) > 0 {
+                    c.numel()
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let all = Self::gather_fields(world, self.cones.len(), &widths, &owned, &results);
+        let offsets = Self::field_offsets(&widths);
+        for (i, data) in results {
+            if widths[i] == 0 {
+                y[self.rng_cones[i].clone()].copy_from_slice(&data);
+            }
+        }
+        for (i, cone) in self.cones.iter().enumerate() {
+            if widths[i] > 0 {
+                let r = self.rng_cones[i].clone();
+                y[r].copy_from_slice(&all[offsets[i]..offsets[i] + cone.numel()]);
+            }
+        }
+    }
+
+    /// Rank-sharded `Δs_from_Δz_offset` with the same gather pattern.
+    fn Δs_sharded(
+        &mut self,
+        world: crate::mpi::World,
+        out: &mut [T],
+        ds: &[T],
+        z: &[T],
+    ) {
+        let owned = world.range(self.cones.len());
+        let results = self.mpi_eval_cones(&owned, |_i, cone, r| {
+            let mut buf = vec![T::zero(); r.len()];
+            let mut w = vec![T::zero(); r.len()];
+            cone.Δs_from_Δz_offset(&mut buf, &ds[r.clone()], &mut w, &z[r]);
+            buf
+        });
+        let widths: Vec<usize> = self
+            .cones
+            .iter()
+            .map(|c| {
+                if Self::scaling_state_len(c) > 0 {
+                    c.numel()
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let all = Self::gather_fields(world, self.cones.len(), &widths, &owned, &results);
+        let offsets = Self::field_offsets(&widths);
+        for (i, data) in results {
+            if widths[i] == 0 {
+                out[self.rng_cones[i].clone()].copy_from_slice(&data);
+            }
+        }
+        for (i, cone) in self.cones.iter().enumerate() {
+            if widths[i] > 0 {
+                let r = self.rng_cones[i].clone();
+                out[r].copy_from_slice(&all[offsets[i]..offsets[i] + cone.numel()]);
+            }
+        }
+    }
+
+    /// Rank-sharded `combined_shift_impl`: `[shift | step_z | step_s]`
+    /// per cone packed as one field.
+    fn combined_shift_sharded(
+        &mut self,
+        world: crate::mpi::World,
+        shift: &mut [T],
+        step_z: &mut [T],
+        step_s: &mut [T],
+        σμ: T,
+        prepared: bool,
+    ) {
+        let owned = world.range(self.cones.len());
+        let results = self.mpi_eval_cones(&owned, |_i, cone, r| {
+            let n = r.len();
+            let mut buf = vec![T::zero(); 3 * n];
+            let (sh, rest) = buf.split_at_mut(n);
+            let (sz, ss) = rest.split_at_mut(n);
+            Self::shift_one(cone, sh, sz, ss, σμ, prepared);
+            buf
+        });
+        let widths: Vec<usize> = self
+            .cones
+            .iter()
+            .map(|c| {
+                if Self::scaling_state_len(c) > 0 {
+                    3 * c.numel()
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let all = Self::gather_fields(world, self.cones.len(), &widths, &owned, &results);
+        let offsets = Self::field_offsets(&widths);
+        let mut scatter = |i: usize, data: &[T], this: &mut Self| {
+            let r = this.rng_cones[i].clone();
+            let n = r.len();
+            shift[r.clone()].copy_from_slice(&data[..n]);
+            step_z[r.clone()].copy_from_slice(&data[n..2 * n]);
+            step_s[r].copy_from_slice(&data[2 * n..3 * n]);
+        };
+        for (i, data) in &results {
+            if widths[*i] == 0 {
+                scatter(*i, data, self);
+            }
+        }
+        for i in 0..self.cones.len() {
+            if widths[i] > 0 {
+                scatter(i, &all[offsets[i]..offsets[i] + widths[i]], self);
+            }
+        }
+    }
+
+    /// Rank-sharded `margins`: per-cone `(αi, βi)` exchanged and folded
+    /// in cone order — bitwise identical to the serial fold.
+    fn margins_sharded(
+        &mut self,
+        world: crate::mpi::World,
+        z: &[T],
+        pd: PrimalOrDualCone,
+    ) -> (T, T) {
+        let owned = world.range(self.cones.len());
+        let results = self.mpi_eval_cones(&owned, |_i, cone, r| {
+            let mut zi = z[r].to_vec();
+            let (αi, βi) = cone.margins(&mut zi, pd);
+            vec![αi, βi]
+        });
+        let widths: Vec<usize> = self
+            .cones
+            .iter()
+            .map(|c| usize::from(Self::scaling_state_len(c) > 0) * 2)
+            .collect();
+        let all = Self::gather_fields(world, self.cones.len(), &widths, &owned, &results);
+        let offsets = Self::field_offsets(&widths);
+        let mut per_cone: Vec<Option<(T, T)>> = vec![None; self.cones.len()];
+        for (i, data) in &results {
+            if widths[*i] == 0 {
+                per_cone[*i] = Some((data[0], data[1]));
+            }
+        }
+        for i in 0..self.cones.len() {
+            if widths[i] > 0 {
+                per_cone[i] = Some((all[offsets[i]], all[offsets[i] + 1]));
+            }
+        }
+        let mut α = T::max_value();
+        let mut β = T::zero();
+        for v in per_cone.iter().flatten() {
+            α = T::min(α, v.0);
+            β += v.1;
+        }
+        (α, β)
+    }
+
+    /// Rank-sharded `compute_barrier`: per-cone barrier exchanged and
+    /// summed in cone order on every rank.
+    fn compute_barrier_sharded(
+        &mut self,
+        world: crate::mpi::World,
+        z: &[T],
+        s: &[T],
+        dz: &[T],
+        ds: &[T],
+        α: T,
+    ) -> T {
+        let owned = world.range(self.cones.len());
+        let results = self.mpi_eval_cones(&owned, |_i, cone, r| {
+            vec![cone.compute_barrier(&z[r.clone()], &s[r.clone()], &dz[r.clone()], &ds[r], α)]
+        });
+        let widths: Vec<usize> = self
+            .cones
+            .iter()
+            .map(|c| usize::from(Self::scaling_state_len(c) > 0))
+            .collect();
+        let all = Self::gather_fields(world, self.cones.len(), &widths, &owned, &results);
+        let offsets = Self::field_offsets(&widths);
+        let mut per_cone: Vec<Option<T>> = vec![None; self.cones.len()];
+        for (i, data) in &results {
+            if widths[*i] == 0 {
+                per_cone[*i] = Some(data[0]);
+            }
+        }
+        for i in 0..self.cones.len() {
+            if widths[i] > 0 {
+                per_cone[i] = Some(all[offsets[i]]);
+            }
+        }
+        let mut barrier = T::zero();
+        for v in per_cone.iter().flatten() {
+            barrier += *v;
+        }
+        barrier
+    }
+
+    /// Rank-sharded symmetric-cone step evaluation shared by
+    /// `step_length` and `prepare_affine_bounds`. Each rank evaluates
+    /// only its owned PSD cones (at the global cap — the min-fold is
+    /// cap-insensitive, so the result is bitwise identical) plus every
+    /// stateless symmetric cone, then exchanges per-cone bounds. Fills
+    /// `sym_step_bounds` for every symmetric cone and, for `prepared`,
+    /// returns the rewritten `(dz, ds)` slices of every PSD cone for the
+    /// caller to scatter.
+    #[allow(clippy::too_many_arguments)]
+    fn mpi_step_bounds(
+        &mut self,
+        world: crate::mpi::World,
+        dz: &[T],
+        ds: &[T],
+        z: &[T],
+        s: &[T],
+        settings: &CoreSettings<T>,
+        αmax: T,
+        prepared: bool,
+    ) -> Vec<(usize, Vec<T>, Vec<T>)> {
+        let owned = world.range(self.cones.len());
+        let results = self.mpi_eval_cones(&owned, |_i, cone, r| {
+            if !cone.is_symmetric() {
+                return Vec::new();
+            }
+            #[cfg(feature = "sdp")]
+            if let SupportedCone::PSDTriangleCone(cone) = cone {
+                if prepared {
+                    let n = r.len();
+                    let mut buf = vec![T::zero(); 2 * n + 2];
+                    let (dz_i, rest) = buf.split_at_mut(n);
+                    let (ds_i, tail) = rest.split_at_mut(n);
+                    let (αz, αs) = cone.prepare_affine_bounds(dz_i, ds_i, αmax);
+                    tail[0] = αz;
+                    tail[1] = αs;
+                    return buf;
+                }
+            }
+            let (αz, αs) = cone.step_length(
+                &dz[r.clone()],
+                &ds[r.clone()],
+                &z[r.clone()],
+                &s[r],
+                settings,
+                αmax,
+            );
+            vec![αz, αs]
+        });
+        let widths: Vec<usize> = self
+            .cones
+            .iter()
+            .map(|c| {
+                if Self::scaling_state_len(c) > 0 {
+                    if prepared {
+                        2 * c.numel() + 2
+                    } else {
+                        2
+                    }
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let all = Self::gather_fields(world, self.cones.len(), &widths, &owned, &results);
+        let offsets = Self::field_offsets(&widths);
+        self.sym_step_bounds.resize(self.cones.len(), (αmax, αmax));
+        let mut writes = Vec::new();
+        let mut absorb = |i: usize, data: &[T], this: &mut Self| {
+            if !this.cones[i].is_symmetric() {
+                return;
+            }
+            if widths[i] > 0 {
+                if prepared {
+                    let n = this.rng_cones[i].len();
+                    writes.push((
+                        i,
+                        data[..n].to_vec(),
+                        data[n..2 * n].to_vec(),
+                    ));
+                }
+                this.sym_step_bounds[i] = (data[widths[i] - 2], data[widths[i] - 1]);
+            } else {
+                this.sym_step_bounds[i] = (data[0], data[1]);
+            }
+        };
+        for (i, data) in &results {
+            if widths[*i] == 0 {
+                absorb(*i, data, self);
+            }
+        }
+        for i in 0..self.cones.len() {
+            if widths[i] > 0 {
+                absorb(i, &all[offsets[i]..offsets[i] + widths[i]], self);
+            }
+        }
+        writes
     }
 }
 
@@ -490,6 +904,9 @@ where
     }
 
     fn margins(&mut self, z: &mut [T], pd: PrimalOrDualCone) -> (T, T) {
+        if let Some(world) = self.mpi_world() {
+            return self.margins_sharded(world, z, pd);
+        }
         let mut α = T::max_value();
         let mut β = T::zero();
         for (cone, rng) in zip(&mut self.cones, &self.rng_cones) {
@@ -525,14 +942,8 @@ where
         μ: T,
         scaling_strategy: ScalingStrategy,
     ) -> bool {
-        if let Some(world) = crate::mpi::World::get() {
-            if self
-                .cones
-                .iter()
-                .any(|c| Self::scaling_state_len(c) > 0)
-            {
-                return self.update_scaling_sharded(world, s, z, μ, scaling_strategy);
-            }
+        if let Some(world) = self.mpi_world() {
+            return self.update_scaling_sharded(world, s, z, μ, scaling_strategy);
         }
         if let Some(threading) = &self.threading {
             if let (Some(chunk), [SupportedCone::NonnegativeCone(cone)]) =
@@ -576,6 +987,9 @@ where
     }
 
     fn mul_Hs(&mut self, y: &mut [T], x: &[T], work: &mut [T]) {
+        if let Some(world) = self.mpi_world() {
+            return self.mul_Hs_sharded(world, y, x);
+        }
         if let Some(threading) = &self.threading {
             if let (Some(chunk), [SupportedCone::NonnegativeCone(cone)]) =
                 (threading.orthant_chunk, self.cones.as_mut_slice())
@@ -616,6 +1030,9 @@ where
     }
 
     fn Δs_from_Δz_offset(&mut self, out: &mut [T], ds: &[T], work: &mut [T], z: &[T]) {
+        if let Some(world) = self.mpi_world() {
+            return self.Δs_sharded(world, out, ds, z);
+        }
         if let Some(threading) = &self.threading {
             if let (Some(chunk), [SupportedCone::NonnegativeCone(cone)]) =
                 (threading.orthant_chunk, self.cones.as_mut_slice())
@@ -656,7 +1073,10 @@ where
         settings: &CoreSettings<T>,
         αmax: T,
     ) -> (T, T) {
-        let cached_sym = if let Some(threading) = &self.threading {
+        let cached_sym = if let Some(world) = self.mpi_world() {
+            self.mpi_step_bounds(world, dz, ds, z, s, settings, αmax, false);
+            true
+        } else if let Some(threading) = &self.threading {
             if let (Some(chunk), [SupportedCone::NonnegativeCone(cone)]) =
                 (threading.orthant_chunk, self.cones.as_mut_slice())
             {
@@ -700,6 +1120,9 @@ where
     }
 
     fn compute_barrier(&mut self, z: &[T], s: &[T], dz: &[T], ds: &[T], α: T) -> T {
+        if let Some(world) = self.mpi_world() {
+            return self.compute_barrier_sharded(world, z, s, dz, ds, α);
+        }
         let mut barrier = T::zero();
         for (cone, rng) in zip(&mut self.cones, &self.rng_cones) {
             let zi = &z[rng.clone()];

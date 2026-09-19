@@ -174,7 +174,7 @@ fn load() -> Option<Fns> {
                 comm_world: resolve_handle(lib, "ompi_mpi_comm_world", 0x4400_0000),
                 byte: resolve_handle(lib, "ompi_mpi_byte", 0x4c00_000d),
                 double: resolve_handle(lib, "ompi_mpi_double", 0x4c00_0011),
-                max: resolve_handle(lib, "ompi_mpi_max", 0x5800_0001),
+                max: resolve_handle(lib, "ompi_mpi_op_max", 0x5800_0001),
             });
         }
     }
