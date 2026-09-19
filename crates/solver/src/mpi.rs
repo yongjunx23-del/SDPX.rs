@@ -242,6 +242,7 @@ impl World {
         assert_eq!(ranges.len(), self.size as usize);
         let lens: Vec<i32> = ranges.iter().map(|&(_, l)| l).collect();
         let displs: Vec<i32> = ranges.iter().map(|&(o, _)| o).collect();
+        let t0 = std::env::var_os("SDPX_PROFILE").map(|_| std::time::Instant::now());
         let rc = unsafe {
             (self.fns.allgatherv)(
                 local.as_ptr().cast(),
@@ -254,6 +255,9 @@ impl World {
                 self.comms[site],
             )
         };
+        if let Some(t0) = t0 {
+            eprintln!("PHASE mpi.gather{site} {:?}", t0.elapsed());
+        }
         assert_eq!(rc, 0, "MPI_Allgatherv failed");
     }
 

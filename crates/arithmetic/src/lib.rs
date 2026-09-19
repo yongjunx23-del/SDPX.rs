@@ -829,6 +829,40 @@ impl<const N: usize> FloatConst for MpFloat<N> {
 }
 
 
+// Inner-operator parallelism gate. Solver-pool lanes set this flag so heavy
+// kernels (e.g. the MPFR SVD) may re-offer independent inner work to the
+// ambient Rayon pool. It lives here because the BLAS sources are `include!`d
+// into standalone test crates where solver-internal paths do not resolve.
+#[doc(hidden)]
+pub mod inner_parallel {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// True while this thread is running a lane on the solver pool.
+    #[inline]
+    pub fn active() -> bool {
+        ENABLED.with(Cell::get)
+    }
+
+    /// RAII guard enabling [`active`] until dropped.
+    pub struct Guard(bool);
+
+    impl Guard {
+        pub fn enter() -> Self {
+            Self(ENABLED.with(|c| c.replace(true)))
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ENABLED.with(|c| c.set(self.0));
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;

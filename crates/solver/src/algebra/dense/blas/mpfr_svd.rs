@@ -1,5 +1,9 @@
 use super::*;
 
+// Minimum column count before a reflector update is offered to the ambient
+// solver pool; smaller tails stay serial to avoid dispatch overhead.
+const PAR_COLS: usize = 4;
+
 pub(super) fn num<const N: usize>(v: usize) -> F<N> {
     <F<N> as num_traits::FromPrimitive>::from_usize(v).unwrap()
 }
@@ -106,20 +110,35 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
     right: &mut [F<N>],
     scratch: &mut [F<N>],
 ) {
+    let par = sdpx_arithmetic::inner_parallel::active();
     for k in 0..n {
         let x = &mut scratch[..m - k];
         x.copy_from_slice(&a[k + k * m..(k + 1) * m]);
         let (beta, tau) = reflector(x);
         d[k] = beta;
         left[k] = tau;
-        for j in k + 1..n {
-            let mut dot = F::dot_fma(
-                x.iter().zip(&a[k + j * m..m + j * m]),
-            );
-            dot *= tau;
-            let ndot = -dot;
-            for i in k..m {
-                a[i + j * m] = x[i - k].mul_add(ndot, a[i + j * m]);
+        // Column updates are independent; under a solver pool they fill the
+        // block-level tail. Order within each column is unchanged.
+        if par && n - k - 1 >= PAR_COLS {
+            let x: &[F<N>] = x;
+            a[(k + 1) * m..n * m].par_chunks_mut(m).for_each(|col| {
+                let mut dot = F::dot_fma(x.iter().zip(&col[k..m]));
+                dot *= tau;
+                let ndot = -dot;
+                for i in k..m {
+                    col[i] = x[i - k].mul_add(ndot, col[i]);
+                }
+            });
+        } else {
+            for j in k + 1..n {
+                let mut dot = F::dot_fma(
+                    x.iter().zip(&a[k + j * m..m + j * m]),
+                );
+                dot *= tau;
+                let ndot = -dot;
+                for i in k..m {
+                    a[i + j * m] = x[i - k].mul_add(ndot, a[i + j * m]);
+                }
             }
         }
         a[k + k * m] = beta;
@@ -127,21 +146,52 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
             a[i + k * m] = x[i - k];
         }
         if k + 1 < n {
-            let x = &mut scratch[..n - k - 1];
+            // Row dots need a second buffer; scratch is sized 2*m so x
+            // occupies the first half and the row-dot results the second.
+            let (xs, ndots) = scratch.split_at_mut(m);
+            let x = &mut xs[..n - k - 1];
             for j in k + 1..n {
                 x[j - k - 1] = a[k + j * m];
             }
             let (beta, tau) = reflector(x);
             e[k] = beta;
             right[k] = tau;
-            for i in k + 1..m {
-                let mut dot = F::dot_fma(
-                    (k + 1..n).map(|j| (&a[i + j * m], &x[j - k - 1])),
-                );
-                dot *= tau;
-                let ndot = -dot;
-                for j in k + 1..n {
-                    a[i + j * m] = x[j - k - 1].mul_add(ndot, a[i + j * m]);
+            let rows = m - k - 1;
+            if par && rows >= PAR_COLS {
+                let x: &[F<N>] = x;
+                // Phase 1: per-row dots (shared reads) into ndots.
+                let a_ro: &[F<N>] = a;
+                ndots[..rows]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(t, nd)| {
+                        let i = k + 1 + t;
+                        let mut dot = F::dot_fma(
+                            (k + 1..n).map(|j| (&a_ro[i + j * m], &x[j - k - 1])),
+                        );
+                        dot *= tau;
+                        *nd = -dot;
+                    });
+                // Phase 2: independent column updates.
+                a[(k + 1) * m..n * m]
+                    .par_chunks_mut(m)
+                    .enumerate()
+                    .for_each(|(t, col)| {
+                        let xj = x[t];
+                        for i in k + 1..m {
+                            col[i] = xj.mul_add(ndots[i - k - 1], col[i]);
+                        }
+                    });
+            } else {
+                for i in k + 1..m {
+                    let mut dot = F::dot_fma(
+                        (k + 1..n).map(|j| (&a[i + j * m], &x[j - k - 1])),
+                    );
+                    dot *= tau;
+                    let ndot = -dot;
+                    for j in k + 1..n {
+                        a[i + j * m] = x[j - k - 1].mul_add(ndot, a[i + j * m]);
+                    }
                 }
             }
             a[k + (k + 1) * m] = beta;
@@ -374,30 +424,45 @@ pub(super) fn apply_reflectors<const N: usize>(
     uc: usize,
     v: &mut [F<N>],
 ) {
+    let par = sdpx_arithmetic::inner_parallel::active();
     for k in (0..n).rev() {
-        for j in 0..uc {
+        let update = |col: &mut [F<N>]| {
             let mut dot = F::dot_fma(
-                (k + 1..m).map(|i| (&a[i + k * m], &u[i + j * m])),
-            ) + u[k + j * m];
+                (k + 1..m).map(|i| (&a[i + k * m], &col[i])),
+            ) + col[k];
             dot *= left[k];
             let ndot = -dot;
-            u[k + j * m] += ndot;
+            col[k] += ndot;
             for i in k + 1..m {
-                u[i + j * m] = a[i + k * m].mul_add(ndot, u[i + j * m]);
+                col[i] = a[i + k * m].mul_add(ndot, col[i]);
+            }
+        };
+        if par && uc >= PAR_COLS {
+            u[..uc * m].par_chunks_mut(m).for_each(update);
+        } else {
+            for j in 0..uc {
+                update(&mut u[j * m..(j + 1) * m]);
             }
         }
     }
     if !v.is_empty() {
         for k in (0..n.saturating_sub(1)).rev() {
-            for j in 0..n {
+            let update = |col: &mut [F<N>]| {
                 let mut dot = F::dot_fma(
-                    (k + 2..n).map(|i| (&a[k + i * m], &v[i + j * n])),
-                ) + v[k + 1 + j * n];
+                    (k + 2..n).map(|i| (&a[k + i * m], &col[i])),
+                ) + col[k + 1];
                 dot *= right[k];
                 let ndot = -dot;
-                v[k + 1 + j * n] += ndot;
+                col[k + 1] += ndot;
                 for i in k + 2..n {
-                    v[i + j * n] = a[k + i * m].mul_add(ndot, v[i + j * n]);
+                    col[i] = a[k + i * m].mul_add(ndot, col[i]);
+                }
+            };
+            if par && n >= PAR_COLS {
+                v[..n * n].par_chunks_mut(n).for_each(update);
+            } else {
+                for j in 0..n {
+                    update(&mut v[j * n..(j + 1) * n]);
                 }
             }
         }
@@ -436,7 +501,7 @@ pub(super) fn svd_work_len(m: usize, n: usize, uc: usize, vr: usize) -> Option<u
         n.saturating_sub(1),
         n,
         n.saturating_sub(1),
-        m,
+        m.checked_mul(2)?,
         m.checked_mul(uc)?,
         if vr > 0 { n.checked_mul(n)? } else { 0 },
         n,
@@ -468,7 +533,7 @@ pub(super) fn svd<'a, const N: usize>(
     let e = take_work(&mut work, n.saturating_sub(1));
     let left = take_work(&mut work, n);
     let right = take_work(&mut work, n.saturating_sub(1));
-    let scratch = take_work(&mut work, m);
+    let scratch = take_work(&mut work, 2 * m);
     let u = take_work(&mut work, m * uc);
     let v = take_work(&mut work, if vr > 0 { n * n } else { 0 });
     let order = take_work(&mut work, n);

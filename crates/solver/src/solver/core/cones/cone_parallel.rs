@@ -203,6 +203,10 @@ where
     F: Fn(&mut SupportedCone<T>, Range<usize>, B) -> bool + Sync,
 {
     if lanes.len() == 1 {
+        // This leaf runs on a solver-pool worker (apply is only ever invoked
+        // under `pool.install`), so heavy per-cone kernels may re-offer
+        // independent inner work to the ambient pool.
+        let _inner = sdpx_arithmetic::inner_parallel::Guard::enter();
         let mut buffers = buffers;
         let mut row = lanes[0].row_start;
         let mut success = true;
