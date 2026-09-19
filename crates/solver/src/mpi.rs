@@ -76,10 +76,14 @@ struct Fns {
 unsafe fn resolve_handle(lib: *mut c_void, variable: &str, fallback: usize) -> *mut c_void {
     let name = CString::new(variable).unwrap();
     let symbol = unsafe { dlsym(lib, name.as_ptr()) };
+    // OpenMPI predefined handles are the *addresses* of global struct
+    // instances (MPI_COMM_WORLD = &ompi_mpi_comm_world), so the dlsym result
+    // is already the handle. MPICH-style integer constants remain the
+    // fallback when the OpenMPI globals are absent.
     if symbol.is_null() {
         fallback as *mut c_void
     } else {
-        unsafe { *(symbol as *const *mut c_void) }
+        symbol
     }
 }
 
@@ -111,15 +115,15 @@ fn load() -> Option<Fns> {
             continue;
         }
         unsafe {
-            if dlsym(lib, c"MpiComm_rank".as_ptr()).is_null() {
+            if dlsym(lib, c"MPI_Comm_rank".as_ptr()).is_null() {
                 continue;
             }
             return Some(Fns {
                 init_thread: sym!(lib, "MPI_Init_thread"),
                 initialized: sym!(lib, "MPI_Initialized"),
-                comm_size: sym!(lib, "MpiComm_size"),
-                comm_rank: sym!(lib, "MpiComm_rank"),
-                comm_dup: sym!(lib, "MpiComm_dup"),
+                comm_size: sym!(lib, "MPI_Comm_size"),
+                comm_rank: sym!(lib, "MPI_Comm_rank"),
+                comm_dup: sym!(lib, "MPI_Comm_dup"),
                 allgatherv: sym!(lib, "MPI_Allgatherv"),
                 allreduce: sym!(lib, "MPI_Allreduce"),
                 comm_world: resolve_handle(lib, "ompi_mpi_comm_world", 0x4400_0000),
