@@ -52,6 +52,72 @@ fn pooled_gemm<T: FloatT, MATA, MATB>(
     c.mul(a, b, T::one(), T::zero());
 }
 
+/// `a·b` when the exact-arithmetic product is symmetric. Only the upper
+/// triangle is evaluated and then mirrored — the same ascending-k accumulation
+/// order as `pooled_gemm`, so upper entries stay bitwise identical while the
+/// lower half is an exact copy instead of independently rounded products.
+fn pooled_gemm_sym<T: FloatT, MATA, MATB>(
+    c: &mut Matrix<T>,
+    a: &MATA,
+    b: &MATB,
+    gemm: Option<(&rayon::ThreadPool, usize)>,
+) where
+    MATA: DenseMatrix<T>,
+    MATB: DenseMatrix<T>,
+{
+    let (m, n, k) = (a.nrows(), b.ncols(), a.ncols());
+    debug_assert_eq!(m, n);
+    let (ta, tb) = (a.shape().as_blas_char(), b.shape().as_blas_char());
+    let lda = if a.shape() == MatrixShape::N { m } else { k };
+    let ldb = if b.shape() == MatrixShape::N { k } else { n };
+    let (adata, bdata) = (a.data(), b.data());
+    let ae = |i: usize, p: usize| -> &T {
+        &adata[if ta == b'N' { i + p * lda } else { p + i * lda }]
+    };
+    let be = |p: usize, j: usize| -> &T {
+        &bdata[if tb == b'N' { p + j * ldb } else { j + p * ldb }]
+    };
+    let column = |j: usize, col: &mut [T]| {
+        for i in 0..=j {
+            let mut v = T::zero();
+            for p in 0..k {
+                v = ae(i, p).mul_add(*be(p, j), v);
+            }
+            col[i] = v;
+        }
+    };
+    if let Some((pool, tiles)) = gemm.filter(|(p, t)| *t > 1 && p.current_num_threads() > 1) {
+        if n > 1 {
+            let tile = n.div_ceil(tiles.min(n));
+            pool.install(|| {
+                c.data_mut()
+                    .par_chunks_mut(tile * m)
+                    .enumerate()
+                    .for_each(|(t, chunk)| {
+                        let j0 = t * tile;
+                        let j1 = (j0 + tile).min(n);
+                        for (jc, j) in (j0..j1).enumerate() {
+                            column(j, &mut chunk[jc * m..(jc + 1) * m]);
+                        }
+                    });
+            });
+        } else {
+            for j in 0..n {
+                column(j, &mut c.data_mut()[j * m..(j + 1) * m]);
+            }
+        }
+    } else {
+        for j in 0..n {
+            column(j, &mut c.data_mut()[j * m..(j + 1) * m]);
+        }
+    }
+    for j in 0..n {
+        for i in j + 1..n {
+            c[(i, j)] = c[(j, i)];
+        }
+    }
+}
+
 impl<T: FloatT> PsdBlock<T> {
     /// Single-block constructor used by tests. The solver routes one shared
     /// pass over A through `from_columns` instead.
@@ -596,18 +662,18 @@ impl<T: FloatT> PsdBlock<T> {
             // H^-1 = W^-1 W^-T; retain the inverse factors in solve-time
             // applications rather than squaring them into Ginv.
             pooled_gemm(&mut self.mat2, &self.mat1, &self.Rinv.t(), gemm);
-            pooled_gemm(&mut self.mat3, &self.Rinv, &self.mat2, gemm);
+            pooled_gemm_sym(&mut self.mat3, &self.Rinv, &self.mat2, gemm);
             mat_to_svec(&mut self.vector, &self.mat3);
             svec_to_mat(&mut self.mat1, &self.vector);
             pooled_gemm(&mut self.mat2, &self.Rinv.t(), &self.mat1, gemm);
-            pooled_gemm(&mut self.mat3, &self.mat2, &self.Rinv, gemm);
+            pooled_gemm_sym(&mut self.mat3, &self.mat2, &self.Rinv, gemm);
         } else {
             pooled_gemm(&mut self.mat2, &self.R.t(), &self.mat1, gemm);
-            pooled_gemm(&mut self.mat3, &self.mat2, &self.R, gemm);
+            pooled_gemm_sym(&mut self.mat3, &self.mat2, &self.R, gemm);
             mat_to_svec(&mut self.vector, &self.mat3);
             svec_to_mat(&mut self.mat1, &self.vector);
             pooled_gemm(&mut self.mat2, &self.mat1, &self.R.t(), gemm);
-            pooled_gemm(&mut self.mat3, &self.R, &self.mat2, gemm);
+            pooled_gemm_sym(&mut self.mat3, &self.R, &self.mat2, gemm);
         }
         mat_to_svec(y, &self.mat3);
     }
