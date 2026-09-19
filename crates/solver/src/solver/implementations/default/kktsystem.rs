@@ -281,8 +281,27 @@ where
             );
             variables.s.scalarop_from(|z| -z, &variables.z);
         }
-        is_success
+        is_success && !initial_point_degenerate(variables, data)
     }
+}
+
+/// True when the initial KKT solve returned a point whose magnitude
+/// dwarfs the problem data by orders of magnitude.  Direct solves on
+/// severely ill-conditioned systems can produce components along
+/// near-null directions that make every relative residual measure
+/// meaningless; such a point is not a usable initializer.
+fn initial_point_degenerate<T: FloatT>(
+    variables: &DefaultVariables<T>,
+    data: &DefaultProblemData<T>,
+) -> bool {
+    let scale = data
+        .b
+        .norm_inf()
+        .max(data.q.norm_inf())
+        .max(data.A.nzval.norm_inf())
+        .max(T::one());
+    let bound = T::from_f64(1e12).unwrap() * scale;
+    !(variables.x.norm_inf() <= bound && variables.z.norm_inf() <= bound)
 }
 
 impl<T> DefaultKKTSystem<T>
@@ -309,5 +328,41 @@ where
 
     pub(crate) fn update_A(&mut self, A: &CscMatrix<T>) {
         self.kktsolver.update_A(A);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::solver::SupportedConeT::NonnegativeConeT;
+
+    #[test]
+    fn degenerate_initial_point_detected() {
+        let P = CscMatrix::<f64>::identity(2);
+        let q = vec![1.0, 0.0];
+        let A = CscMatrix::<f64>::identity(2);
+        let b = vec![1.0, 1.0];
+        let cones = vec![NonnegativeConeT(2)];
+        let settings = DefaultSettings::default();
+        let data = DefaultProblemData::new(&P, &q, &A, &b, &cones, &settings);
+
+        let mut v = DefaultVariables::new(2, 2);
+        v.x.fill(1.0);
+        v.z.fill(1.0);
+        assert!(!initial_point_degenerate(&v, &data));
+
+        // a KKT initializer with components ~1e20 on unit-scale data
+        // is numerically meaningless and must be rejected
+        v.x[0] = 1e20;
+        assert!(initial_point_degenerate(&v, &data));
+
+        v.x[0] = 1.0;
+        v.z[1] = -1e20;
+        assert!(initial_point_degenerate(&v, &data));
+
+        // NaN / non-finite initializers are equally unusable
+        v.z[1] = 1.0;
+        v.x[0] = f64::NAN;
+        assert!(initial_point_degenerate(&v, &data));
     }
 }

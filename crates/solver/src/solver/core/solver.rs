@@ -591,10 +591,18 @@ mod internal {
                 self.kktsystem
                     .update(&self.data, &self.cones, &self.settings);
                 // solve for primal/dual initial points via KKT
-                self.kktsystem
-                    .solve_initial_point(&mut self.variables, &self.data, &self.settings);
+                let ok = self.kktsystem.solve_initial_point(
+                    &mut self.variables,
+                    &self.data,
+                    &self.settings,
+                );
                 // fix up (z,s) so that they are in the cone
                 self.variables.symmetric_initialization(&mut self.cones);
+                // a failed or degenerate KKT initializer is not a valid
+                // starting point; fall back to the unit interior point
+                if !ok {
+                    self.variables.unit_initialization(&self.cones);
+                }
             } else {
                 // Assigns unit (z,s) and zeros the primal variables
                 self.variables.unit_initialization(&self.cones);

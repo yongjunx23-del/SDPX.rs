@@ -226,6 +226,33 @@ External audits falsify the iter-0 "Solved" result. Verified chain:
   envelope; acceptance must use inputs that iterate (587-class or
   better-conditioned conversions).
 
+Further verified findings (cluster jobs 213629/213668/213669):
+
+- Forcing 60 real iterations (tol=1e-300) on Λ=11 converges to the
+  independently audited objective **-18.1686186450146** with audit
+  primal 5.2e-37 / dual 1.7e-35 — the IPM solves the problem fine;
+  only the premature acceptance was wrong.
+- The converged solution itself has ‖x‖ up to ~8e78 (p50 ~4e11) —
+  the huge scale is **intrinsic to the true solution**, not an
+  initial-point artefact; unit column scaling only reduces it to
+  ~1e57 (near-null direction survives coordinate changes).
+- The iter-0 pass needs gap + primal + dual to hold *simultaneously*;
+  the degenerate LSQ initial point coincidentally satisfies the gap
+  check (qᵀx̃ ≈ -bᵀz̃ structurally). A unit interior start makes the
+  gap check honest → forces real iteration.
+
+### Fix: degenerate initial-point guard (this commit)
+
+`solve_initial_point` now returns failure when the KKT initializer's
+‖x‖/‖z‖ exceeds `1e12 × max(1, ‖b‖∞, ‖q‖∞, ‖A‖∞)` — a catastrophic
+numerical degeneracy signature (ising: ‖x‖~1e78 vs bound ~1e14).
+`default_start` falls back to `unit_initialization` on any failed or
+degenerate initializer (previously the solve result was ignored).
+No termination criteria, tolerances or convergence checks change —
+the guard only discards provably-broken starting points; normal
+problems are unaffected (327 lib tests pass). Cluster validation:
+jobs 213671 (Λ=11 default settings) and 213672 (oracle-scaled).
+
 ## Pending
 
 - Unrelated pre-existing warnings (`cached_psd`, `prepared`, `has_lanes`,
