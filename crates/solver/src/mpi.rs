@@ -23,9 +23,12 @@ type MpiOp = *mut c_void;
 extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn dlerror() -> *const c_char;
 }
 const RTLD_NOW: c_int = 2;
-const RTLD_LOCAL: c_int = 4;
+// RTLD_LOCAL is 0 on Linux/macOS; the value 4 is RTLD_NOLOAD, which returns
+// null for not-yet-loaded libraries without setting dlerror.
+const RTLD_LOCAL: c_int = 0;
 
 /// Shard sites run collectives on dedicated communicators so concurrent
 /// gathers from different solver phases never interleave on one stream.
@@ -104,18 +107,59 @@ fn load() -> Option<Fns> {
     const NAMES: &[&str] = &["libmpi.dylib", "libmpi.40.dylib"];
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     const NAMES: &[&str] = &[];
-    for name in NAMES {
-        let lib = unsafe {
-            dlopen(
-                CString::new(*name).unwrap().as_ptr(),
-                RTLD_NOW | RTLD_LOCAL,
-            )
-        };
+    let debug = std::env::var_os("SDPX_MPI_DEBUG").is_some();
+    // Ranks launched via orted may not inherit the submitter's
+    // LD_LIBRARY_PATH, so plain sonames can fail to resolve even when the
+    // library exists. MPI_LIB (or SDPX_MPI_LIBDIR) gives an absolute dir to
+    // fall back to.
+    let mut candidates: Vec<CString> = NAMES
+        .iter()
+        .map(|n| CString::new(*n).unwrap())
+        .collect();
+    for var in ["SDPX_MPI_LIBDIR", "MPI_LIB"] {
+        if let Ok(dir) = std::env::var(var) {
+            // OpenMPI's installed libmpi carries a dead build-host RPATH and
+            // needs libopen-pal/libopen-rte from its own dir; preload them by
+            // absolute path so the later soname lookup hits loaded objects.
+            for dep in ["libopen-pal.so.40", "libopen-rte.so.40"] {
+                if let Ok(p) = CString::new(format!("{dir}/{dep}")) {
+                    let h = unsafe { dlopen(p.as_ptr(), RTLD_NOW | RTLD_LOCAL) };
+                    if debug && h.is_null() {
+                        eprintln!("mpi: dep preload {dep} failed");
+                    }
+                }
+            }
+            for n in NAMES {
+                if let Ok(p) = CString::new(format!("{dir}/{n}")) {
+                    candidates.push(p);
+                }
+            }
+        }
+    }
+    for name in &candidates {
+        let lib = unsafe { dlopen(name.as_ptr(), RTLD_NOW | RTLD_LOCAL) };
         if lib.is_null() {
+            if debug {
+                let err = unsafe { dlerror() };
+                let msg = if err.is_null() {
+                    "unknown".to_string()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(err) }
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                eprintln!(
+                    "mpi: dlopen({}) failed: {msg}",
+                    name.to_string_lossy()
+                );
+            }
             continue;
         }
         unsafe {
             if dlsym(lib, c"MPI_Comm_rank".as_ptr()).is_null() {
+                if debug {
+                    eprintln!("mpi: {} lacks MPI_Comm_rank", name.to_string_lossy());
+                }
                 continue;
             }
             return Some(Fns {
@@ -182,10 +226,25 @@ impl World {
     }
 
     fn init() -> Option<Self> {
+        let debug = std::env::var_os("SDPX_MPI_DEBUG").is_some();
         if advertised_size() <= 1 && std::env::var_os("SDPX_MPI").is_none() {
+            if debug {
+                eprintln!("mpi: no advertised size");
+            }
             return None;
         }
-        let fns = load()?;
+        let fns = match load() {
+            Some(f) => f,
+            None => {
+                if debug {
+                    eprintln!("mpi: dlopen/symbol resolution failed");
+                }
+                return None;
+            }
+        };
+        if debug {
+            eprintln!("mpi: library loaded");
+        }
         let mut flag = 0;
         if unsafe { (fns.initialized)(&mut flag) } != 0 {
             return None;
@@ -194,11 +253,13 @@ impl World {
             // MPI_THREAD_MULTIPLE: gathers may be issued from rayon worker
             // threads on their dedicated per-site communicators.
             let mut provided = 0;
-            if unsafe {
+            let rc = unsafe {
                 (fns.init_thread)(std::ptr::null_mut(), std::ptr::null_mut(), 3, &mut provided)
-            } != 0
-                || provided < 3
-            {
+            };
+            if debug {
+                eprintln!("mpi: init_thread rc={rc} provided={provided}");
+            }
+            if rc != 0 || provided < 3 {
                 return None;
             }
         }
@@ -206,6 +267,9 @@ impl World {
         unsafe {
             (fns.comm_size)(fns.comm_world, &mut size);
             (fns.comm_rank)(fns.comm_world, &mut rank);
+        }
+        if debug {
+            eprintln!("mpi: size={size} rank={rank}");
         }
         if size <= 1 {
             return None;
