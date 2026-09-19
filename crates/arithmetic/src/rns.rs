@@ -132,6 +132,14 @@ fn find_primes(count: usize) -> Vec<Prime> {
     out
 }
 
+/// The first 64 primes of shape `2^60 - c` (~3840 exact bits of dynamic
+/// range), computed once — Miller–Rabin per prime dominated plan builds.
+static PRIMES: std::sync::OnceLock<Vec<Prime>> = std::sync::OnceLock::new();
+
+fn primes() -> &'static [Prime] {
+    PRIMES.get_or_init(|| find_primes(64))
+}
+
 /// Alignment and modulus plan for one residue product `A · B`.
 ///
 /// Each operand matrix is encoded as exact integers `I = value / 2^shift`
@@ -162,6 +170,27 @@ pub struct Residues {
     pub k: usize,
     /// Number of encoded elements.
     pub elems: usize,
+}
+
+/// Per-call workspace for [`RnsPlan::dot_residues_into`] /
+/// [`RnsPlan::reconstruct_into`]. Allocating per output dominates small dots;
+/// the scratch is reused across every output of one matrix product.
+pub struct RnsScratch {
+    acc: Vec<u128>,
+    res: Vec<u64>,
+    c: Vec<u64>,
+    x: Vec<u64>,
+    mag: Vec<u64>,
+}
+
+thread_local! {
+    static RNS_SCRATCH: std::cell::RefCell<RnsScratch> = std::cell::RefCell::new(RnsScratch {
+        acc: Vec::new(),
+        res: Vec::new(),
+        c: Vec::new(),
+        x: Vec::new(),
+        mag: Vec::new(),
+    });
 }
 
 impl RnsPlan {
@@ -212,7 +241,11 @@ impl RnsPlan {
         let p = MpFloat::<N>::PRECISION_BITS as u64;
         let bound = 2 * p + (da + db) as u64 + (64 - (terms as u64).leading_zeros() as u64) + 2;
         let k = bound.div_ceil(PRIME_BITS as u64) as usize;
-        let primes = find_primes(k);
+        let primes = primes();
+        if k > primes.len() {
+            return None; // operand window wider than the cached prime range
+        }
+        let primes = primes[..k].to_vec();
 
         let pow2: Vec<[u64; POW2_STEPS]> = primes
             .iter()
@@ -271,19 +304,32 @@ impl RnsPlan {
         self.primes.len()
     }
 
-    /// Heuristic cost gate: RNS wins when the per-term saving times the term
-    /// count outweighs fixed encode + reconstruction overhead.
+    /// Heuristic cost gate: RNS wins only when the per-term dot saving,
+    /// summed over every output, outweighs the one-shot plan build plus
+    /// the `encode_elems × primes` operand encoding.
     ///
-    /// `outputs` is the number of independent dot products. Measured constants
-    /// come from the Λ=15 profile (`mpfr_fma` ≈ 100–114ns at 768-bit).
-    pub fn profitable(&self, terms: usize, outputs: usize) -> bool {
+    /// `outputs` is the number of independent dot products; `encode_elems`
+    /// counts the operand elements encoded once (a + b for GEMM, a for
+    /// SYRK); `limbs` is the operand mantissa width. Measured constants at
+    /// 512–768-bit: `mpfr_fma` ≈ 110ns/term, residue accumulation ≈ 2ns per
+    /// term per prime, Garner reconstruction ≈ 1.6µs/output, encode ≈
+    /// ~12ns per limb per prime, cached plan ≈ ~30µs.
+    pub fn profitable(
+        &self,
+        terms: usize,
+        outputs: usize,
+        encode_elems: usize,
+        limbs: usize,
+    ) -> bool {
         if terms < 24 || outputs == 0 {
             return false;
         }
         let k = self.primes.len() as f64;
-        let mpfr = terms as f64 * 110.0;
-        let rns = terms as f64 * (2.0 * k) + 1200.0;
-        rns * 1.25 < mpfr // require ≥20% modeled margin before switching paths
+        let mpfr = outputs as f64 * terms as f64 * 110.0;
+        let dots = outputs as f64 * (terms as f64 * 2.0 * k + 1600.0);
+        let encode = encode_elems as f64 * k * limbs as f64 * 16.0;
+        let plan = 30_000.0f64;
+        (dots + encode + plan) * 1.25 < mpfr
     }
 
     /// Encode `m` (slice order) into residues against the `a`- or `b`-shift.
@@ -343,16 +389,54 @@ impl RnsPlan {
         })
     }
 
-    /// Exact dot of two residue columns, each `terms` elements of `K` residues.
+    /// Borrow the thread-local scratch (zeroed allocations amortized across
+    /// every output of a matrix product).
+    pub fn with_scratch<R>(f: impl FnOnce(&mut RnsScratch) -> R) -> R {
+        RNS_SCRATCH.with(|s| f(&mut s.borrow_mut()))
+    }
+
+    /// One exact dot: accumulate `terms` residue pairs, then reconstruct with
+    /// a single rounding. Reuses thread-local scratch (no allocation per
+    /// output after the first call on each worker).
+    pub fn dot<const N: usize>(
+        &self,
+        ra: &Residues,
+        a0: usize,
+        da: usize,
+        rb: &Residues,
+        b0: usize,
+        db: usize,
+        terms: usize,
+    ) -> MpFloat<N> {
+        Self::with_scratch(|s| {
+            self.dot_residues_into(ra, a0, da, rb, b0, db, terms, s);
+            self.reconstruct_scratch(s)
+        })
+    }
+
+    /// Exact dot of two residue columns into `scratch.res[..K]`.
     ///
-    /// `stride_a`/`stride_b` step between consecutive terms inside `ra`/`rb` in
-    /// element units (a stride of `d` selects `res[(l*d)][..]`). Returns the `K`
-    /// accumulated residues reduced mod each prime.
-    pub fn dot_residues(&self, ra: &Residues, mut a0: usize, da: usize, rb: &Residues, mut b0: usize, db: usize, terms: usize) -> Vec<u64> {
+    /// `a0`/`b0` are element indices; `da`/`db` step between consecutive terms
+    /// in element units.
+    pub fn dot_residues_into(
+        &self,
+        ra: &Residues,
+        mut a0: usize,
+        da: usize,
+        rb: &Residues,
+        mut b0: usize,
+        db: usize,
+        terms: usize,
+        scratch: &mut RnsScratch,
+    ) {
         let k = self.primes.len();
         debug_assert_eq!(ra.k, k);
         debug_assert_eq!(rb.k, k);
-        let mut acc = vec![0u128; k];
+        scratch.acc.clear();
+        scratch.acc.resize(k, 0u128);
+        scratch.res.clear();
+        scratch.res.resize(k, 0u64);
+        let acc = &mut scratch.acc;
         let mut l = 0usize;
         while l < terms {
             let end = (l + REDUCE_EVERY).min(terms);
@@ -370,7 +454,19 @@ impl RnsPlan {
             }
             l = end;
         }
-        acc.iter().map(|&x| x as u64).collect()
+        for j in 0..k {
+            scratch.res[j] = acc[j] as u64;
+        }
+    }
+
+    /// Exact dot of two residue columns, allocating the residue vector.
+    pub fn dot_residues(&self, ra: &Residues, a0: usize, da: usize, rb: &Residues, b0: usize, db: usize, terms: usize) -> Vec<u64> {
+        let mut out = vec![0u64; self.primes.len()];
+        Self::with_scratch(|s| {
+            self.dot_residues_into(ra, a0, da, rb, b0, db, terms, s);
+            out.copy_from_slice(&s.res);
+        });
+        out
     }
 
     /// Reconstruct the rounded value of `sum` from its `K` residues.
@@ -379,24 +475,36 @@ impl RnsPlan {
     /// map to negative sums. One `mpz -> mpfr` conversion plus an exact
     /// `2^(shift_a + shift_b)` scale performs the single rounding.
     pub fn reconstruct<const N: usize>(&self, residues: &[u64]) -> MpFloat<N> {
+        Self::with_scratch(|s| {
+            s.res.clear();
+            s.res.extend_from_slice(residues);
+            self.reconstruct_scratch(s)
+        })
+    }
+
+    /// [`RnsPlan::reconstruct`] over the residues already in `scratch.res`.
+    pub fn reconstruct_scratch<const N: usize>(&self, scratch: &mut RnsScratch) -> MpFloat<N> {
         let k = self.primes.len();
-        debug_assert_eq!(residues.len(), k);
+        debug_assert!(scratch.res.len() >= k);
         // Garner coefficients.
-        let mut c = vec![0u64; k];
+        scratch.c.clear();
+        scratch.c.resize(k, 0u64);
         for i in 0..k {
-            let mut t = residues[i];
+            let mut t = scratch.res[i];
             for j in 0..i {
                 let p = self.primes[i];
                 // t = (t - c_j) * inv(j, i) mod p_i
-                let diff = if t >= c[j] { t - c[j] } else { t + p.p - c[j] };
+                let diff = if t >= scratch.c[j] { t - scratch.c[j] } else { t + p.p - scratch.c[j] };
                 t = p.reduce(diff as u128 * self.inv[i][j] as u128);
             }
-            c[i] = t;
+            scratch.c[i] = t;
         }
         // x = sum_i c_i * prefix_i, kept below M by a conditional subtract per
         // addend: each addend is < M, so x stays in [0, M) throughout.
-        let mut x = vec![0u64; self.modulus.len() + 1];
-        for (i, &ci) in c.iter().enumerate() {
+        scratch.x.clear();
+        scratch.x.resize(self.modulus.len() + 1, 0u64);
+        let x = &mut scratch.x;
+        for (i, &ci) in scratch.c.iter().enumerate() {
             if ci == 0 {
                 continue;
             }
@@ -414,18 +522,21 @@ impl RnsPlan {
                 idx += 1;
             }
             if cmp_limbs(&x, &self.modulus) != std::cmp::Ordering::Less {
-                sub_limbs(&mut x, &self.modulus);
+                sub_limbs(&mut *x, &self.modulus);
             }
         }
         // Sign: S mod M in [0, M); if x > M/2 the sum is negative, |S| = M - x.
-        let negative = cmp_limbs(&x, &self.half) == std::cmp::Ordering::Greater;
-        let mut mag = x.clone();
+        let negative = cmp_limbs(x, &self.half) == std::cmp::Ordering::Greater;
+        scratch.mag.clear();
         if negative {
             // |S| = M - x, computed into `mag`.
-            mag = self.modulus.clone();
-            mag.resize(x.len(), 0);
-            sub_limbs(&mut mag, &x);
+            scratch.mag.extend_from_slice(&self.modulus);
+            scratch.mag.resize(x.len(), 0);
+            sub_limbs(&mut scratch.mag, x);
+        } else {
+            scratch.mag.extend_from_slice(x);
         }
+        let mag = &scratch.mag;
         // Import into mpz, convert to MPFR, apply the 2^(shift_a+shift_b) scale.
         let mut z = MaybeUninit::<gmp::mpz_t>::uninit();
         unsafe {
@@ -559,23 +670,28 @@ mod tests {
             let b: Vec<Bits512> = (0..k)
                 .map(|i| Bits512::from_f64(((i * 53) % 89) as f64 * 0.27 + 0.5).unwrap())
                 .collect();
-            let plan = RnsPlan::for_pair(&a, &b, k).unwrap();
-            let ra = plan.encode(&a, EncodeSide::A).unwrap();
-            let rb = plan.encode(&b, EncodeSide::B).unwrap();
-            // warmup + timed MPFR dots
-            for _ in 0..3 { std::hint::black_box(dot_mpfr(&a, &b)); }
             let reps = 50;
             let t0 = Instant::now();
             for _ in 0..reps { std::hint::black_box(dot_mpfr(&a, &b)); }
             let mpfr = t0.elapsed().as_nanos() as f64 / reps as f64;
             let t0 = Instant::now();
+            let mut plan_ns = 0u128;
+            let mut enc_ns = 0u128;
             for _ in 0..reps {
+                let t1 = Instant::now();
+                let plan = RnsPlan::for_pair(&a, &b, k).unwrap();
+                plan_ns += t1.elapsed().as_nanos();
+                let t1 = Instant::now();
+                let ra = plan.encode(&a, EncodeSide::A).unwrap();
+                let rb = plan.encode(&b, EncodeSide::B).unwrap();
+                enc_ns += t1.elapsed().as_nanos();
                 let res = plan.dot_residues(&ra, 0, 1, &rb, 0, 1, k);
                 std::hint::black_box(plan.reconstruct::<8>(&res));
             }
             let rns = t0.elapsed().as_nanos() as f64 / reps as f64;
-            eprintln!("k={k} primes={} mpfr={mpfr:.0}ns rns={rns:.0}ns ratio={:.2}",
-                plan.primes(), mpfr / rns);
+            eprintln!("k={k} primes={} mpfr={mpfr:.0}ns rns={rns:.0}ns ratio={:.2} plan={:.0}ns enc={:.0}ns",
+                RnsPlan::for_pair(&a, &b, k).unwrap().primes(), mpfr / rns,
+                plan_ns as f64 / reps as f64, enc_ns as f64 / reps as f64);
         }
     }
 
@@ -706,7 +822,10 @@ mod tests {
         let a = vec![Bits512::one(); 64];
         let b = vec![Bits512::one(); 64];
         let plan = RnsPlan::for_pair(&a, &b, 64).unwrap();
-        assert!(plan.profitable(64, 100));
-        assert!(!plan.profitable(4, 100));
+        // Long dot, many outputs, few encoded elements: profitable.
+        assert!(plan.profitable(64, 100_000, 128, 8));
+        // Tiny output count cannot amortize encode + plan.
+        assert!(!plan.profitable(64, 100, 128, 8));
+        assert!(!plan.profitable(4, 100_000, 128, 8));
     }
 }

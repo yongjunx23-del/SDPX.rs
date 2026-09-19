@@ -218,7 +218,14 @@ fn gemm<const N: usize>(
     let rns = (alpha != F::<N>::zero() && k > 0)
         .then(|| RnsPlan::for_pair(a, b, k as usize))
         .flatten()
-        .filter(|plan| plan.profitable(k as usize, m as usize * n as usize))
+        .filter(|plan| {
+            plan.profitable(
+                k as usize,
+                m as usize * n as usize,
+                a.len() + b.len(),
+                N,
+            )
+        })
         .and_then(|plan| {
             plan.encode(a, EncodeSide::A)
                 .zip(plan.encode(b, EncodeSide::B))
@@ -241,15 +248,9 @@ fn gemm<const N: usize>(
                     (j, ldb as usize)
                 };
                 v = match &rns {
-                    Some((plan, ra, rb)) => plan.reconstruct(&plan.dot_residues(
-                        ra,
-                        a0,
-                        da,
-                        rb,
-                        b0,
-                        db,
-                        k as usize,
-                    )),
+                    Some((plan, ra, rb)) => {
+                        plan.dot(ra, a0, da, rb, b0, db, k as usize)
+                    }
                     None => {
                         F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &b[b0 + p * db])))
                     }
@@ -409,7 +410,14 @@ fn syrk<const N: usize>(
     let rns = (alpha != F::<N>::zero() && k > 0)
         .then(|| RnsPlan::for_pair(a, a, k as usize))
         .flatten()
-        .filter(|plan| plan.profitable(k as usize, n as usize * (n as usize + 1) / 2))
+        .filter(|plan| {
+            plan.profitable(
+                k as usize,
+                n as usize * (n as usize + 1) / 2,
+                a.len(),
+                N,
+            )
+        })
         .and_then(|plan| plan.encode(a, EncodeSide::A).map(|ra| (plan, ra)));
     let column = |j: usize, column: &mut [F<N>]| {
         for i in 0..n as usize {
@@ -429,15 +437,7 @@ fn syrk<const N: usize>(
                     (j * lda as usize, 1)
                 };
                 v = match &rns {
-                    Some((plan, ra)) => plan.reconstruct(&plan.dot_residues(
-                        ra,
-                        a0,
-                        da,
-                        ra,
-                        b0,
-                        db,
-                        k as usize,
-                    )),
+                    Some((plan, ra)) => plan.dot(ra, a0, da, ra, b0, db, k as usize),
                     None => {
                         F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &a[b0 + p * db])))
                     }
