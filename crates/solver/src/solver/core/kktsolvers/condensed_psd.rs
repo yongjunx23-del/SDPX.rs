@@ -52,68 +52,6 @@ fn pooled_gemm<T: FloatT, MATA, MATB>(
     c.mul(a, b, T::one(), T::zero());
 }
 
-/// `a·b` when the exact-arithmetic product is symmetric. Only the upper
-/// triangle is evaluated and then mirrored — the same ascending-k accumulation
-/// order as `pooled_gemm`, so upper entries stay bitwise identical while the
-/// lower half is an exact copy instead of independently rounded products.
-fn pooled_gemm_sym<T: FloatT, MATA, MATB>(
-    c: &mut Matrix<T>,
-    a: &MATA,
-    b: &MATB,
-    gemm: Option<(&rayon::ThreadPool, usize)>,
-) where
-    MATA: DenseMatrix<T>,
-    MATB: DenseMatrix<T>,
-{
-    let (m, n, k) = (a.nrows(), b.ncols(), a.ncols());
-    debug_assert_eq!(m, n);
-    let (ta, tb) = (a.shape().as_blas_char(), b.shape().as_blas_char());
-    let lda = if a.shape() == MatrixShape::N { m } else { k };
-    let ldb = if b.shape() == MatrixShape::N { k } else { n };
-    let (adata, bdata) = (a.data(), b.data());
-    let ae = |i: usize, p: usize| -> &T {
-        &adata[if ta == b'N' { i + p * lda } else { p + i * lda }]
-    };
-    let be = |p: usize, j: usize| -> &T {
-        &bdata[if tb == b'N' { p + j * ldb } else { j + p * ldb }]
-    };
-    let column = |j: usize, col: &mut [T]| {
-        for i in 0..=j {
-            col[i] = T::dot_fma((0..k).map(|p| (ae(i, p), be(p, j))));
-        }
-    };
-    if let Some((pool, tiles)) = gemm.filter(|(p, t)| *t > 1 && p.current_num_threads() > 1) {
-        if n > 1 {
-            let tile = n.div_ceil(tiles.min(n));
-            pool.install(|| {
-                c.data_mut()
-                    .par_chunks_mut(tile * m)
-                    .enumerate()
-                    .for_each(|(t, chunk)| {
-                        let j0 = t * tile;
-                        let j1 = (j0 + tile).min(n);
-                        for (jc, j) in (j0..j1).enumerate() {
-                            column(j, &mut chunk[jc * m..(jc + 1) * m]);
-                        }
-                    });
-            });
-        } else {
-            for j in 0..n {
-                column(j, &mut c.data_mut()[j * m..(j + 1) * m]);
-            }
-        }
-    } else {
-        for j in 0..n {
-            column(j, &mut c.data_mut()[j * m..(j + 1) * m]);
-        }
-    }
-    for j in 0..n {
-        for i in j + 1..n {
-            c[(i, j)] = c[(j, i)];
-        }
-    }
-}
-
 impl<T: FloatT> PsdBlock<T> {
     /// Single-block constructor used by tests. The solver routes one shared
     /// pass over A through `from_columns` instead.

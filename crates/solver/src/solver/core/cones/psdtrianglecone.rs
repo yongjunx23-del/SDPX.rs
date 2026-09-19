@@ -384,23 +384,42 @@ fn mul_Wx_inner<T>(
 {
     let (X, Y, tmp) = (workmat1, workmat2, workmat3);
     svec_to_mat(X, x);
-    svec_to_mat(Y, y);
 
     match is_transpose {
         MatrixShape::T => {
             // Y .= α*(R*X*R') + βY        #W^T*x,   or....
             // Y .= α*(Rinv*X*Rinv') + βY  #W^{-T}*x
             tmp.mul(X, &Rx.t(), T::one(), T::zero());
-            Y.mul(Rx, tmp, α, β);
+            pooled_gemm_sym(Y, Rx, tmp, None);
         }
         MatrixShape::N => {
             // Y .= α*(R'*X*R) + βY         #W*x
             // Y .= α*(Rinv'*X*Rinv) + βY   #W^{-1}*x
             tmp.mul(&Rx.t(), X, T::one(), T::zero());
-            Y.mul(tmp, Rx, α, β);
+            pooled_gemm_sym(Y, tmp, Rx, None);
         }
     }
-    mat_to_svec(y, Y);
+    if α == T::one() && β == T::zero() {
+        mat_to_svec(y, Y);
+    } else {
+        let scale = if Y.ncols() > 1 {
+            T::FRAC_1_SQRT_2()
+        } else {
+            T::zero()
+        };
+        let mut idx = 0;
+        for col in 0..Y.ncols() {
+            for row in 0..=col {
+                let entry = if row == col {
+                    Y[(row, col)]
+                } else {
+                    (Y[(row, col)] + Y[(col, row)]) * scale
+                };
+                y[idx] = α * entry + β * y[idx];
+                idx += 1;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------
