@@ -296,3 +296,32 @@ are needed; the solver fix alone already passes the 1e-30 protocol.
   fused MPFR FMA already parallelizes perfectly; the residue phase's n·k·P
   folds plus the serial image/plan prefix never amortize below n≈300, beyond
   the solver's block sizes (n≈39–80). No production benefit → removed.
+
+### Residual-family optimization (f67e3db, 3c2c651, 29eccc6) — VERIFIED
+
+Cluster Λ=11 profile (403.5s solve) identified the residual product family as
+the dominant cost: `residual.scale` ~69.9s + `residual.adj` ~66.4s timed,
+with another ~30s+~70s inside `solve_raw`. Three changes, all preserving the
+required factorized arithmetic:
+
+- **Sampled adjoint diagonal pairs (f67e3db)**: for `r == s` pairs,
+  `v_k = q'·S·q` with symmetric `S` reduces to a flat dot over the block's
+  svec triangle against a precomputed constant `W[p,k] = c_p·q_i·q_j`
+  (`c = 1` diagonal, `√2` off-diagonal). Replaces the `h²·kmax` panel product
+  with `kmax·tri(h)` dots — 1.74× kernel-level, covering all `dim=1` blocks
+  (every ising block). Serial and pooled paths share `wdiag`, bitwise parity.
+- **Symmetric scaling products (3c2c651)**: in `PsdBlock::apply`, two of the
+  four factorized congruence products produce symmetric outputs
+  (`Rᵀ·X·R`, `R·S·Rᵀ` and the `Rinv` analogues). `pooled_gemm_sym` evaluates
+  only the upper triangle (same ascending-k accumulation → bitwise identical
+  entries) and mirrors the lower — `4h³ → 3h³` per apply. The factorized
+  form stays (the earlier `G = R·Rᵀ` squaring failed all 7 graded tests and
+  was reverted).
+- **Schur per-column congruence (29eccc6)**: same `pooled_gemm_sym` on the
+  streamed `Ginv·A·Ginv` product.
+
+Λ=11 (np=1×8t, 768-bit): 403.5s → 374.5s solve (**7.2%**), `status=optimal
+iters=69` identical. Phase deltas: `residual.scale` 266→195ms (−27%),
+`residual.adj` 252→177ms (−30%), `residual` 278→205ms. All 328 lib tests
+pass including the 7 `condensed_graded_*` extremes and parallel-equivalence
+bitwise checks.
