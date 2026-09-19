@@ -426,28 +426,51 @@ the MPI world in every prior run:
 
 With all three fixed (580506a, d979c6c), mpiexec ranks report `size=2`,
 `MPI_THREAD_MULTIPLE` granted, and per-site `mpi.gather*` timings appear.
-Λ=15 np=2 (2 nodes × 32 threads, `--bind-to none`): converged optimal in
-75 iters but **759.9s vs 241.8s single-node** — a net loss, dominated by
-~9s/rank/iter of `MPI_Allgatherv` waits across ~30 shard sites. Two
-structural causes, both measured:
 
-- Transport: ranks communicate over TCP/IPoIB (12.12.12.0/24), not native
-  verbs — OpenMPI 4.1.4 here has no UCX pml and the `openib` BTL does not
-  engage on mlx5 HDR; ~350ms per ~3MB gather.
-- Duplication: PSD cone SVD/W/eigmin, Schur assembly and KKT refactor run
-  identically on every rank (~65% of iteration work); only sampled
-  products, scaling and Gram updates are rank-sharded.
+### Cone-state sharding, cost-balanced partitioning and RNS gating
+(42f1c6a, b79bfe8) — retained
 
-Cross-node work stopped per direction: making np≥2 pay requires both a
-working verbs path and cone-state sharding (~12MB/iter exchange). The
-loader is now correct — MPI is functional for future campaigns on
-problems where per-rank compute dominates communication (e.g., Λ≥19) —
-but no scaling claim is made: activation verified, speedup not.
+Following activation, the remaining ~65% duplicated per-iteration work was
+sharded: `CompositeCone` eval loops (`update_scaling`, `combined_shift`,
+`margins`, `compute_barrier`, `step_length` bounds, `prepare_affine_bounds`,
+`mul_Hs`) run each cone on its owning rank, then `allgatherv` the exchange
+surface (PSD `R`/`Rinv`/`λ`; derived `Λisqrt`/`G` are rebuilt locally and
+deterministically). Rank ranges come from `mpi::cost_ranges` — contiguous
+blocks split at prefix sums nearest equal cost (PSD ~numel^1.5, cheap
+cones unit cost), identical on every rank; the same partition drives
+scaling products and the condensed-KKT Gram exchange so computation and
+gather layout never disagree. Two fixes landed here:
+
+- `step_z`/`step_s` are *inputs* to `combined_shift` in both prepared and
+  unprepared modes — the sharded pack must seed them, not treat the buffer
+  as write-only scratch (fixed; trajectory returned to bitwise match).
+- `split_scaling` lanes are begin indices with `blocks.len()` as implicit
+  end; a `0..=n` boundary list indexed past the last owned block (job
+  213803 panic; fixed).
+
+RNS batch products (`crates/arithmetic/rns.rs`): pseudo-Mersenne 60-bit
+residue dots + Garner CRT, exact for finite fixed-precision values, MPFR
+fallback otherwise. Microbenchmarks showed the raw residue dot beating
+MPFR but plan construction (~407µs, Miller–Rabin per prime) and encoding
+(~16ns/limb/prime) dominating; fixed by caching the prime table in a
+`OnceLock` and a profitability gate that charges plan+encode+CRT against
+the MPFR baseline — RNS now engages only where reuse amortizes it.
+
+Λ=15 np=2 (2 nodes × 32 threads, `--bind-to none`, job 213804):
+**optimal, 75 iters, 315.0s**, both ranks' `x` bitwise identical — vs
+759.9s before cone sharding and 240.7s single-node. MPI remains a net
+loss at Λ=15 (TCP/IPoIB transport, no verbs path engaged); the loader and
+sharding are correct and retained for larger inputs where per-rank
+compute dominates, but no speedup is claimed. `mpi/drive.jl` now calls
+`MPI_Barrier`+`MPI_Finalize` (via `ccall` on the already-loaded libmpi)
+before exit so no rank is killed mid-write. Cross-node transport
+optimization and distributed KKT factorization were stopped per direction.
 
 ### Cluster state at task close
 
-`SDPX.jl/current` → `releases/d979c6c…/source` (SVD inner parallelism,
-MPI loader fixes, gather timing under `SDPX_PROFILE`/`SDPX_MPI_DEBUG`);
-Julia loads and links the rebuilt `libsdpx.so`. Release workspace
-`sdpx-releases/580506a` carries the same source and built library.
+`SDPX.jl/current` → `releases/b79bfe8…/source` (MPI loader fixes, cone
+sharding, cost-balanced partitioning, RNS gating, SVD inner parallelism);
+Julia loads and links the rebuilt `libsdpx.so` (smoke test passed).
+Release workspace `sdpx-releases/580506a` carries the same source and
+built library; Λ=15 validated single-node (240.7s) and np=2 (315.0s).
 Best measured: Λ=11 169.7s (t32), Λ=15 241.8s (t32, np=1).
