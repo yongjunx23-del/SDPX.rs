@@ -148,6 +148,7 @@ pub(super) fn forward_split_chunks<T: FloatT>(
 pub(super) fn adjoint_split_chunks<T: FloatT>(
     b: &SampledBlock<T>,
     q: &BorrowedMatrix<'_, T>,
+    wdiag: &[T],
     x: &[T],
     alpha: T,
     s_range: std::ops::Range<usize>,
@@ -160,17 +161,31 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
     if chunks <= 1 || s_range.len() < 2 {
         let h = b.basis_rows;
         let kmax = b.basis_cols;
+        let trih = tri(h);
         let s_offset = tri(s_range.start) * kmax;
         for s in s_range {
             for r in 0..=s {
                 let p = (tri(s) + r) * kmax;
+                if r == s {
+                    // Same `q'·S·q` flat dots as `adjoint_terms`: bitwise
+                    // identical because the `wdiag` weights fix the order.
+                    for k in 0..kmax {
+                        let w = &wdiag[k * trih..(k + 1) * trih];
+                        let mut v = T::zero();
+                        for j in 0..h {
+                            for i in 0..=j {
+                                v = x[b.row_start + tri(r * h + j) + r * h + i]
+                                    .mul_add(w[tri(j) + i], v);
+                            }
+                        }
+                        let idx = p + k - s_offset;
+                        out[idx] = alpha * b.weights[p + k] * v;
+                    }
+                    continue;
+                }
                 for j in 0..h {
                     for i in 0..h {
-                        let (a, c) = if r == s && i > j {
-                            (r * h + j, s * h + i)
-                        } else {
-                            (r * h + i, s * h + j)
-                        };
+                        let (a, c) = (r * h + i, s * h + j);
                         let scale = if a == c { T::one() } else { inv_sqrt2 };
                         square[(i, j)] = x[b.row_start + tri(c) + a] * scale;
                     }
@@ -201,6 +216,7 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
             adjoint_split_chunks(
                 b,
                 q,
+                wdiag,
                 x,
                 alpha,
                 s_range.start..mid,
@@ -215,6 +231,7 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
             adjoint_split_chunks(
                 b,
                 q,
+                wdiag,
                 x,
                 alpha,
                 mid..s_range.end,

@@ -522,6 +522,7 @@ impl<T: FloatT> SampledOperator<T> {
                         adjoint_split_chunks(
                             b,
                             &q,
+                            &w.wdiag,
                             x,
                             alpha,
                             0..b.dim,
@@ -590,6 +591,12 @@ struct SampledBlockWorkspace<T> {
     // forward slices by m; adjoint slices total the primitive column counts.
     forward: Vec<T>,
     adjoint: Vec<T>,
+    // Per-block constant `W[p, k] = c_p·q[i,k]·q[j,k]` over the packed
+    // `p = tri(j)+i` diagonal triangle, with `c = 1` on `i == j` and `√2`
+    // off-diagonal. It turns the `q'·S·q` quadratic forms of every `r == s`
+    // adjoint pair into flat dot products over `x`'s svec entries — half the
+    // `panel.mul` work for the common single-row blocks.
+    wdiag: Vec<T>,
     panel: Matrix<T>,
     square: Matrix<T>,
 }
@@ -686,25 +693,39 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
             phantom: std::marker::PhantomData,
         };
         let mut p = 0;
+        let trih = tri(h);
         for s in 0..b.dim {
             for r in 0..=s {
-                for j in 0..h {
-                    for i in 0..h {
-                        let (a, c) = if r == s && i > j {
-                            (r * h + j, s * h + i)
-                        } else {
-                            (r * h + i, s * h + j)
-                        };
-                        let scale = if a == c { T::one() } else { inv_sqrt2 };
-                        self.square[(i, j)] = x[b.row_start + tri(c) + a] * scale;
+                if r == s {
+                    // Diagonal pair: `v_k = q'·S·q` with symmetric `S` reduces
+                    // to a flat dot over the block's svec triangle against the
+                    // precomputed `wdiag` — half the panel product's work.
+                    for k in 0..kmax {
+                        let w = &self.wdiag[k * trih..(k + 1) * trih];
+                        let mut v = T::zero();
+                        for j in 0..h {
+                            for i in 0..=j {
+                                v = x[b.row_start + tri(r * h + j) + r * h + i]
+                                    .mul_add(w[tri(j) + i], v);
+                            }
+                        }
+                        store(p + k, alpha * b.weights[p + k] * v);
                     }
-                }
-                self.panel.mul(&self.square, &q, T::one(), T::zero());
-                for k in 0..kmax {
-                    let q_col = &q.data()[k * h..(k + 1) * h];
-                    let p_col = &self.panel.data()[k * h..(k + 1) * h];
-                    let v = q_col.dot(p_col);
-                    store(p + k, alpha * b.weights[p + k] * v);
+                } else {
+                    for j in 0..h {
+                        for i in 0..h {
+                            let (a, c) = (r * h + i, s * h + j);
+                            let scale = if a == c { T::one() } else { inv_sqrt2 };
+                            self.square[(i, j)] = x[b.row_start + tri(c) + a] * scale;
+                        }
+                    }
+                    self.panel.mul(&self.square, &q, T::one(), T::zero());
+                    for k in 0..kmax {
+                        let q_col = &q.data()[k * h..(k + 1) * h];
+                        let p_col = &self.panel.data()[k * h..(k + 1) * h];
+                        let v = q_col.dot(p_col);
+                        store(p + k, alpha * b.weights[p + k] * v);
+                    }
                 }
                 p += kmax;
             }
@@ -778,11 +799,28 @@ impl<T: FloatT> SampledWorkspace<T> {
             blocks: operator
                 .blocks
                 .iter()
-                .map(|b| SampledBlockWorkspace {
-                    forward: Vec::new(),
-                    adjoint: Vec::new(),
-                    panel: Matrix::zeros((b.basis_rows, b.basis_cols)),
-                    square: Matrix::zeros((b.basis_rows, b.basis_rows)),
+                .map(|b| {
+                    let h = b.basis_rows;
+                    let trih = tri(h);
+                    let kmax = b.basis_cols;
+                    let sqrt2 = if h > 1 { T::SQRT_2() } else { T::zero() };
+                    let mut wdiag = vec![T::zero(); kmax * trih];
+                    for k in 0..kmax {
+                        for j in 0..h {
+                            for i in 0..=j {
+                                let c = if i == j { T::one() } else { sqrt2 };
+                                wdiag[k * trih + tri(j) + i] =
+                                    c * b.basis[i + k * h] * b.basis[j + k * h];
+                            }
+                        }
+                    }
+                    SampledBlockWorkspace {
+                        forward: Vec::new(),
+                        adjoint: Vec::new(),
+                        wdiag,
+                        panel: Matrix::zeros((h, kmax)),
+                        square: Matrix::zeros((h, h)),
+                    }
                 })
                 .collect(),
             linear_plan: SparseParallel::new(&operator.linear),

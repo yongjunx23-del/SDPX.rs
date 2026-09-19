@@ -288,3 +288,11 @@ are needed; the solver fix alone already passes the 1e-30 protocol.
   GEMM→CRT) for its Gram/Schur products; Elemental distributed Cholesky/Trsm
   for its Schur solve. SDPX's single-node analogues are the existing pooled
   assembly and the new etree-parallel QDLDL kernels.
+- `bigint_syrk` port — **measured negative, reverted**: a full RNS pipeline
+  (dyadic images → per-prime Barrett residues → exact f64 `dsyrk` →
+  coefficient-form CRT, bit-exact vs `dot_fma`) was built and verified, then
+  benchmarked pool-for-pool (8t): n=39/k=76 skipped on gate, n=80/k=150
+  skipped, n=150/k=300 engaged at 641ms vs scalar 298ms (2.2× slower). The
+  fused MPFR FMA already parallelizes perfectly; the residue phase's n·k·P
+  folds plus the serial image/plan prefix never amortize below n≈300, beyond
+  the solver's block sizes (n≈39–80). No production benefit → removed.
