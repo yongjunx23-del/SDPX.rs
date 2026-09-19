@@ -241,17 +241,24 @@ Further verified findings (cluster jobs 213629/213668/213669):
   check (qᵀx̃ ≈ -bᵀz̃ structurally). A unit interior start makes the
   gap check honest → forces real iteration.
 
-### Fix: degenerate initial-point guard (this commit)
+### Fix: degenerate initial-point guard (0373c68) — VERIFIED
 
 `solve_initial_point` now returns failure when the KKT initializer's
-‖x‖/‖z‖ exceeds `1e12 × max(1, ‖b‖∞, ‖q‖∞, ‖A‖∞)` — a catastrophic
-numerical degeneracy signature (ising: ‖x‖~1e78 vs bound ~1e14).
+‖x‖/‖z‖ exceeds `1e12 × max(1, ‖b‖∞, ‖q‖∞, ‖A‖∞)` or is non-finite —
+a catastrophic degeneracy signature (ising: ‖x‖~1e78 vs bound ~1e14).
 `default_start` falls back to `unit_initialization` on any failed or
 degenerate initializer (previously the solve result was ignored).
 No termination criteria, tolerances or convergence checks change —
-the guard only discards provably-broken starting points; normal
-problems are unaffected (327 lib tests pass). Cluster validation:
-jobs 213671 (Λ=11 default settings) and 213672 (oracle-scaled).
+the guard only discards provably-broken starting points.
+
+**Verified on cluster, Λ=11 768-bit, default settings (job 213671):**
+`status=optimal, iters=69` (vs the false `iters=0`), returned point
+audit **primal=3.2e-44 / dual=1.0e-41 / map=7.3e-11**, objective
+`-18.1686186450146` matching the independent reference exactly. The
+unit-interior start keeps the gap check honest, so iteration
+proceeds to real convergence. 328 lib tests pass (incl. detector
+unit test); Julia suite green. Sampled-route + Λ=15 acceptance
+running as job 213673; oracle column-scaling control as 213672.
 
 ## Pending
 
