@@ -19,11 +19,12 @@ pub(super) fn norm<const N: usize>(a: &[F<N>]) -> F<N> {
     a.iter().fold(F::zero(), |v, &x| hypot(v, x))
 }
 pub(super) fn rotate<const N: usize>(a: &mut [F<N>], rows: usize, p: usize, q: usize, c: F<N>, s: F<N>) {
+    let ns = -s;
     for i in 0..rows {
         let x = a[i + p * rows];
         let y = a[i + q * rows];
-        a[i + p * rows] = c * x - s * y;
-        a[i + q * rows] = s * x + c * y;
+        a[i + p * rows] = ns.mul_add(y, c * x);
+        a[i + q * rows] = s.mul_add(x, c * y);
     }
 }
 // Work is owned and retained by the decomposition engine, as in COSMO's
@@ -112,13 +113,13 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
         d[k] = beta;
         left[k] = tau;
         for j in k + 1..n {
-            let mut dot = F::zero();
-            for i in k..m {
-                dot += x[i - k] * a[i + j * m];
-            }
+            let mut dot = F::dot_fma(
+                x.iter().zip(&a[k + j * m..m + j * m]),
+            );
             dot *= tau;
+            let ndot = -dot;
             for i in k..m {
-                a[i + j * m] -= x[i - k] * dot;
+                a[i + j * m] = x[i - k].mul_add(ndot, a[i + j * m]);
             }
         }
         a[k + k * m] = beta;
@@ -134,13 +135,13 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
             e[k] = beta;
             right[k] = tau;
             for i in k + 1..m {
-                let mut dot = F::zero();
-                for j in k + 1..n {
-                    dot += a[i + j * m] * x[j - k - 1];
-                }
+                let mut dot = F::dot_fma(
+                    (k + 1..n).map(|j| (&a[i + j * m], &x[j - k - 1])),
+                );
                 dot *= tau;
+                let ndot = -dot;
                 for j in k + 1..n {
-                    a[i + j * m] -= dot * x[j - k - 1];
+                    a[i + j * m] = x[j - k - 1].mul_add(ndot, a[i + j * m]);
                 }
             }
             a[k + (k + 1) * m] = beta;
@@ -375,28 +376,28 @@ pub(super) fn apply_reflectors<const N: usize>(
 ) {
     for k in (0..n).rev() {
         for j in 0..uc {
-            let mut dot = u[k + j * m];
-            for i in k + 1..m {
-                dot += a[i + k * m] * u[i + j * m];
-            }
+            let mut dot = F::dot_fma(
+                (k + 1..m).map(|i| (&a[i + k * m], &u[i + j * m])),
+            ) + u[k + j * m];
             dot *= left[k];
-            u[k + j * m] -= dot;
+            let ndot = -dot;
+            u[k + j * m] += ndot;
             for i in k + 1..m {
-                u[i + j * m] -= a[i + k * m] * dot;
+                u[i + j * m] = a[i + k * m].mul_add(ndot, u[i + j * m]);
             }
         }
     }
     if !v.is_empty() {
         for k in (0..n.saturating_sub(1)).rev() {
             for j in 0..n {
-                let mut dot = v[k + 1 + j * n];
-                for i in k + 2..n {
-                    dot += a[k + i * m] * v[i + j * n];
-                }
+                let mut dot = F::dot_fma(
+                    (k + 2..n).map(|i| (&a[k + i * m], &v[i + j * n])),
+                ) + v[k + 1 + j * n];
                 dot *= right[k];
-                v[k + 1 + j * n] -= dot;
+                let ndot = -dot;
+                v[k + 1 + j * n] += ndot;
                 for i in k + 2..n {
-                    v[i + j * n] -= a[k + i * m] * dot;
+                    v[i + j * n] = a[k + i * m].mul_add(ndot, v[i + j * n]);
                 }
             }
         }

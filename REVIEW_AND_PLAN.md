@@ -325,3 +325,43 @@ iters=69` identical. Phase deltas: `residual.scale` 266→195ms (−27%),
 `residual.adj` 252→177ms (−30%), `residual` 278→205ms. All 328 lib tests
 pass including the 7 `condensed_graded_*` extremes and parallel-equivalence
 bitwise checks.
+
+### Cone W-products + operator inner loops (8295aec VERIFIED, 6abfde8 pending)
+
+`SDPX_PROFILE` timers on `update_scaling` (`PHASE cone_svd`) and
+`step_length_psd_component` (`PHASE cone_eigmin`) exposed the true serial
+budget (Λ=11, 768-bit): `cone_svd` 428s serial ≈ 53s wall (~16% of solve,
+1932 calls × 221ms) and `cone_eigmin` 117s ≈ 15s wall (7728 × 15ms). The
+solve-path cone products (`mul_Hs`, `step_component`, `Δs_offset`,
+`combined_ds_shift` — ~11 `mul_Wx_inner` calls per block-iteration) were
+previously uninstrumented (~48s wall estimated).
+
+- **Symmetric cone W-products (8295aec)**: `mul_Wx_inner`'s second product
+  (`Rx·tmp` / `tmp·Rx`) always produces a symmetric output consumed only via
+  `mat_to_svec`. Now uses `pooled_gemm_sym` (moved to `matrix_math.rs` for
+  sharing); the α/β-accumulate general path folds `α·entry + β·y` at the
+  svec write. Λ=11: 374.5s → **352.3s** (`status=optimal iters=69`), −24s.
+- **Operator inner loops via `dot_fma` (6abfde8)**: adjoint `wdiag` dots,
+  forward `square` dots and r<s panel dots accumulated a fresh `MpFloat`
+  per op via `mul_add`; `T::dot_fma` folds the same pairs in the same order
+  through the in-place MPFR FMA accumulator — bitwise identical, less
+  per-op overhead. Serial and split-chunk pooled paths both updated.
+
+### SVD → symmetric-eig NT scaling — measured negative, reverted
+
+`update_scaling`'s SVD of `L2ᵀ·L1` is the largest single kernel. A
+single-eigendecomposition variant was implemented: `X = M·Mᵀ` (syrk) →
+symmetric `eigen()` for U and σ², then `R = L2⁻ᵀ·U·Λ^{1/2}` by triangular
+back-substitution (avoids the unstable `V = Mᵀ·U·σ⁻¹` recovery and the
+second eig). All 15 graded tests passed at 128–2048-bit MPFR, but **all
+f64 `basic_sdp` tests failed with `NumericalError`**: `X = M·Mᵀ` squares
+the condition number (κ(X) = κ(M)²), which is exactly the pathology the
+upstream comment warns about — at 53-bit the lost digits are fatal. The
+SVD's κ-preserving bidiagonal QR is load-bearing; no safe eig-based
+replacement exists at fixed conditioning. Reverted to direct SVD.
+
+Remaining measured opportunities (Λ=11): `cone_svd` ~53s wall has no
+known safe algorithmic substitute (eig variants square κ or need two
+decompositions ≈ slower); `cone_eigmin` ~15s wall uses the proven
+Sturm+RQI minimum-eigenvalue path; residual/operator products continue
+to benefit from `dot_fma` accumulation.
