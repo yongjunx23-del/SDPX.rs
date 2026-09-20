@@ -375,3 +375,13 @@ function solve!(p::PreparedProblem{T};q=nothing,b=nothing) where T
 end
 Base.close(p::PreparedProblem)=close(p.handle)
 Base.isopen(p::PreparedProblem)=isopen(p.handle)
+
+"""
+    mpi_world_size() -> Int
+
+Number of MPI ranks the solver core actually engaged, or 1 when running
+serially. Under `mpiexec -n N` a value below `N` means MPI failed to
+initialize and the run is *not* distributed — treat it as a launch
+failure rather than a distributed success.
+"""
+mpi_world_size()=Int(ccall(_sym(:sdpx_mpi_world_size),Cint,()))

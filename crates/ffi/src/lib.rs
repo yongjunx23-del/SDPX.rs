@@ -752,6 +752,13 @@ pub unsafe extern "C" fn sdpx_get_info(h: *mut Handle, out: *mut Info) -> i32 {
         })
     })
 }
+/// Engaged MPI world size (1 = serial). Under `mpiexec -n N` a value
+/// below N means MPI failed to initialize and the run is *not*
+/// distributed — callers should treat that as a launch failure.
+#[no_mangle]
+pub unsafe extern "C" fn sdpx_mpi_world_size() -> i32 {
+    sdpx_solver::mpi_world_size()
+}
 #[no_mangle]
 pub unsafe extern "C" fn sdpx_get_solver_name(
     h: *mut Handle,

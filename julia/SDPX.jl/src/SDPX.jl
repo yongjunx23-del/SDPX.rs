@@ -25,7 +25,7 @@ export Settings, Limits, Tolerances, Outputs
 export SampledBlock, SampledProgram, sampled_program
 export ZeroCone, Nonnegative, Nonpositive, Reals, LorentzCone, RotatedLorentzCone
 export PSDCone, ExponentialCone, PowerCone
-export optimize!, solve, prepare, solve!, solve_conic, execution_plan
+export optimize!, solve, prepare, solve!, solve_conic, execution_plan, mpi_world_size
 export status, value, dual, dual_slack, primal_objective, dual_objective
 export objective_value, dual_objective_value, primal_residual, dual_residual, relative_gap
 export iterations, solve_time, is_optimal, is_primal_infeasible, is_dual_infeasible

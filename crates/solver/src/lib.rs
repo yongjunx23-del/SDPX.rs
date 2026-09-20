@@ -21,3 +21,11 @@ pub(crate) mod utils;
 pub use crate::utils::infbounds::*;
 
 pub(crate) const _INFINITY_DEFAULT: f64 = 1e20;
+
+/// Number of MPI ranks the solver actually engaged, or 1 when running
+/// without MPI. Lets callers distinguish a real distributed run from a
+/// silent serial fallback under `mpiexec` (a launcher failure would
+/// otherwise produce identical-looking serial results on every rank).
+pub fn mpi_world_size() -> i32 {
+    crate::mpi::World::get().map_or(1, |w| w.size() as i32)
+}

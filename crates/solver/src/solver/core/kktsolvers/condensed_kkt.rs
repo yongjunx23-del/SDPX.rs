@@ -268,6 +268,13 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             );
         }
         crate::receipt::phase_record("sync", __ts.elapsed());
+        // `valid` folds this rank's owned blocks only; a failing owner
+        // returning early while peers proceed would hang the next
+        // collective. Merge the flag before any rank leaves the call.
+        let valid = match world {
+            Some(w) => valid && w.allreduce_max_f64(if valid { 0.0 } else { 1.0 }) == 0.0,
+            None => valid,
+        };
         if !valid {
             return false;
         }
