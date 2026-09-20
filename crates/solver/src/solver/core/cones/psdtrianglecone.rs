@@ -230,6 +230,9 @@ where
         // SVD of L2'*L1,
         let tmp = &mut f.workmat1;
         tmp.mul(&L2.t(), L1, T::one(), T::zero());
+        if let Some(dir) = std::env::var_os("SDPX_DUMP_CONE") {
+            dump_cone_f64(&dir, tmp);
+        }
 
         // Direct SVD avoids squaring the condition number of L2' * L1.
         let __ts = std::time::Instant::now();
@@ -743,6 +746,37 @@ where
             col += 1;
         } //end k
     } //end l
+}
+
+/// Debug probe: dump the SVD input `L2'·L1` as f64 text, keyed by the
+/// workspace's stable data pointer so consecutive files per cone form the
+/// iteration sequence. Gated by SDPX_DUMP_CONE=<dir>; measures how much the
+/// right singular factor drifts between IPM iterations.
+fn dump_cone_f64<T: FloatT>(dir: &std::ffi::OsStr, m: &Matrix<T>) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static SEQ: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+    let key = m.data().as_ptr() as usize;
+    let iter = {
+        let mut guard = SEQ.lock().unwrap();
+        *guard.get_or_insert_with(HashMap::new).entry(key).or_insert(0)
+    };
+    *SEQ.lock().unwrap().as_mut().unwrap().get_mut(&key).unwrap() += 1;
+    let path = std::path::Path::new(dir).join(format!("cone-{key:x}-iter{iter:04}.txt"));
+    let (rows, cols) = m.size();
+    let mut out = String::with_capacity(m.data().len() * 24);
+    out.push_str(&format!("{rows} {cols}\n"));
+    for v in m.data().iter() {
+        let f = v.to_f64().unwrap_or_else(|| {
+            if *v < T::zero() {
+                -f64::MAX
+            } else {
+                f64::MAX
+            }
+        });
+        out.push_str(&format!("{f:.17e}\n"));
+    }
+    let _ = std::fs::write(&path, out);
 }
 
 #[cfg(test)]

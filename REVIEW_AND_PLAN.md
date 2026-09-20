@@ -587,21 +587,25 @@ A/Aᵀ products (2.07M nnz)**, not the 88k KKT matvec — already pooled,
    **Measured on node7 (singlejob): Λ=15 t64 224.5→208.2s (−7.3%),
    t128 193.6→169.9s (−12.2%), Λ=19 t64 446.6→402.5s (−9.9%);
    iteration counts unchanged (75/75/83, all Solved).**
-2. **Warm-start MPFR Jacobi SVD** (probe before committing): the
-   reverted cold-start Jacobi needed too many sweeps; restarting from
-   the *previous iteration's* V (iterates move smoothly) or an f64
-   skeleton of `M/‖M‖` should converge quadratically in ~4–6 sweeps.
-   Output contract unchanged — Jacobi's convergence test *is* the
-   MPFR verification; fall back to QR per-block when it fails.
-   Targets `cone_svd` 289ms serial floor. Honest expectation:
-   0–30% of that phase — sweep cost is the unknown.
-3. **eigmin warm-start** — same pattern on the tridiagonal QR eig
-   (~25ms/call → target ~5–10ms).
+2. ~~Warm-start MPFR Jacobi SVD~~ — **closed by measurement.** The
+   premise was that V moves smoothly across iterations. A
+   `SDPX_DUMP_CONE` hook dumped `L2'·L1` for all 28 cones × 75
+   iterations of Λ=15; offline f64 SVD shows the right-factor
+   Frobenius drift is ~3–8 out of the ~8.7 maximum — the singular
+   subspaces rotate almost freely every iteration, including the
+   converged tail (degenerate/clustered spectra). Warm starts would
+   need full sweep counts, i.e. the already-reverted 4.6×-slower
+   path. SVD phase split for reference (38×38, Bits768):
+   reduce 31ms / bidiagonal-QR 151ms / reflectors 37ms — the QR chain
+   is the serial floor and stays.
+3. ~~eigmin warm-start~~ — same falsified premise; eigmin inputs are
+   fresh trial-step matrices each call.
 4. ~~Residual-path audit~~ — done; found the leaf-split defect above.
 
 Closed permanently: cross-node transport (np2 = −31% measured, SDPB
-np128 diverges), cold Jacobi, eig-for-SVD (κ²), f64 preconditioner
-(κ≥1e18), residue Gram/Schur/LDLᵀ without SIMD.
+np128 diverges), cold AND warm Jacobi (V drift ≈ full range), eig-for-
+SVD (κ²), f64 preconditioner (κ≥1e18), residue Gram/Schur/LDLᵀ without
+SIMD, warm-start eigmin.
 
 Cluster validation status: t128 = 193.6s clean on an exclusive node
 (job 213892); t64 = 224.5s on node7 (job 213903); t32 = 251.9s on
