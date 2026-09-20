@@ -494,7 +494,12 @@ where
                     .par_iter_mut()
                     .enumerate()
                     .filter(|(i, c)| mask(*i, c))
-                    .map(|(i, c)| (i, eval(i, c, rng[i].clone())))
+                    .map(|(i, c)| {
+                        // Owned blocks can outnumber free workers; let heavy
+                        // kernels offer inner work to the ambient pool.
+                        let _inner = sdpx_arithmetic::inner_parallel::Guard::enter();
+                        (i, eval(i, c, rng[i].clone()))
+                    })
                     .collect()
             }),
             None => cones

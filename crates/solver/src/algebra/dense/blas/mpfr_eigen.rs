@@ -25,13 +25,27 @@ pub(super) fn tridiagonalize<const N: usize>(
         if tau != F::zero() {
             // Two-sided update of the trailing block B = b[k+1..n, k+1..n]:
             // p = tau * B v; w = p - (tau/2)(p·v) v; B -= v wᵀ + w vᵀ.
+            // The symv rows and the rank-2 column updates are independent,
+            // so they join the ambient pool under the inner-parallel gate.
+            let par = inner_par() && len >= PAR_COLS;
             let p = &mut p[..len];
-            for i in 0..len {
-                let mut acc = F::zero();
-                for j in 0..len {
-                    acc += b[k + 1 + i + (k + 1 + j) * n] * v[j];
+            if par {
+                let tail: &[F<N>] = &b[(k + 1) * n..n * n];
+                p.par_iter_mut().enumerate().for_each(|(i, pi)| {
+                    let mut acc = F::zero();
+                    for j in 0..len {
+                        acc += tail[k + 1 + i + j * n] * v[j];
+                    }
+                    *pi = tau * acc;
+                });
+            } else {
+                for i in 0..len {
+                    let mut acc = F::zero();
+                    for j in 0..len {
+                        acc += b[k + 1 + i + (k + 1 + j) * n] * v[j];
+                    }
+                    p[i] = tau * acc;
                 }
-                p[i] = tau * acc;
             }
             let mut dot = F::zero();
             for i in 0..len {
@@ -41,9 +55,20 @@ pub(super) fn tridiagonalize<const N: usize>(
             for i in 0..len {
                 p[i] -= alpha * v[i];
             }
-            for j in 0..len {
-                for i in 0..len {
-                    b[k + 1 + i + (k + 1 + j) * n] -= v[i] * p[j] + p[i] * v[j];
+            if par {
+                b[(k + 1) * n..n * n]
+                    .par_chunks_mut(n)
+                    .enumerate()
+                    .for_each(|(j, col)| {
+                        for i in 0..len {
+                            col[k + 1 + i] -= v[i] * p[j] + p[i] * v[j];
+                        }
+                    });
+            } else {
+                for j in 0..len {
+                    for i in 0..len {
+                        b[k + 1 + i + (k + 1 + j) * n] -= v[i] * p[j] + p[i] * v[j];
+                    }
                 }
             }
         }
@@ -63,16 +88,33 @@ pub(super) fn tridiagonalize<const N: usize>(
 // apply_reflectors pattern: Q = H_0 ... H_{n-3} with H_k acting on k+1..n.
 pub(super) fn form_q<const N: usize>(b: &[F<N>], n: usize, taus: &[F<N>], q: &mut [F<N>]) {
     identity(q, n);
+    // Reflector applications to independent columns join the ambient pool
+    // under the inner-parallel gate; the reflector sequence stays serial.
+    let par = inner_par() && n >= PAR_COLS;
     for k in (0..n.saturating_sub(2)).rev() {
-        for j in 0..n {
-            let mut dot = q[k + 1 + j * n];
-            for i in k + 2..n {
-                dot += b[i + k * n] * q[i + j * n];
-            }
-            dot *= taus[k];
-            q[k + 1 + j * n] -= dot;
-            for i in k + 2..n {
-                q[i + j * n] -= b[i + k * n] * dot;
+        if par {
+            q[..n * n].par_chunks_mut(n).for_each(|qj| {
+                let mut dot = qj[k + 1];
+                for i in k + 2..n {
+                    dot += b[i + k * n] * qj[i];
+                }
+                dot *= taus[k];
+                qj[k + 1] -= dot;
+                for i in k + 2..n {
+                    qj[i] -= b[i + k * n] * dot;
+                }
+            });
+        } else {
+            for j in 0..n {
+                let mut dot = q[k + 1 + j * n];
+                for i in k + 2..n {
+                    dot += b[i + k * n] * q[i + j * n];
+                }
+                dot *= taus[k];
+                q[k + 1 + j * n] -= dot;
+                for i in k + 2..n {
+                    q[i + j * n] -= b[i + k * n] * dot;
+                }
             }
         }
     }

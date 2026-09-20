@@ -13,6 +13,18 @@ use rayon::prelude::*;
 use sdpx_arithmetic::{EncodeSide, MpFloat, RnsPlan, Scalar};
 type F<const N: usize> = MpFloat<N>;
 
+// Minimum trailing column/element count before a kernel offers independent
+// column work to the ambient solver pool while `inner_parallel` is active;
+// smaller tails stay serial to avoid dispatch overhead.
+const PAR_COLS: usize = 4;
+
+// True when this kernel may re-offer independent column work to the ambient
+// Rayon pool. Only solver-pool lanes set the TLS gate, so par iterators here
+// join the solver pool rather than the global pool.
+fn inner_par() -> bool {
+    sdpx_arithmetic::inner_parallel::active()
+}
+
 fn upper(c: u8) -> u8 {
     c.to_ascii_uppercase()
 }
@@ -86,6 +98,18 @@ fn output_columns<const N: usize>(
                     }
                 })
         });
+    } else if inner_par() && columns >= PAR_COLS {
+        // Called on a solver-pool lane without an explicit pool: offer the
+        // same complete-column tiles to the ambient pool.
+        let tile = columns.div_ceil(4 * rayon::current_num_threads()).max(1);
+        c[..used]
+            .par_chunks_mut(tile * ld)
+            .enumerate()
+            .for_each(|(t, values)| {
+                for (j, values) in values.chunks_mut(ld).enumerate() {
+                    column(t * tile + j, &mut values[..rows]);
+                }
+            });
     } else {
         for j in 0..columns {
             column(j, &mut c[j * ld..j * ld + rows]);
@@ -172,6 +196,20 @@ fn syrk_output_columns<const N: usize>(
                 &column,
             )
         });
+    } else if inner_par() && n >= PAR_COLS {
+        // Ambient-pool fallback on a solver-pool lane; split_syrk_columns
+        // keeps the triangular load balanced across lanes.
+        let lanes = (4 * rayon::current_num_threads()).min(n).max(1);
+        split_syrk_columns(
+            &mut c[..(n - 1) * ld + n],
+            n,
+            ld,
+            0,
+            n,
+            lanes,
+            upper,
+            &column,
+        );
     } else {
         output_columns(c, n, n, ld, None, column);
     }
@@ -568,22 +606,47 @@ impl<const N: usize> XpotrfScalar for F<N> {
             }
             let d = d.sqrt();
             a[j + j * ld] = d;
-            for i in j + 1..n {
-                let q = if upper(u) == b'L' {
-                    i + j * ld
-                } else {
-                    j + i * ld
-                };
-                let mut v = a[q];
-                for k in 0..j {
-                    let (v1, v2) = if upper(u) == b'L' {
-                        (a[i + k * ld], a[j + k * ld])
+            let tail = n - j - 1;
+            // Each trailing update reads only completed columns and writes a
+            // disjoint element, so it can join the ambient pool under the
+            // solver's inner-parallel gate.
+            if inner_par() && tail >= PAR_COLS && upper(u) == b'L' {
+                let (done, rest) = a.split_at_mut(j * ld);
+                rest[j + 1..n].par_iter_mut().enumerate().for_each(|(t, q)| {
+                    let i = j + 1 + t;
+                    let mut v = *q;
+                    for k in 0..j {
+                        v = (-done[i + k * ld]).mul_add(done[j + k * ld], v);
+                    }
+                    *q = v / d;
+                });
+            } else if inner_par() && tail >= PAR_COLS {
+                let (head, right) = a.split_at_mut((j + 1) * ld);
+                right.par_chunks_mut(ld).for_each(|col| {
+                    let mut v = col[j];
+                    for k in 0..j {
+                        v = (-col[k]).mul_add(head[k + j * ld], v);
+                    }
+                    col[j] = v / d;
+                });
+            } else {
+                for i in j + 1..n {
+                    let q = if upper(u) == b'L' {
+                        i + j * ld
                     } else {
-                        (a[k + i * ld], a[k + j * ld])
+                        j + i * ld
                     };
-                    v = (-v1).mul_add(v2, v);
+                    let mut v = a[q];
+                    for k in 0..j {
+                        let (v1, v2) = if upper(u) == b'L' {
+                            (a[i + k * ld], a[j + k * ld])
+                        } else {
+                            (a[k + i * ld], a[k + j * ld])
+                        };
+                        v = (-v1).mul_add(v2, v);
+                    }
+                    a[q] = v / d;
                 }
-                a[q] = v / d;
             }
         }
     }
