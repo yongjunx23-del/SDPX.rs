@@ -555,20 +555,38 @@ impl<const N: usize> Xsyr2kScalar for F<N> {
         assert!(tri(u) && trans(t) && n >= 0 && k >= 0 && valid(c.len(), n, n, ldc));
         let (r, s) = if upper(t) == b'N' { (n, k) } else { (k, n) };
         assert!(valid(a.len(), r, s, lda) && valid(b.len(), r, s, ldb));
-        for j in 0..n as usize {
-            for i in 0..n as usize {
+        let (n, k) = (n as usize, k as usize);
+        let (lda, ldb, ldc) = (lda as usize, ldb as usize, ldc as usize);
+        // Output columns are disjoint and read only a/b, so they can join
+        // the ambient pool while the solver's inner-parallel gate is active.
+        let column = |j: usize, cj: &mut [Self]| {
+            for i in 0..n {
                 if (upper(u) == b'U' && i > j) || (upper(u) == b'L' && i < j) {
                     continue;
                 }
                 let mut v = Self::zero();
                 if alpha != Self::zero() {
-                    for p in 0..k as usize {
-                        v += at(a, lda as usize, i, p, t) * at(b, ldb as usize, j, p, t)
-                            + at(b, ldb as usize, i, p, t) * at(a, lda as usize, j, p, t);
+                    for p in 0..k {
+                        v += at(a, lda, i, p, t) * at(b, ldb, j, p, t)
+                            + at(b, ldb, i, p, t) * at(a, lda, j, p, t);
                     }
                 }
-                let q = i + j * ldc as usize;
-                c[q] = axpby(alpha, v, beta, c[q]);
+                cj[i] = axpby(alpha, v, beta, cj[i]);
+            }
+        };
+        if inner_par() && n >= PAR_COLS && ldc == n {
+            let tile = n.div_ceil(4 * rayon::current_num_threads()).max(1);
+            c[..n * ldc]
+                .par_chunks_mut(tile * ldc)
+                .enumerate()
+                .for_each(|(ti, chunk)| {
+                    for (jc, cj) in chunk.chunks_mut(ldc).enumerate() {
+                        column(ti * tile + jc, cj);
+                    }
+                });
+        } else {
+            for j in 0..n {
+                column(j, &mut c[j * ldc..(j + 1) * ldc]);
             }
         }
     }
