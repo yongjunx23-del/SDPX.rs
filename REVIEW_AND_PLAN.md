@@ -821,3 +821,68 @@ worker-time. On this evidence:
   worker-sum ≈660s, `scale cones` 34s, `cones_schur` 8.2s) — intrinsic
   scalar cost already parallelized across the solver pool; the plan's
   rotation-logging and RNS avenues measured no improvement there.
+
+## M6 distributed path — executed under renewed authorization
+
+The pre-existing rank-sharded path (dlopen MPI shim in `mpi.rs`,
+cost-balanced cone partition, per-site communicators, `gather_slice`
+transports of inline-owned `MpFloat` bytes) was audited against PR-16
+and exercised end-to-end:
+
+- **PR-16 contract**: two gaps fixed (`d4b404e`). The `sync` phase's
+  `valid` folded only owned blocks — a failing owner would return early
+  while peers marched into the next collective; the flag is now merged
+  by allreduce after the Gram gather (the `update_scaling_sharded`
+  merge already existed). And `sdpx_mpi_world_size` /
+  `SDPX.mpi_world_size()` reports the engaged world so a launcher
+  failure can no longer masquerade as a distributed run (the driver
+  aborts on disagreement). Serialization is raw inline `MpFloat` bytes
+  — exact for the owned-storage layout on homogeneous clusters; scalar
+  `exact_encode` remains the cross-format path for snapshots.
+- **Bitwise correctness**: 2-rank Λ=11 (same node, 2×32t) and 2-node
+  Λ=15 (node3+node10, 2×32t) both Solved with per-rank outputs and the
+  serial reference **bitwise identical** except the timing line;
+  iteration counts unchanged (69/75). Gather order is block-ordered
+  and rank-count-independent by construction.
+- **G6 performance outcome — negative at authorized sizes**: Λ=11
+  2r×32t 165.8s vs 1×64t 138.0s (−20%); Λ=15 2-node 2r×32t 1840.9s vs
+  1×128t 199.2s (9.2× slower, though at half the cores — replicated
+  phases lose threads: refactor 106→701ms, cones_schur 107→702ms, plus
+  ~0.2-0.3s/iter gather latency). Cone work already saturates the
+  solver pool on one node, so sharding it adds latency without adding
+  throughput; every rank still holds all cone state, so there is no
+  memory-capacity win either.
+- **PR-17 disposition**: compute is owner-sharded for every heavy cone
+  path (scaling state `[R,Rinv,λ]` pack/gather, Gram, Δs, barrier,
+  margins, step bounds, `mul_Hs`, sparse products, residuals);
+  replicated state remains the documented limitation. Full ownership
+  only pays at inputs exceeding single-node memory — beyond the
+  Λ≤19 envelope where inputs exist.
+- **PR-18 disposition**: the coupled factor is the 1190×1190 Schur
+  (35-dim border under Arrow) — replicated per rank and far below the
+  size where a distributed tile factorization could repay its latency.
+  Not built; recorded as a measured rejection, not an oversight.
+- MPI remains strictly opt-in (engaged only under a launcher
+  environment); single-node behaviour is untouched.
+
+## M8 — executed
+
+**11.1 conditioning at fixed precision — evaluated, no change.**
+Λ=11/768-bit receipt: `factorizations=70` (exactly one successful
+refactor per iteration plus init — zero escalation), `rhs_applied=210`,
+260 LDL solves → ~0.24 IR refinements per outer solve, `Solved` at 69
+iterations with the 1e-42 tolerance stack. Ruiz + presolve + chordal +
+static regularization + IR are achieving their design intent; there is
+no measured headroom (no refactor churn, no IR pile-up) that an extra
+reversible basis/scaling transform could attack. Per the plan's own
+caution, the bounded evaluation is negative — recorded, not shipped.
+
+**11.2 cross-problem reuse — exists, measured, no change.**
+`prepare`/`solve!(;q,b)` already reuses the prepared handle (Ruiz kept,
+presolve/chordal disabled for structure stability, symbolics and pool
+retained); termination agrees with fresh prepares (dual_infeasible on a
+fixture, bitwise-same statuses). At mid-size the saving is bounded by
+the disabled structural preprocessing (~equal); at Ising scale the
+per-point win is the ~2-3s solver setup plus Julia program
+construction — ~2% of a 140-400s solve, real but modest; basis/weight
+changes still require a fresh prepare, as the contract requires.
