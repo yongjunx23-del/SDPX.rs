@@ -12,6 +12,7 @@ pub mod algebra;
 pub mod io;
 pub(crate) mod mpi;
 pub mod qdldl;
+pub mod receipt;
 pub mod solver;
 pub mod timers;
 

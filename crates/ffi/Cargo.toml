@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 sdpx-solver = { path = "../solver", default-features = false, features = ["sdp"] }
 sdpx-arithmetic = { path = "../arithmetic" }
+serde_json = "1"
 [features]
 sdp-accelerate = ["sdpx-solver/sdp-accelerate"]
 sdp-netlib = ["sdpx-solver/sdp-netlib"]

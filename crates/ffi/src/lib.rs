@@ -25,6 +25,12 @@ type Result<T> = std::result::Result<T, (i32, String)>;
 fn invalid(s: impl Into<String>) -> (i32, String) {
     (1, s.into())
 }
+fn peak_rss_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = s.lines().find(|l| l.starts_with("VmHWM"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
 thread_local! { static ERROR: RefCell<String> = const { RefCell::new(String::new()) }; }
 fn boundary(f: impl FnOnce() -> Result<()>) -> i32 {
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -446,9 +452,69 @@ impl<T: Scalar> Typed<T> {
     }
     fn solve(&mut self) -> Result<()> {
         self.solved = false;
+        // Reset per-solve phase aggregation so the receipt covers this solve.
+        sdpx_solver::receipt::drain();
         self.solver.solve();
         self.solved = true;
+        self.emit_receipt();
         Ok(())
+    }
+    /// JSON execution receipt (plan PR-01), written when `SDPX_RECEIPT` names
+    /// a path. Records identities, counts and aggregated phase timings; never
+    /// fails the solve on I/O errors.
+    fn emit_receipt(&self) {
+        let Some(path) = std::env::var_os("SDPX_RECEIPT") else {
+            return;
+        };
+        let phases = sdpx_solver::receipt::drain();
+        let mut phase_map = serde_json::Map::new();
+        for (name, s) in &phases {
+            phase_map.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "count": s.count,
+                    "total_s": s.total.as_secs_f64(),
+                    "median_s": s.median().as_secs_f64(),
+                    "max_s": s.max.as_secs_f64(),
+                }),
+            );
+        }
+        let ctr = self.solver.kktsystem.counters();
+        let env = |k: &str| match std::env::var(k) {
+            Ok(v) => serde_json::json!(v),
+            Err(_) => serde_json::Value::Null,
+        };
+        let v = serde_json::json!({
+            "schema_version": 1,
+            "crate_version": env!("CARGO_PKG_VERSION"),
+            "git_hash": option_env!("SDPX_GIT_HASH"),
+            "precision_bits": self.bits,
+            "backend": self.solver.info.linsolver.name,
+            "threads": {
+                "backend": self.solver.info.linsolver.threads,
+                "cones": self.solver.cones.cone_threads(),
+            },
+            "dimensions": {"n": self.solver.solution.x.len(), "m": self.solver.solution.z.len()},
+            "iterations": self.solver.solution.iterations,
+            "status": format!("{:?}", self.solver.solution.status),
+            "solve_time_s": self.solver.solution.solve_time,
+            "counters": {
+                "factorizations": ctr.factorizations,
+                "rhs_applied": ctr.rhs_applied,
+                "batches": ctr.batches,
+            },
+            "phases": phase_map,
+            "memory": {"peak_rss_bytes": peak_rss_bytes()},
+            "env": {
+                "SDPX_SVD_ROT": env("SDPX_SVD_ROT"),
+                "SDPX_DIRECT_SOLVE": env("SDPX_DIRECT_SOLVE"),
+                "SDPX_RNS_OPS": env("SDPX_RNS_OPS"),
+                "SDPX_INPUT_ID": env("SDPX_INPUT_ID"),
+            },
+        });
+        if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()) {
+            eprintln!("SDPX_RECEIPT write failed for {path:?}: {e}");
+        }
     }
     unsafe fn update(&mut self, q: &Scalars, b: &Scalars) -> Result<()> {
         if q.count != self.solver.solution.x.len() as u64

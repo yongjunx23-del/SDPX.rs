@@ -122,6 +122,13 @@ where
     }
 }
 
+impl<T: FloatT> DefaultKKTSystem<T> {
+    /// Per-solve factorization/RHS accounting for execution receipts.
+    pub fn counters(&self) -> SolveCounters {
+        self.kktsolver.counters()
+    }
+}
+
 impl<T> KKTSystem<T> for DefaultKKTSystem<T>
 where
     T: FloatT,

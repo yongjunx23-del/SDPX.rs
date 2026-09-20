@@ -819,9 +819,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     fn residual(&mut self, out: &mut [T], rhs: &[T], solution: &[T], reuse_forward: bool) -> T {
         let __t0 = std::time::Instant::now();
         let __r = self.residual_inner(out, rhs, solution, reuse_forward);
-        if std::env::var_os("SDPX_PROFILE").is_some() {
-            eprintln!("PHASE residual {:?}", __t0.elapsed());
-        }
+        crate::receipt::phase("residual", __t0.elapsed());
         __r
     }
 
@@ -857,15 +855,11 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             if let Some((operator, work)) = sampled {
                 let __t = std::time::Instant::now();
                 operator.apply_transpose_with_pool(ex, z, -T::one(), T::one(), work, pool.as_ref());
-                if std::env::var_os("SDPX_PROFILE").is_some() {
-                    eprintln!("PHASE residual.adj {:?}", __t.elapsed());
-                }
+                crate::receipt::phase("residual.adj", __t.elapsed());
                 if !reuse_forward {
                     let __t = std::time::Instant::now();
                     operator.apply_with_pool(ez, x, -T::one(), T::one(), work, pool.as_ref());
-                    if std::env::var_os("SDPX_PROFILE").is_some() {
-                        eprintln!("PHASE residual.fwd {:?}", __t.elapsed());
-                    }
+                    crate::receipt::phase("residual.fwd", __t.elapsed());
                 }
             } else if let (Some(world), Some(plan)) =
                 (crate::mpi::World::get(), sparse_products.as_ref())
@@ -910,9 +904,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let mut scaling = || {
             let __t = std::time::Instant::now();
             apply_scaling_pool(pool, scaling_lanes, *scaling_tiles, blocks, workh, z, false);
-            if std::env::var_os("SDPX_PROFILE").is_some() {
-                eprintln!("PHASE residual.scale {:?}", __t.elapsed());
-            }
+            crate::receipt::phase("residual.scale", __t.elapsed());
         };
         if let Some(pool) = pool.as_ref().filter(|_| scaling_lanes.len() > 1) {
             pool.install(|| rayon::join(products, scaling));

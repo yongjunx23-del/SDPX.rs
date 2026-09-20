@@ -1791,6 +1791,7 @@ version = "0.7.0"
 dependencies = [
  "sdpx-arithmetic",
  "sdpx-solver",
+ "serde_json",
 ]
 
 [[package]]

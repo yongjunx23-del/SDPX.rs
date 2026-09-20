@@ -347,6 +347,7 @@ impl World {
         };
         if let Some(t0) = t0 {
             eprintln!("PHASE mpi.gather{site} {:?}", t0.elapsed());
+            crate::receipt::phase_record("mpi.gather", t0.elapsed());
         }
         assert_eq!(rc, 0, "MPI_Allgatherv failed");
     }

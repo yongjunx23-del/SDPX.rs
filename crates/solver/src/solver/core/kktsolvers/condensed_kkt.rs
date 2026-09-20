@@ -267,6 +267,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 inner_sampled
             );
         }
+        crate::receipt::phase_record("sync", __ts.elapsed());
         if !valid {
             return false;
         }
@@ -274,9 +275,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         if !self.assemble() {
             return false;
         }
-        if std::env::var_os("SDPX_PROFILE").is_some() {
-            eprintln!("PHASE assemble {:?}", __t0.elapsed());
-        }
+        crate::receipt::phase("assemble", __t0.elapsed());
         self.reduced.update_P(&self.schur);
         self.counters.factorizations += 1;
         let retained = &self.retained_indices;
@@ -289,9 +288,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 .map(|(_, c)| c),
             settings,
         );
-        if std::env::var_os("SDPX_PROFILE").is_some() {
-            eprintln!("PHASE cones_schur {:?}", __t1.elapsed());
-        }
+        crate::receipt::phase("cones_schur", __t1.elapsed());
         __r
     }
 

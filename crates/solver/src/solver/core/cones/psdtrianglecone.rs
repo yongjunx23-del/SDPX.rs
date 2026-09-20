@@ -237,9 +237,7 @@ where
         // Direct SVD avoids squaring the condition number of L2' * L1.
         let __ts = std::time::Instant::now();
         f.SVD.factor(tmp).expect("SVD error");
-        if std::env::var_os("SDPX_PROFILE").is_some() {
-            eprintln!("PHASE cone_svd {:?}", __ts.elapsed());
-        }
+        crate::receipt::phase("cone_svd", __ts.elapsed());
 
         // assemble λ (diagonal), R and Rinv.
         f.λ.copy_from(&f.SVD.s);
@@ -532,9 +530,7 @@ fn mul_Wx_inner<T>(
             pooled_gemm_sym(Y, tmp, Rx, None);
         }
     }
-    if std::env::var_os("SDPX_PROFILE").is_some() {
-        eprintln!("PHASE cone_wprod {:?}", __ts.elapsed());
-    }
+    crate::receipt::phase("cone_wprod", __ts.elapsed());
     if α == T::one() && β == T::zero() {
         mat_to_svec(y, Y);
     } else {
@@ -648,9 +644,7 @@ where
             workΔ.lrscale(Λisqrt, Λisqrt);
             let __ts = std::time::Instant::now();
             let v = engine.eigval_min(workΔ).expect("Eigval error");
-            if std::env::var_os("SDPX_PROFILE").is_some() {
-                eprintln!("PHASE cone_eigmin {:?}", __ts.elapsed());
-            }
+            crate::receipt::phase("cone_eigmin", __ts.elapsed());
             v
         }
     };

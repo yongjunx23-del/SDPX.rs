@@ -163,11 +163,13 @@ where
                 if std::env::var_os("SDPX_PROFILE").is_some() {
                     eprintln!("PHASE trsv {:?} ir {:?}", __t_trsv, __t0.elapsed());
                 }
+                crate::receipt::phase_record("trsv", __t_trsv);
+                // The printed "ir" field is cumulative since __t0; record the
+                // refinement-only share for per-phase accounting.
+                crate::receipt::phase_record("ir", __t0.elapsed() - __t_trsv);
                 r
             } else {
-                if std::env::var_os("SDPX_PROFILE").is_some() {
-                    eprintln!("PHASE trsv {:?}", __t_trsv);
-                }
+                crate::receipt::phase("trsv", __t_trsv);
                 self.x.is_finite()
             }
         };
@@ -286,9 +288,7 @@ where
         //refactor with new data
         let __t0 = std::time::Instant::now();
         let is_success = self.ldlsolver.refactor(KKT);
-        if std::env::var_os("SDPX_PROFILE").is_some() {
-            eprintln!("PHASE refactor {:?}", __t0.elapsed());
-        }
+        crate::receipt::phase("refactor", __t0.elapsed());
 
         if settings.static_regularization_enable {
             // put our internal copy of the KKT matrix back the way
