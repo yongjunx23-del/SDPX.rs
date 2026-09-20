@@ -474,3 +474,65 @@ Julia loads and links the rebuilt `libsdpx.so` (smoke test passed).
 Release workspace `sdpx-releases/580506a` carries the same source and
 built library; Λ=15 validated single-node (240.7s) and np=2 (315.0s).
 Best measured: Λ=11 169.7s (t32), Λ=15 241.8s (t32, np=1).
+
+### Single-node inner parallelism beyond the 28-lane cap (2026-09-20)
+
+Λ=15's 28 PSD cones cap lane-level parallelism at 28; t64/t128 were flat
+(243/240s vs 240.7 t32). Two gate levels now let spare workers absorb
+intra-cone work (`inner_parallel` TLS pair in `arithmetic::inner_parallel`,
+set by `ConeThreading::{inner_parallel,paired}` and applied at
+`cone_parallel` leaves):
+
+- **Heavy inner splits** (`workers ≥ 2×lanes`): column ranges of
+  `xgemm`/`xsyrk`/`xsyr2k`/`pooled_gemm_sym`/`xpotrf` tail updates,
+  `tridiagonalize` symv+rank-2, `form_q` columns re-offered to the pool.
+- **Paired joins** (`workers > lanes`, one stealer suffices): the two
+  cone Choleskys, `R`/`Rinv` products, and `dz`/`ds` step-bound
+  `eigval_min` evaluations run as `rayon::join` pairs (second per-cone
+  scratch set: `workvec2`/`workmat4-6`/`eig2`).
+
+All splits preserve per-element accumulation order → bitwise identical.
+
+Measured Λ=15 768-bit (jobs 213853–213869, `secs=`):
+
+| build | t32 | t64 | t128 |
+|---|---|---|---|
+| a77acd8 baseline | 240.7 | 243.1 | 240.5 |
+| +inner splits+pairing (ungated) | 248.6* | 228.2 | 192.4 |
+| +gate (workers≥2·lanes) | — | 231.6 | 196.6 |
+| +paired gate (df86cbe) | pending | pending | pending |
+
+*The apparent t32 regression was a measurement artefact:
+`prof_l15_t32.pbs` hard-pinned release `a77acd8`, so all "regressed"
+t32 numbers (248.6/251.4/250.3) re-measured the baseline library on
+sugon-queue nodes — the ~4% spread is node variance, not code. New
+`sdpx_l15_t32.pbs` points at the live release.
+
+**t128 OOM in job 213869** was a job-script bug, not solver: ppn=64 +
+mem=96gb while running `-t 128` oversubscribed 2:1 and the 231MB setup
+alloc hit the cgroup ceiling. Script now requests mem=160gb.
+
+**One-sided Jacobi SVD — measured negative, reverted (c4a51c5).** To
+break the serial QR bulge-chase inside `cone_svd` (~576s agg at t64),
+a deterministic tournament-scheduled one-sided Jacobi path was built
+(parallel Gram + column-pair rotations, QR fallback on non-convergence).
+Local probe at 44×44/768-bit: Jacobi **5.92s vs QR 1.27s** (4.6× slower
+before scheduling overhead); cluster `cone_svd` rose to 570–770ms.
+High-precision orthogonality thresholds need too many sweeps at too
+fine a task granularity. Reverted; `cone_svd` stays on the QR path.
+
+**RNS weight-table encode (e7d87d5) — retained.** `encode` folds limbs
+as `Σ limb_l·2^(64l) mod p` via a per-call weight table with u128
+accumulation reduced every 8 limbs (~2× encode). Gate unchanged in
+effect: `profitable` still rejects RNS at 44×44 (encode+CRT exceeds the
+MPFR dot at this size) — verified by direct cost-model evaluation.
+RNS pays only at larger blocks; the remaining real lever is an
+iteration-scoped operand cache so encodes amortize across the ~6
+products per cone-iteration — deferred pending Λ=19 sizing.
+
+**SDPB reference curve measured** (same Λ=15 input, 768-bit):
+np32=170s, np64=125s (1.36×), np128 (2 nodes) diverged reproducibly
+(`maxIterations exceeded`, objective diverging — a deterministic
+numerical failure, not transport noise). SDPB's single-node edge comes
+from residual-domain `dsyrk` machine-word arithmetic on the *Schur-side*
+matrices, not from more parallel units at the cone layer.
