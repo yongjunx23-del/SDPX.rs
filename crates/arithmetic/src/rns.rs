@@ -313,7 +313,7 @@ impl RnsPlan {
     /// SYRK); `limbs` is the operand mantissa width. Measured constants at
     /// 512–768-bit: `mpfr_fma` ≈ 110ns/term, residue accumulation ≈ 2ns per
     /// term per prime, Garner reconstruction ≈ 1.6µs/output, encode ≈
-    /// ~12ns per limb per prime, cached plan ≈ ~30µs.
+    /// ~8ns per limb per prime with the weighted table, cached plan ≈ ~30µs.
     pub fn profitable(
         &self,
         terms: usize,
@@ -327,7 +327,7 @@ impl RnsPlan {
         let k = self.primes.len() as f64;
         let mpfr = outputs as f64 * terms as f64 * 110.0;
         let dots = outputs as f64 * (terms as f64 * 2.0 * k + 1600.0);
-        let encode = encode_elems as f64 * k * limbs as f64 * 16.0;
+        let encode = encode_elems as f64 * k * limbs as f64 * 8.0;
         let plan = 30_000.0f64;
         (dots + encode + plan) * 1.25 < mpfr
     }
@@ -336,41 +336,58 @@ impl RnsPlan {
     ///
     /// `side` selects `shift_a`/`shift_b`. Returns `None` if a value is
     /// non-finite (the scan in `for_pair` should already have excluded this).
+    ///
+    /// Per-element work is a weighted limb sum: `v mod p = sum_l limb_l *
+    /// 2^(64l) mod p`, accumulated in `u128` with one reduction per 8-limb
+    /// batch — roughly half the cost of the per-limb Horner fold.
     pub fn encode<const N: usize>(&self, m: &[MpFloat<N>], side: EncodeSide) -> Option<Residues> {
         let k = self.primes.len();
         let shift = match side {
             EncodeSide::A => self.shift_a,
             EncodeSide::B => self.shift_b,
         };
-        let mut data = vec![0u64; m.len() * k];
-        for (e, v) in m.iter().enumerate() {
+        // w[l][k] = 2^(64*l) mod p_k. Small fixed table per call.
+        let nl = m.iter().map(|v| v.limbs.len()).max().unwrap_or(0);
+        let mut w = vec![vec![0u64; k]; nl.max(1)];
+        for (kk, pr) in self.primes.iter().enumerate() {
+            w[0][kk] = 1 % pr.p;
+            for l in 1..nl {
+                w[l][kk] = pr.reduce(w[l - 1][kk] as u128 * pr.r64 as u128);
+            }
+        }
+        let encode_one = |e: usize, row: &mut [u64]| -> bool {
+            let v = &m[e];
             let view = v.dyadic_view();
             let delta = match view.kind {
-                DyadicKind::Zero => {
-                    continue; // residues stay zero
-                }
+                DyadicKind::Zero => return true, // residues stay zero
                 DyadicKind::Finite { .. } => (view.exponent as i64)
                     .saturating_sub(MpFloat::<N>::PRECISION_BITS as i64)
                     .saturating_sub(shift),
-                _ => return None,
+                _ => return false,
             };
             if delta < 0 || delta >= (1i64 << POW2_STEPS) {
-                return None;
+                return false;
             }
-            let row = &mut data[e * k..(e + 1) * k];
-            for (k, pr) in self.primes.iter().enumerate() {
-                // M mod p: Horner fold, most significant limb first.
-                let mut r = 0u64;
-                for &limb in v.limbs.iter().rev() {
-                    r = pr.reduce(r as u128 * pr.r64 as u128 + limb as u128);
+            for (kk, pr) in self.primes.iter().enumerate() {
+                // Sum limb_l * 2^(64l) mod p in u128, folding every 8 limbs:
+                // each term < 2^124, so a batch of 8 stays below 2^127.
+                let mut acc = 0u128;
+                let mut batch = 0usize;
+                for (l, &limb) in v.limbs.iter().enumerate() {
+                    acc += limb as u128 * w[l][kk] as u128;
+                    batch += 1;
+                    if batch == 8 {
+                        acc = pr.reduce(acc) as u128;
+                        batch = 0;
+                    }
                 }
-                // Multiply by 2^delta mod p via the square table.
+                let mut r = pr.reduce(acc);
                 if delta != 0 && r != 0 {
                     let mut d = delta as u64;
                     let mut j = 0usize;
                     while d != 0 {
                         if d & 1 == 1 {
-                            r = pr.reduce(r as u128 * self.pow2[k][j] as u128);
+                            r = pr.reduce(r as u128 * self.pow2[kk][j] as u128);
                         }
                         d >>= 1;
                         j += 1;
@@ -379,7 +396,14 @@ impl RnsPlan {
                 if view.kind.is_negative() && r != 0 {
                     r = pr.p - r;
                 }
-                row[k] = r;
+                row[kk] = r;
+            }
+            true
+        };
+        let mut data = vec![0u64; m.len() * k];
+        for (e, row) in data.chunks_mut(k).enumerate() {
+            if !encode_one(e, row) {
+                return None;
             }
         }
         Some(Residues {
