@@ -255,6 +255,24 @@ pub(crate) fn pooled_gemm_sym<T: FloatT, MATA, MATB>(
                 column(j, &mut c.data_mut()[j * m..(j + 1) * m]);
             }
         }
+    } else if sdpx_arithmetic::inner_parallel::active()
+        && n >= 4
+        && rayon::current_num_threads() > 1
+    {
+        // No explicit pool, but a caller marked this as inner work: offer the
+        // triangular columns to the ambient pool's idle workers. Per-element
+        // accumulation order is unchanged, so results stay bitwise identical.
+        let tile = n.div_ceil(4 * rayon::current_num_threads()).max(1);
+        c.data_mut()
+            .par_chunks_mut(tile * m)
+            .enumerate()
+            .for_each(|(t, chunk)| {
+                let j0 = t * tile;
+                let j1 = (j0 + tile).min(n);
+                for (jc, j) in (j0..j1).enumerate() {
+                    column(j, &mut chunk[jc * m..(jc + 1) * m]);
+                }
+            });
     } else {
         for j in 0..n {
             column(j, &mut c.data_mut()[j * m..(j + 1) * m]);

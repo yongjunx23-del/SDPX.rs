@@ -198,9 +198,14 @@ where
         svec_to_mat(S, s);
         svec_to_mat(Z, z);
 
-        //compute Cholesky factors
-        let c1 = f.chol1.factor(S);
-        let c2 = f.chol2.factor(Z);
+        //compute Cholesky factors. The S and Z factorizations are
+        //independent, so offer the second to an idle ambient worker.
+        let (ch1, ch2) = (&mut f.chol1, &mut f.chol2);
+        let (c1, c2) = if sdpx_arithmetic::inner_parallel::active() {
+            rayon::join(|| ch1.factor(S), || ch2.factor(Z))
+        } else {
+            (ch1.factor(S), ch2.factor(Z))
+        };
 
         // bail if the cholesky factorization fails
         // PJG: Need proper Result return type here
