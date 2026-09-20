@@ -13,6 +13,7 @@ pub mod io;
 pub(crate) mod mpi;
 pub mod qdldl;
 pub mod receipt;
+pub mod snapshot;
 pub mod solver;
 pub mod timers;
 

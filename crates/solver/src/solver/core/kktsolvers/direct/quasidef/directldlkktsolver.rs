@@ -155,8 +155,35 @@ where
         settings: &CoreSettings<T>,
     ) -> bool {
         let __t0 = std::time::Instant::now();
+        // Lossless snapshot capture (PR-02): the RHS is cloned before the
+        // solve because a backend may overwrite it.
+        let snap = if crate::snapshot::enabled() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SNAP_IDX: AtomicU64 = AtomicU64::new(0);
+            Some((SNAP_IDX.fetch_add(1, Ordering::Relaxed), self.b.clone()))
+        } else {
+            None
+        };
         self.ldlsolver.solve(&self.KKT, &mut self.x, &mut self.b);
         let __t_trsv = __t0.elapsed();
+        if let Some((idx, rhs)) = snap {
+            let ok = self.x.is_finite();
+            if crate::snapshot::wanted(idx, !ok) {
+                if let Some(dir) = std::env::var_os("SDPX_SNAPSHOT") {
+                    let backend = self.ldlsolver.linear_solver_info().name.clone();
+                    let _ = crate::snapshot::write(
+                        std::path::Path::new(&dir),
+                        idx,
+                        &self.KKT,
+                        &self.dsigns,
+                        &rhs,
+                        &self.x,
+                        ok,
+                        &backend,
+                    );
+                }
+            }
+        }
         let is_success = {
             if settings.iterative_refinement_enable {
                 let r = self.iterative_refinement(settings);

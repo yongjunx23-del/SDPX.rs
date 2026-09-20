@@ -709,3 +709,68 @@ on the large inputs; retained in `auto` for MpFloat.
 Also fixed en route: `condensed_psd::compute_schur_dense_fma` was
 private but called by `condensed_tests` on x86_64 only — now
 `pub(super)` so the test suite compiles there.
+
+## Engineering plan PR status (large-Ising follow-ups)
+
+### PR-01 execution receipts — landed (efda563)
+
+`solver::receipt` aggregates per-phase timings (count / total / max /
+samples) in a process-wide registry drained at solve end. `SDPX_PROFILE`
+keeps its existing `PHASE` lines; `SDPX_RECEIPT=<path>` additionally
+writes a JSON receipt with git hash, settings, phase table and solve
+counters (factorizations, RHS applied, batches).
+
+### PR-02 lossless KKT/cone/RHS snapshots + replay — landed (this commit)
+
+`SDPX_SNAPSHOT=<dir>` captures every `DirectLDLKKTSolver::solve` call as
+`snap-NNNN.bin` + `.json` manifest: authoritative CSC, diagonal signs,
+RHS as presented, post-solve `x`, FNV-1a64 checksum, precision/shape/
+backend/git identity. `SDPX_SNAPSHOT_AT=csv` selects call indices
+(early/mid/late); failed solves are always captured. Values serialize
+via `Scalar::scalar_exact_encode` — `(kind, exponent, limbs)` — covering
+finite values, ±0, ±inf and NaN with no text/f64 intermediates and no
+descriptor pointers. `SDPX_DUMP_CONE` now also emits an exact `.bin`
+companion of the cone SVD input `L2'·L1` beside the f64 text probe.
+
+Replay: `snapshot::replay` rebuilds the CSC, re-applies the static
+diagonal regularization shift (`regularize_and_refactor` restores the
+stored KKT after factoring, so the snapshot is unregularized), runs
+`refactor`+`solve` through the production `LDLConfiguration` constructor,
+and reports residuals plus a bitwise comparison against the recorded `x`.
+`cargo run --example kkt_replay <snap.bin> [method]` is the CLI harness.
+Verified: round-trip identical encodings (f64 and MpFloat), and real
+`sdp` example snapshots replay bitwise-identical under `qdldl`.
+
+### PR-03 SVD rotation log — landed (15e92f4)
+
+`mpfr_rotations.rs` defers U/V Givens rotations into a `(column, c, s)`
+log; d/e updates stay immediate. Flushes after each Demmel–Kahan /
+shifted-QR sweep, at capacity, and before error returns. Modes via
+`SDPX_SVD_ROT=immediate|serial|tiled` (default immediate); serial and
+row-tiled replay preserve the exact arithmetic sequence — bitwise
+equivalence test passes including the capacity-flush path (the
+`mid > len` tile-count bug was fixed by building tiles from actual
+`chunks_mut` results).
+
+### PR-04 row-tiled replay A/B — measured, rejected
+
+Cluster Λ=15 t128, node10, 75 iterations, all Solved (job 215225):
+
+| mode | total | cone_svd median |
+|---|---|---|
+| immediate | 195.50s | 315.5ms |
+| serial | 193.99s | 319.7ms |
+| tiled | 195.18s | 364.0ms |
+
+Tiled replay is ~15% slower per SVD call — the 38×38 cone matrices are
+too small for tile overhead to pay off, and total time is unchanged
+because cone SVDs already overlap on the pool. No arm clears the ≥2%
+bar, so `immediate` stays the default; serial/tiled remain available for
+larger-matrix regimes.
+
+### PR-06 grouping statistics — landed (b186833)
+
+`ArrowLDLSolver::try_new` emits one `GROUP_STATS` line per analysis under
+`SDPX_PROFILE`: dimension, positive-component count, leaf min/median/max,
+border size, cross-sign coupling nnz, dense working-set estimate and
+eligibility. Observation-only; no solve-path change.

@@ -156,6 +156,10 @@ name = "json"
 path = "examples/rust/example_json.rs"
 required-features = ["serde"]
 
+[[example]]
+name = "kkt_replay"
+path = "examples/rust/kkt_replay.rs"
+
 
 
 # -------------------------------

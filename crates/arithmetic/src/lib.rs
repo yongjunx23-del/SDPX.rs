@@ -137,12 +137,35 @@ pub trait Scalar:
     fn rns_exponent_range(_m: &[Self]) -> Option<(i64, i64)> {
         None
     }
+    /// Lossless value encoding for solver-state snapshots: `(kind, exponent,
+    /// limbs)`. `None` (the default) means the type has no exact snapshot
+    /// encoding. Only concrete payload words are serialized — never
+    /// descriptor pointers.
+    #[doc(hidden)]
+    fn scalar_exact_encode(&self) -> Option<(i32, i64, Vec<u64>)> {
+        None
+    }
+    /// Inverse of [`Scalar::scalar_exact_encode`].
+    #[doc(hidden)]
+    fn scalar_exact_decode(_kind: i32, _exponent: i64, _limbs: &[u64]) -> Option<Self> {
+        None
+    }
 }
 macro_rules! primitive_scalar {
     ($t:ty) => {
         impl Scalar for $t {
             fn exact(&self) -> Option<Exact> {
                 self.is_finite().then(|| Exact::from_f64(*self as f64))
+            }
+            fn scalar_exact_encode(&self) -> Option<(i32, i64, Vec<u64>)> {
+                Some((0, 0, vec![self.to_bits() as u64]))
+            }
+            fn scalar_exact_decode(kind: i32, exponent: i64, limbs: &[u64]) -> Option<Self> {
+                if kind == 0 && exponent == 0 && limbs.len() == 1 {
+                    Some(Self::from_bits(limbs[0] as _))
+                } else {
+                    None
+                }
             }
             fn precision_bits() -> usize {
                 Self::MANTISSA_DIGITS as usize
@@ -325,6 +348,24 @@ impl<const N: usize> MpFloat<N> {
         Self::output(|r| unsafe {
             mpfr::set(r, desc, ROUND);
         })
+    }
+
+    /// Lossless snapshot encoding: `(kind, exponent, limbs)`. Round-trips
+    /// every representable state — finite values, ±0, ±inf, NaN — without
+    /// text or f64 intermediates. Only the three public fields are exposed;
+    /// no MPFR descriptor pointers are serialized.
+    pub fn exact_encode(&self) -> (i32, i64, &[u64; N]) {
+        (self.kind, self.exponent as i64, &self.limbs)
+    }
+    /// Inverse of [`exact_encode`]. The caller must supply a triple produced
+    /// at the same precision; no validation beyond a precision check is done.
+    pub fn exact_decode(kind: i32, exponent: i64, limbs: [u64; N]) -> Self {
+        Self::check_precision();
+        Self {
+            limbs,
+            kind,
+            exponent: exponent as mpfr::exp_t,
+        }
     }
 
     /// Accumulate products in iterator order, rounding each FMA at this precision.
@@ -577,6 +618,14 @@ impl<const N: usize> Scalar for MpFloat<N> {
             mpfr::get_q(&mut value.raw, &self.descriptor());
         }
         Some(value)
+    }
+    fn scalar_exact_encode(&self) -> Option<(i32, i64, Vec<u64>)> {
+        let (k, e, l) = self.exact_encode();
+        Some((k, e, l.to_vec()))
+    }
+    fn scalar_exact_decode(kind: i32, exponent: i64, limbs: &[u64]) -> Option<Self> {
+        let a: [u64; N] = limbs.try_into().ok()?;
+        Some(Self::exact_decode(kind, exponent, a))
     }
     fn precision_bits() -> usize {
         Self::PRECISION_BITS

@@ -756,7 +756,16 @@ fn dump_cone_f64<T: FloatT>(dir: &std::ffi::OsStr, m: &Matrix<T>) {
         *guard.get_or_insert_with(HashMap::new).entry(key).or_insert(0)
     };
     *SEQ.lock().unwrap().as_mut().unwrap().get_mut(&key).unwrap() += 1;
-    let path = std::path::Path::new(dir).join(format!("cone-{key:x}-iter{iter:04}.txt"));
+    let name = format!("cone-{key:x}-iter{iter:04}");
+    // Lossless companion for replay: exact (kind, exponent, limbs) encoding.
+    let _ = crate::snapshot::write_dense(
+        std::path::Path::new(dir),
+        &name,
+        m.size().0,
+        m.size().1,
+        m.data(),
+    );
+    let path = std::path::Path::new(dir).join(format!("{name}.txt"));
     let (rows, cols) = m.size();
     let mut out = String::with_capacity(m.data().len() * 24);
     out.push_str(&format!("{rows} {cols}\n"));
