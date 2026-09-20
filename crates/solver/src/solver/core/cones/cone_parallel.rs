@@ -250,6 +250,10 @@ pub(super) fn sym_step_bounds<T: FloatT>(
     alpha: T,
 ) {
     if lanes.len() == 1 {
+        // Leaf task on a pool worker: per-cone step kernels may re-offer
+        // independent inner work (paired dz/ds bounds, dense kernels) to
+        // the ambient pool.
+        let _inner = sdpx_arithmetic::inner_parallel::Guard::enter();
         let mut row = lanes[0].row_start;
         for (cone, bound) in cones.iter_mut().zip(bounds) {
             let end = row + cone.numel();
@@ -353,6 +357,7 @@ pub(super) fn prepare_affine_bounds<T: FloatT>(
     alpha: T,
 ) {
     if lanes.len() <= 1 {
+        let _inner = sdpx_arithmetic::inner_parallel::Guard::enter();
         let mut row = 0;
         for (cone, bound) in cones.iter_mut().zip(bounds) {
             let end = row + cone.numel();

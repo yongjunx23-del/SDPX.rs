@@ -23,6 +23,13 @@ pub struct PSDConeData<T> {
     workmat2: Matrix<T>,
     workmat3: Matrix<T>,
     workvec: Vec<T>,
+    // Second scratch set so the independent dz and ds step-bound
+    // evaluations can run on two workers at once.
+    eig2: EigEngine<T>,
+    workmat4: Matrix<T>,
+    workmat5: Matrix<T>,
+    workmat6: Matrix<T>,
+    workvec2: Vec<T>,
 }
 
 impl<T> PSDConeData<T>
@@ -47,6 +54,11 @@ where
             workmat2: Matrix::zeros((n, n)),
             workmat3: Matrix::zeros((n, n)),
             workvec: vec![T::zero(); triangular_number(n)],
+            eig2: EigEngine::<T>::new(n),
+            workmat4: Matrix::zeros((n, n)),
+            workmat5: Matrix::zeros((n, n)),
+            workmat6: Matrix::zeros((n, n)),
+            workvec2: vec![T::zero(); triangular_number(n)],
         }
     }
 }
@@ -230,13 +242,25 @@ where
         f.λ.copy_from(&f.SVD.s);
         f.Λisqrt.copy_from(&f.λ).sqrt().recip();
 
-        //f.R = L1*(f.SVD.V)*f.Λisqrt
-        f.R.mul(L1, &f.SVD.Vt.t(), T::one(), T::zero());
-        f.R.rscale(&f.Λisqrt);
-
-        //f.Rinv .= f.Λisqrt*(f.SVD.U)'*L2'
-        f.Rinv.mul(&f.SVD.U.t(), &L2.t(), T::one(), T::zero());
-        f.Rinv.lscale(&f.Λisqrt);
+        //f.R = L1*(f.SVD.V)*f.Λisqrt and f.Rinv = f.Λisqrt*(f.SVD.U)'*L2'
+        //are independent products; pair them when inner workers are idle.
+        {
+            let (R, Rinv, svd, Λi) = (&mut f.R, &mut f.Rinv, &f.SVD, &f.Λisqrt);
+            let mut build_r = || {
+                R.mul(L1, &svd.Vt.t(), T::one(), T::zero());
+                R.rscale(Λi);
+            };
+            let mut build_rinv = || {
+                Rinv.mul(&svd.U.t(), &L2.t(), T::one(), T::zero());
+                Rinv.lscale(Λi);
+            };
+            if sdpx_arithmetic::inner_parallel::active() {
+                rayon::join(build_r, build_rinv);
+            } else {
+                build_r();
+                build_rinv();
+            }
+        }
 
         // Cache only the matrix defining the congruence X -> G X G.
         // Keeping its upper triangle authoritative preserves the original
@@ -285,9 +309,41 @@ where
         _settings: &CoreSettings<T>,
         αmax: T,
     ) -> (T, T) {
-        let αz = self.step_component(dz, false, αmax);
-        let αs = self.step_component(ds, true, αmax);
-        (αz, αs)
+        if sdpx_arithmetic::inner_parallel::active() {
+            let f = &mut *self.data;
+            let PSDConeData {
+                R,
+                Rinv,
+                Λisqrt,
+                workvec,
+                workmat1,
+                workmat2,
+                workmat3,
+                Eig,
+                workvec2,
+                workmat4,
+                workmat5,
+                workmat6,
+                eig2,
+                ..
+            } = f;
+            rayon::join(
+                || {
+                    step_component_inner(
+                        dz, R, Λisqrt, false, αmax, workvec, workmat1, workmat2, workmat3, Eig,
+                    )
+                },
+                || {
+                    step_component_inner(
+                        ds, Rinv, Λisqrt, true, αmax, workvec2, workmat4, workmat5, workmat6, eig2,
+                    )
+                },
+            )
+        } else {
+            let αz = self.step_component(dz, false, αmax);
+            let αs = self.step_component(ds, true, αmax);
+            (αz, αs)
+        }
     }
 
     fn compute_barrier(&mut self, z: &[T], s: &[T], dz: &[T], ds: &[T], α: T) -> T {
@@ -304,30 +360,66 @@ where
 {
     fn step_component(&mut self, direction: &[T], primal: bool, αmax: T) -> T {
         let f = &mut self.data;
-        mul_Wx_inner(
-            if primal {
-                MatrixShape::T
-            } else {
-                MatrixShape::N
-            },
-            &mut f.workvec,
+        step_component_inner(
             direction,
-            T::one(),
-            T::zero(),
             if primal { &f.Rinv } else { &f.R },
+            &f.Λisqrt,
+            primal,
+            αmax,
+            &mut f.workvec,
             &mut f.workmat1,
             &mut f.workmat2,
             &mut f.workmat3,
-        );
-        step_length_psd_component(&mut f.workmat1, &mut f.Eig, &f.workvec, &f.Λisqrt, αmax)
+            &mut f.Eig,
+        )
     }
 
     pub(super) fn prepare_affine_bounds(&mut self, dz: &mut [T], ds: &mut [T], αmax: T) -> (T, T) {
-        let αz = self.step_component(dz, false, αmax);
-        dz.copy_from_slice(&self.data.workvec);
-        let αs = self.step_component(ds, true, αmax);
-        ds.copy_from_slice(&self.data.workvec);
-        (αz, αs)
+        // The dz (dual, R) and ds (primal, Rinv) bounds are independent.
+        // With a second scratch set they can run on two ambient workers;
+        // without one they fold serially, bitwise identical either way.
+        if sdpx_arithmetic::inner_parallel::active() {
+            let f = &mut *self.data;
+            let PSDConeData {
+                R,
+                Rinv,
+                Λisqrt,
+                workvec,
+                workmat1,
+                workmat2,
+                workmat3,
+                Eig,
+                workvec2,
+                workmat4,
+                workmat5,
+                workmat6,
+                eig2,
+                ..
+            } = f;
+            let (αz, αs) = rayon::join(
+                || {
+                    let α = step_component_inner(
+                        dz, R, Λisqrt, false, αmax, workvec, workmat1, workmat2, workmat3, Eig,
+                    );
+                    dz.copy_from_slice(workvec);
+                    α
+                },
+                || {
+                    let α = step_component_inner(
+                        ds, Rinv, Λisqrt, true, αmax, workvec2, workmat4, workmat5, workmat6, eig2,
+                    );
+                    ds.copy_from_slice(workvec2);
+                    α
+                },
+            );
+            (αz, αs)
+        } else {
+            let αz = self.step_component(dz, false, αmax);
+            dz.copy_from_slice(&self.data.workvec);
+            let αs = self.step_component(ds, true, αmax);
+            ds.copy_from_slice(&self.data.workvec);
+            (αz, αs)
+        }
     }
 
     pub(super) fn combined_shift_prepared(&mut self, shift: &mut [T], dz: &[T], ds: &[T], σμ: T) {
@@ -501,6 +593,39 @@ where
 //-----------------------------------------
 // internal operations for SDP cones
 // ----------------------------------------
+
+fn step_component_inner<T>(
+    direction: &[T],
+    rx: &Matrix<T>,
+    Λisqrt: &[T],
+    primal: bool,
+    αmax: T,
+    wv: &mut Vec<T>,
+    wm1: &mut Matrix<T>,
+    wm2: &mut Matrix<T>,
+    wm3: &mut Matrix<T>,
+    eig: &mut EigEngine<T>,
+) -> T
+where
+    T: FloatT,
+{
+    mul_Wx_inner(
+        if primal {
+            MatrixShape::T
+        } else {
+            MatrixShape::N
+        },
+        wv,
+        direction,
+        T::one(),
+        T::zero(),
+        rx,
+        wm1,
+        wm2,
+        wm3,
+    );
+    step_length_psd_component(wm1, eig, wv, Λisqrt, αmax)
+}
 
 fn step_length_psd_component<T>(
     workΔ: &mut Matrix<T>,
