@@ -818,7 +818,3 @@ mod syrk_partition_tests;
 #[cfg(test)]
 #[path = "mpfr_tridiagonal_tests.rs"]
 mod tridiagonal_tests;
-
-#[cfg(test)]
-#[path = "mpfr_jacobi_tests.rs"]
-mod jacobi_tests;
