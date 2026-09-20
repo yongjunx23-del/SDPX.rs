@@ -536,3 +536,65 @@ np32=170s, np64=125s (1.36×), np128 (2 nodes) diverged reproducibly
 numerical failure, not transport noise). SDPB's single-node edge comes
 from residual-domain `dsyrk` machine-word arithmetic on the *Schur-side*
 matrices, not from more parallel units at the cone layer.
+
+## Route re-evaluation (2026-09-20, post-probe)
+
+Deep probes against the measured wall-clock model (Λ=15, t128,
+189.7s/75it ≈ 2.53s/iter: kkt-update 820ms + kkt-solve 800ms +
+scale-cones 410ms + step 152ms + residual 60ms) closed two
+previously-plausible directions and reshaped the remaining plan:
+
+**Probe A — KKT conditioning kills the f64-factor route.** Debug hook
+`SDPX_DUMP_KKT=<dir>` (in `regularize_and_refactor`, after the diagonal
+restore so the dumped matrix is the *true* one) writes the factored
+CSC as f64. Measured cond: iter2 = 5.8e18, iter30 = 8.1e22,
+iter50 = 2.3e34, iter74 = 3.0e54 (smin 1.7e-57 — at the f64 subnormal
+floor). κ·ε_f64 ≫ 1 from iteration 2 onward: an f64 factorization of
+this matrix carries zero correct digits. This is intrinsic to the
+768-bit barrier at tol=1e-42, not a structural choice — it is also why
+SDPB keeps its factorization in MPFR. **Closed.**
+
+**Probe B — residue Gram breaks even at real dimensions.** Actual
+sampled-block dims: `dim=1, basis_rows≈38 → side≈38, rank≤76`
+(14 input blocks × 2 parities = 28 cones). Per-block per-iter Gram
+work ≈ 25ms MPFR vs ≈23–29ms residue (encode Rinv ~4ms + residue
+gemm/syrk ~13ms + CRT ~6–12ms). RNS does not reduce operation count —
+it only relocates it; without SIMD residue kernels (~4× u64 lanes) the
+constant-factor gap at n≈38–76 cannot amortize encode+CRT. The same
+arithmetic dooms a residue-domain dense LDLᵀ: n³/6·30 primes ≈
+130–260ms vs QDLDL's 196ms. **Both closed pending SIMD kernels.**
+
+**Structural accounting corrections.** `kktsystem.update` hides a
+*third* full solve per iteration (`solve_constant_rhs`); per-iteration
+solve work = 3 solves × ~2.7 IR sub-solves, each with trsv (~13ms) and
+a full-residual eval. The 66ms residual eval is the **sampled operator
+A/Aᵀ products (2.07M nnz)**, not the 88k KKT matvec — already pooled,
+≈30–50% headroom at best.
+
+### Remaining levers (ranked)
+
+1. **Warm-start MPFR Jacobi SVD** (probe before committing): the
+   reverted cold-start Jacobi needed too many sweeps; restarting from
+   the *previous iteration's* V (iterates move smoothly) or an f64
+   skeleton of `M/‖M‖` should converge quadratically in ~4–6 sweeps.
+   Output contract unchanged — Jacobi's convergence test *is* the
+   MPFR verification; fall back to QR per-block when it fails.
+   Targets `cone_svd` 289ms serial floor. Honest expectation:
+   0–30% of that phase — sweep cost is the unknown.
+2. **eigmin warm-start** — same pattern on the tridiagonal QR eig
+   (~25ms/call → target ~5–10ms).
+3. **Residual-path audit** — confirm the 2M-nnz sampled products are
+   actually engaging the pool inside `residual()`.
+4. **Λ=19 acceptance** — profile first; per-block sizes only grow to
+   ~46–47, so no residue windfall is expected.
+
+Closed permanently: cross-node transport (np2 = −31% measured, SDPB
+np128 diverges), cold Jacobi, eig-for-SVD (κ²), f64 preconditioner
+(κ≥1e18), residue Gram/Schur/LDLᵀ without SIMD.
+
+Cluster validation status: t128 = 193.6s clean on an exclusive node
+(job 213892); t32 = 251.9s on sugon queue (same as old library → node
+variance, no regression); t64 pending resubmit (co-tenant memory
+pressure caused repeated setup-stage OOMs — `mem=` requests set
+RLIMIT_DATA/-m AND scheduler does not memory-pack, so co-tenancy is
+unavoidable; mitigated by `naccesspolicy=singlejob` + mem=180gb).

@@ -298,6 +298,10 @@ where
             _update_values_KKT(KKT, &map.diag_full, diag_kkt);
         }
 
+        if let Some(dir) = std::env::var_os("SDPX_DUMP_KKT") {
+            dump_kkt_f64(&dir, KKT);
+        }
+
         is_success
     }
 
@@ -466,6 +470,37 @@ fn _fill_signs(signs: &mut [i8], m: usize, n: usize, map: &LDLDataMap) {
         signs[p..(p + thisp)].copy_from_slice(thismap.Dsigns());
         p += thisp;
     }
+}
+
+/// Debug probe: dump the true (unregularized) KKT matrix as f64 CSC text.
+/// Gated by SDPX_DUMP_KKT=<dir>; writes <dir>/kkt-NNNN.txt with the matrix
+/// dimension, colptr, rowval and nzval converted elementwise to f64. Values
+/// overflowing f64 clamp to ±f64::MAX, which already answers the conditioning
+/// question the probe exists for.
+fn dump_kkt_f64<T: FloatT>(dir: &std::ffi::OsStr, KKT: &CscMatrix<T>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DUMP_IDX: AtomicUsize = AtomicUsize::new(0);
+    let idx = DUMP_IDX.fetch_add(1, Ordering::Relaxed);
+    let path = std::path::Path::new(dir).join(format!("kkt-{idx:04}.txt"));
+    let mut out = String::with_capacity(KKT.nzval.len() * 24);
+    out.push_str(&format!("{} {}\n", KKT.n, KKT.nzval.len()));
+    for &p in KKT.colptr.iter() {
+        out.push_str(&format!("{p}\n"));
+    }
+    for &r in KKT.rowval.iter() {
+        out.push_str(&format!("{r}\n"));
+    }
+    for v in KKT.nzval.iter() {
+        let f = v.to_f64().unwrap_or_else(|| {
+            if *v < T::zero() {
+                -f64::MAX
+            } else {
+                f64::MAX
+            }
+        });
+        out.push_str(&format!("{f:.17e}\n"));
+    }
+    let _ = std::fs::write(&path, out);
 }
 
 #[cfg(test)]
