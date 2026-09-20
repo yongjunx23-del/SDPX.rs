@@ -573,20 +573,20 @@ A/Aᵀ products (2.07M nnz)**, not the 88k KKT matvec — already pooled,
 
 ### Remaining levers (ranked)
 
-1. **Sampled-operator leaf split (implemented, measuring)** — the
-   residual-path audit found the real defect: `block_chunks` hands
+1. **Sampled-operator leaf split — shipped (d575d5a).** The
+   residual-path audit found the real defect: `block_chunks` handed
    ~5 spare workers per block at t128, but the `s`-level recursion
    could not subdivide a `dim=1` leaf, so ~100 workers idled while
    28 lanes ran ~15–50ms serial blocks. `sampled_split.rs` now
    subdivides the lone level: adjoint splits `(s,r)` pairs then
-   basis-column ranges (each `out[k]` is an independent `wdiag`
-   dot); forward splits `j` bands (disjoint svec positions, panel
-   rebuilt per task — h·kmax redundant muls only). Bitwise-identical:
-   new `pooled_dim1_operators_*` tests assert equality vs serial at
-   pool widths 2/4/8, mpfr256+512 exercise `chunks>1`. Local probe
-   (4 blocks 38×76, Bits512, 10 cores): leaf split at chunks=2 gave
-   ~8% on adjoint, neutral on forward — machine saturates at 8
-   threads; the real test is t128 chunks=5 on cluster.
+   basis-column ranges (each `out[k]` an independent `wdiag` dot);
+   forward splits `j` bands (disjoint svec positions, panel rebuilt
+   per task — h·kmax redundant muls only). Bitwise-identical:
+   `pooled_dim1_operators_*` assert equality vs serial at widths
+   2/4/8; production runs reproduce identical iterate trajectories.
+   **Measured on node7 (singlejob): Λ=15 t64 224.5→208.2s (−7.3%),
+   t128 193.6→169.9s (−12.2%), Λ=19 t64 446.6→402.5s (−9.9%);
+   iteration counts unchanged (75/75/83, all Solved).**
 2. **Warm-start MPFR Jacobi SVD** (probe before committing): the
    reverted cold-start Jacobi needed too many sweeps; restarting from
    the *previous iteration's* V (iterates move smoothly) or an f64
