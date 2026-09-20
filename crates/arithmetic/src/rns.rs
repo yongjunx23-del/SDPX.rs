@@ -609,7 +609,15 @@ impl RnsPlan {
             for j in 0..i {
                 let p = self.tables.primes[i];
                 // t = (t - c_j) * inv(j, i) mod p_i
-                let diff = if t >= scratch.c[j] { t - scratch.c[j] } else { t + p.p - scratch.c[j] };
+                // c_j is canonical modulo p_j, not necessarily modulo p_i.
+                // In particular the prime table is descending. Reduce first
+                // so the unsigned modular subtraction cannot underflow.
+                // The division is confined to the uncommon out-of-range case.
+                let mut cj = scratch.c[j];
+                if cj >= p.p {
+                    cj %= p.p;
+                }
+                let diff = if t >= cj { t - cj } else { t + p.p - cj };
                 t = p.reduce(diff as u128 * self.tables.inv[i][j] as u128);
             }
             scratch.c[i] = t;
