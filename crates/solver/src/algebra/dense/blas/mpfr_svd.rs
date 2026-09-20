@@ -485,6 +485,185 @@ pub(super) fn scale_checked<const N: usize>(a: &mut [F<N>], scale: F<N>) -> Resu
     }
     Ok(())
 }
+// ---------------------------------------------------------------------------
+// One-sided Jacobi SVD (LAPACK ?gesvj structure).
+//
+// The bidiagonal QR chain above is inherently serial: each bulge-chase step
+// depends on the previous rotation, so a whole block sits on one worker for
+// O(n^2) scalar work. One-sided Jacobi instead orthogonalizes columns by
+// independent 2x2 rotations; a tournament schedule groups the n(n-1)/2 pairs
+// of each sweep into rounds of n/2 disjoint pairs, so rotation work can fill
+// idle ambient workers. Jacobi is also the more accurate method for small
+// singular values (Demmel-Veselic), so the substitution does not weaken the
+// numerics. If a sweep cap is hit the caller falls back to the QR path.
+//
+// The sweep/pair schedule is fixed by the tournament ordering, so results are
+// bitwise deterministic regardless of how many workers participate.
+
+/// Minimum column count for the Jacobi path; smaller problems stay on the
+/// serial QR chain where round scheduling cannot pay for itself.
+const JACOBI_MIN: usize = 16;
+/// Hard cap on sweeps; exceeded only on pathological Gram spectra, in which
+/// case the QR path takes over unchanged.
+const JACOBI_MAX_SWEEPS: usize = 64;
+
+/// Mutable-column cursor for disjoint column-pair writes. The tournament
+/// schedule guarantees that no column index appears twice within a round, so
+/// concurrent writes to columns `p` and `q` of `b`/`v` never alias.
+#[derive(Clone, Copy)]
+struct ColMut<T>(*mut T);
+unsafe impl<T> Send for ColMut<T> {}
+unsafe impl<T> Sync for ColMut<T> {}
+
+/// Apply [c s; -s c] to columns p and q of a column-major `rows`-tall matrix
+/// addressed by `base`. Identical arithmetic to [`rotate`].
+#[inline]
+unsafe fn rotate_cols<const N: usize>(
+    base: *mut F<N>,
+    rows: usize,
+    p: usize,
+    q: usize,
+    c: F<N>,
+    s: F<N>,
+) {
+    let ns = -s;
+    for i in 0..rows {
+        let xp = base.add(i + p * rows);
+        let xq = base.add(i + q * rows);
+        let x = *xp;
+        let y = *xq;
+        *xp = ns.mul_add(y, c * x);
+        *xq = s.mul_add(x, c * y);
+    }
+}
+
+/// Jacobi sweeps on the scaled working matrix `b` (m x n, m >= n,
+/// column-major), accumulating right rotations into `v` (n x n, may be empty
+/// when no right factor is requested). `norms` holds squared column norms and
+/// is refreshed at the top of every sweep. Returns Ok when a whole sweep
+/// applies no rotation, Err when the sweep cap is exceeded.
+fn jacobi_sweeps<const N: usize>(
+    b: &mut [F<N>],
+    m: usize,
+    n: usize,
+    v: &mut [F<N>],
+    norms: &mut [F<N>],
+    par: bool,
+) -> Result<(), i32> {
+    // Circle/tournament schedule over an even column count; index `nn - 1`
+    // acts as the bye when n is odd.
+    let nn = if n % 2 == 0 { n } else { n + 1 };
+    let mut perm: Vec<usize> = (0..nn).collect();
+    let rounds = nn - 1;
+    let pairs_per_round = nn / 2;
+    let eps = F::<N>::epsilon();
+    let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(pairs_per_round);
+    let mut jobs: Vec<(usize, usize, F<N>, F<N>)> = Vec::with_capacity(pairs_per_round);
+
+    for _sweep in 0..JACOBI_MAX_SWEEPS {
+        // Fresh squared column norms; within a sweep they are maintained by
+        // the exact identity a' = a - t*c, b' = b + t*c.
+        for j in 0..n {
+            norms[j] = F::dot_fma(b[j * m..(j + 1) * m].iter().map(|x| (x, x)));
+        }
+        let mut moved = 0usize;
+        for _round in 0..rounds {
+            pairs.clear();
+            for k in 0..pairs_per_round {
+                let (mut p, mut q) = (perm[k], perm[nn - 1 - k]);
+                if p == n || q == n {
+                    continue; // odd-n bye slot
+                }
+                if p > q {
+                    std::mem::swap(&mut p, &mut q);
+                }
+                pairs.push((p, q));
+            }
+            // Phase 1: Gram entry + rotation parameters per pair. `b` is only
+            // read here, so the pair dots run in parallel without aliasing.
+            let norms_ref: &[F<N>] = norms;
+            let b_ref: &[F<N>] = b;
+            let pair_rotation = |&(p, q): &(usize, usize)| {
+                let c = F::<N>::dot_fma(
+                    (0..m).map(|i| (&b_ref[i + p * m], &b_ref[i + q * m])),
+                );
+                jacobi_rotation::<N>(c, norms_ref[p], norms_ref[q], eps)
+            };
+            let rots: Vec<Option<(F<N>, F<N>, F<N>, F<N>)>> =
+                if par && pairs.len() >= PAR_COLS {
+                    pairs.par_iter().map(pair_rotation).collect()
+                } else {
+                    pairs.iter().map(pair_rotation).collect()
+                };
+            // Norm bookkeeping is exact and tiny; do it serially, collecting
+            // the rotation jobs for phase 2.
+            jobs.clear();
+            for (idx, rot) in rots.iter().enumerate() {
+                if let Some((cs, sn, c, t)) = *rot {
+                    let (p, q) = pairs[idx];
+                    let (a, b2) = (norms[p], norms[q]);
+                    norms[p] = a - t * c;
+                    norms[q] = b2 + t * c;
+                    jobs.push((p, q, cs, sn));
+                    moved += 1;
+                }
+            }
+            // Phase 2: apply disjoint column rotations to b and v.
+            let bb = &ColMut(b.as_mut_ptr());
+            let vv = &ColMut(v.as_mut_ptr());
+            let vn = !v.is_empty();
+            let apply = move |&(p, q, cs, sn): &(usize, usize, F<N>, F<N>)| {
+                // SAFETY: jobs within a round are disjoint columns by the
+                // tournament schedule; no element is written twice.
+                unsafe {
+                    rotate_cols(bb.0, m, p, q, cs, sn);
+                    if vn {
+                        rotate_cols(vv.0, n, p, q, cs, sn);
+                    }
+                }
+            };
+            if par && jobs.len() >= PAR_COLS {
+                jobs.par_iter().for_each(apply);
+            } else {
+                jobs.iter().for_each(apply);
+            }
+            // Rotate the trailing positions of the schedule.
+            perm[1..].rotate_right(1);
+        }
+        if moved == 0 {
+            return Ok(());
+        }
+    }
+    Err(1)
+}
+
+/// Rotation parameters for one column pair, or None when the pair is already
+/// orthogonal to working precision. `a`/`b` are squared column norms and `c`
+/// the fresh Gram entry; returns (cs, sn, c, t) with t = tan(theta).
+#[inline]
+fn jacobi_rotation<const N: usize>(
+    c: F<N>,
+    a: F<N>,
+    b: F<N>,
+    eps: F<N>,
+) -> Option<(F<N>, F<N>, F<N>, F<N>)> {
+    if c == F::zero() || a == F::zero() || b == F::zero() {
+        return None;
+    }
+    // |c| <= eps*sqrt(a*b): orthogonal to machine precision.
+    if c.abs() <= eps * (a * b).sqrt() {
+        return None;
+    }
+    let two = num::<N>(2);
+    let zeta = (b - a) / (two * c);
+    let t = zeta.signum() / (zeta.abs() + (F::one() + zeta * zeta).sqrt());
+    if t == F::zero() {
+        return None;
+    }
+    let cs = (F::one() + t * t).sqrt().recip();
+    let sn = cs * t;
+    Some((cs, sn, c, t))
+}
 // Work layout for the tall factorization; wide matrices transpose both the
 // input and requested vector counts. GESVD has no integer work argument, so
 // exact integer indices occupy scalar work cells during output ordering.
@@ -555,22 +734,71 @@ pub(super) fn svd<'a, const N: usize>(
         }
     }
     scale_checked(b, scale)?;
-    reduce_bidiagonal(b, m, n, d, e, left, right, scratch);
-    if b.iter()
-        .chain(d.iter())
-        .chain(e.iter())
-        .any(|x| !x.is_finite())
-    {
-        return Err(1);
+    let refill_b = |b: &mut [F<N>]| {
+        for j in 0..n {
+            for i in 0..m {
+                b[i + j * m] = if wide { a[j + i * lda] } else { a[i + j * lda] };
+            }
+        }
+    };
+    // One-sided Jacobi replaces the serial bidiagonal QR chain when the job
+    // shape admits it (economy/full-column U at n columns) and ambient inner
+    // workers exist; any failure refills b and continues on the QR path.
+    let par = sdpx_arithmetic::inner_parallel::active();
+    let mut jacobi_done = false;
+    if par && n >= JACOBI_MIN && (uc == n || uc == 0) {
+        if vr > 0 {
+            identity(v, n);
+        }
+        // `left` (n cells) is borrowed as the squared-norm scratch; a QR
+        // fallback rewrites it.
+        jacobi_done = jacobi_sweeps(b, m, n, v, left, par).is_ok();
+        if jacobi_done {
+            // Fresh column norms for the singular values — the sweep-maintained
+            // values accumulate rotation rounding. A zero column leaves no
+            // usable U, so fall back rather than emit a NaN factor.
+            let mut ok = true;
+            for j in 0..n {
+                let s = norm(&b[j * m..(j + 1) * m]);
+                if s == F::zero() || !s.is_finite() {
+                    ok = false;
+                    break;
+                }
+                d[j] = s;
+            }
+            jacobi_done = ok;
+            if ok && uc == n {
+                for j in 0..n {
+                    let s = d[j];
+                    for i in 0..m {
+                        u[i + j * m] = b[i + j * m] / s;
+                    }
+                }
+            }
+        }
+        if !jacobi_done {
+            refill_b(b);
+            scale_checked(b, scale)?;
+        }
     }
-    for j in 0..uc {
-        u[j + j * m] = F::one();
+    if !jacobi_done {
+        reduce_bidiagonal(b, m, n, d, e, left, right, scratch);
+        if b.iter()
+            .chain(d.iter())
+            .chain(e.iter())
+            .any(|x| !x.is_finite())
+        {
+            return Err(1);
+        }
+        for j in 0..uc {
+            u[j + j * m] = F::one();
+        }
+        if vr > 0 {
+            identity(v, n);
+        }
+        bidiagonal_svd(d, e, u, m, v, n)?;
+        apply_reflectors(b, m, n, left, right, u, uc, v);
     }
-    if vr > 0 {
-        identity(v, n);
-    }
-    bidiagonal_svd(d, e, u, m, v, n)?;
-    apply_reflectors(b, m, n, left, right, u, uc, v);
     for (i, cell) in order.iter_mut().enumerate() {
         *cell = num::<N>(i);
     }
