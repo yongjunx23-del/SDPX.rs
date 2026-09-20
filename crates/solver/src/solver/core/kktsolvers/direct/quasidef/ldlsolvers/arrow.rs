@@ -248,9 +248,6 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             }
         }
         let mut groups: Vec<Vec<usize>> = components.into_values().collect();
-        if groups.len() < 2 {
-            return None;
-        }
         groups.sort_by_key(|g| g[0]);
         let t = trunk.len();
         let cells: u128 = groups
@@ -262,6 +259,30 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             .sum::<u128>()
             + 6 * (t as u128).pow(2)
             + 8 * n as u128;
+        if std::env::var_os("SDPX_PROFILE").is_some() {
+            // Observation-only grouping stats (plan PR-06): positive-sign
+            // components, leaf size spread, border size, leaf-border coupling
+            // edges and the dense working-set estimate.
+            let mut sizes: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+            sizes.sort_unstable();
+            let coupling = (0..n)
+                .flat_map(|j| (k.colptr[j]..k.colptr[j + 1]).map(move |q| (k.rowval[q], j)))
+                .filter(|&(i, j)| signs[i] != signs[j])
+                .count();
+            eprintln!(
+                "GROUP_STATS n={n} components={} leaf_min={} leaf_med={} leaf_max={} border={t} coupling_nnz={coupling} dense_mib={:.1} eligible={}",
+                groups.len(),
+                sizes.first().copied().unwrap_or(0),
+                sizes.get(sizes.len() / 2).copied().unwrap_or(0),
+                sizes.last().copied().unwrap_or(0),
+                cells as f64 * std::mem::size_of::<T>() as f64 / 1048576.0,
+                groups.len() >= 2
+                    && cells * std::mem::size_of::<T>() as u128 <= ARROW_MAX_BYTES,
+            );
+        }
+        if groups.len() < 2 {
+            return None;
+        }
         if cells * std::mem::size_of::<T>() as u128 > ARROW_MAX_BYTES {
             return None;
         }
