@@ -227,6 +227,7 @@ where
                 cone_parallel::apply(
                     &mut self.cones,
                     &threading.lanes,
+                    threading.inner_parallel,
                     (shift, step_z, step_s),
                     &|cone, _rows, (shift, step_z, step_s)| {
                         Self::shift_one(cone, shift, step_z, step_s, σμ, prepared);
@@ -293,6 +294,7 @@ where
                             &mut self.cones,
                             &mut self.sym_step_bounds,
                             &threading.sym_step_lanes,
+                            threading.inner_parallel,
                             dz,
                             ds,
                             z,
@@ -486,6 +488,10 @@ where
             owned.contains(&i) || Self::scaling_state_len(c) == 0
         };
         let pool = self.threading.as_ref().map(|t| t.pool.clone());
+        let inner = self
+            .threading
+            .as_ref()
+            .is_some_and(|t| t.inner_parallel);
         let rng = &self.rng_cones;
         let cones = &mut self.cones;
         match pool {
@@ -496,8 +502,9 @@ where
                     .filter(|(i, c)| mask(*i, c))
                     .map(|(i, c)| {
                         // Owned blocks can outnumber free workers; let heavy
-                        // kernels offer inner work to the ambient pool.
-                        let _inner = sdpx_arithmetic::inner_parallel::Guard::enter();
+                        // kernels offer inner work to the ambient pool when
+                        // spare workers exist.
+                        let _inner = inner.then(sdpx_arithmetic::inner_parallel::Guard::enter);
                         (i, eval(i, c, rng[i].clone()))
                     })
                     .collect()
@@ -538,12 +545,16 @@ where
                 true
             }
         };
+        let inner = self
+            .threading
+            .as_ref()
+            .is_some_and(|t| t.inner_parallel);
         let ok = match &self.threading {
             Some(threading) => threading.pool.install(|| {
                 cones
                     .par_iter_mut()
                     .enumerate()
-                    .map(|(i, cone)| update_one(i, cone, true))
+                    .map(|(i, cone)| update_one(i, cone, inner))
                     .reduce(|| true, |a, b| a & b)
             }),
             None => cones
@@ -1016,9 +1027,15 @@ where
                 return true;
             }
             return threading.pool.install(|| {
-                cone_parallel::apply(&mut self.cones, &threading.lanes, (), &|cone, rows, ()| {
-                    cone.update_scaling(&s[rows.clone()], &z[rows], μ, scaling_strategy)
-                })
+                cone_parallel::apply(
+                    &mut self.cones,
+                    &threading.lanes,
+                    threading.inner_parallel,
+                    (),
+                    &|cone, rows, ()| {
+                        cone.update_scaling(&s[rows.clone()], &z[rows], μ, scaling_strategy)
+                    },
+                )
             });
         }
         let mut is_scaling_success;
@@ -1064,6 +1081,7 @@ where
                 cone_parallel::apply(
                     &mut self.cones,
                     &threading.lanes,
+                    threading.inner_parallel,
                     (y, work),
                     &|cone, rows, (y, work)| {
                         cone.mul_Hs(y, &x[rows], work);
@@ -1107,6 +1125,7 @@ where
                 cone_parallel::apply(
                     &mut self.cones,
                     &threading.lanes,
+                    threading.inner_parallel,
                     (out, work),
                     &|cone, rows, (out, work)| {
                         cone.Δs_from_Δz_offset(out, &ds[rows.clone()], work, &z[rows]);
@@ -1152,6 +1171,7 @@ where
                         &mut self.cones,
                         &mut self.sym_step_bounds,
                         &threading.sym_step_lanes,
+                        threading.inner_parallel,
                         dz,
                         ds,
                         z,
