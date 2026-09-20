@@ -213,7 +213,7 @@ where
         //compute Cholesky factors. The S and Z factorizations are
         //independent, so offer the second to an idle ambient worker.
         let (ch1, ch2) = (&mut f.chol1, &mut f.chol2);
-        let (c1, c2) = if sdpx_arithmetic::inner_parallel::active() {
+        let (c1, c2) = if sdpx_arithmetic::inner_parallel::paired() {
             rayon::join(|| ch1.factor(S), || ch2.factor(Z))
         } else {
             (ch1.factor(S), ch2.factor(Z))
@@ -254,7 +254,7 @@ where
                 Rinv.mul(&svd.U.t(), &L2.t(), T::one(), T::zero());
                 Rinv.lscale(Λi);
             };
-            if sdpx_arithmetic::inner_parallel::active() {
+            if sdpx_arithmetic::inner_parallel::paired() {
                 rayon::join(build_r, build_rinv);
             } else {
                 build_r();
@@ -309,7 +309,7 @@ where
         _settings: &CoreSettings<T>,
         αmax: T,
     ) -> (T, T) {
-        if sdpx_arithmetic::inner_parallel::active() {
+        if sdpx_arithmetic::inner_parallel::paired() {
             let f = &mut *self.data;
             let PSDConeData {
                 R,
@@ -378,7 +378,7 @@ where
         // The dz (dual, R) and ds (primal, Rinv) bounds are independent.
         // With a second scratch set they can run on two ambient workers;
         // without one they fold serially, bitwise identical either way.
-        if sdpx_arithmetic::inner_parallel::active() {
+        if sdpx_arithmetic::inner_parallel::paired() {
             let f = &mut *self.data;
             let PSDConeData {
                 R,

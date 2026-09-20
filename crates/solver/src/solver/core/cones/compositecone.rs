@@ -228,6 +228,7 @@ where
                     &mut self.cones,
                     &threading.lanes,
                     threading.inner_parallel,
+                    threading.paired,
                     (shift, step_z, step_s),
                     &|cone, _rows, (shift, step_z, step_s)| {
                         Self::shift_one(cone, shift, step_z, step_s, σμ, prepared);
@@ -295,6 +296,7 @@ where
                             &mut self.sym_step_bounds,
                             &threading.sym_step_lanes,
                             threading.inner_parallel,
+                            threading.paired,
                             dz,
                             ds,
                             z,
@@ -488,10 +490,10 @@ where
             owned.contains(&i) || Self::scaling_state_len(c) == 0
         };
         let pool = self.threading.as_ref().map(|t| t.pool.clone());
-        let inner = self
+        let (inner, paired) = self
             .threading
             .as_ref()
-            .is_some_and(|t| t.inner_parallel);
+            .map_or((false, false), |t| (t.inner_parallel, t.paired));
         let rng = &self.rng_cones;
         let cones = &mut self.cones;
         match pool {
@@ -504,7 +506,8 @@ where
                         // Owned blocks can outnumber free workers; let heavy
                         // kernels offer inner work to the ambient pool when
                         // spare workers exist.
-                        let _inner = inner.then(sdpx_arithmetic::inner_parallel::Guard::enter);
+                        let _inner = (inner || paired)
+                            .then(|| sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired));
                         (i, eval(i, c, rng[i].clone()))
                     })
                     .collect()
@@ -537,30 +540,31 @@ where
         };
         let rng = &self.rng_cones;
         let cones = &mut self.cones;
-        let update_one = |i: usize, cone: &mut SupportedCone<T>, inner: bool| -> bool {
+        let update_one = |i: usize, cone: &mut SupportedCone<T>, inner: bool, paired: bool| -> bool {
             if owned.contains(&i) || Self::scaling_state_len(cone) == 0 {
-                let _inner = inner.then(sdpx_arithmetic::inner_parallel::Guard::enter);
+                let _inner = (inner || paired)
+                    .then(|| sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired));
                 cone.update_scaling(&s[rng[i].clone()], &z[rng[i].clone()], μ, scaling_strategy)
             } else {
                 true
             }
         };
-        let inner = self
+        let (inner, paired) = self
             .threading
             .as_ref()
-            .is_some_and(|t| t.inner_parallel);
+            .map_or((false, false), |t| (t.inner_parallel, t.paired));
         let ok = match &self.threading {
             Some(threading) => threading.pool.install(|| {
                 cones
                     .par_iter_mut()
                     .enumerate()
-                    .map(|(i, cone)| update_one(i, cone, inner))
+                    .map(|(i, cone)| update_one(i, cone, inner, paired))
                     .reduce(|| true, |a, b| a & b)
             }),
             None => cones
                 .iter_mut()
                 .enumerate()
-                .map(|(i, cone)| update_one(i, cone, false))
+                .map(|(i, cone)| update_one(i, cone, false, false))
                 .fold(true, |a, b| a & b),
         };
         // Scaling success must agree on every rank before any collective:
@@ -1031,6 +1035,7 @@ where
                     &mut self.cones,
                     &threading.lanes,
                     threading.inner_parallel,
+                    threading.paired,
                     (),
                     &|cone, rows, ()| {
                         cone.update_scaling(&s[rows.clone()], &z[rows], μ, scaling_strategy)
@@ -1082,6 +1087,7 @@ where
                     &mut self.cones,
                     &threading.lanes,
                     threading.inner_parallel,
+                    threading.paired,
                     (y, work),
                     &|cone, rows, (y, work)| {
                         cone.mul_Hs(y, &x[rows], work);
@@ -1126,6 +1132,7 @@ where
                     &mut self.cones,
                     &threading.lanes,
                     threading.inner_parallel,
+                    threading.paired,
                     (out, work),
                     &|cone, rows, (out, work)| {
                         cone.Δs_from_Δz_offset(out, &ds[rows.clone()], work, &z[rows]);
@@ -1172,6 +1179,7 @@ where
                         &mut self.sym_step_bounds,
                         &threading.sym_step_lanes,
                         threading.inner_parallel,
+                        threading.paired,
                         dz,
                         ds,
                         z,

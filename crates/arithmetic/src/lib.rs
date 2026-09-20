@@ -841,26 +841,46 @@ pub mod inner_parallel {
 
     std::thread_local! {
         static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static PAIRED: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// True while this thread is running a lane on the solver pool.
+    /// True while this thread is running a lane on the solver pool and the
+    /// pool has enough spare workers for multi-way inner splits.
     #[inline]
     pub fn active() -> bool {
         ENABLED.with(Cell::get)
     }
 
-    /// RAII guard enabling [`active`] until dropped.
-    pub struct Guard(bool);
+    /// True while any spare worker exists beyond the cone lanes: a paired
+    /// `rayon::join` of two independent operations pays off with a single
+    /// stealer, so it needs far less headroom than column-level splits.
+    #[inline]
+    pub fn paired() -> bool {
+        PAIRED.with(Cell::get)
+    }
+
+    /// RAII guard enabling [`active`]/[`paired`] until dropped.
+    pub struct Guard(bool, bool);
 
     impl Guard {
+        /// Enable both levels (heavy inner splits and pairing).
         pub fn enter() -> Self {
-            Self(ENABLED.with(|c| c.replace(true)))
+            Self::enter_levels(true, true)
+        }
+
+        /// Enable each level independently.
+        pub fn enter_levels(inner: bool, paired: bool) -> Self {
+            Self(
+                ENABLED.with(|c| c.replace(inner)),
+                PAIRED.with(|c| c.replace(paired)),
+            )
         }
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
             ENABLED.with(|c| c.set(self.0));
+            PAIRED.with(|c| c.set(self.1));
         }
     }
 }
