@@ -774,3 +774,50 @@ larger-matrix regimes.
 `SDPX_PROFILE`: dimension, positive-component count, leaf min/median/max,
 border size, cross-sign coupling nnz, dense working-set estimate and
 eligibility. Observation-only; no solve-path change.
+
+### PR-05 structured `Rinv·(I_dim ⊗ Qbasis)` — landed (dim>1)
+
+`SampledSchurWorkspace` no longer materializes the `side × (dim·count)`
+block-diagonal `u`; it stores the packed `basis_rows × count` unique
+basis (`ub`) and computes each output block as `Rinv[:, r·h..]·ub`
+(side·count·h flops per block — `dim×` less than the dense GEMM).
+Accumulation order per kept term is unchanged (`dot_fma`), so MPFR
+results are bitwise identical; a `±0` output is recomputed with the
+full-side accumulation because skipped out-of-block terms were `±0` and
+could have carried the opposite zero sign. dim=1 degenerates to the
+identical call. The workspace also drops `side·rank` scalars of storage.
+Tests: `structured_v_parity` (f64 close / MpFloat bitwise, dim 1–3,
+including an all-zero basis column) plus the existing pooled-vs-serial
+and oracle audits. For f64 the per-block BLAS call changes accumulation
+order — an accepted rounding-order change, not a semantic one.
+
+### M3–M5 disposition (measured against phase receipts)
+
+Λ=15 t128 phase medians (76 iterations, ~195s): `assemble` 14ms (1.2s
+total), `cones_schur` 107ms (8.2s), `refactor` 106ms (8.1s), `trsv`
+13ms ×346 (5.1s), `residual` 52ms ×346 (18.5s), `cone_svd` 315ms ×2100
+worker-time. On this evidence:
+
+- **PR-08 direct grouped construction**: the CSC round-trip it would
+  remove is ≈ the `assemble` phase (≈0.6% of solve) plus a small scatter
+  share of `cones_schur`. Below the ≥2% bar and far below the ≥10%
+  heavy-backend bar. Arrow — already the production grouped factor —
+  remains the single implementation; no third copy was created.
+- **PR-09 backend contract**: verified on Arrow — refactor re-scatters
+  and re-factors from the authoritative CSC each call; failure lazily
+  rebuilds QDLDL with a full value re-sync of the current matrix; no
+  stale-factor reuse, no benchmark-name or sticky-failure state.
+- **M4 blocked/RNS Qg**: the global border is 35×35 at Λ=15 (and similar
+  at Λ=11/19). There is no large Qg operand to accelerate; the prior
+  RNS operator experiment already measured a net regression at this
+  scale. Not implemented.
+- **M5 two-wave RHS / shared traversal**: `trsv` totals 5.1s and
+  batched columns would only share memory traffic — the solves are
+  MPFR-arithmetic-bound. Residual-phase sharing is likewise bounded by
+  ~1–2% upside. Below the retention bar; not implemented. PR-15
+  (NUMA/thread-budget recording) is covered by the receipt's recorded
+  thread counts and per-run identities.
+- The remaining wall-clock mass is cone-side MPFR work (`cone_svd`
+  worker-sum ≈660s, `scale cones` 34s, `cones_schur` 8.2s) — intrinsic
+  scalar cost already parallelized across the solver pool; the plan's
+  rotation-logging and RNS avenues measured no improvement there.

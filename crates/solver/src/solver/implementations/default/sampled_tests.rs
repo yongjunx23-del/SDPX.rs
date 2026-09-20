@@ -378,7 +378,7 @@ fn pooled_gram<T: FloatT>() {
         assert_eq!(pooled.v.data(), serial.v.data());
         assert_eq!(pooled.gram.data(), serial.gram.data());
         let pointers = (
-            pooled.u.data().as_ptr(),
+            pooled.ub.data().as_ptr(),
             pooled.v.data().as_ptr(),
             pooled.gram.data().as_ptr(),
         );
@@ -387,7 +387,7 @@ fn pooled_gram<T: FloatT>() {
         assert_eq!(
             pointers,
             (
-                pooled.u.data().as_ptr(),
+                pooled.ub.data().as_ptr(),
                 pooled.v.data().as_ptr(),
                 pooled.gram.data().as_ptr()
             )
@@ -881,7 +881,7 @@ fn duplicate_basis<T: FloatT>() {
         weights: (0..18).map(|i| c::<T>(i % 7 - 3) / c(4)).collect(),
     };
     let mut work = SampledSchurWorkspace::new(&b);
-    assert_eq!(work.u.ncols(), 8); // Four exact vectors, including a near duplicate.
+    assert_eq!(work.ub.ncols(), 4); // Four exact vectors, including a near duplicate.
     assert_eq!(work.gram.size(), (8, 8));
     assert_eq!(work.pairs.len(), b.weights.len());
     let mut pooled = SampledSchurWorkspace::new(&b);
@@ -899,6 +899,85 @@ fn duplicate_basis<T: FloatT>() {
     }
     schur_parity_block(b);
 }
+// PR-05: the block-diagonal update must reproduce the old dense
+// Rinv·(I_dim ⊗ Qbasis) product bit-for-bit, including stored zeros.
+fn structured_v_parity<T: FloatT>() {
+    for dim in [1usize, 2, 3] {
+        let (h, cols) = (4usize, 5usize);
+        let mut basis: Vec<T> = (0..h * cols)
+            .map(|i| c::<T>((i % 9) as i32 - 4) / c(7))
+            .collect();
+        // An all-zero basis column exercises the ±0 fixup path.
+        for i in 0..h {
+            basis[i + (cols - 1) * h] = T::zero();
+        }
+        let b = SampledBlock {
+            row_start: 0,
+            column_start: 0,
+            dim,
+            basis_rows: h,
+            basis_cols: cols,
+            basis,
+            weights: (0..tri(dim) * cols)
+                .map(|i| c::<T>((i % 6) as i32 - 2) / c(5))
+                .collect(),
+        };
+        let side = b.side();
+        let mut rinv = Matrix::identity(side);
+        for j in 0..side {
+            for i in 0..j {
+                rinv[(i, j)] = c::<T>(((i * 3 + j) % 11) as i32 - 5) / c(9);
+            }
+        }
+        let mut work = SampledSchurWorkspace::new(&b);
+        work.update_with_pool(&b, &rinv, None);
+        // Reference: the explicit dense block-diagonal u, dense GEMM.
+        let count = work.ub.ncols();
+        let rank = dim * count;
+        let mut u = Matrix::zeros((side, rank));
+        for r in 0..dim {
+            for k in 0..count {
+                for i in 0..h {
+                    u[(r * h + i, r * count + k)] = work.ub[(i, k)];
+                }
+            }
+        }
+        let mut vref = Matrix::zeros((side, rank));
+        vref.mul(&rinv, &u, T::one(), T::zero());
+        // MPFR uses the ordered dot_fma kernel, so the structured product is
+        // bitwise identical. f64 routes to BLAS whose accumulation order is
+        // shape-dependent — compare within rounding there.
+        if T::precision_bits() > 64 {
+            assert_eq!(work.v.data(), vref.data(), "dim={dim}");
+        } else {
+            for (&a, &b) in work.v.data().iter().zip(vref.data()) {
+                close(a, b);
+            }
+        }
+        let mut gref = Matrix::zeros((rank, rank));
+        gref.syrk(&vref.t(), T::one(), T::zero(), MatrixTriangle::Triu);
+        if T::precision_bits() > 64 {
+            assert_eq!(work.gram.data(), gref.data(), "dim={dim}");
+        } else {
+            for (&a, &b) in work.gram.data().iter().zip(gref.data()) {
+                close(a, b);
+            }
+        }
+    }
+}
+#[test]
+fn structured_v_parity_f64() {
+    structured_v_parity::<f64>();
+}
+#[test]
+fn structured_v_parity_256() {
+    structured_v_parity::<Bits256>();
+}
+#[test]
+fn structured_v_parity_512() {
+    structured_v_parity::<Bits512>();
+}
+
 #[test]
 fn sampled_duplicate_basis_f64() {
     duplicate_basis::<f64>();

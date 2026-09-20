@@ -1042,11 +1042,26 @@ impl<T: FloatT> SampledWorkspace<T> {
 
 /// NT Gram workspace. Its columns retain canonical primitive indices even
 /// when basis values or weights are zero.
+///
+/// The structured update exploits the block-diagonal layout of
+/// `I_dim ⊗ Qbasis`: the old code materialized a `side × (dim·count)`
+/// matrix `u` whose r-th column block is nonzero only in rows
+/// `[r·h, (r+1)·h)` (h = basis_rows) and ran a dense `side²·dim·count`
+/// GEMM. The workspace instead stores the packed `h × count` unique basis
+/// and computes each output block as `Rinv[:, r·h..] · ub`, a
+/// `side·count·h` product — `dim×` less work. Dropped terms are exactly
+/// `Rinv·(+0)`; ordered-FMA accumulation makes nonzero results bitwise
+/// identical. A `±0` output can differ in sign because skipped zero terms
+/// may carry the opposite sign, so zero results are recomputed with the
+/// full-side accumulation to preserve bitwise parity.
 pub struct SampledSchurWorkspace<T> {
-    u: Matrix<T>,
+    ub: Matrix<T>,
     v: Matrix<T>,
     gram: Matrix<T>,
     pairs: Vec<(usize, usize)>,
+    dim: usize,
+    side: usize,
+    count: usize,
     plan_threads: usize,
     gemm_tile: usize,
     syrk_tile: usize,
@@ -1076,15 +1091,13 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
         }
         let count = unique.len();
         let rank = b.dim * count;
-        let mut u = Matrix::zeros((b.side(), rank));
-        let mut pairs = Vec::with_capacity(b.weights.len());
-        for r in 0..b.dim {
-            for (k, &original) in unique.iter().enumerate() {
-                for i in 0..b.basis_rows {
-                    u[(r * b.basis_rows + i, r * count + k)] = b.basis[i + original * b.basis_rows];
-                }
+        let mut ub = Matrix::zeros((b.basis_rows, count));
+        for (k, &original) in unique.iter().enumerate() {
+            for i in 0..b.basis_rows {
+                ub[(i, k)] = b.basis[i + original * b.basis_rows];
             }
         }
+        let mut pairs = Vec::with_capacity(b.weights.len());
         for s in 0..b.dim {
             for r in 0..=s {
                 for &k in &map {
@@ -1093,10 +1106,13 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
             }
         }
         Self {
-            u,
+            ub,
             v: Matrix::zeros((b.side(), rank)),
             gram: Matrix::zeros((rank, rank)),
             pairs,
+            dim: b.dim,
+            side: b.side(),
+            count,
             plan_threads: 0,
             gemm_tile: 0,
             syrk_tile: 0,
@@ -1112,24 +1128,27 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
     }
     // Dimensions are fixed by construction; only the current pool width changes.
     pub(crate) fn configure_parallel(&mut self, workers: usize) -> u128 {
-        let (side, rank) = self.u.size();
+        let (side, rank) = (self.side, self.dim * self.count);
+        let h = side / self.dim.max(1);
         let words = T::precision_bits().div_ceil(64) as u128;
-        let gemm = side as u128 * side as u128 * rank as u128 * words * words;
+        // The structured update costs side·count·h per block, dim blocks total.
+        let gemm = side as u128 * rank as u128 * h as u128 * words * words;
         let syrk = side as u128 * rank as u128 * (rank + 1) as u128 / 2 * words * words;
         if self.plan_threads != workers {
             self.plan_threads = workers;
-            let tile = |work: u128| {
-                let lanes = workers
-                    .min(rank)
-                    .min((work / 4096).min(usize::MAX as u128) as usize);
-                if lanes > 1 {
-                    rank.div_ceil(lanes)
-                } else {
-                    0
-                }
+            let block_work = gemm / self.dim.max(1) as u128;
+            let lanes = workers
+                .min(self.count)
+                .min((block_work / 4096).min(usize::MAX as u128) as usize);
+            self.gemm_tile = if lanes > 1 {
+                self.count.div_ceil(lanes)
+            } else {
+                0
             };
-            self.gemm_tile = tile(gemm);
-            self.syrk_tile = tile(syrk);
+            let lanes = workers
+                .min(rank)
+                .min((syrk / 4096).min(usize::MAX as u128) as usize);
+            self.syrk_tile = if lanes > 1 { rank.div_ceil(lanes) } else { 0 };
         }
         gemm + syrk
     }
@@ -1144,48 +1163,99 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
         pool: Option<&rayon::ThreadPool>,
     ) {
         assert_eq!(rinv.size(), (b.side(), b.side()));
-        assert_eq!(self.u.nrows(), b.side());
+        assert_eq!(self.side, b.side());
         assert_eq!(self.pairs.len(), b.column_count());
         if b.basis_cols == 0 {
             return;
         }
+        let (side, h, count) = (self.side, b.basis_rows, self.count);
+        let (side32, h32, count32) = (
+            i32::try_from(side).unwrap(),
+            i32::try_from(h).unwrap(),
+            i32::try_from(count).unwrap(),
+        );
         if let Some(pool) = pool {
             self.configure_parallel(pool.current_num_threads());
-            let side = i32::try_from(b.side()).unwrap();
-            let rank = i32::try_from(self.u.ncols()).unwrap();
-            T::xgemm_pool(
-                b'N',
-                b'N',
-                side,
-                rank,
-                side,
-                T::one(),
-                rinv.data(),
-                side,
-                self.u.data(),
-                side,
-                T::zero(),
-                self.v.data_mut(),
-                side,
-                pool,
-                self.gemm_tile,
-            );
+        }
+        // Block-diagonal structure: V[:, r·count..) = Rinv[:, r·h..) · ub.
+        let vcols = self.v.data_mut();
+        for r in 0..self.dim {
+            let a = &rinv.data()[r * h * side..(r + 1) * h * side];
+            let ccols = &mut vcols[r * count * side..(r + 1) * count * side];
+            match pool {
+                Some(pool) => T::xgemm_pool(
+                    b'N',
+                    b'N',
+                    side32,
+                    count32,
+                    h32,
+                    T::one(),
+                    a,
+                    side32,
+                    self.ub.data(),
+                    h32,
+                    T::zero(),
+                    ccols,
+                    side32,
+                    pool,
+                    self.gemm_tile,
+                ),
+                None => T::xgemm(
+                    b'N',
+                    b'N',
+                    side32,
+                    count32,
+                    h32,
+                    T::one(),
+                    a,
+                    side32,
+                    self.ub.data(),
+                    h32,
+                    T::zero(),
+                    ccols,
+                    side32,
+                ),
+            }
+        }
+        // Signed-zero parity: a ±0 output may carry the wrong sign because
+        // skipped out-of-block terms were ±0 too. Recompute those elements
+        // with the full-side ordered accumulation. dim == 1 skips nothing.
+        if self.dim > 1 {
+            let zero = T::zero();
+            for c in 0..self.dim * count {
+                let (r, k) = (c / count, c % count);
+                for i in 0..side {
+                    let slot = &mut vcols[i + c * side];
+                    if slot.is_zero() {
+                        *slot = T::dot_fma((0..side).map(|j| {
+                            let rj = &rinv.data()[i + j * side];
+                            if j / h == r {
+                                (rj, &self.ub.data()[j - r * h + k * h])
+                            } else {
+                                (rj, &zero)
+                            }
+                        }));
+                    }
+                }
+            }
+        }
+        let rank32 = i32::try_from(self.dim * count).unwrap();
+        if let Some(pool) = pool {
             T::xsyrk_pool(
                 b'U',
                 b'T',
-                rank,
-                side,
+                rank32,
+                side32,
                 T::one(),
                 self.v.data(),
-                side,
+                side32,
                 T::zero(),
                 self.gram.data_mut(),
-                rank,
+                rank32,
                 pool,
                 self.syrk_tile,
             );
         } else {
-            self.v.mul(rinv, &self.u, T::one(), T::zero());
             self.gram
                 .syrk(&self.v.t(), T::one(), T::zero(), MatrixTriangle::Triu);
         }
