@@ -623,6 +623,227 @@ fn pooled_dim1_operators_mpfr256() {
 fn pooled_dim1_operators_mpfr512() {
     pooled_dim1_operators::<Bits512>();
 }
+/// `SDPX_RNS_OPS` leaf bodies driven with a hand-built `RnsSide` (the env gate
+/// only selects the prepare path; these leaves are what it feeds). Residue
+/// dots round the exact sum once, so compare against the serial `dot_fma`
+/// evaluation at working precision rather than bitwise.
+fn rns_dim1_leaves<T: FloatT>() {
+    if T::precision_bits() <= 53 {
+        return;
+    }
+    let b = SampledBlock::<T> {
+        row_start: 1,
+        column_start: 2,
+        dim: 1,
+        basis_rows: 12,
+        basis_cols: 8,
+        basis: (0..96)
+            .map(|i| c::<T>((i % 9) as i32 - 4) / c(6))
+            .collect(),
+        weights: (0..8)
+            .map(|i| c::<T>((i % 4) as i32 - 1) / c(3))
+            .collect(),
+    };
+    let (h, kmax, trih) = (b.basis_rows, b.basis_cols, tri(b.basis_rows));
+    let (m, n) = (1 + trih, 16);
+    let x: Vec<T> = (0..n).map(|i| c::<T>(i as i32 - 6) / c(7)).collect();
+    let z: Vec<T> = (0..m).map(|i| c::<T>((i % 13) as i32 - 5) / c(4)).collect();
+    let linear = CscMatrix::zeros((m, n));
+    let op = SampledOperator::new(linear, vec![b.clone()]).unwrap();
+    let mut work = SampledWorkspace::new(&op);
+
+    let mut fwd_ref = vec![T::zero(); trih];
+    work.blocks[0].forward_terms(&b, &x, T::one(), |i, t| fwd_ref[i] = t);
+    let mut adj_ref = vec![T::zero(); kmax];
+    work.blocks[0].adjoint_terms(&b, &z, T::one(), |i, t| adj_ref[i] = t);
+
+    let w0 = &mut work.blocks[0];
+    let q = BorrowedMatrix {
+        size: (h, kmax),
+        data: b.basis.as_slice(),
+        phantom: std::marker::PhantomData,
+    };
+    let mut sq = Matrix::<T>::zeros((h, h));
+    let mut pa = Matrix::<T>::zeros((h, kmax));
+
+    let z_sub = &z[b.row_start..b.row_start + trih];
+    let plan_a = T::rns_plan_ranges(
+        T::rns_exponent_range(&w0.wdiag).unwrap(),
+        T::rns_exponent_range(z_sub).unwrap(),
+        trih,
+    )
+    .unwrap();
+    // Production caches the constant side at full prime width
+    // (`rns_encode_wide`); the dot then reads the plan's prefix.
+    let cns_a = T::rns_encode_wide(&plan_a, EncodeSide::A, &w0.wdiag).unwrap();
+    let var_a = T::rns_encode(&plan_a, EncodeSide::B, z_sub).unwrap();
+    let side_a = RnsSide {
+        plan: &plan_a,
+        cns: &cns_a,
+        var: &var_a,
+    };
+    for chunks in [1usize, 2, 4] {
+        let mut out = vec![T::zero(); kmax];
+        adjoint_split_chunks(
+            &b,
+            &q,
+            &w0.wdiag,
+            &z,
+            T::one(),
+            0..1,
+            &mut out,
+            T::FRAC_1_SQRT_2(),
+            chunks,
+            &mut sq,
+            &mut pa,
+            Some(side_a),
+        );
+        for (v, e) in out.iter().zip(&adj_ref) {
+            close(*v, *e);
+        }
+    }
+
+    let mut qq = vec![T::zero(); trih * kmax];
+    for k in 0..kmax {
+        for t in 0..trih {
+            qq[t * kmax + k] = w0.wdiag[k * trih + t];
+        }
+    }
+    let dvec: Vec<T> = (0..kmax)
+        .map(|k| b.weights[k] * x[b.column_start + k])
+        .collect();
+    let plan_f = T::rns_plan_ranges(
+        T::rns_exponent_range(&qq).unwrap(),
+        T::rns_exponent_range(&dvec).unwrap(),
+        kmax,
+    )
+    .unwrap();
+    let cns_f = T::rns_encode_wide(&plan_f, EncodeSide::A, &qq).unwrap();
+    let var_f = T::rns_encode(&plan_f, EncodeSide::B, &dvec).unwrap();
+    let side_f = RnsSide {
+        plan: &plan_f,
+        cns: &cns_f,
+        var: &var_f,
+    };
+    for chunks in [1usize, 2, 4] {
+        let mut out = vec![T::zero(); trih];
+        forward_split_chunks(
+            &b,
+            &q,
+            &x,
+            T::one(),
+            0..1,
+            &mut out,
+            T::SQRT_2(),
+            T::zero(),
+            chunks,
+            &mut sq,
+            &mut pa,
+            Some(side_f),
+        );
+        for (v, e) in out.iter().zip(&fwd_ref) {
+            close(*v, *e);
+        }
+    }
+}
+#[test]
+fn rns_dim1_leaves_mpfr256() {
+    rns_dim1_leaves::<Bits256>();
+}
+#[test]
+fn rns_dim1_leaves_mpfr512() {
+    rns_dim1_leaves::<Bits512>();
+}
+/// Per-block cost of the residue kernels at production shape (h = 38,
+/// kmax = 76): serial `dot_fma` terms vs hand-driven `RnsSide` dots, plus the
+/// per-call plan/encode overhead. Run with `--ignored`.
+fn rns_dim1_perf<T: FloatT>() {
+    if T::precision_bits() <= 53 {
+        return;
+    }
+    let b = SampledBlock::<T> {
+        row_start: 0,
+        column_start: 0,
+        dim: 1,
+        basis_rows: 38,
+        basis_cols: 76,
+        basis: (0..38 * 76)
+            .map(|i| c::<T>(((i * 7) % 11) as i32 - 5) / c(6))
+            .collect(),
+        weights: (0..76).map(|i| c::<T>((i % 5) as i32 - 2) / c(3)).collect(),
+    };
+    let (kmax, trih) = (b.basis_cols, tri(b.basis_rows));
+    let (m, n) = (trih, 2 * kmax);
+    let x: Vec<T> = (0..n).map(|i| c::<T>((i % 13) as i32 - 6) / c(7)).collect();
+    let z: Vec<T> = (0..m).map(|i| c::<T>((i % 17) as i32 - 8) / c(4)).collect();
+    let op = SampledOperator::new(CscMatrix::zeros((m, n)), vec![b.clone()]).unwrap();
+    let mut work = SampledWorkspace::new(&op);
+    let reps = 20;
+    let t0 = std::time::Instant::now();
+    let mut acc = T::zero();
+    for _ in 0..reps {
+        work.blocks[0].adjoint_terms(&b, &z, T::one(), |_, t| acc += t);
+        work.blocks[0].forward_terms(&b, &x, T::one(), |_, t| acc += t);
+    }
+    eprintln!("serial adj+fwd: {:?} ({:?})", t0.elapsed() / reps, acc);
+
+    // Adjoint residues.
+    let z_sub = &z[..trih];
+    let plan = T::rns_plan_ranges(
+        T::rns_exponent_range(&work.blocks[0].wdiag).unwrap(),
+        T::rns_exponent_range(z_sub).unwrap(),
+        trih,
+    )
+    .unwrap();
+    let cns = T::rns_encode(&plan, EncodeSide::A, &work.blocks[0].wdiag).unwrap();
+    let t1 = std::time::Instant::now();
+    for _ in 0..reps {
+        let var = T::rns_encode(&plan, EncodeSide::B, z_sub).unwrap();
+        for k in 0..kmax {
+            acc += T::rns_dot(&plan, &cns, k * trih, 1, &var, 0, 1, trih);
+        }
+    }
+    eprintln!("rns adj (encode+{} dots): {:?} primes={}", kmax, t1.elapsed() / reps, plan.primes());
+
+    // Forward residues.
+    let mut qq = vec![T::zero(); trih * kmax];
+    for k in 0..kmax {
+        for t in 0..trih {
+            qq[t * kmax + k] = work.blocks[0].wdiag[k * trih + t];
+        }
+    }
+    let dvec: Vec<T> = (0..kmax).map(|k| b.weights[k] * x[k]).collect();
+    let plan_f = T::rns_plan_ranges(
+        T::rns_exponent_range(&qq).unwrap(),
+        T::rns_exponent_range(&dvec).unwrap(),
+        kmax,
+    )
+    .unwrap();
+    let cns_f = T::rns_encode_wide(&plan_f, EncodeSide::A, &qq).unwrap();
+    let t2 = std::time::Instant::now();
+    for _ in 0..reps {
+        let var = T::rns_encode(&plan_f, EncodeSide::B, &dvec).unwrap();
+        for t in 0..trih {
+            acc += T::rns_dot(&plan_f, &cns_f, t * kmax, 1, &var, 0, 1, kmax);
+        }
+    }
+    eprintln!(
+        "rns fwd (encode+{} dots): {:?} primes={}",
+        trih,
+        t2.elapsed() / reps,
+        plan_f.primes()
+    );
+}
+#[test]
+#[ignore]
+fn rns_dim1_perf_512() {
+    rns_dim1_perf::<Bits512>();
+}
+#[test]
+#[ignore]
+fn rns_dim1_perf_768() {
+    rns_dim1_perf::<sdpx_arithmetic::Bits768>();
+}
 #[test]
 fn pooled_operators_f64() {
     pooled_operators::<f64>();

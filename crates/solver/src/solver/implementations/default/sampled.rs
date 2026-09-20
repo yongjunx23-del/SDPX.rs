@@ -3,6 +3,7 @@
 use crate::algebra::sparse_parallel::SparseParallel;
 use crate::algebra::*;
 use rayon::prelude::*;
+use sdpx_arithmetic::{EncodeSide, Residues, RnsPlan};
 use std::sync::Arc;
 
 /// A sampled PSD row block with canonical columns `(s, r, k)`, r <= s.
@@ -39,6 +40,97 @@ fn tri(n: usize) -> usize {
 }
 fn tri_work(n: usize) -> u128 {
     (n as u128) * (n as u128 + 1) / 2
+}
+
+/// `SDPX_RNS_OPS` selects exact residue-domain dots for sampled products.
+/// Reconstruction rounds each output once, so results may differ from the
+/// `dot_fma` chain in the last ulp; every dot remains the correctly rounded
+/// exact sum.
+fn rns_ops_enabled() -> bool {
+    std::env::var_os("SDPX_RNS_OPS").is_some()
+}
+
+/// Cached constant-side encoding: residues of an operand that never changes
+/// across calls. Encoded once at the full prime-table width so it stays
+/// valid while the per-call plan's prime count moves with the varying
+/// side's exponent window (see [`RnsPlan::encode_wide`]).
+struct RnsConst {
+    shift: i64,
+    primes: usize,
+    res: Residues,
+}
+
+/// Shared context passed to split leaves: the constant and per-call variable
+/// residues plus the plan they were encoded against. Immutable and `Sync`, so
+/// parallel subtasks evaluate disjoint outputs against the same operands.
+#[derive(Clone, Copy)]
+struct RnsSide<'a> {
+    plan: &'a RnsPlan,
+    cns: &'a Residues,
+    var: &'a Residues,
+}
+
+/// Refresh `cache` to the plan's a-side encoding of `const_vals`.
+fn rns_const<T: FloatT>(
+    cache: &mut Option<RnsConst>,
+    plan: &RnsPlan,
+    const_vals: &[T],
+) -> Option<()> {
+    let hit = matches!(cache, Some(c) if c.shift == plan.shift_a() && c.primes >= plan.primes());
+    if !hit {
+        let res = T::rns_encode_wide(plan, EncodeSide::A, const_vals)?;
+        *cache = Some(RnsConst {
+            shift: plan.shift_a(),
+            primes: res.k,
+            res,
+        });
+    }
+    Some(())
+}
+
+/// Build this call's plan and encode the varying side; the constant side is
+/// scanned once (`range`) and encoded once per `shift_a` (`cache`).
+/// Returns `None` — keeping the MPFR dot path — when the gate is off, the
+/// backend has no residue support, an operand is non-finite, the exponent
+/// window overflows, or the cost model says the swap is not profitable.
+fn rns_call<T: FloatT>(
+    cache: &mut Option<RnsConst>,
+    range: &mut Option<Option<(i64, i64)>>,
+    const_vals: &[T],
+    var: &[T],
+    terms: usize,
+    outputs: usize,
+) -> Option<(RnsPlan, Residues)> {
+    if !rns_ops_enabled() {
+        return None;
+    }
+    // Measured on Λ=15 (jobs 214136/214153): reconstruction is per-output,
+    // so products with more outputs than terms pay more Garner+MPFR work
+    // than the residue dots save — the forward product (76 terms, 741
+    // outputs) regressed ~40% while the adjoint (741 terms, 76 outputs)
+    // improved ~20%. Restrict RNS to term-dominated products.
+    if outputs > terms {
+        return None;
+    }
+    let a_range = match range {
+        Some(r) => *r,
+        slot @ None => {
+            let r = T::rns_exponent_range(const_vals);
+            *slot = Some(r);
+            r
+        }
+    }?;
+    let b_range = T::rns_exponent_range(var)?;
+    let plan = T::rns_plan_ranges(a_range, b_range, terms)?;
+    // The constant side is encoded once; the recurring cost is the varying
+    // side plus a small amortized share of the constant encode.
+    let encode_elems = var.len() + const_vals.len() / 64;
+    if !plan.profitable(terms, outputs, encode_elems, T::precision_bits() / 64) {
+        return None;
+    }
+    rns_const(cache, &plan, const_vals)?;
+    let var = T::rns_encode(&plan, EncodeSide::B, var)?;
+    Some((plan, var))
 }
 
 impl<T: FloatT> SampledBlock<T> {
@@ -411,6 +503,12 @@ impl<T: FloatT> SampledOperator<T> {
                             data: b.basis.as_slice(),
                             phantom: std::marker::PhantomData,
                         };
+                        let call = w.prepare_fwd_rns(b, x);
+                        let rns = call.as_ref().map(|(p, v)| RnsSide {
+                            plan: p,
+                            cns: &w.rns_fwd.as_ref().unwrap().res,
+                            var: v,
+                        });
                         forward_split_chunks(
                             b,
                             &q,
@@ -423,6 +521,7 @@ impl<T: FloatT> SampledOperator<T> {
                             chunks,
                             &mut w.square,
                             &mut w.panel,
+                            rns,
                         );
                     } else {
                         w.forward_terms(b, x, alpha, |i, term| terms[i] = term);
@@ -519,6 +618,12 @@ impl<T: FloatT> SampledOperator<T> {
                             data: b.basis.as_slice(),
                             phantom: std::marker::PhantomData,
                         };
+                        let call = w.prepare_adj_rns(b, x);
+                        let rns = call.as_ref().map(|(p, v)| RnsSide {
+                            plan: p,
+                            cns: &w.rns_adj.as_ref().unwrap().res,
+                            var: v,
+                        });
                         adjoint_split_chunks(
                             b,
                             &q,
@@ -531,6 +636,7 @@ impl<T: FloatT> SampledOperator<T> {
                             chunks,
                             &mut w.square,
                             &mut w.panel,
+                            rns,
                         );
                     } else {
                         w.adjoint_terms(b, x, alpha, |i, term| terms[i] = term);
@@ -599,8 +705,84 @@ struct SampledBlockWorkspace<T> {
     wdiag: Vec<T>,
     panel: Matrix<T>,
     square: Matrix<T>,
+    /// Transposed `wdiag` (`qq[tri(j)+i][k] = wdiag[k][tri(j)+i]`): turns the
+    /// forward `q'·D·q` triangle into flat `qq·d` dots on the residue path.
+    /// Lazily built for `dim == 1` blocks only.
+    qq: Vec<T>,
+    /// `d[k] = weights[k]·x[column_start+k]` scratch for the residue forward.
+    dvec: Vec<T>,
+    /// Constant-side residue caches: `adj` encodes `wdiag`, `fwd` encodes `qq`.
+    rns_adj: Option<RnsConst>,
+    rns_fwd: Option<RnsConst>,
+    /// Shared `wdiag`/`qq` exponent range (same values, permuted layout);
+    /// `Some(None)` records a permanent non-finite scan failure.
+    rns_range: Option<Option<(i64, i64)>>,
 }
 impl<T: FloatT> SampledBlockWorkspace<T> {
+    /// `dim == 1` adjoint residue context: `wdiagᵀ·x_sub` over the block's
+    /// contiguous svec row range. Constant residues land in `self.rns_adj`.
+    fn prepare_adj_rns(
+        &mut self,
+        b: &SampledBlock<T>,
+        x: &[T],
+    ) -> Option<(RnsPlan, Residues)> {
+        if b.dim != 1 || b.basis_cols == 0 {
+            return None;
+        }
+        let terms = tri(b.basis_rows);
+        let x_sub = &x[b.row_start..b.row_start + terms];
+        rns_call(
+            &mut self.rns_adj,
+            &mut self.rns_range,
+            &self.wdiag,
+            x_sub,
+            terms,
+            b.basis_cols,
+        )
+    }
+
+    /// `dim == 1` forward residue context: `qq·d` where `d_k` is the
+    /// weight-scaled primitive slice and `qq` is `wdiag` transposed so the
+    /// svec scale factors ride inside the residues.
+    fn prepare_fwd_rns(
+        &mut self,
+        b: &SampledBlock<T>,
+        x: &[T],
+    ) -> Option<(RnsPlan, Residues)> {
+        if b.dim != 1 || b.basis_cols == 0 {
+            return None;
+        }
+        let h = b.basis_rows;
+        let kmax = b.basis_cols;
+        let trih = tri(h);
+        // Skip building `qq` entirely for output-dominated shapes that
+        // `rns_call` rejects anyway.
+        if trih > kmax {
+            return None;
+        }
+        if self.qq.is_empty() {
+            self.qq = vec![T::zero(); trih * kmax];
+            for k in 0..kmax {
+                for t in 0..trih {
+                    self.qq[t * kmax + k] = self.wdiag[k * trih + t];
+                }
+            }
+        }
+        self.dvec.clear();
+        self.dvec.resize(kmax, T::zero());
+        for k in 0..kmax {
+            self.dvec[k] = b.weights[k] * x[b.column_start + k];
+        }
+        rns_call(
+            &mut self.rns_fwd,
+            &mut self.rns_range,
+            &self.qq,
+            &self.dvec,
+            kmax,
+            trih,
+        )
+    }
+
     fn forward_terms(
         &mut self,
         b: &SampledBlock<T>,
@@ -613,6 +795,18 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
         self.check(b);
         if kmax == 0 {
             return;
+        }
+        if b.dim == 1 {
+            if let Some((plan, var)) = self.prepare_fwd_rns(b, x) {
+                // qq folds the svec √2 scale into the constant residues, so
+                // each output row is a single residue dot against `d`.
+                let cns = &self.rns_fwd.as_ref().unwrap().res;
+                for t in 0..tri(h) {
+                    let v = T::rns_dot(&plan, cns, t * kmax, 1, &var, 0, 1, kmax);
+                    store(t, alpha * v);
+                }
+                return;
+            }
         }
         let sqrt2 = if h > 1 { T::SQRT_2() } else { T::zero() };
         let inv_sqrt2 = if h > 0 && b.dim > 1 {
@@ -696,6 +890,18 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
         for s in 0..b.dim {
             for r in 0..=s {
                 if r == s {
+                    if b.dim == 1 {
+                        if let Some((plan, var)) = self.prepare_adj_rns(b, x) {
+                            let cns = &self.rns_adj.as_ref().unwrap().res;
+                            for k in 0..kmax {
+                                let v =
+                                    T::rns_dot(&plan, cns, k * trih, 1, &var, 0, 1, trih);
+                                store(p + k, alpha * b.weights[p + k] * v);
+                            }
+                            p += kmax;
+                            continue;
+                        }
+                    }
                     // Diagonal pair: `v_k = q'·S·q` with symmetric `S` reduces
                     // to a flat dot over the block's svec triangle against the
                     // precomputed `wdiag` — half the panel product's work.
@@ -820,6 +1026,11 @@ impl<T: FloatT> SampledWorkspace<T> {
                         wdiag,
                         panel: Matrix::zeros((h, kmax)),
                         square: Matrix::zeros((h, h)),
+                        qq: Vec::new(),
+                        dvec: Vec::new(),
+                        rns_adj: None,
+                        rns_fwd: None,
+                        rns_range: None,
                     }
                 })
                 .collect(),

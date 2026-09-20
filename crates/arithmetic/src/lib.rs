@@ -86,6 +86,57 @@ pub trait Scalar:
     fn is_sign_negative(self) -> bool;
     fn min(self, other: Self) -> Self;
     fn max(self, other: Self) -> Self;
+    /// Exact residue-domain dot support (arbitrary-precision backends only).
+    /// The default reports `None` so callers keep `dot_fma`.
+    #[doc(hidden)]
+    fn rns_plan(_a: &[Self], _b: &[Self], _terms: usize) -> Option<crate::rns::RnsPlan> {
+        None
+    }
+    /// [`Scalar::rns_plan`] variant with precomputed `(lo, hi)` exponent ranges.
+    #[doc(hidden)]
+    fn rns_plan_ranges(
+        _a_range: (i64, i64),
+        _b_range: (i64, i64),
+        _terms: usize,
+    ) -> Option<crate::rns::RnsPlan> {
+        None
+    }
+    #[doc(hidden)]
+    fn rns_encode(
+        _plan: &crate::rns::RnsPlan,
+        _side: crate::rns::EncodeSide,
+        _m: &[Self],
+    ) -> Option<crate::rns::Residues> {
+        None
+    }
+    /// Full-width encode for cached constant operands; see
+    /// [`crate::rns::RnsPlan::encode_wide`].
+    #[doc(hidden)]
+    fn rns_encode_wide(
+        _plan: &crate::rns::RnsPlan,
+        _side: crate::rns::EncodeSide,
+        _m: &[Self],
+    ) -> Option<crate::rns::Residues> {
+        None
+    }
+    #[doc(hidden)]
+    fn rns_dot(
+        _plan: &crate::rns::RnsPlan,
+        _ra: &crate::rns::Residues,
+        _a0: usize,
+        _da: usize,
+        _rb: &crate::rns::Residues,
+        _b0: usize,
+        _db: usize,
+        _terms: usize,
+    ) -> Self {
+        unimplemented!("rns_dot requires rns_plan support")
+    }
+    /// Reusable exponent range scan shared by `rns_plan` implementations.
+    #[doc(hidden)]
+    fn rns_exponent_range(_m: &[Self]) -> Option<(i64, i64)> {
+        None
+    }
 }
 macro_rules! primitive_scalar {
     ($t:ty) => {
@@ -584,6 +635,45 @@ impl<const N: usize> Scalar for MpFloat<N> {
     }
     fn dot_fma<'a>(pairs: impl IntoIterator<Item = (&'a Self, &'a Self)>) -> Self {
         MpFloat::dot_fma(pairs)
+    }
+    fn rns_plan(a: &[Self], b: &[Self], terms: usize) -> Option<crate::rns::RnsPlan> {
+        crate::rns::RnsPlan::for_pair(a, b, terms)
+    }
+    fn rns_plan_ranges(
+        a_range: (i64, i64),
+        b_range: (i64, i64),
+        terms: usize,
+    ) -> Option<crate::rns::RnsPlan> {
+        crate::rns::RnsPlan::for_ranges::<N>(a_range, b_range, terms)
+    }
+    fn rns_encode(
+        plan: &crate::rns::RnsPlan,
+        side: crate::rns::EncodeSide,
+        m: &[Self],
+    ) -> Option<crate::rns::Residues> {
+        plan.encode(m, side)
+    }
+    fn rns_encode_wide(
+        plan: &crate::rns::RnsPlan,
+        side: crate::rns::EncodeSide,
+        m: &[Self],
+    ) -> Option<crate::rns::Residues> {
+        plan.encode_wide(m, side)
+    }
+    fn rns_dot(
+        plan: &crate::rns::RnsPlan,
+        ra: &crate::rns::Residues,
+        a0: usize,
+        da: usize,
+        rb: &crate::rns::Residues,
+        b0: usize,
+        db: usize,
+        terms: usize,
+    ) -> Self {
+        plan.dot::<N>(ra, a0, da, rb, b0, db, terms)
+    }
+    fn rns_exponent_range(m: &[Self]) -> Option<(i64, i64)> {
+        crate::rns::exponent_range(m)
     }
     fn ln(self) -> Self {
         self.unary(mpfr::log)

@@ -85,6 +85,31 @@ fn mulmod(a: u64, b: u64, m: u64) -> u64 {
     ((a as u128 * b as u128) % m as u128) as u64
 }
 
+/// Exponent range `(lo, hi)` of the dyadic window `exponent - PRECISION_BITS`
+/// over a slice; `None` on non-finite values. Identically-zero slices return
+/// `(i64::MAX, i64::MIN)` so callers can detect them.
+pub fn exponent_range<const N: usize>(m: &[MpFloat<N>]) -> Option<(i64, i64)> {
+    let mut lo = i64::MAX;
+    let mut hi = i64::MIN;
+    for v in m {
+        let view = v.dyadic_view();
+        match view.kind {
+            DyadicKind::Zero => continue,
+            DyadicKind::Finite { .. } => {
+                // Extreme exponents (subnormal-range values) can sit at
+                // the MPFR exponent floor; a saturating window check is
+                // enough since such values always exceed MAX_SPREAD.
+                let e = (view.exponent as i64)
+                    .saturating_sub(MpFloat::<N>::PRECISION_BITS as i64);
+                lo = lo.min(e);
+                hi = hi.max(e);
+            }
+            _ => return None,
+        }
+    }
+    Some((lo, hi))
+}
+
 /// One modulus `p = 2^60 - c`, `c < 2^32`, plus its Montgomery-free helpers.
 #[derive(Clone, Copy)]
 struct Prime {
@@ -140,12 +165,11 @@ fn primes() -> &'static [Prime] {
     PRIMES.get_or_init(|| find_primes(64))
 }
 
-/// Alignment and modulus plan for one residue product `A · B`.
-///
-/// Each operand matrix is encoded as exact integers `I = value / 2^shift`
-/// where `shift` is the matrix minimum of `exponent - PRECISION_BITS`. The
-/// product integer then carries `2^(shift_a + shift_b)` exactly.
-pub struct RnsPlan {
+/// Tables that depend only on the prime count `k`: encode weights, Garner
+/// inverses, prefix products and the modulus. Shared between plans through
+/// `Arc` so building a per-call plan is just the bound computation and the
+/// two exponent shifts — the O(k²) tables are paid once per `k` per process.
+struct RnsTables {
     primes: Vec<Prime>,
     /// `pow2[k][j] = 2^(2^j) mod p_k`.
     pow2: Vec<[u64; POW2_STEPS]>,
@@ -157,6 +181,75 @@ pub struct RnsPlan {
     modulus: Vec<u64>,
     /// `floor(M / 2)` for the symmetric sign test.
     half: Vec<u64>,
+}
+
+static TABLES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<RnsTables>>>,
+> = std::sync::OnceLock::new();
+
+fn build_tables(k: usize) -> RnsTables {
+    let primes = primes()[..k].to_vec();
+    let pow2: Vec<[u64; POW2_STEPS]> = primes
+        .iter()
+        .map(|pr| {
+            let mut t = [0u64; POW2_STEPS];
+            t[0] = 2 % pr.p;
+            for j in 1..POW2_STEPS {
+                t[j] = pr.reduce(t[j - 1] as u128 * t[j - 1] as u128);
+            }
+            t
+        })
+        .collect();
+    // Garner inverse table: inv[j][i] = p_j^{-1} mod p_i for j < i.
+    let inv: Vec<Vec<u64>> = (0..k)
+        .map(|i| (0..i).map(|j| mod_inverse(primes[j].p % primes[i].p, primes[i].p)).collect())
+        .collect();
+    // Prefix products and modulus as little-endian limb vectors.
+    let mut prefix = Vec::with_capacity(k);
+    let mut modulus = vec![1u64];
+    for pr in &primes {
+        prefix.push(modulus.clone());
+        mul_add_word(&mut modulus, pr.p, 0);
+    }
+    let mut half = modulus.clone();
+    // floor(M/2): M is odd (all primes odd), so (M-1)/2 = shift right once.
+    let mut rem = 0u64;
+    for limb in half.iter_mut().rev() {
+        let cur = (rem << 63) | (*limb >> 1);
+        rem = *limb & 1;
+        *limb = cur;
+    }
+    RnsTables {
+        primes,
+        pow2,
+        inv,
+        prefix,
+        modulus,
+        half,
+    }
+}
+
+fn tables_for(k: usize) -> Option<std::sync::Arc<RnsTables>> {
+    if k == 0 || k > primes().len() {
+        return None;
+    }
+    let map = TABLES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    Some(
+        map.lock()
+            .unwrap()
+            .entry(k)
+            .or_insert_with(|| std::sync::Arc::new(build_tables(k)))
+            .clone(),
+    )
+}
+
+/// Alignment and modulus plan for one residue product `A · B`.
+///
+/// Each operand matrix is encoded as exact integers `I = value / 2^shift`
+/// where `shift` is the matrix minimum of `exponent - PRECISION_BITS`. The
+/// product integer then carries `2^(shift_a + shift_b)` exactly.
+pub struct RnsPlan {
+    tables: std::sync::Arc<RnsTables>,
     shift_a: i64,
     shift_b: i64,
 }
@@ -181,6 +274,26 @@ pub struct RnsScratch {
     c: Vec<u64>,
     x: Vec<u64>,
     mag: Vec<u64>,
+    /// Pooled GMP/MPFR reconstruction objects: `mpz_import` and
+    /// `mpfr::set_z` reuse their limb allocations, so the only per-output
+    /// cost is the copy itself. `f_prec` tracks the mpfr precision; a
+    /// precision change reallocates `f`.
+    z: Option<gmp::mpz_t>,
+    f: Option<gmp_mpfr_sys::mpfr::mpfr_t>,
+    f_prec: usize,
+}
+
+impl Drop for RnsScratch {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(z) = self.z.as_mut() {
+                gmp::mpz_clear(z);
+            }
+            if let Some(f) = self.f.as_mut() {
+                gmp_mpfr_sys::mpfr::clear(f);
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -190,6 +303,9 @@ thread_local! {
         c: Vec::new(),
         x: Vec::new(),
         mag: Vec::new(),
+        z: None,
+        f: None,
+        f_prec: 0,
     });
 }
 
@@ -204,32 +320,23 @@ impl RnsPlan {
         b: &[MpFloat<N>],
         terms: usize,
     ) -> Option<Self> {
+        let (lo_a, hi_a) = exponent_range(a)?;
+        let (lo_b, hi_b) = exponent_range(b)?;
+        Self::for_ranges::<N>((lo_a, hi_a), (lo_b, hi_b), terms)
+    }
+
+    /// Variant of [`RnsPlan::for_pair`] with precomputed exponent ranges, so a
+    /// constant operand is scanned once per solve rather than once per call.
+    pub fn for_ranges<const N: usize>(
+        a_range: (i64, i64),
+        b_range: (i64, i64),
+        terms: usize,
+    ) -> Option<Self> {
         if terms == 0 {
             return None;
         }
-        let scan = |m: &[MpFloat<N>]| -> Option<(i64, i64)> {
-            let mut lo = i64::MAX;
-            let mut hi = i64::MIN;
-            for v in m {
-                let view = v.dyadic_view();
-                match view.kind {
-                    DyadicKind::Zero => continue,
-                    DyadicKind::Finite { .. } => {
-                        // Extreme exponents (subnormal-range values) can sit at
-                        // the MPFR exponent floor; a saturating window check is
-                        // enough since such values always exceed MAX_SPREAD.
-                        let e = (view.exponent as i64)
-                            .saturating_sub(MpFloat::<N>::PRECISION_BITS as i64);
-                        lo = lo.min(e);
-                        hi = hi.max(e);
-                    }
-                    _ => return None,
-                }
-            }
-            Some((lo, hi))
-        };
-        let (lo_a, hi_a) = scan(a)?;
-        let (lo_b, hi_b) = scan(b)?;
+        let (lo_a, hi_a) = a_range;
+        let (lo_b, hi_b) = b_range;
         if lo_a == i64::MAX || lo_b == i64::MAX {
             return None; // an operand is identically zero; nothing to gain
         }
@@ -241,59 +348,10 @@ impl RnsPlan {
         let p = MpFloat::<N>::PRECISION_BITS as u64;
         let bound = 2 * p + (da + db) as u64 + (64 - (terms as u64).leading_zeros() as u64) + 2;
         let k = bound.div_ceil(PRIME_BITS as u64) as usize;
-        let primes = primes();
-        if k > primes.len() {
-            return None; // operand window wider than the cached prime range
-        }
-        let primes = primes[..k].to_vec();
-
-        let pow2: Vec<[u64; POW2_STEPS]> = primes
-            .iter()
-            .map(|pr| {
-                let mut t = [0u64; POW2_STEPS];
-                t[0] = 2 % pr.p;
-                for j in 1..POW2_STEPS {
-                    t[j] = pr.reduce(t[j - 1] as u128 * t[j - 1] as u128);
-                }
-                t
-            })
-            .collect();
-
-        // Garner inverse table: inv[j][i] = p_j^{-1} mod p_i for j < i.
-        let inv: Vec<Vec<u64>> = (0..k)
-            .map(|i| {
-                (0..i)
-                    .map(|j| {
-                        // p_j^{-1} mod p_i via extended Euclid on i64-magnitudes.
-                        mod_inverse(primes[j].p % primes[i].p, primes[i].p)
-                    })
-                    .collect()
-            })
-            .collect();
-
-        // Prefix products and modulus as little-endian limb vectors.
-        let mut prefix = Vec::with_capacity(k);
-        let mut modulus = vec![1u64];
-        for pr in &primes {
-            prefix.push(modulus.clone());
-            mul_add_word(&mut modulus, pr.p, 0);
-        }
-        let mut half = modulus.clone();
-        // floor(M/2): M is odd (all primes odd), so (M-1)/2 = shift right once.
-        let mut rem = 0u64;
-        for limb in half.iter_mut().rev() {
-            let cur = (rem << 63) | (*limb >> 1);
-            rem = *limb & 1;
-            *limb = cur;
-        }
+        let tables = tables_for(k)?; // wider operand window than the cached prime range
 
         Some(Self {
-            primes,
-            pow2,
-            inv,
-            prefix,
-            modulus,
-            half,
+            tables,
             shift_a: lo_a,
             shift_b: lo_b,
         })
@@ -301,7 +359,14 @@ impl RnsPlan {
 
     /// Number of primes; also the residue stride per element.
     pub fn primes(&self) -> usize {
-        self.primes.len()
+        self.tables.primes.len()
+    }
+
+    /// The `a`-side alignment shift this plan was built with. Constant
+    /// operands encoded against `(shift_a, primes)` stay reusable while the
+    /// varying side is re-encoded per call.
+    pub fn shift_a(&self) -> i64 {
+        self.shift_a
     }
 
     /// Heuristic cost gate: RNS wins only when the per-term dot saving,
@@ -311,9 +376,12 @@ impl RnsPlan {
     /// `outputs` is the number of independent dot products; `encode_elems`
     /// counts the operand elements encoded once (a + b for GEMM, a for
     /// SYRK); `limbs` is the operand mantissa width. Measured constants at
-    /// 512–768-bit: `mpfr_fma` ≈ 110ns/term, residue accumulation ≈ 2ns per
-    /// term per prime, Garner reconstruction ≈ 1.6µs/output, encode ≈
-    /// ~8ns per limb per prime with the weighted table, cached plan ≈ ~30µs.
+    /// 512–768-bit: `mpfr_fma` ≈ 300ns/term including per-call overhead
+    /// (release builds range ~110ns bare-MPFR to ~365ns end-to-end;
+    /// underestimating it wrongly rejects profitable operator dots),
+    /// residue accumulation ≈ 2ns per term per prime, Garner
+    /// reconstruction ≈ 1.6µs/output, encode ≈ ~8ns per limb per prime
+    /// with the weighted table, cached plan ≈ ~30µs.
     pub fn profitable(
         &self,
         terms: usize,
@@ -324,8 +392,8 @@ impl RnsPlan {
         if terms < 24 || outputs == 0 {
             return false;
         }
-        let k = self.primes.len() as f64;
-        let mpfr = outputs as f64 * terms as f64 * 110.0;
+        let k = self.tables.primes.len() as f64;
+        let mpfr = outputs as f64 * terms as f64 * 300.0;
         let dots = outputs as f64 * (terms as f64 * 2.0 * k + 1600.0);
         let encode = encode_elems as f64 * k * limbs as f64 * 8.0;
         let plan = 30_000.0f64;
@@ -341,7 +409,28 @@ impl RnsPlan {
     /// 2^(64l) mod p`, accumulated in `u128` with one reduction per 8-limb
     /// batch — roughly half the cost of the per-limb Horner fold.
     pub fn encode<const N: usize>(&self, m: &[MpFloat<N>], side: EncodeSide) -> Option<Residues> {
-        let k = self.primes.len();
+        self.encode_with(m, side, &self.tables.primes, &self.tables.pow2)
+    }
+
+    /// Encode against the full cached prime table rather than this plan's
+    /// first `K`. Plans draw primes as a fixed prefix of that table, so a
+    /// constant operand encoded once at the wider stride stays valid for
+    /// every later plan: [`RnsPlan::dot_residues_into`] reads only the
+    /// first `k` residues of each row. Costs more than a plan-width
+    /// encode and is meant for the cached constant side of a product.
+    pub fn encode_wide<const N: usize>(&self, m: &[MpFloat<N>], side: EncodeSide) -> Option<Residues> {
+        let t = tables_for(primes().len())?;
+        self.encode_with(m, side, &t.primes, &t.pow2)
+    }
+
+    fn encode_with<const N: usize>(
+        &self,
+        m: &[MpFloat<N>],
+        side: EncodeSide,
+        primes: &[Prime],
+        pow2: &[[u64; POW2_STEPS]],
+    ) -> Option<Residues> {
+        let k = primes.len();
         let shift = match side {
             EncodeSide::A => self.shift_a,
             EncodeSide::B => self.shift_b,
@@ -349,7 +438,7 @@ impl RnsPlan {
         // w[l][k] = 2^(64*l) mod p_k. Small fixed table per call.
         let nl = m.iter().map(|v| v.limbs.len()).max().unwrap_or(0);
         let mut w = vec![vec![0u64; k]; nl.max(1)];
-        for (kk, pr) in self.primes.iter().enumerate() {
+        for (kk, pr) in primes.iter().enumerate() {
             w[0][kk] = 1 % pr.p;
             for l in 1..nl {
                 w[l][kk] = pr.reduce(w[l - 1][kk] as u128 * pr.r64 as u128);
@@ -368,7 +457,7 @@ impl RnsPlan {
             if delta < 0 || delta >= (1i64 << POW2_STEPS) {
                 return false;
             }
-            for (kk, pr) in self.primes.iter().enumerate() {
+            for (kk, pr) in primes.iter().enumerate() {
                 // Sum limb_l * 2^(64l) mod p in u128, folding every 8 limbs:
                 // each term < 2^124, so a batch of 8 stays below 2^127.
                 let mut acc = 0u128;
@@ -387,7 +476,7 @@ impl RnsPlan {
                     let mut j = 0usize;
                     while d != 0 {
                         if d & 1 == 1 {
-                            r = pr.reduce(r as u128 * self.pow2[kk][j] as u128);
+                            r = pr.reduce(r as u128 * pow2[kk][j] as u128);
                         }
                         d >>= 1;
                         j += 1;
@@ -453,9 +542,11 @@ impl RnsPlan {
         terms: usize,
         scratch: &mut RnsScratch,
     ) {
-        let k = self.primes.len();
-        debug_assert_eq!(ra.k, k);
-        debug_assert_eq!(rb.k, k);
+        let k = self.tables.primes.len();
+        // Rows may be stored at a wider stride than `k` (see
+        // [`RnsPlan::encode_wide`]); only the first `k` residues of each
+        // row participate since plans draw a fixed prefix of primes.
+        debug_assert!(ra.k >= k && rb.k >= k);
         scratch.acc.clear();
         scratch.acc.resize(k, 0u128);
         scratch.res.clear();
@@ -465,15 +556,15 @@ impl RnsPlan {
         while l < terms {
             let end = (l + REDUCE_EVERY).min(terms);
             for _ in l..end {
-                let rowa = &ra.data[a0 * k..a0 * k + k];
-                let rowb = &rb.data[b0 * k..b0 * k + k];
+                let rowa = &ra.data[a0 * ra.k..a0 * ra.k + k];
+                let rowb = &rb.data[b0 * rb.k..b0 * rb.k + k];
                 for j in 0..k {
                     acc[j] += rowa[j] as u128 * rowb[j] as u128;
                 }
                 a0 += da;
                 b0 += db;
             }
-            for (j, pr) in self.primes.iter().enumerate() {
+            for (j, pr) in self.tables.primes.iter().enumerate() {
                 acc[j] = pr.reduce(acc[j]) as u128;
             }
             l = end;
@@ -485,7 +576,7 @@ impl RnsPlan {
 
     /// Exact dot of two residue columns, allocating the residue vector.
     pub fn dot_residues(&self, ra: &Residues, a0: usize, da: usize, rb: &Residues, b0: usize, db: usize, terms: usize) -> Vec<u64> {
-        let mut out = vec![0u64; self.primes.len()];
+        let mut out = vec![0u64; self.tables.primes.len()];
         Self::with_scratch(|s| {
             self.dot_residues_into(ra, a0, da, rb, b0, db, terms, s);
             out.copy_from_slice(&s.res);
@@ -508,7 +599,7 @@ impl RnsPlan {
 
     /// [`RnsPlan::reconstruct`] over the residues already in `scratch.res`.
     pub fn reconstruct_scratch<const N: usize>(&self, scratch: &mut RnsScratch) -> MpFloat<N> {
-        let k = self.primes.len();
+        let k = self.tables.primes.len();
         debug_assert!(scratch.res.len() >= k);
         // Garner coefficients.
         scratch.c.clear();
@@ -516,58 +607,75 @@ impl RnsPlan {
         for i in 0..k {
             let mut t = scratch.res[i];
             for j in 0..i {
-                let p = self.primes[i];
+                let p = self.tables.primes[i];
                 // t = (t - c_j) * inv(j, i) mod p_i
                 let diff = if t >= scratch.c[j] { t - scratch.c[j] } else { t + p.p - scratch.c[j] };
-                t = p.reduce(diff as u128 * self.inv[i][j] as u128);
+                t = p.reduce(diff as u128 * self.tables.inv[i][j] as u128);
             }
             scratch.c[i] = t;
         }
         // x = sum_i c_i * prefix_i, kept below M by a conditional subtract per
         // addend: each addend is < M, so x stays in [0, M) throughout.
         scratch.x.clear();
-        scratch.x.resize(self.modulus.len() + 1, 0u64);
+        scratch.x.resize(self.tables.modulus.len() + 1, 0u64);
         let x = &mut scratch.x;
         for (i, &ci) in scratch.c.iter().enumerate() {
             if ci == 0 {
                 continue;
             }
             let mut carry = 0u128;
-            for (d, &m) in x.iter_mut().zip(self.prefix[i].iter()) {
+            for (d, &m) in x.iter_mut().zip(self.tables.prefix[i].iter()) {
                 let cur = *d as u128 + ci as u128 * m as u128 + carry;
                 *d = cur as u64;
                 carry = cur >> 64;
             }
-            let mut idx = self.prefix[i].len();
+            let mut idx = self.tables.prefix[i].len();
             while carry != 0 && idx < x.len() {
                 let cur = x[idx] as u128 + carry;
                 x[idx] = cur as u64;
                 carry = cur >> 64;
                 idx += 1;
             }
-            if cmp_limbs(&x, &self.modulus) != std::cmp::Ordering::Less {
-                sub_limbs(&mut *x, &self.modulus);
+            if cmp_limbs(&x, &self.tables.modulus) != std::cmp::Ordering::Less {
+                sub_limbs(&mut *x, &self.tables.modulus);
             }
         }
         // Sign: S mod M in [0, M); if x > M/2 the sum is negative, |S| = M - x.
-        let negative = cmp_limbs(x, &self.half) == std::cmp::Ordering::Greater;
+        let negative = cmp_limbs(x, &self.tables.half) == std::cmp::Ordering::Greater;
         scratch.mag.clear();
         if negative {
             // |S| = M - x, computed into `mag`.
-            scratch.mag.extend_from_slice(&self.modulus);
+            scratch.mag.extend_from_slice(&self.tables.modulus);
             scratch.mag.resize(x.len(), 0);
             sub_limbs(&mut scratch.mag, x);
         } else {
             scratch.mag.extend_from_slice(x);
         }
         let mag = &scratch.mag;
-        // Import into mpz, convert to MPFR, apply the 2^(shift_a+shift_b) scale.
-        let mut z = MaybeUninit::<gmp::mpz_t>::uninit();
+        // Import into the pooled mpz, convert to the pooled MPFR, apply the
+        // 2^(shift_a+shift_b) scale. Both objects keep their allocations
+        // across every output of the product.
+        if scratch.z.is_none() {
+            let mut z = MaybeUninit::<gmp::mpz_t>::uninit();
+            unsafe { gmp::mpz_init(z.as_mut_ptr()) };
+            scratch.z = Some(unsafe { z.assume_init() });
+        }
+        if scratch.f_prec != MpFloat::<N>::PRECISION_BITS {
+            if let Some(mut f) = scratch.f.take() {
+                unsafe { gmp_mpfr_sys::mpfr::clear(&mut f) };
+            }
+            let mut f = MaybeUninit::<gmp_mpfr_sys::mpfr::mpfr_t>::uninit();
+            unsafe {
+                gmp_mpfr_sys::mpfr::init2(f.as_mut_ptr(), MpFloat::<N>::PRECISION_BITS as _)
+            };
+            scratch.f = Some(unsafe { f.assume_init() });
+            scratch.f_prec = MpFloat::<N>::PRECISION_BITS;
+        }
+        let z = scratch.z.as_mut().unwrap();
+        let f = scratch.f.as_mut().unwrap();
         unsafe {
-            gmp::mpz_init(z.as_mut_ptr());
-            let mut z = z.assume_init();
             gmp::mpz_import(
-                &mut z,
+                z,
                 mag.len(),
                 -1, // least significant word first
                 8,
@@ -576,35 +684,21 @@ impl RnsPlan {
                 mag.as_ptr().cast(),
             );
             if negative {
-                gmp::mpz_neg(&mut z, &z);
+                gmp::mpz_neg(z, z);
             }
-            let mut f = MaybeUninit::<gmp_mpfr_sys::mpfr::mpfr_t>::uninit();
-            gmp_mpfr_sys::mpfr::init2(
-                f.as_mut_ptr(),
-                MpFloat::<N>::PRECISION_BITS as _,
-            );
-            let mut f = f.assume_init();
-            gmp_mpfr_sys::mpfr::set_z(&mut f, &z, gmp_mpfr_sys::mpfr::rnd_t::RNDN);
+            gmp_mpfr_sys::mpfr::set_z(f, z, gmp_mpfr_sys::mpfr::rnd_t::RNDN);
             let scale = self.shift_a + self.shift_b;
             if scale >= 0 {
-                gmp_mpfr_sys::mpfr::mul_2exp(
-                    &mut f,
-                    &f,
-                    scale as u64,
-                    gmp_mpfr_sys::mpfr::rnd_t::RNDN,
-                );
+                gmp_mpfr_sys::mpfr::mul_2exp(f, f, scale as u64, gmp_mpfr_sys::mpfr::rnd_t::RNDN);
             } else {
                 gmp_mpfr_sys::mpfr::div_2exp(
-                    &mut f,
-                    &f,
+                    f,
+                    f,
                     scale.unsigned_abs(),
                     gmp_mpfr_sys::mpfr::rnd_t::RNDN,
                 );
             }
-            let out = MpFloat::<N>::from_mpfr_descriptor(&f);
-            gmp_mpfr_sys::mpfr::clear(&mut f);
-            gmp::mpz_clear(&mut z);
-            out
+            MpFloat::<N>::from_mpfr_descriptor(f)
         }
     }
 }
@@ -849,7 +943,7 @@ mod tests {
         // Long dot, many outputs, few encoded elements: profitable.
         assert!(plan.profitable(64, 100_000, 128, 8));
         // Tiny output count cannot amortize encode + plan.
-        assert!(!plan.profitable(64, 100, 128, 8));
+        assert!(!plan.profitable(64, 8, 128, 8));
         assert!(!plan.profitable(4, 100_000, 128, 8));
     }
 }

@@ -55,6 +55,7 @@ pub(super) fn forward_split_chunks<T: FloatT>(
     chunks: usize,
     square: &mut Matrix<T>,
     panel: &mut Matrix<T>,
+    rns: Option<RnsSide<'_>>,
 ) {
     if s_range.len() == 1 && chunks > 1 {
         // A lone `s` level owns a contiguous svec row band; split it into
@@ -74,6 +75,7 @@ pub(super) fn forward_split_chunks<T: FloatT>(
             inv_sqrt2,
             chunks,
             panel,
+            rns,
         );
         return;
     }
@@ -84,6 +86,17 @@ pub(super) fn forward_split_chunks<T: FloatT>(
         for s in s_range {
             for r in 0..=s {
                 let p = (tri(s) + r) * kmax;
+                if r == s {
+                    if let Some(rc) = rns {
+                        // qq rows carry the svec scale; one dot per output.
+                        for t in 0..tri(h) {
+                            let v =
+                                T::rns_dot(rc.plan, rc.cns, t * kmax, 1, rc.var, 0, 1, kmax);
+                            out[t - s_offset] += alpha * v;
+                        }
+                        continue;
+                    }
+                }
                 for k in 0..kmax {
                     let weight = b.weights[p + k] * x[b.column_start + p + k];
                     let q_col = &q.data()[k * h..(k + 1) * h];
@@ -145,6 +158,7 @@ pub(super) fn forward_split_chunks<T: FloatT>(
                 left_chunks,
                 square,
                 panel,
+                rns,
             )
         },
         || {
@@ -160,6 +174,7 @@ pub(super) fn forward_split_chunks<T: FloatT>(
                 right_chunks,
                 &mut local_square,
                 &mut local_panel,
+                rns,
             )
         },
     );
@@ -177,6 +192,7 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
     chunks: usize,
     square: &mut Matrix<T>,
     panel: &mut Matrix<T>,
+    rns: Option<RnsSide<'_>>,
 ) {
     if s_range.len() == 1 && chunks > 1 {
         // A lone `s` level still owns `s + 1` pairs (or, for a diagonal pair,
@@ -195,6 +211,7 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
             chunks,
             square,
             panel,
+            rns,
         );
         return;
     }
@@ -207,6 +224,14 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
             for r in 0..=s {
                 let p = (tri(s) + r) * kmax;
                 if r == s {
+                    if let Some(rc) = rns {
+                        for k in 0..kmax {
+                            let v =
+                                T::rns_dot(rc.plan, rc.cns, k * trih, 1, rc.var, 0, 1, trih);
+                            out[p + k - s_offset] = alpha * b.weights[p + k] * v;
+                        }
+                        continue;
+                    }
                     // Same `q'·S·q` flat dots as `adjoint_terms`: bitwise
                     // identical because the `wdiag` weights fix the order.
                     for k in 0..kmax {
@@ -266,6 +291,7 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
                 left_chunks,
                 square,
                 panel,
+                rns,
             )
         },
         || {
@@ -281,6 +307,7 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
                 right_chunks,
                 &mut local_square,
                 &mut local_panel,
+                rns,
             )
         },
     );
@@ -298,6 +325,7 @@ fn adjoint_diag_chunks<T: FloatT>(
     k_range: std::ops::Range<usize>,
     out: &mut [T],
     chunks: usize,
+    rns: Option<RnsSide<'_>>,
 ) {
     let h = b.basis_rows;
     let kmax = b.basis_cols;
@@ -318,6 +346,7 @@ fn adjoint_diag_chunks<T: FloatT>(
                     k_range.start..mid,
                     left,
                     left_chunks,
+                    rns,
                 )
             },
             || {
@@ -330,6 +359,7 @@ fn adjoint_diag_chunks<T: FloatT>(
                     mid..k_range.end,
                     right,
                     right_chunks,
+                    rns,
                 )
             },
         );
@@ -337,6 +367,13 @@ fn adjoint_diag_chunks<T: FloatT>(
     }
     let p = (tri(s) + s) * kmax;
     let k0 = k_range.start;
+    if let Some(rc) = rns {
+        for k in k_range {
+            let v = T::rns_dot(rc.plan, rc.cns, k * trih, 1, rc.var, 0, 1, trih);
+            out[k - k0] = alpha * b.weights[p + k] * v;
+        }
+        return;
+    }
     for k in k_range {
         let w = &wdiag[k * trih..(k + 1) * trih];
         let v = T::dot_fma((0..h).flat_map(|j| {
@@ -368,6 +405,7 @@ fn adjoint_level_chunks<T: FloatT>(
     chunks: usize,
     square: &mut Matrix<T>,
     panel: &mut Matrix<T>,
+    rns: Option<RnsSide<'_>>,
 ) {
     let h = b.basis_rows;
     let kmax = b.basis_cols;
@@ -395,6 +433,7 @@ fn adjoint_level_chunks<T: FloatT>(
                     left_chunks,
                     square,
                     panel,
+                    rns,
                 )
             },
             || {
@@ -411,19 +450,27 @@ fn adjoint_level_chunks<T: FloatT>(
                     right_chunks,
                     &mut local_square,
                     &mut local_panel,
+                    rns,
                 )
             },
         );
         return;
     }
     if chunks > 1 && r0 == s && kmax > 1 {
-        adjoint_diag_chunks(b, wdiag, x, alpha, s, 0..kmax, out, chunks);
+        adjoint_diag_chunks(b, wdiag, x, alpha, s, 0..kmax, out, chunks, rns);
         return;
     }
     let trih = tri(h);
     for r in r0..=r1 {
         let p = (tri(s) + r) * kmax;
         if r == s {
+            if let Some(rc) = rns {
+                for k in 0..kmax {
+                    let v = T::rns_dot(rc.plan, rc.cns, k * trih, 1, rc.var, 0, 1, trih);
+                    out[(r - r0) * kmax + k] = alpha * b.weights[p + k] * v;
+                }
+                continue;
+            }
             for k in 0..kmax {
                 let w = &wdiag[k * trih..(k + 1) * trih];
                 let v = T::dot_fma((0..h).flat_map(|j| {
@@ -485,6 +532,13 @@ pub(super) fn forward_disjoint<T: FloatT>(
                 };
                 let y_slice = &mut y[offset..offset + b.row_count()];
                 if chunks > 1 {
+                    let w0 = &mut work[0];
+                    let call = w0.prepare_fwd_rns(b, x);
+                    let rns = call.as_ref().map(|(p, v)| RnsSide {
+                        plan: p,
+                        cns: &w0.rns_fwd.as_ref().unwrap().res,
+                        var: v,
+                    });
                     forward_split_chunks(
                         b,
                         &q,
@@ -495,8 +549,9 @@ pub(super) fn forward_disjoint<T: FloatT>(
                         sqrt2,
                         inv_sqrt2,
                         chunks,
-                        &mut work[0].square,
-                        &mut work[0].panel,
+                        &mut w0.square,
+                        &mut w0.panel,
+                        rns,
                     );
                 } else {
                     work[0].forward_terms(b, x, alpha, |i, term| y_slice[i] += term);
@@ -543,6 +598,7 @@ fn forward_band_chunks<T: FloatT>(
     inv_sqrt2: T,
     chunks: usize,
     panel: &mut Matrix<T>,
+    rns: Option<RnsSide<'_>>,
 ) {
     let h = b.basis_rows;
     let kmax = b.basis_cols;
@@ -567,6 +623,7 @@ fn forward_band_chunks<T: FloatT>(
                     inv_sqrt2,
                     left_chunks,
                     panel,
+                    rns,
                 )
             },
             || {
@@ -582,6 +639,7 @@ fn forward_band_chunks<T: FloatT>(
                     inv_sqrt2,
                     right_chunks,
                     &mut local_panel,
+                    rns,
                 )
             },
         );
@@ -590,6 +648,18 @@ fn forward_band_chunks<T: FloatT>(
     let base = tri(s * h + j_range.start);
     for r in 0..=s {
         let p = (tri(s) + r) * kmax;
+        if r == s {
+            if let Some(rc) = rns {
+                for j in j_range.clone() {
+                    for i in 0..=j {
+                        let t = tri(j) + i;
+                        let v = T::rns_dot(rc.plan, rc.cns, t * kmax, 1, rc.var, 0, 1, kmax);
+                        out[t - base] += alpha * v;
+                    }
+                }
+                continue;
+            }
+        }
         for k in 0..kmax {
             let weight = b.weights[p + k] * x[b.column_start + p + k];
             let q_col = &q.data()[k * h..(k + 1) * h];

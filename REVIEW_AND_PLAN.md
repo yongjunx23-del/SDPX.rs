@@ -618,3 +618,51 @@ structure as Λ=15, so the leaf split applies directly. Earlier
 co-tenant OOMs were scheduler memory over-subscription, not solver:
 `mem=` sets RLIMIT_DATA/-m but does not memory-pack; exclusive
 placement (`node7`, singlejob) is the reliable mitigation.
+
+### Residue-domain sampled products (A) — implemented, gated, measured negative on Λ=15
+
+`SDPX_RNS_OPS=1` routes `dim == 1` sampled blocks through
+`RnsPlan` dots: adjoint becomes `wdiagᵀ·x_sub` (76 outputs × 741
+terms), forward `qq·d` (741 outputs × 76 terms) with the svec √2
+folded into the constant residues. The constant side (`wdiag`/`qq`,
+identical value sets permuted) encodes once at the full 64-prime
+width (`encode_wide`) into `rns_adj`/`rns_fwd`, so per-call plans —
+whose prime count jitters with the residual vector's exponent window
+— always hit the cache (`dot_residues_into` strides by each operand's
+stored width). `RnsPlan` tables (pow2/inverses/prefix/modulus) are
+shared per `k` through `Arc`, and CRT reconstruction reuses pooled
+GMP/MPFR objects in the thread-local scratch. The varying side
+encodes per call. Serial and split leaves share `RnsSide`
+(immutable, `Sync`); `dot_fma` stays as fallback for f64, non-finite
+inputs, exponent spread > MAX_SPREAD, output-dominated products
+(`outputs > terms`, measured CRT-bound), and the `profitable` gate.
+
+**Cluster measurement — negative, gate stays off.** Three configs on
+node7 (singlejob): narrow cache thrash 330.7s t64 / 300.5s t128
+(jobs 214081/214082, residual.adj oscillating 33↔385ms as `K` jitter
+re-encoded `wdiag` every call); wide-encode fix 228.0s t64 / 191.9s
+t128 (214153/214154); adjoint-only gate 222.8s t64 / 187.8s t128
+(214158/214159) — all vs leaf-split baselines 208.2s / 169.9s. The
+adjoint phase itself does improve (med 52.9→42.6ms t64, 31→22.9ms
+t128) but the ~84MB per-solve residue working set costs ~8–10ms on
+neighbouring phases (`residual.scale`, fwd, kkt solve/update),
+netting −7…−13%. The implementation stays behind `SDPX_RNS_OPS` for
+term-dominated shapes where it may win; it is off by default and does
+not satisfy the ≥2% retention bar on the acceptance benchmark.
+
+**Bug found by the new leaf test**: `dyadic_view` classified `-0`
+(kind `-ZERO_KIND`) as Finite and read its undefined exponent field,
+inflating `exponent_range` to i64::MIN and rejecting every plan.
+Fixed by testing `kind.abs() == ZERO_KIND`; `mantissa_limbs` and
+`exact_bit_length` inherit the fix.
+
+The f64 direction skeleton (`SDPX_SKELETON_F64`) was **falsified on
+the cluster** (job 214062): with κ(KKT) ≥ 5.8e18 an f64 direction
+gives IR 10 rounds without convergence → `InsufficientProgress` at
+iteration 1. Code reverted; "approximate direction + exact IR" needs
+an exact-enough skeleton, which does not exist below MPFR. B
+(residue-domain condensed solve) stays closed: n=1190 QDLDL is
+sparse and CRT reconstruction of rational LDLᵀ entries has no
+reachable bound. D (residue PSD-SVD column updates) closed: each
+rotation must round back to MPFR for the scalar chain, so residues
+pay encode/CRT per step without saving flops.

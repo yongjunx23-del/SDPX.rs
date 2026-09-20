@@ -58,7 +58,9 @@ impl<const N: usize> MpFloat<N> {
     /// Classify and locate this value in the dyadic representation.
     pub fn dyadic_view(&self) -> DyadicView {
         Self::check_precision();
-        if self.kind == mpfr::ZERO_KIND {
+        // MPFR encodes the sign in `kind`, so -0 is `-ZERO_KIND`; solver paths
+        // do not preserve the sign of zero and its exponent field is undefined.
+        if self.kind.abs() == mpfr::ZERO_KIND {
             return DyadicView {
                 kind: DyadicKind::Zero,
                 exponent: 0,
@@ -242,6 +244,8 @@ mod tests {
     #[test]
     fn dyadic_view_reproduces_exact_values_512() {
         let f = |x: f64| Bits512::from_f64(x).unwrap();
+        // -0 keeps kind `-ZERO_KIND`; the view must classify it as Zero.
+        oracle_matches::<8>(f(-0.0));
         oracle_matches::<8>(Bits512::one());
         oracle_matches::<8>(f(1e300));
         oracle_matches::<8>(-f(1e-300));
