@@ -250,6 +250,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let mut groups: Vec<Vec<usize>> = components.into_values().collect();
         groups.sort_by_key(|g| g[0]);
         let t = trunk.len();
+        let n_pos = (n - t) as u128;
         let cells: u128 = groups
             .iter()
             .map(|g| {
@@ -259,6 +260,15 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             .sum::<u128>()
             + 6 * (t as u128).pow(2)
             + 8 * n as u128;
+        // Dense work estimates: leaf factorizations ~ sum(g^3)/3, coupling
+        // transforms ~ n_pos*t^2/2, trunk factor ~ t^3/3.  Arrow only pays
+        // when real dense leaf blocks exist to amortize that dense
+        // coupling/trunk work; singleton-leaf structures (e.g. a diagonal
+        // positive block in an LP) degenerate to a dense Schur assembly and
+        // lose to sparse QDLDL by an order of magnitude.
+        let leaf_work: u128 = groups.iter().map(|g| (g.len() as u128).pow(3)).sum();
+        let border_work = n_pos * (t as u128).pow(2) + (t as u128).pow(3);
+        let work_ok = border_work <= 24 * leaf_work.max(1);
         if std::env::var_os("SDPX_PROFILE").is_some() {
             // Observation-only grouping stats (plan PR-06): positive-sign
             // components, leaf size spread, border size, leaf-border coupling
@@ -270,17 +280,21 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 .filter(|&(i, j)| signs[i] != signs[j])
                 .count();
             eprintln!(
-                "GROUP_STATS n={n} components={} leaf_min={} leaf_med={} leaf_max={} border={t} coupling_nnz={coupling} dense_mib={:.1} eligible={}",
+                "GROUP_STATS n={n} components={} leaf_min={} leaf_med={} leaf_max={} border={t} coupling_nnz={coupling} dense_mib={:.1} leaf_work={leaf_work} border_work={border_work} eligible={}",
                 groups.len(),
                 sizes.first().copied().unwrap_or(0),
                 sizes.get(sizes.len() / 2).copied().unwrap_or(0),
                 sizes.last().copied().unwrap_or(0),
                 cells as f64 * std::mem::size_of::<T>() as f64 / 1048576.0,
                 groups.len() >= 2
+                    && work_ok
                     && cells * std::mem::size_of::<T>() as u128 <= ARROW_MAX_BYTES,
             );
         }
         if groups.len() < 2 {
+            return None;
+        }
+        if !work_ok {
             return None;
         }
         if cells * std::mem::size_of::<T>() as u128 > ARROW_MAX_BYTES {
@@ -712,5 +726,40 @@ mod tests {
                 "{x:?} != {expect:?}"
             );
         }
+    }
+
+    /// A diagonal positive block (the LP shape) yields only singleton
+    /// leaves: the dense trunk/coupling work is not amortized by any real
+    /// leaf factorization, so the arrow representation must decline and
+    /// leave the system to sparse QDLDL.
+    #[test]
+    fn arrow_rejects_singleton_leaves() {
+        let n = 40;
+        let t = 8;
+        // Column j stores rows i <= j; positive->border edges sit in the
+        // border columns.
+        let mut colptr = vec![0usize];
+        let mut rowval = Vec::new();
+        let mut nzval = Vec::new();
+        for j in 0..n + t {
+            if j < n {
+                rowval.push(j);
+                nzval.push(2.0);
+            } else {
+                for i in (0..n).filter(|i| i % t == j - n) {
+                    rowval.push(i);
+                    nzval.push(0.25);
+                }
+                rowval.push(j);
+                nzval.push(-1.0);
+            }
+            colptr.push(rowval.len());
+        }
+        let k = CscMatrix::new(n + t, n + t, colptr, rowval, nzval);
+        let signs = vec![1i8; n]
+            .into_iter()
+            .chain(vec![-1i8; t])
+            .collect::<Vec<_>>();
+        assert!(ArrowLDLSolver::try_new(&k, &signs, &CoreSettings::<f64>::default()).is_none());
     }
 }

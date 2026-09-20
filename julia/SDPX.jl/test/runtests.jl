@@ -271,7 +271,9 @@ end
             plan=execution_plan(r)
             @test plan.precision_bits==128
             @test plan.kkt_form==:condensed
-            @test plan.factorization==:condensed_qdldl
+            # The four independent PSD16 Schur blocks are arrow-eligible at
+            # MPFR; qdldl remains the fallback when the structure declines.
+            @test plan.factorization in (:condensed_qdldl,:condensed_arrow)
             @test plan.backend_threads==1
             @test plan.cone_threads==nt
             r

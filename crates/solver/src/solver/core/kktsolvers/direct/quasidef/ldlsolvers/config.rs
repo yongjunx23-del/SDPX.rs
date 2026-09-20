@@ -92,6 +92,10 @@ impl SpecializedLDL for f64 {
         {
             super::dense_block::DenseBlockSolver::try_new(matrix, signs, settings)
                 .map(|solver| Box::new(solver) as BoxedDirectLDLSolver<Self>)
+                .or_else(|| {
+                    super::arrow::ArrowLDLSolver::try_new(matrix, signs, settings)
+                        .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
+                })
         }
         #[cfg(not(feature = "sdp"))]
         {
@@ -113,11 +117,7 @@ impl<const N: usize> LDLConfiguration for MpFloat<N> {
         match settings.direct_solve_method.as_str() {
             // "auto" promotes eligible quasidefinite systems to the dense
             // multi-leaf arrow factorization; "qdldl" pins the baseline.
-            "auto" => (MatrixTriangle::Triu, |m, d, s, p| {
-                super::arrow::ArrowLDLSolver::try_new(m, d, s)
-                    .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
-                    .unwrap_or_else(|| Box::new(QDLDLDirectLDLSolver::new(m, d, s, p)))
-            }),
+            "auto" => (MatrixTriangle::Triu, |m, d, s, _p| Self::auto_ldlsolver(m, d, s)),
             "qdldl" => (MatrixTriangle::Triu, |m, d, s, p| {
                 Box::new(QDLDLDirectLDLSolver::new(m, d, s, p))
             }),

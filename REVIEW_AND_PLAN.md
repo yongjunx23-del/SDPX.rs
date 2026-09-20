@@ -886,3 +886,58 @@ the disabled structural preprocessing (~equal); at Ising scale the
 per-point win is the ~2-3s solver setup plus Julia program
 construction — ~2% of a 140-400s solve, real but modest; basis/weight
 changes still require a fresh prepare, as the contract requires.
+
+## Cone-generic high-precision reuse — executed
+
+The follow-up request asked to simplify the code and reuse the
+high-precision optimizations for SOCP, LP and the other supported
+cones. Audit first: the expensive machinery was already cone-agnostic
+— Arrow eligibility is decided purely from KKT sign structure
+(positive connected components as dense leaves, negative-sign
+variables as the border), the cone worker pool covers every cone type
+through `cone_parallel::apply` plus the single-orthant chunk path, and
+the condensed/auto KKT selection never inspects cone identities.
+What was missing was correctness of the eligibility *gate* itself.
+
+**Fix — work-aware Arrow eligibility.** The gate previously required
+only `>= 2` positive components and a 512 MiB dense working set. On an
+LP-shaped KKT (diagonal positive block -> all singleton leaves) Arrow
+engaged and measured 16x *slower* than QDLDL (lp_300x120 at 256-bit:
+2.83s vs 0.176s) — every singleton leaf pays a dense `t^2` coupling
+contribution with no dense leaf factorization to amortize it. The gate
+now also requires the dense border work (`n_pos*t^2 + t^3`) not exceed
+`24x` the leaf factorization work (`sum g^3`), i.e. Arrow only engages
+where genuine dense leaf blocks exist. Calibration: block-diagonal LP
+(6x50 leaves, t=60) stays eligible at ratio ~1.7 and Arrow measures
+**4.8x faster** than QDLDL (1.63s vs 7.76s); Ising Lambda=11/15 sit at
+ratio ~0.06-0.18 (14 leaves of ~72-89, border 20-35) — far inside the
+gate; singleton-leaf LP/SOCP structures sit at ~20,000 and are now
+correctly declined to QDLDL. `GROUP_STATS` reports `leaf_work` and
+`border_work` so the decision stays observable.
+
+**Unified dispatch.** `auto` now tries `DenseBlockSolver` (single
+contiguous dense positive block, BLAS Cholesky) then `ArrowLDLSolver`
+(multi-leaf grouped LDL) before faer/QDLDL for `f64` as well — the two
+dense backends are complementary, not duplicated: DenseBlock requires
+one ~80%-dense positive block; Arrow requires >=2 disconnected
+components. Measured on the block-diagonal LP at f64: Arrow 20.3ms vs
+QDLDL 22.1ms (~8%). The MpFloat `"auto"` config arm now calls
+`auto_ldlsolver` directly, removing the duplicated body.
+
+**Measured negatives / no-change findings:**
+
+- Plain LP and multi-SOC at MPFR are QDLDL-bound: `refactor` is ~94%
+  of the 2000x4000 LP wall time (2.5s/iter); cone-side ops
+  (`margins`, `compute_barrier`, `affine_ds`) are all <1ms/iter at
+  these sizes and stay serial — parallelizing them is below the
+  evidence bar and would perturb summation order.
+- The condensed Schur (`A H^-1 A^T`) is dense `m x m`; at MPFR it is
+  never profitable for LP/SOCP, so `prefer_condensed` still requires
+  `psd >= 256`. Correct as-is.
+- SOCP/Exp/Pow/GenPower cone blocks live in the negative-sign border;
+  Arrow engagement is therefore decided by the positive (`P`) block
+  structure for every cone mix — no cone-family code needed changing.
+- `condensed_arrow` was already reachable on multi-PSD condensed Schur
+  systems; the Julia plan assertion was updated to accept it
+  (pre-existing gap exposed by this pass, not a behaviour change from
+  this diff).
