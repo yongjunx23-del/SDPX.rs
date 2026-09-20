@@ -1,6 +1,7 @@
 use crate::algebra::{CscMatrix, FloatT};
 use amd::Info;
 
+pub mod arrow;
 pub mod auto;
 pub mod config;
 #[cfg(feature = "sdp")]

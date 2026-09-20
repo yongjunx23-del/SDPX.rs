@@ -666,3 +666,46 @@ sparse and CRT reconstruction of rational LDLᵀ entries has no
 reachable bound. D (residue PSD-SVD column updates) closed: each
 rotation must round back to MPFR for the scalar chain, so residues
 pay encode/CRT per step without saving flops.
+
+### Arrow (multi-leaf) LDLᵀ backend for MPFR KKT — accepted
+
+`ldlsolvers/arrow.rs` adds a dense multi-leaf arrow factorization for
+quasidefinite KKT systems whose positive-sign variables decompose into
+several structurally disconnected components (union-find over the CSC
+pattern; stored zeros count as edges).  Negative-sign variables form a
+dense border: leaves factor independently (unpivoted dense LDLᵀ with
+QDLDL-compatible per-pivot dynamic regularization `d*sign < eps ->
+d = delta*sign`), the Schur complement `C - ΣYᵀD⁻¹Y` (Y = L⁻¹B) is
+accumulated deterministically over leaves, and the border factors with
+negative sign.  Selection is structural only — never by benchmark name:
+`"auto"` for MpFloat tries Arrow first and falls back to QDLDL;
+`"qdldl"` pins the baseline; `SDPX_DIRECT_SOLVE=qdldl` overrides for
+A/B runs.  Dense working set is capped at 512 MiB; ineligible or
+failed systems delegate to a lazily built QDLDL fallback that is
+re-synchronized with the authoritative CSC values each refactor.
+FFI MPFR now maps to `"auto"` (was forced `"qdldl"`).
+
+Real-structure evidence (Λ=11 KKT dump, n=1190): 14 positive
+components (76–89) + 35-dim border; snapshot replay showed Arrow
+factor ~1.6× faster than QDLDL at t64 with equal or better residuals.
+
+**Cluster production acceptance** (release tree `arrow`, exclusive
+nodes, same binary both arms via `SDPX_DIRECT_SOLVE`):
+
+| case | Arrow | QDLDL | Δ |
+|---|---|---|---|
+| Λ=11 t64 (node189) | 144.19s | 146.69s | −1.7% |
+| Λ=15 t64 run1 (node58) | 218.00s | 224.77s | −3.0% |
+| Λ=15 t64 run2 (node58) | 221.53s | 232.98s | −4.9% |
+| Λ=15 t128 (node3) | 175.68s | 188.15s | −6.6% |
+| Λ=19 t64 (node4) | 397.78s | 417.95s | −4.8% |
+
+All Solved; Λ=15 trajectories bitwise identical between arms (76
+iterations, same residuals); Λ=15 refactor median 97.1ms vs 223.0ms
+(2.3×), trsv within noise (+0.8ms).  Banner reports
+`condensed_sampled_arrow` when engaged.  Meets the ≥2% repeatable bar
+on the large inputs; retained in `auto` for MpFloat.
+
+Also fixed en route: `condensed_psd::compute_schur_dense_fma` was
+private but called by `condensed_tests` on x86_64 only — now
+`pub(super)` so the test suite compiles there.

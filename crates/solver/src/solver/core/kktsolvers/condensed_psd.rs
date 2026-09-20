@@ -382,7 +382,7 @@ impl<T: FloatT> PsdBlock<T> {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
-    unsafe fn compute_schur_dense_fma(
+    pub(super) unsafe fn compute_schur_dense_fma(
         &mut self,
         values: &[T],
         skip_sparse: bool,

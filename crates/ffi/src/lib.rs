@@ -357,12 +357,13 @@ unsafe fn settings<T: Scalar>(s: &Settings) -> Result<DefaultSettings<T>> {
     v.max_threads = s.max_threads.max(1);
     // Reuse the core's symbolic fill/work estimate. A thread budget alone
     // does not determine whether supernodal factorization is worthwhile.
-    v.direct_solve_method = if s.precision_bits == 53 {
-        "auto"
-    } else {
-        "qdldl"
-    }
-    .into();
+    // "auto" keeps QDLDL semantics for MpFloat while allowing the
+    // structurally-detected arrow factorization when it applies.
+    // SDPX_DIRECT_SOLVE pins the backend for A/B measurements.
+    v.direct_solve_method = match std::env::var("SDPX_DIRECT_SOLVE") {
+        Ok(m) if m == "qdldl" || m == "auto" => m,
+        _ => "auto".to_string(),
+    };
     v.kkt_form = match s.kkt_form {
         0 => "auto",
         1 => "augmented",

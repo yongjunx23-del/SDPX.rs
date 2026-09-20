@@ -111,7 +111,14 @@ impl<const N: usize> LDLConfiguration for MpFloat<N> {
         settings: &CoreSettings<Self>,
     ) -> (MatrixTriangle, LDLConstructor<Self>) {
         match settings.direct_solve_method.as_str() {
-            "auto" | "qdldl" => (MatrixTriangle::Triu, |m, d, s, p| {
+            // "auto" promotes eligible quasidefinite systems to the dense
+            // multi-leaf arrow factorization; "qdldl" pins the baseline.
+            "auto" => (MatrixTriangle::Triu, |m, d, s, p| {
+                super::arrow::ArrowLDLSolver::try_new(m, d, s)
+                    .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
+                    .unwrap_or_else(|| Box::new(QDLDLDirectLDLSolver::new(m, d, s, p)))
+            }),
+            "qdldl" => (MatrixTriangle::Triu, |m, d, s, p| {
                 Box::new(QDLDLDirectLDLSolver::new(m, d, s, p))
             }),
             method => panic!(
@@ -126,6 +133,8 @@ impl<const N: usize> LDLConfiguration for MpFloat<N> {
         signs: &[i8],
         settings: &CoreSettings<Self>,
     ) -> BoxedDirectLDLSolver<Self> {
-        Box::new(QDLDLDirectLDLSolver::new(matrix, signs, settings, None))
+        super::arrow::ArrowLDLSolver::try_new(matrix, signs, settings)
+            .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
+            .unwrap_or_else(|| Box::new(QDLDLDirectLDLSolver::new(matrix, signs, settings, None)))
     }
 }

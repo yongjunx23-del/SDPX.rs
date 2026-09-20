@@ -228,7 +228,7 @@ fn abi_version_and_kkt_form_validation() {
         s.precision_bits = 128;
         let hp_settings = settings::<MpFloat<2>>(&s).unwrap();
         assert_eq!(hp_settings.max_threads, 4);
-        assert_eq!(hp_settings.direct_solve_method, "qdldl");
+        assert_eq!(hp_settings.direct_solve_method, "auto");
     }
 }
 fn preprocessing_mapping<T: Scalar>(bits: u32) {
