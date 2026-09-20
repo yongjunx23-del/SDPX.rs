@@ -573,7 +573,21 @@ A/Aᵀ products (2.07M nnz)**, not the 88k KKT matvec — already pooled,
 
 ### Remaining levers (ranked)
 
-1. **Warm-start MPFR Jacobi SVD** (probe before committing): the
+1. **Sampled-operator leaf split (implemented, measuring)** — the
+   residual-path audit found the real defect: `block_chunks` hands
+   ~5 spare workers per block at t128, but the `s`-level recursion
+   could not subdivide a `dim=1` leaf, so ~100 workers idled while
+   28 lanes ran ~15–50ms serial blocks. `sampled_split.rs` now
+   subdivides the lone level: adjoint splits `(s,r)` pairs then
+   basis-column ranges (each `out[k]` is an independent `wdiag`
+   dot); forward splits `j` bands (disjoint svec positions, panel
+   rebuilt per task — h·kmax redundant muls only). Bitwise-identical:
+   new `pooled_dim1_operators_*` tests assert equality vs serial at
+   pool widths 2/4/8, mpfr256+512 exercise `chunks>1`. Local probe
+   (4 blocks 38×76, Bits512, 10 cores): leaf split at chunks=2 gave
+   ~8% on adjoint, neutral on forward — machine saturates at 8
+   threads; the real test is t128 chunks=5 on cluster.
+2. **Warm-start MPFR Jacobi SVD** (probe before committing): the
    reverted cold-start Jacobi needed too many sweeps; restarting from
    the *previous iteration's* V (iterates move smoothly) or an f64
    skeleton of `M/‖M‖` should converge quadratically in ~4–6 sweeps.
@@ -581,20 +595,22 @@ A/Aᵀ products (2.07M nnz)**, not the 88k KKT matvec — already pooled,
    MPFR verification; fall back to QR per-block when it fails.
    Targets `cone_svd` 289ms serial floor. Honest expectation:
    0–30% of that phase — sweep cost is the unknown.
-2. **eigmin warm-start** — same pattern on the tridiagonal QR eig
+3. **eigmin warm-start** — same pattern on the tridiagonal QR eig
    (~25ms/call → target ~5–10ms).
-3. **Residual-path audit** — confirm the 2M-nnz sampled products are
-   actually engaging the pool inside `residual()`.
-4. **Λ=19 acceptance** — profile first; per-block sizes only grow to
-   ~46–47, so no residue windfall is expected.
+4. ~~Residual-path audit~~ — done; found the leaf-split defect above.
 
 Closed permanently: cross-node transport (np2 = −31% measured, SDPB
 np128 diverges), cold Jacobi, eig-for-SVD (κ²), f64 preconditioner
 (κ≥1e18), residue Gram/Schur/LDLᵀ without SIMD.
 
 Cluster validation status: t128 = 193.6s clean on an exclusive node
-(job 213892); t32 = 251.9s on sugon queue (same as old library → node
-variance, no regression); t64 pending resubmit (co-tenant memory
-pressure caused repeated setup-stage OOMs — `mem=` requests set
-RLIMIT_DATA/-m AND scheduler does not memory-pack, so co-tenancy is
-unavoidable; mitigated by `naccesspolicy=singlejob` + mem=180gb).
+(job 213892); t64 = 224.5s on node7 (job 213903); t32 = 251.9s on
+sugon queue (same as old library → node variance, no regression).
+**Λ=19 t64 accepted**: 83 iterations, solve 431.0s, wall 449.5s,
+status Solved (job 213994, node7, `naccesspolicy=singlejob` +
+mem=180gb). Λ=19 phase shape: refactor 413ms/iter (QDLDL share grows
+with n), cones_schur 413ms, sampled adj/fwd ~40–55ms each — same
+structure as Λ=15, so the leaf split applies directly. Earlier
+co-tenant OOMs were scheduler memory over-subscription, not solver:
+`mem=` sets RLIMIT_DATA/-m but does not memory-pack; exclusive
+placement (`node7`, singlejob) is the reliable mitigation.

@@ -562,6 +562,67 @@ fn pooled_operators<T: FloatT>() {
     );
     assert!(tiny_work.blocks[0].forward.is_empty());
 }
+/// `dim = 1` blocks cannot split at the `s` level; the leaf subdivision by
+/// basis column (adjoint) or output band (forward) must stay bitwise equal to
+/// the serial evaluation.
+fn pooled_dim1_operators<T: FloatT>() {
+    let make = |row_start, column_start| SampledBlock {
+        row_start,
+        column_start,
+        dim: 1,
+        basis_rows: 12,
+        basis_cols: 8,
+        basis: (0..96)
+            .map(|i| c::<T>((i % 9) as i32 - 4) / c(6))
+            .collect(),
+        weights: (0..8).map(|i| c::<T>((i % 4) as i32 - 1) / c(3)).collect(),
+    };
+    let first = make(0, 0);
+    let second = make(first.row_count(), 3);
+    let (m, n) = (second.row_start + second.row_count(), 16);
+    // Every row is sampled, so the linear part is empty.
+    let linear = CscMatrix::zeros((m, n));
+    let operator = SampledOperator::new(linear, vec![first, second]).unwrap();
+    let mut serial = SampledWorkspace::new(&operator);
+    let mut pooled = SampledWorkspace::new(&operator);
+    let x: Vec<_> = (0..n).map(|i| c::<T>(i as i32 - 6) / c(7)).collect();
+    let z: Vec<_> = (0..m).map(|i| c::<T>((i % 13) as i32 - 5) / c(4)).collect();
+    for width in [2, 4, 8] {
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .unwrap(),
+        );
+        let (mut ys, mut yp) = (z.clone(), z.clone());
+        let (mut ts, mut tp) = (x.clone(), x.clone());
+        operator.apply(&mut ys, &x, T::one(), -c::<T>(2), &mut serial);
+        operator.apply_with_pool(&mut yp, &x, T::one(), -c::<T>(2), &mut pooled, Some(&pool));
+        operator.apply_transpose(&mut ts, &z, -c::<T>(3) / c(2), c::<T>(2), &mut serial);
+        operator.apply_transpose_with_pool(
+            &mut tp,
+            &z,
+            -c::<T>(3) / c(2),
+            c::<T>(2),
+            &mut pooled,
+            Some(&pool),
+        );
+        assert_eq!(ys, yp);
+        assert_eq!(ts, tp);
+    }
+}
+#[test]
+fn pooled_dim1_operators_f64() {
+    pooled_dim1_operators::<f64>();
+}
+#[test]
+fn pooled_dim1_operators_mpfr256() {
+    pooled_dim1_operators::<Bits256>();
+}
+#[test]
+fn pooled_dim1_operators_mpfr512() {
+    pooled_dim1_operators::<Bits512>();
+}
 #[test]
 fn pooled_operators_f64() {
     pooled_operators::<f64>();

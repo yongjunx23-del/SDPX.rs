@@ -56,6 +56,27 @@ pub(super) fn forward_split_chunks<T: FloatT>(
     square: &mut Matrix<T>,
     panel: &mut Matrix<T>,
 ) {
+    if s_range.len() == 1 && chunks > 1 {
+        // A lone `s` level owns a contiguous svec row band; split it into
+        // `j` bands so a pool wider than the block count still fills. Each
+        // task rebuilds the pair panels (h*kmax) and evaluates every
+        // position's dot in the serial order, keeping writes disjoint and
+        // bitwise identical.
+        forward_band_chunks(
+            b,
+            q,
+            x,
+            alpha,
+            s_range.start,
+            0..b.basis_rows,
+            out,
+            sqrt2,
+            inv_sqrt2,
+            chunks,
+            panel,
+        );
+        return;
+    }
     if chunks <= 1 || s_range.len() < 2 {
         let h = b.basis_rows;
         let kmax = b.basis_cols;
@@ -157,6 +178,26 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
     square: &mut Matrix<T>,
     panel: &mut Matrix<T>,
 ) {
+    if s_range.len() == 1 && chunks > 1 {
+        // A lone `s` level still owns `s + 1` pairs (or, for a diagonal pair,
+        // `kmax` independent column dots) — keep subdividing so a pool wider
+        // than the block count is not left idle.
+        adjoint_level_chunks(
+            b,
+            q,
+            wdiag,
+            x,
+            alpha,
+            s_range.start,
+            0..=s_range.start,
+            out,
+            inv_sqrt2,
+            chunks,
+            square,
+            panel,
+        );
+        return;
+    }
     if chunks <= 1 || s_range.len() < 2 {
         let h = b.basis_rows;
         let kmax = b.basis_cols;
@@ -245,6 +286,175 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
     );
 }
 
+/// Diagonal-pair dots are independent per basis column: each `out[k]` is one
+/// `wdiag` flat dot evaluated in the same order as the serial leaf, so a
+/// column-range split reproduces it bitwise.
+fn adjoint_diag_chunks<T: FloatT>(
+    b: &SampledBlock<T>,
+    wdiag: &[T],
+    x: &[T],
+    alpha: T,
+    s: usize,
+    k_range: std::ops::Range<usize>,
+    out: &mut [T],
+    chunks: usize,
+) {
+    let h = b.basis_rows;
+    let kmax = b.basis_cols;
+    let trih = tri(h);
+    if chunks > 1 && k_range.len() > 1 {
+        let mid = k_range.start + k_range.len() / 2;
+        let (left, right) = out.split_at_mut(mid - k_range.start);
+        let left_chunks = chunks / 2;
+        let right_chunks = chunks - left_chunks;
+        rayon::join(
+            || {
+                adjoint_diag_chunks(
+                    b,
+                    wdiag,
+                    x,
+                    alpha,
+                    s,
+                    k_range.start..mid,
+                    left,
+                    left_chunks,
+                )
+            },
+            || {
+                adjoint_diag_chunks(
+                    b,
+                    wdiag,
+                    x,
+                    alpha,
+                    s,
+                    mid..k_range.end,
+                    right,
+                    right_chunks,
+                )
+            },
+        );
+        return;
+    }
+    let p = (tri(s) + s) * kmax;
+    let k0 = k_range.start;
+    for k in k_range {
+        let w = &wdiag[k * trih..(k + 1) * trih];
+        let v = T::dot_fma((0..h).flat_map(|j| {
+            (0..=j).map(move |i| {
+                (
+                    &x[b.row_start + tri(s * h + j) + s * h + i],
+                    &w[tri(j) + i],
+                )
+            })
+        }));
+        out[k - k0] = alpha * b.weights[p + k] * v;
+    }
+}
+
+/// Split one `s` level's `(s, r)` pairs. Pair outputs are contiguous
+/// (`kmax` entries each), so an `r` split keeps disjoint writes; a remaining
+/// lone pair falls back to a column split whose sub-tasks each evaluate the
+/// same per-`k` dots as the serial body.
+fn adjoint_level_chunks<T: FloatT>(
+    b: &SampledBlock<T>,
+    q: &BorrowedMatrix<'_, T>,
+    wdiag: &[T],
+    x: &[T],
+    alpha: T,
+    s: usize,
+    r_range: std::ops::RangeInclusive<usize>,
+    out: &mut [T],
+    inv_sqrt2: T,
+    chunks: usize,
+    square: &mut Matrix<T>,
+    panel: &mut Matrix<T>,
+) {
+    let h = b.basis_rows;
+    let kmax = b.basis_cols;
+    let r0 = *r_range.start();
+    let r1 = *r_range.end();
+    if chunks > 1 && r0 < r1 {
+        let mid = r0 + (r1 - r0 + 1) / 2;
+        let (left, right) = out.split_at_mut((mid - r0) * kmax);
+        let left_chunks = chunks / 2;
+        let right_chunks = chunks - left_chunks;
+        let mut local_square = Matrix::<T>::zeros((h, h));
+        let mut local_panel = Matrix::<T>::zeros((h, kmax));
+        rayon::join(
+            || {
+                adjoint_level_chunks(
+                    b,
+                    q,
+                    wdiag,
+                    x,
+                    alpha,
+                    s,
+                    r0..=mid - 1,
+                    left,
+                    inv_sqrt2,
+                    left_chunks,
+                    square,
+                    panel,
+                )
+            },
+            || {
+                adjoint_level_chunks(
+                    b,
+                    q,
+                    wdiag,
+                    x,
+                    alpha,
+                    s,
+                    mid..=r1,
+                    right,
+                    inv_sqrt2,
+                    right_chunks,
+                    &mut local_square,
+                    &mut local_panel,
+                )
+            },
+        );
+        return;
+    }
+    if chunks > 1 && r0 == s && kmax > 1 {
+        adjoint_diag_chunks(b, wdiag, x, alpha, s, 0..kmax, out, chunks);
+        return;
+    }
+    let trih = tri(h);
+    for r in r0..=r1 {
+        let p = (tri(s) + r) * kmax;
+        if r == s {
+            for k in 0..kmax {
+                let w = &wdiag[k * trih..(k + 1) * trih];
+                let v = T::dot_fma((0..h).flat_map(|j| {
+                    (0..=j).map(move |i| {
+                        (
+                            &x[b.row_start + tri(r * h + j) + r * h + i],
+                            &w[tri(j) + i],
+                        )
+                    })
+                }));
+                out[(r - r0) * kmax + k] = alpha * b.weights[p + k] * v;
+            }
+            continue;
+        }
+        for j in 0..h {
+            for i in 0..h {
+                let (a, c) = (r * h + i, s * h + j);
+                let scale = if a == c { T::one() } else { inv_sqrt2 };
+                square[(i, j)] = x[b.row_start + tri(c) + a] * scale;
+            }
+        }
+        panel.mul(square, q, T::one(), T::zero());
+        for k in 0..kmax {
+            let q_col = &q.data()[k * h..(k + 1) * h];
+            let p_col = &panel.data()[k * h..(k + 1) * h];
+            let v = T::dot_fma(q_col.iter().zip(p_col.iter()));
+            out[(r - r0) * kmax + k] = alpha * b.weights[p + k] * v;
+        }
+    }
+}
+
 // Row ranges were checked disjoint at construction. Preserve each row's
 // arithmetic order while allowing independent blocks to update in parallel.
 pub(super) fn forward_disjoint<T: FloatT>(
@@ -313,4 +523,98 @@ pub(super) fn forward_disjoint<T: FloatT>(
         },
         || forward_disjoint(&blocks[mid..], right_work, right_y, split, x, alpha, chunks),
     );
+}
+
+/// One `s` level's svec rows are contiguous (`tri(s*h)..tri((s+1)*h)`), so a
+/// `j`-band split keeps disjoint writes while covering every `(s, r)` pair.
+/// Position `(j, i)` stores `dot(panel_min(i,j), q_max(i,j))` — the same value
+/// the serial path reads from its mirrored `square`, evaluated in the same
+/// operand order. Each task refills each pair's panel; that `h*kmax` redo is
+/// the only redundant work.
+fn forward_band_chunks<T: FloatT>(
+    b: &SampledBlock<T>,
+    q: &BorrowedMatrix<'_, T>,
+    x: &[T],
+    alpha: T,
+    s: usize,
+    j_range: std::ops::Range<usize>,
+    out: &mut [T],
+    sqrt2: T,
+    inv_sqrt2: T,
+    chunks: usize,
+    panel: &mut Matrix<T>,
+) {
+    let h = b.basis_rows;
+    let kmax = b.basis_cols;
+    if chunks > 1 && j_range.len() > 1 {
+        let mid = balanced_level_split(j_range.start, j_range.end, chunks / 2, chunks);
+        let split_idx = tri(s * h + mid) - tri(s * h + j_range.start);
+        let (left, right) = out.split_at_mut(split_idx);
+        let left_chunks = chunks / 2;
+        let right_chunks = chunks - left_chunks;
+        let mut local_panel = Matrix::<T>::zeros((h, kmax));
+        rayon::join(
+            || {
+                forward_band_chunks(
+                    b,
+                    q,
+                    x,
+                    alpha,
+                    s,
+                    j_range.start..mid,
+                    left,
+                    sqrt2,
+                    inv_sqrt2,
+                    left_chunks,
+                    panel,
+                )
+            },
+            || {
+                forward_band_chunks(
+                    b,
+                    q,
+                    x,
+                    alpha,
+                    s,
+                    mid..j_range.end,
+                    right,
+                    sqrt2,
+                    inv_sqrt2,
+                    right_chunks,
+                    &mut local_panel,
+                )
+            },
+        );
+        return;
+    }
+    let base = tri(s * h + j_range.start);
+    for r in 0..=s {
+        let p = (tri(s) + r) * kmax;
+        for k in 0..kmax {
+            let weight = b.weights[p + k] * x[b.column_start + p + k];
+            let q_col = &q.data()[k * h..(k + 1) * h];
+            let p_col = &mut panel.data_mut()[k * h..(k + 1) * h];
+            for i in 0..h {
+                p_col[i] = q_col[i] * weight;
+            }
+        }
+        let p_data = panel.data();
+        let q_data = q.data();
+        for j in j_range.clone() {
+            for i in 0..if r == s { j + 1 } else { h } {
+                let (a, c) = (i.min(j), i.max(j));
+                let v = T::dot_fma(
+                    (0..kmax).map(|k| (&p_data[a + k * h], &q_data[c + k * h])),
+                );
+                let scale = if r != s {
+                    inv_sqrt2
+                } else if i != j {
+                    sqrt2
+                } else {
+                    T::one()
+                };
+                out[tri(s * h + j) - base + r * h + i] += alpha * scale * v;
+            }
+        }
+    }
 }
