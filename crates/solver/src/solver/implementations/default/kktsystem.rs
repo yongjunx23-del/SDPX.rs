@@ -144,15 +144,18 @@ where
         cones: &CompositeCone<T>,
         settings: &DefaultSettings<T>,
     ) -> bool {
-        // update the linear solver with new cones
-        let is_success = self.kktsolver.update(cones, settings.core());
-
-        if !is_success {
-            return is_success;
+        // Update the linear solver with new cones and solve for the constant
+        // terms.  On failure escalate the static regularization and retry:
+        // unpivoted elimination can overflow pivots on degenerate quasidef
+        // systems even though the shifted matrix is benign, and iterative
+        // refinement still runs against the unshifted matrix.
+        loop {
+            let is_success = self.kktsolver.update(cones, settings.core())
+                && self.solve_constant_rhs(data, settings.core());
+            if is_success || !self.kktsolver.escalate_regularization() {
+                return is_success;
+            }
         }
-
-        // calculate KKT solution for constant terms
-        self.solve_constant_rhs(data, settings.core())
 
         //PJG is_success should be a Result in rust
     }

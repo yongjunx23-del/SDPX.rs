@@ -51,6 +51,9 @@ pub struct DirectLDLKKTSolver<T> {
 
     // the diagonal regularizer currently applied
     diagonal_regularizer: T,
+    // static regularization escalation level, raised on refactor/solve
+    // failure and retained for later factorizations
+    reg_boost: usize,
     residual_plan: Option<SparseParallel>,
 }
 
@@ -115,6 +118,7 @@ where
             KKTuplo: kktshape,
             ldlsolver,
             diagonal_regularizer,
+            reg_boost: 0,
             residual_plan: None,
         }
     }
@@ -208,6 +212,14 @@ where
         is_success
     }
 
+    fn escalate_regularization(&mut self) -> bool {
+        // Each level multiplies the static shift by 100, so the budget of
+        // three reaches ~1e-2·max(1,‖diag‖) for binary64 — beyond that the
+        // factorized system is too perturbed to rescue the iteration.
+        self.reg_boost += 1;
+        self.reg_boost <= 3
+    }
+
     fn update_P(&mut self, P: &CscMatrix<T>) {
         _update_values(&mut self.ldlsolver, &mut self.KKT, &self.map.P, &P.nzval);
     }
@@ -291,7 +303,10 @@ where
                 *d = KKT.nzval[*idx];
             }
 
-            let eps = _compute_regularizer(diag_kkt, settings);
+            let mut eps = _compute_regularizer(diag_kkt, settings);
+            if self.reg_boost > 0 {
+                eps = eps * 100f64.powi(self.reg_boost as i32).as_T();
+            }
 
             // compute an offset version, accounting for signs
             diag_shifted.copy_from(diag_kkt);

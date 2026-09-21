@@ -66,6 +66,15 @@ pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
 
     fn update_P(&mut self, P: &CscMatrix<T>);
     fn update_A(&mut self, A: &CscMatrix<T>);
+
+    /// Raise the static regularization level used by the next factorization.
+    /// Returns false once the escalation budget is exhausted; solvers that
+    /// cannot escalate report false immediately. Escalation only perturbs the
+    /// factorized matrix — iterative refinement still runs against the true
+    /// one, so convergence semantics are unchanged.
+    fn escalate_regularization(&mut self) -> bool {
+        false
+    }
     #[cfg(feature = "sdp")]
     fn set_sampled_operator(
         &mut self,

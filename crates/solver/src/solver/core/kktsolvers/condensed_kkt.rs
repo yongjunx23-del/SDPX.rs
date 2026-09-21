@@ -397,6 +397,10 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         success
     }
 
+    fn escalate_regularization(&mut self) -> bool {
+        self.reduced.escalate_regularization()
+    }
+
     fn update_P(&mut self, P: &CscMatrix<T>) {
         assert_eq!(P.size(), self.P.size());
         assert_eq!(P.colptr, self.P.colptr);

@@ -941,3 +941,51 @@ QDLDL 22.1ms (~8%). The MpFloat `"auto"` config arm now calls
   systems; the Julia plan assertion was updated to accept it
   (pre-existing gap exposed by this pass, not a behaviour change from
   this diff).
+
+## Escalating regularization — large-matrix f64 failures fixed
+
+The `大规模矩阵` suite exposed an iter-1 `numerical_failure` on both the
+small (1132 var / 1505 eq rows) and large (7054 var / 1720 eq rows)
+models, at every λ and both KKT forms. Diagnosis: the matrices are
+benign once shifted (dense LU on the shifted KKT shows min pivot ~2e-8,
+cond ~1e9), but unpivoted LDLᵀ overflows intermediate `D` values
+through chains of dynamically regularized pivots (Dinv ~ 5e6 each) —
+`Dinv` goes non-finite, `refactor` reports failure, iteration aborts.
+A temporary NaN-clamp on `D` proved the failure moves downstream into
+solve (inf residuals) — clamping is not a fix and was reverted.
+
+**Fix (landed):** `DirectLDLKKTSolver` now carries a persistent
+`reg_boost`; `KKTSolver::escalate_regularization` raises it (×100 per
+level, ≤3 levels, so the static shift reaches ~1e-2·max‖diag‖) and
+`DefaultKKTSystem::update` retries `update + solve_constant_rhs` under
+escalation. Iterative refinement always runs against the unshifted
+matrix and all convergence gates are unchanged — the retry only buys
+extra refactorizations on the failure path. `CondensedKKTSolver`
+delegates to its reduced solver. Under MPI the decision stays uniform
+across ranks because the reduced KKT is replicated and the refactor is
+deterministic.
+
+**Measured (f64, single thread):**
+
+- small λ=2.0: numerical_failure → **optimal, 16 iters, 5.7s**
+  (λ=0.5/1.0 also optimal). Both `augmented+qdldl` and
+  `condensed+condensed_arrow` now converge.
+- medium: optimal, 18 iters, ~8.1s — unchanged (escalation never
+  triggers; MOSEK reference ~3.5s).
+
+**Presolve cap experiment — rejected.** Widening `redundant_equalities`
+from 512 rows / 1M-op budget to 4096 / 64M removed ~1238 exact-redundant
+rows on small (KKT 4161→2923) but triggered a latent chordal compact
+augmentation panic on large (`ba_I` sentinel unfilled when reduction
+removes rows inside a decomposed cone's span). With escalation alone
+rescuing small at the original cap, the expansion was reverted; the
+chordal interaction is a known-latent edge, unreachable again once the
+cap returned to 512.
+
+**f64 parallelism — already shared, verified.** The cone pool is
+scalar-generic (`CompositeCone::configure_threads`), so prior cone-level
+threading, pooled GEMM, grouped Schur assembly and Arrow all apply to
+f64 without porting. Medium at 8 cone threads: 6.73s vs 8.08s
+single-thread, objective bitwise identical. The dominant residual
+serial phase is condensed `assemble` (already tiled + batched-FMA;
+further gains need an algorithmic change, not vectorization).
