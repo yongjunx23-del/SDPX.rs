@@ -33,18 +33,26 @@ impl DenseBlockSolver {
         }
         let n = signs.iter().take_while(|&&s| s == 1).count();
         let m = k.n - n;
-        if n < 128 || m > 256 || m > n / 4 || signs[n..].iter().any(|&s| s != -1) {
+        if n < 128 || signs[n..].iter().any(|&s| s != -1) {
             return None;
         }
         let elements = n
             .checked_mul(n)?
             .checked_add(n.checked_mul(m)?)?
             .checked_add(m.checked_mul(m)?)?;
-        if elements > 64 * 1024 * 1024 || k.n > i32::MAX as usize {
+        if elements > 256 * 1024 * 1024 || k.n > i32::MAX as usize {
             return None;
         }
-        // Structural admission only: the values are populated after construction.
-        if k.colptr[n] as f64 / ((n * (n + 1) / 2) as f64) < 0.8 {
+        // Structural admission only: the values are populated after
+        // construction, and a failed dense factorization falls back to the
+        // sparse solver, so over-admission costs memory, not correctness.
+        // Dense block elimination wins when the matrix is mostly dense
+        // (scalar sparse elimination pays index overhead on every entry) or
+        // the tail is small and the leading block is dense (classic QP form).
+        let leading_fill = k.colptr[n] as f64 / ((n * (n + 1) / 2) as f64);
+        let total_fill =
+            k.colptr[k.n] as f64 / ((k.n as f64) * (k.n as f64 + 1.) / 2.);
+        if !(total_fill >= 0.4 || (m <= 256 && m <= n / 4 && leading_fill >= 0.8)) {
             return None;
         }
         Some(Self::new(k, signs, settings, n))

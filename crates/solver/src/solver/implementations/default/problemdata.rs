@@ -95,8 +95,16 @@ where
 
         // chordal decomposition : return nothing if disabled or no decomp
         // --------------------------------------
+        // ChordalInfo must be built on the *reduced* problem: its init_cones
+        // and per-cone row ranges index the presolved A/b, and the cone_maps
+        // it records map decomposed cones back to the presolved cone list.
         #[cfg(feature = "sdp")]
-        let mut chordal_info = try_chordal_info(A, b, &cones, settings);
+        let mut chordal_info = try_chordal_info(
+            A_new.as_ref().unwrap_or(A),
+            unwrap_and_slice_or_else(&b_new, || b),
+            cones_new.as_deref().unwrap_or(&cones),
+            settings,
+        );
         #[cfg(feature = "sdp")]
         if let Some(ref mut chordal_info) = chordal_info {
             let (_P_new, _q_new, _A_new, _b_new, _cones_new) = chordal_info.decomp_augment(

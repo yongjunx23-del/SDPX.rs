@@ -989,3 +989,48 @@ f64 without porting. Medium at 8 cone threads: 6.73s vs 8.08s
 single-thread, objective bitwise identical. The dominant residual
 serial phase is condensed `assemble` (already tiled + batched-FMA;
 further gains need an algorithmic change, not vectorization).
+
+### 2026-09-21 follow-up: presolve↔chordal fix, uncapped exact reduction, work-aware dense gate
+
+Two previously recorded blockers are now resolved together.
+
+**Chordal-after-presolve bug — fixed (was the `ba_I` sentinel panic).**
+`DefaultProblemData::new` built `ChordalInfo` on the *original* `A, b,
+cones` but called `decomp_augment` on the *presolved* data, so compact
+augmentation iterated original cone row-ranges over reduced coordinates
+(`ba_I`/`Aa_I` left at `usize::MAX`, panic in sparse-vector conversion).
+`try_chordal_info` now receives the reduced `A_new/b_new/cones_new`;
+`cone_maps.orig_index` indexes the reduced cone list and the reverse map
+composes cleanly with `reverse_presolve`. Verified on large: presolve
+removes 1317 rows and chordal decomposes the reduced problem (7→15 PSD
+cones) — the exact path that panicked.
+
+**Exact redundant-equality detection — row cap removed.** The 512-row
+cap and 1M-op budget in `redundant_equalities` are replaced by a 64M-op
+work budget only (`checked_sub` bail-out keeps pathological inputs a
+safe no-op). f64: small deletes 1238 rows (1505→267 zero rows), large
+deletes 1317 rows (1720→403). Objectives unchanged: small λ=2 gives
+0.5653714957170626.
+
+**DenseBlock admission — work/density aware.** The gate dropped the
+`m ≤ 256` tail cap and `n/4` ratio; admission is now `total_fill ≥ 0.4`
+(mostly-dense ⇒ BLAS wins) or the original small-tail/dense-leading QP
+form, under a 256M-element memory cap (~2 GB). A 40-GFLOP "cheap dense"
+route was measured and rejected: at ~8 GFLOP/iter the dense path was 3×
+slower than faer on small's sparse structure. `factor_dense` failure
+still falls back to the sparse solver.
+
+**Measured (f64, single thread, vs recorded MOSEK 11.1.3):**
+
+| model | MOSEK | SDPX before | SDPX now | iters |
+|---|---:|---:|---:|---:|
+| small λ=2 | 0.33 s | 5.7 s | ~1.65 s solve (4.5 s e2e) | 16 |
+| medium | 1.89 s | 8.1 s | 7.98 s | 18 |
+| large | 25.4 s | 941 s | **129 s** | 26 |
+
+Large went from 37× to ~5.1× MOSEK: condensed_dense_block replaces
+scalar QDLDL on the ~7.5k-order mostly-dense reduced KKT. The residual
+~4-5× gap is condensed `assemble` (serial ~157 ms/iter on medium) plus
+IR/cone/residual overheads — the assembly path is already
+deduplicated/tiled and further single-thread gains need an algorithmic
+change.

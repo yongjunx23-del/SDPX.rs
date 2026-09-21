@@ -242,7 +242,7 @@ fn redundant_equalities<T: FloatT>(
         }
         start += cone.nvars();
     }
-    if ids.is_empty() || ids.len() > 512 {
+    if ids.is_empty() {
         return None;
     }
     let mut lookup = vec![usize::MAX; b.len()];
@@ -253,7 +253,9 @@ fn redundant_equalities<T: FloatT>(
             rows[i].insert(A.n, b[r].exact()?);
         }
     }
-    let mut budget = 1_000_000usize;
+    // Work budget only: degenerate inputs bail out through `checked_sub`
+    // instead of a hard row cap, so large equality blocks are still exact.
+    let mut budget = 64_000_000usize;
     for c in 0..A.n {
         for k in A.colptr[c]..A.colptr[c + 1] {
             let i = lookup[A.rowval[k]];
