@@ -8,12 +8,13 @@
 //! through `Scalar::scalar_exact_encode` — sign/kind, exponent and limbs —
 //! with no pointers, text or f64 intermediates.
 
-use crate::algebra::{CscMatrix, FloatT, VectorMath};
+use crate::algebra::{AsFloatT, CscMatrix, FloatT, VectorMath};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-const MAGIC: &[u8; 8] = b"SDPXSNP1";
+const MAGIC: &[u8; 8] = b"SDPXSNP2";
+const MAGIC_V1: &[u8; 8] = b"SDPXSNP1";
 
 /// One captured KKT solve: matrix, signs, RHS as presented, and the recorded
 /// solution (empty when the solve failed).
@@ -36,6 +37,9 @@ pub struct KktSnapshot<T> {
     pub x: Vec<T>,
     /// Whether the recorded solve succeeded.
     pub solved: bool,
+    /// Static regularization escalation level active at capture time.
+    /// V1 snapshots carry no level and decode as 0.
+    pub reg_boost: usize,
 }
 
 fn wanted_indices() -> &'static Option<Vec<u64>> {
@@ -118,6 +122,7 @@ pub fn write<T: FloatT>(
     x: &[T],
     solved: bool,
     backend: &str,
+    reg_boost: usize,
 ) -> io::Result<Option<PathBuf>> {
     let nlimbs = if let Some(v) = kkt.nzval.first().or(rhs.first()) {
         match v.scalar_exact_encode() {
@@ -138,6 +143,7 @@ pub fn write<T: FloatT>(
         x.len() as u64,
         nlimbs as u64,
         solved as u64,
+        reg_boost as u64,
     ] {
         buf.write_all(&v.to_le_bytes())?;
     }
@@ -160,12 +166,13 @@ pub fn write<T: FloatT>(
     let manifest = format!(
         concat!(
             "{{\n",
-            "  \"schema_version\": 1,\n",
+            "  \"schema_version\": 2,\n",
             "  \"file\": {:?},\n",
             "  \"fnv1a64\": {:?},\n",
             "  \"call_index\": {},\n",
             "  \"solved\": {},\n",
             "  \"precision_bits\": {},\n",
+            "  \"reg_boost\": {},\n",
             "  \"shape\": {{\"n\": {}, \"nnz\": {}, \"rhs\": {}}},\n",
             "  \"ordering\": \"csc upper-triangular, sorted rowval per column\",\n",
             "  \"backend\": {:?},\n",
@@ -177,6 +184,7 @@ pub fn write<T: FloatT>(
         idx,
         solved,
         prec,
+        reg_boost,
         kkt.n,
         kkt.nzval.len(),
         rhs.len(),
@@ -195,7 +203,8 @@ pub fn load<T: FloatT>(path: &Path) -> io::Result<KktSnapshot<T>> {
     let mut r = &data[..];
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
-    if &magic != MAGIC {
+    let v1 = &magic == MAGIC_V1;
+    if !v1 && &magic != MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
     }
     let u64s = |r: &mut &[u8]| -> io::Result<u64> {
@@ -221,6 +230,7 @@ pub fn load<T: FloatT>(path: &Path) -> io::Result<KktSnapshot<T>> {
         u64s(&mut r)? as usize,
         u64s(&mut r)? != 0,
     );
+    let reg_boost = if v1 { 0 } else { u64s(&mut r)? as usize };
     let mut colptr = Vec::with_capacity(n + 1);
     for _ in 0..=n {
         colptr.push(u64s(&mut r)?);
@@ -257,6 +267,7 @@ pub fn load<T: FloatT>(path: &Path) -> io::Result<KktSnapshot<T>> {
         rhs,
         x,
         solved,
+        reg_boost,
     })
 }
 
@@ -287,6 +298,7 @@ pub struct ReplayReport {
 fn regularized_nzval<T: FloatT>(
     snap: &KktSnapshot<T>,
     settings: &crate::solver::CoreSettings<T>,
+    reg_boost: usize,
 ) -> Vec<T> {
     let mut nzval = snap.nzval.clone();
     if !settings.static_regularization_enable {
@@ -306,8 +318,13 @@ fn regularized_nzval<T: FloatT>(
         .filter(|&&p| p != usize::MAX)
         .map(|&p| snap.nzval[p])
         .fold(T::zero(), |a, b| a.max(b.abs()));
-    let eps = settings.static_regularization_constant
+    let mut eps = settings.static_regularization_constant
         + settings.static_regularization_proportional * maxdiag;
+    // Mirror the production escalation: each level multiplies the shift
+    // by 100 (see `DirectLDLKKTSolver::escalate_regularization`).
+    if reg_boost > 0 {
+        eps = eps * 100f64.powi(reg_boost as i32).as_T();
+    }
     for (j, &p) in diagpos.iter().enumerate() {
         if p != usize::MAX {
             nzval[p] += eps * T::from_i8(snap.dsigns[j]).unwrap();
@@ -326,8 +343,9 @@ pub fn replay<T: FloatT>(
 ) -> Result<ReplayReport, String> {
     // The snapshot stores the authoritative unregularized KKT (production
     // restores it after refactoring). Reproduce `regularize_and_refactor`'s
-    // static shift so the factorization sees the same matrix.
-    let nzval = regularized_nzval(snap, settings);
+    // static shift at the captured escalation level so the factorization sees
+    // the same matrix.
+    let nzval = regularized_nzval(snap, settings, snap.reg_boost);
     let kkt = CscMatrix::new(
         snap.n,
         snap.n,
@@ -542,8 +560,15 @@ mod tests {
             rhs: rhs.clone(),
             x: Vec::new(),
             solved: false,
+            reg_boost: 0,
         };
-        let reg = CscMatrix::new(4, 4, m.colptr.clone(), m.rowval.clone(), regularized_nzval(&snap_view, &settings));
+        let reg = CscMatrix::new(
+            4,
+            4,
+            m.colptr.clone(),
+            m.rowval.clone(),
+            regularized_nzval(&snap_view, &settings, 0),
+        );
         let mut solver = QDLDLDirectLDLSolver::new(&reg, &dsigns, &settings, None);
         assert!(solver.refactor(&reg));
         let mut x = vec![T::zero(); 4];
@@ -552,7 +577,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("sdpx-snap-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = write(&dir, 7, &m, &dsigns, &rhs, &x, true, "qdldl")
+        let path = write(&dir, 7, &m, &dsigns, &rhs, &x, true, "qdldl", 0)
             .unwrap()
             .expect("exact encoding available");
         let snap = load::<T>(&path).unwrap();

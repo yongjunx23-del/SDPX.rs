@@ -184,6 +184,7 @@ where
                         &self.x,
                         ok,
                         &backend,
+                        self.reg_boost,
                     );
                 }
             }
