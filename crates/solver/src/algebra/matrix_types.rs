@@ -21,14 +21,6 @@ impl MatrixTriangle {
             MatrixTriangle::Tril => b'L',
         }
     }
-    /// transpose
-    #[allow(dead_code)]
-    pub fn t(&self) -> Self {
-        match self {
-            MatrixTriangle::Triu => MatrixTriangle::Tril,
-            MatrixTriangle::Tril => MatrixTriangle::Triu,
-        }
-    }
 }
 
 /// Matrix orientation marker

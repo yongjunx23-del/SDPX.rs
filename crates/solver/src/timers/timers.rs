@@ -75,13 +75,6 @@ impl SubTimersMap {
         t.start();
     }
 
-    #[allow(dead_code)]
-    //not used but included for symmetry
-    fn stop_subtimer(&mut self, key: &'static str) {
-        let t = self.get_mut(key).unwrap();
-        t.stop();
-    }
-
     //this function suspends every timer in the
     //collection.   Used for notimeit!
     fn suspend(&mut self) {

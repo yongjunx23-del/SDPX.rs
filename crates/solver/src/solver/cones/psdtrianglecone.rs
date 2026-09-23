@@ -585,15 +585,6 @@ where
         mat_to_svec(x, &X.sym_up());
     }
 
-    fn inv_circ_op(&mut self, _x: &mut [T], _y: &[T], _z: &[T]) {
-        // X should be the solution to (YX + XY)/2 = Z
-
-        //  For general arguments this requires solution to a symmetric
-        // Sylvester equation.  Throwing an error here since I do not think
-        // the inverse of the ∘ operator is ever required for general arguments,
-        // and solving this equation is best avoided.
-        unreachable!();
-    }
 }
 
 //-----------------------------------------

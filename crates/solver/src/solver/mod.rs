@@ -5,6 +5,7 @@
 pub(crate) mod cones;
 pub(crate) mod core;
 pub mod default;
+#[cfg(feature = "sdp")]
 pub(crate) mod distributed;
 pub(crate) mod kkt;
 #[cfg(feature = "sdp")]

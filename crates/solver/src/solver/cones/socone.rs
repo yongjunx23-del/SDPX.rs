@@ -348,9 +348,6 @@ where
         _circ_op(x, y, z);
     }
 
-    fn inv_circ_op(&mut self, x: &mut [T], y: &[T], z: &[T]) {
-        _inv_circ_op(x, y, z);
-    }
 }
 
 // circ ops don't use self for this cone, so put the actual

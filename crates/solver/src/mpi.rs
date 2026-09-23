@@ -685,15 +685,6 @@ impl World {
         r.0..r.0 + r.1
     }
 
-    /// The `[begin, end)` range owned by this rank when items carry
-    /// heterogeneous costs. Collective callers must derive their exchange
-    /// layout from the same [`cost_ranges`] partition.
-    #[allow(dead_code)]
-    pub(crate) fn range_cost(&self, costs: &[u64]) -> std::ops::Range<usize> {
-        let (b, l) = cost_ranges(costs, self.size as usize)[self.rank as usize];
-        b..b + l
-    }
-
     pub(crate) fn abort(&self, reason: &str) -> ! {
         eprintln!(
             "mpi: rank {}/{} fatal collective error: {reason}",
@@ -1309,6 +1300,7 @@ pub(crate) fn ranges(count: usize, size: usize) -> Vec<(usize, usize)> {
 /// `rank * total / size` mark, so equal-cost items split exactly like
 /// [`ranges`]. Deterministic for a fixed cost array — every rank computes
 /// the identical partition. Empty ranges are allowed.
+#[cfg_attr(not(feature = "sdp"), allow(dead_code))]
 pub(crate) fn cost_ranges(costs: &[u64], size: usize) -> Vec<(usize, usize)> {
     let n = costs.len();
     let size = size.max(1);

@@ -77,9 +77,6 @@ where
 pub struct QDLDLFactorisation<T = f64> {
     /// permutation vector
     pub perm: Vec<usize>,
-    /// inverse permutation
-    #[allow(dead_code)] //Unused because we call ipermute in solve instead.  Keep anyway.
-    iperm: Vec<usize>,
     /// lower triangular factor L in LDL^T
     pub L: CscMatrix<T>,
     /// vector of diagonal elements of D in LDL^T
@@ -365,7 +362,6 @@ fn _qdldl_new<T: FloatT>(
 
     Ok(QDLDLFactorisation {
         perm,
-        iperm,
         L,
         D,
         Dinv,
