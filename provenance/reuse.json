@@ -4,12 +4,12 @@
   "files": [
     {
       "source": "SDPX.jl/src/core/kktsystem.jl",
-      "destination": "crates/solver/src/solver/implementations/default/kktsystem.rs",
+      "destination": "crates/solver/src/solver/default/kktsystem.rs",
       "original_sha256": "369240300fba57a6080ad61e35296179c7d91025f80e5a8986209bae09a5c1cd"
     },
     {
       "source": "SDPX.jl/src/settings.jl",
-      "destination": "crates/solver/src/solver/implementations/default/settings.rs",
+      "destination": "crates/solver/src/solver/default/settings.rs",
       "original_sha256": "fbf5f0332a4ea7b0330166af08bcd61f03766b1b82142ef050d3f96d6e023932"
     },
     {

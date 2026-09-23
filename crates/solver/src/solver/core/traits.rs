@@ -6,13 +6,14 @@
 //!
 //! In nearly all cases there is no need for a user to implement these traits.
 //! Instead, users should use the collection of types that are provided
-//! in the [Default solver implementation](crate::solver::implementations::default),
+//! in the [Default solver implementation](crate::solver::default),
 //!  which collectively implement support for the problem format described in the top
 //! level crate documentation.
 
-use super::{cones::Cone, CoreSettings, ScalingStrategy, SettingsError};
+use super::{CoreSettings, ScalingStrategy, SettingsError};
 use super::{SolverStatus, StepDirection};
 use crate::algebra::*;
+use crate::solver::cones::Cone;
 use crate::timers::*;
 
 /// Cone-level control needed by the common HSD loop, independent of vector storage.
@@ -26,7 +27,7 @@ pub trait ConeCollection<T: FloatT> {
     /// Shared worker pool for independent numerical stages.
     fn worker_pool(&self) -> Option<std::sync::Arc<rayon::ThreadPool>>;
 }
-impl<T: FloatT> ConeCollection<T> for super::cones::CompositeCone<T> {
+impl<T: FloatT> ConeCollection<T> for crate::solver::cones::CompositeCone<T> {
     fn all_symmetric(&self) -> bool {
         self.is_symmetric()
     }
@@ -180,7 +181,7 @@ pub trait Residuals<T: FloatT> {
 }
 
 /// KKT linear solver object.
-pub trait KKTSystem<T: FloatT>: super::kktsolvers::HasLinearSolverInfo {
+pub trait KKTSystem<T: FloatT>: crate::solver::kkt::HasLinearSolverInfo {
     /// associated problem data type
     type D: ProblemData<T>;
     /// associated variable type
@@ -280,7 +281,7 @@ where
     fn reset(&mut self, timers: &mut Timers);
 
     /// Refresh metadata after lazy backend selection, pool changes or fallback.
-    fn set_linear_solver_info(&mut self, _info: super::kktsolvers::LinearSolverInfo) {}
+    fn set_linear_solver_info(&mut self, _info: crate::solver::kkt::LinearSolverInfo) {}
 
     /// Final convergence checks, e.g. for "almost" convergence cases
     fn post_process(&mut self, residuals: &Self::R, settings: &Self::SE);

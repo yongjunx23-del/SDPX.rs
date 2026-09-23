@@ -107,6 +107,21 @@ separate from solver status in `sdpx_info`.
 | `crates/arithmetic` | Independently owned fixed-precision MPFR values and arithmetic |
 | `benchmark/research` | Fixed inputs, native process protocol, and external original-coordinate gates |
 
+Solver source layout (`crates/solver/src/solver/`; the public API is the flat
+`sdpx_solver::solver::*` facade):
+
+| Module | Contents |
+|---|---|
+| `core/` | Generic HSD predictor/corrector loop, component traits, core settings |
+| `default/` | Standard-format implementation: data, presolve, Ruiz, variables, residuals, KKT system, info |
+| `cones/` | Cone implementations and the composite cone |
+| `kkt/` | KKT solvers: `condensed/`, `direct/` (augmented LDL), `ldl/` backends, refinement |
+| `sampled/` | Factor-authoritative sampled PSD operator and SDPB-style input |
+| `distributed/` | Owner-partitioned MPI implementation of the core traits and collectives |
+| `chordal/` | Chordal decomposition |
+
+Unit tests live in each module's `tests/` directory.
+
 Float64 uses native BLAS/LAPACK with QDLDL or optional multithreaded Faer
 factorization. MPFR uses owned GMP/MPFR scalars and serial QDLDL with bounded
 parallel cone work. The condensed backend eliminates PSD/orthant rows while

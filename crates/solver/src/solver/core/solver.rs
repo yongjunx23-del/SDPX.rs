@@ -132,7 +132,7 @@ where
 // The top-level solver.
 
 // This trait is defined with a collection of mutually interacting associated types.
-// See the [`DefaultSolver`](crate::solver::implementations::default) for an example.
+// See the [`DefaultSolver`](crate::solver::default) for an example.
 
 pub struct Solver<T, D, V, R, K, C, I, SO, SE>
 where

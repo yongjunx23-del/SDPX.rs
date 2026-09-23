@@ -7,7 +7,7 @@
 use crate::algebra::*;
 use crate::solver::chordal::ChordalInfo;
 use crate::solver::chordal::SparsityPattern;
-use crate::solver::core::cones::*;
+use crate::solver::cones::*;
 use crate::solver::DefaultVariables;
 use std::cmp::max;
 use std::iter::zip;

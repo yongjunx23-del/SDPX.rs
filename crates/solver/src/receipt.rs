@@ -152,7 +152,7 @@ pub fn try_write<T: crate::algebra::FloatT>(
 /// Write a receipt for the owner-partitioned backend.
 #[cfg(all(feature = "serde", feature = "sdp"))]
 pub fn try_write_partitioned<T: crate::algebra::FloatT>(
-    solver: &crate::solver::implementations::default::PartitionedSolver<T>,
+    solver: &crate::solver::PartitionedSolver<T>,
     peak_rss: Option<u64>,
 ) -> std::io::Result<()> {
     try_write_parts(
@@ -169,7 +169,7 @@ pub fn try_write_partitioned<T: crate::algebra::FloatT>(
 fn try_write_parts<T: crate::algebra::FloatT>(
     solution: &crate::solver::DefaultSolution<T>,
     info: &crate::solver::DefaultInfo<T>,
-    ctr: crate::solver::core::kktsolvers::SolveCounters,
+    ctr: crate::solver::kkt::SolveCounters,
     cone_threads: usize,
     partitions: usize,
     peak_rss: Option<u64>,

@@ -8,7 +8,7 @@ use crate::{
     algebra::*,
     qdldl::*,
     solver::{
-        core::cones::ConeRanges,
+        cones::ConeRanges,
         CoreSettings,
         SupportedConeT::{self, *},
     },

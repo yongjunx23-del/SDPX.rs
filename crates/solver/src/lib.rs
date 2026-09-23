@@ -9,7 +9,6 @@
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod algebra;
-pub(crate) mod collective;
 pub mod io;
 pub(crate) mod mpi;
 pub use mpi::MpiContext;

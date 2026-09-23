@@ -1,5 +1,5 @@
 #![allow(non_snake_case)]
-use crate::solver::core::kktsolvers::direct::ldlsolvers::config::LDLConfiguration;
+use crate::solver::kkt::ldl::config::LDLConfiguration;
 use num_traits::FromPrimitive;
 use sdpx_arithmetic::Scalar;
 
@@ -33,7 +33,7 @@ impl<T: CoreFloatT + MaybeBlasFloatT + LDLConfiguration> FloatT for T {}
 /// This convenience trait is implemented on f32/64 and u32/64.  This trait
 /// is required internally by the solver for converting constant primitives
 /// to [`FloatT`](crate::algebra::FloatT).  It is also used by the
-/// [user settings](crate::solver::implementations::default::DefaultSettings)
+/// [user settings](crate::solver::default::DefaultSettings)
 /// for converting defaults of primitive type to [`FloatT`](crate::algebra::FloatT).
 //
 // NB: `AsFloatT` is a convenience trait for f32/64 and u32/64

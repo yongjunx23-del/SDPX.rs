@@ -1,5 +1,5 @@
 use super::*;
-use crate::solver::{core::cones::CompositeCone, core::traits::Residuals, *};
+use crate::solver::{cones::CompositeCone, core::traits::Residuals, *};
 
 fn num<T: FloatT>(n: usize) -> T {
     T::from_usize(n).unwrap()
