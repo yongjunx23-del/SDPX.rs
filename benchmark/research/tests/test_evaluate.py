@@ -68,10 +68,13 @@ class EvaluateTests(unittest.TestCase):
             data['contract']['repetitions'] = 2
         self.assertEqual(evaluate(a,b)['verdict'], 'screen_fail')
 
-    def test_screen_regression_and_missing_failed_or_changed_samples(self):
+    def test_screen_timing_is_diagnostic_but_numerical_contract_is_required(self):
         a,b = self.screen_pair()
         b['records'][1]['time_s'] = 1.021
-        self.assertEqual(evaluate(a,b)['verdict'], 'screen_fail')
+        result = evaluate(a,b)
+        self.assertEqual(result['verdict'], 'screen_pass')
+        self.assertFalse(result['policy']['timing_gate'])
+        self.assertTrue(result['timing_observations'])
         for mutate in (lambda c: c['records'].pop(),
                        lambda c: c['records'][1].update(passed=False),
                        lambda c: c['records'][1].update(repetition=99),

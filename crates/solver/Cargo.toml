@@ -31,7 +31,7 @@ thiserror      = "1.0"
 default = ["serde"]
 
 # enable reading / writing of problems from json files 
-serde = ["dep:serde", "dep:serde_json"]
+serde = ["dep:serde", "dep:serde_json", "dep:sha2", "sdpx-arithmetic/serde"]
 
 # enables blas/lapack for SDP support, with blas/lapack src unspecified
 # also enable packages required for chordal decomposition 
@@ -48,6 +48,9 @@ faer-sparse = ["dep:faer", "dep:faer-traits"]
 
 # compile with more exhaustive benchmarking tests 
 bench = []
+
+# opt-in lossless KKT snapshot capture/replay for offline audits (see snapshot.rs)
+snapshot = []
 
 # -------------------------------
 # SDP configuration
@@ -159,6 +162,7 @@ required-features = ["serde"]
 [[example]]
 name = "kkt_replay"
 path = "examples/rust/kkt_replay.rs"
+required-features = ["snapshot"]
 
 
 
@@ -168,9 +172,8 @@ path = "examples/rust/kkt_replay.rs"
 
 
 # ------------------------------
-# Optional julia and python interface 
+# JSON input, settings, and CLI receipts
 # ------------------------------
-
 
 [dependencies.serde]
 optional = true 
@@ -182,6 +185,10 @@ optional = true
 version = "1"
 features = ["float_roundtrip"]
 
+[dependencies.sha2]
+version = "=0.10.9"
+optional = true
+
 
 # derive_more is used to implement the Debug trait
 # used for display python objects.  Increases MSRV
@@ -191,9 +198,14 @@ features = ["float_roundtrip"]
 
 [lib]
 name = "sdpx_solver"
-# "cdylib" is necessary to produce a shared libraries for Python/Julia
-# "lib" is necessary to allow the ./examples to build
+# A single static library target: the Rust API, examples, and the
+# `sdpx-ffi` crate (cdylib) are the only consumers.
 crate-type = ["lib"] 
+
+[[bin]]
+name = "sdpx"
+path = "src/bin/sdpx.rs"
+required-features = ["serde"]
 
 
 # ------------------------------
@@ -202,18 +214,10 @@ crate-type = ["lib"]
 # ------------------------------
 
 
-[target.'cfg(target_family = "wasm")'.dependencies]
-web-time = "0.2.3"
-[target.'cfg(target_family = "wasm")'.dev-dependencies]
-wasm-bindgen-test = "0.3"
-
-
 # ------------------------------
 # testing, benchmarking etc 
 # ------------------------------
 [dev-dependencies]
 tempfile = "3"
-
-
 
 

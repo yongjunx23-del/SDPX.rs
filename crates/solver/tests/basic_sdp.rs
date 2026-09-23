@@ -93,3 +93,44 @@ fn test_sdp_primal_infeasible() {
 
     assert_eq!(solver.solution.status, SolverStatus::PrimalInfeasible);
 }
+
+#[test]
+fn projection_matches_both_kkt_forms() {
+    let (p, q, a, b, mut cones) = basic_sdp_data();
+    cones.push(PSDTriangleConeT(0));
+    let (expected, objective) = basic_sdp_solution();
+    for form in ["augmented", "condensed"] {
+        for threads in [1, 4] {
+            let settings = DefaultSettings {
+                kkt_form: form.into(),
+                max_threads: threads,
+                verbose: false,
+                ..DefaultSettings::default()
+            };
+            let mut solver = DefaultSolver::new(&p, &q, &a, &b, &cones, settings).unwrap();
+            solver.solve();
+            assert_eq!(solver.solution.status, SolverStatus::Solved);
+            assert!(solver.solution.x.dist(&expected) < 1e-6);
+            assert!((solver.info.cost_primal - objective).abs() < 1e-6);
+            let mut rp: Vec<_> = b
+                .iter()
+                .zip(&solver.solution.s)
+                .map(|(b, s)| b - s)
+                .collect();
+            let mut rd = q.clone();
+            for col in 0..a.n {
+                for k in a.colptr[col]..a.colptr[col + 1] {
+                    rp[a.rowval[k]] -= a.nzval[k] * solver.solution.x[col];
+                    rd[col] += a.nzval[k] * solver.solution.z[a.rowval[k]];
+                }
+                for k in p.colptr[col]..p.colptr[col + 1] {
+                    rd[p.rowval[k]] += p.nzval[k] * solver.solution.x[col];
+                    if p.rowval[k] != col {
+                        rd[col] += p.nzval[k] * solver.solution.x[p.rowval[k]];
+                    }
+                }
+            }
+            assert!(rp.norm_inf() < 1e-7 && rd.norm_inf() < 1e-7);
+        }
+    }
+}

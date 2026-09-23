@@ -50,20 +50,34 @@ pub(super) fn psd_entry<T: FloatT>(G: &Matrix<T>, a: Entry, b: Entry, sqrt2: T) 
     }
 }
 
-pub(super) fn apply_scaling<T: FloatT>(
+#[derive(Clone, Copy)]
+pub(super) enum ScalingAction<'a, T> {
+    Apply(bool),
+    Condense,
+    Recover(&'a [T]),
+}
+
+fn apply_blocks<T: FloatT>(
     blocks: &mut [Block<T>],
     y: &mut [T],
     x: &[T],
-    inverse: bool,
+    action: ScalingAction<'_, T>,
     gemm: Option<(&rayon::ThreadPool, usize)>,
 ) {
     y.fill(T::zero());
+    let inverse = !matches!(action, ScalingAction::Apply(false));
     let offset = blocks.first().map_or(0, |b| b.rows.start);
     for block in blocks {
         let rows = block.rows.start - offset..block.rows.end - offset;
         let (y, x) = (&mut y[rows.clone()], &x[rows]);
         match &mut block.scaling {
-            Scaling::Psd(p) => p.apply(y, x, inverse, gemm),
+            Scaling::Psd(p) => match action {
+                ScalingAction::Condense if p.sampled.is_some() => p.condense_rhs(x, gemm),
+                ScalingAction::Recover(primal) if p.sampled.is_some() => {
+                    p.recover_rhs(y, primal, gemm)
+                }
+                _ => p.apply(y, x, inverse, gemm),
+            },
             Scaling::Orthant { w, .. } => {
                 for ((y, &x), &w) in y.iter_mut().zip(x).zip(w.iter()) {
                     *y = if inverse { (x / w) / w } else { w * (w * x) };
@@ -224,6 +238,7 @@ pub(super) fn weighted_lanes(costs: &[u128], workers: usize) -> Vec<usize> {
     lanes
 }
 
+#[cfg(test)]
 pub(super) fn apply_scaling_pool<T: FloatT>(
     pool: &Option<Arc<rayon::ThreadPool>>,
     lanes: &[usize],
@@ -233,6 +248,50 @@ pub(super) fn apply_scaling_pool<T: FloatT>(
     x: &[T],
     inverse: bool,
 ) {
+    apply_scaling_pool_with_world(
+        crate::mpi::World::get(),
+        pool,
+        lanes,
+        tiles,
+        blocks,
+        y,
+        x,
+        inverse,
+    );
+}
+
+pub(super) fn apply_scaling_pool_with_world<T: FloatT>(
+    world: Option<crate::mpi::World>,
+    pool: &Option<Arc<rayon::ThreadPool>>,
+    lanes: &[usize],
+    tiles: usize,
+    blocks: &mut [Block<T>],
+    y: &mut [T],
+    x: &[T],
+    inverse: bool,
+) {
+    apply_block_pool_with_world(
+        world,
+        pool,
+        lanes,
+        tiles,
+        blocks,
+        y,
+        x,
+        ScalingAction::Apply(inverse),
+    );
+}
+
+pub(super) fn apply_block_pool_with_world<T: FloatT>(
+    world: Option<crate::mpi::World>,
+    pool: &Option<Arc<rayon::ThreadPool>>,
+    lanes: &[usize],
+    tiles: usize,
+    blocks: &mut [Block<T>],
+    y: &mut [T],
+    x: &[T],
+    action: ScalingAction<'_, T>,
+) {
     // A pool wider than the lane count cannot be filled by the lane level
     // alone: one congruence GEMM per block is a single task. `tiles` is derived
     // from the cost model in `scaling_dispatch`, so a dominant block is split
@@ -240,7 +299,7 @@ pub(super) fn apply_scaling_pool<T: FloatT>(
     // worker. Tiles stay 1 whenever no lane outweighs an equal share of the
     // pool, so narrow pools and balanced inputs keep the previous schedule.
     let gemm = pool.as_ref().map(|pool| (pool.as_ref(), tiles.max(1)));
-    if let Some(world) = crate::mpi::World::get() {
+    if let Some(world) = world {
         // Rank-sharded scaling products. Block row ranges are disjoint, so
         // each rank fills its own y segment; gathered segments reproduce the
         // serial result bitwise. Ranks split by cost, not count: a PSD block's
@@ -290,11 +349,9 @@ pub(super) fn apply_scaling_pool<T: FloatT>(
         // per-block GEMM tiles.
         if let Some(pool) = pool.as_ref().filter(|_| owned.len() > 1) {
             let lanes: Vec<usize> = (0..owned.len()).collect();
-            pool.install(|| {
-                split_scaling(owned, &mut local, &x[y0..y1], inverse, &lanes, gemm)
-            });
+            pool.install(|| split_scaling(owned, &mut local, &x[y0..y1], action, &lanes, gemm));
         } else {
-            apply_scaling(owned, &mut local, &x[y0..y1], inverse, gemm);
+            apply_blocks(owned, &mut local, &x[y0..y1], action, gemm);
         }
         y.fill(T::zero());
         world.gather_slice(crate::mpi::SITE_SCALING, &local, &gather_ranges, &mut y[..]);
@@ -302,23 +359,23 @@ pub(super) fn apply_scaling_pool<T: FloatT>(
     }
     if let Some(pool) = pool {
         if lanes.len() > 1 {
-            pool.install(|| split_scaling(blocks, y, x, inverse, lanes, gemm));
+            pool.install(|| split_scaling(blocks, y, x, action, lanes, gemm));
             return;
         }
     }
-    apply_scaling(blocks, y, x, inverse, gemm);
+    apply_blocks(blocks, y, x, action, gemm);
 }
 
 pub(super) fn split_scaling<T: FloatT>(
     blocks: &mut [Block<T>],
     y: &mut [T],
     x: &[T],
-    inverse: bool,
+    action: ScalingAction<'_, T>,
     lanes: &[usize],
     gemm: Option<(&rayon::ThreadPool, usize)>,
 ) {
     if lanes.len() <= 1 {
-        apply_scaling(blocks, y, x, inverse, gemm);
+        apply_blocks(blocks, y, x, action, gemm);
         return;
     }
     let mid = lanes.len() / 2;
@@ -328,8 +385,8 @@ pub(super) fn split_scaling<T: FloatT>(
     let (yl, yr) = y.split_at_mut(row);
     let (xl, xr) = x.split_at(row);
     rayon::join(
-        || split_scaling(left, yl, xl, inverse, &lanes[..mid], gemm),
-        || split_scaling(right, yr, xr, inverse, &lanes[mid..], gemm),
+        || split_scaling(left, yl, xl, action, &lanes[..mid], gemm),
+        || split_scaling(right, yr, xr, action, &lanes[mid..], gemm),
     );
 }
 

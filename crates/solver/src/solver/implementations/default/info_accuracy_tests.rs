@@ -301,6 +301,7 @@ fn ordinary_recovery_restores_accepted_metrics_and_variables() {
     info.cost_dual = 3.;
     info.res_primal = 1e-12;
     info.res_dual = 2e-12;
+    info.res_dual_componentwise = Some(3e-12);
     info.gap_abs = 0.;
     info.gap_rel = 0.;
     info.save_prev_iterate(&variables, &mut previous);
@@ -309,12 +310,14 @@ fn ordinary_recovery_restores_accepted_metrics_and_variables() {
     info.cost_dual = 6.;
     info.res_primal = 1.;
     info.res_dual = 1.;
+    info.res_dual_componentwise = None;
     info.gap_abs = 1.;
     info.gap_rel = 1.;
     info.reset_to_prev_iterate(&mut variables, &previous);
     assert_eq!(variables.x, vec![2.]);
     assert_eq!((info.cost_primal, info.cost_dual), (3., 3.));
     assert_eq!((info.res_primal, info.res_dual), (1e-12, 2e-12));
+    assert_eq!(info.res_dual_componentwise, Some(3e-12));
     assert_eq!((info.gap_abs, info.gap_rel), (0., 0.));
     // Residuals can still belong to a rejected iterate after rollback;
     // ordinary solved checks consume the restored Info metrics.
@@ -348,4 +351,144 @@ fn ordinary_convergence_requires_gap_and_both_residuals() {
         info.post_process(&residuals, &settings);
         assert_eq!(info.status, SolverStatus::MaxIterations);
     }
+}
+
+#[test]
+fn componentwise_dual_gate_is_opt_in_and_full_only() {
+    let mut residuals = DefaultResiduals::<f64>::new(1, 1);
+    residuals.dual_componentwise = Some(1e-12);
+    let mut info = DefaultInfo::new();
+    info.gap_abs = 0.;
+    info.gap_rel = 0.;
+    info.res_primal = 0.;
+    info.res_dual = 0.;
+    info.res_dual_componentwise = residuals.dual_componentwise;
+    info.ktratio = 0.;
+
+    // Existing global convergence remains unchanged when the option is off.
+    let mut settings = settings::<f64>();
+    info.check_convergence_full(&residuals, &settings);
+    assert_eq!(info.status, SolverStatus::Solved);
+
+    // Opting in rejects the same globally-converged point when the
+    // componentwise residual exceeds the requested tolerance.
+    info.status = SolverStatus::Unsolved;
+    settings.tol_feas_componentwise = Some(1e-30);
+    info.check_convergence_full(&residuals, &settings);
+    assert_eq!(info.status, SolverStatus::Unsolved);
+
+    // Reduced AlmostSolved remains a reduced global status and does not gain
+    // full-credit componentwise semantics.
+    info.status = SolverStatus::MaxIterations;
+    info.post_process(&residuals, &settings);
+    assert_eq!(info.status, SolverStatus::AlmostSolved);
+}
+
+fn componentwise_metric_tracks_hsd_and_ruiz<T: FloatT>() {
+    let two = T::from_i32(2).unwrap();
+    let q = two.powi(4);
+    let a_value = T::one() / q;
+    let p = CscMatrix::zeros((1, 1));
+    let a = CscMatrix::from(&[[a_value]]);
+    let b = [T::zero()];
+    let cones = [SupportedConeT::NonnegativeConeT(1)];
+    let physical_x = two.powi(80);
+    let physical_s = -a_value * physical_x;
+    // Keep the cancellation remainder well above the f64 test helper's
+    // absolute floor while the large x norm still drives the global metric
+    // below 1e-30.
+    let physical_z = -(q / a_value) + two.powi(-20);
+
+    let mut no_ruiz = settings::<T>();
+    no_ruiz.equilibrate_enable = false;
+    let mut data = DefaultProblemData::new(&p, &[q], &a, &b, &cones, &no_ruiz);
+    data.componentwise_enabled = true;
+    let variables = DefaultVariables {
+        x: vec![physical_x],
+        s: vec![physical_s],
+        z: vec![physical_z],
+        τ: T::one(),
+        κ: T::zero(),
+    };
+    let mut residuals = DefaultResiduals::new(1, 1);
+    residuals.update(&variables, &data);
+    let metric = residuals.dual_componentwise.unwrap();
+    assert!(metric > T::from_f64(1e-30).unwrap());
+    let mut info = DefaultInfo::new();
+    info.update(&mut data, &variables, &residuals, &Timers::default());
+    assert!(info.res_dual < T::from_f64(1e-30).unwrap());
+    assert!(info.res_dual_componentwise.unwrap() > T::from_f64(1e-30).unwrap());
+
+    // Positive HSD scaling changes every dual-equation term by the same tau
+    // factor; the work-relative metric must therefore remain unchanged.
+    let doubled = DefaultVariables {
+        x: vec![two * physical_x],
+        s: vec![two * physical_s],
+        z: vec![two * physical_z],
+        τ: two,
+        κ: T::zero(),
+    };
+    let mut doubled_residuals = DefaultResiduals::new(1, 1);
+    doubled_residuals.update(&doubled, &data);
+    close(doubled_residuals.dual_componentwise.unwrap(), metric);
+
+    // Ruiz data coordinates use the same positive diagonal map as solution
+    // recovery. The ratio is invariant when the physical point is mapped into
+    // those coordinates.
+    let mut ruiz = settings::<T>();
+    ruiz.equilibrate_enable = true;
+    let mut scaled = DefaultProblemData::new(&p, &[q], &a, &b, &cones, &ruiz);
+    scaled.equilibrate(&CompositeCone::new(&cones), &ruiz);
+    scaled.componentwise_enabled = true;
+    let eq = &scaled.equilibration;
+    let scaled_variables = DefaultVariables {
+        x: vec![physical_x * eq.dinv[0]],
+        s: vec![physical_s * eq.e[0]],
+        z: vec![physical_z * eq.c * eq.einv[0]],
+        τ: T::one(),
+        κ: T::zero(),
+    };
+    let mut scaled_residuals = DefaultResiduals::new(1, 1);
+    scaled_residuals.update(&scaled_variables, &scaled);
+    close(scaled_residuals.dual_componentwise.unwrap(), metric);
+}
+
+#[test]
+fn componentwise_metric_hsd_ruiz_f64() {
+    componentwise_metric_tracks_hsd_and_ruiz::<f64>();
+}
+
+#[test]
+fn componentwise_metric_hsd_ruiz_mpfr256() {
+    componentwise_metric_tracks_hsd_and_ruiz::<Bits256>();
+}
+
+#[test]
+fn componentwise_metric_zero_and_nonfinite_rows_are_conservative() {
+    let settings = settings::<f64>();
+    let cones = [SupportedConeT::NonnegativeConeT(1)];
+    let p = CscMatrix::zeros((1, 1));
+    // Keep a structural zero so the nonfinite z path exercises an actual
+    // operator product (0 * infinity -> NaN), which the metric must reject.
+    let a = CscMatrix::new(1, 1, vec![0, 1], vec![0], vec![0.]);
+    let mut data = DefaultProblemData::new(&p, &[0.], &a, &[0.], &cones, &settings);
+    data.componentwise_enabled = true;
+
+    let finite = DefaultVariables {
+        x: vec![0.],
+        s: vec![0.],
+        z: vec![0.],
+        τ: 1.,
+        κ: 0.,
+    };
+    let mut residuals = DefaultResiduals::new(1, 1);
+    residuals.update(&finite, &data);
+    assert_eq!(residuals.dual_componentwise, Some(0.));
+
+    let nonfinite = DefaultVariables {
+        z: vec![f64::INFINITY],
+        ..finite
+    };
+    residuals.update(&nonfinite, &data);
+    assert!(residuals.dual_componentwise.unwrap().is_infinite());
 }

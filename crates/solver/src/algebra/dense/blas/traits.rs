@@ -81,10 +81,36 @@ pub trait XpotrsScalar: Sized {
     fn xpotrs(
         uplo: u8, n: i32, nrhs: i32, a: &[Self], lda: i32,  b: &mut [Self], ldb: i32, info: &mut i32
     );
+    /// Solve L*X=B (or L'*X=B), with a square lower-triangular factor.
+    /// MPFR uses the shared fixed-precision arithmetic; native types use TRSM.
+    fn xtrsm_lower(n: usize, a: &[Self], b: &mut [Self], transpose: bool)
+    where Self: crate::algebra::FloatT {
+        use rayon::prelude::*;
+        if n == 0 { return; }
+        assert_eq!(a.len(), n*n);
+        assert_eq!(b.len() % n, 0);
+        let solve = |column: &mut [Self]| {
+            for step in 0..n {
+                let i = if transpose { n-1-step } else { step };
+                let mut v = column[i];
+                let range = if transpose { i+1..n } else { 0..i };
+                for k in range {
+                    let av = if transpose { a[k+i*n] } else { a[i+k*n] };
+                    v = (-av).mul_add(column[k], v);
+                }
+                column[i] = v / a[i+i*n];
+            }
+        };
+        if sdpx_arithmetic::inner_parallel::active() && n*b.len() >= 16384 {
+            b.par_chunks_mut(n).for_each(solve);
+        } else {
+            b.chunks_mut(n).for_each(solve);
+        }
+    }
 }
 
 macro_rules! impl_blas_xpotrfs{
-    ($T:ty, $XPOTRF:path, $XPOTRS:path) => {
+    ($T:ty, $XPOTRF:path, $XPOTRS:path, $XTRSM:path) => {
         impl XpotrfScalar for $T {
             fn xpotrf(
                 uplo: u8, n: i32, a: &mut [Self], lda: i32, info: &mut i32
@@ -97,6 +123,15 @@ macro_rules! impl_blas_xpotrfs{
             }
         }
         impl XpotrsScalar for $T {
+            fn xtrsm_lower(n: usize, a: &[Self], b: &mut [Self], transpose: bool) {
+                if n == 0 { return; }
+                assert_eq!(a.len(), n*n);
+                assert_eq!(b.len() % n, 0);
+                let rows = i32::try_from(n).unwrap();
+                let cols = i32::try_from(b.len()/n).unwrap();
+                unsafe { $XTRSM(b'L', b'L', if transpose { b'T' } else { b'N' },
+                    b'N', rows, cols, 1.0, a, rows, b, rows); }
+            }
             fn xpotrs(
                 uplo: u8, n: i32, nrhs: i32, a: &[Self], lda: i32, b: &mut [Self], ldb: i32, info: &mut i32
             ) {
@@ -110,8 +145,8 @@ macro_rules! impl_blas_xpotrfs{
     };
 }
 
-impl_blas_xpotrfs!(f32, spotrf, spotrs);
-impl_blas_xpotrfs!(f64, dpotrf, dpotrs);
+impl_blas_xpotrfs!(f32, spotrf, spotrs, strsm);
+impl_blas_xpotrfs!(f64, dpotrf, dpotrs, dtrsm);
 
 
 // --------------------------------------

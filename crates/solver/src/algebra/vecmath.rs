@@ -202,16 +202,38 @@ impl<T: FloatT> VectorMath<T> for [T] {
     }
 }
 
-// numerically more stable 2-norm that avoids overflow/underflow
-fn stable_norm<T, I, B>(x: I) -> T
-where
-    T: FloatT,
-    I: Iterator<Item = B>,
-    B: Borrow<T>,
-{
-    let (scale, sumsq) =
-        x.filter(|b| *b.borrow() != T::zero())
-            .fold((T::zero(), T::one()), |(scale, sumsq), b| {
+/// Owned scaled sum of squares. Serial construction preserves the vector norm's
+/// historical operation order; merging partitions may round differently.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScaledNorm<T> {
+    scale: T,
+    sumsq: T,
+}
+
+impl<T: FloatT> ScaledNorm<T> {
+    pub(crate) fn scale(&self) -> T {
+        self.scale
+    }
+
+    pub(crate) fn sumsq(&self) -> T {
+        self.sumsq
+    }
+
+    pub(crate) fn from_norm(norm: T) -> Self {
+        Self {
+            scale: norm,
+            sumsq: T::one(),
+        }
+    }
+
+    pub(crate) fn from_iter<I, B>(x: I) -> Self
+    where
+        I: Iterator<Item = B>,
+        B: Borrow<T>,
+    {
+        let (scale, sumsq) = x.filter(|b| *b.borrow() != T::zero()).fold(
+            (T::zero(), T::one()),
+            |(scale, sumsq), b| {
                 let xi = *b.borrow();
                 let absxi = xi.abs();
                 if scale < absxi {
@@ -221,6 +243,55 @@ where
                     let r = absxi / scale;
                     (scale, sumsq + r * r)
                 }
-            });
-    scale * sumsq.sqrt()
+            },
+        );
+        Self { scale, sumsq }
+    }
+
+    pub(crate) fn norm(&self) -> T {
+        self.scale * self.sumsq.sqrt()
+    }
+
+    pub(crate) fn merge(self, other: Self) -> Self {
+        // A NaN input can leave scale at zero: test poison before identity.
+        if self.sumsq.is_nan() || other.sumsq.is_nan() {
+            return Self {
+                scale: T::zero(),
+                sumsq: T::nan(),
+            };
+        }
+        if self.scale == T::zero() {
+            return other;
+        }
+        if other.scale == T::zero() {
+            return self;
+        }
+        if self.scale < other.scale {
+            let r = self.scale / other.scale;
+            Self {
+                scale: other.scale,
+                sumsq: other.sumsq + self.sumsq * r * r,
+            }
+        } else {
+            let r = other.scale / self.scale;
+            Self {
+                scale: self.scale,
+                sumsq: self.sumsq + other.sumsq * r * r,
+            }
+        }
+    }
 }
+
+// Numerically stable 2-norm without changing serial evaluation order.
+fn stable_norm<T, I, B>(x: I) -> T
+where
+    T: FloatT,
+    I: Iterator<Item = B>,
+    B: Borrow<T>,
+{
+    ScaledNorm::from_iter(x).norm()
+}
+
+#[cfg(test)]
+#[path = "scaled_norm_tests.rs"]
+mod scaled_norm_tests;

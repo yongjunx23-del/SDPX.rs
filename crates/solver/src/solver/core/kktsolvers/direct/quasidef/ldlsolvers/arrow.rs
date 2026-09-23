@@ -108,6 +108,29 @@ impl<T: FloatT> DenseLeaf<T> {
         }
     }
 
+    // Row-major RHS lanes keep each factor coefficient live across columns.
+    // Every column retains the single-RHS accumulation order.
+    fn forward_many(&self, x: &mut [T], cols: usize) {
+        for i in 0..self.n {
+            for k in 0..i {
+                let l = -self.l[i + k * self.n];
+                for c in 0..cols {
+                    x[i * cols + c] = l.mul_add(x[k * cols + c], x[i * cols + c]);
+                }
+            }
+        }
+    }
+    fn backward_many(&self, x: &mut [T], cols: usize) {
+        for i in (0..self.n).rev() {
+            for k in i + 1..self.n {
+                let l = -self.l[k + i * self.n];
+                for c in 0..cols {
+                    x[i * cols + c] = l.mul_add(x[k * cols + c], x[i * cols + c]);
+                }
+            }
+        }
+    }
+
     fn solve(&self, x: &mut [T]) {
         self.forward(x);
         for (x, d) in x.iter_mut().zip(&self.dinv) {
@@ -127,6 +150,8 @@ struct Leaf<T> {
     contribution: Vec<T>,
     w: Vec<T>,
     v: Vec<T>,
+    batch_w: Vec<T>,
+    batch_v: Vec<T>,
 }
 
 impl<T: FloatT> Leaf<T> {
@@ -142,6 +167,8 @@ impl<T: FloatT> Leaf<T> {
             contribution: vec![T::zero(); t * t],
             w: vec![T::zero(); g],
             v: vec![T::zero(); g],
+            batch_w: Vec::new(),
+            batch_v: Vec::new(),
         }
     }
 
@@ -173,6 +200,35 @@ impl<T: FloatT> Leaf<T> {
         Ok(())
     }
 
+    fn first_many(&mut self, rhs: &[T], n: usize, cols: usize) {
+        let g = self.ids.len();
+        self.batch_w.resize(g * cols, T::zero());
+        self.batch_v.resize(g * cols, T::zero());
+        for (i, &id) in self.ids.iter().enumerate() {
+            for c in 0..cols {
+                self.batch_w[i * cols + c] = rhs[c * n + id];
+            }
+        }
+        self.factor.forward_many(&mut self.batch_w, cols);
+        for i in 0..g {
+            for c in 0..cols {
+                self.batch_v[i * cols + c] = self.batch_w[i * cols + c] * self.factor.dinv[i];
+            }
+        }
+    }
+    fn second_many(&mut self, xt: &[T], cols: usize) {
+        let g = self.ids.len();
+        for i in 0..g {
+            for c in 0..cols {
+                let s = T::dot_fma(
+                    (0..xt.len() / cols).map(|j| (&self.y[i + j * g], &xt[j * cols + c])),
+                );
+                self.batch_w[i * cols + c] = (self.batch_w[i * cols + c] - s) * self.factor.dinv[i];
+            }
+        }
+        self.factor.backward_many(&mut self.batch_w, cols);
+    }
+
     fn first_solve(&mut self, rhs: &[T]) {
         for (w, &id) in self.w.iter_mut().zip(&self.ids) {
             *w = rhs[id];
@@ -194,7 +250,10 @@ impl<T: FloatT> Leaf<T> {
 }
 
 pub struct ArrowLDLSolver<T: FloatT> {
-    matrix: CscMatrix<T>,
+    // Only the fixed sparse pattern is global. Numerical entries live in
+    // their leaf H/B or border C; the parent retains the original KKT for IR.
+    colptr: Vec<usize>,
+    rowval: Vec<usize>,
     signs: Vec<i8>,
     settings: CoreSettings<T>,
     n: usize,
@@ -206,6 +265,7 @@ pub struct ArrowLDLSolver<T: FloatT> {
     s: Vec<T>,
     tf: DenseLeaf<T>,
     tx: Vec<T>,
+    batch_tx: Vec<T>,
     pool: Option<Arc<rayon::ThreadPool>>,
     regularize_count: usize,
     fallback: Option<BoxedDirectLDLSolver<T>>,
@@ -226,7 +286,10 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         for j in 0..n {
             for q in k.colptr[j]..k.colptr[j + 1] {
                 let i = k.rowval[q];
-                if i > j {
+                // One owned slot per coordinate requires canonical CSC, as
+                // does the public problem-data contract. Keep malformed or
+                // duplicate coordinates on the existing general backend.
+                if i > j || (q > k.colptr[j] && k.rowval[q - 1] >= i) {
                     return None;
                 }
                 if signs[i] > 0 && signs[j] > 0 {
@@ -269,7 +332,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let leaf_work: u128 = groups.iter().map(|g| (g.len() as u128).pow(3)).sum();
         let border_work = n_pos * (t as u128).pow(2) + (t as u128).pow(3);
         let work_ok = border_work <= 24 * leaf_work.max(1);
-        if std::env::var_os("SDPX_PROFILE").is_some() {
+        if crate::receipt::profile_requested() {
             // Observation-only grouping stats (plan PR-06): positive-sign
             // components, leaf size spread, border size, leaf-border coupling
             // edges and the dense working-set estimate.
@@ -312,8 +375,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             local[id] = i;
         }
         let leaves = groups.into_iter().map(|g| Leaf::new(g, t)).collect();
-        Some(Self {
-            matrix: k.clone(),
+        let mut solver = Self {
+            colptr: k.colptr.clone(),
+            rowval: k.rowval.clone(),
             signs: signs.to_vec(),
             settings: settings.clone(),
             n,
@@ -325,58 +389,101 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             s: vec![T::zero(); t * t],
             tf: DenseLeaf::new(t),
             tx: vec![T::zero(); t],
+            batch_tx: Vec::new(),
             pool: None,
             regularize_count: 0,
             fallback: None,
             use_arrow: false,
-        })
+        };
+        solver.update_entries(0..k.nzval.len(), |q, value| *value = k.nzval[q]);
+        Some(solver)
     }
 
-    /// Rebuild dense leaf/coupling/border blocks from the authoritative CSC
-    /// copy.  Structure is fixed; only values are refreshed.
-    fn scatter(&mut self) -> bool {
+    /// Route sparse-position updates directly to the owned numeric blocks.
+    /// Sorted runs reuse their current column; arbitrary/repeated positions
+    /// retain the update order and locate a new column only when needed.
+    fn update_entries<I, F>(&mut self, positions: I, mut update: F)
+    where
+        I: IntoIterator<Item = usize>,
+        F: FnMut(usize, &mut T),
+    {
+        let mut j = 0;
         let t = self.trunk.len();
-        for leaf in self.leaves.iter_mut() {
-            leaf.h.fill(T::zero());
-            leaf.b.fill(T::zero());
-        }
-        self.c.fill(T::zero());
-        for j in 0..self.n {
-            for q in self.matrix.colptr[j]..self.matrix.colptr[j + 1] {
-                let i = self.matrix.rowval[q];
-                let a = self.matrix.nzval[q];
-                if !a.is_finite() {
-                    return false;
+        for (q, position) in positions.into_iter().enumerate() {
+            if position < self.colptr[j] || position >= self.colptr[j + 1] {
+                j = self.colptr.partition_point(|&p| p <= position) - 1;
+            }
+            let i = self.rowval[position];
+            let (li, lj) = (self.local[i], self.local[j]);
+            match (self.owner[i], self.owner[j]) {
+                (x, y) if x == usize::MAX && y == usize::MAX => {
+                    update(q, &mut self.c[li + lj * t]);
+                    self.c[lj + li * t] = self.c[li + lj * t];
                 }
-                match (self.owner[i], self.owner[j]) {
-                    (x, y) if x == usize::MAX && y == usize::MAX => {
-                        self.c[self.local[i] + self.local[j] * t] = a;
-                        self.c[self.local[j] + self.local[i] * t] = a;
-                    }
-                    (x, y) if x != usize::MAX && y != usize::MAX => {
-                        if x != y {
-                            return false; // cross-leaf edge cannot appear
-                        }
-                        let g = self.leaves[x].ids.len();
-                        self.leaves[x].h[self.local[i] + self.local[j] * g] = a;
-                        self.leaves[x].h[self.local[j] + self.local[i] * g] = a;
-                    }
-                    (x, _) if x != usize::MAX => {
-                        let g = self.leaves[x].ids.len();
-                        self.leaves[x].b[self.local[i] + self.local[j] * g] = a;
-                    }
-                    (_, y) => {
-                        let g = self.leaves[y].ids.len();
-                        self.leaves[y].b[self.local[j] + self.local[i] * g] = a;
-                    }
+                (x, y) if x != usize::MAX && y != usize::MAX => {
+                    debug_assert_eq!(x, y);
+                    let leaf = &mut self.leaves[x];
+                    let g = leaf.ids.len();
+                    update(q, &mut leaf.h[li + lj * g]);
+                    leaf.h[lj + li * g] = leaf.h[li + lj * g];
+                }
+                (x, _) if x != usize::MAX => {
+                    let leaf = &mut self.leaves[x];
+                    let g = leaf.ids.len();
+                    update(q, &mut leaf.b[li + lj * g]);
+                }
+                (_, y) => {
+                    let leaf = &mut self.leaves[y];
+                    let g = leaf.ids.len();
+                    update(q, &mut leaf.b[lj + li * g]);
                 }
             }
         }
-        true
+    }
+
+    /// The existing QDLDL fallback needs a CSC input. Reconstruct it only
+    /// when Arrow fails, including the caller's current static shifts.
+    fn materialize(&self) -> CscMatrix<T> {
+        let t = self.trunk.len();
+        let mut values = Vec::with_capacity(self.rowval.len());
+        for j in 0..self.n {
+            for q in self.colptr[j]..self.colptr[j + 1] {
+                let i = self.rowval[q];
+                let (li, lj) = (self.local[i], self.local[j]);
+                values.push(match (self.owner[i], self.owner[j]) {
+                    (x, y) if x == usize::MAX && y == usize::MAX => self.c[li + lj * t],
+                    (x, y) if x != usize::MAX && y != usize::MAX => {
+                        debug_assert_eq!(x, y);
+                        let leaf = &self.leaves[x];
+                        leaf.h[li + lj * leaf.ids.len()]
+                    }
+                    (x, _) if x != usize::MAX => {
+                        let leaf = &self.leaves[x];
+                        leaf.b[li + lj * leaf.ids.len()]
+                    }
+                    (_, y) => {
+                        let leaf = &self.leaves[y];
+                        leaf.b[lj + li * leaf.ids.len()]
+                    }
+                });
+            }
+        }
+        CscMatrix::new(
+            self.n,
+            self.n,
+            self.colptr.clone(),
+            self.rowval.clone(),
+            values,
+        )
     }
 
     fn factor_arrow(&mut self) -> bool {
-        if !self.scatter() {
+        if !self.c.is_finite()
+            || self
+                .leaves
+                .iter()
+                .any(|leaf| !leaf.h.is_finite() || !leaf.b.is_finite())
+        {
             return false;
         }
         let reg = self.settings.dynamic_regularization_enable.then_some((
@@ -421,24 +528,21 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     }
 
     fn factor_fallback(&mut self) -> bool {
+        let matrix = self.materialize();
         if self.fallback.is_none() {
-            let solver: BoxedDirectLDLSolver<T> =
-                Box::new(super::qdldl::QDLDLDirectLDLSolver::new(
-                    &self.matrix,
-                    &self.signs,
-                    &self.settings,
-                    None,
-                ));
+            let solver: BoxedDirectLDLSolver<T> = Box::new(
+                super::qdldl::QDLDLDirectLDLSolver::new(&matrix, &self.signs, &self.settings, None),
+            );
             self.fallback = Some(solver);
         }
         let solver = self.fallback.as_mut().unwrap();
         // The fallback's internal permuted copy must observe the same values
-        // the caller has written into our authoritative CSC (including any
-        // temporary regularization shifts already applied to it).
-        let indices: Vec<usize> = (0..self.matrix.nzval.len()).collect();
-        solver.update_values(&indices, &self.matrix.nzval);
+        // the caller has written into the owned blocks, including its
+        // temporary regularization shifts.
+        let indices: Vec<usize> = (0..self.rowval.len()).collect();
+        solver.update_values(&indices, &matrix.nzval);
         solver.set_pool(self.pool.clone());
-        solver.refactor(&self.matrix)
+        solver.refactor(&matrix)
     }
 
     fn solve_arrow(&mut self, x: &mut [T], b: &[T]) {
@@ -496,7 +600,7 @@ impl<T: FloatT> HasLinearSolverInfo for ArrowLDLSolver<T> {
             name: "arrow".to_string(),
             threads: self.pool.as_ref().map_or(1, |p| p.current_num_threads()),
             direct: true,
-            nnzA: self.matrix.nzval.len(),
+            nnzA: self.rowval.len(),
             nnzL: self
                 .leaves
                 .iter()
@@ -509,26 +613,93 @@ impl<T: FloatT> HasLinearSolverInfo for ArrowLDLSolver<T> {
 
 impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
     fn update_values(&mut self, index: &[usize], values: &[T]) {
-        for (&i, &v) in index.iter().zip(values) {
-            self.matrix.nzval[i] = v;
-        }
+        self.update_entries(index.iter().copied().take(values.len()), |q, value| {
+            *value = values[q];
+        });
     }
 
     fn scale_values(&mut self, index: &[usize], scale: T) {
-        for &i in index {
-            self.matrix.nzval[i] *= scale;
-        }
+        self.update_entries(index.iter().copied(), |_, value| *value *= scale);
     }
 
     fn offset_values(&mut self, index: &[usize], offset: T, signs: &[i8]) {
-        for (&i, &s) in index.iter().zip(signs) {
-            self.matrix.nzval[i] += offset * T::from_i8(s).unwrap();
-        }
+        self.update_entries(index.iter().copied().take(signs.len()), |q, value| {
+            *value += offset * T::from_i8(signs[q]).unwrap();
+        });
     }
 
     fn refactor(&mut self, _kkt: &CscMatrix<T>) -> bool {
         self.use_arrow = self.factor_arrow();
         self.use_arrow || self.factor_fallback()
+    }
+
+    fn solve_many(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T], cols: usize) {
+        if !self.use_arrow {
+            self.fallback.as_mut().unwrap().solve_many(kkt, x, b, cols);
+            return;
+        }
+        let (n, t) = (self.n, self.trunk.len());
+        assert_eq!(x.len(), n * cols);
+        assert_eq!(b.len(), x.len());
+        if cols == 0 {
+            return;
+        }
+        self.batch_tx.resize(t * cols, T::zero());
+        if let Some(pool) = &self.pool {
+            pool.install(|| {
+                self.leaves
+                    .par_iter_mut()
+                    .for_each(|l| l.first_many(b, n, cols))
+            });
+        } else {
+            self.leaves
+                .iter_mut()
+                .for_each(|l| l.first_many(b, n, cols));
+        }
+        let tx = &mut self.batch_tx;
+        for (j, &id) in self.trunk.iter().enumerate() {
+            for c in 0..cols {
+                tx[j * cols + c] = b[c * n + id];
+            }
+        }
+        for leaf in &self.leaves {
+            let g = leaf.ids.len();
+            for j in 0..t {
+                for c in 0..cols {
+                    tx[j * cols + c] -= T::dot_fma(
+                        (0..g).map(|i| (&leaf.y[i + j * g], &leaf.batch_v[i * cols + c])),
+                    );
+                }
+            }
+        }
+        self.tf.forward_many(tx, cols);
+        for j in 0..t {
+            for c in 0..cols {
+                tx[j * cols + c] *= self.tf.dinv[j];
+            }
+        }
+        self.tf.backward_many(tx, cols);
+        if let Some(pool) = &self.pool {
+            pool.install(|| {
+                self.leaves
+                    .par_iter_mut()
+                    .for_each(|l| l.second_many(tx, cols))
+            });
+        } else {
+            self.leaves.iter_mut().for_each(|l| l.second_many(tx, cols));
+        }
+        for leaf in &self.leaves {
+            for (i, &id) in leaf.ids.iter().enumerate() {
+                for c in 0..cols {
+                    x[c * n + id] = leaf.batch_w[i * cols + c];
+                }
+            }
+        }
+        for (i, &id) in self.trunk.iter().enumerate() {
+            for c in 0..cols {
+                x[c * n + id] = tx[i * cols + c];
+            }
+        }
     }
 
     fn solve(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T]) {
@@ -549,6 +720,70 @@ mod tests {
     use super::*;
     use num_traits::{FromPrimitive, ToPrimitive, Zero};
     use sdpx_arithmetic::MpFloat;
+
+    fn batch_parity<T: FloatT>() {
+        let (base, signs) = arrow_kkt();
+        let k = CscMatrix::new(
+            base.m,
+            base.n,
+            base.colptr,
+            base.rowval,
+            base.nzval
+                .iter()
+                .map(|&v| T::from_f64(v).unwrap())
+                .collect(),
+        );
+        let settings = CoreSettings::<T>::default();
+        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings).unwrap();
+        assert!(solver.refactor(&k));
+        for workers in [1, 4, 1] {
+            solver.set_pool((workers > 1).then(|| {
+                Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(workers)
+                        .build()
+                        .unwrap(),
+                )
+            }));
+            for cols in [1, 3, 2] {
+                let rhs: Vec<T> = (0..cols * k.n)
+                    .map(|i| T::from_f64((i as f64 - 5.) / 8.).unwrap())
+                    .collect();
+                let mut out = vec![T::zero(); rhs.len()];
+                solver.solve_many(&k, &mut out, &mut rhs.clone(), cols);
+                for c in 0..cols {
+                    let mut single = vec![T::zero(); k.n];
+                    solver.solve(&k, &mut single, &mut rhs[c * k.n..(c + 1) * k.n].to_vec());
+                    assert_eq!(single, out[c * k.n..(c + 1) * k.n]);
+                }
+            }
+        }
+        // Force the existing fallback, and verify the multi-column call follows it.
+        let diag = k.colptr[0];
+        solver.settings.dynamic_regularization_enable = false;
+        solver.update_values(&[diag], &[T::zero()]);
+        assert!(solver.refactor(&k));
+        assert!(!solver.use_arrow);
+        let rhs = vec![T::one(); k.n * 2];
+        let mut out = vec![T::zero(); rhs.len()];
+        solver.solve_many(&k, &mut out, &mut rhs.clone(), 2);
+        let mut single = vec![T::zero(); k.n];
+        solver.solve(&k, &mut single, &mut rhs[..k.n].to_vec());
+        assert_eq!(single, out[..k.n]);
+        assert_eq!(single, out[k.n..]);
+    }
+    #[test]
+    fn arrow_batch_f64() {
+        batch_parity::<f64>();
+    }
+    #[test]
+    fn arrow_batch_256() {
+        batch_parity::<sdpx_arithmetic::Bits256>();
+    }
+    #[test]
+    fn arrow_batch_512() {
+        batch_parity::<sdpx_arithmetic::Bits512>();
+    }
 
     /// K = [H1 . . B1; . H2 . B2; . . H3 B3; B1' B2' B3' C] with three
     /// positive leaves and a negative border, stored as upper-triangular CSC.
@@ -658,8 +893,7 @@ mod tests {
         let (k1, s1) = arrow_kkt_merged(true);
         assert!(ArrowLDLSolver::try_new(&k1, &s1, &settings).is_none());
         // QDLDL parity: a wrong-sign leaf pivot is regularized, not rejected.
-        // Solver-side updates go through update_values (the authoritative CSC
-        // clone lives inside the solver).
+        // Solver-side updates go through update_values into owned blocks.
         let (k2, s2) = arrow_kkt();
         let diag0 = k2.colptr[1] - 1; // (0,0) is the last entry of column 0
         let mut solver = ArrowLDLSolver::try_new(&k2, &s2, &settings).unwrap();
@@ -762,4 +996,5 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(ArrowLDLSolver::try_new(&k, &signs, &CoreSettings::<f64>::default()).is_none());
     }
+    include!("arrow_storage_tests.rs");
 }

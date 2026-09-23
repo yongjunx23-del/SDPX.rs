@@ -1,407 +1,197 @@
 #!/usr/bin/env julia
+# Standalone native-CLI benchmark adapter.
 #
-# SDPX Julia/Rust frontend leg. Adapted from the retained phase13 runner.
-# External oracle and fresh-solve timing scopes are unchanged; see README.md.
-#
-# Consumes the *same* Clarabel JSON bytes as runner/rust-harness (the sha256 in
-# fixtures/manifest.json identifies that shared input) and emits the same
-# per-run oracle fields and PASS/FAIL gate.
-#
-# Per-run oracle:
-#   1. finiteness of x, z, s and returned-slack affine/cone residuals
-#   2. r_p_x = dist_K(b - Ac x)      primal feasibility from the primal point
-#   3. r_d   = || Ac' z + q ||_inf   dual feasibility
-#   4. dist_K*(z)                    dual cone membership
-#   5. gap   = | q'x + b'z | / (1 + |q'x|)
-# plus the ordinary solver status; independent residuals determine accuracy;
-# residuals alone never mark a run as PASS.
+# This file intentionally does not load the retired Julia solver package:
+# Julia is only an independent
+# original-coordinate oracle and JSON/input utility.  Every sample launches a
+# fresh Rust `sdpx` process and retains native/API/load/CLI timings separately.
+using SparseArrays, LinearAlgebra, SHA, JSON
 
-using SparseArrays
-using LinearAlgebra
-using Printf
-using JSON
-using SDPX
+required(k) = isempty(get(ENV, k, "")) ? error("set $k explicitly") : ENV[k]
+const cli = realpath(get(ENV, "SDPX_CLI", required("SDPX_CLI")))
+isfile(cli) && Base.Filesystem.isexecutable(cli) || error("SDPX_CLI is not an executable file")
+const threads = parse(Int, get(ENV, "SDPX_BENCH_THREADS", "1"))
+threads in (1, 2, 4, 8) || error("SDPX_BENCH_THREADS must be 1, 2, 4 or 8")
+const blas = get(ENV, "SDPX_BENCH_BLAS", "default")
+blas in ("default", "accelerate") || error("unsupported benchmark BLAS label")
+const requested_runs = Ref(4)
+const requested_tol = Ref(1e-6)
+const requested_settings = Ref{Union{Nothing,String}}(nothing)
 
-if haskey(ENV, "SDPX_EXPECTED_SOURCE")
-    realpath(dirname(dirname(pathof(SDPX)))) == realpath(ENV["SDPX_EXPECTED_SOURCE"]) ||
-        error("SDPX environment does not resolve to the declared candidate")
+for arg in ARGS
+    startswith(arg, "--runs=") && (requested_runs[] = parse(Int, split(arg, "=", limit=2)[2]))
+    startswith(arg, "--tol=") && (requested_tol[] = parse(Float64, split(arg, "=", limit=2)[2]))
+    startswith(arg, "--settings=") &&
+        (requested_settings[] = split(arg, "=", limit=2)[2])
+end
+requested_runs[] > 0 || error("--runs must be positive")
+requested_settings[] === nothing || isfile(requested_settings[]) ||
+    error("--settings path is not a file")
+
+_f(x) = try Float64(x) catch; NaN end
+filehash(path) = open(sha256, path) |> bytes2hex
+safe(x::AbstractFloat) = isfinite(x) ? x : nothing
+safe(x::Integer) = x
+safe(x::Bool) = x
+safe(x::AbstractString) = x
+safe(x::Nothing) = nothing
+safe(x::NamedTuple) = Dict(string(k) => safe(v) for (k, v) in pairs(x))
+safe(x::AbstractDict) = Dict(string(k) => safe(v) for (k, v) in x)
+safe(x::AbstractVector) = safe.(x)
+
+function csc(d)
+    m, n = Int(d["m"]), Int(d["n"])
+    colptr = Int[Int(v) + 1 for v in d["colptr"]]
+    rowval = Int[Int(v) + 1 for v in d["rowval"]]
+    nzval = Float64[_f(v) for v in d["nzval"]]
+    SparseMatrixCSC(m, n, colptr, rowval, nzval)
 end
 
-# Benchmark-only selection: AppleAccelerate redirects libblastrampoline.
-# Production dependencies and provider choices remain outside this driver.
-const SDPX_BENCH_BLAS = get(ENV, "SDPX_BENCH_BLAS", "default")
-const SDPX_BENCH_THREADS = parse(Int, get(ENV, "SDPX_BENCH_THREADS", "1"))
-const SDPX_BENCH_PREPROCESSING = get(ENV, "SDPX_BENCH_PREPROCESSING", "default")
-SDPX_BENCH_PREPROCESSING in ("default", "controlled") ||
-    error("SDPX_BENCH_PREPROCESSING must be default or controlled")
-SDPX_BENCH_THREADS in (1, 2, 4, 8) || error("SDPX_BENCH_THREADS must be 1, 2, 4 or 8")
-SDPX_BENCH_BLAS in ("default", "accelerate") ||
-    error("SDPX_BENCH_BLAS must be default or accelerate")
-if SDPX_BENCH_BLAS == "accelerate"
-    import AppleAccelerate
-    AppleAccelerate.get_macos_version() >= v"15" ||
-        error("the Accelerate benchmark thread receipt requires macOS 15 or later")
-    AppleAccelerate.set_num_threads(1)
-end
-BLAS.set_num_threads(1)
-benchmark_blas_threads() = SDPX_BENCH_BLAS == "accelerate" ?
-    AppleAccelerate.get_num_threads() : BLAS.get_num_threads()
-benchmark_blas_threads() == 1 || error("benchmark requires one BLAS thread")
-
-# ---------------------------------------------------------------------------
-# Common input parsing uses the benchmark environment's JSON package.
-_f64(x) = Float64(x)
-
-function _csc(d)
-    m = Int(d["m"])
-    n = Int(d["n"])
-    colptr = Int[Int(c) for c in d["colptr"]] .+ 1
-    rowval = Int[Int(c) for c in d["rowval"]] .+ 1
-    nzval = Float64[_f64(v) for v in d["nzval"]]
-    return SparseMatrixCSC(m, n, colptr, rowval, nzval)
+function block_length(tag, p)
+    tag in ("ZeroConeT", "NonnegativeConeT", "SecondOrderConeT") && return Int(p)
+    tag == "PSDTriangleConeT" && return div(Int(p) * (Int(p) + 1), 2)
+    error("unsupported cone $tag")
 end
 
-function read_problem_json(path::String)
-    data = JSON.parsefile(path)
-    q = Float64[_f64(v) for v in data["q"]]
-    b = Float64[_f64(v) for v in data["b"]]
-    A = _csc(data["A"])
-    return q, A, b, data["cones"]
-end
-
-# ---------------------------------------------------------------------------
-# JSON-safe serialisation
-# ---------------------------------------------------------------------------
-
-_jj(x::Bool) = x ? "true" : "false"
-_jj(x::Real) = isfinite(Float64(x)) ? string(Float64(x)) : "null"
-_jj(x::AbstractString) = JSON.json(x)
-
-# Receipts are serialized outside setup/solve timing. Keep the actual core
-# field names, including optional tolerance overrides and backend parameters.
-_jj(::Nothing) = "null"
-_jj(x::Symbol) = _jj(string(x))
-_jj(x::Integer) = string(x)
-_jj(x::AbstractVector) = "[" * join(_jj.(x), ",") * "]"
-_setting_json(x) = x isa Real && !isfinite(x) ? _jj(string(x)) : _jj(x)
-function settings_json(settings, result)
-    result.info.precision_bits == 53 || error("Float64 precision receipt mismatch")
-    settings.max_threads == SDPX_BENCH_THREADS || error("requested native thread receipt mismatch")
-    for key in (:equilibration, :presolve_enable, :chordal_decomposition_enable)
-        getproperty(settings,key) == getproperty(result.info,key) ||
-            error("native preprocessing receipt mismatch: $key")
-    end
-    factorization = result.info.factorization
-    factorization in (:qdldl, :condensed_qdldl, :faer, :condensed_faer,
-                      :dense_block, :condensed_dense_block) ||
-        error("unsupported factorization thread receipt: $factorization")
-    factor_threads = factorization in (:faer, :condensed_faer) ? SDPX_BENCH_THREADS : 1
-    result.info.backend_threads == factor_threads || error("native factorization thread receipt mismatch")
-    1 <= result.info.cone_threads <= SDPX_BENCH_THREADS || error("native cone thread budget exceeded")
-    benchmark_blas_threads() == 1 || error("benchmark requires one BLAS thread")
-    fields = [_jj(string(k)) * ":" * _setting_json(getfield(settings, k))
-              for k in fieldnames(typeof(settings)) if k != :outputs]
-    append!(fields, ["\"requested_native_threads\":" * _jj(SDPX_BENCH_THREADS),
-        "\"actual_backend_threads\":" * _jj(result.info.backend_threads),
-        "\"actual_cone_threads\":" * _jj(result.info.cone_threads),
-        "\"actual_blas_threads\":" * _jj(benchmark_blas_threads()),
-        "\"actual_factorization\":" * _jj(result.info.factorization),
-        "\"actual_kkt_form\":" * _jj(result.info.kkt_form),
-        "\"preprocessing_arm\":" * _jj(SDPX_BENCH_PREPROCESSING)])
-    return "{" * join(fields, ",") * "}"
-end
-
-"""JSON-safe fixed/two-exponent formatting: non-finite becomes `null`."""
-function _jf6(x::Real)
-    v = Float64(x)
-    return isfinite(v) ? @sprintf("%.6f", v) : "null"
-end
-
-function _jfe(x::Real)
-    v = Float64(x)
-    return isfinite(v) ? @sprintf("%.6e", v) : "null"
-end
-
-# ---------------------------------------------------------------------------
-# Clarabel JSON cones -> SDPX native program
-# ---------------------------------------------------------------------------
-
-const _SUPPORTED = "ZeroConeT/NonnegativeConeT/SecondOrderConeT/PSDTriangleConeT"
-
-"""Block length in the Clarabel slack vector for one JSON cone."""
-function _block_len(tag::String, param)
-    tag == "ZeroConeT" && return Int(param)
-    tag == "NonnegativeConeT" && return Int(param)
-    tag == "SecondOrderConeT" && return Int(param)
-    if tag == "PSDTriangleConeT"
-        k = Int(param)                       # JSON stores the matrix side
-        return div(k * (k + 1), 2)
-    end
-    error("residual oracle supports $(_SUPPORTED) only; fixture contains $tag")
-end
-
-"""Clarabel svec index: upper triangle column-wise, diagonal per column."""
-_cl_svec_index_c(row, col) = row + div(col * (col - 1), 2)
-
-# Fresh public standard-form setup: cone construction belongs inside timing.
-function build_sdpx_program(q, A, b, cones, T::Type=Float64)
-    specs = [getproperty(SDPX, Symbol(first(keys(c))))(Int(first(values(c)))) for c in cones]
-    enabled = SDPX_BENCH_PREPROCESSING == "default"
-    return (T.(q), SparseMatrixCSC{T,Int}(A), T.(b), specs), SDPX.Settings(T;
-        verbose=false, max_threads=SDPX_BENCH_THREADS, max_iter=200, tol_gap_abs=1e-8,
-        tol_gap_rel=1e-8, tol_feas=1e-8, equilibration=enabled ? :ruiz : :off,
-        presolve_enable=enabled, chordal_decomposition_enable=enabled)
-end
-function solve_full(data, settings, T::Type=Float64)
-    return SDPX.solve_conic(data...; settings=settings, return_result=true)
-end
-
-# ---------------------------------------------------------------------------
-# cone geometry
-# ---------------------------------------------------------------------------
-
-function _psd_mat(v, k::Int)
-    M = zeros(Float64, k, k)
-    idx = 1
-    for j in 1:k, i in 1:j
-        M[i, j] = i == j ? Float64(v[idx]) : Float64(v[idx]) / sqrt(2.0)
+function psd_matrix(v, side)
+    M = zeros(Float64, side, side)
+    p = 0
+    for j in 1:side, i in 1:j
+        p += 1
+        M[i, j] = i == j ? v[p] : v[p] / sqrt(2.0)
         M[j, i] = M[i, j]
-        idx += 1
     end
-    return M
+    M
 end
 
-"""Distance of `v` to the cone product; `dual=true` evaluates dual membership
-(ZeroConeT's dual is free; the other cones here are self-dual)."""
-function cone_distance(v, cones; dual::Bool = false)
+function cone_distance(v, cones; dual=false)
     any(!isfinite, v) && return NaN
-    worst = 0.0
-    off = 0
+    off, worst = 1, 0.0
     for cone in cones
-        tag = first(keys(cone))
-        p = cone[tag]
-        L = _block_len(tag, p)
-        blk = @view v[(off + 1):(off + L)]
-        d = if tag == "ZeroConeT"
-            dual ? 0.0 : maximum(abs, blk)
+        tag, parameter = first(collect(cone))
+        len = block_length(tag, parameter)
+        block = @view v[off:off + len - 1]
+        distance = if tag == "ZeroConeT"
+            dual ? 0.0 : maximum(abs, block)
         elseif tag == "NonnegativeConeT"
-            max(0.0, -minimum(blk))
+            max(0.0, -minimum(block))
         elseif tag == "SecondOrderConeT"
-            max(0.0, norm(blk[2:end]) - blk[1])
+            max(0.0, norm(block[2:end]) - block[1])
         else
-            max(0.0, -eigmin(Symmetric(_psd_mat(blk, Int(p)))))
+            max(0.0, -minimum(eigvals(Symmetric(psd_matrix(block, Int(parameter))))))
         end
-        worst = max(worst, d)
-        off += L
+        worst = max(worst, distance)
+        off += len
     end
-    return worst
+    worst
 end
 
-# The direct public solve already returns original Clarabel row coordinates.
-phase_timings(result) = nothing
-
-"""Independent original-coordinate residuals plus the solver status and the external accuracy gate."""
-function oracle(result, q::Vector{Float64}, A::AbstractMatrix, b::Vector{Float64},
-    cones, tol::Float64; dual_sign::Float64 = 1.0)
-    x = Float64.(SDPX.value(result))
-    z = dual_sign .* Float64.(SDPX.dual(result))
-    returned_s = Float64.(SDPX.dual_slack(result))
-
-    finite = all(isfinite, x) && all(isfinite, z) && all(isfinite, returned_s)
-    s = b .- A * x
-    r_p = norm(returned_s .- s, Inf)
-    dist_k_s = cone_distance(returned_s, cones)
-    r_p_x = cone_distance(s, cones)
-    r_d = norm(A' * z .+ q, Inf)
-    dist_k_z = cone_distance(z, cones; dual = true)
-    qx = dot(q, x)
-    bz = dot(b, z)
-    gap = abs(qx + bz) / (1.0 + abs(qx))
-
-    tol_feas = tol * (1.0 + norm(b, Inf))
-    tol_dual = tol * (1.0 + norm(q, Inf))
-    residuals_ok = finite && r_p <= tol_feas && dist_k_s <= tol_feas &&
-                   r_p_x <= tol_feas && r_d <= tol_dual &&
-                   dist_k_z <= tol_dual && gap <= tol
-    solver_optimal = SDPX.status(result) in (SDPX.Optimal, :optimal)
-    return (;
-        finite,
-        status = string(SDPX.status(result)),
-        termination_reason = string(SDPX.status(result)),
-        termination_stage = "solver",
-        termination_message = string(result.status),
-        iterations = Int(SDPX.iterations(result)),
-        solver_optimal,
-        r_p,
-        dist_k_s,
-        r_p_x,
-        r_d,
-        dist_k_z,
-        gap,
-        residuals_ok,
-        pass = solver_optimal && residuals_ok,
-        tol_feas,
-        tol_dual,
-        primal_objective = Float64(SDPX.primal_objective(result)),
-        dual_objective = Float64(SDPX.dual_objective(result)),
-        solver_primal_affine_residual = Float64(SDPX.primal_residual(result)),
-        solver_dual_affine_residual = Float64(SDPX.dual_residual(result)),
-        solver_gap = Float64(SDPX.relative_gap(result)),
-        timings = phase_timings(result),
-    )
+function audit(result, q, P, A, b, cones, tol)
+    x, z, s = Float64.([_f(v) for v in result["x"]]), Float64.([_f(v) for v in result["z"]]),
+        Float64.([_f(v) for v in result["s"]])
+    finite = all(isfinite, x) && all(isfinite, z) && all(isfinite, s)
+    finite || return (pass=false, finite=false, status=string(get(result, "status", "Error")))
+    slack = b - A * x
+    rp = norm(slack - s, Inf)
+    dist_s = cone_distance(s, cones)
+    rp_x = cone_distance(slack, cones)
+    # P is serialized as an upper triangle.  Use it as the symmetric
+    # quadratic operator for stationarity and both objective values.
+    px = P * x
+    rd = norm(px + A' * z + q, Inf)
+    dist_z = cone_distance(z, cones; dual=true)
+    pxx, qx, bz = dot(x, px), dot(q, x), dot(b, z)
+    primal_objective = 0.5 * pxx + qx
+    dual_objective = -0.5 * pxx - bz
+    gap = abs(primal_objective - dual_objective) / (1.0 + abs(primal_objective))
+    tol_feas, tol_dual = tol * (1.0 + norm(b, Inf)), tol * (1.0 + norm(q, Inf))
+    status = string(get(result, "status", "Error"))
+    optimal = status in ("Solved", "Optimal", "solved", "optimal")
+    residuals_ok = all(isfinite(v) && v <= tol_feas for v in (rp, dist_s, rp_x)) &&
+        all(isfinite(v) && v <= tol_dual for v in (rd, dist_z)) && isfinite(gap) && gap <= tol
+    (pass=optimal && residuals_ok, finite=true, status=status, solver_optimal=optimal,
+        r_p=rp, dist_K_s=dist_s, r_p_x=rp_x, r_d=rd, dist_Kstar_z=dist_z,
+        gap=gap, tol_feas=tol_feas, tol_dual=tol_dual,
+        independent_primal_objective=primal_objective,
+        independent_dual_objective=dual_objective,
+        primal_objective=_f(result["objective"]), dual_objective=_f(result["dual_objective"]),
+        solver_primal_affine_residual=_f(result["primal_residual"]),
+        solver_dual_affine_residual=_f(result["dual_residual"]))
 end
 
-function _median(v::Vector{Float64})
-    isempty(v) && return NaN
-    w = sort(v)
-    n = length(w)
-    return isodd(n) ? w[(n + 1) ÷ 2] : 0.5 * (w[n ÷ 2] + w[n ÷ 2 + 1])
-end
-
-function _timings_json(t)
-    t === nothing && return "null"
-    return "{" * join(["\"$k\":" * _jj(v) for (k, v) in sort(collect(t))], ",") * "}"
-end
-
-function _run_json(rec)
-    rec.ok || return string(
-        "{\"ok\":false,\"error\":", _jj(rec.error),
-        ",\"setup_s\":null,\"solve_s\":null,\"e2e_s\":null,\"pass\":false}")
-    r = rec.oracle
-    return string(
-        "{\"ok\":true",
-        ",\"setup_s\":", _jf6(rec.setup_s),
-        ",\"solve_s\":", _jf6(rec.solve_s),
-        ",\"e2e_s\":", _jf6(rec.setup_s + rec.solve_s),
-        ",\"settings\":", rec.settings,
-        ",\"status\":", _jj(r.status),
-        ",\"termination_reason\":", _jj(r.termination_reason),
-        ",\"termination_stage\":", _jj(r.termination_stage),
-        ",\"termination_message\":", _jj(r.termination_message),
-        ",\"iterations\":", r.iterations,
-        ",\"solver_optimal\":", _jj(r.solver_optimal),
-        ",\"finite\":", _jj(r.finite),
-        ",\"r_p\":", _jfe(r.r_p),
-        ",\"dist_K_s\":", _jfe(r.dist_k_s),
-        ",\"r_p_x\":", _jfe(r.r_p_x),
-        ",\"r_d\":", _jfe(r.r_d),
-        ",\"dist_Kstar_z\":", _jfe(r.dist_k_z),
-        ",\"gap\":", _jfe(r.gap),
-        ",\"solver_primal_affine_residual\":", _jfe(r.solver_primal_affine_residual),
-        ",\"solver_dual_affine_residual\":", _jfe(r.solver_dual_affine_residual),
-        ",\"solver_gap\":", _jfe(r.solver_gap),
-        ",\"timings\":", _timings_json(r.timings),
-        ",\"pass\":", _jj(r.pass), "}",
-    )
-end
-
-function main()
-    files = String[]
-    runs = 8
-    tol = 1e-6
-    dual_sign = 1.0
-    for a in ARGS
-        if startswith(a, "--runs=")
-            runs = parse(Int, split(a, '=')[2])
-        elseif startswith(a, "--tol=")
-            tol = parse(Float64, split(a, '=')[2])
-        elseif startswith(a, "--dual-sign=")
-            dual_sign = parse(Float64, split(a, '=')[2])
-        elseif startswith(a, "--")
-            continue
-        else
-            push!(files, a)
-        end
-    end
-    isempty(files) && error("usage: sdpx_runner.jl <problem.json>... [--runs=N] [--tol=X]")
-
-    println("{\"impl\":\"SDPX Julia/Rust\",\"julia\":", _jj(string(VERSION)),
-        ",\"runs\":", runs, ",\"tol\":", tol,
-        ",\"timing\":\"fresh model build + solve per run (no reuse)\",",
-        "\"blas_selection\":", _jj(SDPX_BENCH_BLAS),
-        ",\"requested_native_threads\":", SDPX_BENCH_THREADS,
-        ",\"rayon_num_threads\":", _jj(get(ENV, "RAYON_NUM_THREADS", "unset")),
-        ",\"appleaccelerate_version\":", _jj(SDPX_BENCH_BLAS == "accelerate" ? string(Base.pkgversion(AppleAccelerate)) : nothing),
-        ",\"blas_num_threads\":", BLAS.get_num_threads(),
-        ",\"blas_config\":", _jj(string(BLAS.get_config())), "}")
-    flush(stdout)
-
-    all_pass = true
-    for f in files
-        name = replace(basename(f), ".json" => "")
-        records = []
-        t_json = NaN
-        cone_str = ""
-        n_vars = 0
-        m_rows = 0
-
+function run_input(path)
+    data = JSON.parsefile(path)
+    q, b, P, A, cones = Float64.([_f(v) for v in data["q"]]), Float64.([_f(v) for v in data["b"]]),
+        Symmetric(csc(data["P"]), :U), csc(data["A"]), data["cones"]
+    records = Any[]
+    for i in 1:requested_runs[]
+        result_path = tempname() * ".json"
+        started = time()
+        ok, err = true, nothing
         try
-            t = time()
-            q, A, b, cones = read_problem_json(f)
-            t_json = time() - t
-            n_vars = length(q)
-            m_rows = size(A, 1)
-            cone_str = join(
-                [string(first(keys(c)), ":", c[first(keys(c))]) for c in cones], ",")
-
-            for _ in 1:runs
-                try
-                    t = time()
-                    model, program = build_sdpx_program(q, A, b, cones)
-                    setup_s = time() - t
-                    t = time()
-                    res = solve_full(model, program)
-                    solve_s = time() - t
-                    push!(records, (ok = true, setup_s = setup_s, solve_s = solve_s,
-                        error = "", settings = settings_json(program, res),
-                        oracle = oracle(res, q, A, b, cones, tol;
-                            dual_sign = dual_sign)))
-                catch err
-                    push!(records, (ok = false, setup_s = NaN, solve_s = NaN,
-                        error = sprint(showerror, err), oracle = nothing))
-                end
+            argv = [cli, path, "--precision", "53", "--threads", string(threads),
+                "--quiet", "--output", result_path]
+            if requested_settings[] !== nothing
+                append!(argv, ["--settings", requested_settings[]])
             end
-        catch err
-            push!(records, (ok = false, setup_s = NaN, solve_s = NaN,
-                error = sprint(showerror, err), oracle = nothing))
+            run(Cmd(argv))
+        catch ex
+            ok, err = false, sprint(showerror, ex)
         end
-
-        ok_recs = [r for r in records if r.ok]
-        pass = !isempty(ok_recs) && all(r -> r.oracle.pass, ok_recs) &&
-               length(ok_recs) == runs
-        all_pass &= pass
-
-        e2e = [r.setup_s + r.solve_s for r in ok_recs]
-        cold_e2e = isempty(e2e) ? NaN : e2e[1]
-        warm_e2e = length(e2e) > 1 ? _median(e2e[2:end]) : NaN
-        setups = Float64[r.setup_s for r in ok_recs]
-        solves = Float64[r.solve_s for r in ok_recs]
-        cost = isempty(ok_recs) ? NaN : ok_recs[1].oracle.primal_objective
-        tol_feas = isempty(ok_recs) ? NaN : ok_recs[1].oracle.tol_feas
-        tol_dual = isempty(ok_recs) ? NaN : ok_recs[1].oracle.tol_dual
-
-        print("{\"instance\":", _jj(name), ",\"n\":", n_vars, ",\"m\":", m_rows,
-            ",\"cones\":", _jj(cone_str), ",\"runs_n\":", runs,
-            ",\"t_json_s\":", _jf6(t_json),
-            ",\"cold_e2e_s\":", _jf6(cold_e2e),
-            ",\"warm_e2e_median_s\":", _jf6(warm_e2e),
-            ",\"setup_median_s\":", _jf6(_median(setups)),
-            ",\"solve_median_s\":", _jf6(_median(solves)),
-            ",\"cost_primal\":", _jfe(cost),
-            ",\"tol_feas\":", _jfe(tol_feas),
-            ",\"tol_dual\":", _jfe(tol_dual),
-            ",\"tol_gap\":", _jfe(tol),
-            ",\"pass\":", _jj(pass), ",\"runs\":[")
-        for (i, r) in enumerate(records)
-            i > 1 && print(",")
-            print(_run_json(r))
+        cli_seconds = time() - started
+        result_available = isfile(result_path)
+        result = result_available ? JSON.parsefile(result_path) : Dict{String,Any}()
+        validation = if result_available
+            try
+                audit(result, q, P, A, b, cones, requested_tol[])
+            catch ex
+                (pass=false, finite=false, status="Error", error=sprint(showerror, ex))
+            end
+        else
+            (pass=false, finite=false, status="Error")
         end
-        println("]}")
-        flush(stdout)
+        receipt_ok = result_available && get(result, "precision_bits", 0) == 53 &&
+            get(result, "threads_requested", 0) == threads && 1 <= get(result, "cone_threads", 0) <= threads
+        pass = ok && get(validation, :pass, false) && receipt_ok
+        push!(records, Dict("run" => i, "phase" => i == 1 ? "cold" : "warm",
+            "sample_scope" => "fresh_cli_process",
+            "ok" => ok, "result_available" => result_available, "pass" => pass,
+            "status" => get(result, "status", "Error"),
+            "termination_reason" => get(result, "status", "Error"),
+            "validation" => safe(validation), "receipt_ok" => receipt_ok,
+            "native_seconds" => get(result, "native_seconds", nothing),
+            "api_seconds" => get(result, "api_seconds", nothing),
+            "load_seconds" => get(result, "load_seconds", nothing),
+            "cli_e2e_seconds" => cli_seconds, "iterations" => get(result, "iterations", nothing),
+            "settings" => get(result, "settings", Dict()), "error" => err))
+        rm(result_path, force=true)
     end
-    all_pass || exit(1)
+    result_records = [r for r in records if r["result_available"]]
+    pass = length(result_records) == requested_runs[] && all(r["ok"] && r["pass"] for r in records)
+    e2e = [r["cli_e2e_seconds"] for r in result_records]
+    warm = length(e2e) > 1 ? sort(e2e[2:end])[cld(length(e2e[2:end]), 2)] : nothing
+    Dict("instance" => splitext(basename(path))[1], "n" => length(q), "m" => length(b),
+        "runs_n" => requested_runs[], "tol" => requested_tol[], "pass" => pass,
+        "cli" => cli, "cli_sha256" => filehash(cli), "timing_scope" =>
+        "one fresh native CLI process per sample; API/native/load and CLI wall times separate",
+        "cold_cli_e2e_s" => isempty(e2e) ? nothing : e2e[1], "warm_cli_e2e_median_s" => warm,
+        "runs" => records)
 end
 
-if abspath(PROGRAM_FILE) == @__FILE__
-    main()
+files = filter(x -> !startswith(x, "--"), ARGS)
+isempty(files) && error("usage: sdpx_runner.jl INPUT.json [--runs=N] [--tol=X]")
+println(JSON.json(Dict("impl" => "SDPX native CLI", "cli" => cli,
+    "cli_sha256" => filehash(cli), "runs" => requested_runs[], "tol" => requested_tol[],
+    "settings" => requested_settings[],
+    "timing" => "one fresh native CLI process per run", "requested_native_threads" => threads,
+    "blas_selection" => blas)))
+all_pass = true
+for file in files
+    row = try run_input(file) catch ex
+        Dict("instance" => splitext(basename(file))[1], "pass" => false,
+             "error" => sprint(showerror, ex), "runs" => Any[])
+    end
+    global all_pass &= get(row, "pass", false)
+    println(JSON.json(row))
 end
+all_pass || exit(1)

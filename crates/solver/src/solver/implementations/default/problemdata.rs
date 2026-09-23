@@ -36,6 +36,10 @@ pub struct DefaultProblemData<T> {
     pub n: usize,
     /// Number of constraints
     pub m: usize,
+    /// Whether the optional operator-aware dual feasibility work scan is
+    /// enabled. Keeping this beside the prepared data lets the residual pass
+    /// avoid any extra traversal in the default global-only mode.
+    pub(crate) componentwise_enabled: bool,
     /// Equilibration data for the problem
     pub equilibration: DefaultEquilibrationData<T>,
 
@@ -171,6 +175,7 @@ where
             cones: cones_new,
             n,
             m,
+            componentwise_enabled: settings.tol_feas_componentwise.is_some(),
             equilibration,
             normq,
             normb,
@@ -496,3 +501,7 @@ where
         f()
     }
 }
+
+// Local storage consumer for the common operator and residual implementation.
+#[path = "owned_state.rs"]
+pub(crate) mod owned_state;

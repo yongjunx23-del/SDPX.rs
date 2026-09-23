@@ -344,7 +344,7 @@ fn _qdldl_new<T: FloatT>(
     // serial kernels are used whenever this rejects the symbolic pattern
     let plan = ParallelPlan::build(n, &workspace.etree, &workspace.Lnz, &L.colptr, &L.rowval);
 
-    if std::env::var_os("SDPX_PROFILE").is_some() {
+    if crate::receipt::profile_requested() {
         static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             match &plan {

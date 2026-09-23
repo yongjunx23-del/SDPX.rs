@@ -56,11 +56,21 @@ pub enum SolverError {
     JsonError(#[from] serde_json::Error),
 }
 
-impl<T> DefaultSolver<T>
-where
-    T: FloatT,
-{
-    pub fn new(
+/// Shared validated, preprocessed and equilibrated input. No iteration vectors,
+/// residual workspaces or KKT system have been allocated. Consumers resume the
+/// stopped `setup` timer while constructing their own persistent state.
+pub(crate) struct PreparedProblem<T: FloatT> {
+    pub data: DefaultProblemData<T>,
+    pub cones: CompositeCone<T>,
+    pub settings: DefaultSettings<T>,
+    pub solution: DefaultSolution<T>,
+    pub timers: Timers,
+    /// Exact raw-input identity for optional owner-cost histories.
+    pub cost_input_fingerprint: Option<[u8; 32]>,
+}
+
+impl<T: FloatT> PreparedProblem<T> {
+    pub(crate) fn new(
         P: &CscMatrix<T>,
         q: &[T],
         A: &CscMatrix<T>,
@@ -68,13 +78,40 @@ where
         cones: &[SupportedConeT<T>],
         settings: DefaultSettings<T>,
     ) -> Result<Self, SolverError> {
-        Self::new_with_setup(P, q, A, b, cones, settings, |_| {})
+        Self::new_with_cost_identity_impl(P, q, A, b, cones, settings, false)
     }
 
-    /// Construct a problem whose sampled PSD coefficients are defined by the
-    /// supplied factors. `A_linear` is zero on every described PSD row range.
+    #[cfg(feature = "serde")]
+    pub(crate) fn new_with_cost_identity(
+        P: &CscMatrix<T>,
+        q: &[T],
+        A: &CscMatrix<T>,
+        b: &[T],
+        cones: &[SupportedConeT<T>],
+        settings: DefaultSettings<T>,
+    ) -> Result<Self, SolverError> {
+        Self::new_with_cost_identity_impl(P, q, A, b, cones, settings, true)
+    }
+
+    fn new_with_cost_identity_impl(
+        P: &CscMatrix<T>,
+        q: &[T],
+        A: &CscMatrix<T>,
+        b: &[T],
+        cones: &[SupportedConeT<T>],
+        settings: DefaultSettings<T>,
+        with_identity: bool,
+    ) -> Result<Self, SolverError> {
+        #[cfg(all(feature = "sdp", feature = "serde"))]
+        let input_fingerprint =
+            with_identity.then(|| super::owned_costs::input_fingerprint(P, q, A, b, cones, None));
+        #[cfg(not(all(feature = "sdp", feature = "serde")))]
+        let input_fingerprint = None;
+        Self::new_with_setup(P, q, A, b, cones, settings, input_fingerprint, |_| {})
+    }
+
     #[cfg(feature = "sdp")]
-    pub fn new_sampled(
+    pub(crate) fn new_sampled(
         P: &CscMatrix<T>,
         q: &[T],
         A_linear: &CscMatrix<T>,
@@ -83,6 +120,49 @@ where
         blocks: Vec<SampledBlock<T>>,
         settings: DefaultSettings<T>,
     ) -> Result<Self, SolverError> {
+        Self::new_sampled_with_cost_identity_impl(P, q, A_linear, b, cones, blocks, settings, false)
+    }
+
+    #[cfg(all(feature = "serde", feature = "sdp"))]
+    pub(crate) fn new_sampled_with_cost_identity(
+        P: &CscMatrix<T>,
+        q: &[T],
+        A_linear: &CscMatrix<T>,
+        b: &[T],
+        cones: &[SupportedConeT<T>],
+        blocks: Vec<SampledBlock<T>>,
+        settings: DefaultSettings<T>,
+        with_identity: bool,
+    ) -> Result<Self, SolverError> {
+        Self::new_sampled_with_cost_identity_impl(
+            P,
+            q,
+            A_linear,
+            b,
+            cones,
+            blocks,
+            settings,
+            with_identity,
+        )
+    }
+
+    #[cfg(feature = "sdp")]
+    fn new_sampled_with_cost_identity_impl(
+        P: &CscMatrix<T>,
+        q: &[T],
+        A_linear: &CscMatrix<T>,
+        b: &[T],
+        cones: &[SupportedConeT<T>],
+        blocks: Vec<SampledBlock<T>>,
+        settings: DefaultSettings<T>,
+        with_identity: bool,
+    ) -> Result<Self, SolverError> {
+        #[cfg(feature = "serde")]
+        let input_fingerprint = with_identity.then(|| {
+            super::owned_costs::input_fingerprint(P, q, A_linear, b, cones, Some(&blocks))
+        });
+        #[cfg(not(feature = "serde"))]
+        let input_fingerprint = None;
         let mut sampled_timers = Timers::default();
         sampled_timers.start_as_current("setup");
         let operator =
@@ -107,15 +187,24 @@ where
                 ));
             }
         }
-        let A = operator.materialize();
-        let mut solver = Self::new_with_setup(P, q, &A, b, cones, settings, move |data| {
-            data.install_sampled(operator)
-        })?;
+        let A = operator
+            .materialize_checked()
+            .map_err(SolverError::SampledInput)?;
+        let mut prepared = Self::new_with_setup(
+            P,
+            q,
+            &A,
+            b,
+            cones,
+            settings,
+            input_fingerprint,
+            move |data| data.install_sampled(operator),
+        )?;
         // Include factor-input assembly in native setup time as well as the
-        // ordinary setup performed by the shared constructor.
+        // ordinary preparation performed by the shared constructor.
         sampled_timers.stop_current();
-        solver.timers = Some(sampled_timers);
-        Ok(solver)
+        prepared.timers = sampled_timers;
+        Ok(prepared)
     }
 
     fn new_with_setup(
@@ -125,29 +214,18 @@ where
         b: &[T],
         cones: &[SupportedConeT<T>],
         settings: DefaultSettings<T>,
+        input_fingerprint: Option<[u8; 32]>,
         prepare_data: impl FnOnce(&mut DefaultProblemData<T>),
     ) -> Result<Self, SolverError> {
-        //sanity check problem dimensions
         check_dimensions(P, q, A, b, cones)?;
-        //sanity check settings
         settings.validate()?;
-
         let mut timers = Timers::default();
-        let mut output;
-        let mut info = DefaultInfo::<T>::new();
-
-        timeit! {timers => "setup"; {
-
-        // user facing results go here.
+        timers.start_as_current("setup");
         let solution = DefaultSolution::<T>::new(A.n, A.m);
-
-        // presolve / chordal decomposition if needed,
-        // then take an internal copy of the problem data
         let mut data;
-        timeit!{timers => "presolve"; {
+        timeit! {timers => "presolve"; {
             data = DefaultProblemData::<T>::new(P,q,A,b,cones,&settings);
         }}
-
         let mut cones = CompositeCone::<T>::new(&data.cones);
         cones
             .configure_threads(settings.max_threads as usize)
@@ -155,58 +233,100 @@ where
                 solver: "cone workers",
                 problem: "failed to create worker pool",
             })?;
-        // Report an inconsistent reduction as an input error instead of
-        // panicking: a panic at the ABI boundary poisons the caller's handle.
         if cones.numel != data.m {
             return Err(SolverError::BadInputData(
                 "cone dimensions do not match the reduced problem",
             ));
         }
-        let variables = DefaultVariables::<T>::new(data.n,data.m);
-        let mut residuals = DefaultResiduals::<T>::new(data.n,data.m);
-
-        // equilibrate problem data immediately on setup.
-        // this prevents multiple equlibrations if solve!
-        // is called more than once.
-        timeit!{timers => "equilibration"; {
+        timeit! {timers => "equilibration"; {
             data.equilibrate(&cones,&settings);
             prepare_data(&mut data);
         }}
+        timers.stop_current();
+        Ok(Self {
+            data,
+            cones,
+            settings,
+            solution,
+            timers,
+            cost_input_fingerprint: input_fingerprint,
+        })
+    }
+}
 
+impl<T: FloatT> DefaultSolver<T> {
+    pub fn new(
+        P: &CscMatrix<T>,
+        q: &[T],
+        A: &CscMatrix<T>,
+        b: &[T],
+        cones: &[SupportedConeT<T>],
+        settings: DefaultSettings<T>,
+    ) -> Result<Self, SolverError> {
+        Self::from_prepared(PreparedProblem::new(P, q, A, b, cones, settings)?)
+    }
+
+    /// Construct a problem whose sampled PSD coefficients are defined by the
+    /// supplied factors. `A_linear` is zero on every described PSD row range.
+    #[cfg(feature = "sdp")]
+    pub fn new_sampled(
+        P: &CscMatrix<T>,
+        q: &[T],
+        A_linear: &CscMatrix<T>,
+        b: &[T],
+        cones: &[SupportedConeT<T>],
+        blocks: Vec<SampledBlock<T>>,
+        settings: DefaultSettings<T>,
+    ) -> Result<Self, SolverError> {
+        Self::from_prepared(PreparedProblem::new_sampled(
+            P, q, A_linear, b, cones, blocks, settings,
+        )?)
+    }
+
+    pub(crate) fn from_prepared(prepared: PreparedProblem<T>) -> Result<Self, SolverError> {
+        let PreparedProblem {
+            data,
+            cones,
+            settings,
+            solution,
+            mut timers,
+            cost_input_fingerprint: _,
+        } = prepared;
+        timers.start_as_current("setup");
+        let variables = DefaultVariables::<T>::new(data.n, data.m);
+        let mut residuals = DefaultResiduals::<T>::new(data.n, data.m);
         #[cfg(feature = "sdp")]
         if let Some(operator) = &data.sampled {
             residuals.sampled_workspace = Some(SampledWorkspace::new(operator));
         }
-
         residuals.prepare_sparse(&data, cones.thread_pool());
-
         let kktsystem;
-        timeit!{timers => "kktinit"; {
+        timeit! {timers => "kktinit"; {
             kktsystem = DefaultKKTSystem::<T>::new(&data,&cones,&settings);
         }}
+        let mut info = DefaultInfo::<T>::new();
         info.linsolver = kktsystem.linear_solver_info();
-
-        // work variables for assembling step direction LHS/RHS
-        let step_rhs  = DefaultVariables::<T>::new(data.n,data.m);
-        let step_lhs  = DefaultVariables::<T>::new(data.n,data.m);
-        let prev_vars = DefaultVariables::<T>::new(data.n,data.m);
-
-        // configure empty user callbacks
-
-        output = Self{
-            data,variables,residuals,kktsystem,
-            step_lhs,step_rhs,prev_vars,info,
-            solution,cones,settings,
+        let step_rhs = DefaultVariables::<T>::new(data.n, data.m);
+        let step_lhs = DefaultVariables::<T>::new(data.n, data.m);
+        let prev_vars = DefaultVariables::<T>::new(data.n, data.m);
+        let mut output = Self {
+            data,
+            variables,
+            residuals,
+            kktsystem,
+            step_lhs,
+            step_rhs,
+            prev_vars,
+            info,
+            solution,
+            cones,
+            settings,
             timers: None,
             callbacks: SolverCallbacks::default(),
-            phantom: std::marker::PhantomData };
-
-        }} //end "setup" timer.
-
-        //now that the timer is finished we can swap our
-        //timer object into the solver structure
+            phantom: std::marker::PhantomData,
+        };
+        timers.stop_current();
         output.timers.replace(timers);
-
         Ok(output)
     }
 }

@@ -2,46 +2,74 @@
 
 ## Working agreement
 
-- **Unless the user explicitly requests subagents for the current task, do not
-  use subagents.** Implement and review changes in the main agent.
-- Complete requested work and affected checks. Broad regression belongs at
-  integration milestones; documentation-only changes need document checks.
-- Preserve unrelated edits, sibling/reference repositories and licenses.
-  Commit, push and remote work must remain within the user's authorized scope.
+- Follow the [workspace delegation policy](../AGENTS.md) when independent work
+  benefits from delegation. Keep tightly coupled changes together and preserve
+  edits made by other workers in the shared checkout.
+- Give workers a concrete file ownership and acceptance check. Comparable
+  numerical timings run serially on each host; freeze benchmark sources before
+  measuring them.
+- Complete requested checks and preserve sibling/reference repositories,
+  attribution, licenses, and temporary experiment artifacts outside the repo.
 
 ## Solver contracts
 
-- Keep one Julia frontend / Rust solver / native-library architecture. Reuse
-  Clarabel.rs algorithms and mature libraries; preserve upstream attribution.
+- Keep one Rust solver with a native API, CLI, and C ABI. Julia programs in
+  this repository are independent input generators or numerical auditors; they
+  must not load a solver package or act as a frontend.
 - Preserve precision, original-coordinate outputs, accepted-iterate recovery,
-  convergence/infeasibility criteria and regularization/refinement. No looser
-  accuracy gates, mixed precision, precision-ladder warm starts, approximate rank
-  reduction or benchmark-name branches.
-- Runtime numerical checks follow Clarabel.rs. Do not restore the retired
-  independent certificate stage, status promotion or SDPX-only five-equation
-  correction gates. Tests audit returned points/rays outside solver timing.
-- Direct solves default to Ruiz, presolve and chordal decomposition. Prepared
-  handles retain Ruiz and disable structural preprocessing for q/b updates.
-  Preserve upstream reduced tolerances; AlmostSolved earns no full-accuracy credit.
-- Mutable MPFR values must own storage. Sampled factors define their operator;
-  do not replace authoritative rounded CSC data with approximate factors.
-- Prefer small typed interfaces. Check consumers before retiring code. Aim for
-  20–30k production lines, counting adapted code and implementations behind wrappers.
+  convergence/infeasibility criteria, regularization, and refinement. Do not
+  weaken accuracy gates, mix precisions, use precision-ladder warm starts, or
+  add benchmark-name branches.
+- Runtime numerical checks follow Clarabel.rs. Preserve its reduced tolerances,
+  regularization/refinement and infeasibility semantics; do not reintroduce the
+  retired independent certificate stage or status promotion. Tests and benchmark
+  audits inspect returned points and rays outside solver timing.
+- The optional `tol_feas_componentwise` dual-feasibility criterion is disabled
+  by default. Keep global checks, external gates, and `AlmostSolved` semantics.
+- Direct solves default to Ruiz, presolve, and chordal preprocessing. Prepared
+  handles retain Ruiz and disable structural preprocessing for reusable updates.
+- MPFR values must own their storage. Sampled factors define their operator;
+  do not replace authoritative factors with rounded materializations.
+- Prefer small typed interfaces and keep adapted production code focused. Aim
+  for 20–30k production lines by removing duplication, not by hiding code behind
+  wrappers or compressing formatting. Retain upstream attribution.
 
-## Evidence and task guidance
+## Fast development workflow
 
-Freeze source, dependencies and inputs before timing. Run measurements sequentially
-on each host. Record identities, precision, settings, providers, threads and failures.
-Separate native/API, cold/warm time and process memory. Retain performance changes
-with repeatable ≥2% median improvement or a justified correctness/memory benefit.
+For the active performance goal, use one representative complete E2E solve as
+the per-change acceptance: check returned status, original-coordinate
+residuals/gap, and total solve time at unchanged precision and tolerances. Build
+the CLI when needed to run that solve. Do not require focused tests, a case
+screen, repeated A/B for correctness, microbenchmarks, thread matrices, or the
+full suite at each milestone. For a performance comparison, when practical run
+frozen A/B executables sequentially in an interleaved A–B–B–A order on one
+host; concurrent solves contend for the same CPU. Keep existing test and
+benchmark tools available for other explicitly requested work.
 
-Read only the relevant entry:
-- [README](README.md): installation, API and architecture.
+```sh
+# Reuse this fast CLI build for local end-to-end checks.
+cargo build --locked --offline --profile fast -p sdpx-solver --bin sdpx \
+  --features sdp-accelerate,faer-sparse
+```
+
+Do not use the nine-case set or full workspace suite as routine gates for this
+goal. New numerical outcomes must satisfy existing status, original-coordinate
+residual, gap, and objective tolerances. Iteration count and time are diagnostics
+unless performance is the subject; do not require exact iteration/objective
+matches after a valid algorithm change. Keep known failures labeled as failures,
+and never weaken accuracy gates to make a check pass. Fix warnings in touched
+code when convenient; unrelated warnings do not block.
+
+Use `--profile fast` for development E2E and `--profile release` for performance
+E2E. Compare identical settings and report timing scope. Treat one noisy timing
+as preliminary rather than adding a repeat requirement. MOSEK/SDPB and cluster
+comparisons are later plan milestones, not per-edit checks.
+
+Read the relevant entry:
+
+- [README](README.md): native installation, API, architecture, and licenses.
 - [Review and plan](REVIEW_AND_PLAN.md): current priorities and unqualified work.
-- [sdpx-development](.agents/skills/sdpx-development/SKILL.md): build/test setup,
-  precision ownership and benchmark routing.
+- [sdpx-development](.agents/skills/sdpx-development/SKILL.md): build setup,
+  precision ownership, and benchmark routing.
 - [Benchmark protocol](benchmark/research/README.md): research experiments.
-  Use the available `ucas-hpc` skill for actual cluster work.
-
-Guidance follows OpenAI's [skills and prompts advice](https://developers.openai.com/blog/rethinking-skills-and-prompts-for-gpt-6-astra):
-keep project-specific constraints here and load operational detail on demand.
+  Use the available `ucas-hpc` skill for cluster work.

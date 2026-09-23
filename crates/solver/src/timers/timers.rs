@@ -1,15 +1,7 @@
 #![allow(missing_docs)]
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-
-cfg_if::cfg_if! {
-    if #[cfg(target_family = "wasm")] {
-        use web_time::{Duration, Instant};
-    }
-    else {
-        use std::time::{Duration, Instant};
-    }
-}
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Default)]
 struct InnerTimer {

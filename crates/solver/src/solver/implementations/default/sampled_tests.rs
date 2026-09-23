@@ -1,6 +1,7 @@
 use super::*;
-use num_traits::FromPrimitive;
-use sdpx_arithmetic::{Bits256, Bits512, MpFloat, Scalar};
+use num_traits::{FromPrimitive, One, Zero};
+use sdpx_arithmetic::{Bits256, Bits512, Bits768, MpFloat, Scalar};
+use std::sync::Arc;
 type Oracle = MpFloat<128>;
 fn lift<T: FloatT>(v: T) -> Oracle {
     // Fixtures have bounded exponents; these digits retain the complete dyadic
@@ -111,6 +112,203 @@ fn sampled_parity_512() {
     parity::<Bits512>();
 }
 
+fn exact_with_zero_sign<T: FloatT>(a: &[T], b: &[T]) {
+    assert_eq!(a, b);
+    for (&x, &y) in a.iter().zip(b) {
+        assert_eq!(x.is_zero(), y.is_zero());
+        if x.is_zero() {
+            assert_eq!(x.is_sign_negative(), y.is_sign_negative());
+        }
+    }
+}
+
+fn cache_block<T: FloatT>(row_start: usize, column_start: usize, h: usize) -> SampledBlock<T> {
+    let k = 21;
+    let basis = (0..h * k)
+        .map(|i| {
+            let value = (i as i32 % 11) - 5;
+            c::<T>(value) / c(7)
+        })
+        .collect();
+    let weights = (0..k)
+        .map(|i| {
+            if i % 5 == 0 {
+                T::zero()
+            } else {
+                c::<T>((i as i32 % 7) - 3)
+            }
+        })
+        .collect();
+    SampledBlock {
+        row_start,
+        column_start,
+        dim: 1,
+        basis_rows: h,
+        basis_cols: k,
+        basis,
+        weights,
+    }
+}
+
+fn sampled_constant_cache<T: FloatT>() {
+    let first = cache_block::<T>(0, 0, 3); // tri(3) == 6 <= 21: qq eligible.
+    let second = cache_block::<T>(first.row_count(), 21, 20); // tri(20) == 210 > 21.
+    let m = first.row_count() + second.row_count();
+    let n = 42;
+    let operator = SampledOperator::new(CscMatrix::zeros((m, n)), vec![first, second]).unwrap();
+    let cloned = operator.clone();
+    let mut serial = SampledWorkspace::new(&operator);
+    let mut pooled = SampledWorkspace::new(&operator);
+    let cloned_work = SampledWorkspace::new(&cloned);
+
+    assert_eq!(serial.blocks.len(), 2);
+    assert_eq!(
+        serial.blocks[0].constants.wdiag.get().unwrap().len(),
+        21 * tri(3)
+    );
+    assert_eq!(
+        serial.blocks[1].constants.wdiag.get().unwrap().len(),
+        21 * tri(20)
+    );
+    let constant_elements = 21 * (tri(3) + tri(20));
+    let shared_payload = constant_elements * std::mem::size_of::<T>();
+    let old_three_workspace_payload = 3 * shared_payload;
+    assert_eq!(
+        serial
+            .blocks
+            .iter()
+            .map(|b| b.constants.wdiag.get().unwrap().len())
+            .sum::<usize>()
+            * std::mem::size_of::<T>(),
+        shared_payload
+    );
+    assert_eq!(
+        old_three_workspace_payload - shared_payload,
+        2 * shared_payload
+    );
+    assert_eq!(
+        serial.blocks[0].constants.wdiag.get().unwrap().len() * std::mem::size_of::<T>(),
+        21 * tri(3) * std::mem::size_of::<T>()
+    );
+    assert!(Arc::ptr_eq(
+        &serial.blocks[0].constants,
+        &pooled.blocks[0].constants
+    ));
+    assert!(Arc::ptr_eq(
+        &serial.blocks[0].constants,
+        &cloned_work.blocks[0].constants
+    ));
+    assert!(!Arc::ptr_eq(
+        &serial.blocks[0].constants,
+        &serial.blocks[1].constants
+    ));
+    assert!(serial.blocks[0].constants.qq.get().is_none());
+    assert!(serial.blocks[1].constants.qq.get().is_none());
+
+    let x: Vec<_> = (0..n).map(|i| c::<T>((i as i32 % 9) - 4) / c(5)).collect();
+    let z: Vec<_> = (0..m)
+        .map(|i| c::<T>((i as i32 % 13) - 6) / c(11))
+        .collect();
+    let mut ys = vec![T::zero(); m];
+    let mut yp = vec![T::zero(); m];
+    operator.apply(&mut ys, &x, T::one(), T::zero(), &mut serial);
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap(),
+    );
+    operator.apply_with_pool(&mut yp, &x, T::one(), T::zero(), &mut pooled, Some(&pool));
+    exact_with_zero_sign(&ys, &yp);
+    assert!(serial.blocks[0].constants.qq.get().is_some());
+    assert!(serial.blocks[1].constants.qq.get().is_none());
+    assert_eq!(
+        serial.blocks[0].constants.qq.get().unwrap().len(),
+        21 * tri(3)
+    );
+    assert_eq!(
+        serial.blocks[0].constants.qq.get().unwrap().len() * std::mem::size_of::<T>(),
+        21 * tri(3) * std::mem::size_of::<T>()
+    );
+
+    let mut ts = vec![T::zero(); n];
+    let mut tp = vec![T::zero(); n];
+    operator.apply_transpose(&mut ts, &z, T::one(), T::zero(), &mut serial);
+    operator.apply_transpose_with_pool(&mut tp, &z, T::one(), T::zero(), &mut pooled, Some(&pool));
+    exact_with_zero_sign(&ts, &tp);
+
+    let materialized = operator.materialize();
+    let mut expected = vec![T::zero(); m];
+    materialized.gemv(&mut expected, &x, T::one(), T::zero());
+    for (&actual, &reference) in ys.iter().zip(&expected) {
+        close(actual, reference);
+    }
+
+    let wdiag_before = serial.blocks[0].constants.wdiag.get().unwrap().clone();
+    let wdiag_ptr = serial.blocks[0].constants.wdiag.get().unwrap().as_ptr();
+    let qq_before = serial.blocks[0].constants.qq.get().unwrap().clone();
+    let qq_ptr = serial.blocks[0].constants.qq.get().unwrap().as_ptr();
+    let d = vec![c::<T>(2); n];
+    let e = vec![c::<T>(3); m];
+    let mut scaled = operator;
+    scaled.scale(&d, &e);
+    assert_eq!(
+        serial.blocks[0].constants.wdiag.get().unwrap().as_ptr(),
+        wdiag_ptr
+    );
+    assert_eq!(
+        serial.blocks[0].constants.wdiag.get().unwrap(),
+        &wdiag_before
+    );
+    assert_eq!(
+        serial.blocks[0].constants.qq.get().unwrap().as_ptr(),
+        qq_ptr
+    );
+    assert_eq!(serial.blocks[0].constants.qq.get().unwrap(), &qq_before);
+    let mut scaled_y = vec![T::zero(); m];
+    scaled.apply(&mut scaled_y, &x, T::one(), T::zero(), &mut serial);
+    let scaled_materialized = scaled.materialize();
+    let mut scaled_expected = vec![T::zero(); m];
+    scaled_materialized.gemv(&mut scaled_expected, &x, T::one(), T::zero());
+    for (&actual, &reference) in scaled_y.iter().zip(&scaled_expected) {
+        close(actual, reference);
+    }
+
+    let mut different_basis = cache_block::<T>(0, 0, 3);
+    different_basis.basis[0] = c(19);
+    let different = SampledOperator::new(
+        CscMatrix::zeros((different_basis.row_count(), n)),
+        vec![different_basis],
+    )
+    .unwrap();
+    let different_work = SampledWorkspace::new(&different);
+    assert!(!Arc::ptr_eq(
+        &serial.blocks[0].constants,
+        &different_work.blocks[0].constants
+    ));
+    assert_ne!(
+        serial.blocks[0].constants.wdiag.get().unwrap(),
+        different_work.blocks[0].constants.wdiag.get().unwrap()
+    );
+}
+
+#[test]
+fn sampled_constant_cache_f64() {
+    sampled_constant_cache::<f64>();
+}
+#[test]
+fn sampled_constant_cache_256() {
+    sampled_constant_cache::<Bits256>();
+}
+#[test]
+fn sampled_constant_cache_512() {
+    sampled_constant_cache::<Bits512>();
+}
+#[test]
+fn sampled_constant_cache_768() {
+    sampled_constant_cache::<Bits768>();
+}
+
 #[test]
 fn zero_basis_columns_and_input_structure() {
     let empty = SampledBlock::<f64> {
@@ -203,9 +401,12 @@ fn schur_parity_block<T: FloatT>(b: SampledBlock<T>) {
             let expected = transformed[p]
                 .iter()
                 .zip(&transformed[q])
-                .fold(Oracle::from_i32(0).unwrap(), |sum, (&a, &b)| sum + a * b);
+                .enumerate()
+                .fold(Oracle::from_i32(0).unwrap(), |sum, (_, (&a, &b))| {
+                    sum + a * b
+                });
             oracle_close(work.entry(&b, p, q), expected);
-            assert_eq!(work.entry(&b, p, q), work.entry(&b, q, p));
+            close(work.entry(&b, p, q), work.entry(&b, q, p));
         }
     }
 }
@@ -289,6 +490,62 @@ fn primitive_offdiagonal_half_and_scaling() {
     for (&actual, &expected) in op.materialize().nzval.iter().zip(&expected.nzval) {
         close(actual, expected);
     }
+}
+
+fn sampled_adjoint_abs_matches_materialized<T: FloatT>() {
+    // The materialized view is used only as an independent small oracle here;
+    // production accuracy work walks the factors directly. The two basis
+    // columns cancel in the signed adjoint while their individual terms stay
+    // nonzero, which is the failure mode this denominator must expose.
+    let block = SampledBlock {
+        row_start: 0,
+        column_start: 0,
+        dim: 1,
+        basis_rows: 2,
+        basis_cols: 2,
+        basis: vec![c::<T>(1), c(1), c(1), c(-1)],
+        weights: vec![c(1), c(1)],
+    };
+    let op = SampledOperator::new(
+        CscMatrix::zeros((block.row_count(), block.column_count())),
+        vec![block],
+    )
+    .unwrap();
+    let z = vec![c::<T>(1), T::zero(), c(-1)];
+    let mut got = vec![T::zero(); op.dims().1];
+    let mut work = SampledWorkspace::new(&op);
+    op.add_adjoint_abs(&mut got, &z, &mut work, None);
+
+    let mut signed = vec![T::zero(); op.dims().1];
+    op.apply_transpose(&mut signed, &z, T::one(), T::zero(), &mut work);
+    assert!(signed.iter().all(|&v| v == T::zero()));
+    assert!(got.iter().all(|&v| v > T::one()));
+
+    let materialized = op.materialize();
+    let mut expected = vec![T::zero(); op.dims().1];
+    for col in 0..materialized.n {
+        for idx in materialized.colptr[col]..materialized.colptr[col + 1] {
+            expected[col] += T::abs(materialized.nzval[idx] * z[materialized.rowval[idx]]);
+        }
+    }
+    for (&actual, &want) in got.iter().zip(&expected) {
+        close(actual, want);
+    }
+}
+
+#[test]
+fn sampled_adjoint_abs_f64() {
+    sampled_adjoint_abs_matches_materialized::<f64>();
+}
+
+#[test]
+fn sampled_adjoint_abs_256() {
+    sampled_adjoint_abs_matches_materialized::<Bits256>();
+}
+
+#[test]
+fn sampled_adjoint_abs_512() {
+    sampled_adjoint_abs_matches_materialized::<Bits512>();
 }
 
 #[test]
@@ -572,9 +829,7 @@ fn pooled_dim1_operators<T: FloatT>() {
         dim: 1,
         basis_rows: 12,
         basis_cols: 8,
-        basis: (0..96)
-            .map(|i| c::<T>((i % 9) as i32 - 4) / c(6))
-            .collect(),
+        basis: (0..96).map(|i| c::<T>((i % 9) as i32 - 4) / c(6)).collect(),
         weights: (0..8).map(|i| c::<T>((i % 4) as i32 - 1) / c(3)).collect(),
     };
     let first = make(0, 0);
@@ -637,12 +892,8 @@ fn rns_dim1_leaves<T: FloatT>() {
         dim: 1,
         basis_rows: 12,
         basis_cols: 8,
-        basis: (0..96)
-            .map(|i| c::<T>((i % 9) as i32 - 4) / c(6))
-            .collect(),
-        weights: (0..8)
-            .map(|i| c::<T>((i % 4) as i32 - 1) / c(3))
-            .collect(),
+        basis: (0..96).map(|i| c::<T>((i % 9) as i32 - 4) / c(6)).collect(),
+        weights: (0..8).map(|i| c::<T>((i % 4) as i32 - 1) / c(3)).collect(),
     };
     let (h, kmax, trih) = (b.basis_rows, b.basis_cols, tri(b.basis_rows));
     let (m, n) = (1 + trih, 16);
@@ -667,15 +918,16 @@ fn rns_dim1_leaves<T: FloatT>() {
     let mut pa = Matrix::<T>::zeros((h, kmax));
 
     let z_sub = &z[b.row_start..b.row_start + trih];
+    let wdiag = w0.constants.wdiag.get().unwrap();
     let plan_a = T::rns_plan_ranges(
-        T::rns_exponent_range(&w0.wdiag).unwrap(),
+        T::rns_exponent_range(wdiag).unwrap(),
         T::rns_exponent_range(z_sub).unwrap(),
         trih,
     )
     .unwrap();
     // Production caches the constant side at full prime width
     // (`rns_encode_wide`); the dot then reads the plan's prefix.
-    let cns_a = T::rns_encode_wide(&plan_a, EncodeSide::A, &w0.wdiag).unwrap();
+    let cns_a = T::rns_encode_wide(&plan_a, EncodeSide::A, wdiag).unwrap();
     let var_a = T::rns_encode(&plan_a, EncodeSide::B, z_sub).unwrap();
     let side_a = RnsSide {
         plan: &plan_a,
@@ -687,7 +939,7 @@ fn rns_dim1_leaves<T: FloatT>() {
         adjoint_split_chunks(
             &b,
             &q,
-            &w0.wdiag,
+            wdiag,
             &z,
             T::one(),
             0..1,
@@ -706,7 +958,7 @@ fn rns_dim1_leaves<T: FloatT>() {
     let mut qq = vec![T::zero(); trih * kmax];
     for k in 0..kmax {
         for t in 0..trih {
-            qq[t * kmax + k] = w0.wdiag[k * trih + t];
+            qq[t * kmax + k] = wdiag[k * trih + t];
         }
     }
     let dvec: Vec<T> = (0..kmax)
@@ -789,13 +1041,14 @@ fn rns_dim1_perf<T: FloatT>() {
 
     // Adjoint residues.
     let z_sub = &z[..trih];
+    let wdiag = work.blocks[0].constants.wdiag.get().unwrap();
     let plan = T::rns_plan_ranges(
-        T::rns_exponent_range(&work.blocks[0].wdiag).unwrap(),
+        T::rns_exponent_range(wdiag).unwrap(),
         T::rns_exponent_range(z_sub).unwrap(),
         trih,
     )
     .unwrap();
-    let cns = T::rns_encode(&plan, EncodeSide::A, &work.blocks[0].wdiag).unwrap();
+    let cns = T::rns_encode(&plan, EncodeSide::A, wdiag).unwrap();
     let t1 = std::time::Instant::now();
     for _ in 0..reps {
         let var = T::rns_encode(&plan, EncodeSide::B, z_sub).unwrap();
@@ -803,13 +1056,18 @@ fn rns_dim1_perf<T: FloatT>() {
             acc += T::rns_dot(&plan, &cns, k * trih, 1, &var, 0, 1, trih);
         }
     }
-    eprintln!("rns adj (encode+{} dots): {:?} primes={}", kmax, t1.elapsed() / reps, plan.primes());
+    eprintln!(
+        "rns adj (encode+{} dots): {:?} primes={}",
+        kmax,
+        t1.elapsed() / reps,
+        plan.primes()
+    );
 
     // Forward residues.
     let mut qq = vec![T::zero(); trih * kmax];
     for k in 0..kmax {
         for t in 0..trih {
-            qq[t * kmax + k] = work.blocks[0].wdiag[k * trih + t];
+            qq[t * kmax + k] = wdiag[k * trih + t];
         }
     }
     let dvec: Vec<T> = (0..kmax).map(|k| b.weights[k] * x[k]).collect();
@@ -1075,10 +1333,108 @@ fn pooled_linear_products_f64() {
     pooled_linear_products::<f64>();
 }
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn pooled_linear_products_mpfr256() {
     pooled_linear_products::<Bits256>();
 }
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn pooled_linear_products_mpfr512() {
     pooled_linear_products::<Bits512>();
+}
+
+// Independent high-precision dense compositions exercise the fused sampled
+// operators, signed/zero weights, repeated bases and non-diagonal graded factors.
+fn fused_oracle<T: FloatT>() {
+    for dim in [1, 2, 3] {
+        let mut b = block::<T>(0, 0, dim);
+        b.basis[4] = b.basis[0];
+        b.basis[5] = b.basis[1];
+        let n = b.side();
+        let mut r = Matrix::<T>::zeros((n, n));
+        for j in 0..n {
+            for i in 0..n {
+                r[(i, j)] = if i == j {
+                    c::<T>(2).powi(i as i32 * 3 - 5)
+                } else {
+                    c::<T>((i as i32 - j as i32) % 3) / c::<T>(32)
+                };
+            }
+        }
+        let mut schur = SampledSchurWorkspace::new(&b);
+        schur.update_with_pool(&b, &r, None);
+        let bo = SampledBlock {
+            row_start: 0,
+            column_start: 0,
+            dim,
+            basis_rows: b.basis_rows,
+            basis_cols: b.basis_cols,
+            basis: b.basis.iter().map(|&v| lift(v)).collect(),
+            weights: b.weights.iter().map(|&v| lift(v)).collect(),
+        };
+        let op = SampledOperator::new(
+            CscMatrix::zeros((b.row_count(), b.column_count())),
+            vec![bo],
+        )
+        .unwrap();
+        let mut work = SampledWorkspace::new(&op);
+        let mut ro = Matrix::<Oracle>::zeros((n, n));
+        for j in 0..n {
+            for i in 0..n {
+                ro[(i, j)] = lift(r[(i, j)]);
+            }
+        }
+        let x: Vec<T> = (0..b.column_count())
+            .map(|i| c::<T>(i as i32 - 3) / c(8))
+            .collect();
+        let xo: Vec<_> = x.iter().map(|&v| lift(v)).collect();
+        let mut ax = vec![Oracle::zero(); b.row_count()];
+        op.apply(&mut ax, &xo, Oracle::one(), Oracle::zero(), &mut work);
+        let mut a = Matrix::<Oracle>::zeros((n, n));
+        svec_to_mat(&mut a, &ax);
+        let mut temp = Matrix::<Oracle>::zeros((n, n));
+        let mut expected = Matrix::<Oracle>::zeros((n, n));
+        temp.mul(&ro, &a, Oracle::one(), Oracle::zero());
+        expected.mul(&temp, &ro.t(), Oracle::one(), Oracle::zero());
+        let mut actual = Matrix::<T>::zeros((n, n));
+        schur.inverse_forward(&b, &x, &mut actual);
+        for (&a, &e) in actual.data().iter().zip(expected.data()) {
+            oracle_close(a, e);
+        }
+        // Adjoint accepts any symmetric half-scaled RHS U.
+        let mut u = Matrix::<T>::zeros((n, n));
+        for j in 0..n {
+            for i in 0..=j {
+                u[(i, j)] = c::<T>(i as i32 - j as i32 + 2) / c(16);
+                u[(j, i)] = u[(i, j)];
+            }
+        }
+        for j in 0..n {
+            for i in 0..n {
+                a[(i, j)] = lift(u[(i, j)]);
+            }
+        }
+        temp.mul(&ro.t(), &a, Oracle::one(), Oracle::zero());
+        expected.mul(&temp, &ro, Oracle::one(), Oracle::zero());
+        mat_to_svec(&mut ax, &expected);
+        let mut adj = vec![Oracle::zero(); b.column_count()];
+        op.apply_transpose(&mut adj, &ax, Oracle::one(), Oracle::zero(), &mut work);
+        let mut actual = vec![T::zero(); adj.len()];
+        schur.inverse_adjoint(&b, &u, &mut actual);
+        for (&a, &e) in actual.iter().zip(&adj) {
+            oracle_close(a, e);
+        }
+    }
+}
+#[test]
+fn fused_sampled_f64() {
+    fused_oracle::<f64>();
+}
+#[test]
+fn fused_sampled_256() {
+    fused_oracle::<Bits256>();
+}
+#[test]
+fn fused_sampled_512() {
+    fused_oracle::<Bits512>();
 }

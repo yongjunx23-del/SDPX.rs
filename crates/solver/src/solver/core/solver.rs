@@ -1,10 +1,8 @@
 use self::internal::*;
-use super::callbacks::{Callback, CallbackFcnFFI, TerminationCallback};
-use super::cones::Cone;
+use super::callbacks::{Callback, TerminationCallback};
 use super::{traits::*, SettingsError};
 use crate::algebra::*;
 use crate::solver::core::callbacks::SolverCallbacks;
-use crate::solver::core::ffi::*;
 #[cfg(feature = "serde")]
 use crate::solver::SolverError;
 use crate::timers::*;
@@ -89,6 +87,22 @@ enum StrategyCheckpoint {
     Fail,                    // Checkpoint found a problem but no more ScalingStrategies to try
 }
 
+impl StrategyCheckpoint {
+    fn synchronized(self) -> Self {
+        if let Some(world) = crate::mpi::World::get() {
+            let action = match self {
+                Self::NoUpdate => 0,
+                Self::Fail => 1,
+                Self::Update(scaling) => 2 + scaling as u32,
+            };
+            if !world.agree_u32(action) {
+                world.abort("inconsistent replicated solver strategy decision");
+            }
+        }
+        self
+    }
+}
+
 impl std::fmt::Display for SolverStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{self:?}")
@@ -122,7 +136,6 @@ where
 
 pub struct Solver<T, D, V, R, K, C, I, SO, SE>
 where
-    I: SolverFFI<I>,
     SE: Settings<T>,
     T: FloatT,
 {
@@ -138,7 +151,7 @@ where
     pub solution: SO,
     pub(crate) settings: SE, // not public to avoid unchecked modifications
     pub timers: Option<Timers>,
-    pub(crate) callbacks: SolverCallbacks<I, I::FFI>,
+    pub(crate) callbacks: SolverCallbacks<I>,
     pub(crate) phantom: std::marker::PhantomData<T>,
 }
 
@@ -189,14 +202,6 @@ where
         self.callbacks.termination_callback = Callback::Rust(Box::new(callback));
     }
 
-    pub fn set_termination_callback_c(
-        &mut self,
-        callback: CallbackFcnFFI<I::FFI>,
-        data_ptr: *mut std::ffi::c_void,
-    ) {
-        self.callbacks.termination_callback = Callback::new_c(callback, data_ptr);
-    }
-
     pub fn unset_termination_callback(&mut self) {
         self.callbacks.termination_callback = Callback::None;
     }
@@ -235,16 +240,18 @@ where
     V: Variables<T, D = D, R = R, C = C, SE = SE>,
     R: Residuals<T, D = D, V = V>,
     K: KKTSystem<T, D = D, V = V, C = C, SE = SE>,
-    C: Cone<T>,
+    C: ConeCollection<T>,
     I: Info<T, D = D, V = V, R = R, C = C, SE = SE>,
     SO: Solution<T, D = D, V = V, I = I, SE = SE>,
     SE: Settings<T>,
 {
     fn solve(&mut self) {
+        let _receipt_scope = crate::receipt::Scope::begin();
+        self.kktsystem.reset_solve();
         // various initializations
         // The generic curve is validated at all precisions, but its extra PSD
         // step searches regress the 512-bit Ising workload; retain the measured policy.
-        let use_curve = T::precision_bits() <= 53 && self.cones.is_symmetric();
+        let use_curve = T::precision_bits() <= 53 && self.cones.all_symmetric();
         let mut affine_direction = use_curve.then(|| self.variables.new_like());
         let mut curve_direction = use_curve.then(|| self.variables.new_like());
         let mut iter: u32 = 0;
@@ -281,7 +288,7 @@ where
         // ----------
 
         let mut scaling = {
-            if self.cones.allows_primal_dual_scaling() {ScalingStrategy::PrimalDual}
+            if self.cones.supports_primal_dual() {ScalingStrategy::PrimalDual}
             else {ScalingStrategy::Dual}
         };
 
@@ -290,7 +297,7 @@ where
             //update the residuals
             //--------------
             timeit!{timers => "residual update"; {
-            self.residuals.update_with_pool(&self.variables, &self.data, self.cones.thread_pool());
+            self.residuals.update_with_pool(&self.variables, &self.data, self.cones.worker_pool());
             }}
 
             //calculate duality gap (scaled)
@@ -309,7 +316,7 @@ where
                 &self.variables,
                 &self.residuals,
                 &timers,
-                self.cones.thread_pool());
+                self.cones.worker_pool());
             }}
 
             notimeit!{timers; {
@@ -320,16 +327,24 @@ where
             // --------------
 
             // user defined termination checks
-            if self.callbacks.check_termination(&self.info) {
+            let callback_stop = self.callbacks.check_termination(&self.info);
+            let callback_stop = crate::mpi::World::get()
+                .map_or(callback_stop, |w| !w.all_true(!callback_stop));
+            if callback_stop {
                 self.info.set_status(SolverStatus::CallbackTerminated);
                 break;
             }
             // internal termination checks
             let is_done = self.info.check_termination(&self.residuals, &self.settings, iter);
+            if let Some(world) = crate::mpi::World::get() {
+                if !world.agree_u32(self.info.get_status() as u32) {
+                    world.abort("inconsistent replicated solver termination status");
+                }
+            }
 
             // check for termination due to slow progress and update strategy
             if is_done{
-                    match self.strategy_checkpoint_insufficient_progress(scaling){
+                    match self.strategy_checkpoint_insufficient_progress(scaling).synchronized(){
                         StrategyCheckpoint::NoUpdate | StrategyCheckpoint::Fail => {break}
                         StrategyCheckpoint::Update(s) => {scaling = s; continue}
                     }
@@ -342,8 +357,10 @@ where
             timeit!{timers => "scale cones"; {
                 is_scaling_success = self.variables.scale_cones(&mut self.cones,μ,scaling);
             }}
+            let is_scaling_success = crate::mpi::World::get()
+                .map_or(is_scaling_success, |w| w.all_true(is_scaling_success));
             // check whether variables are interior points
-            match self.strategy_checkpoint_is_scaling_success(is_scaling_success,scaling){
+            match self.strategy_checkpoint_is_scaling_success(is_scaling_success,scaling).synchronized(){
                 StrategyCheckpoint::Fail => {break}
                 StrategyCheckpoint::NoUpdate => {} // we only expect NoUpdate or Fail here
                 StrategyCheckpoint::Update(_) => {unreachable!()}
@@ -353,6 +370,13 @@ where
             //iterations that produce a KKT update
             iter += 1;
 
+            // Keep the affine RHS beside the constant RHS so the KKT update
+            // can reuse the factorization and multi-RHS solve.
+            timeit!{timers => "affine rhs"; {
+            self.step_rhs
+                .affine_step_rhs(&self.residuals, &self.variables, &self.cones);
+            }}
+
             // Update the KKT system and the constant parts of its solution.
             // Keep track of the success of each step that calls KKT
             // --------------
@@ -360,15 +384,10 @@ where
             //into the KKT solvers to do that.
             let mut is_kkt_solve_success : bool;
             timeit!{timers => "kkt update"; {
-                is_kkt_solve_success = self.kktsystem.update(&self.data, &self.cones, &self.settings);
+                is_kkt_solve_success = self.kktsystem.update_affine(&self.data, &self.cones, &self.step_rhs, &self.variables, &self.settings);
             }} // end "kkt update" timer
-
-            // calculate the affine step
-            // --------------
-            timeit!{timers => "affine rhs"; {
-            self.step_rhs
-                .affine_step_rhs(&self.residuals, &self.variables, &self.cones);
-            }}
+            is_kkt_solve_success = crate::mpi::World::get()
+                .map_or(is_kkt_solve_success, |w| w.all_true(is_kkt_solve_success));
 
             timeit!{timers => "kkt solve"; {
                 is_kkt_solve_success = is_kkt_solve_success &&
@@ -382,6 +401,8 @@ where
                     &self.settings,
                 );
             }}  //end "kkt solve affine" timer
+            is_kkt_solve_success = crate::mpi::World::get()
+                .map_or(is_kkt_solve_success, |w| w.all_true(is_kkt_solve_success));
 
             // combined step only on affine step success
             if is_kkt_solve_success {
@@ -438,7 +459,9 @@ where
             }
 
             // check for numerical failure and update strategy
-            match self.strategy_checkpoint_numerical_error(is_kkt_solve_success,scaling) {
+            is_kkt_solve_success = crate::mpi::World::get()
+                .map_or(is_kkt_solve_success, |w| w.all_true(is_kkt_solve_success));
+            match self.strategy_checkpoint_numerical_error(is_kkt_solve_success,scaling).synchronized() {
                 StrategyCheckpoint::NoUpdate => {}
                 StrategyCheckpoint::Update(s) => {α = T::zero(); scaling = s; continue}
                 StrategyCheckpoint::Fail => {α = T::zero(); break}
@@ -453,19 +476,19 @@ where
             // Inspired by Hypatia curve search, using the two existing NT directions.
             // Quadratic predictor-corrector curve: t*affine + t^2*(combined-affine).
             // No new KKT solves. Trial bounds use the existing cone-interior margin.
-            if use_curve && α > T::zero() && α < (0.9).as_T() {
+            if crate::mpi::agreed_branch(use_curve && α > T::zero() && α < (0.9).as_T()) {
                 let original_alpha = α;
                 let affine = affine_direction.as_ref().unwrap();
                 let curve = curve_direction.as_mut().unwrap();
                 for fraction in [0.5, 0.25] {
                     let t = original_alpha + (T::one()-original_alpha)*T::from_f64(fraction).unwrap();
-                    if t*(T::one()-σ*t) <= T::from_f64(1.01).unwrap()*original_alpha*(T::one()-σ) {
+                    if crate::mpi::agreed_branch(t*(T::one()-σ*t) <= T::from_f64(1.01).unwrap()*original_alpha*(T::one()-σ)) {
                         continue;
                     }
                     curve.interpolate(affine, &self.step_lhs, t);
                     let bound = self.variables.calc_step_length(curve, &mut self.cones,
                         &self.settings, StepDirection::Combined);
-                    if t <= bound {
+                    if crate::mpi::agreed_branch(t <= bound) {
                         self.step_lhs.copy_from(curve);
                         α = t;
                         break;
@@ -474,7 +497,7 @@ where
             }
 
             // check for undersized step and update strategy
-            match self.strategy_checkpoint_small_step(α, scaling) {
+            match self.strategy_checkpoint_small_step(α, scaling).synchronized() {
                 StrategyCheckpoint::NoUpdate => {}
                 StrategyCheckpoint::Update(s) => {α = T::zero(); scaling = s; continue}
                 StrategyCheckpoint::Fail => {α = T::zero(); break}
@@ -486,7 +509,7 @@ where
 
             timeit!{timers => "iterate update"; {
             self.variables
-                .add_step_with_pool(&self.step_lhs, α, self.cones.thread_pool());
+                .add_step_with_pool(&self.step_lhs, α, self.cones.worker_pool());
             }}
 
         } //end loop
@@ -505,6 +528,7 @@ where
         }
 
         timeit! {timers => "post-process"; {
+            self.info.set_linear_solver_info(self.kktsystem.linear_solver_info());
             //check for "almost" convergence case and then extract solution
             self.info.post_process(&self.residuals, &self.settings);
             self.solution
@@ -515,7 +539,9 @@ where
         self.info.finalize(&mut timers);
         self.solution.finalize(&self.info);
 
-        if std::env::var_os("SDPX_PROFILE").is_some() {
+        if crate::receipt::profile_requested()
+            && crate::mpi::World::get().is_none_or(|w| w.rank() == 0)
+        {
             timers.print();
         }
 
@@ -578,15 +604,15 @@ mod internal {
         V: Variables<T, D = D, R = R, C = C, SE = SE>,
         R: Residuals<T, D = D, V = V>,
         K: KKTSystem<T, D = D, V = V, C = C, SE = SE>,
-        C: Cone<T>,
+        C: ConeCollection<T>,
         I: Info<T, D = D, V = V, R = R, C = C, SE = SE>,
         SO: Solution<T, D = D, V = V, I = I>,
         SE: Settings<T>,
     {
         fn default_start(&mut self) {
-            if self.cones.is_symmetric() {
+            if self.cones.all_symmetric() {
                 // set all scalings to identity (or zero for the zero cone)
-                self.cones.set_identity_scaling();
+                self.cones.reset_scaling();
                 // Refactor
                 self.kktsystem
                     .update(&self.data, &self.cones, &self.settings);
@@ -627,7 +653,7 @@ mod internal {
             );
 
             // additional barrier function limits for asymmetric cones
-            if !self.cones.is_symmetric()
+            if !self.cones.all_symmetric()
                 && step_direction == StepDirection::Combined
                 && scaling == ScalingStrategy::Dual
             {
@@ -667,7 +693,7 @@ mod internal {
                     .reset_to_prev_iterate(&mut self.variables, &self.prev_vars);
 
                 // If problem is asymmetric, we can try to continue with the dual-only strategy
-                if !self.cones.is_symmetric() && (scaling == ScalingStrategy::PrimalDual) {
+                if !self.cones.all_symmetric() && (scaling == ScalingStrategy::PrimalDual) {
                     self.info.set_status(SolverStatus::Unsolved);
                     output = StrategyCheckpoint::Update(ScalingStrategy::Dual);
                 } else {
@@ -688,7 +714,7 @@ mod internal {
                 output = StrategyCheckpoint::NoUpdate;
             }
             // If problem is asymmetric, we can try to continue with the dual-only strategy
-            else if !self.cones.is_symmetric() && (scaling == ScalingStrategy::PrimalDual) {
+            else if !self.cones.all_symmetric() && (scaling == ScalingStrategy::PrimalDual) {
                 output = StrategyCheckpoint::Update(ScalingStrategy::Dual);
             } else {
                 // out of tricks.  Bail out with an error
@@ -705,7 +731,7 @@ mod internal {
         ) -> StrategyCheckpoint {
             let output;
 
-            if !self.cones.is_symmetric()
+            if !self.cones.all_symmetric()
                 && scaling == ScalingStrategy::PrimalDual
                 && α < self.settings.core().min_switch_step_length
             {

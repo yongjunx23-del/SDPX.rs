@@ -8,7 +8,6 @@
 //!
 //! This is a reference and planning path. It is not yet a production kernel.
 use crate::MpFloat;
-use num_traits::One;
 use gmp_mpfr_sys::gmp;
 use std::mem::MaybeUninit;
 
@@ -75,39 +74,12 @@ impl ExactInteger {
     }
 }
 
-/// Multiply by `2^shift` using exact power-of-two doubling/halving.
+/// Multiply by `2^shift` in one exact MPFR step.
 ///
 /// Exact while the exponent stays in range, so no extra rounding is introduced
 /// beyond the destination precision already in force.
 pub fn scale_by_power_of_two<const N: usize>(v: &MpFloat<N>, shift: i64) -> MpFloat<N> {
-    let mut out = *v;
-    let two = MpFloat::<N>::one() + MpFloat::<N>::one();
-    let mut magnitude = shift.unsigned_abs();
-    // Binary exponentiation keeps this bounded for MPFR's full exponent range.
-    let mut step = 1u64;
-    let upward = shift >= 0;
-    while magnitude > 0 {
-        if magnitude & step != 0 {
-            out = if upward { out * pow2(&two, step) } else { out / pow2(&two, step) };
-            magnitude &= !step;
-        }
-        step <<= 1;
-    }
-    out
-}
-
-fn pow2<const N: usize>(two: &MpFloat<N>, exponent: u64) -> MpFloat<N> {
-    let mut result = MpFloat::<N>::one();
-    let mut base = *two;
-    let mut k = exponent;
-    while k > 0 {
-        if k & 1 == 1 {
-            result = result * base;
-        }
-        base = base * base;
-        k >>= 1;
-    }
-    result
+    v.scale_pow2(shift)
 }
 
 /// One aligned term of an exact integer image.

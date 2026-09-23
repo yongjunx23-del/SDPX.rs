@@ -1,45 +1,52 @@
 ---
 name: sdpx-development
-description: Build or validate the SDPX Rust core and Julia frontend, including precision changes and performance experiments.
+description: Build or validate the SDPX Rust core, native CLI, C ABI, precision paths, and benchmark contracts.
 ---
 
 # SDPX development
 
-Applies to the Rust-backed `SDPX` package (v0.7.0), which replaced the retired
-`SDPX.jl` package on 2026-09-18. No legacy Julia solver or physics rules apply.
-Follow [AGENTS.md](../../../AGENTS.md).
+Applies to the Rust-backed SDPX solver, native CLI, and versioned C ABI. Julia
+programs are allowed only as independent benchmark input generators or
+original-coordinate audits; there is no Julia solver frontend or package
+environment to load.
 
-## Build and checks
+## Fast development loop
 
-From the project root, use the pinned Cargo.lock. Local setup:
+For the current performance goal, use one representative complete E2E solve per
+change. Check status, original-coordinate residuals and gap at unchanged
+precision/tolerances, and record full solve time. Do not require focused tests,
+a multi-case screen, repeated A/B, microbenchmarks, a thread matrix, or the full
+suite as routine acceptance gates. Preserve known failures and never relax
+accuracy thresholds. Existing tools remain available when explicitly requested
+for another purpose.
+
+`--profile fast` uses release arithmetic with LTO disabled and parallel codegen.
+Use it for local CLI builds; use `release` only for performance numbers.
 
 ```sh
 export CARGO_HOME=/Users/xuyongjun/.local/share/sdpx-toolchain/cargo
 export RUSTUP_HOME=/Users/xuyongjun/.local/share/sdpx-toolchain/rustup
 export PATH="$CARGO_HOME/bin:$PATH"
-export JULIA_DEPOT_PATH=/Users/xuyongjun/Desktop/project/SDPX/rebuild-env-depot:$HOME/.julia
 
-cargo test --locked --offline -p sdpx-solver --features sdp-accelerate --lib FILTER
-julia --startup-file=no --project=julia/SDPX.jl -t1 --gcthreads=1 julia/SDPX.jl/test/runtests.jl
+cargo build --locked --offline --profile fast -p sdpx-solver --bin sdpx \
+  --features sdp-accelerate,faer-sparse
 ```
 
-Replace FILTER with an affected test, or use `--test NAME` for its integration
-target. Add `faer-sparse` when exercising that backend. Release-library builds
-use `-p sdpx-ffi --features sdp-accelerate,faer-sparse`; Linux uses the campaign's
-pinned BLAS feature, commonly `sdp-openblas`. Resolve a missing offline cache
-without changing lock versions.
+The `fast` binary lands in `target/fast/sdpx`; copy it out before the next
+rebuild when an immutable comparison arm is needed. Build the CLI only when
+needed for a complete E2E solve. Use `release` for quoted performance
+measurements; avoid rebuilding or rerunning unchanged E2E arms.
 
-Julia 1.12.6 is the local baseline; 1.13 is a separate compatibility leg.
-`SDPX_LIBRARY` selects the matching frozen library. Check that the environment
-loads this package rather than the sibling. CI work follows the affected
-workflow; this project currently has no `.github/workflows` directory.
+Focused tests and full suites remain available when explicitly requested, but
+they are not milestone gates for this optimization goal.
 
 ## Precision changes
 
-MPFR destinations and scratch values must have independently owned storage.
-Shallow array copies do not prove ownership. Do not change global precision or
-rounding concurrently. Check the changed modes and relevant cancellation,
-factorization residual, aliasing and reuse cases.
+MPFR destinations and scratch values must own storage. Shallow array copies do
+not prove ownership. Do not change global precision or rounding concurrently.
+For this goal, check precision preservation and the original-coordinate result
+through the representative high-precision E2E solve; do not add a per-mode test
+matrix. Decimal JSON values must reach MPFR without a Float64 intermediate.
 
 If explicitly testing sibling BFLA/MFLA providers, use separate processes and
 environments with `--gcthreads=1`; their legacy acceptance is not a prerequisite
@@ -48,13 +55,29 @@ for ordinary Rust-core changes.
 ## Benchmarks
 
 Load only the relevant driver instructions:
-- [Research library](../../../benchmark/research/README.md): fixed suites and screen/full comparisons.
-- [Float64](../../../benchmark/float64/README.md): Clarabel.rs/MOSEK adapters.
+
+- [Research library](../../../benchmark/research/README.md): fixed suites and native CLI comparisons.
+- [Float64](../../../benchmark/float64/README.md): native CLI and Clarabel/MOSEK reference adapters.
 - [MPFR](../../../benchmark/mpfr/README.md): provider kernels.
 - [Parallel](../../../benchmark/parallel/README.md): orthant/sampled diagnostics.
-- [Ising](../../../benchmark/ising/README.md): matched SDPX/SDPB acceptance.
+- [Ising](../../../benchmark/ising/README.md): matched native SDPX/SDPB acceptance.
 
-Use external immutable arms and pinned BLAS/solver budgets. Keep the evaluator
-fixed. A short screen guides development but does not establish performance parity.
-Local focused checks are allowed; actual cluster work uses `ucas-hpc` and the
-user's campaign scope. Documentation does not itself start a campaign.
+Use external immutable arms and pinned BLAS/solver budgets. Keep process,
+native/API, audit, and memory scopes separate. Documentation does not start a
+campaign. Actual cluster work follows `ucas-hpc` and the user's explicit
+campaign scope.
+
+## Performance work
+
+For an optimization, use existing evidence to choose the hotspot and run one
+matching complete solve in `release`. Keep settings identical; verify
+original-coordinate precision and report time, memory if already available,
+precision, and thread count. Use external solvers, Ising, or cluster only at the
+corresponding plan milestone. Do not require repeated timing runs; label a noisy
+single E2E measurement preliminary.
+The existing `SDP_control3` accuracy failure remains a failure; it is neither
+waived nor a routine gate for unrelated changes.
+
+Do not create a second solver or benchmark framework. Reuse sampled operators,
+cone/Arrow pools, original-coordinate audits, and the existing watchdog. Do not
+restart rejected experiments without new workload or cost evidence.

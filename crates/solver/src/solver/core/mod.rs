@@ -12,8 +12,6 @@ pub mod cones;
 pub mod kktsolvers;
 pub mod traits;
 
-pub mod ffi;
-
 //partially flatten top level pieces
 
 mod settings;

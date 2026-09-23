@@ -1,21 +1,6 @@
 #![allow(non_snake_case)]
 use crate::algebra::*;
 
-pub(crate) trait FactorEigen<T> {
-    // computes eigenvalues only (full set)
-    fn eigvals<S>(
-        &mut self,
-        A: &mut DenseStorageMatrix<S, T>,
-    ) -> Result<(), DenseFactorizationError>
-    where
-        S: AsMut<[T]> + AsRef<[T]>;
-    // computes eigenvalues and vectors (full set)
-    #[allow(dead_code)] //PJG: implemented for some future projection method
-    fn eigen<S>(&mut self, A: &mut DenseStorageMatrix<S, T>) -> Result<(), DenseFactorizationError>
-    where
-        S: AsMut<[T]> + AsRef<[T]>;
-}
-
 pub(crate) trait FactorCholesky<T> {
     // computes the Cholesky decomposition.  Only the upper
     // part of the input A will be referenced. The Cholesky factor
@@ -87,17 +72,6 @@ pub(crate) trait MultiplyGEMM<T> {
     where
         MATB: DenseMatrix<T>,
         MATA: DenseMatrix<T>;
-}
-
-// Solve AX = B.  A will be corrupted post solution, and B will be
-// overwritten with the solution X.
-#[allow(dead_code)] //PJG: not currently used anywhere
-pub(crate) trait SolveLU<T> {
-    fn lusolve(
-        &mut self,
-        A: &mut Matrix<T>,
-        B: &mut Matrix<T>,
-    ) -> Result<(), DenseFactorizationError>;
 }
 
 #[allow(dead_code)] //PJG: not currently used anywhere

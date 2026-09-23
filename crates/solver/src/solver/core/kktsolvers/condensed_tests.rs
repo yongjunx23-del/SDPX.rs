@@ -2,6 +2,156 @@ use super::*;
 use crate::solver::core::ScalingStrategy;
 use sdpx_arithmetic::Bits128;
 
+#[test]
+fn dense_panels_are_lazy_and_reused() {
+    fn check<T: FloatT>(batched: bool) {
+        let side = 8;
+        let rows = triangular_number(side);
+        let a = CscMatrix::from(&vec![vec![T::one()]; rows]);
+        let mut block = PsdBlock::new(side, &a, &(0..rows));
+        block.columns[0].schur_positions = vec![0];
+        block.Ginv = Matrix::identity(side);
+        assert!(block.mat3c.data().is_empty());
+        assert!(block.transform_lanes.is_empty());
+        let mut value = T::zero();
+        block.compute_schur(&a.nzval, |_, _, _, v| value = v);
+        assert!((value - (rows as f64).as_T()).abs() < (1e-12).as_T());
+        // The batched dense path keeps its panels in a lazily allocated lane
+        // set that is reused in place; the sampled recovery workspace stays
+        // empty so unrelated blocks never reserve it.
+        assert!(block.mat3c.data().is_empty());
+        assert_eq!(
+            block
+                .transform_lanes
+                .first()
+                .map_or(0, |panels| panels.mat2c.data().len()),
+            if batched { side * side } else { 0 }
+        );
+        let storage = block
+            .transform_lanes
+            .first()
+            .map(|panels| panels.mat2c.data().as_ptr());
+        block.compute_schur(&a.nzval, |_, _, _, v| assert_eq!(v, value));
+        assert_eq!(
+            block
+                .transform_lanes
+                .first()
+                .map(|panels| panels.mat2c.data().as_ptr()),
+            storage
+        );
+    }
+    check::<f64>(true);
+    check::<sdpx_arithmetic::Bits512>(false);
+}
+
+fn parallel_transform_lanes() -> usize {
+    use std::sync::atomic::Ordering;
+    super::PARALLEL_TRANSFORM_LANES.load(Ordering::Relaxed)
+}
+
+fn parallel_dot_lanes() -> usize {
+    use std::sync::atomic::Ordering;
+    super::PARALLEL_DOT_LANES.load(Ordering::Relaxed)
+}
+
+// The tiled dense dot must reproduce the serial store loop bit for bit, and
+// must really run more than one lane. The block needs more left columns than
+// one tile (256) for the split to trigger.
+#[test]
+fn dense_dot_tiles_match_the_serial_store_loop() {
+    let side = 8;
+    let rows = triangular_number(side);
+    let columns = 300;
+    let mut data = vec![vec![0.0; columns]; rows];
+    for c in 0..columns {
+        // Same support pattern, distinct values: keys may repeat, values must
+        // not, or the columns collapse into one representative.
+        data[c % rows][c] = 1.0 + c as f64;
+        data[(c + 7) % rows][c] = 0.5;
+    }
+    let a = CscMatrix::from(&data);
+    let mut block = PsdBlock::<f64>::new(side, &a, &(0..rows));
+    for j in 0..side {
+        for i in 0..side {
+            block.Ginv[(i, j)] = 1.0 / (1 + i + j) as f64;
+        }
+    }
+    let count = block.columns.len();
+    assert!(count > 256, "fixture must exceed one tile, got {count}");
+    for column in block.columns.iter_mut() {
+        column.schur_positions = (0..count).collect();
+    }
+    block.compute_schur(&a.nzval, |_, _, _, _| {});
+    assert!(block.dense_indices.len() > 256, "dense axis must tile");
+    let mut serial = vec![f64::NAN; triangular_number(count)];
+    block.compute_schur_selected(
+        &a.nzval,
+        false,
+        |b, a, _, v| serial[triangular_number(b) + a] = v,
+        None,
+    );
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let lanes_before = parallel_dot_lanes();
+    let mut packed = vec![f64::NAN; triangular_number(count)];
+    block.compute_schur_packed(&a.nzval, false, &mut packed, Some(&pool));
+    assert_eq!(serial, packed);
+    assert!(parallel_dot_lanes() > lanes_before);
+}
+
+// The chunk-parallel dense transform must reproduce the serial chunk loop bit
+// for bit, and must really use more than one lane for a multi-chunk block: the
+// equivalence assertion below is worthless if the pooled call kept one lane.
+#[test]
+fn dense_transform_lanes_match_the_serial_chunk_loop() {
+    let side = 8;
+    let rows = triangular_number(side);
+    let mut data = Vec::new();
+    for c in 0..2 {
+        // Two structurally distinct dense columns: every coordinate, then the
+        // even ones. Equal columns would collapse into one representative.
+        data.push(
+            (0..rows)
+                .map(|row| {
+                    if row % (c + 1) == 0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect::<Vec<f64>>(),
+        );
+    }
+    let a = CscMatrix::from(&data);
+    let mut block = PsdBlock::<f64>::new(side, &a, &(0..rows));
+    for j in 0..side {
+        for i in 0..side {
+            block.Ginv[(i, j)] = 1.0 / (1 + i + j) as f64;
+        }
+    }
+    let columns = block.columns.len();
+    assert!(columns >= 2, "fixture needs two dense columns");
+    for column in block.columns.iter_mut() {
+        column.schur_positions = (0..columns).collect();
+    }
+    // Warm the derived plans and row offsets the way an assembly does.
+    block.compute_schur(&a.nzval, |_, _, _, _| {});
+    assert!(block.dense_indices.len() >= 2, "fixture must split chunks");
+    let mut serial = vec![f64::NAN; columns];
+    block.compute_schur_selected(&a.nzval, false, |b, _, _, v| serial[b] = v, None);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let lanes_before = parallel_transform_lanes();
+    let mut pooled = vec![f64::NAN; columns];
+    block.compute_schur_selected(&a.nzval, false, |b, _, _, v| pooled[b] = v, Some(&pool));
+    assert_eq!(serial, pooled);
+    assert!(parallel_transform_lanes() > lanes_before);
+}
+
 // Repeated small PSD blocks share local column groups, while equality
 // rows touch every variable. Dimensions are deliberately generic and
 // chosen so charging a dense primal factor would reject this structure.
@@ -112,7 +262,13 @@ fn reordered_coordinates_512() {
 
 #[test]
 fn compact_panel_late_coordinates_and_changing_width() {
-    let (n, cols) = (8, 150);
+    check_compact_panel(8);
+    check_compact_panel(80);
+}
+
+fn check_compact_panel(n: usize) {
+    // The larger block exercises a full 256-row dot tile and its tail.
+    let cols = if n >= 64 { 300 } else { 150 };
     let rows = triangular_number(n);
     let mut data = vec![vec![0.; cols]; rows];
     for j in 0..cols {
@@ -152,6 +308,7 @@ fn compact_panel_late_coordinates_and_changing_width() {
                 c.sparse = j % 7 == 0;
             }
         }
+        p.coefficient_plan_valid = false;
         p.dense_vectors.fill(f64::NAN);
         let mut got = vec![f64::NAN; triangular_number(cols)];
         p.compute_schur(&a.nzval, |_, _, pos, v| got[pos] = v);
@@ -163,10 +320,15 @@ fn compact_panel_late_coordinates_and_changing_width() {
             for skip in [false, true] {
                 let mut generic = vec![f64::NAN; triangular_number(cols)];
                 let mut accelerated = generic.clone();
-                p.compute_schur_dense_impl(&a.nzval, skip, |_, _, pos, v| generic[pos] = v);
+                p.compute_schur_dense_impl(&a.nzval, skip, |_, _, pos, v| generic[pos] = v, None);
                 // SAFETY: both CPU features were checked above.
                 unsafe {
-                    p.compute_schur_dense_fma(&a.nzval, skip, |_, _, pos, v| accelerated[pos] = v);
+                    p.compute_schur_dense_fma(
+                        &a.nzval,
+                        skip,
+                        |_, _, pos, v| accelerated[pos] = v,
+                        None,
+                    );
                 }
                 for (plain, fast) in generic.iter().zip(&accelerated) {
                     assert_eq!(plain.to_bits(), fast.to_bits());
@@ -236,14 +398,16 @@ fn equal_columns_reuse_matches_explicit_congruence_and_updates() {
             }
         }
         let mut serial = vec![0.; triangular_number(cols)];
+        p.coefficient_plan_valid = false;
         let groups = std::mem::take(&mut p.column_groups);
-        p.compute_schur_selected(&A.nzval, false, |_, _, pos, v| serial[pos] = v);
+        p.compute_schur_selected(&A.nzval, false, |_, _, pos, v| serial[pos] = v, None);
         p.column_groups = groups;
+        p.coefficient_plan_valid = false;
         let mut reused = serial.clone();
         reused.fill(f64::NAN);
         // Unwritten panel cells must never be read, even across A updates.
         p.dense_vectors.fill(f64::NAN);
-        p.compute_schur_selected(&A.nzval, false, |_, _, pos, v| reused[pos] = v);
+        p.compute_schur_selected(&A.nzval, false, |_, _, pos, v| reused[pos] = v, None);
         if update == 0 {
             assert!(p.dense_indices.len() < cols / 2);
         }
@@ -294,12 +458,14 @@ fn streamed_exact_reuse<T: FloatT>() {
         if update == 1 {
             a.nzval[0] += T::one();
         }
+        p.coefficient_plan_valid = false;
         let groups = std::mem::take(&mut p.column_groups);
         let mut expected = vec![T::zero(); triangular_number(cols)];
-        p.compute_schur_selected(&a.nzval, false, |_, _, pos, v| expected[pos] = v);
+        p.compute_schur_selected(&a.nzval, false, |_, _, pos, v| expected[pos] = v, None);
         p.column_groups = groups;
+        p.coefficient_plan_valid = false;
         let mut got = vec![T::nan(); expected.len()];
-        p.compute_schur_selected(&a.nzval, false, |_, _, pos, v| got[pos] = v);
+        p.compute_schur_selected(&a.nzval, false, |_, _, pos, v| got[pos] = v, None);
         assert_eq!(got, expected);
         assert!(p.dense_indices.len() < cols / 2);
     }
@@ -396,6 +562,7 @@ fn mixed_operator<T: FloatT>() {
         SupportedConeT::SecondOrderConeT(3),
     ];
     let mut cones = CompositeCone::new(&kinds);
+
     let mut P = CscMatrix::from(&[
         [T::from_f64(3.).unwrap(), T::from_f64(0.25).unwrap()],
         [T::zero(), T::from_f64(2.).unwrap()],

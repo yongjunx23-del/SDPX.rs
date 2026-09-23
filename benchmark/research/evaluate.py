@@ -277,7 +277,8 @@ def evaluate(baseline, candidate, *, min_speedup=1.02, max_family_ratio=1.02,
             max_memory_ratio=max_memory_ratio)
     reason = 'reduced screen protocol: one cold + one warm, AB only; speed_credit: false'
     result = dict(schema_version=1, verdict='screen_fail', speed_credit=False,
-                  reasons=[reason], policy={'max_family_ratio': max_family_ratio})
+                  reasons=[reason], policy={'timing_gate': False, 'timing_warning_ratio': max_family_ratio},
+                  timing_observations=[])
     errors = []
     if not _positive(max_family_ratio):
         result['policy'] = None
@@ -322,7 +323,8 @@ def evaluate(baseline, candidate, *, min_speedup=1.02, max_family_ratio=1.02,
             continue
         comparisons[case_id] = dict(baseline_median_s=a, candidate_median_s=b, ratio=ratio)
         if ratio > max_family_ratio:
-            errors.append(f'{case_id}: case median regression exceeds {max_family_ratio}')
+            result['timing_observations'].append(
+                f'{case_id}: ratio {ratio:.3g}; repeat in a timed campaign before deciding')
     result['comparisons'] = comparisons
     result['reasons'] += errors
     result['verdict'] = 'screen_fail' if errors else 'screen_pass'

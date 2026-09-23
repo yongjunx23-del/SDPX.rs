@@ -14,6 +14,7 @@ use std::ops::Range;
 
 pub struct CompositeCone<T: FloatT = f64> {
     cones: Vec<SupportedCone<T>>,
+    local_only: bool,
 
     //Type count for each cone type
     pub(crate) type_counts: HashMap<SupportedConeTag, usize>,
@@ -39,6 +40,17 @@ impl<T> CompositeCone<T>
 where
     T: FloatT,
 {
+    /// Owner-local cones never discover or shard over the process MPI world.
+    pub(crate) fn is_local_only(&self) -> bool {
+        self.local_only
+    }
+
+    pub(crate) fn new_local(types: &[SupportedConeT<T>]) -> Self {
+        let mut cones = Self::new(types);
+        cones.local_only = true;
+        cones
+    }
+
     pub fn new(types: &[SupportedConeT<T>]) -> Self {
         // make an internal copy to protect from user modification
         let types = types.to_vec();
@@ -80,6 +92,7 @@ where
         let rng_blocks = make_rng_blocks(&cones);
 
         Self {
+            local_only: false,
             cones,
             //types,
             type_counts,
@@ -421,11 +434,11 @@ where
     /// (the only cone type worth sharding). Stateless cones still run on
     /// every rank, so the gate is identical on all ranks.
     fn mpi_world(&self) -> Option<crate::mpi::World> {
-        crate::mpi::World::get().filter(|_| {
-            self.cones
-                .iter()
-                .any(|c| Self::scaling_state_len(c) > 0)
-        })
+        if self.local_only {
+            return None;
+        }
+        crate::mpi::World::get()
+            .filter(|_| self.cones.iter().any(|c| Self::scaling_state_len(c) > 0))
     }
 
     /// Allgather packed per-cone fields over `world`. `widths[i]` is
@@ -486,9 +499,8 @@ where
         owned: &std::ops::Range<usize>,
         eval: impl Fn(usize, &mut SupportedCone<T>, std::ops::Range<usize>) -> Vec<T> + Sync,
     ) -> Vec<(usize, Vec<T>)> {
-        let mask = |i: usize, c: &SupportedCone<T>| {
-            owned.contains(&i) || Self::scaling_state_len(c) == 0
-        };
+        let mask =
+            |i: usize, c: &SupportedCone<T>| owned.contains(&i) || Self::scaling_state_len(c) == 0;
         let pool = self.threading.as_ref().map(|t| t.pool.clone());
         let (inner, paired) = self
             .threading
@@ -506,8 +518,9 @@ where
                         // Owned blocks can outnumber free workers; let heavy
                         // kernels offer inner work to the ambient pool when
                         // spare workers exist.
-                        let _inner = (inner || paired)
-                            .then(|| sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired));
+                        let _inner = (inner || paired).then(|| {
+                            sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired)
+                        });
                         (i, eval(i, c, rng[i].clone()))
                     })
                     .collect()
@@ -540,15 +553,17 @@ where
         };
         let rng = &self.rng_cones;
         let cones = &mut self.cones;
-        let update_one = |i: usize, cone: &mut SupportedCone<T>, inner: bool, paired: bool| -> bool {
-            if owned.contains(&i) || Self::scaling_state_len(cone) == 0 {
-                let _inner = (inner || paired)
-                    .then(|| sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired));
-                cone.update_scaling(&s[rng[i].clone()], &z[rng[i].clone()], μ, scaling_strategy)
-            } else {
-                true
-            }
-        };
+        let update_one =
+            |i: usize, cone: &mut SupportedCone<T>, inner: bool, paired: bool| -> bool {
+                if owned.contains(&i) || Self::scaling_state_len(cone) == 0 {
+                    let _inner = (inner || paired).then(|| {
+                        sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired)
+                    });
+                    cone.update_scaling(&s[rng[i].clone()], &z[rng[i].clone()], μ, scaling_strategy)
+                } else {
+                    true
+                }
+            };
         let (inner, paired) = self
             .threading
             .as_ref()
@@ -634,13 +649,7 @@ where
     }
 
     /// Rank-sharded `Δs_from_Δz_offset` with the same gather pattern.
-    fn Δs_sharded(
-        &mut self,
-        world: crate::mpi::World,
-        out: &mut [T],
-        ds: &[T],
-        z: &[T],
-    ) {
+    fn Δs_sharded(&mut self, world: crate::mpi::World, out: &mut [T], ds: &[T], z: &[T]) {
         let blocks = self.mpi_blocks(world);
         let owned = {
             let (b0, len) = blocks[world.rank()];
@@ -908,11 +917,7 @@ where
             if widths[i] > 0 {
                 if prepared {
                     let n = this.rng_cones[i].len();
-                    writes.push((
-                        i,
-                        data[..n].to_vec(),
-                        data[n..2 * n].to_vec(),
-                    ));
+                    writes.push((i, data[..n].to_vec(), data[n..2 * n].to_vec()));
                 }
                 this.sym_step_bounds[i] = (data[widths[i] - 2], data[widths[i] - 1]);
             } else {

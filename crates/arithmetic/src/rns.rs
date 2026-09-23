@@ -310,6 +310,13 @@ thread_local! {
 }
 
 impl RnsPlan {
+    /// Cheap necessary condition for `profitable`. Call before scanning
+    /// operands or locking the shared tables; true still requires the full
+    /// exponent-window and amortization checks.
+    pub fn worth_planning(terms: usize, outputs: usize) -> bool {
+        terms >= 24 && outputs != 0
+    }
+
     /// Build a plan for `sum over `terms` products of `a`-by-`b` elements.
     ///
     /// Returns `None` when any value is non-finite or the combined exponent
@@ -389,7 +396,7 @@ impl RnsPlan {
         encode_elems: usize,
         limbs: usize,
     ) -> bool {
-        if terms < 24 || outputs == 0 {
+        if !Self::worth_planning(terms, outputs) {
             return false;
         }
         let k = self.tables.primes.len() as f64;
@@ -822,7 +829,8 @@ mod tests {
     }
 
     use super::*;
-    use crate::{exact_product, Bits256, Bits512, Scalar};
+    use crate::integer::exact_product;
+    use crate::{Bits256, Bits512, Scalar};
     use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
 
     fn dot_mpfr<const N: usize>(a: &[MpFloat<N>], b: &[MpFloat<N>]) -> MpFloat<N> {
@@ -852,7 +860,7 @@ mod tests {
         let res = plan.dot_residues(&ra, 0, 1, &rb, 0, 1, 1);
         eprintln!("res={:?}", &res[..8.min(res.len())]);
         let got: Bits512 = plan.reconstruct(&res);
-        let want = crate::exact_product(&a, &b).unwrap().to_mpfloat::<8>();
+        let want = exact_product(&a, &b).unwrap().to_mpfloat::<8>();
         eprintln!("got={got} want={want}");
         assert_eq!(got, want);
     }

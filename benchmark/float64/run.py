@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Reuse the retained sequential watchdog and original-coordinate reference runners."""
+"""Run retained reference legs under the sequential watchdog.
+
+The former ``--engine new`` SDPX frontend leg is retired.  Native SDPX
+research comparisons use ``benchmark/research/run.py pair`` with an explicit
+``cli`` arm configuration; this wrapper remains for Clarabel/MOSEK reference
+measurements only.
+"""
 import argparse
 import hashlib
 import importlib.util
@@ -138,32 +144,21 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--reference', type=Path, required=True,
                    help='retained final-selection directory')
-    p.add_argument('--engine', choices=['new', 'old', 'rust_clarabel', 'mosek'], required=True)
+    p.add_argument('--engine', choices=['rust_clarabel', 'mosek'], required=True)
     p.add_argument('--reference-arm', choices=['reference_default', 'controlled'],
                    help='Clarabel.rs preprocessing; defaults on, controlled disables it explicitly')
-    p.add_argument('--sdpx-arm', choices=['default', 'controlled'],
-                   help='new SDPX preprocessing; defaults on, controlled disables it explicitly')
-    p.add_argument('--threads', type=int, choices=[1, 2, 4, 8], default=1,
-                   help='new candidate cone/KKT budget; references support only 1')
+    p.add_argument('--threads', type=int, choices=[1], default=1,
+                   help='reference legs are fixed to one solver thread')
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--native-highwater', action='store_true',
                    help='add OS child high-water RSS; retain sampled process-group watchdog')
-    p.add_argument('--project-source', type=Path,
-                   help='frozen new project root including crates/native sources')
     args, forwarded = p.parse_known_args()
     if args.reference_arm is not None and args.engine != 'rust_clarabel':
         p.error('--reference-arm applies only to --engine rust_clarabel')
-    if args.sdpx_arm is not None and args.engine != 'new':
-        p.error('--sdpx-arm applies only to --engine new')
-    if args.engine == 'new':
-        args.sdpx_arm = args.sdpx_arm or 'default'
-        os.environ['SDPX_BENCH_PREPROCESSING'] = args.sdpx_arm
     if args.engine == 'rust_clarabel':
         # An inherited controlled-arm environment must not disable product defaults.
         args.reference_arm = args.reference_arm or 'reference_default'
         os.environ['SDPX_RUST_ARM'] = args.reference_arm
-    if args.engine != 'new' and args.threads != 1:
-        p.error('--threads greater than 1 is supported only for --engine new')
     if args.native_highwater and (not hasattr(os, 'wait4') or sys.platform not in ('darwin', 'linux')):
         p.error('--native-highwater requires wait4 on macOS or Linux')
     os.environ['SDPX_BENCH_THREADS'] = str(args.threads)
@@ -191,16 +186,7 @@ def main():
         suite.run_owned = with_native_highwater(suite.run_owned)
     # Fingerprint this wrapper and adapter in addition to retained reference code.
     extra = ['--rust-source', str(HERE)]
-    if args.engine == 'new':
-        if args.project_source is None or not args.project_source.is_dir():
-            p.error('--project-source must identify the frozen new project')
-        library = Path(os.environ.get('SDPX_LIBRARY', ''))
-        if not library.is_file():
-            p.error('set SDPX_LIBRARY to the exact frozen native shared library')
-        suite.RUNNER = HERE
-        extra += ['--rust-source', str(args.project_source.resolve()),
-                  '--rust-source', str(library.resolve())]
-    leg = 'sdpx' if args.engine in ('new', 'old') else args.engine
+    leg = args.engine
     sys.argv = [str(ref / 'adapters/run_suite.py'), *forwarded, *extra,
                 '--output', str(args.output),
                 '--data', str(ref / 'data'), '--legs', leg, '--selection', 'full',
@@ -215,14 +201,8 @@ def main():
     metadata_path = args.output / 'run_metadata.json'
     metadata = json.loads(metadata_path.read_text())
     metadata['reference_arm'] = args.reference_arm
-    metadata['sdpx_arm'] = args.sdpx_arm
     if args.engine == 'rust_clarabel':
         enabled = args.reference_arm == 'reference_default'
-        metadata['requested_preprocessing'] = dict(
-            equilibrate_enable=enabled, presolve_enable=enabled,
-            chordal_decomposition_enable=enabled)
-    elif args.engine == 'new':
-        enabled = args.sdpx_arm == 'default'
         metadata['requested_preprocessing'] = dict(
             equilibrate_enable=enabled, presolve_enable=enabled,
             chordal_decomposition_enable=enabled)

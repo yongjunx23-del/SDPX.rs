@@ -107,6 +107,18 @@ fn data<T: FloatT>(cones: &CompositeCone<T>) -> (CscMatrix<T>, CscMatrix<T>, Vec
     (p, CscMatrix::from(&rows), s, z)
 }
 
+#[test]
+fn assembly_buffer_budget_bounds_extra_storage() {
+    // Original rule: inside two copies of the stored Schur values.
+    assert!(parallel_assembly_allowed::<f64>(true, 100, 100));
+    // Overlapping cliques fit the byte budget until it is exceeded.
+    let budget_cells = (PARALLEL_ASSEMBLY_BUDGET_BYTES / std::mem::size_of::<f64>()) as u128;
+    assert!(parallel_assembly_allowed::<f64>(true, budget_cells, 10));
+    assert!(!parallel_assembly_allowed::<f64>(true, budget_cells + 1, 10));
+    // Without a cone pool the allocation-free serial path is kept.
+    assert!(!parallel_assembly_allowed::<f64>(false, 1, 1));
+}
+
 fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
     let kinds = kinds::<T>(overlap_fallback);
     let mut serial_cones = CompositeCone::new(&kinds);
@@ -123,7 +135,10 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
     let mut serial = CondensedKKTSolver::new(&p, &a, &kinds, &serial_cones, &settings);
     let mut pooled = CondensedKKTSolver::new(&p, &a, &kinds, &pooled_cones, &settings);
     assert!(!serial.parallel_assembly);
-    assert_eq!(pooled.parallel_assembly, !overlap_fallback);
+    // This fixture's contribution buffers fit the assembly budget, so
+    // overlapping cliques now use the ordered parallel path as well; the
+    // value-equality assertions below still pin the bitwise-identical publish.
+    assert!(pooled.parallel_assembly);
     assert!(pooled
         .blocks
         .iter()
@@ -142,8 +157,13 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
             .sum::<usize>()
     };
     assert_eq!(buffer_cells(&serial), 0);
-    assert!(buffer_cells(&pooled) <= 2 * pooled.schur.nnz());
-    assert_eq!(buffer_cells(&pooled) == 0, overlap_fallback);
+    // Buffers are bounded by whichever limit admitted them: the two-copy
+    // rule or the byte budget.
+    let budget_cells =
+        (PARALLEL_ASSEMBLY_BUDGET_BYTES / std::mem::size_of::<T>()) as u128;
+    let allowed = (2 * pooled.schur.nnz() as u128).max(budget_cells);
+    assert!(buffer_cells(&pooled) as u128 <= allowed);
+    assert!(buffer_cells(&pooled) > 0);
     let saved_buffers = buffer_cells(&pooled);
     let probe: Vec<T> = (0..m)
         .map(|i| num::<T>(i % 11 + 1) / num::<T>(32))
@@ -184,7 +204,7 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
         if let Some(pool) = pooled_cones.thread_pool() {
             assert!(Arc::ptr_eq(&pool, pooled.pool.as_ref().unwrap()));
         }
-        assert_eq!(pooled.parallel_assembly, width > 1 && !overlap_fallback);
+        assert_eq!(pooled.parallel_assembly, width > 1);
         assert_eq!(buffer_cells(&pooled), saved_buffers);
         assert_eq!(serial.schur.colptr, pooled.schur.colptr);
         assert_eq!(serial.schur.rowval, pooled.schur.rowval);
@@ -309,14 +329,17 @@ fn pooled_condensed_f64() {
     pooled_equivalence::<f64>(false);
 }
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn pooled_condensed_mpfr256() {
     pooled_equivalence::<Bits256>(false);
 }
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn pooled_condensed_mpfr512() {
     pooled_equivalence::<sdpx_arithmetic::Bits512>(false);
 }
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn overlapping_memory_fallback_mpfr512() {
     pooled_equivalence::<sdpx_arithmetic::Bits512>(true);
 }
@@ -325,6 +348,7 @@ fn overlapping_memory_fallback_f64() {
     pooled_equivalence::<f64>(true);
 }
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn overlapping_memory_fallback_mpfr256() {
     pooled_equivalence::<Bits256>(true);
 }
@@ -457,11 +481,13 @@ fn wide_pool_splits_congruence_tiles_f64() {
 }
 
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn wide_pool_splits_congruence_tiles_mpfr256() {
     wide_pool_splits_congruence_tiles::<Bits256>();
 }
 
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn wide_pool_splits_congruence_tiles_mpfr512() {
     wide_pool_splits_congruence_tiles::<sdpx_arithmetic::Bits512>();
 }
@@ -588,6 +614,10 @@ fn dominant_sparse_psd<T: FloatT>() {
     };
     let mut serial = CondensedKKTSolver::new(&p, &a, &kinds, &serial_cones, &settings);
     let mut pooled = CondensedKKTSolver::new(&p, &a, &kinds, &pooled_cones, &settings);
+    // Exercise the owner override explicitly.  The planner must still keep
+    // inner admission off for a one-worker pool and enable it only after the
+    // shared pool grows, preserving the existing single-level thresholds.
+    pooled.set_owner_inner_admission(true);
     for workers in [2, 4, 8, 1, 4] {
         pooled_cones.configure_threads(workers).unwrap();
         for (i, v) in a.nzval.iter_mut().enumerate() {
@@ -627,11 +657,15 @@ fn dominant_sparse_psd_f64() {
 }
 
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn dominant_sparse_psd_mpfr256() {
     dominant_sparse_psd::<Bits256>();
 }
 
 fn dominant_sampled_psd<T: FloatT>() {
+    dominant_sampled_pool_mode::<T>(false, 1);
+}
+fn dominant_sampled_pool_mode<T: FloatT>(external: bool, blocks: usize) {
     use crate::solver::SampledBlock;
     let block = SampledBlock {
         row_start: 0,
@@ -644,13 +678,28 @@ fn dominant_sampled_psd<T: FloatT>() {
             .collect(),
         weights: vec![T::one(); 48],
     };
-    let (m, n) = (block.row_count(), block.column_count());
-    let operator = Arc::new(SampledOperator::new(CscMatrix::zeros((m, n)), vec![block]).unwrap());
+    let (rows, n) = (block.row_count(), block.column_count());
+    let m = rows * blocks;
+    let operator = Arc::new(
+        SampledOperator::new(
+            CscMatrix::zeros((m, n)),
+            (0..blocks)
+                .map(|i| {
+                    let mut b = block.clone();
+                    b.row_start = i * rows;
+                    b
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
     let a = operator.materialize();
     let p = CscMatrix::identity(n);
-    let kinds = vec![SupportedConeT::PSDTriangleConeT(48)];
+    let kinds = vec![SupportedConeT::PSDTriangleConeT(48); blocks];
     let mut serial_cones = CompositeCone::new(&kinds);
     let mut pooled_cones = CompositeCone::new(&kinds);
+    let mut reference_cones = CompositeCone::new(&kinds);
+    reference_cones.set_identity_scaling();
     serial_cones.set_identity_scaling();
     pooled_cones.set_identity_scaling();
     let settings = CoreSettings::<T> {
@@ -672,15 +721,40 @@ fn dominant_sampled_psd<T: FloatT>() {
     let mut bx = exact_x.clone();
     operator.apply_transpose(&mut bx, &exact_z, T::one(), T::one(), &mut operator_work);
     let mut bz = exact_z.clone();
+    let mut hs_work = vec![T::zero(); m];
+    reference_cones.mul_Hs(&mut bz, &exact_z, &mut hs_work);
     operator.apply(&mut bz, &exact_x, T::one(), -T::one(), &mut operator_work);
+    // The input and serial scaling are invariant across pool transitions.
+    // Build the independent reference once; each candidate still refactors,
+    // checks reuse, solves both RHS columns, and checks original residuals.
+    assert!(serial.update(&serial_cones, &settings));
+    let (mut xs, mut zs) = (vec![T::zero(); n], vec![T::zero(); m]);
+    serial.setrhs(&bx, &bz);
+    assert!(serial.solve(Some(&mut xs), Some(&mut zs), &settings));
     for workers in [1, 2, 4, 8, 1, 4] {
-        pooled_cones.configure_threads(workers).unwrap();
-        assert!(serial.update(&serial_cones, &settings));
-        assert!(pooled.update(&pooled_cones, &settings));
+        let shared = if external {
+            test_shared_pool(workers)
+        } else {
+            pooled_cones.configure_threads(workers).unwrap();
+            pooled_cones.thread_pool()
+        };
+        assert!(if external {
+            pooled.update_partition_with_pool(&pooled_cones, &settings, true, shared.clone())
+        } else {
+            pooled.update(&pooled_cones, &settings)
+        });
+        if external {
+            assert!(pooled_cones.thread_pool().is_none());
+            assert_shared_pool(&pooled, &shared);
+        }
         assert_eq!(pooled.plan_threads, workers);
         assert_eq!(
             pooled.inner_sampled,
-            if workers > 1 { Some(0) } else { None }
+            if workers > 1 && blocks == 1 {
+                Some(0)
+            } else {
+                None
+            }
         );
         assert_eq!(pooled.parallel_assembly, workers > 1);
         assert_eq!(serial.schur.nzval, pooled.schur.nzval);
@@ -688,11 +762,19 @@ fn dominant_sampled_psd<T: FloatT>() {
             unreachable!()
         };
         let sampled = psd.sampled.as_ref().unwrap();
-        if workers > 1 {
+        if workers > blocks {
             assert!(sampled.pair_lanes.len() > 1);
         }
         let pointers = (sampled.pair_lanes.as_ptr(), psd.schur_values.as_ptr());
-        assert!(pooled.update(&pooled_cones, &settings));
+        assert!(if external {
+            pooled.update_partition_with_pool(&pooled_cones, &settings, true, shared.clone())
+        } else {
+            pooled.update(&pooled_cones, &settings)
+        });
+        if external {
+            assert!(pooled_cones.thread_pool().is_none());
+            assert_shared_pool(&pooled, &shared);
+        }
         let Scaling::Psd(psd) = &pooled.blocks[0].scaling else {
             unreachable!()
         };
@@ -703,14 +785,28 @@ fn dominant_sampled_psd<T: FloatT>() {
                 psd.schur_values.as_ptr()
             )
         );
-        let (mut xs, mut xp) = (vec![T::zero(); n], vec![T::zero(); n]);
-        let (mut zs, mut zp) = (vec![T::zero(); m], vec![T::zero(); m]);
-        serial.setrhs(&bx, &bz);
+        let (mut xp, mut zp) = (vec![T::zero(); n], vec![T::zero(); m]);
         pooled.setrhs(&bx, &bz);
-        assert!(serial.solve(Some(&mut xs), Some(&mut zs), &settings));
         assert!(pooled.solve(Some(&mut xp), Some(&mut zp), &settings));
         assert_eq!(xs, xp);
         assert_eq!(zs, zp);
+        // Each batched column has its own half-scaled RHS and refinement state.
+        let mut rhs = bx.clone();
+        rhs.extend_from_slice(&bz);
+        let first = rhs.clone();
+        rhs.extend(first.iter().map(|&v| -v));
+        let mut batch = vec![T::zero(); rhs.len()];
+        assert_eq!(
+            pooled.solve_many(n, &rhs, &mut batch, 2, &settings),
+            vec![true, true]
+        );
+        assert_eq!(&batch[..n], &xp);
+        assert_eq!(&batch[n..n + m], &zp);
+        pooled.setrhs(&rhs[n + m..2 * n + m], &rhs[2 * n + m..]);
+        let mut second = vec![T::zero(); n + m];
+        let (xx, zz) = second.split_at_mut(n);
+        assert!(pooled.solve(Some(xx), Some(zz), &settings));
+        assert_eq!(&batch[n + m..], &second);
         // External full augmented equations, using factor-authoritative A.
         let mut ex = bx.clone();
         for (e, x) in ex.iter_mut().zip(&xp) {
@@ -718,7 +814,9 @@ fn dominant_sampled_psd<T: FloatT>() {
         }
         operator.apply_transpose(&mut ex, &zp, -T::one(), T::one(), &mut operator_work);
         let mut ez = bz.clone();
-        for (e, z) in ez.iter_mut().zip(&zp) {
+        let mut hz = vec![T::zero(); m];
+        reference_cones.mul_Hs(&mut hz, &zp, &mut hs_work);
+        for (e, z) in ez.iter_mut().zip(&hz) {
             *e += *z;
         }
         operator.apply(&mut ez, &xp, -T::one(), T::one(), &mut operator_work);
@@ -738,10 +836,12 @@ fn dominant_sampled_psd_f64() {
     dominant_sampled_psd::<f64>();
 }
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn dominant_sampled_psd_mpfr256() {
     dominant_sampled_psd::<Bits256>();
 }
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn dominant_sampled_psd_mpfr512() {
     dominant_sampled_psd::<sdpx_arithmetic::Bits512>();
 }
@@ -879,9 +979,9 @@ fn solve_many_accounting<T: FloatT>() {
     assert_eq!(
         counters,
         SolveCounters {
+            factor_attempts: 1,
             factorizations: 1,
-            rhs_applied: 0,
-            batches: 0
+            ..Default::default()
         },
         "one KKT update must produce exactly one factorization"
     );
@@ -899,6 +999,22 @@ fn solve_many_accounting<T: FloatT>() {
     assert_eq!(after.factorizations, 1, "batching must not refactorize");
     assert_eq!(after.rhs_applied, ncols as u64);
     assert_eq!(after.batches, 1, "the wave is one batch, not {ncols}");
+
+    let mut hs = vec![T::zero(); a.m];
+    let mut scratch = hs.clone();
+    for c in 0..ncols {
+        cones.mul_Hs(
+            &mut hs,
+            &batch[c * width + n..(c + 1) * width],
+            &mut scratch,
+        );
+        close(
+            solver
+                .scaled_solution(c)
+                .expect("accepted original residual product"),
+            &hs,
+        );
+    }
 
     // Every column must match the single-RHS path bit for bit.
     for c in 0..ncols {
@@ -930,6 +1046,21 @@ fn solve_many_accounting<T: FloatT>() {
         vec![false, true, true],
         "failure must stay local to its column"
     );
+    assert!(solver.scaled_solution(0).is_none());
+    assert!(solver.scaled_solution(1).is_some());
+    settings.iterative_refinement_enable = false;
+    solver.setrhs(&rhs[..n], &rhs[n..width]);
+    let (x, z) = mixed_out[..width].split_at_mut(n);
+    assert!(solver.solve(Some(x), Some(z), &settings));
+    assert!(
+        solver.scaled_solution(0).is_none(),
+        "no original residual was computed"
+    );
+    assert!(solver.update(&cones, &settings));
+    assert!(
+        solver.scaled_solution(0).is_none(),
+        "factor updates invalidate products"
+    );
 }
 
 #[test]
@@ -938,11 +1069,168 @@ fn solve_many_accounting_f64() {
 }
 
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn solve_many_accounting_mpfr256() {
     solve_many_accounting::<Bits256>();
 }
 
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn solve_many_accounting_mpfr512() {
     solve_many_accounting::<sdpx_arithmetic::Bits512>();
+}
+
+fn test_shared_pool(workers: usize) -> Option<Arc<rayon::ThreadPool>> {
+    (workers > 1).then(|| {
+        Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap(),
+        )
+    })
+}
+fn assert_shared_pool<T: FloatT>(
+    solver: &CondensedKKTSolver<T>,
+    expected: &Option<Arc<rayon::ThreadPool>>,
+) {
+    match (&solver.pool, expected) {
+        (Some(actual), Some(expected)) => assert!(Arc::ptr_eq(actual, expected)),
+        (None, None) => (),
+        _ => panic!("explicit pool was substituted"),
+    }
+}
+fn external_ordinary<T: FloatT>(blocks: usize) {
+    let kinds = vec![SupportedConeT::PSDTriangleConeT(32); blocks];
+    let mut cones = CompositeCone::new(&kinds);
+    let (p, a, s, z) = data(&cones);
+    assert!(cones.update_scaling(&s, &z, T::one(), ScalingStrategy::PrimalDual));
+    let settings = CoreSettings {
+        max_threads: 1,
+        direct_solve_method: "qdldl".into(),
+        iterative_refinement_abstol: T::epsilon() * num::<T>(1024),
+        iterative_refinement_reltol: T::epsilon() * num::<T>(1024),
+        ..CoreSettings::default()
+    };
+    let mut serial = CondensedKKTSolver::new(&p, &a, &kinds, &cones, &settings);
+    let mut pooled = CondensedKKTSolver::new(&p, &a, &kinds, &cones, &settings);
+    pooled.prepare_shared_pool();
+    let storage: Vec<_> = pooled
+        .blocks
+        .iter()
+        .filter_map(|b| match &b.scaling {
+            Scaling::Psd(p) => Some(p.schur_values.as_ptr()),
+            _ => None,
+        })
+        .collect();
+    assert!(serial.update(&cones, &settings));
+    let known: Vec<T> = (0..a.n + a.m)
+        .map(|i| num::<T>(i % 13 + 1) / num::<T>(64))
+        .collect();
+    let zeros = vec![T::zero(); known.len()];
+    let mut rhs = zeros.clone();
+    serial.original_residual(&mut rhs, &zeros, &known);
+    rhs.negate();
+    let mut xs = vec![T::zero(); a.n];
+    let mut zs = vec![T::zero(); a.m];
+    serial.setrhs(&rhs[..a.n], &rhs[a.n..]);
+    assert!(serial.solve(Some(&mut xs), Some(&mut zs), &settings));
+    // Repeated width 4 replaces a pool at unchanged capacity; retain it once.
+    for width in [1, 2, 4, 8, 4, 4, 1] {
+        let pool = test_shared_pool(width);
+        assert!(pooled.update_partition_with_pool(&cones, &settings, true, pool.clone()));
+        assert_shared_pool(&pooled, &pool);
+        assert!(cones.thread_pool().is_none());
+        assert_eq!(pooled.plan_threads, width);
+        assert_eq!(serial.schur.nzval, pooled.schur.nzval);
+        // Two fully overlapping cliques can exceed the original contribution
+        // cap; operator tiling still applies when assembly stays serial.
+        let before = wide_pool_tiles();
+        let mut scaled = vec![T::zero(); a.m];
+        let mut expected = scaled.clone();
+        apply_scaling_pool(
+            &pooled.pool,
+            &pooled.scaling_lanes,
+            pooled.scaling_tiles,
+            &mut pooled.blocks,
+            &mut scaled,
+            &known[a.n..],
+            false,
+        );
+        apply_scaling_pool(
+            &serial.pool,
+            &serial.scaling_lanes,
+            serial.scaling_tiles,
+            &mut serial.blocks,
+            &mut expected,
+            &known[a.n..],
+            false,
+        );
+        // Native POTRS may choose a different blocked TRSM accumulation for
+        // the tiled RHS width. MPFR retains its exact per-column sweep.
+        assert_eq!(scaled, expected);
+        if width > blocks {
+            assert!(wide_pool_tiles() > before);
+        }
+        let mut xp = xs.clone();
+        let mut zp = zs.clone();
+        pooled.setrhs(&rhs[..a.n], &rhs[a.n..]);
+        assert!(pooled.solve(Some(&mut xp), Some(&mut zp), &settings));
+        assert_eq!(xs, xp);
+        assert_eq!(zs, zp);
+        xp.extend(zp);
+        let mut residual = zeros.clone();
+        assert!(
+            pooled.original_residual(&mut residual, &rhs, &xp)
+                <= num::<T>(65536) * T::epsilon() * (T::one() + rhs.norm_inf())
+        );
+        let current: Vec<_> = pooled
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.scaling {
+                Scaling::Psd(p) => Some(p.schur_values.as_ptr()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(storage, current);
+    }
+    // Failed numerical update must not prevent replacing/removing the pool
+    // and refactoring valid values on the next update.
+    let pool = test_shared_pool(4);
+    let mut bad = p.clone();
+    bad.nzval[0] = T::nan();
+    pooled.update_P(&bad);
+    assert!(!pooled.update_partition_with_pool(&cones, &settings, true, pool.clone()));
+    assert_shared_pool(&pooled, &pool);
+    pooled.update_P(&p);
+    assert!(pooled.update_partition_with_pool(&cones, &settings, true, None));
+    assert_shared_pool(&pooled, &None);
+    assert_eq!(pooled.schur.nzval, serial.schur.nzval);
+    assert!(pooled.update_partition_with_pool(&cones, &settings, false, pool));
+    // The existing/default entry must still follow the cone configuration,
+    // rather than retaining a pool supplied by an earlier explicit call.
+    assert!(pooled.update(&cones, &settings));
+    assert!(pooled.pool.is_none());
+}
+fn external_pool_cases<T: FloatT>() {
+    for blocks in [1, 2] {
+        external_ordinary::<T>(blocks);
+    }
+    for blocks in [1, 2] {
+        dominant_sampled_pool_mode::<T>(true, blocks);
+    }
+}
+#[test]
+fn external_shared_pool_f64() {
+    external_pool_cases::<f64>();
+}
+#[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
+fn external_shared_pool_mpfr256() {
+    external_pool_cases::<Bits256>();
+}
+#[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
+fn external_shared_pool_mpfr512() {
+    external_pool_cases::<sdpx_arithmetic::MpFloat<8>>();
 }

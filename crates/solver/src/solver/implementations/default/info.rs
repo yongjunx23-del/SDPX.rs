@@ -1,7 +1,6 @@
 use super::*;
 use crate::algebra::*;
 use crate::io::PrintTarget;
-use crate::solver::core::ffi::*;
 use crate::solver::core::kktsolvers::LinearSolverInfo;
 use crate::solver::core::{traits::Info, SolverStatus};
 use crate::solver::traits::Variables;
@@ -27,6 +26,9 @@ pub struct DefaultInfo<T> {
     pub res_primal: T,
     /// dual residual
     pub res_dual: T,
+    /// Optional operator-aware componentwise dual residual. It is `None`
+    /// unless `tol_feas_componentwise` is enabled.
+    pub res_dual_componentwise: Option<T>,
     /// primal infeasibility residual
     pub res_primal_inf: T,
     /// dual infeasibility residual
@@ -47,6 +49,8 @@ pub struct DefaultInfo<T> {
     pub(crate) prev_res_primal: T,
     /// dual residual from previous iteration
     pub(crate) prev_res_dual: T,
+    /// componentwise dual residual from previous iteration
+    pub(crate) prev_res_dual_componentwise: Option<T>,
     /// absolute duality gap from previous iteration
     pub(crate) prev_gap_abs: T,
     /// relative duality gap from previous iteration
@@ -80,63 +84,67 @@ where
         timers: &Timers,
         pool: Option<std::sync::Arc<rayon::ThreadPool>>,
     ) {
-        // optimality termination check should be computed w.r.t
-        // the pre-homogenization x and z variables.
-        let τinv = T::recip(variables.τ);
-
-        // unscaled linear term norms
         let normb = data.get_normb();
         let normq = data.get_normq();
+        let eq = &data.equilibration;
+        let owner = ResidualOwner {
+            products: residuals.products,
+            norms: [
+                NormView::dense(&variables.x, &eq.d),
+                NormView::dense(&variables.z, &eq.e),
+                NormView::dense(&variables.s, &eq.einv),
+                NormView::dense(&residuals.rx_inf, &eq.dinv),
+                NormView::dense(&residuals.Px, &eq.dinv),
+                NormView::dense(&residuals.rz_inf, &eq.einv),
+                NormView::dense(&residuals.rz, &eq.einv),
+                NormView::dense(&residuals.rx, &eq.dinv),
+            ],
+            dual_componentwise: residuals.dual_componentwise,
+        };
+        // Current local/replicated solves have exactly one counted owner.
+        // A sharded caller must first sum coupled operator contributions and
+        // supply each residual coordinate once, then use the same summary API.
+        let summary = ResidualSummary::from_owners(std::iter::once(owner), pool.as_deref())
+            .expect("one residual owner has consistent settings");
+        self.update_from_summary(
+            &summary,
+            variables.τ,
+            variables.κ,
+            T::recip(eq.c),
+            normb,
+            normq,
+        );
 
-        // shortcuts for the equilibration matrices
-        let d = &data.equilibration.d;
-        let e = &data.equilibration.e;
-        let dinv = &data.equilibration.dinv;
-        let einv = &data.equilibration.einv;
-        let cinv = T::recip(data.equilibration.c);
-
+        // solve time so far (includes setup)
+        self.solve_time = timers.total_time().as_secs_f64();
+        if let Some(world) = crate::mpi::World::get() {
+            // A local deadline must not let one rank leave while its peers
+            // enter the next numerical collective. All ranks observe the
+            // slowest elapsed clock before applying the same stopping rule.
+            self.solve_time = world.allreduce_max_f64(self.solve_time);
+        }
+    }
+    /// Consume global residual statistics without accessing full iterate arrays.
+    pub(super) fn update_from_summary(
+        &mut self,
+        summary: &ResidualSummary<T>,
+        tau: T,
+        kappa: T,
+        cinv: T,
+        normb: T,
+        normq: T,
+    ) {
+        let τinv = T::recip(tau);
         // primal and dual costs. dot products are invariant w.r.t
         // equilibration, but we still need to back out the overall
         // objective scaling term c
 
-        let xPx_τinvsq_over2 = residuals.dot_xPx * τinv * τinv / (2.).as_T();
-        self.cost_primal = (residuals.dot_qx * τinv + xPx_τinvsq_over2) * cinv;
-        self.cost_dual = (-residuals.dot_bz * τinv - xPx_τinvsq_over2) * cinv;
+        let xPx_τinvsq_over2 = summary.products.xpx * τinv * τinv / (2.).as_T();
+        self.cost_primal = (summary.products.qx * τinv + xPx_τinvsq_over2) * cinv;
+        self.cost_dual = (-summary.products.bz * τinv - xPx_τinvsq_over2) * cinv;
 
-        // Eight independent norm scans.  On a worker pool they run
-        // concurrently; every scan keeps its serial reduction order, so
-        // each value is bitwise identical to the sequential version.
-        let mut normx = T::zero();
-        let mut normz = T::zero();
-        let mut norms = T::zero();
-        let mut rx_inf_ns = T::zero();
-        let mut px_ns = T::zero();
-        let mut rz_inf_ns = T::zero();
-        let mut rz_ns = T::zero();
-        let mut rx_ns = T::zero();
-        if let Some(pool) = &pool {
-            pool.install(|| {
-                rayon::scope(|sc| {
-                    sc.spawn(|_| normx = variables.x.norm_scaled(d));
-                    sc.spawn(|_| normz = variables.z.norm_scaled(e));
-                    sc.spawn(|_| norms = variables.s.norm_scaled(einv));
-                    sc.spawn(|_| rx_inf_ns = residuals.rx_inf.norm_scaled(dinv));
-                    sc.spawn(|_| px_ns = residuals.Px.norm_scaled(dinv));
-                    sc.spawn(|_| rz_inf_ns = residuals.rz_inf.norm_scaled(einv));
-                    sc.spawn(|_| rz_ns = residuals.rz.norm_scaled(einv));
-                    sc.spawn(|_| rx_ns = residuals.rx.norm_scaled(dinv));
-                });
-            });
-        } else {
-            normx = variables.x.norm_scaled(d);
-            normz = variables.z.norm_scaled(e);
-            norms = variables.s.norm_scaled(einv);
-            rx_inf_ns = residuals.rx_inf.norm_scaled(dinv);
-            px_ns = residuals.Px.norm_scaled(dinv);
-            rz_inf_ns = residuals.rz_inf.norm_scaled(einv);
-            rz_ns = residuals.rz.norm_scaled(einv);
-            rx_ns = residuals.rx.norm_scaled(dinv);
-        }
+        let [mut normx, mut normz, mut norms, rx_inf_ns, px_ns, rz_inf_ns, rz_ns, rx_ns] =
+            summary.norms();
         normz *= cinv;
 
         // variables norms, undoing the equilibration.  Do not unscale
@@ -158,6 +166,7 @@ where
         // primal and dual relative residuals.
         self.res_primal = rz_ns * τinv / T::max(T::one(), normb + normx + norms);
         self.res_dual = rx_ns * τinv * cinv / T::max(T::one(), normq + normx + normz);
+        self.res_dual_componentwise = summary.dual_componentwise;
 
         // absolute and relative gaps
         self.gap_abs = T::abs(self.cost_primal - self.cost_dual);
@@ -168,15 +177,8 @@ where
             );
 
         // κ/τ ratio (scaled)
-        self.ktratio = variables.κ * τinv;
-
-        // solve time so far (includes setup)
-        self.solve_time = timers.total_time().as_secs_f64();
+        self.ktratio = kappa * τinv;
     }
-}
-
-impl<T: FloatT> SolverFFI<Self> for DefaultInfo<T> {
-    type FFI = super::ffi::DefaultInfoFFI<T>;
 }
 
 impl<T> Info<T> for DefaultInfo<T>
@@ -186,10 +188,16 @@ where
     type V = DefaultVariables<T>;
     type R = DefaultResiduals<T>;
 
+    fn set_linear_solver_info(&mut self, info: LinearSolverInfo) {
+        self.linsolver = info;
+    }
+
     fn reset(&mut self, timers: &mut Timers) {
         self.status = SolverStatus::Unsolved;
         self.iterations = 0;
         self.solve_time = 0f64;
+        self.res_dual_componentwise = None;
+        self.prev_res_dual_componentwise = None;
 
         timers.reset_timer("solve");
     }
@@ -209,6 +217,9 @@ where
     fn finalize(&mut self, timers: &mut Timers) {
         //final check of timers
         self.solve_time = timers.total_time().as_secs_f64();
+        if let Some(world) = crate::mpi::World::get() {
+            self.solve_time = world.allreduce_max_f64(self.solve_time);
+        }
     }
 
     fn update(
@@ -288,6 +299,7 @@ where
         self.prev_cost_dual = self.cost_dual;
         self.prev_res_primal = self.res_primal;
         self.prev_res_dual = self.res_dual;
+        self.prev_res_dual_componentwise = self.res_dual_componentwise;
         self.prev_gap_abs = self.gap_abs;
         self.prev_gap_rel = self.gap_rel;
 
@@ -299,6 +311,7 @@ where
         self.cost_dual = self.prev_cost_dual;
         self.res_primal = self.prev_res_primal;
         self.res_dual = self.prev_res_dual;
+        self.res_dual_componentwise = self.prev_res_dual_componentwise;
         self.gap_abs = self.prev_gap_abs;
         self.gap_rel = self.prev_gap_rel;
 
@@ -352,6 +365,7 @@ where
             tol_infeas_abs,
             tol_infeas_rel,
             tol_ktratio,
+            settings.tol_feas_componentwise,
             solved_status,
             pinf_status,
             dinf_status,
@@ -383,6 +397,7 @@ where
             tol_infeas_abs,
             tol_infeas_rel,
             tol_ktratio,
+            None,
             solved_status,
             pinf_status,
             dinf_status,
@@ -399,11 +414,14 @@ where
         tol_infeas_abs: T,
         tol_infeas_rel: T,
         tol_ktratio: T,
+        tol_componentwise: Option<T>,
         solved_status: SolverStatus,
         pinf_status: SolverStatus,
         dinf_status: SolverStatus,
     ) {
-        if self.ktratio <= T::one() && self.is_solved(tol_gap_abs, tol_gap_rel, tol_feas) {
+        if self.ktratio <= T::one()
+            && self.is_solved(tol_gap_abs, tol_gap_rel, tol_feas, tol_componentwise)
+        {
             self.status = solved_status;
         //PJG hardcoded factor 1000 here should be fixed
         } else if self.ktratio > tol_ktratio.recip() * (1000.0).as_T() {
@@ -415,10 +433,20 @@ where
         }
     }
 
-    fn is_solved(&self, tol_gap_abs: T, tol_gap_rel: T, tol_feas: T) -> bool {
+    fn is_solved(
+        &self,
+        tol_gap_abs: T,
+        tol_gap_rel: T,
+        tol_feas: T,
+        tol_componentwise: Option<T>,
+    ) -> bool {
         ((self.gap_abs < tol_gap_abs) || (self.gap_rel < tol_gap_rel))
             && (self.res_primal < tol_feas)
             && (self.res_dual < tol_feas)
+            && tol_componentwise.map_or(true, |tol| {
+                self.res_dual_componentwise
+                    .is_some_and(|residual| residual < tol)
+            })
     }
 
     fn is_primal_infeasible(
@@ -427,8 +455,8 @@ where
         tol_infeas_abs: T,
         tol_infeas_rel: T,
     ) -> bool {
-        (residuals.dot_bz < -tol_infeas_abs)
-            && (self.res_primal_inf < -tol_infeas_rel * residuals.dot_bz)
+        (residuals.products.bz < -tol_infeas_abs)
+            && (self.res_primal_inf < -tol_infeas_rel * residuals.products.bz)
     }
 
     fn is_dual_infeasible(
@@ -437,8 +465,8 @@ where
         tol_infeas_abs: T,
         tol_infeas_rel: T,
     ) -> bool {
-        (residuals.dot_qx < -tol_infeas_abs)
-            && (self.res_dual_inf < -tol_infeas_rel * residuals.dot_qx)
+        (residuals.products.qx < -tol_infeas_abs)
+            && (self.res_dual_inf < -tol_infeas_rel * residuals.products.qx)
     }
 }
 

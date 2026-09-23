@@ -34,9 +34,6 @@ pub use crate::solver::core::{IPSolver, SolverStatus};
 pub use crate::solver::core::traits;
 pub use crate::solver::core::CoreSettings;
 
-//user facing ffi interfaces
-pub use crate::solver::core::ffi;
-
 // read/write types if enabled
 #[cfg(feature = "serde")]
 pub use crate::solver::core::SolverJSONReadWrite;

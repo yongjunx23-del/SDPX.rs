@@ -1,5 +1,4 @@
 /target/
-/julia/SDPX.jl/Manifest.toml
 .DS_Store
 __pycache__/
 *.pyc

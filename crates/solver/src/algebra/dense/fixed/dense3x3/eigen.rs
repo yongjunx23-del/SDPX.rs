@@ -17,6 +17,7 @@ where
         eigen_hybrid(self, &mut None)
     }
 
+    #[cfg(test)]
     pub(crate) fn eigen(&mut self, V: &mut DenseMatrix3<T>) -> [T; 3] {
         // compute eigenvalues and eigenvectors
         eigen_hybrid(self, &mut Some(V))

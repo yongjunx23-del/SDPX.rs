@@ -6,6 +6,7 @@
 #[allow(dead_code)]
 #[path = "../src/algebra/dense/blas/traits.rs"]
 mod provider;
+use sdpx_solver::algebra;
 use num_traits::{FromPrimitive, One, Zero};
 use provider::{XgemmScalar, XsyrkScalar};
 use sdpx_arithmetic::{MpFloat, Scalar};
@@ -65,6 +66,8 @@ fn run<const N: usize>() {
     // baseline multiply/add legitimately rounds that product before adding.
     let parameters = [
         (F::one(), F::zero()),
+        (-F::one(), F::one()),
+        (F::one(), -F::one()),
         (-f(3) / f(2), F::one() / f(4)),
         (F::zero(), f(-2)),
         (F::zero(), F::zero()),

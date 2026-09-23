@@ -5,7 +5,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 3. ABI 1/2 settings are rejected; settings/info sizes remain 80/104 bytes
+/* ABI 4. ABI 1/2/3 settings are rejected; settings/info sizes are 88/112 bytes
  * on 64-bit platforms. All pointers must reference valid aligned storage for their stated
  * lengths for the duration of the call. Output storage must not overlap input
  * storage or other outputs. Inputs are copied. Indices are zero
@@ -16,7 +16,7 @@ extern "C" {
  * 5 panic, 6 insufficient output capacity, 7 no solved result.
  * Solver status is independent of ABI return codes (see sdpx_info.status).
  */
-#define SDPX_ABI_VERSION 3u
+#define SDPX_ABI_VERSION 4u
 #define SDPX_PREPROCESS_RUIZ 1u
 #define SDPX_PREPROCESS_PRESOLVE 2u
 #define SDPX_PREPROCESS_CHORDAL 4u
@@ -50,6 +50,7 @@ typedef struct {
   * bit 2 chordal decomposition. Defaults to SDPX_PREPROCESS_ALL (7).
   * Clear individual bits to disable; unknown bits are rejected. */
  uint32_t verbose, preprocessing_flags, max_threads, kkt_form;
+ uint32_t reserved_0; /* Reserved ABI slot; must be zero. */
  double time_limit;
  /* NULL tolerances select precision-aware defaults. All decimal strings. */
  const char *tol_gap_abs, *tol_gap_rel, *tol_feas, *tol_infeas_abs, *tol_infeas_rel;
@@ -59,6 +60,7 @@ typedef struct {
  /* Actual factorization threads, cone pool workers, and KKT form (1 or 2).
   * High precision uses serial QDLDL with independently parallel cone work. */
  uint32_t working_bits, backend_threads, cone_threads, kkt_form;
+ uint32_t reserved_0; /* Reserved ABI slot; always zero. */
  uint64_t n, m;
  double solve_time, objective, dual_objective, primal_residual, dual_residual, gap_abs, gap_rel;
 } sdpx_info;
@@ -67,9 +69,11 @@ typedef struct {
  * 7 max iterations,8 max time,9 numerical error,10 insufficient progress,
  * 11 callback terminated. Info floating scalars are approximate summaries.
  * Exact numeric results are obtained through decimal bulk output below. */
-int32_t sdpx_default_settings(sdpx_settings *out);
+/* Versioned first handshake prevents old clients from allocating ABI-3 storage. */
+int32_t sdpx_default_settings_v4(sdpx_settings *out);
+#define sdpx_default_settings sdpx_default_settings_v4
 int32_t sdpx_prepare(const sdpx_csc *P, const sdpx_scalars *q, const sdpx_csc *A, const sdpx_scalars *b, const sdpx_cone *cones, uint64_t cone_count, const sdpx_settings *settings, sdpx_handle **out);
-/* Additive ABI 3 entrypoint; existing descriptor layouts remain unchanged.
+/* Sampled input entrypoint, introduced in ABI 3; uses current settings layout.
  * Factor arrays and blocks are copied before return, as with CSC inputs. */
 int32_t sdpx_prepare_sampled(const sdpx_csc *P, const sdpx_scalars *q, const sdpx_csc *A_linear, const sdpx_scalars *b, const sdpx_cone *cones, uint64_t cone_count, const sdpx_settings *settings, const sdpx_sampled_block *blocks, uint64_t block_count, sdpx_handle **out);
 int32_t sdpx_solve(sdpx_handle *handle);

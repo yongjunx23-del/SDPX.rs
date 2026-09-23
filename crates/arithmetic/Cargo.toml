@@ -8,3 +8,4 @@ description = "Owned fixed-precision MPFR arithmetic for SDPX"
 [dependencies]
 gmp-mpfr-sys = { version = "=1.6.8", default-features = false, features = ["mpfr"] }
 num-traits = "0.2"
+serde = { version = "1", optional = true }

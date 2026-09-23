@@ -62,7 +62,7 @@ where
 
     fn calc_mu(&mut self, residuals: &DefaultResiduals<T>, cones: &CompositeCone<T>) -> T {
         let denom = T::from_usize(cones.degree() + 1).unwrap();
-        (residuals.dot_sz + self.τ * self.κ) / denom
+        (residuals.products.sz + self.τ * self.κ) / denom
     }
 
     fn affine_step_rhs(
@@ -302,25 +302,27 @@ where
     T: FloatT,
 {
     let (min_margin, pos_margin) = cones.margins(z, pd);
-    let target = T::max(
-        T::one(),
-        (pos_margin * (0.1).as_T()) / cones.degree().as_T(),
-    );
+    let (first, second) = interior_shifts(min_margin, pos_margin, cones.degree());
+    cones.scaled_unit_shift(z, first, pd);
+    if let Some(second) = second {
+        cones.scaled_unit_shift(z, second, pd);
+    }
+}
 
+/// Shared scalar decision for serial and owned symmetric initialization.
+pub(super) fn interior_shifts<T: FloatT>(
+    min_margin: T,
+    pos_margin: T,
+    degree: usize,
+) -> (T, Option<T>) {
+    let target = T::max(T::one(), (pos_margin * (0.1).as_T()) / degree.as_T());
     if min_margin <= T::zero() {
-        // at least some component is outside its cone
-        // done in two stages since otherwise (1-α) = -α for
-        // large α, which makes z exactly 0. (or worse, -0.0 )
-        cones.scaled_unit_shift(z, -min_margin, pd);
-        cones.scaled_unit_shift(z, target, pd);
+        // Two shifts avoid losing the positive target when -min is large.
+        (-min_margin, Some(target))
     } else if min_margin < target {
-        // margin is positive but small.
-        cones.scaled_unit_shift(z, target - min_margin, pd);
+        (target - min_margin, None)
     } else {
-        // good margin, but still shift explicitly by
-        // zero to catch any elements in the zero cone
-        // that need to be forced to zero
-        cones.scaled_unit_shift(z, T::zero(), pd);
+        (T::zero(), None)
     }
 }
 

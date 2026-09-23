@@ -15,7 +15,7 @@ use std::{
     sync::{Mutex, TryLockError},
 };
 
-const ABI_VERSION: u32 = 3;
+const ABI_VERSION: u32 = 4;
 const PREPROCESS_RUIZ: u32 = 1;
 const PREPROCESS_PRESOLVE: u32 = 2;
 const PREPROCESS_CHORDAL: u32 = 4;
@@ -131,6 +131,7 @@ pub struct Settings {
     pub preprocessing_flags: u32,
     pub max_threads: u32,
     pub kkt_form: u32,
+    pub reserved_0: u32,
     pub time_limit: f64,
     pub tol_gap_abs: *const c_char,
     pub tol_gap_rel: *const c_char,
@@ -148,6 +149,7 @@ pub struct Info {
     pub backend_threads: u32,
     pub cone_threads: u32,
     pub kkt_form: u32,
+    pub reserved_0: u32,
     pub n: u64,
     pub m: u64,
     pub solve_time: f64,
@@ -327,6 +329,7 @@ fn defaults() -> Settings {
         preprocessing_flags: PREPROCESS_ALL,
         max_threads: 1,
         kkt_form: 0,
+        reserved_0: 0,
         time_limit: f64::INFINITY,
         tol_gap_abs: ptr::null(),
         tol_gap_rel: ptr::null(),
@@ -338,12 +341,13 @@ fn defaults() -> Settings {
 fn validate_settings_layout(s: &Settings) -> Result<()> {
     if s.abi_version != ABI_VERSION {
         return Err(invalid(format!(
-            "unsupported SDPX ABI version {}; this library requires ABI 3",
+            "unsupported SDPX ABI version {}; this library requires ABI 4",
             s.abi_version
         )));
     }
     if s.struct_size as usize != std::mem::size_of::<Settings>()
         || s.kkt_form > 2
+        || s.reserved_0 != 0
         || s.verbose > 1
         || s.preprocessing_flags & !PREPROCESS_ALL != 0
         || s.time_limit.is_nan()
@@ -463,58 +467,7 @@ impl<T: Scalar> Typed<T> {
     /// a path. Records identities, counts and aggregated phase timings; never
     /// fails the solve on I/O errors.
     fn emit_receipt(&self) {
-        let Some(path) = std::env::var_os("SDPX_RECEIPT") else {
-            return;
-        };
-        let phases = sdpx_solver::receipt::drain();
-        let mut phase_map = serde_json::Map::new();
-        for (name, s) in &phases {
-            phase_map.insert(
-                (*name).to_string(),
-                serde_json::json!({
-                    "count": s.count,
-                    "total_s": s.total.as_secs_f64(),
-                    "median_s": s.median().as_secs_f64(),
-                    "max_s": s.max.as_secs_f64(),
-                }),
-            );
-        }
-        let ctr = self.solver.kktsystem.counters();
-        let env = |k: &str| match std::env::var(k) {
-            Ok(v) => serde_json::json!(v),
-            Err(_) => serde_json::Value::Null,
-        };
-        let v = serde_json::json!({
-            "schema_version": 1,
-            "crate_version": env!("CARGO_PKG_VERSION"),
-            "git_hash": option_env!("SDPX_GIT_HASH"),
-            "precision_bits": self.bits,
-            "backend": self.solver.info.linsolver.name,
-            "threads": {
-                "backend": self.solver.info.linsolver.threads,
-                "cones": self.solver.cones.cone_threads(),
-            },
-            "dimensions": {"n": self.solver.solution.x.len(), "m": self.solver.solution.z.len()},
-            "iterations": self.solver.solution.iterations,
-            "status": format!("{:?}", self.solver.solution.status),
-            "solve_time_s": self.solver.solution.solve_time,
-            "counters": {
-                "factorizations": ctr.factorizations,
-                "rhs_applied": ctr.rhs_applied,
-                "batches": ctr.batches,
-            },
-            "phases": phase_map,
-            "memory": {"peak_rss_bytes": peak_rss_bytes()},
-            "env": {
-                "SDPX_SVD_ROT": env("SDPX_SVD_ROT"),
-                "SDPX_DIRECT_SOLVE": env("SDPX_DIRECT_SOLVE"),
-                "SDPX_RNS_OPS": env("SDPX_RNS_OPS"),
-                "SDPX_INPUT_ID": env("SDPX_INPUT_ID"),
-            },
-        });
-        if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()) {
-            eprintln!("SDPX_RECEIPT write failed for {path:?}: {e}");
-        }
+        sdpx_solver::receipt::write(&self.solver, peak_rss_bytes());
     }
     unsafe fn update(&mut self, q: &Scalars, b: &Scalars) -> Result<()> {
         if q.count != self.solver.solution.x.len() as u64
@@ -549,6 +502,7 @@ impl<T: Scalar> Typed<T> {
             } else {
                 1
             },
+            reserved_0: 0,
             n: s.x.len() as u64,
             m: s.z.len() as u64,
             solve_time: if self.solved { s.solve_time } else { 0.0 },
@@ -589,8 +543,14 @@ impl<T: Scalar> Typed<T> {
     fn decimal_result(&self) -> Result<Vec<u8>> {
         let digits = (self.bits as usize * 30103 / 100000) + 4;
         let mut bytes = Vec::new();
+        // Reuse one formatting buffer instead of allocating per element; the
+        // emitted text is identical.
+        let mut text = String::new();
         for x in self.result()? {
-            bytes.extend_from_slice(format!("{x:.digits$e}").as_bytes());
+            use std::fmt::Write as _;
+            text.clear();
+            write!(text, "{x:.digits$e}").expect("String formatting is infallible");
+            bytes.extend_from_slice(text.as_bytes());
             bytes.push(0)
         }
         Ok(bytes)
@@ -644,7 +604,8 @@ unsafe fn operate(h: *mut Handle, f: impl FnOnce(&mut Engine) -> Result<()>) -> 
         }
     }
 }
-#[no_mangle]
+// Version this first handshake: an ABI-3 caller allocated only 80 bytes.
+#[export_name = "sdpx_default_settings_v4"]
 pub unsafe extern "C" fn sdpx_default_settings(out: *mut Settings) -> i32 {
     boundary(|| {
         pointer(out)?;
@@ -859,7 +820,6 @@ pub unsafe extern "C" fn sdpx_destroy(h: *mut Handle) -> i32 {
         Ok(())
     })
 }
-
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

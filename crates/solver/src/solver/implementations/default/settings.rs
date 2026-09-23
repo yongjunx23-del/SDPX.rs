@@ -1,4 +1,3 @@
-use crate::solver::core::ffi::*;
 use crate::solver::core::traits::Settings;
 use crate::{algebra::*, solver::core::SettingsError};
 use derive_builder::Builder;
@@ -6,18 +5,13 @@ use derive_builder::Builder;
 #[cfg(feature = "serde")]
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-// PJG: Serialization is required for file in/out, but is also used to pass
-// settings structures between Rust and Julia (and possibly Python)
-// Passing to Julia should be done using the new FFI interface types
-// implemented in https://github.com/oxfordcontrol/Clarabel.rs/pull/176
-
 /// Standard-form solver type implementing the [`Settings`](crate::solver::core::traits::Settings) trait
 
 #[derive(Builder, Debug, Clone)]
 #[builder(build_fn(validate = "Self::validate"))]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(bound = "T: Serialize + DeserializeOwned"))]
-#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct DefaultSettings<T: FloatT> {
     ///maximum number of iterations
     #[builder(default = "200")]
@@ -46,6 +40,13 @@ pub struct DefaultSettings<T: FloatT> {
     ///feasibility check tolerance (primal and dual)
     #[builder(default = "accuracy_default::<T>(1e-8)")]
     pub tol_feas: T,
+
+    /// Optional componentwise dual feasibility tolerance. When set, a full
+    /// `Solved` status also requires the operator-aware maximum of
+    /// `|r_dual[i]| / (|tau*q[i]| + sum_j |A[j,i]*z[j]| + sum_j |P[i,j]*x[j]|)`
+    /// to be below this value. `None` preserves the standard global test.
+    #[builder(default = "None")]
+    pub tol_feas_componentwise: Option<T>,
 
     ///absolute infeasibility tolerance (primal and dual)
     #[builder(default = "accuracy_default::<T>(1e-8)")]
@@ -309,6 +310,12 @@ where
         validate_direct_solve_method(&self.direct_solve_method)?;
         validate_kkt_form(&self.kkt_form)?;
 
+        if let Some(tol) = self.tol_feas_componentwise {
+            if !tol.is_finite() || tol <= T::zero() {
+                return Err(SettingsError::BadFieldValue("tol_feas_componentwise"));
+            }
+        }
+
         // check that the chordal decomposition merge method (string) is valid
         #[cfg(feature = "sdp")]
         validate_chordal_decomposition_merge_method(&self.chordal_decomposition_merge_method)?;
@@ -334,6 +341,11 @@ where
         check_immutable_setting!(self, prev, kkt_form);
         check_immutable_setting!(self, prev, presolve_enable);
         check_immutable_setting!(self, prev, input_sparse_dropzeros);
+        // Enabling the metric changes the residual update work allocated at
+        // setup; changing its numeric tolerance while enabled is safe.
+        if self.tol_feas_componentwise.is_some() != prev.tol_feas_componentwise.is_some() {
+            return Err(SettingsError::ImmutableSetting("tol_feas_componentwise"));
+        }
 
         #[cfg(feature = "sdp")]
         {
@@ -345,10 +357,6 @@ where
 
         Ok(())
     }
-}
-
-impl<T: FloatT> SolverFFI<Self> for DefaultSettings<T> {
-    type FFI = super::ffi::DefaultSettingsFFI<T>;
 }
 
 // pre build checker (for auto-validation when using the builder)
@@ -371,6 +379,12 @@ where
         }
         if let Some(ref kkt_form) = self.kkt_form {
             validate_kkt_form(kkt_form)?;
+        }
+
+        if let Some(Some(tol)) = self.tol_feas_componentwise.as_ref() {
+            if !tol.is_finite() || *tol <= T::zero() {
+                return Err(SettingsError::BadFieldValue("tol_feas_componentwise"));
+            }
         }
 
         // check that the chordal decomposition merge method is valid
@@ -429,6 +443,16 @@ fn test_settings_validate() {
     // fail on unknown direct solve method
     assert!(DefaultSettingsBuilder::<f64>::default()
         .direct_solve_method("foo".to_string())
+        .build()
+        .is_err());
+
+    // componentwise accuracy is opt-in but must be finite and positive
+    assert!(DefaultSettingsBuilder::<f64>::default()
+        .tol_feas_componentwise(Some(0.0))
+        .build()
+        .is_err());
+    assert!(DefaultSettingsBuilder::<f64>::default()
+        .tol_feas_componentwise(Some(f64::INFINITY))
         .build()
         .is_err());
 
@@ -521,4 +545,16 @@ fn reduced_tolerances_stay_distinct_from_full_accuracy_tolerances() {
     check::<f64>();
     check::<sdpx_arithmetic::Bits256>();
     check::<sdpx_arithmetic::Bits512>();
+}
+
+#[cfg(all(test, feature = "serde"))]
+#[test]
+fn removed_direction_setting_is_rejected() {
+    for direction in ["nt", "hkm"] {
+        let input = format!(r#"{{"psd_direction":"{direction}"}}"#);
+        assert!(serde_json::from_str::<DefaultSettings<f64>>(&input).is_err());
+    }
+    let settings = DefaultSettings::<f64>::default();
+    let serialized = serde_json::to_value(&settings).unwrap();
+    assert!(serialized.get("psd_direction").is_none());
 }

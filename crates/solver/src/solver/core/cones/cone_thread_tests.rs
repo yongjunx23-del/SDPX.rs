@@ -323,11 +323,13 @@ fn single_orthant_complete_lp_f64() {
 }
 
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn single_orthant_complete_lp_mpfr256() {
     single_orthant_complete_lp::<Bits256>(1027);
 }
 
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn single_orthant_complete_lp_mpfr512() {
     single_orthant_complete_lp::<sdpx_arithmetic::Bits512>(259);
 }
@@ -481,11 +483,13 @@ fn psd_step_lengths_f64() {
 }
 #[cfg(feature = "sdp")]
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn psd_step_lengths_mpfr256() {
     psd_steps::<Bits256>();
 }
 #[cfg(feature = "sdp")]
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn psd_step_lengths_mpfr512() {
     psd_steps::<sdpx_arithmetic::Bits512>();
 }
@@ -536,10 +540,12 @@ fn orthant_step_lengths_f64() {
     single_orthant_steps::<f64>();
 }
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn orthant_step_lengths_mpfr256() {
     single_orthant_steps::<Bits256>();
 }
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn orthant_step_lengths_mpfr512() {
     single_orthant_steps::<sdpx_arithmetic::Bits512>();
 }

@@ -226,7 +226,8 @@ where
 
 // Prove dependence over exact input values, including RHS. Retained rows are
 // unchanged, so zero multipliers restore a valid dual in original coordinates.
-// A fixed work budget makes dense/ill-conditioned equality sets a safe no-op.
+// The elimination has no operation budget: it runs to completion, and only the
+// per-coefficient size guard (`Exact::bounded`) can decline a degenerate set.
 fn redundant_equalities<T: FloatT>(
     A: &CscMatrix<T>,
     b: &[T],
@@ -253,14 +254,10 @@ fn redundant_equalities<T: FloatT>(
             rows[i].insert(A.n, b[r].exact()?);
         }
     }
-    // Work budget only: degenerate inputs bail out through `checked_sub`
-    // instead of a hard row cap, so large equality blocks are still exact.
-    let mut budget = 64_000_000usize;
     for c in 0..A.n {
         for k in A.colptr[c]..A.colptr[c + 1] {
             let i = lookup[A.rowval[k]];
             if i != usize::MAX && A.nzval[k] != T::zero() {
-                budget = budget.checked_sub(1)?;
                 // Do not prove rank from overwritten noncanonical CSC entries.
                 if rows[i].insert(c, A.nzval[k].exact()?).is_some() {
                     return None;
@@ -278,7 +275,6 @@ fn redundant_equalities<T: FloatT>(
             };
             let factor = value.clone();
             if let Some(previous) = basis.get(&pivot) {
-                budget = budget.checked_sub(previous.len())?;
                 for (&c, value) in previous {
                     let entry = row.entry(c).or_default();
                     entry.subtract_product(&factor, value);

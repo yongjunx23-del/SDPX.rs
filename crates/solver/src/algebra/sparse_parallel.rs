@@ -136,7 +136,34 @@ impl SparseParallel {
         rx: &mut [T],
         rz: &mut [T],
     ) {
-        if let Some(world) = crate::mpi::World::get() {
+        self.residual_products_impl(a, x, z, rx, rz, crate::mpi::World::get());
+    }
+
+    /// Evaluate both ordinary residual products using only this plan's local
+    /// worker pool.  Owned rank-local solvers must use this route: consulting
+    /// the implicit MPI world from a worker would shard an already-local block
+    /// a second time and can also introduce a collective into the owner pool.
+    pub(crate) fn residual_products_local<T: FloatT>(
+        &self,
+        a: &CscMatrix<T>,
+        x: &[T],
+        z: &[T],
+        rx: &mut [T],
+        rz: &mut [T],
+    ) {
+        self.residual_products_impl(a, x, z, rx, rz, None);
+    }
+
+    fn residual_products_impl<T: FloatT>(
+        &self,
+        a: &CscMatrix<T>,
+        x: &[T],
+        z: &[T],
+        rx: &mut [T],
+        rz: &mut [T],
+        world: Option<crate::mpi::World>,
+    ) {
+        if let Some(world) = world {
             self.product_sharded(a, true, rx, z, -T::one(), T::zero(), world, crate::mpi::SITE_RX);
             self.product_sharded(a, false, rz, x, T::one(), T::one(), world, crate::mpi::SITE_RZ);
             return;

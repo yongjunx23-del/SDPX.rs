@@ -4,6 +4,7 @@
 #[allow(dead_code)]
 #[path = "../src/algebra/dense/blas/traits.rs"]
 mod provider;
+use sdpx_solver::algebra;
 use num_traits::{FromPrimitive, Zero};
 use provider::{XgemmScalar, XsyrkScalar};
 use sdpx_arithmetic::{MpFloat, Scalar};

@@ -15,6 +15,7 @@ where
         eig2(self, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn eigen(&mut self, V: &mut DenseMatrix2<T>) -> [T; 2] {
         eig2(self, Some(V))
     }

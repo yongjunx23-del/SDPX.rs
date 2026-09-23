@@ -134,7 +134,8 @@
       "json_sha256": "bde1f9575717718317a53e1a33557e2a2817d3b47fd6ca265107b4fa07f5b37c",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/LP_afiro.json"
+        "path": "SDPX/benchmark/float64/data/LP_afiro.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "91113b338e52882c4205ac5db8327b56a370239b81f802c91cdf82c3db9c3ec9",
       "provenance": {
@@ -189,7 +190,8 @@
       "json_sha256": "5f496d9f223d410a2440ce6cede6ee92f052c58359a523e83d92289f8ce1d30f",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/LP_adlittle.json"
+        "path": "SDPX/benchmark/float64/data/LP_adlittle.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "2ecb13d7f79ac3d984d4f04f9907ab3f769610b823de619d22e79eb8e829ecdf",
       "provenance": {
@@ -243,7 +245,8 @@
       "json_sha256": "e8fea1a331e54c420e1609251a78f4e699fc72e7fb145c2b9a43a044b49d89d2",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/LP_blend.json"
+        "path": "SDPX/benchmark/float64/data/LP_blend.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "62ea1a54846c63d28a5c0cbc6cd39fe9abf0fa0c5ed92033db7b7449a004bc29",
       "provenance": {
@@ -297,7 +300,8 @@
       "json_sha256": "5a46bceb51646277860179fcafdcc90be3648607739f926115ee12ee2259298e",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/LP_sc105.json"
+        "path": "SDPX/benchmark/float64/data/LP_sc105.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "b3e0110008e7f4a26bae3b18ccdaa3621e22c21922ee35159e56824ddbb254f5",
       "provenance": {
@@ -351,7 +355,8 @@
       "json_sha256": "6048627ea656cbf3f752620220add18905ec29b6b940a3ced2cc80c2aed5e6fd",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/LP_sc205.json"
+        "path": "SDPX/benchmark/float64/data/LP_sc205.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "1b8496f1425f8cce9ddcf1663f2769ff6bf454f022b570261bc24804ef677522",
       "provenance": {
@@ -405,7 +410,8 @@
       "json_sha256": "baf329ff6f5d06b2901f1fdab511ffdb780b57c311c3e709cc768e963e9171af",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/LP_share2b.json"
+        "path": "SDPX/benchmark/float64/data/LP_share2b.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "b97f04b4756d1d69906d7dee147b23522e308814c93a2616d987498d767730eb",
       "provenance": {
@@ -9441,7 +9447,8 @@
       "json_sha256": "4fb91ca23878710bf0908c7c56729f27243a3a9bc2df73498da93804830269d6",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/SOCP_chainsing_1000_1.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_chainsing_1000_1.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "98d493d5a85e832d78e17c89da6450c131e4b00c726187249e33b17687fb4ddd",
       "provenance": {
@@ -12191,7 +12198,8 @@
       "json_sha256": "8d394447e1e528bf07cbb7bc973f5b933af83f991915eb78d94b638790c8fdf8",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/SOCP_nql30.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_nql30.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "f926413ff08c1c296254f60c54cb7a4154f501ddb9d2f6948918d72d14f93739",
       "provenance": {
@@ -17915,7 +17923,8 @@
       "json_sha256": "f50d92088cb519dc2cf86febc061edc487b1a67f4a4602c590da4a5f34a646da",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/SOCP_qssp30.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_qssp30.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "b6d3c20ee39d89bd48db11343a8c95ca11f0c8e1c5fe2c33633f59a12c7a0406",
       "provenance": {
@@ -18008,7 +18017,8 @@
       "json_sha256": "5c2cb4c05347b6568f19e7ff0e2b76c0ed0495978c795d213e2f5b6b0f205ed0",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/SOCP_sambal.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_sambal.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "dcb4266e21442dc0bb83e3c57533517faceafe7eb5a41662a02e84ea54da8b07",
       "provenance": {
@@ -20441,7 +20451,8 @@
       "json_sha256": "a9f13fbf88dfce406688e26dc12c80453a0a92f34aa4f94a39ec8ad671aed485",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/SOCP_nb.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_nb.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "6e137968db4bb094a331efe0186f895b49566a4b5177200b7b3fcaf60da753e7",
       "provenance": {
@@ -20497,7 +20508,8 @@
       "json_sha256": "b47e95d918fef6cb6c7817abba53570ee1d80e69ffcb6374eebef2358a90487c",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/SOCP_sched_50_50_scaled.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_sched_50_50_scaled.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "16b8c16f5a9d06ab4f0d311cfee9412b0eb241ea65e95fc7f81b838a5e25cbfb",
       "provenance": {
@@ -20550,7 +20562,8 @@
       "json_sha256": "7c4826716252d3c27606b319be1b8ea2dbaea374eca10055e110e72961efcfe6",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/SDP_control1.json"
+        "path": "SDPX/benchmark/float64/data/SDP_control1.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "482528bb128e64dad102fab88e4e8b7074efdfa22e396ebec586d832b1545bcb",
       "provenance": {
@@ -20603,7 +20616,8 @@
       "json_sha256": "3dca59e80052d993d1d9a0700adf9343ec9aae9fdbbcc2f0037063c07ed17c0c",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/SDP_control2.json"
+        "path": "SDPX/benchmark/float64/data/SDP_control2.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "3a43871daec9c0e1700caba254708c61379eff58be78576da4a2a32115274faa",
       "provenance": {
@@ -20659,7 +20673,8 @@
       "json_sha256": "8674c5c5a6a547f61af56f5ac0c145ac1b8bb2f6578c56154ea54db2141f35d9",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/SDP_hinf1.json"
+        "path": "SDPX/benchmark/float64/data/SDP_hinf1.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "a2d3e9f340f304fe59147e5f7d8b3c54c8169cebe946d81009796c184164ab77",
       "provenance": {
@@ -20709,7 +20724,8 @@
       "json_sha256": "77178c6e2df8afe389c6459de58ec2f6c00182c2f96756fae199309c8b00aa59",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/SDP_theta1.json"
+        "path": "SDPX/benchmark/float64/data/SDP_theta1.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "e957517b2284f24eba158db56a0ae34ecc07d24fa299a31f732dad3d4a54ea34",
       "provenance": {
@@ -20777,7 +20793,8 @@
       "json_sha256": "93fc969a188032439fc0ca1ebd8b856263322dc59bef3b125e13361ed60596d4",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/SDP_truss1.json"
+        "path": "SDPX/benchmark/float64/data/SDP_truss1.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "07bfaa5beaee8d2df2188a7aff80abe307a176466824211d68ffe68764c6efca",
       "provenance": {
@@ -20828,7 +20845,8 @@
       "json_sha256": "3da8e44fb0511a4fc009f72d89a3c35326f736ab51f40a0524d2af94a8a3b588",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic18/json/SDP_qap5.json"
+        "path": "SDPX/benchmark/float64/data/SDP_qap5.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "08afd61ec131d190aa3344f3bfd5c39551b1a5639b99f42ecf5b6a993faa7a52",
       "provenance": {
@@ -20881,7 +20899,8 @@
       "json_sha256": "e4cda94cd829b2b34c9ce5026370a3fd1453a6a74634e29bc3f7da2c041d6986",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic10/json/LP_bandm.json"
+        "path": "SDPX/benchmark/float64/data/LP_bandm.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "032b71dbf4c03e16fddd03048f750843d948918f73a6c9c55e493592fee88f4c",
       "provenance": {
@@ -20941,7 +20960,8 @@
       "json_sha256": "ea592e07ba4fa827a07b5967e79f6a590b7bb4e8b2bbc3b20ed3f0053037007c",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic10/json/LP_capri.json"
+        "path": "SDPX/benchmark/float64/data/LP_capri.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "04dec4544f5f3c2ed77bbc886061fa5ef5b0bf9b5db2d7a7bcf3d1501e4498e3",
       "provenance": {
@@ -21001,7 +21021,8 @@
       "json_sha256": "a87f36ec5f5b439d479bcb9f629c648718ed59dd1a5ac0cbb6ddc57ba483ce25",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic10/json/LP_bnl1.json"
+        "path": "SDPX/benchmark/float64/data/LP_bnl1.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "6d7b2ee656006f866c824ce7484f84aa10e362fd52370afd951833bf1a6de507",
       "provenance": {
@@ -27059,7 +27080,8 @@
       "json_sha256": "d028b67ba9d3a4c465b102d1621d9d1480f3ef8b11e5b900df0a144d04c6f6af",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic10/json/SOCP_chainsing_1000_3.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_chainsing_1000_3.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "9f7bebe04d9232e75076a28829654a55a2b978213588a5a108c45ad9e1b9b5ac",
       "provenance": {
@@ -27144,7 +27166,8 @@
       "json_sha256": "06e489d74b82a24f789766453dd1b0e0b2b6158a2117b3b71d2ded81c4ffb22e",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic10/json/SOCP_sched_50_50_orig.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_sched_50_50_orig.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "852150ed6696116e8db12dd595d5ebfea6c00deb48a31c02cef12bdef149f7f3",
       "provenance": {
@@ -27224,7 +27247,8 @@
       "json_sha256": "7bfc1f88c9938b3a61814f63cccca4aa67bb4b57640b4653f3727e35e83e3388",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic10/json/SDP_hinf2.json"
+        "path": "SDPX/benchmark/float64/data/SDP_hinf2.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "16f42918cb14d9eecd6c7f881d6fd16f8eb760c9450182e32c894a75204b45ef",
       "provenance": {
@@ -27291,7 +27315,8 @@
       "json_sha256": "d3a7cc2724fbf39b819f34e8c191bda4a7c3f3669772fc0b5552267d26286e84",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic10/json/SDP_control3.json"
+        "path": "SDPX/benchmark/float64/data/SDP_control3.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "931c6f1cb5b70ad7907d73067642c935228244c3908ebc4912001271d0fdb009",
       "provenance": {
@@ -27355,7 +27380,8 @@
       "json_sha256": "04dac5d8dffe2d8bbf5582846760f219ba5a1cd357234c0019234347673ae603",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic10/json/SDP_gpp124-1.json"
+        "path": "SDPX/benchmark/float64/data/SDP_gpp124-1.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "630b9fd006c3d06ed4e82b4b73be64b68c04376df95991b6a2e32ddc50614db5",
       "provenance": {
@@ -27426,7 +27452,8 @@
       "json_sha256": "e4c56d8e6cae65c8c3e92e6a95c93c0afbc6f204510156e3223bbe7f0f8e0be5",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic10/json/SOCP_sched_100_100_orig.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_sched_100_100_orig.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "5a4062bfd8b5fad62dc3998f138c6c25e7ef22e77c68e65ef0056740519726b2",
       "provenance": {
@@ -27499,7 +27526,8 @@
       "json_sha256": "10faf748e2b64a7c3424b080ea7a450237519dcb71ff416567885f038008e6bd",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/conic10/json/SDP_gpp500-1.json"
+        "path": "SDPX/benchmark/float64/data/SDP_gpp500-1.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "65cba23664de75bfc90352caea2cf9dd063fa17a8112868160f239c2e7e64070",
       "provenance": {
@@ -27565,7 +27593,8 @@
       "json_sha256": "6d52db2b507b47da119f3ad25a32c45d5b58f8c120881320473d0f2ca4142897",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/LP_agg.json"
+        "path": "SDPX/benchmark/float64/data/LP_agg.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "f8dcf5c003d126e693c544a86bad3bcc4c122d482efc468cab6a0567628f5a1c",
       "provenance": {
@@ -27627,7 +27656,8 @@
       "json_sha256": "28399418e70194387c55c0a45ac514014aee8d14de3365a10b3dd5451399854d",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/LP_beaconfd.json"
+        "path": "SDPX/benchmark/float64/data/LP_beaconfd.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "414cb356f27db843989454cfb2129a964a5ab14ac1b914a842ad24545b6b3053",
       "provenance": {
@@ -27689,7 +27719,8 @@
       "json_sha256": "dc155a105f6f197b7203021eec53523184243305a843455eae2b74574954a122",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/LP_brandy.json"
+        "path": "SDPX/benchmark/float64/data/LP_brandy.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "616dae9ad0f230baa3e63fabdaa337c215768454fd77494c74370e39c3425abc",
       "provenance": {
@@ -27751,7 +27782,8 @@
       "json_sha256": "b43ebbe7120f1fd6d09b4dfca9f91eea8b47ce1953d3ee0369017d9b6cfe40aa",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/LP_recipe.json"
+        "path": "SDPX/benchmark/float64/data/LP_recipe.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "1ccf47dc36849e8fb11f0f9615e5aa33f5e3e6ddf204306c067f90deb20ca7a5",
       "provenance": {
@@ -27813,7 +27845,8 @@
       "json_sha256": "6304f0b7dbe19f2734110887009f23ceb09fc2970517d6de16746fced7662d00",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/LP_israel.json"
+        "path": "SDPX/benchmark/float64/data/LP_israel.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "93319153caf361197607ec926c2b3f323fbc78635f253f44941add96c156758d",
       "provenance": {
@@ -36867,7 +36900,8 @@
       "json_sha256": "3ddd64546d3b91c7193a91a5316f80c62d724b49312ee9f6596614c7afde5778",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/SOCP_chainsing_1000_2.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_chainsing_1000_2.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "e564a64f7aa83041042e1a047e38840ef63c8e9c741283715006031e4bb866d4",
       "provenance": {
@@ -39326,7 +39360,8 @@
       "json_sha256": "6ca8aa2b376967577828fcee3587a958b0c48b479d24b833c712384ae98bbe88",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/SOCP_nb_L1.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_nb_L1.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "43781acdc55fd81a0791e835a3141b5900229e03838885e0673f60fdf9a74310",
       "provenance": {
@@ -41921,7 +41956,8 @@
       "json_sha256": "71ec87b468b87dd2e266418ca9c12f88fe2933fe29fa94f1207ff21c15d0a602",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/SOCP_nb_L2_bessel.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_nb_L2_bessel.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "fc05306e2a2774b2b58eb3cd89b2606b43a1cd9c249985d5606f1e451f0056dd",
       "provenance": {
@@ -52799,7 +52835,8 @@
       "json_sha256": "b76bba4673f51f434b7ebc515dc8b5d5615bd90e67826015c238084887e42d2f",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/SOCP_nql60.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_nql60.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "a6c680874314566d5808ea8174b4e3c8705d8c9d450d8e8b0f21a3734e15a87b",
       "provenance": {
@@ -52883,7 +52920,8 @@
       "json_sha256": "8561efdd18c6570b564745b784ba8413ae01e8382503dc79d1794598d979e48c",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/SOCP_sched_100_50_orig.json"
+        "path": "SDPX/benchmark/float64/data/SOCP_sched_100_50_orig.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "da1ad978c9ff3581d8f4275911fd280a60709c16212543c4c6a4bf9027bf8f79",
       "provenance": {
@@ -52961,7 +52999,8 @@
       "json_sha256": "ec1d663199e1fa682886c1de8309aaecc624c3e05f561d8b9902ce0a0e5b85c3",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/SDP_arch0.json"
+        "path": "SDPX/benchmark/float64/data/SDP_arch0.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "2e87189c77823fafa2755f4fd6d0a2dd6476f06297a2d0d9a017b95ade3943bd",
       "provenance": {
@@ -53028,7 +53067,8 @@
       "json_sha256": "151a30c4a10060deaa55dc6b07eb63d93d351b66d02b56e9a69d03be8bd81d61",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/SDP_gpp100.json"
+        "path": "SDPX/benchmark/float64/data/SDP_gpp100.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "8d43fdd3eb08f824f413af9e450136d1da1f00fbc1d0ff135fa909a6b7c03f60",
       "provenance": {
@@ -53093,7 +53133,8 @@
       "json_sha256": "db230a6855d26a0a0092cbef7b5c0b11196b88272844ca82891dda7af9b89d8e",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/SDP_gpp250-1.json"
+        "path": "SDPX/benchmark/float64/data/SDP_gpp250-1.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "c0a9d32cfb464c6b688bd6d26e62b2f7bff685bd86bdf2a30277f0224e24d726",
       "provenance": {
@@ -53158,7 +53199,8 @@
       "json_sha256": "b0f22ec00115d27829cc28117f317888cb37e0da433ba5a6d1182dcefdbfd026",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/SDP_qap6.json"
+        "path": "SDPX/benchmark/float64/data/SDP_qap6.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "3e1d035f90184c62f275c817a1fc5920c4a8bad1beda344e401a239c79867974",
       "provenance": {
@@ -53241,7 +53283,8 @@
       "json_sha256": "af3d534c239b48879dd1836f1949b85ac0f62aa5a9af50e04595faa96c4d39b0",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/holdout/json/SDP_truss4.json"
+        "path": "SDPX/benchmark/float64/data/SDP_truss4.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "7b9c1e1b9c535308dcceaa0dcf9b06cee7e1ef03f3f44c089de7ba44036e0feb",
       "provenance": {
@@ -53312,7 +53355,8 @@
       "json_sha256": "2d174f11a032090d0a1620de7dfecf74db3b70fd92f145fb40bce207c5125ad0",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/sdplib-scale3/SDP_theta2.json"
+        "path": "SDPX/benchmark/float64/data/SDP_theta2.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "3c837c54400e6e442cb73b6ca55be5f4eb8e46c8b1c27ed9c379d2c632b5cc73",
       "provenance": {
@@ -53354,7 +53398,8 @@
       "json_sha256": "5ebea6f0cb6da29b2beb43bc21baf4f33e197c5530132debd55c0d736d992c81",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/sdplib-scale3/SDP_mcp250-1.json"
+        "path": "SDPX/benchmark/float64/data/SDP_mcp250-1.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "52dae4df63f07c69672d91a49306c611c8112deeef7fd72f7aeb823d7e78bb9a",
       "provenance": {
@@ -53396,7 +53441,8 @@
       "json_sha256": "1d5106bc6dbb9c9584049e56a133fdd048556d0d95c05122b110a7f9ad524b72",
       "source": {
         "kind": "workspace",
-        "path": "SDPX.jl/benchmark/data/sdplib-scale3/SDP_mcp500-1.json"
+        "path": "SDPX/benchmark/float64/data/SDP_mcp500-1.json.gz",
+        "compression": "gzip"
       },
       "source_sha256": "9f9fc9db4a06829338998568afea1fd8a536106f8dd9d9bfacf1f6b8e04bc610",
       "provenance": {
@@ -53437,7 +53483,7 @@
       "source": {
         "kind": "driver",
         "path": "SDPX/benchmark/parallel/orthant.jl",
-        "sha256": "32402f453ecc8e62666c8338407e0021afb0ffd8caa94076769d5b4c871b1150"
+        "sha256": "5b231326ecd356e9c942c14f90976b65860c03a4b9e2dbbd622d338265055fe0"
       },
       "parameters": {
         "n": 200,
@@ -53470,7 +53516,7 @@
       "source": {
         "kind": "driver",
         "path": "SDPX/benchmark/parallel/sampled.jl",
-        "sha256": "9fd676899bc900792ea5d67e226ae3be3b97a10fe39aa176bd14116066505c12"
+        "sha256": "0fe1a5187463f73580b35e1a8cc8af5527b9a58ec683d2974d2319f296309f77"
       },
       "parameters": {
         "n": 12
@@ -53502,7 +53548,7 @@
       "source": {
         "kind": "driver",
         "path": "SDPX/benchmark/parallel/sampled.jl",
-        "sha256": "9fd676899bc900792ea5d67e226ae3be3b97a10fe39aa176bd14116066505c12"
+        "sha256": "0fe1a5187463f73580b35e1a8cc8af5527b9a58ec683d2974d2319f296309f77"
       },
       "parameters": {
         "n": 24

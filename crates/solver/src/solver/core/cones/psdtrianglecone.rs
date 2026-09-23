@@ -230,8 +230,8 @@ where
         // SVD of L2'*L1,
         let tmp = &mut f.workmat1;
         tmp.mul(&L2.t(), L1, T::one(), T::zero());
-        if let Some(dir) = std::env::var_os("SDPX_DUMP_CONE") {
-            dump_cone_f64(&dir, tmp);
+        if let Some(dir) = cone_dump_dir() {
+            dump_cone_f64(dir, tmp);
         }
 
         // Direct SVD avoids squaring the condition number of L2' * L1.
@@ -375,7 +375,7 @@ where
         )
     }
 
-    pub(super) fn prepare_affine_bounds(&mut self, dz: &mut [T], ds: &mut [T], αmax: T) -> (T, T) {
+    pub(crate) fn prepare_affine_bounds(&mut self, dz: &mut [T], ds: &mut [T], αmax: T) -> (T, T) {
         // The dz (dual, R) and ds (primal, Rinv) bounds are independent.
         // With a second scratch set they can run on two ambient workers;
         // without one they fold serially, bitwise identical either way.
@@ -461,9 +461,16 @@ where
 
         let λ = &self.data.λ;
         let two: T = (2.).as_T();
-        for i in 0..self.n {
-            for j in 0..self.n {
-                X[(i, j)] = (two * Z[(i, j)]) / (λ[i] + λ[j]);
+        // Z is symmetric and the Jordan inverse uses the same denominator
+        // for (i,j) and (j,i). Evaluate each pair once, then mirror it before
+        // mat_to_svec performs its usual symmetric packing.
+        for j in 0..self.n {
+            for i in 0..=j {
+                let value = (two * Z[(i, j)]) / (λ[i] + λ[j]);
+                X[(i, j)] = value;
+                if i != j {
+                    X[(j, i)] = value;
+                }
             }
         }
         mat_to_svec(x, X);
@@ -641,7 +648,7 @@ where
             T::max_value()
         } else {
             svec_to_mat(workΔ, d);
-            workΔ.lrscale(Λisqrt, Λisqrt);
+            lrscale_symmetric(workΔ, Λisqrt);
             let __ts = std::time::Instant::now();
             let v = engine.eigval_min(workΔ).expect("Eigval error");
             crate::receipt::phase("cone_eigmin", __ts.elapsed());
@@ -653,6 +660,26 @@ where
         T::min(-γ.recip(), αmax)
     } else {
         αmax
+    }
+}
+
+// `svec_to_mat` already mirrors this matrix, and congruence uses the same
+// diagonal vector on both sides. Scale each symmetric pair once to avoid
+// duplicate high-precision multiplications.
+fn lrscale_symmetric<T>(matrix: &mut Matrix<T>, d: &[T])
+where
+    T: FloatT,
+{
+    let n = matrix.nrows();
+    debug_assert_eq!(matrix.ncols(), n);
+    debug_assert_eq!(d.len(), n);
+    for col in 0..n {
+        for row in 0..=col {
+            matrix[(row, col)] *= d[row] * d[col];
+            if row != col {
+                matrix[(col, row)] = matrix[(row, col)];
+            }
+        }
     }
 }
 
@@ -746,6 +773,14 @@ where
 /// workspace's stable data pointer so consecutive files per cone form the
 /// iteration sequence. Gated by SDPX_DUMP_CONE=<dir>; measures how much the
 /// right singular factor drifts between IPM iterations.
+/// `SDPX_DUMP_CONE` capture gate, read once per process. The gate is fixed at
+/// launch; caching keeps getenv out of the per-iteration cone scaling path.
+fn cone_dump_dir() -> Option<&'static std::ffi::OsStr> {
+    static DIR: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("SDPX_DUMP_CONE"))
+        .as_deref()
+}
+
 fn dump_cone_f64<T: FloatT>(dir: &std::ffi::OsStr, m: &Matrix<T>) {
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -753,11 +788,15 @@ fn dump_cone_f64<T: FloatT>(dir: &std::ffi::OsStr, m: &Matrix<T>) {
     let key = m.data().as_ptr() as usize;
     let iter = {
         let mut guard = SEQ.lock().unwrap();
-        *guard.get_or_insert_with(HashMap::new).entry(key).or_insert(0)
+        *guard
+            .get_or_insert_with(HashMap::new)
+            .entry(key)
+            .or_insert(0)
     };
     *SEQ.lock().unwrap().as_mut().unwrap().get_mut(&key).unwrap() += 1;
     let name = format!("cone-{key:x}-iter{iter:04}");
     // Lossless companion for replay: exact (kind, exponent, limbs) encoding.
+    #[cfg(feature = "snapshot")]
     let _ = crate::snapshot::write_dense(
         std::path::Path::new(dir),
         &name,
@@ -770,13 +809,9 @@ fn dump_cone_f64<T: FloatT>(dir: &std::ffi::OsStr, m: &Matrix<T>) {
     let mut out = String::with_capacity(m.data().len() * 24);
     out.push_str(&format!("{rows} {cols}\n"));
     for v in m.data().iter() {
-        let f = v.to_f64().unwrap_or_else(|| {
-            if *v < T::zero() {
-                -f64::MAX
-            } else {
-                f64::MAX
-            }
-        });
+        let f = v
+            .to_f64()
+            .unwrap_or_else(|| if *v < T::zero() { -f64::MAX } else { f64::MAX });
         out.push_str(&format!("{f:.17e}\n"));
     }
     let _ = std::fs::write(&path, out);

@@ -5,6 +5,7 @@ use crate::algebra::*;
 #[cfg(feature = "sdp")]
 mod condensed;
 pub mod direct;
+pub(crate) mod refinement;
 #[cfg(feature = "sdp")]
 pub(crate) use condensed::CondensedKKTSolver;
 
@@ -13,15 +14,24 @@ pub(crate) use condensed::CondensedKKTSolver;
 /// attributed instead of assumed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SolveCounters {
+    /// Numeric factorization attempts, including failed attempts.
+    pub factor_attempts: u64,
+    /// Backend linear solves, including iterative refinement corrections.
+    pub linear_solves: u64,
+    /// Iterative refinement corrections applied by the direct solver.
+    pub refinements: u64,
     /// Successful numeric factorizations of the current KKT structure.
     pub factorizations: u64,
-    /// Right-hand-side applications across all columns and waves.
+    /// Caller-supplied RHS columns, excluding refinement corrections.
     pub rhs_applied: u64,
     /// Batched submissions; one wave may carry several columns.
     pub batches: u64,
 }
 
 pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
+    /// Begin an independent solve, resetting counters and retry state.
+    fn reset_solve(&mut self) {}
+
     fn update(&mut self, cones: &CompositeCone<T>, settings: &CoreSettings<T>) -> bool;
     fn setrhs(&mut self, x: &[T], z: &[T]);
     fn solve(
@@ -33,10 +43,7 @@ pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
 
     /// Accounting for the current solver instance. Backends that do not track it
     /// report zeros rather than a guess.
-    ///
-    /// Inert until the main loop batches right-hand sides (plan item A22): only
-    /// tests call it today, which the workspace build reports as dead code.
-    #[allow(dead_code)]
+
     fn counters(&self) -> SolveCounters {
         SolveCounters::default()
     }
@@ -50,9 +57,7 @@ pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
     /// The default implementation loops the single-RHS path column by column, so
     /// every existing backend stays correct. Only a backend that genuinely
     /// exploits several columns at once should override it.
-    ///
-    /// Inert until the main loop batches right-hand sides (plan item A22).
-    #[allow(dead_code)]
+
     fn solve_many(
         &mut self,
         n: usize,
@@ -62,6 +67,13 @@ pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
         settings: &CoreSettings<T>,
     ) -> Vec<bool> {
         solve_many_by_columns(self, n, rhs, out, ncols, settings)
+    }
+
+    /// Exact working-precision Hs*z computed by the original-operator residual
+    /// for an accepted single solution (column 0) or the last batched wave.
+    /// None when refinement did not evaluate it, or that column failed.
+    fn scaled_solution(&self, _column: usize) -> Option<&[T]> {
+        None
     }
 
     fn update_P(&mut self, P: &CscMatrix<T>);

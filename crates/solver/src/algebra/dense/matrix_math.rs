@@ -220,6 +220,17 @@ pub(crate) fn pooled_gemm_sym<T: FloatT, MATA, MATB>(
 {
     let (m, n, k) = (a.nrows(), b.ncols(), a.ncols());
     debug_assert_eq!(m, n);
+    if T::precision_bits() <= 64 {
+        // Primitive floats: exact-arithmetic-symmetric product via BLAS gemm,
+        // then mirror the upper triangle so the result is exactly symmetric.
+        c.mul(a, b, T::one(), T::zero());
+        for j in 0..n {
+            for i in j + 1..n {
+                c[(i, j)] = c[(j, i)];
+            }
+        }
+        return;
+    }
     let (ta, tb) = (a.shape().as_blas_char(), b.shape().as_blas_char());
     let lda = if a.shape() == MatrixShape::N { m } else { k };
     let ldb = if b.shape() == MatrixShape::N { k } else { n };

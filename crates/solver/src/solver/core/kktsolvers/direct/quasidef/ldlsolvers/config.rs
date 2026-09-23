@@ -77,6 +77,9 @@ trait SpecializedLDL: FloatT {
         None
     }
 }
+/// Single-precision stays configured because the dense BLAS suites exercise
+/// both `s`- and `d`-prefixed kernels; the solver itself is instantiated only
+/// at f64 and the fixed-precision MPFR types.
 impl SpecializedLDL for f32 {
     fn specialized_ldl(method: &str) -> (MatrixTriangle, LDLConstructor<Self>) {
         panic!("LDL backend {method:?} is unavailable for Float32")

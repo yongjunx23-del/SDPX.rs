@@ -64,11 +64,19 @@ fn valid(a: usize, rows: i32, cols: i32, ld: i32) -> bool {
 fn axpby<const N: usize>(alpha: F<N>, x: F<N>, beta: F<N>, y: F<N>) -> F<N> {
     let p = if alpha == F::zero() {
         F::zero()
+    } else if alpha == F::one() {
+        x
+    } else if alpha == -F::one() {
+        -x
     } else {
         alpha * x
     };
     if beta == F::zero() {
         p
+    } else if beta == F::one() {
+        p + y
+    } else if beta == -F::one() {
+        p - y
     } else {
         p + beta * y
     }
@@ -253,22 +261,16 @@ fn gemm<const N: usize>(
     }
     // Exact residue accumulation replaces the FMA chain when the operand
     // window admits a plan; reconstruction rounds once at the destination.
-    let rns = (alpha != F::<N>::zero() && k > 0)
-        .then(|| RnsPlan::for_pair(a, b, k as usize))
-        .flatten()
-        .filter(|plan| {
-            plan.profitable(
-                k as usize,
-                m as usize * n as usize,
-                a.len() + b.len(),
-                N,
-            )
-        })
-        .and_then(|plan| {
-            plan.encode(a, EncodeSide::A)
-                .zip(plan.encode(b, EncodeSide::B))
-                .map(|(ra, rb)| (plan, ra, rb))
-        });
+    let rns = (alpha != F::<N>::zero()
+        && RnsPlan::worth_planning(k as usize, m as usize * n as usize))
+    .then(|| RnsPlan::for_pair(a, b, k as usize))
+    .flatten()
+    .filter(|plan| plan.profitable(k as usize, m as usize * n as usize, a.len() + b.len(), N))
+    .and_then(|plan| {
+        plan.encode(a, EncodeSide::A)
+            .zip(plan.encode(b, EncodeSide::B))
+            .map(|(ra, rb)| (plan, ra, rb))
+    });
     let column = |j: usize, column: &mut [F<N>]| {
         for i in 0..m as usize {
             let mut v = F::<N>::zero();
@@ -286,12 +288,8 @@ fn gemm<const N: usize>(
                     (j, ldb as usize)
                 };
                 v = match &rns {
-                    Some((plan, ra, rb)) => {
-                        plan.dot(ra, a0, da, rb, b0, db, k as usize)
-                    }
-                    None => {
-                        F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &b[b0 + p * db])))
-                    }
+                    Some((plan, ra, rb)) => plan.dot(ra, a0, da, rb, b0, db, k as usize),
+                    None => F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &b[b0 + p * db]))),
                 };
             }
             column[i] = axpby(alpha, v, beta, column[i]);
@@ -445,18 +443,12 @@ fn syrk<const N: usize>(
         return;
     }
     // Same operand on both sides: one encode serves both residue columns.
-    let rns = (alpha != F::<N>::zero() && k > 0)
-        .then(|| RnsPlan::for_pair(a, a, k as usize))
-        .flatten()
-        .filter(|plan| {
-            plan.profitable(
-                k as usize,
-                n as usize * (n as usize + 1) / 2,
-                a.len(),
-                N,
-            )
-        })
-        .and_then(|plan| plan.encode(a, EncodeSide::A).map(|ra| (plan, ra)));
+    let rns = (alpha != F::<N>::zero()
+        && RnsPlan::worth_planning(k as usize, n as usize * (n as usize + 1) / 2))
+    .then(|| RnsPlan::for_pair(a, a, k as usize))
+    .flatten()
+    .filter(|plan| plan.profitable(k as usize, n as usize * (n as usize + 1) / 2, a.len(), N))
+    .and_then(|plan| plan.encode(a, EncodeSide::A).map(|ra| (plan, ra)));
     let column = |j: usize, column: &mut [F<N>]| {
         for i in 0..n as usize {
             if (upper(u) == b'U' && i > j) || (upper(u) == b'L' && i < j) {
@@ -476,9 +468,7 @@ fn syrk<const N: usize>(
                 };
                 v = match &rns {
                     Some((plan, ra)) => plan.dot(ra, a0, da, ra, b0, db, k as usize),
-                    None => {
-                        F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &a[b0 + p * db])))
-                    }
+                    None => F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &a[b0 + p * db]))),
                 };
             }
             column[i] = axpby(alpha, v, beta, column[i]);
@@ -630,14 +620,17 @@ impl<const N: usize> XpotrfScalar for F<N> {
             // solver's inner-parallel gate.
             if inner_par() && tail >= PAR_COLS && upper(u) == b'L' {
                 let (done, rest) = a.split_at_mut(j * ld);
-                rest[j + 1..n].par_iter_mut().enumerate().for_each(|(t, q)| {
-                    let i = j + 1 + t;
-                    let mut v = *q;
-                    for k in 0..j {
-                        v = (-done[i + k * ld]).mul_add(done[j + k * ld], v);
-                    }
-                    *q = v / d;
-                });
+                rest[j + 1..n]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(t, q)| {
+                        let i = j + 1 + t;
+                        let mut v = *q;
+                        for k in 0..j {
+                            v = (-done[i + k * ld]).mul_add(done[j + k * ld], v);
+                        }
+                        *q = v / d;
+                    });
             } else if inner_par() && tail >= PAR_COLS {
                 let (head, right) = a.split_at_mut((j + 1) * ld);
                 right.par_chunks_mut(ld).for_each(|col| {
@@ -699,32 +692,58 @@ impl<const N: usize> XpotrsScalar for F<N> {
         let n = n as usize;
         let ld = lda as usize;
         let lb = ldb as usize;
-        for r in 0..nrhs as usize {
+        let nrhs = nrhs as usize;
+        if n == 0 || nrhs == 0 {
+            return;
+        }
+        let solve_column = |b: &mut [Self]| {
             for i in 0..n {
-                let mut v = b[i + r * lb];
+                let mut v = b[i];
                 for k in 0..i {
                     let a_val = if upper(u) == b'L' {
                         a[i + k * ld]
                     } else {
                         a[k + i * ld]
                     };
-                    let b_val = b[k + r * lb];
+                    let b_val = b[k];
                     v = (-a_val).mul_add(b_val, v);
                 }
-                b[i + r * lb] = v / a[i + i * ld];
+                b[i] = v / a[i + i * ld];
             }
             for i in (0..n).rev() {
-                let mut v = b[i + r * lb];
+                let mut v = b[i];
                 for k in i + 1..n {
                     let a_val = if upper(u) == b'L' {
                         a[k + i * ld]
                     } else {
                         a[i + k * ld]
                     };
-                    let b_val = b[k + r * lb];
+                    let b_val = b[k];
                     v = (-a_val).mul_add(b_val, v);
                 }
-                b[i + r * lb] = v / a[i + i * ld];
+                b[i] = v / a[i + i * ld];
+            }
+        };
+        // One task owns each complete RHS; the dependent triangular sweeps
+        // inside a column retain exactly the serial arithmetic order.
+        let parallel = inner_par()
+            && rayon::current_num_threads() > 1
+            && nrhs >= PAR_COLS
+            && (n as u128) * (n as u128) * (nrhs as u128) >= 4096;
+        if parallel {
+            #[cfg(test)]
+            POOLED_POTRS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tile = nrhs.div_ceil(4 * rayon::current_num_threads()).max(1);
+            b[..(nrhs - 1) * lb + n]
+                .par_chunks_mut(tile * lb)
+                .for_each(|tile| {
+                    for column in tile.chunks_mut(lb) {
+                        solve_column(&mut column[..n]);
+                    }
+                });
+        } else {
+            for r in 0..nrhs {
+                solve_column(&mut b[r * lb..r * lb + n]);
             }
         }
     }
@@ -802,11 +821,10 @@ impl<const N: usize> XgesvScalar for F<N> {
     }
 }
 
-
-#[path = "mpfr_svd.rs"]
-mod svd;
 #[path = "mpfr_eigen.rs"]
 mod eigen;
+#[path = "mpfr_svd.rs"]
+mod svd;
 #[cfg(test)]
 use eigen::*;
 use svd::*;
@@ -818,3 +836,9 @@ mod syrk_partition_tests;
 #[cfg(test)]
 #[path = "mpfr_tridiagonal_tests.rs"]
 mod tridiagonal_tests;
+
+#[cfg(test)]
+static POOLED_POTRS_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+#[path = "mpfr_potrs_tests.rs"]
+mod potrs_tests;

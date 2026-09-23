@@ -6,9 +6,6 @@ mod syevr;
 pub(crate) use syevr::*;
 mod svd;
 pub(crate) use svd::*;
-mod lu;
-#[allow(unused_imports)]
-pub(crate) use lu::*;
 
 mod gemm;
 mod gemv;

@@ -1,3 +1,4 @@
+use super::super::refinement::{refine, Refinement};
 use super::*;
 
 impl<T: FloatT> HasLinearSolverInfo for CondensedKKTSolver<T> {
@@ -14,6 +15,10 @@ impl<T: FloatT> HasLinearSolverInfo for CondensedKKTSolver<T> {
 
 impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
     fn set_sampled_operator(&mut self, operator: Arc<SampledOperator<T>>) {
+        debug_assert!(
+            !self.local_only || operator.is_local_only(),
+            "local KKT requires local sampled policy"
+        );
         for (bi, sampled_block) in operator.blocks().iter().enumerate() {
             if let Some(block) = self
                 .blocks
@@ -21,9 +26,11 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 .find(|b| b.rows.start == sampled_block.row_start)
             {
                 if let Scaling::Psd(p) = &mut block.scaling {
+                    p.mat3c = Matrix::zeros(p.Rinv.size());
                     p.sampled = Some(SampledPsd {
                         work: SampledSchurWorkspace::new(sampled_block),
                         pair_lanes: Vec::new(),
+                        adjoint: vec![T::zero(); sampled_block.column_count()],
                         operator: Arc::clone(&operator),
                         block: bi,
                     });
@@ -31,32 +38,365 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             }
         }
         self.sampled = Some((Arc::clone(&operator), SampledWorkspace::new(&operator)));
-        // Reserve within the existing contribution-storage cap even if the
-        // handle starts at one worker and is later reconfigured.
-        let cells: u128 = self
-            .blocks
-            .iter()
-            .map(|b| match &b.scaling {
-                Scaling::Psd(p) => triangular_number(p.columns.len()) as u128,
-                _ => 0,
-            })
-            .sum();
-        if cells <= 2 * self.schur.nzval.len() as u128 {
-            for block in &mut self.blocks {
-                if let Scaling::Psd(p) = &mut block.scaling {
-                    p.schur_values
-                        .resize(triangular_number(p.columns.len()), T::zero());
-                }
-            }
-        }
-        self.plan_threads = 0;
+        self.prepare_shared_pool();
         self.refresh_parallel_plan();
     }
     fn update(&mut self, cones: &CompositeCone<T>, settings: &CoreSettings<T>) -> bool {
+        self.update_partition(cones, settings, true)
+    }
+
+    fn setrhs(&mut self, x: &[T], z: &[T]) {
+        self.b[..self.n].copy_from_slice(x);
+        self.b[self.n..].copy_from_slice(z);
+    }
+
+    fn counters(&self) -> crate::solver::core::kktsolvers::SolveCounters {
+        let mut counters = self.reduced.counters();
+        counters.rhs_applied = self.counters.rhs_applied;
+        counters.batches = self.counters.batches;
+        counters
+    }
+
+    fn reset_solve(&mut self) {
+        self.scaled_valid.fill(false);
+        self.counters = Default::default();
+        self.reduced.reset_solve();
+    }
+
+    fn scaled_solution(&self, column: usize) -> Option<&[T]> {
+        self.scaled_valid
+            .get(column)
+            .copied()
+            .unwrap_or(false)
+            .then(|| &self.scaled_solutions[column * self.A.m..(column + 1) * self.A.m])
+    }
+
+    fn solve_many(
+        &mut self,
+        n: usize,
+        rhs: &[T],
+        out: &mut [T],
+        cols: usize,
+        settings: &CoreSettings<T>,
+    ) -> Vec<bool> {
+        assert_eq!(n, self.n);
+        let width = self.A.m + n;
+        assert_eq!(rhs.len(), cols * width);
+        assert_eq!(out.len(), rhs.len());
+        if cols == 0 {
+            return Vec::new();
+        }
+        self.scaled_valid.clear();
+        self.scaled_valid.resize(cols, false);
+        self.scaled_solutions.resize(cols * self.A.m, T::zero());
+        self.counters.batches += 1;
+        self.counters.rhs_applied += cols as u64;
+        let reduced_width = n + self.retained_rows.len();
+        let half_width: usize = if self.fused_sampled() {
+            self.blocks
+                .iter()
+                .map(|b| match &b.scaling {
+                    Scaling::Psd(p) if p.sampled.is_some() => p.mat3c.data().len(),
+                    _ => 0,
+                })
+                .sum()
+        } else {
+            0
+        };
+        let mut b = std::mem::take(&mut self.batch_rhs);
+        let mut reduced_out = std::mem::take(&mut self.batch_out);
+        let mut halves = std::mem::take(&mut self.batch_halves);
+        b.resize(cols * reduced_width, T::zero());
+        reduced_out.resize(b.len(), T::zero());
+        halves.resize(cols * half_width, T::zero());
+        let valid: Vec<bool> = rhs
+            .chunks(width)
+            .map(|b| local_success(self.local_only, b.is_finite()))
+            .collect();
+        for c in 0..cols {
+            let dest = &mut b[c * reduced_width..(c + 1) * reduced_width];
+            if !valid[c] {
+                dest.fill(T::zero());
+                continue;
+            }
+            self.prepare_rhs(&rhs[c * width..(c + 1) * width]);
+            dest[..n].copy_from_slice(&self.workx);
+            dest[n..].copy_from_slice(&self.retained_rhs);
+            let mut offset = c * half_width;
+            if half_width != 0 {
+                for block in &self.blocks {
+                    if let Scaling::Psd(p) = &block.scaling {
+                        if p.sampled.is_some() {
+                            let values = p.mat3c.data();
+                            halves[offset..offset + values.len()].copy_from_slice(values);
+                            offset += values.len();
+                        }
+                    }
+                }
+            }
+        }
+        let mut flags = self
+            .reduced
+            .solve_many(n, &b, &mut reduced_out, cols, settings);
+        let mut x = std::mem::take(&mut self.x);
+        for c in 0..cols {
+            flags[c] = local_success(self.local_only, flags[c]) && valid[c];
+            if !flags[c] {
+                continue;
+            }
+            let rhs = &rhs[c * width..(c + 1) * width];
+            let r = &reduced_out[c * reduced_width..(c + 1) * reduced_width];
+            x[..n].copy_from_slice(&r[..n]);
+            self.retained_rhs.copy_from_slice(&r[n..]);
+            let mut offset = c * half_width;
+            if half_width != 0 {
+                for block in &mut self.blocks {
+                    if let Scaling::Psd(p) = &mut block.scaling {
+                        if p.sampled.is_some() {
+                            let values = p.mat3c.data_mut();
+                            values.copy_from_slice(&halves[offset..offset + values.len()]);
+                            offset += values.len();
+                        }
+                    }
+                }
+            }
+            flags[c] = local_success(self.local_only, self.recover_rhs(&mut x, rhs))
+                && self.refine_solution(&mut x, rhs, settings);
+            if flags[c] {
+                if settings.iterative_refinement_enable {
+                    self.scaled_solutions[c * self.A.m..(c + 1) * self.A.m]
+                        .copy_from_slice(&self.workh);
+                    self.scaled_valid[c] = true;
+                }
+                out[c * width..(c + 1) * width].copy_from_slice(&x);
+            }
+        }
+        self.x = x;
+        self.batch_rhs = b;
+        self.batch_out = reduced_out;
+        self.batch_halves = halves;
+        flags
+    }
+
+    fn solve(
+        &mut self,
+        lhsx: Option<&mut [T]>,
+        lhsz: Option<&mut [T]>,
+        settings: &CoreSettings<T>,
+    ) -> bool {
+        // Move reusable buffers to keep operator scratch and refinement storage
+        // disjoint. Sampled operator caches initialize on their first pooled use;
+        // subsequent calls reuse them without precision conversion.
+        self.scaled_valid.clear();
+        self.scaled_valid.push(false);
+        self.counters.rhs_applied += 1;
+        let b = std::mem::take(&mut self.b);
+        let mut x = std::mem::take(&mut self.x);
+        let success = (|| {
+            if !local_success(self.local_only, b.is_finite())
+                || !local_success(self.local_only, self.solve_raw(&mut x, &b, settings))
+                || !self.refine_solution(&mut x, &b, settings)
+            {
+                return false;
+            }
+            if settings.iterative_refinement_enable {
+                self.scaled_solutions.resize(self.A.m, T::zero());
+                self.scaled_solutions.copy_from_slice(&self.workh);
+                self.scaled_valid[0] = true;
+            }
+            // As in upstream DirectLDL, refinement may stop at a finite
+            // stalled approximation; ordinary solver convergence is unchanged.
+            if let Some(v) = lhsx {
+                v.copy_from_slice(&x[..self.n]);
+            }
+            if let Some(v) = lhsz {
+                v.copy_from_slice(&x[self.n..]);
+            }
+            true
+        })();
+
+        self.b = b;
+        self.x = x;
+        success
+    }
+
+    fn escalate_regularization(&mut self) -> bool {
+        self.reduced.escalate_regularization()
+    }
+
+    fn update_P(&mut self, P: &CscMatrix<T>) {
+        self.scaled_valid.fill(false);
+        assert_eq!(P.size(), self.P.size());
+        assert_eq!(P.colptr, self.P.colptr);
+        assert_eq!(P.rowval, self.P.rowval);
+        self.P.nzval.copy_from_slice(&P.nzval);
+    }
+
+    fn update_A(&mut self, A: &CscMatrix<T>) {
+        self.scaled_valid.fill(false);
+        assert_eq!(A.size(), self.A.size());
+        assert_eq!(A.colptr, self.A.colptr);
+        assert_eq!(A.rowval, self.A.rowval);
+        self.A.nzval.copy_from_slice(&A.nzval);
+        for block in &mut self.blocks {
+            if let Scaling::Psd(psd) = &mut block.scaling {
+                psd.coefficient_plan_valid = false;
+            }
+        }
+        for (v, &p) in self
+            .retained_A
+            .nzval
+            .iter_mut()
+            .zip(&self.retained_positions)
+        {
+            *v = A.nzval[p];
+        }
+        self.reduced.update_A(&self.retained_A);
+    }
+}
+
+impl<T: FloatT> CondensedKKTSolver<T> {
+    fn refine_solution(&mut self, x: &mut Vec<T>, b: &[T], settings: &CoreSettings<T>) -> bool {
+        let mut error = std::mem::take(&mut self.error);
+        let mut candidate = std::mem::take(&mut self.candidate);
+        let success = refine(
+            &mut LocalRefinement {
+                kernel: self,
+                x,
+                b,
+                error: &mut error,
+                candidate: &mut candidate,
+            },
+            settings,
+        );
+        self.error = error;
+        self.candidate = candidate;
+        success
+    }
+}
+
+struct LocalRefinement<'a, T: FloatT> {
+    kernel: &'a mut CondensedKKTSolver<T>,
+    x: &'a mut Vec<T>,
+    b: &'a [T],
+    error: &'a mut Vec<T>,
+    candidate: &'a mut Vec<T>,
+}
+impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
+    fn all_succeeded(&self, value: bool) -> bool {
+        local_success(self.kernel.local_only, value)
+    }
+    fn decision_agrees(&self, value: u32) -> bool {
+        self.kernel.local_only || crate::mpi::decision_agrees(value)
+    }
+    fn rhs_norm(&self) -> T {
+        self.b.norm_inf()
+    }
+    fn residual(&mut self, candidate: bool, reuse: bool) -> T {
+        self.kernel.residual(
+            self.error,
+            self.b,
+            if candidate { self.candidate } else { self.x },
+            reuse,
+        )
+    }
+    fn solve_correction(&mut self, settings: &CoreSettings<T>) -> bool {
+        self.kernel.solve_raw(self.candidate, self.error, settings)
+    }
+    fn add_correction(&mut self) {
+        for (c, &v) in self.candidate.iter_mut().zip(self.x.iter()) {
+            *c += v;
+        }
+    }
+    fn accept_candidate(&mut self) {
+        std::mem::swap(self.x, self.candidate);
+    }
+    fn restore_product(&mut self) {
+        self.kernel.restore_scaled_product(self.x);
+    }
+}
+
+#[cfg(test)]
+mod mpi_tests {
+    use super::*;
+    use crate::solver::core::ScalingStrategy;
+
+    fn rank_local_rhs_failure<T: FloatT>(rank: usize) {
+        let kinds = vec![SupportedConeT::PSDTriangleConeT(2); 2];
+        let mut cones = CompositeCone::<T>::new(&kinds);
+        let (mut slack, mut dual) = (vec![T::zero(); 6], vec![T::zero(); 6]);
+        cones.unit_initialization(&mut dual, &mut slack);
+        assert!(cones.update_scaling(&slack, &dual, T::one(), ScalingStrategy::PrimalDual));
+        let p = CscMatrix::identity(6);
+        let a = CscMatrix::identity(6);
+        let settings = CoreSettings::<T>::default();
+        let mut kkt = CondensedKKTSolver::new(&p, &a, &kinds, &cones, &settings);
+        assert!(kkt.update(&cones, &settings));
+        let mut rhs = vec![T::one(); 24];
+        if rank == 0 {
+            rhs[0] = T::nan();
+        }
+        let mut out = vec![T::zero(); rhs.len()];
+        // A single-rank bad column must skip preparation/recovery on all
+        // ranks, while the next independent column still solves normally.
+        assert_eq!(
+            kkt.solve_many(6, &rhs, &mut out, 2, &settings),
+            [false, true]
+        );
+        assert!(out[12..].is_finite());
+        kkt.setrhs(&rhs[..6], &rhs[6..12]);
+        assert!(!kkt.solve(None, None, &settings));
+        rhs.fill(T::one());
+        assert_eq!(
+            kkt.solve_many(6, &rhs, &mut out, 2, &settings),
+            [true, true]
+        );
+        let mut error = vec![T::zero(); 12];
+        for c in 0..2 {
+            let norm = kkt.residual(
+                &mut error,
+                &rhs[c * 12..(c + 1) * 12],
+                &out[c * 12..(c + 1) * 12],
+                false,
+            );
+            assert!(norm < T::from_f64(1e-7).unwrap());
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn mpi_probe_two_rank_condensed_rhs_failure() {
+        let mpi = crate::MpiContext::initialize();
+        assert_eq!(mpi.size(), 2);
+        rank_local_rhs_failure::<f64>(mpi.rank());
+        rank_local_rhs_failure::<sdpx_arithmetic::Bits256>(mpi.rank());
+        mpi.finish();
+    }
+}
+
+impl<T: FloatT> CondensedKKTSolver<T> {
+    pub(crate) fn update_partition(
+        &mut self,
+        cones: &CompositeCone<T>,
+        settings: &CoreSettings<T>,
+        factor: bool,
+    ) -> bool {
+        self.update_partition_with_pool(cones, settings, factor, cones.thread_pool())
+    }
+
+    /// Update on an externally owned pool. None explicitly restores serial
+    /// execution; no cone pool is created or implicitly substituted.
+    pub(crate) fn update_partition_with_pool(
+        &mut self,
+        cones: &CompositeCone<T>,
+        settings: &CoreSettings<T>,
+        factor: bool,
+        pool: Option<Arc<rayon::ThreadPool>>,
+    ) -> bool {
+        self.scaled_valid.fill(false);
         assert_eq!(self.blocks.len(), cones.len());
-        // CompositeCone can be reconfigured between solves. Follow its actual
-        // current pool; reconfiguration never silently retains an old budget.
-        self.pool = cones.thread_pool();
+        // Follow this update's actual pool, including removal/replacement.
+        self.pool = pool;
         self.reduced.set_residual_pool(self.pool.clone());
         self.reduced.set_factor_pool(self.pool.clone());
         self.refresh_parallel_plan();
@@ -67,7 +407,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             });
         let inner_sampled = self.inner_sampled;
         let pool = &self.pool;
-        let world = crate::mpi::World::get();
+        let world = self.mpi_world();
         let sync = |(block, cone, owned): (&mut Block<T>, &SupportedCone<T>, bool)| {
             match (&mut block.scaling, cone) {
                 (Scaling::Psd(p), SupportedCone::PSDTriangleCone(c)) => {
@@ -92,19 +432,19 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                                 },
                             );
                         }
-                    } else {
-                        p.Ginv
-                            .syrk(&p.Rinv.t(), T::one(), T::zero(), MatrixTriangle::Triu);
                     }
-                    if p.sampled.is_none() {
-                        for j in 0..c.n {
-                            for i in j + 1..c.n {
-                                p.Ginv[(i, j)] = p.Ginv[(j, i)];
-                            }
+                    p.G.syrk(&p.R, T::one(), T::zero(), MatrixTriangle::Triu);
+                    p.Ginv
+                        .syrk(&p.Rinv.t(), T::one(), T::zero(), MatrixTriangle::Triu);
+                    for j in 0..c.n {
+                        for i in j + 1..c.n {
+                            p.G[(i, j)] = p.G[(j, i)];
+                            p.Ginv[(i, j)] = p.Ginv[(j, i)];
                         }
                     }
                     if !p.R.data().is_finite()
                         || !p.Rinv.data().is_finite()
+                        || !p.G.data().is_finite()
                         || !p.Ginv.data().is_finite()
                     {
                         return false;
@@ -218,9 +558,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 .blocks
                 .iter()
                 .map(|b| match &b.scaling {
-                    Scaling::Psd(p) => {
-                        p.sampled.as_ref().map_or(0, |s| s.work.gram_slice().len())
-                    }
+                    Scaling::Psd(p) => p.sampled.as_ref().map_or(0, |s| s.work.gram_slice().len()),
                     _ => 0,
                 })
                 .collect();
@@ -260,7 +598,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 }
             }
         }
-        if std::env::var_os("SDPX_PROFILE").is_some() {
+        if crate::receipt::profile_requested() {
             eprintln!(
                 "PHASE sync {:?} (inner_sampled={:?})",
                 __ts.elapsed(),
@@ -272,7 +610,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         // returning early while peers proceed would hang the next
         // collective. Merge the flag before any rank leaves the call.
         let valid = match world {
-            Some(w) => valid && w.allreduce_max_f64(if valid { 0.0 } else { 1.0 }) == 0.0,
+            // Every rank must enter the collective, including a failing owner.
+            Some(w) => w.allreduce_max_f64(if valid { 0.0 } else { 1.0 }) == 0.0,
             None => valid,
         };
         if !valid {
@@ -284,143 +623,20 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         }
         crate::receipt::phase("assemble", __t0.elapsed());
         self.reduced.update_P(&self.schur);
-        self.counters.factorizations += 1;
         let retained = &self.retained_indices;
         let __t1 = std::time::Instant::now();
-        let __r = self.reduced.update_from_cones(
-            cones
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| retained.binary_search(i).is_ok())
-                .map(|(_, c)| c),
-            settings,
-        );
+        let retained_cones = cones
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| retained.binary_search(i).is_ok())
+            .map(|(_, c)| c);
+        let __r = if factor {
+            self.reduced.update_from_cones(retained_cones, settings)
+        } else {
+            self.reduced.assemble_from_cones(retained_cones);
+            true
+        };
         crate::receipt::phase("cones_schur", __t1.elapsed());
         __r
-    }
-
-    fn setrhs(&mut self, x: &[T], z: &[T]) {
-        self.b[..self.n].copy_from_slice(x);
-        self.b[self.n..].copy_from_slice(z);
-    }
-
-    fn counters(&self) -> crate::solver::core::kktsolvers::SolveCounters {
-        self.counters
-    }
-
-    /// One wave carrying `ncols` columns. The default column loop applies every
-    /// column to the same factorization, so this adds only the wave accounting
-    /// that distinguishes "three RHS in two waves" from "three waves".
-    fn solve_many(
-        &mut self,
-        n: usize,
-        rhs: &[T],
-        out: &mut [T],
-        ncols: usize,
-        settings: &CoreSettings<T>,
-    ) -> Vec<bool> {
-        assert_eq!(
-            n, self.n,
-            "solve_many x-width must match the condensed system"
-        );
-        self.counters.batches += 1;
-        crate::solver::core::kktsolvers::solve_many_by_columns(self, n, rhs, out, ncols, settings)
-    }
-
-    fn solve(
-        &mut self,
-        lhsx: Option<&mut [T]>,
-        lhsz: Option<&mut [T]>,
-        settings: &CoreSettings<T>,
-    ) -> bool {
-        // Move reusable buffers to keep operator scratch and refinement storage
-        // disjoint. Sampled operator caches initialize on their first pooled use;
-        // subsequent calls reuse them without precision conversion.
-        self.counters.rhs_applied += 1;
-        let b = std::mem::take(&mut self.b);
-        let mut x = std::mem::take(&mut self.x);
-        let mut error = std::mem::take(&mut self.error);
-        let mut candidate = std::mem::take(&mut self.candidate);
-        let success = (|| {
-            if !b.is_finite() || !self.solve_raw(&mut x, &b, settings) {
-                return false;
-            }
-            if settings.iterative_refinement_enable {
-                let normb = b.norm_inf();
-                let mut norme = self.residual(&mut error, &b, &x, true);
-                if !norme.is_finite() {
-                    return false;
-                }
-                for _ in 0..settings.iterative_refinement_max_iter {
-                    if norme
-                        <= settings.iterative_refinement_abstol
-                            + settings.iterative_refinement_reltol * normb
-                    {
-                        break;
-                    }
-                    let previous = norme;
-                    if !self.solve_raw(&mut candidate, &error, settings) {
-                        return false;
-                    }
-                    for (c, &v) in candidate.iter_mut().zip(&x) {
-                        *c += v;
-                    }
-                    norme = self.residual(&mut error, &b, &candidate, false);
-                    if !norme.is_finite() {
-                        return false;
-                    }
-                    let ratio = previous / norme;
-                    if ratio < settings.iterative_refinement_stop_ratio {
-                        if ratio > T::one() {
-                            std::mem::swap(&mut x, &mut candidate);
-                        }
-                        break;
-                    }
-                    std::mem::swap(&mut x, &mut candidate);
-                }
-            }
-            // As in upstream DirectLDL, refinement may stop at a finite
-            // stalled approximation; ordinary solver convergence is unchanged.
-            if let Some(v) = lhsx {
-                v.copy_from_slice(&x[..self.n]);
-            }
-            if let Some(v) = lhsz {
-                v.copy_from_slice(&x[self.n..]);
-            }
-            true
-        })();
-
-        self.b = b;
-        self.x = x;
-        self.error = error;
-        self.candidate = candidate;
-        success
-    }
-
-    fn escalate_regularization(&mut self) -> bool {
-        self.reduced.escalate_regularization()
-    }
-
-    fn update_P(&mut self, P: &CscMatrix<T>) {
-        assert_eq!(P.size(), self.P.size());
-        assert_eq!(P.colptr, self.P.colptr);
-        assert_eq!(P.rowval, self.P.rowval);
-        self.P.nzval.copy_from_slice(&P.nzval);
-    }
-
-    fn update_A(&mut self, A: &CscMatrix<T>) {
-        assert_eq!(A.size(), self.A.size());
-        assert_eq!(A.colptr, self.A.colptr);
-        assert_eq!(A.rowval, self.A.rowval);
-        self.A.nzval.copy_from_slice(&A.nzval);
-        for (v, &p) in self
-            .retained_A
-            .nzval
-            .iter_mut()
-            .zip(&self.retained_positions)
-        {
-            *v = A.nzval[p];
-        }
-        self.reduced.update_A(&self.retained_A);
     }
 }

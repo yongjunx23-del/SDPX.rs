@@ -7,6 +7,7 @@ use crate::solver::core::{
 };
 
 use crate::algebra::*;
+use crate::mpi::all_succeeded;
 
 // We require Send/Sync here to allow pyo3 builds to share
 // solver objects between threads.
@@ -29,12 +30,29 @@ pub struct DefaultKKTSystem<T> {
     workx: Vec<T>,
     workz: Vec<T>,
     work_conic: Vec<T>,
+    batch_rhs: Vec<T>,
+    batch_out: Vec<T>,
+    affine_ready: Option<bool>,
+    hs1: Vec<T>,
+    hs2: Vec<T>,
 }
 
 impl<T> DefaultKKTSystem<T>
 where
     T: FloatT,
 {
+    #[cfg(feature = "sdp")]
+    pub(crate) fn uses_condensed(
+        data: &DefaultProblemData<T>,
+        cones: &CompositeCone<T>,
+        settings: &DefaultSettings<T>,
+    ) -> bool {
+        match settings.kkt_form.as_str() {
+            "condensed" => data.n > 0,
+            "augmented" => false,
+            _ => CondensedKKTSolver::prefer_condensed(&data.P, &data.A, cones, settings.core()),
+        }
+    }
     /// Create a new KKT system solver
     pub fn new(
         data: &DefaultProblemData<T>,
@@ -45,12 +63,7 @@ where
 
         // Both formulations share the embedding and recovery.
         #[cfg(feature = "sdp")]
-        let use_condensed = match settings.kkt_form.as_str() {
-            // A constant feasibility problem has no primal block to condense.
-            "condensed" => data.n > 0,
-            "augmented" => false,
-            _ => CondensedKKTSolver::prefer_condensed(&data.P, &data.A, cones, settings.core()),
-        };
+        let use_condensed = Self::uses_condensed(data, cones, settings);
         assert!(
             settings.direct_kkt_solver,
             "Indirect solve strategies are not supported."
@@ -109,6 +122,11 @@ where
             workx,
             workz,
             work_conic,
+            batch_rhs: Vec::new(),
+            batch_out: Vec::new(),
+            affine_ready: None,
+            hs1: Vec::new(),
+            hs2: Vec::new(),
         }
     }
 }
@@ -138,26 +156,89 @@ where
     type C = CompositeCone<T>;
     type SE = DefaultSettings<T>;
 
+    fn reset_solve(&mut self) {
+        self.kktsolver.reset_solve();
+        self.affine_ready = None;
+    }
+
     fn update(
         &mut self,
         data: &DefaultProblemData<T>,
         cones: &CompositeCone<T>,
         settings: &DefaultSettings<T>,
     ) -> bool {
+        self.affine_ready = None;
         // Update the linear solver with new cones and solve for the constant
         // terms.  On failure escalate the static regularization and retry:
         // unpivoted elimination can overflow pivots on degenerate quasidef
         // systems even though the shifted matrix is benign, and iterative
         // refinement still runs against the unshifted matrix.
         loop {
-            let is_success = self.kktsolver.update(cones, settings.core())
-                && self.solve_constant_rhs(data, settings.core());
-            if is_success || !self.kktsolver.escalate_regularization() {
+            let updated = all_succeeded(self.kktsolver.update(cones, settings.core()));
+            let is_success =
+                updated && all_succeeded(self.solve_constant_rhs(data, settings.core()));
+            if is_success
+                || !settings.core().static_regularization_enable
+                || !all_succeeded(self.kktsolver.escalate_regularization())
+            {
                 return is_success;
             }
         }
 
         //PJG is_success should be a Result in rust
+    }
+
+    fn update_affine(
+        &mut self,
+        data: &DefaultProblemData<T>,
+        cones: &CompositeCone<T>,
+        rhs: &DefaultVariables<T>,
+        variables: &DefaultVariables<T>,
+        settings: &DefaultSettings<T>,
+    ) -> bool {
+        self.affine_ready = None;
+        let (n, m) = (data.n, data.m);
+        let width = n + m;
+        self.batch_rhs.resize(2 * width, T::zero());
+        self.batch_out.resize(2 * width, T::zero());
+        loop {
+            let updated = all_succeeded(self.kktsolver.update(cones, settings.core()));
+            let mut constant_ok = false;
+            if updated {
+                for (v, &q) in self.batch_rhs[..n].iter_mut().zip(&data.q) {
+                    *v = -q;
+                }
+                self.batch_rhs[n..width].copy_from_slice(&data.b);
+                self.batch_rhs[width..width + n].copy_from_slice(&rhs.x);
+                self.batch_rhs[width + n..].waxpby(T::one(), &variables.s, -T::one(), &rhs.z);
+                let ok = self.kktsolver.solve_many(
+                    n,
+                    &self.batch_rhs,
+                    &mut self.batch_out,
+                    2,
+                    settings.core(),
+                );
+                constant_ok = all_succeeded(ok[0]);
+                let affine_ok = all_succeeded(ok[1]);
+                if constant_ok {
+                    self.x2.copy_from_slice(&self.batch_out[..n]);
+                    self.z2.copy_from_slice(&self.batch_out[n..width]);
+                    self.x1.copy_from_slice(&self.batch_out[width..width + n]);
+                    self.z1.copy_from_slice(&self.batch_out[width + n..]);
+                    copy_scaled(&*self.kktsolver, 0, &mut self.hs2);
+                    copy_scaled(&*self.kktsolver, 1, &mut self.hs1);
+                    self.affine_ready = Some(affine_ok);
+                }
+            }
+            // Match the existing retry policy: only factor/constant failure
+            // escalates regularization; affine failure remains a failed step.
+            if constant_ok
+                || !settings.core().static_regularization_enable
+                || !all_succeeded(self.kktsolver.escalate_regularization())
+            {
+                return constant_ok;
+            }
+        }
     }
 
     fn solve(
@@ -191,39 +272,38 @@ where
             }
         }
 
-        workz.waxpby(T::one(), Δs_const_term, -T::one(), &rhs.z);
+        match step_direction {
+            StepDirection::Affine => {
+                workz.waxpby(T::one(), Δs_const_term, -T::one(), &rhs.z);
+            }
+            StepDirection::Combined => {
+                workz.copy_from_slice(&rhs.z);
+                for (v, &c) in workz.iter_mut().zip(Δs_const_term.iter()) {
+                    *v = c - *v;
+                }
+            }
+        }
 
         // ---------------------------------------------------
         // this solves the variable part of reduced KKT system
-        self.kktsolver.setrhs(workx, workz);
-        let is_success = self.kktsolver.solve(Some(x1), Some(z1), settings.core());
-        if !is_success {
+        let cached = self.affine_ready.take();
+        let prepared = match step_direction {
+            StepDirection::Affine => cached,
+            StepDirection::Combined => None,
+        };
+        let is_success = prepared.unwrap_or_else(|| {
+            self.kktsolver.setrhs(workx, workz);
+            let ok = self.kktsolver.solve(Some(x1), Some(z1), settings.core());
+            copy_scaled(&*self.kktsolver, 0, &mut self.hs1);
+            ok
+        });
+        if !all_succeeded(is_success) {
             return false;
         }
 
-        // solve for Δτ.
-        // -----------
-        // Numerator first
-        let ξ = workx;
-        ξ.axpby(T::recip(variables.τ), &variables.x, T::zero());
-
-        let two: T = (2.).as_T();
-        let tau_num = rhs.τ - rhs.κ / variables.τ
-            + data.q.dot(x1)
-            + data.b.dot(z1)
-            + two * data.P.sym_up().quad_form(ξ, x1);
-
-        // offset ξ for the quadratic form in the denominator
-        let ξ_minus_x2 = ξ; //alias to ξ, same as workx
-        ξ_minus_x2.axpby(-T::one(), x2, T::one());
-
-        let mut tau_den = variables.κ / variables.τ - data.q.dot(x2) - data.b.dot(z2);
-        tau_den +=
-            data.P.sym_up().quad_form(ξ_minus_x2, ξ_minus_x2) - data.P.sym_up().quad_form(x2, x2);
-
-        // solve for (Δx,Δz)
-        // -----------
-        lhs.τ = tau_num / tau_den;
+        // One shared homogeneous scalar formula, independent of storage layout.
+        let terms = hsd_terms(workx, &variables.x, variables.τ, data, x1, z1, x2, z2);
+        lhs.τ = hsd_tau(terms, rhs.τ, rhs.κ, variables.τ, variables.κ);
         lhs.x.waxpby(T::one(), x1, lhs.τ, x2);
         lhs.z.waxpby(T::one(), z1, lhs.τ, z2);
 
@@ -231,7 +311,13 @@ where
         // -------------
         //  compute the linear term HₛΔz, where Hs = WᵀW for symmetric
         //  cones and Hs = μH(z) for asymmetric cones
-        cones.mul_Hs(&mut lhs.s, &lhs.z, workz);
+        if self.hs1.len() == data.m && self.hs2.len() == data.m {
+            // Linearity: reuse original-operator products from the two accepted
+            // KKT solutions. No product from a rejected refinement is reused.
+            lhs.s.waxpby(T::one(), &self.hs1, lhs.τ, &self.hs2);
+        } else {
+            cones.mul_Hs(&mut lhs.s, &lhs.z, workz);
+        }
         lhs.s.axpby(-T::one(), Δs_const_term, -T::one()); // lhs.s = -(lhs.s+Δs_const_term);
 
         // solve for Δκ
@@ -266,8 +352,8 @@ where
             );
             variables.s.negate();
 
-            if !is_success {
-                return is_success;
+            if !all_succeeded(is_success) {
+                return false;
             }
 
             // solve with [-q;0] as a RHS to get z initializer
@@ -291,7 +377,70 @@ where
             );
             variables.s.scalarop_from(|z| -z, &variables.z);
         }
-        is_success && !initial_point_degenerate(variables, data)
+        all_succeeded(is_success && !initial_point_degenerate(variables, data))
+    }
+}
+
+/// Contributions to the HSD tau equation before global scalar reduction.
+#[derive(Clone, Copy)]
+pub(super) struct HsdTerms<T> {
+    pub q1: T,
+    pub b1: T,
+    pub quad1: T,
+    pub q2: T,
+    pub b2: T,
+    pub delta: T,
+    pub quad2: T,
+}
+impl<T: FloatT> HsdTerms<T> {
+    pub fn add(&mut self, rhs: Self) {
+        self.q1 += rhs.q1;
+        self.b1 += rhs.b1;
+        self.quad1 += rhs.quad1;
+        self.q2 += rhs.q2;
+        self.b2 += rhs.b2;
+        self.delta += rhs.delta;
+        self.quad2 += rhs.quad2;
+    }
+}
+pub(super) fn hsd_terms<T: FloatT>(
+    xi: &mut [T],
+    x: &[T],
+    tau: T,
+    data: &DefaultProblemData<T>,
+    x1: &[T],
+    z1: &[T],
+    x2: &[T],
+    z2: &[T],
+) -> HsdTerms<T> {
+    xi.axpby(T::recip(tau), x, T::zero());
+    let q1 = data.q.dot(x1);
+    let b1 = data.b.dot(z1);
+    let quad1 = data.P.sym_up().quad_form(xi, x1);
+    xi.axpby(-T::one(), x2, T::one());
+    HsdTerms {
+        q1,
+        b1,
+        quad1,
+        q2: data.q.dot(x2),
+        b2: data.b.dot(z2),
+        delta: data.P.sym_up().quad_form(xi, xi),
+        quad2: data.P.sym_up().quad_form(x2, x2),
+    }
+}
+pub(super) fn hsd_tau<T: FloatT>(v: HsdTerms<T>, rt: T, rk: T, tau: T, kappa: T) -> T {
+    let numerator = rt - rk / tau + v.q1 + v.b1 + T::from_f64(2.).unwrap() * v.quad1;
+    let mut denominator = kappa / tau - v.q2 - v.b2;
+    denominator += v.delta - v.quad2;
+    numerator / denominator
+}
+
+fn copy_scaled<T: FloatT>(solver: &dyn KKTSolver<T>, column: usize, out: &mut Vec<T>) {
+    if let Some(value) = solver.scaled_solution(column) {
+        out.resize(value.len(), T::zero());
+        out.copy_from_slice(value);
+    } else {
+        out.clear();
     }
 }
 
@@ -324,19 +473,23 @@ where
         settings: &DefaultSettings<T>,
     ) -> bool {
         self.workx.axpby(-T::one(), &data.q, T::zero()); //workx .= -q
-        self.kktsolver.setrhs(&self.workx, &data.b);
+        self.workz.copy_from_slice(&data.b);
+        self.kktsolver.setrhs(&self.workx, &self.workz);
         let is_success =
             self.kktsolver
                 .solve(Some(&mut self.x2), Some(&mut self.z2), settings.core());
 
+        copy_scaled(&*self.kktsolver, 0, &mut self.hs2);
         is_success
     }
 
     pub(crate) fn update_P(&mut self, P: &CscMatrix<T>) {
+        self.affine_ready = None;
         self.kktsolver.update_P(P);
     }
 
     pub(crate) fn update_A(&mut self, A: &CscMatrix<T>) {
+        self.affine_ready = None;
         self.kktsolver.update_A(A);
     }
 }
@@ -344,7 +497,274 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::SupportedConeT::NonnegativeConeT;
+    use crate::solver::{CoreSettings, SupportedConeT::NonnegativeConeT};
+
+    #[derive(Default)]
+    struct Calls {
+        updates: usize,
+        singles: usize,
+        batches: usize,
+        retries: usize,
+    }
+    struct BatchProbe {
+        calls: std::sync::Arc<std::sync::Mutex<Calls>>,
+        fail_constant_once: bool,
+        affine_ok: bool,
+    }
+    impl HasLinearSolverInfo for BatchProbe {
+        fn linear_solver_info(&self) -> LinearSolverInfo {
+            LinearSolverInfo::default()
+        }
+    }
+    impl KKTSolver<f64> for BatchProbe {
+        fn update(&mut self, _: &CompositeCone<f64>, _: &CoreSettings<f64>) -> bool {
+            self.calls.lock().unwrap().updates += 1;
+            true
+        }
+        fn setrhs(&mut self, _: &[f64], _: &[f64]) {}
+        fn solve(
+            &mut self,
+            _: Option<&mut [f64]>,
+            _: Option<&mut [f64]>,
+            _: &CoreSettings<f64>,
+        ) -> bool {
+            self.calls.lock().unwrap().singles += 1;
+            false
+        }
+        fn solve_many(
+            &mut self,
+            n: usize,
+            rhs: &[f64],
+            out: &mut [f64],
+            cols: usize,
+            _: &CoreSettings<f64>,
+        ) -> Vec<bool> {
+            assert_eq!((n, cols), (1, 2));
+            assert_eq!(rhs, &[-1., 2., 3., 3.]);
+            self.calls.lock().unwrap().batches += 1;
+            out.fill(0.);
+            vec![
+                !std::mem::take(&mut self.fail_constant_once),
+                self.affine_ok,
+            ]
+        }
+        fn escalate_regularization(&mut self) -> bool {
+            self.calls.lock().unwrap().retries += 1;
+            true
+        }
+        fn update_P(&mut self, _: &CscMatrix<f64>) {}
+        fn update_A(&mut self, _: &CscMatrix<f64>) {}
+    }
+    #[test]
+    fn affine_batch_retry_and_cache_lifetime() {
+        let settings = DefaultSettings::<f64>::default();
+        let kinds = vec![NonnegativeConeT(1)];
+        let data = DefaultProblemData::new(
+            &CscMatrix::zeros((1, 1)),
+            &[1.],
+            &CscMatrix::identity(1),
+            &[2.],
+            &kinds,
+            &settings,
+        );
+        let mut cones = CompositeCone::new(&kinds);
+        let mut v = DefaultVariables::new(1, 1);
+        v.s[0] = 5.;
+        v.τ = 1.;
+        v.κ = 1.;
+        let mut rhs = DefaultVariables::new(1, 1);
+        rhs.x[0] = 3.;
+        rhs.z[0] = 2.;
+        let mut lhs = DefaultVariables::new(1, 1);
+        for affine_ok in [false, true] {
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Calls::default()));
+            let mut kkt = DefaultKKTSystem::new(&data, &cones, &settings);
+            kkt.kktsolver = Box::new(BatchProbe {
+                calls: calls.clone(),
+                fail_constant_once: affine_ok,
+                affine_ok,
+            });
+            assert!(kkt.update_affine(&data, &cones, &rhs, &v, &settings));
+            assert_eq!(
+                kkt.solve(
+                    &mut lhs,
+                    &rhs,
+                    &data,
+                    &v,
+                    &mut cones,
+                    StepDirection::Affine,
+                    &settings
+                ),
+                affine_ok
+            );
+            let count = calls.lock().unwrap();
+            assert_eq!(count.singles, 0);
+            assert_eq!(count.retries, usize::from(affine_ok));
+            assert_eq!(count.batches, 1 + usize::from(affine_ok));
+            assert_eq!(count.updates, count.batches);
+            drop(count);
+            // The cached affine solve is consumed once, including a failed one.
+            assert!(!kkt.solve(
+                &mut lhs,
+                &rhs,
+                &data,
+                &v,
+                &mut cones,
+                StepDirection::Affine,
+                &settings
+            ));
+            assert_eq!(calls.lock().unwrap().singles, 1);
+            assert!(kkt.update_affine(&data, &cones, &rhs, &v, &settings));
+            kkt.reset_solve();
+            assert!(kkt.affine_ready.is_none());
+        }
+    }
+
+    /// Run alone under a two-rank launcher with --ignored --test-threads=1.
+    /// The mock uses a real, separate collective stream: a missing agreement
+    /// before retry/solve either mismatches an event or hits the launch timeout.
+    #[test]
+    #[ignore]
+    fn mpi_probe_two_rank_kkt_failure_retry() {
+        use std::sync::{Arc, Mutex};
+
+        struct FaultProbe {
+            calls: Arc<Mutex<Vec<u32>>>,
+            fail_update_once: bool,
+            fail_constant_once: bool,
+            retries: usize,
+        }
+        impl FaultProbe {
+            fn event(&self, event: u32) {
+                let world = crate::mpi::World::get().unwrap();
+                let mut received = [0.0; 2];
+                world.gather_slice(
+                    crate::mpi::SITE_GRAM,
+                    &[f64::from(event)],
+                    &[(0, 1), (1, 1)],
+                    &mut received,
+                );
+                if received != [f64::from(event); 2] {
+                    world.abort("KKT fault probe observed different call sequences");
+                }
+                self.calls.lock().unwrap().push(event);
+            }
+        }
+        impl HasLinearSolverInfo for FaultProbe {
+            fn linear_solver_info(&self) -> LinearSolverInfo {
+                LinearSolverInfo::default()
+            }
+        }
+        impl KKTSolver<f64> for FaultProbe {
+            fn update(&mut self, _: &CompositeCone<f64>, _: &CoreSettings<f64>) -> bool {
+                self.event(1);
+                !std::mem::take(&mut self.fail_update_once)
+            }
+            fn setrhs(&mut self, _: &[f64], _: &[f64]) {}
+            fn solve(
+                &mut self,
+                x: Option<&mut [f64]>,
+                z: Option<&mut [f64]>,
+                _: &CoreSettings<f64>,
+            ) -> bool {
+                self.event(2);
+                if let Some(x) = x {
+                    x.fill(0.0);
+                }
+                if let Some(z) = z {
+                    z.fill(0.0);
+                }
+                !std::mem::take(&mut self.fail_constant_once)
+            }
+            fn solve_many(
+                &mut self,
+                _: usize,
+                _: &[f64],
+                out: &mut [f64],
+                cols: usize,
+                _: &CoreSettings<f64>,
+            ) -> Vec<bool> {
+                self.event(3);
+                assert_eq!(cols, 2);
+                out.fill(0.0);
+                vec![!std::mem::take(&mut self.fail_constant_once), true]
+            }
+            fn escalate_regularization(&mut self) -> bool {
+                self.event(4);
+                self.retries += 1;
+                self.retries <= 2
+            }
+            fn update_P(&mut self, _: &CscMatrix<f64>) {}
+            fn update_A(&mut self, _: &CscMatrix<f64>) {}
+        }
+
+        let mpi = crate::MpiContext::initialize();
+        assert_eq!(mpi.size(), 2, "launch exactly this test on two ranks");
+        let settings = DefaultSettings::<f64>::default();
+        assert!(settings.static_regularization_enable);
+        let kinds = vec![NonnegativeConeT(1)];
+        let data = DefaultProblemData::new(
+            &CscMatrix::zeros((1, 1)),
+            &[1.],
+            &CscMatrix::identity(1),
+            &[2.],
+            &kinds,
+            &settings,
+        );
+        let cones = CompositeCone::new(&kinds);
+        let variables = DefaultVariables::new(1, 1);
+        let rhs = DefaultVariables::new(1, 1);
+        let install = |fail_factor: bool, fail_constant: bool| {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut kkt = DefaultKKTSystem::new(&data, &cones, &settings);
+            kkt.kktsolver = Box::new(FaultProbe {
+                calls: calls.clone(),
+                fail_update_once: mpi.rank() == 0 && fail_factor,
+                fail_constant_once: mpi.rank() == 0 && fail_constant,
+                retries: 0,
+            });
+            (kkt, calls)
+        };
+        // Exercise both public update paths. Only rank zero fails; both ranks
+        // must skip the same solve or retry the same constant RHS exactly once.
+        for batched in [false, true] {
+            for factor_failure in [true, false] {
+                let (mut kkt, calls) = install(factor_failure, !factor_failure);
+                let ok = if batched {
+                    kkt.update_affine(&data, &cones, &rhs, &variables, &settings)
+                } else {
+                    kkt.update(&data, &cones, &settings)
+                };
+                let solve_event = if batched { 3 } else { 2 };
+                let expected = if factor_failure {
+                    vec![1, 4, 1, solve_event]
+                } else {
+                    vec![1, solve_event, 4, 1, solve_event]
+                };
+                let matches = ok
+                    && *calls.lock().unwrap() == expected
+                    && (!batched || kkt.affine_ready == Some(true));
+                if !mpi.all_succeeded(matches) {
+                    mpi.abort("KKT fault probe retry count or affine cache mismatch");
+                }
+            }
+        }
+        // LP initialization has two sequential solves. A first-solve failure
+        // on rank zero must suppress the second solve on BOTH ranks.
+        let (mut kkt, calls) = install(false, true);
+        let mut point = DefaultVariables::new(1, 1);
+        let ok = kkt.solve_initial_point(&mut point, &data, &settings);
+        if !mpi.all_succeeded(!ok && *calls.lock().unwrap() == [2]) {
+            mpi.abort("KKT fault probe entered second initializer after peer failure");
+        }
+        // Confirm that the non-failing initializer still performs both solves.
+        let (mut kkt, calls) = install(false, false);
+        let ok = kkt.solve_initial_point(&mut point, &data, &settings);
+        if !mpi.all_succeeded(ok && *calls.lock().unwrap() == [2, 2]) {
+            mpi.abort("KKT fault probe changed successful initialization");
+        }
+        mpi.finish();
+    }
 
     #[test]
     fn degenerate_initial_point_detected() {
