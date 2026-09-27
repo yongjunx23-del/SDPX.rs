@@ -42,8 +42,10 @@ The optional `--settings` file replaces the input settings object. With no
 override, Ruiz equilibration, presolve, chordal preprocessing, and the NT
 direction retain their native defaults. The CLI supports 53-bit Float64 and
 128, 256, 512, 768, 1024, and 2048-bit MPFR arithmetic. PSD cones use NT. The optional
-`--partitions auto` owner-local path supports local pools and MPI.
-Distributed performance has not been qualified.
+`--partitions auto` owner-local path supports local pools and MPI. For
+multi-node runs, start with one rank per 8–16 cores. If OpenMPI's `openib`
+transport misbehaves (hangs, or "wire encode/decode failed"), select TCP with
+`--mca btl self,vader,tcp --mca btl_tcp_if_include <ib-or-eth-interface>`.
 The optional MPI loader supports OpenMPI's exported-handle ABI and requires
 `MPI_THREAD_MULTIPLE`, including when the host initializes MPI. Rust embedding
 applications can initialize `MpiContext` before reading distributed inputs,
@@ -122,9 +124,16 @@ Solver source layout (`crates/solver/src/solver/`; the public API is the flat
 
 Unit tests live in each module's `tests/` directory.
 
-Float64 uses native BLAS/LAPACK with QDLDL or optional multithreaded Faer
-factorization. MPFR uses owned GMP/MPFR scalars and serial QDLDL with bounded
-parallel cone work. The condensed backend eliminates PSD/orthant rows while
+Float64 uses native BLAS/LAPACK with QDLDL, or, with the `faer-sparse`
+feature, faer's multithreaded supernodal LDLᵀ for high-fill factorizations.
+MPFR uses owned GMP/MPFR scalars:
+- Dense products run through an exact residue-number-system kernel: exact
+  accumulation, one rounding.
+- Block-structured KKT systems use a parallel arrow LDLᵀ.
+- Otherwise QDLDL.
+Cones, blocks and long vector operations share one worker pool. Step lengths
+use certified binary64 screens with full-precision fallback, for PSD λmin and
+for the exponential/power backtracking. The condensed backend eliminates PSD/orthant rows while
 preserving the Newton equations; augmented and condensed forms share
 embedding, recovery, and refinement rules. Native receipts report the actual
 `linear_solver`, `linear_solver_threads`, `cone_threads`, and `kkt_form`; these
@@ -136,58 +145,56 @@ the source of sampled coefficients. Exact equality reduction preserves factor
 metadata; a chordal structural rewrite may use a materialized fallback and
 change coordinates, so acceptance audits the original problem independently.
 
+## Performance
+
+Audited full solves at 768 bits on 2× AMD EPYC 7742 nodes (see
+[CHANGELOG.md](CHANGELOG.md) and [docs/JOURNAL.md](docs/JOURNAL.md)):
+
+| Problem | SDPX 0.8 | SDPB |
+|---|---|---|
+| Ising Λ19, 32 threads / 32 ranks | 102–106 s | 204 s |
+| Ising Λ19, 64 threads / 64 ranks | 102 s | 153 s |
+| Λ19 spins 0–50, one node (52 threads / 64 ranks) | 238 s | 328 s |
+
+SDPX needs fewer iterations (119 vs 243 and 177 vs 265). Both solvers used
+the same precision and tolerances, and each SDPX result passed an
+independent original-coordinate audit.
+
+On glibc Linux the CLI raises malloc's `mmap` and trim thresholds at start-up
+(32 MiB / 256 MiB). Otherwise, repeated multi-megabyte work buffers are
+mapped and unmapped on every call, and the page faults and TLB shootdowns
+stop per-block kernels scaling across threads. Setting
+`MALLOC_MMAP_THRESHOLD_` in the environment keeps glibc's own policy.
+Programs that embed the library can apply the same `mallopt` settings.
+
 ## Verification and benchmarks
 
-Use risk-based checks, not a full regression after every edit. Run the focused
-test for the changed package and behavior. For a single cone/kernel change,
-test that cone and precision; add a matching solve only if the focused test
-does not cover it. Use the three-case LP/SOCP/SDP screen for shared defaults,
-convergence/status, input/output, or cross-cone changes. The nine-case full
-development set is for performance candidates and integration milestones.
-Documentation-only edits need `git diff --check`; run benchmark-tool tests only
-when that tooling changed.
+Each change is checked with one complete solve of a pinned case plus an
+independent original-coordinate audit:
 
-For local end-to-end work, use `--profile fast` and reuse the binary. Use the
-benchmark runner's three-case `--profile screen` when the CLI/result path
-changed (`--stage development --threads 1`). Check status,
-original-coordinate residuals, gap, and objective against existing tolerances;
-iteration count and runtime are diagnostic unless being measured. A valid
-algorithm change need not preserve exact iterations or objective digits.
+```sh
+python3 benchmark/e2e/e2e.py build
+python3 benchmark/e2e/e2e.py run medium      # Float64
+python3 benchmark/e2e/e2e.py run ising11     # MPFR 512-bit sampled SDP
+```
 
-At integration milestones or before release, run the full workspace suite:
+[AGENTS.md](AGENTS.md) says which check each kind of change needs. Known
+failures are listed in [REVIEW_AND_PLAN.md](REVIEW_AND_PLAN.md). Before a
+release, run the full suite:
 
 ```sh
 cargo test --locked --release --workspace \
   --features sdpx-ffi/sdp-accelerate,sdpx-ffi/faer-sparse -- --test-threads=1
 ```
 
-Run extended MPFR/threading checks only when changing the corresponding pool,
-precision, parallel, or condensed-congruence behavior. Keep the known
-`condensed_graded` failure labeled as a failure; do not describe it as passing.
+On Linux use `sdpx-ffi/sdp-openblas` instead of `sdp-accelerate`.
 
-```sh
-cargo test --locked -p sdpx-solver --features sdp-accelerate,faer-sparse \
-  --lib mpfr -- --ignored --test-threads=1
-cargo test --locked -p sdpx-solver --features sdp-accelerate \
-  --lib condensed_graded -- --ignored --test-threads=1
-```
-
-The [research protocol](benchmark/research/README.md) fixes input identities,
-native CLI process scope, precision, settings, and independent audits for
-candidate comparisons. `benchmark/float64` and `benchmark/parallel` launch the
-same native executable directly. Their Julia programs only generate inputs or
-run external original-coordinate audits, with oracle time and memory recorded
-outside solver timing. The Ising controller follows the same rule for its
-independent high-precision audit.
-
-Use external immutable arms and pinned BLAS/solver budgets. Measurements run
-serially on each host; no benchmark command starts a cluster campaign by
-itself. Accuracy failures, timeouts, OOMs, and incomplete process receipts
-remain in the denominator.
-
-Recorded MOSEK and SDPB runs use different inputs, settings, machines, and
-source revisions. They are reference context only and do not establish
-performance parity for this solver.
+The [research protocol](benchmark/research/README.md) handles the fixed
+multi-case suites and the MOSEK/Clarabel reference comparisons.
+[benchmark/ising](benchmark/ising/README.md) handles SDPB comparisons and
+scaling. Recorded MOSEK and SDPB runs use different inputs, settings, machines
+and source revisions, so they are context only, not evidence of performance
+parity.
 
 ## References and licenses
 
