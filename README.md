@@ -9,9 +9,8 @@ backends. It solves
 ```
 
 The supported solver surfaces are the Rust API, the `sdpx` command-line
-executable, and the versioned C ABI. Julia appears only in independent
-benchmark and audit scripts; it is not a solver interface or a required
-runtime dependency.
+executable, and the versioned C ABI. There is no Julia or Python runtime
+dependency.
 
 ## Build and run
 
@@ -107,7 +106,6 @@ separate from solver status in `sdpx_info`.
 | `sdpx` CLI / `JsonProblem` | Native JSON input, settings, precision selection, and solution receipts |
 | `crates/ffi` / `include/sdpx.h` | Versioned C ABI and Rust-owned prepared handles |
 | `crates/arithmetic` | Independently owned fixed-precision MPFR values and arithmetic |
-| `benchmark/research` | Fixed inputs, native process protocol, and external original-coordinate gates |
 
 Solver source layout (`crates/solver/src/solver/`; the public API is the flat
 `sdpx_solver::solver::*` facade):
@@ -167,34 +165,20 @@ stop per-block kernels scaling across threads. Setting
 `MALLOC_MMAP_THRESHOLD_` in the environment keeps glibc's own policy.
 Programs that embed the library can apply the same `mallopt` settings.
 
-## Verification and benchmarks
+## Verification
 
-Each change is checked with one complete solve of a pinned case plus an
-independent original-coordinate audit:
-
-```sh
-python3 benchmark/e2e/e2e.py build
-python3 benchmark/e2e/e2e.py run medium      # Float64
-python3 benchmark/e2e/e2e.py run ising11     # MPFR 512-bit sampled SDP
-```
-
-[AGENTS.md](AGENTS.md) says which check each kind of change needs. Known
-failures are listed in [REVIEW_AND_PLAN.md](REVIEW_AND_PLAN.md). Before a
-release, run the full suite:
+Before a release, run the full suite:
 
 ```sh
 cargo test --locked --release --workspace \
   --features sdpx-ffi/sdp-accelerate,sdpx-ffi/faer-sparse -- --test-threads=1
 ```
 
-On Linux use `sdpx-ffi/sdp-openblas` instead of `sdp-accelerate`.
-
-The [research protocol](benchmark/research/README.md) handles the fixed
-multi-case suites and the MOSEK/Clarabel reference comparisons.
-[benchmark/ising](benchmark/ising/README.md) handles SDPB comparisons and
-scaling. Recorded MOSEK and SDPB runs use different inputs, settings, machines
-and source revisions, so they are context only, not evidence of performance
-parity.
+On Linux use `sdpx-ffi/sdp-openblas` instead of `sdp-accelerate`. Each
+performance change is also checked by complete solves of pinned cases with an
+independent original-coordinate audit. The benchmark inputs and harness are
+kept outside this repository. Known failures are listed in
+[REVIEW_AND_PLAN.md](REVIEW_AND_PLAN.md).
 
 ## References and licenses
 
@@ -203,8 +187,8 @@ and retains its Apache-2.0 attribution. Historical adapted source mappings are
 listed in [`provenance/reuse.json`](provenance/reuse.json); the retained MIT
 notice is [`provenance/SDPX.jl-LICENSE`](provenance/SDPX.jl-LICENSE). The
 fixed-precision SVD port records its GenericLinearAlgebra MIT notice in that
-mapping. Native BLAS, LAPACK, GMP, MPFR, and benchmark dependency licenses
-remain with their respective packages.
+mapping. Native BLAS, LAPACK, GMP, and MPFR licenses remain with their
+respective packages.
 
 [SDPB](https://arxiv.org/abs/1909.09745) documents the structured sampled SDP
 form used by the native reader. [Hypatia](https://arxiv.org/abs/2107.04262)

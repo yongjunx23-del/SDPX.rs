@@ -1,2 +1,0 @@
-set(CMAKE_POSITION_INDEPENDENT_CODE ON CACHE BOOL "PIC required by SDPX cdylib" FORCE)
-set(CMAKE_Fortran_FLAGS "-fPIC" CACHE STRING "PIC required by SDPX cdylib" FORCE)

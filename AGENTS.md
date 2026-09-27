@@ -11,8 +11,11 @@ This file is the single source for **how to work**. Other documents:
 | [REVIEW_AND_PLAN.md](REVIEW_AND_PLAN.md) | Current status, known failures, priorities, closed directions |
 | [docs/JOURNAL.md](docs/JOURNAL.md) | Completed experiments and their conclusions (append-only) |
 | [README.md](README.md) | Users: build, CLI, API, C ABI, architecture |
-| [benchmark/e2e/README.md](benchmark/e2e/README.md) | The per-change check tool |
+| `benchmark/e2e/README.md` | The per-change check tool |
 | `benchmark/{research,ising,float64,parallel,mpfr}/README.md` | Milestone and external comparisons only |
+
+`benchmark/` and `docs/archive/` are local working copies, git-ignored and not
+published; keep inputs and harness changes there, never in commits.
 
 ## Development loop
 
