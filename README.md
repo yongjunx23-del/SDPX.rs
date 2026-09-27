@@ -1,174 +1,212 @@
 # SDPX
 
-A Julia interface to a Rust conic solver, with BLAS/LAPACK and MPFR/GMP numerical backends.
-
-SDPX solves
+SDPX is a Rust conic solver with native Float64 and fixed precision MPFR/GMP
+backends. It solves
 
 ```math
-\min_x \tfrac12 x^T P x + q^T x \quad\text{subject to}\quad Ax+s=b,\;s\in\mathcal K.
+\min_x \tfrac12 x^T P x + q^T x \quad\text{subject to}\quad Ax+s=b,
+\;s\in\mathcal K.
 ```
 
-The Rust engine is adapted from [Clarabel.rs](https://github.com/oxfordcontrol/Clarabel.rs). The Julia modeling interface reuses the former SDPX.jl front end, which this package replaces: the legacy `SDPX.jl` package, its environments and its repository were retired on 2026-09-18, and `SDPX` v0.7.0 is the supported solver.
+The supported solver surfaces are the Rust API, the `sdpx` command-line
+executable, and the versioned C ABI. Julia appears only in independent
+benchmark and audit scripts; it is not a solver interface or a required
+runtime dependency.
 
-## Features
+## Build and run
 
-- LP, convex QP, SOCP, SDP, exponential, power and generalized power cones.
-- One predictor/corrector engine for Float64 and fixed 128, 256, 512, 768, 1024 and 2048-bit MPFR arithmetic.
-- Julia modeling and MathOptInterface integration; prepared problems with reusable `q` and `b` updates.
-- Bulk C ABI: data crosses the language boundary during preparation, updates and result retrieval. Solver iterations remain in Rust.
-- Automatic augmented/condensed KKT selection, preserving sparse Schur blocks and the original Newton equations. `Settings(kkt_form=:augmented)` or `:condensed` selects a formulation explicitly.
-- Cached worker pools for independent cone phases in Float64 and MPFR arithmetic.
-- Original-coordinate primal, dual and slack outputs, ordinary infeasibility detection and accepted-iterate recovery. Runtime convergence and linear-solve checks follow Clarabel.rs; independent accuracy checks run in tests and benchmarks. Direct solves enable Ruiz equilibration, presolve and chordal decomposition by default.
-
-## Installation
-
-Requires a Rust toolchain, a C toolchain for GMP/MPFR, and Julia 1.12 or later. From this directory, on macOS:
+The Rust workspace needs a Rust toolchain and a C toolchain for GMP/MPFR. On
+macOS, a release CLI build is:
 
 ```sh
-cargo build --locked --release -p sdpx-ffi --features sdp-accelerate,faer-sparse
-julia --project=julia/SDPX.jl -e 'using Pkg; Pkg.instantiate()'
+cargo build --locked --release -p sdpx-solver --bin sdpx \
+  --features sdp-accelerate,faer-sparse
+target/release/sdpx problem.json --threads 8 --output solution.json
+target/release/sdpx /path/to/sdpb-json --precision 768 \
+  --settings settings.json
 ```
 
-On Linux, use `sdp-openblas,faer-sparse` instead. OpenBLAS source builds also require a Fortran compiler. The dependency versions are pinned in `Cargo.lock`. Julia can invoke the build with `include("julia/SDPX.jl/deps/build.jl")`; `CARGO` selects the Cargo executable.
+On Linux use `sdp-openblas,faer-sparse` instead. The CLI has no Julia runtime
+dependency. `sdpx --help` lists options. Its JSON receipt includes original
+coordinate `x`, `s`, and `z`, status, iterations, precision, factorization and
+thread receipts, and separate input, API, and native solve times. Exit code 0
+denotes a full solved or infeasible status; code 2 denotes incomplete or
+reduced accuracy; code 1 denotes input or I/O failure. `AlmostSolved` is not
+promoted to a full result.
 
-For x86 backend evaluation, `sdpx-ffi` also forwards `sdp-mkl` to the Rust
-solver. Select one BLAS provider per build; the MKL configuration requires its
-native dependencies and is not a qualified performance default. Changing Julia's
-BLAS alone does not change the BLAS linked into the Rust library.
+Conic JSON uses `P`, `q`, `A`, `b`, `cones`, and `settings` fields. `P` is an
+upper-triangle CSC matrix. Float64 inputs use JSON numbers. MPFR coefficients
+and settings use decimal strings; exact integer tokens are also accepted, while
+fractional JSON numbers are rejected so they cannot pass through Float64 first.
+The optional `--settings` file replaces the input settings object. With no
+override, Ruiz equilibration, presolve, chordal preprocessing, and the NT
+direction retain their native defaults. The CLI supports 53-bit Float64 and
+128, 256, 512, 768, 1024, and 2048-bit MPFR arithmetic. PSD cones use NT. The optional
+`--partitions auto` owner-local path supports local pools and MPI. For
+multi-node runs, start with one rank per 8–16 cores. If OpenMPI's `openib`
+transport misbehaves (hangs, or "wire encode/decode failed"), select TCP with
+`--mca btl self,vader,tcp --mca btl_tcp_if_include <ib-or-eth-interface>`.
+The optional MPI loader supports OpenMPI's exported-handle ABI and requires
+`MPI_THREAD_MULTIPLE`, including when the host initializes MPI. Rust embedding
+applications can initialize `MpiContext` before reading distributed inputs,
+agree on their configuration, and call `finish()` on that same thread after
+all solver work has joined (`mpi_finalize()` remains available). Host-owned
+MPI remains the host's responsibility. The CLI initializes and finalizes MPI
+explicitly, checks rank input/configuration agreement, and writes results and
+the main receipt only on rank 0. MPI input must be a file or directory;
+stdin broadcasting is not implemented.
 
-Start Julia with `--project=julia/SDPX.jl`. The package finds `target/release/libsdpx` automatically; `SDPX_LIBRARY` can select an explicitly built library.
+Sampled SDP input accepts an uncompressed `pmp2sdp --outputFormat=json`
+directory. The reader preserves factor-authoritative PSD blocks and returns
+the sample variables, original SDPB `y`, block/parity row maps, and the
+objective constant. Normalization metadata is not applied twice. The optional
+`tol_feas_componentwise` setting adds a componentwise dual-feasibility check
+to the existing full `Solved` checks; it is disabled by default.
 
-```julia
-using SDPX, SparseArrays
+Use SDPB's `pmp2sdp` to construct sample points, weights and bilinear bases.
+SDPX consumes those decimal factors directly at the selected precision; it
+does not resample the polynomial or introduce a separate sampling scheme.
+Input-generation precision and solve precision must be recorded separately:
+reading a lower-precision input at higher precision cannot recover lost digits.
 
-# min x subject to x >= 1
-result = solve_conic([1.0], sparse(reshape([-1.0], 1, 1)), [-1.0],
-                     [NonnegativeConeT(1)]; return_result=true)
-status(result), result.x
+## Rust API
+
+The JSON reader and solver share the CLI input path:
+
+```rust
+use sdpx_solver::solver::*;
+use std::fs::File;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let problem = JsonProblem::<f64>::read(File::open("problem.json")?)?;
+    let mut solver = problem.into_solver()?;
+    solver.solve();
+    Ok(())
+}
 ```
 
-High precision uses `BigFloat` input/output with a fixed precision selected for the prepared handle. Unsupported precision values are rejected. Decimal transport preserves the supplied bits without a Float64 intermediate.
+`read_sdpb_sampled::<T>(directory)` builds the same structured sampled input
+used by the CLI. `JsonProblem::write` preserves factors and MPFR decimal
+digits.
 
-```julia
-setprecision(BigFloat, 256) do
-    settings = Settings(BigFloat; precision_bits=256)
-    solve_conic(BigFloat[1], sparse(reshape(BigFloat[-1], 1, 1)), BigFloat[-1],
-                [NonnegativeConeT(1)]; settings, return_result=true)
-end
-```
+## C ABI
 
-`prepare(...)`, `solve!(problem; q=..., b=...)` and `close(problem)` support repeated solves.
-This reuses the prepared workspace, not a primal/dual warm-start point; each solve
-uses the core's default initialization. Explicit warm starts are unsupported. Julia's reusable handles retain Ruiz but disable presolve and chordal rewriting so that the original input structure stays updateable. Direct `solve` / `solve_conic` and model optimization use all three defaults. See the [PMP2SDP callback example](julia/SDPX.jl/test/pmp_callback.jl).
+`include/sdpx.h` defines ABI version 4. `crates/ffi` owns prepared handles and
+copies all input arrays during `sdpx_prepare` or `sdpx_prepare_sampled`.
+`sdpx_solve`, `sdpx_update`, `sdpx_get_info`, `sdpx_result_f64`,
+`sdpx_result_decimal`, and `sdpx_destroy` provide the lifecycle and bulk
+result operations. Indices are zero-based, `P` is upper triangular, and MPFR
+decimal buffers preserve the requested precision. ABI return codes are
+separate from solver status in `sdpx_info`.
 
 ## Architecture
 
 | Component | Responsibility |
 |---|---|
-| `julia/SDPX.jl` | Modeling, MOI, bulk conversion and result recovery |
+| `crates/solver` | Homogeneous embedding, cones, KKT systems, refinement, termination, and structured sampled operators |
+| `sdpx` CLI / `JsonProblem` | Native JSON input, settings, precision selection, and solution receipts |
 | `crates/ffi` / `include/sdpx.h` | Versioned C ABI and Rust-owned prepared handles |
-| `crates/solver` | Homogeneous embedding, cones, KKT, refinement and termination |
-| `crates/arithmetic` | Independently owned fixed-precision MPFR values |
+| `crates/arithmetic` | Independently owned fixed-precision MPFR values and arithmetic |
+| `benchmark/research` | Fixed inputs, native process protocol, and external original-coordinate gates |
 
-Float64 uses native BLAS/LAPACK with QDLDL or optional multithreaded Faer for sparse KKT factorization. Batched Schur assembly uses runtime-checked AVX2/FMA on supported x86 CPUs, with the same arithmetic implementation and a portable fallback. Auto selection can use dense block Cholesky for a near-dense positive block with a small negative border, retaining sparse fallback and refinement. The condensed backend eliminates PSD/orthant rows, retains other cones and equalities, and preserves the structural Schur sparsity. PSD cones cache matrix-sized scaling factors instead of a dense Hessian over packed cone coordinates. Both formulations use the same embedding, accepted-iterate recovery and native linear-solve refinement. Exact repeated coefficient columns share transforms across precisions; Float64 batches them, while MPFR streams them with bounded scratch. Presolve uses one bounded GMP rational elimination for exact redundant equalities, including their right-hand sides, and restores original-coordinate slacks and duals.
+Solver source layout (`crates/solver/src/solver/`; the public API is the flat
+`sdpx_solver::solver::*` facade):
 
-Set `Limits(threads=...)` for independent cone work, eligible sparse residual products, sampled block operators and Float64 Faer factorization. MPFR uses serial QDLDL and a dense provider with Householder/bidiagonal-QR SVD and symmetric Householder/QL eigenanalysis. NT scaling uses direct SVD at every precision; cone blocks can execute in parallel. Fused accumulation in the MPFR BLAS applies at every precision from 128 to 2048 bits. Large single orthants also split independent elementwise phases across the existing pool, preserving reduction order. `execution_plan(result)` reports the formulation, factorization width and cone pool size. These are configured capacities, not a count of busy cores; the reported cone pool size is the requested budget, so a request above the number of independent cones can be slower than a smaller one. Native BLAS threads are configured separately; use one BLAS thread when measuring cone/Faer scaling and set `RAYON_NUM_THREADS` to the requested factorization width.
+| Module | Contents |
+|---|---|
+| `core/` | Generic HSD predictor/corrector loop, component traits, core settings |
+| `default/` | Standard-format implementation: data, presolve, Ruiz, variables, residuals, KKT system, info |
+| `cones/` | Cone implementations and the composite cone |
+| `kkt/` | KKT solvers: `condensed/`, `direct/` (augmented LDL), `ldl/` backends, refinement |
+| `sampled/` | Factor-authoritative sampled PSD operator and SDPB-style input |
+| `distributed/` | Owner-partitioned MPI implementation of the core traits and collectives |
+| `chordal/` | Chordal decomposition |
 
-An explicit `sampled_program` input retains shared basis factors and uses paired operators plus NT Gram Schur assembly. Exactly equal basis vectors share Gram columns at the working precision; canonical variables and weights remain unchanged. Ordinary CSC input keeps its existing semantics. Exact equality and infinite-bound row reductions retain the factors and remap block offsets; chordal block rewriting uses the materialized fallback. The optional PMP2SDP extension supplies this representation without a mandatory frontend dependency. Float64 and 256/512-bit integration tests cover this path, including row recovery, chordal fallback, updates, shared columns and deterministic threaded operator results. The ordinary CSC part of a sampled operator also uses the pool through row and column lanes, reproducing the serial product exactly. Dominant blocks can use the existing pool for MPFR matrix products, with triangular SYRK work balanced across tasks; every other block keeps the outer block level as its only parallel level. More configured workers do not guarantee a whole-solve speedup.
+Unit tests live in each module's `tests/` directory.
 
-BFLA/MFLA, CRT acceleration and MPI are not implemented as backends in this project. The stable sibling retains its existing capabilities. The Julia frontend and shared library must both use ABI 3; an older library is rejected explicitly.
+Float64 uses native BLAS/LAPACK with QDLDL, or, with the `faer-sparse`
+feature, faer's multithreaded supernodal LDLᵀ for high-fill factorizations.
+MPFR uses owned GMP/MPFR scalars:
+- Dense products run through an exact residue-number-system kernel: exact
+  accumulation, one rounding.
+- Block-structured KKT systems use a parallel arrow LDLᵀ.
+- Otherwise QDLDL.
+Cones, blocks and long vector operations share one worker pool. Step lengths
+use certified binary64 screens with full-precision fallback, for PSD λmin and
+for the exponential/power backtracking. The condensed backend eliminates PSD/orthant rows while
+preserving the Newton equations; augmented and condensed forms share
+embedding, recovery, and refinement rules. Native receipts report the actual
+`linear_solver`, `linear_solver_threads`, `cone_threads`, and `kkt_form`; these
+are configured capacities, not measurements of busy cores.
 
-## Verification
+The sampled operator retains shared basis factors and weights as the numerical
+input. Materialization is a checked fallback for structural preprocessing, not
+the source of sampled coefficients. Exact equality reduction preserves factor
+metadata; a chordal structural rewrite may use a materialized fallback and
+change coordinates, so acceptance audits the original problem independently.
 
-The [benchmark library and research loop](benchmark/research/README.md) provide pinned development/regression inputs, separately reserved holdouts, paired time/RSS measurements and accuracy-first candidate decisions. Experiments have explicit budgets and completion criteria; accuracy checks stay outside solver timing.
+## Performance
+
+Audited full solves at 768 bits on 2× AMD EPYC 7742 nodes (see
+[CHANGELOG.md](CHANGELOG.md) and [docs/JOURNAL.md](docs/JOURNAL.md)):
+
+| Problem | SDPX 0.8 | SDPB |
+|---|---|---|
+| Ising Λ19, 32 threads / 32 ranks | 102–106 s | 204 s |
+| Ising Λ19, 64 threads / 64 ranks | 102 s | 153 s |
+| Λ19 spins 0–50, one node (52 threads / 64 ranks) | 238 s | 328 s |
+
+SDPX needs fewer iterations (119 vs 243 and 177 vs 265). Both solvers used
+the same precision and tolerances, and each SDPX result passed an
+independent original-coordinate audit.
+
+On glibc Linux the CLI raises malloc's `mmap` and trim thresholds at start-up
+(32 MiB / 256 MiB). Otherwise, repeated multi-megabyte work buffers are
+mapped and unmapped on every call, and the page faults and TLB shootdowns
+stop per-block kernels scaling across threads. Setting
+`MALLOC_MMAP_THRESHOLD_` in the environment keeps glibc's own policy.
+Programs that embed the library can apply the same `mallopt` settings.
+
+## Verification and benchmarks
+
+Each change is checked with one complete solve of a pinned case plus an
+independent original-coordinate audit:
 
 ```sh
-cargo test --locked --release --workspace --features sdpx-ffi/sdp-accelerate,sdpx-ffi/faer-sparse -- --test-threads=1
-julia --project=julia/SDPX.jl julia/SDPX.jl/test/runtests.jl
+python3 benchmark/e2e/e2e.py build
+python3 benchmark/e2e/e2e.py run medium      # Float64
+python3 benchmark/e2e/e2e.py run ising11     # MPFR 512-bit sampled SDP
 ```
 
-Measured counts on the reviewed tree: 498 Rust tests pass across all workspace
-targets (321 solver-library unit tests and 4 doc-tests included in that total),
-and the Julia suite reports 673 of 673. Quote these with the command above, not
-as a fixed project property.
+[AGENTS.md](AGENTS.md) says which check each kind of change needs. Known
+failures are listed in [REVIEW_AND_PLAN.md](REVIEW_AND_PLAN.md). Before a
+release, run the full suite:
 
-## Performance status
-
-Performance parity is not established. On the retained Float64 conic10/holdout
-campaign, SDPX/MOSEK warmed API-time ratio was 1.54 across 14 jointly accepted
-cases; optimal-point counts were 4/10 and 12/15 for SDPX versus 7/10 and 12/15
-for MOSEK. Across 11 accepted Clarabel.rs holdout cases the ratio was 0.91,
-dominated by one SDP case. These historical observations do not establish broad
-superiority; native solver and frontend memory measurements have different scopes.
-
-The medium dense SDP development case now has a 3.15 s native median versus
-3.34 s in a matched forward/reverse comparison (18 versus 19 iterations,
-one thread, unchanged 1e-6 tolerances and external gates). A bounded quadratic
-curve search reuses the existing predictor/corrector directions without extra
-KKT solves, building on compact Schur assembly and exact coefficient reuse.
-Five independent LP/SOCP/SDP cases and the 344 Rust checks of that round pass;
-[Verification](#verification) records the current count and its command. At 1e-8 tolerances,
-both baseline and candidate return AlmostOptimal on medium, so that accuracy
-remains unqualified. Retained MOSEK is 1.89 s / 16 iterations; broad parity
-is not established. Current optimization is single-core; the curve is enabled
-only for Float64 symmetric cones, leaving high precision and nonsymmetric cones
-on their existing step strategy. Exact presolve now removes 14 redundant medium
-equalities without approximate rank tests; its matched timing is unchanged.
-The unified paths preserve the 512-bit Ising solution, but do not show a new
-Ising speedup. Enabling the curve at high precision was slower and was rejected.
-See [current priorities and evidence](PERFORMANCE_PLAN.md).
-
-On the local 3D Ising Lambda=11 sampled case (512-bit, 322 variables, 2558 rows,
-50 iterations, every returned point audited externally at 1e-30), native-solve
-medians are 58.6 s / 33.4 s / 19.6 s / 13.0 s at 1/2/4/8 cone workers, i.e.
-1.00x / 1.76x / 2.99x / 4.52x. Measured phase shares at eight workers are 41%
-KKT solves, 26% KKT update (of which the reduced MPFR factorization is a
-thread-independent 3.0 s), 15% cone scaling and 11% step lengths. The reduced
-Schur factorization and its triangular solves do not scale (1.0x and 1.8x at
-eight workers) and account for about 42% of that solve, so they are the current
-scaling barrier and the first target for any further parallel work; see the
-review round in [the performance plan](PERFORMANCE_PLAN.md).
-
-No SDPX-versus-SDPB speed claim is made here. Earlier campaigns ran on other
-sources, hosts and core counts than the current tree, so their seconds are not
-comparable and must not be quoted as current evidence. Scaling is re-measured on
-one node at a fixed core set before any such claim is restated; the receipts live
-in `PERFORMANCE_PLAN.md` under an explicit campaign identity.
-
-The larger Lambda11 case still fails its sampled dual-consistency gate, and no
-large-SDP superiority is claimed.
-
-## Julia API details
-
-PSD rows use upper-column svec packing with square-root-of-two off-diagonal
-scaling. `Model`, `variable!` and `constraint!` use ordinary symmetric matrices.
-MOI accepts Float64 models with affine or quadratic objectives and nonnegative,
-zero, second-order, PSD triangle, exponential and power cone constraints.
-Constraint primal/dual getters recover original MOI coordinates, including PSD
-trace scaling, interval duals and infeasibility rays. Dual signs follow MOI's
-constraint convention for both minimization and maximization. Raw optimizer
-attributes accept writable `Settings` fields plus `threads`/`verbosity` aliases;
-`limits` and `tolerances` are constructor/read-only groups, not raw setters.
-BigFloat direct/model calls require matching
-`Settings(BigFloat; precision_bits=...)`. Prepared settings are fixed at creation;
-`solve_time` excludes Julia conversion and result copying.
-
-```julia
-p = prepare([1.0], sparse(reshape([-1.0], 1, 1)), [-1.0], [NonnegativeConeT(1)])
-try
-    result = solve!(p; b=[-2.0])
-finally
-    close(p)
-end
+```sh
+cargo test --locked --release --workspace \
+  --features sdpx-ffi/sdp-accelerate,sdpx-ffi/faer-sparse -- --test-threads=1
 ```
 
-Optional PMP2SDP tests use an isolated environment with that package developed
-alongside this frontend. Julia sources derive from the sibling's modeling,
-storage, compiler, result and MOI layers; their MIT notice remains in
-`julia/SDPX.jl/LICENSE`. The solver executes in Rust.
+On Linux use `sdpx-ffi/sdp-openblas` instead of `sdp-accelerate`.
 
-## References and license
+The [research protocol](benchmark/research/README.md) handles the fixed
+multi-case suites and the MOSEK/Clarabel reference comparisons.
+[benchmark/ising](benchmark/ising/README.md) handles SDPB comparisons and
+scaling. Recorded MOSEK and SDPB runs use different inputs, settings, machines
+and source revisions, so they are context only, not evidence of performance
+parity.
 
-Clarabel's homogeneous-embedding interior-point design is a modern, mature foundation, not a universal best algorithm. [The Clarabel paper](https://link.springer.com/article/10.1007/s12532-026-00320-7) describes its quadratic-objective and cone treatment. [Hypatia](https://arxiv.org/abs/2107.04262) is a useful reference for more general cones, and [SDPB](https://arxiv.org/abs/1909.09745) for structured, parallel high-precision SDP.
+## References and licenses
 
-The Rust core retains Clarabel's Apache-2.0 license and attribution. Reused SDPX.jl code retains its MIT notice in `provenance/SDPX.jl-LICENSE`. Source mappings and original file hashes are in `provenance/`. Native dependency licenses remain with their packages.
+The Rust core is adapted from [Clarabel.rs](https://github.com/oxfordcontrol/Clarabel.rs)
+and retains its Apache-2.0 attribution. Historical adapted source mappings are
+listed in [`provenance/reuse.json`](provenance/reuse.json); the retained MIT
+notice is [`provenance/SDPX.jl-LICENSE`](provenance/SDPX.jl-LICENSE). The
+fixed-precision SVD port records its GenericLinearAlgebra MIT notice in that
+mapping. Native BLAS, LAPACK, GMP, MPFR, and benchmark dependency licenses
+remain with their respective packages.
+
+[SDPB](https://arxiv.org/abs/1909.09745) documents the structured sampled SDP
+form used by the native reader. [Hypatia](https://arxiv.org/abs/2107.04262)
+and the [Clarabel paper](https://link.springer.com/article/10.1007/s12532-026-00320-7)
+provide related cone-solver references.

@@ -36,11 +36,6 @@ where
     }
 
     #[allow(dead_code)]
-    pub fn nnz(&self) -> usize {
-        self.nzval.len()
-    }
-
-    #[allow(dead_code)]
     pub fn dropzeros(&mut self) {
         let mut writeidx: usize = 0;
 

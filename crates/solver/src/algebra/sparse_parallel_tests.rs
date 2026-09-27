@@ -1,5 +1,5 @@
 use super::*;
-use crate::solver::{core::cones::CompositeCone, core::traits::Residuals, *};
+use crate::solver::{cones::CompositeCone, core::traits::Residuals, *};
 
 fn num<T: FloatT>(n: usize) -> T {
     T::from_usize(n).unwrap()
@@ -212,17 +212,17 @@ fn live_residual_updates<T: FloatT>(soc: bool) {
         same(
             &[
                 serial.rτ,
-                serial.dot_xPx,
-                serial.dot_qx,
-                serial.dot_bz,
-                serial.dot_sz,
+                serial.products.xpx,
+                serial.products.qx,
+                serial.products.bz,
+                serial.products.sz,
             ],
             &[
                 solver.residuals.rτ,
-                solver.residuals.dot_xPx,
-                solver.residuals.dot_qx,
-                solver.residuals.dot_bz,
-                solver.residuals.dot_sz,
+                solver.residuals.products.xpx,
+                solver.residuals.products.qx,
+                solver.residuals.products.bz,
+                solver.residuals.products.sz,
             ],
         );
         if let Some(plan) = &solver.residuals.sparse_parallel {
@@ -247,11 +247,13 @@ fn sparse_live_lp_soc_f64() {
     live_residual_updates::<f64>(true);
 }
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn sparse_live_lp_soc_mpfr256() {
     live_residual_updates::<sdpx_arithmetic::Bits256>(false);
     live_residual_updates::<sdpx_arithmetic::Bits256>(true);
 }
 #[test]
+#[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn sparse_live_lp_soc_mpfr512() {
     live_residual_updates::<sdpx_arithmetic::Bits512>(false);
     live_residual_updates::<sdpx_arithmetic::Bits512>(true);

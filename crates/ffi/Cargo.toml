@@ -1,13 +1,13 @@
 [package]
 name = "sdpx-ffi"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license = "Apache-2.0"
 [lib]
 name = "sdpx"
 crate-type = ["cdylib", "rlib"]
 [dependencies]
-sdpx-solver = { path = "../solver", default-features = false, features = ["sdp"] }
+sdpx-solver = { path = "../solver", default-features = false, features = ["sdp", "serde"] }
 sdpx-arithmetic = { path = "../arithmetic" }
 serde_json = "1"
 [features]

@@ -7,6 +7,7 @@ mod provider;
 use num_traits::{FromPrimitive, Zero};
 use provider::{XgemmScalar, XsyrkScalar};
 use sdpx_arithmetic::{MpFloat, Scalar};
+use sdpx_solver::algebra;
 type F<const N: usize> = MpFloat<N>;
 fn f<const N: usize>(x: i32) -> F<N> {
     F::from_i32(x).unwrap()

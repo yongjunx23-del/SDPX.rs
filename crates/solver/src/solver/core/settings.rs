@@ -1,9 +1,9 @@
-use crate::solver::implementations::default::DefaultSettings;
+use crate::solver::default::DefaultSettings;
 use thiserror::Error;
 
 /// Solver general core settings are the same as in the default solver.
 ///
-/// Go [here](crate::solver::implementations::default::DefaultSettings)
+/// Go [here](crate::solver::default::DefaultSettings)
 /// to view the complete list.
 ///
 pub type CoreSettings<T> = DefaultSettings<T>;

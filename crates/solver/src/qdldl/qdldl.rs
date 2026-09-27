@@ -77,9 +77,6 @@ where
 pub struct QDLDLFactorisation<T = f64> {
     /// permutation vector
     pub perm: Vec<usize>,
-    /// inverse permutation
-    #[allow(dead_code)] //Unused because we call ipermute in solve instead.  Keep anyway.
-    iperm: Vec<usize>,
     /// lower triangular factor L in LDL^T
     pub L: CscMatrix<T>,
     /// vector of diagonal elements of D in LDL^T
@@ -344,7 +341,7 @@ fn _qdldl_new<T: FloatT>(
     // serial kernels are used whenever this rejects the symbolic pattern
     let plan = ParallelPlan::build(n, &workspace.etree, &workspace.Lnz, &L.colptr, &L.rowval);
 
-    if std::env::var_os("SDPX_PROFILE").is_some() {
+    if crate::receipt::profile_requested() {
         static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             match &plan {
@@ -365,7 +362,6 @@ fn _qdldl_new<T: FloatT>(
 
     Ok(QDLDLFactorisation {
         perm,
-        iperm,
         L,
         D,
         Dinv,

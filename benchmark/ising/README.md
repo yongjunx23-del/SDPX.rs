@@ -1,35 +1,133 @@
-# Ising512 comparison
+# Ising scaling benchmark
 
-This driver repeats the frozen SDPB Ising sampled problem using the Julia frontend and Rust core. `sampled/` and `audit_helpers.jl` preserve the prior compiler, provenance and original-coordinate audit. The numerical protocol below fixes tolerances, thread budgets and timing scope.
+`scaling.py` runs the sampled Ising SDP through the frozen native
+`crates/solver/src/bin/sdpx.rs` executable.  The CLI accepts the SDPB sampled
+JSON directory directly, so this benchmark no longer loads the retired SDPX.jl
+frontend or materializes a Julia conic problem.
 
-Prepare a fresh campaign directory with `source/`, the unchanged `common-sdp/` and `input.sha256`, a copied SDPB executable `sdpb` and its environment script, a pinned Julia `env/` containing this SDPX, JSON 0.21.4 and GenericLinearAlgebra, accepted prior `reference/sdpb1-audit.json` and `reference/input.json`, and `benchmark/ising/`. Record source hashes in `source-identity.json`. Adjust campaign/toolchain paths and a currently healthy PBS node in `comparison.pbs`. Fetch locked Cargo dependencies before submission; sustained builds run in PBS. `pic.cmake` supplies position-independent Fortran objects required by the shared library.
+Each sample is one fresh CLI process and one solve.  There is no warmed,
+repeated-in-process, iterate, or checkpoint timing mode.  The receipt's
+`native_seconds` covers the numerical setup/solve core timer, `api_seconds`
+covers native `into_solver` plus solve, and `load_seconds` covers sampled-input
+parsing/compile.  Process startup/output and the independent `audit_point.jl`
+process are outside those timers.  Results label this scope as
+`fresh native CLI process`.
 
-The controller performs a small Linux gate, then serially runs SDPX 1/2/4/8-thread cells with one first call and three warmed fresh solves each. Every point must pass external audits and actual precision/KKT/cone-thread checks. It then runs three fresh SDPB references at each matching width. Any failed/incomplete stage stops subsequent work. The source, environment, inputs and loaded library must remain frozen throughout.
+## Frozen configuration
 
-Results under `results/<job>/` include raw points, audit JSON, exact commands, solver/API/compilation/process timings, immutable identities and private CPU metadata. `memory.json` reports the sampled peak sum of process-tree/MPI-rank RSS and individual process peaks, separately from GNU time's maximum RSS. Shared pages are counted once per process; aggregate RSS is not PSS. Compare native solver and process startup costs separately, and keep first-call and warmed timings distinct.
+The configuration is JSON and must use absolute paths.  `cli` identifies the
+frozen native executable.  `source` is the frozen native source snapshot and is
+hashed in the identity receipt; the executable and source are bound as one arm.
+The optional `oracle` object identifies the Julia
+runtime/project used only by the independent `GenericLinearAlgebra`/JSON
+audit; it does not load `SDPX.jl`.
 
-This condensed MPFR configuration reports one QDLDL thread and the cone worker budget. Condensed scaling, operator applications and eligible Schur contributions share that pool; contribution caching is bounded and overlapping sums retain a fixed order. MPFR factorization remains serial. Linux Netlib/faer serves Float64; MPFR retains its high-precision arithmetic.
+```json
+{
+  "cli": "/tmp/sdpx-rust-entry-20260922/sdpx",
+  "source": "/campaign/native-source",
+  "input": "/tmp/sdpx-refreshed-phases-20260917/common-sdp",
+  "input_sha256": "e4484eb8895e504a8f5c83651a5b964172e24c7060db24ddf09b737dcc78fddf",
+  "reference": "/path/to/reference-audit.json",
+  "oracle": {
+    "julia": "/absolute/path/to/julia",
+    "project": "/campaign/audit-env"
+  },
+  "settings": "/campaign/ising-settings.json",
+  "bits": 512,
+  "plans": {
+    "1": {"factorization": "condensed_sampled_arrow", "backend_threads": 1},
+    "2": {"factorization": "condensed_sampled_arrow", "backend_threads": 2},
+    "4": {"factorization": "condensed_sampled_arrow", "backend_threads": 4},
+    "8": {"factorization": "condensed_sampled_arrow", "backend_threads": 8}
+  }
+}
+```
 
-## Numerical protocol
+`settings` can instead be an object and is written before launch.  It must
+retain 1000 iterations and `tol_feas`, `tol_gap_abs` and `tol_gap_rel` at
+`1e-42`; if `tol_feas_componentwise` is supplied, it may be any positive value
+through the external `1e-30` gate and is preserved exactly.  A typical native
+settings file is:
 
-This campaign repeats the frozen Ising512 sampled SDP without regenerating or changing its finite problem. The prior common-sdp, input manifest, SDPB executable and sampled-primal compiler retain SHA256 identities. Primal variables are SDPB sample-equation multipliers; equality constraints are the original sampled B transpose equations; PSD slacks use sqrt(2)-scaled upper-column-major svec. There is no rank reduction or benchmark-only solver branch.
+```json
+{
+  "max_iter": 1000,
+  "time_limit": 120.0,
+  "tol_feas": "1e-42",
+  "tol_gap_abs": "1e-42",
+  "tol_gap_rel": "1e-42",
+  "max_threads": 8,
+  "verbose": true
+}
+```
 
-Both solvers use 512-bit arithmetic, 1e-42 internal primal/dual/gap tolerances and 1000 maximum iterations. SDPX uses its default Ruiz, presolve and chordal settings, with automatic KKT selection. Archived campaigns that disabled preprocessing remain separate baselines and must retain their original settings labels. Every returned first/warmed point is audited outside solver timing: normalized original-coordinate primal/dual residuals, relative gap, PSD violations and sampled mapping residuals must be <=1e-30, with optimal status and relative objective agreement <=1e-30 against the previously accepted frozen SDPB reference. GenericLinearAlgebra BigFloat eigenvalues provide external PSD checks. These checks qualify only the fixed finite SDP.
+PSD cones use NT. Plan entries may use `linear_solver` and
+`linear_solver_threads`; the older `factorization`/`backend_threads` spellings
+remain accepted for receipts produced by the current CLI.
 
-One ordinary 8-core, 48 GB, four-hour PBS allocation builds the locked Linux release with Netlib PIC and faer enabled. A Linux analytic Float64/MPFR512 gate precedes candidate execution. SDPX widths 1, 2, 4 and 8 run sequentially in separate fresh Julia processes, each with one first call and three warmed fresh solves. Every solve starts a new solver and keeps no iterate/checkpoint. Explicit budgets bind each Julia process to distinct physical cores, set BLAS/OpenMP to one and require returned metadata to report condensed QDLDL, one KKT thread, and the requested cone thread count.
+The input manifest hash is computed from every JSON file in the sampled
+directory and must agree with the accepted reference (`input_sha256`, or the
+legacy `mapping.input_sha256` field).  The identity receipt hashes the native
+executable, optional source/provider files, input, reference, settings and all
+benchmark/audit helpers before and after the run.  A changed identity makes
+the campaign fail.
 
-The single-thread candidate cell is the bounded pilot. Any failure stops the campaign; a finite maximum wall budget prevents launching work beyond the allocation. Only after all candidate points pass does the controller run three fresh SDPB MPI processes at each width 1/2/4/8 on the same node, each independently audited. No numerical benchmarks run concurrently. The build is capped at 45 minutes. The controller deadline is the earlier of three hours after build completion or 3h40m after PBS script start, leaving at least 20 minutes of allocation headroom for receipts. Each native SDPX call has an 850-second limit, each SDPB process a 900-second limit, and each candidate cell an external 3550-second cap.
+Returned settings must represent the requested MPFR values at the declared
+precision. The driver compares exact nearest/even binary rounding, since a
+round-trip decimal such as the MPFR representation of `1e-42` need not equal
+the input decimal string. It rejects changed or missing settings; this does
+not relax solver tolerances or the independent residual gates.
 
-Preserve source/library/environment/input/helper hashes before and after, exact commands and CPU binding, raw points, all audits, actual solver plan, input construction, first-call compilation, native solve and public API timing, and whole-process time. A 250 ms sampler sums current RSS over process-group descendants and explicitly identified MPI ranks, while separately tracking each process peak; shared pages count per process, so this is RSS sum rather than PSS. GNU time's maximum RSS remains a separate raw measure. Timeouts and failures remain incomplete; only complete compatible repetitions support median comparisons or speed credit (at least 2%).
+## Local screen and confirmation
 
-## Multi-node preparation
+```sh
+python3 benchmark/ising/scaling.py --config /campaign/ising.json \
+  --output /campaign/screen --widths 1,2,4,8 --seconds 600 --cell-seconds 180
 
-`rank_exec.py` records global MPI rank, local rank and hostname. Multi-node
-launches require `SDPX_RANK_CPU_MAP`, a JSON file mapping each exact compute-node
-hostname to its preselected physical CPU IDs. Binding is checked against inherited
-affinity; global-rank receipt filenames prevent cross-node collisions. The caller
-must establish physical topology inside the allocation before writing that map.
-The existing controller and RSS sampler remain single-node; this binding support
-does not implement an SDPX MPI backend or multi-node memory aggregation. The
-1/4/16/64/256-core campaign and numerical prerequisites are tracked in
-[the performance plan](../../PERFORMANCE_PLAN.md).
+python3 benchmark/ising/scaling.py --config /campaign/ising.json \
+  --output /campaign/confirm --widths 1,2,4,8 --repetitions 3 \
+  --seconds 1200 --cell-seconds 180
+```
+
+The one-round invocation is labelled `screen`; three repetitions are the
+qualification shape and use three fresh processes per width.  Width order is
+reversed in the middle repetition.  Every cell must finish within its whole
+process cap, pass the native receipt gate, and pass the independent
+original-coordinate audit.  Internal solver tolerances stay at `1e-42` and the
+external primal, dual, gap, PSD, sampled-mapping and reference-objective gates
+stay at `1e-30`.  A non-finite or failed point remains a failed sample and is
+never omitted from the denominator.
+
+An independently generated SDPB point can be checked with the same
+original-coordinate oracle, without loading a solver frontend:
+
+```sh
+julia --startup-file=no benchmark/ising/audit_sdpb.jl \
+  /campaign/sampled-input /campaign/sdpb-out /campaign/sdpb-audit.json \
+  512 /campaign/accepted-reference.json
+```
+
+`SDPB_OUT` must contain the per-block `x_*.txt` and `X_matrix_*.txt` files,
+`y.txt`, `Y_matrix_*.txt`, and SDPB's `out.txt` status log.  The audit converts
+those files through the shared sampled mapping, checks the optimal status,
+precision-tagged arbitrary-precision residual/PSD/objective gates, and writes
+`accepted` only when every gate and the reference objective agree within
+`1e-30`.  The harness verifies the solver's precision setting in its log; this
+oracle process is outside solve timings.
+
+On Linux the native process is pinned to unique physical cores from the
+inherited affinity; PBS must reserve those cores.  macOS reports that hard
+affinity is unavailable.  BLAS/OpenMP are held at one and the CLI's
+`cone_threads`/`linear_solver_threads` receipts are checked independently.
+
+`native_seconds`, `api_seconds`, `load_seconds`, iterations, solver metadata,
+process RSS, commands and audit receipts are retained.  Summary speedup uses
+the native solve time median, `S(p)=T(1)/T(p)`, and efficiency; audit and process
+startup are reported separately.  Profile runs are diagnostic and do not earn
+speed credit.  Run candidate arms sequentially under the shared research slot
+lock.
+
+`comparison.pbs` launches `scaling.py` using explicit
+`SDPX_ISING_CONFIG` and `SDPX_ISING_OUTPUT` paths. Cluster timings remain
+separate from local development and require a bounded campaign.

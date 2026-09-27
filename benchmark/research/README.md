@@ -1,12 +1,13 @@
 # Benchmark library and research loop
 
-固定数据、评估器和数值契约，在独立源码副本中逐项尝试优化。每轮先检查正确性，再比较时间和内存；输出候选决策，不自动覆盖工作区源码。
+固定题库、评估器和外部参考对照，用于里程碑和最终比较。日常逐项改动的检查用
+[benchmark/e2e](../e2e/README.md)，规则见 [AGENTS.md](../../AGENTS.md)。
 
-流程借鉴 [karpathy/autoresearch](https://github.com/karpathy/autoresearch) 的小步实验、固定评估、保留/丢弃和实验记录。求解器需要额外保留精度、失败覆盖率、各类问题退化及内存约束，不能只优化一个时间数字。项目执行规则见 [AGENTS.md](../../AGENTS.md)。
+流程借鉴 [karpathy/autoresearch](https://github.com/karpathy/autoresearch) 的小步实验、固定评估、保留/丢弃和实验记录。求解器需要额外保留精度、失败覆盖率、各类问题退化及内存约束，不能只优化一个时间数字。
 
 ## 执行范围
 
-每次执行有明确的假设、输入、预算和结束条件；完成测试与候选决策后报告结果。
+每项 E2E 执行有明确的假设、输入和结束条件；完成求解、原问题审计与候选决策后报告结果。
 默认由主 agent 完成，不自动启动后台研究或集群任务。
 
 `tree.py` 保留候选谱系和 `record/cut/merge/adopt` 状态管理功能；
@@ -15,6 +16,12 @@
 这些工具的容量上限不是必须消耗的资源配额。命令参数以 `--help` 为准。
 清理候选前先保留结果，并确认没有活动作业使用它。
 
+## 与日常开发的关系
+
+本目录的 `pair`、`qualify`、参考适配器和多题 suite 不是逐项改动的门槛，只在里程碑、
+最终外部比较或用户明确要求时使用。已知失败（含 `SDP_control3`）统一记录在
+[REVIEW_AND_PLAN.md](../../REVIEW_AND_PLAN.md) §3，完整评估器的严格判定不改写。
+
 ## 数据库
 
 `catalog.json` 固定输入身份、来源、结构、角色与精度；`catalog.py` 仅校验和复制/解压输入，不调用求解器。运行数据、源码副本、构建产物和日志放在仓库外。
@@ -22,12 +29,14 @@
 | Suite | 内容 | 用途 |
 |---|---|---|
 | `smoke` | 3 个有解析最优解的 LP/SOCP/SDP | 检查完整接口与外部验算，不作为性能排名 |
-| `development` | 9 个历史实例，每类按规模选小/中/大各一个 | 日常反馈；选择依据是尺寸，不是求解结果 |
+| `development` | 9 个历史实例，每类按规模选小/中/大各一个 | 较完整的集成/候选评估；不是每次编辑的门槛 |
 | `regression` | 52 个公开实例和 3 个固定合成实例 | 保留所有已暴露题目，包括原来的 holdout |
 | `holdout` | LP_ship04s、SDP_copo14、混合锥 SDP_filter48_socp、SOCP_strictmin_2D_43_dual，均未求解 | ship、共正性、PAM 滤波器和几何 ARAP 家族；large SOCP 设 180 秒上限 |
 | `mpfr-dev` | 一个 orthant LP、两个 sampled SDP 配方 | 256/512 位及 1/2/4/8 线程的定向诊断 |
 
-历史题库复用相邻 `SDPX.jl/benchmark/data`，不再依赖某次 `/tmp` 历史任务。原六项及 ship 来源为固定的 ClarabelBenchmarks revision `3679912c6bbd3f64c5c962f9d1c09d524561c412`；源 URL、原始/转换后 SHA256、转换信息和归属保留在目录中。六个压缩输入约 23 KB，原始来源与许可见 [data/holdout](data/holdout)。
+原目录中的 46 个历史 JSON 已从保留的集群快照恢复到 `benchmark/float64/data`，逐个匹配 catalog 原 SHA256；只迁移存储路径，未改变角色或输入。development 9 项、regression 55 项、mpfr-dev 3 项均通过 materialize 前置校验。MOSEK 驱动和依赖指纹工具位于 `benchmark/float64/adapters`；实际参考运行仍需安装包及有效许可证。
+
+原六项及 ship 来源为固定的 ClarabelBenchmarks revision `3679912c6bbd3f64c5c962f9d1c09d524561c412`；源 URL、原始/转换后 SHA256、转换信息和归属保留在目录中。六个压缩输入约 23 KB，原始来源与许可见 [data/holdout](data/holdout)。
 
 9 月 16 日对比 MOSEK 后，原 6 个保留实例已转入回归，不再作为独立验收。
 另外加入两个固定种子的 SOCP 和一个 80 阶 PSD 合成问题，全部使用预先构造的
@@ -53,26 +62,41 @@ python3 benchmark/research/catalog.py materialize \
 
 ## 单轮执行
 
-Python 3.11+，macOS/Linux；Julia、数值依赖与共享库必须事先准备好。相同机器上的测量串行执行。所有本流程命令共享 `--state` 的文件锁；其他工具的计时也需要协调。
+Python 3.11+，macOS/Linux；native `sdpx` executable and any independent oracle
+environment must be prepared in advance. Measurements on one machine run
+serially. All commands share the `--state` file lock; coordinate other numerical
+tools as well.
 
 每个 arm 用一个 JSON 配置，路径均指向已冻结的来源：
 
 ```json
 {
   "source": "/absolute/frozen/candidate",
-  "library": "/absolute/frozen/candidate/lib/libsdpx.dylib",
-  "julia": "/absolute/julia/bin/julia",
-  "julia_project": "/absolute/frozen/candidate-benchmark-env",
+  "cli": "/absolute/frozen/candidate/target/release/sdpx",
   "blas": "accelerate",
-  "env": {"JULIA_DEPOT_PATH": "/absolute/frozen-depot:/absolute/fallback-depot"},
+  "env": {"RAYON_NUM_THREADS": "1"},
   "provider_files": ["/absolute/extra-provider-library-if-needed"],
+  "oracle": {"julia": "/absolute/julia/bin/julia", "project": "/absolute/oracle-env"},
   "qualification": "/absolute/qualification/qualification.json"
 }
 ```
 
-Linux 库后缀用 `.so`，`blas` 通常为 `default`；删除不需要的 `provider_files` 示例项。benchmark 环境需有 SDPX、JSON；Accelerate 分支需要 AppleAccelerate，sampled MPFR 还需要 GenericLinearAlgebra。环境中的 SDPX 必须解析到 `source/julia/SDPX.jl`，驱动会检查。两个 arm 的依赖版本、Julia、BLAS 和有效运行环境应一致；仅源码/产物身份可以不同。
+`cli` must be an absolute executable. `blas` and `provider_files` describe the
+external runtime when applicable. `oracle` is optional and is used only for an
+independent audit/input generator; it is never a solver frontend. A historical
+`library` field may be retained for identity records, but it is not a native
+binding and a missing file fails clearly. Source and CLI are hashed separately;
+the hashes do not claim an inferred build relationship.
 
-`fingerprint` 记录生产文件、Cargo.lock、库、Julia、环境与本地 path 依赖的哈希。完整项目文件映射包括未提交改动，因此不要求项目已经是 Git 仓库。源码和产物之间的构建关系仍需真实的锁定构建记录，独立哈希本身不证明二者对应。
+`fingerprint` records production Rust files, Cargo.lock, the CLI, optional
+provider/oracle files and environment hashes. The complete mapping includes
+uncommitted changes, so a Git checkout is not required. Use it for final
+published comparisons when source/artifact provenance matters; it is not a
+prerequisite for each E2E optimization iteration.
+
+每行保留 CLI 路径、产物哈希、版本与求解状态；这些不混入两臂必须相同的
+`settings_sha256`。该哈希比较实际数值设置、精度、方向、KKT/线性后端与线程预算；
+产物身份在各 arm 内独立验证，状态与原问题残差仍单独验收。
 
 ```sh
 python3 benchmark/research/run.py fingerprint --config /absolute/candidate.json
@@ -81,32 +105,39 @@ python3 benchmark/research/run.py qualify \
   --output /absolute/experiments/qualification-candidate
 ```
 
-`frozen-checks.json` 是事先审阅过的 argv 数组列表，命令使用绝对路径，构建/测试目标指向该源码副本。可包含锁定的 Rust provider/solver 测试、Julia 前端检查和此次改动相关的数值回归。命令不经过 shell。命令和验算标准属于固定评估器，优化 agent 不得把它们改成无效检查。缺失、失败或身份不匹配的 qualification 都不能带来速度晋级。
+`frozen-checks.json` 仅供需要严格来源追溯的最终实验使用，不定义日常优化的必经门槛。
 
 ```sh
 python3 benchmark/research/run.py pair \
   --baseline /absolute/baseline.json --candidate /absolute/candidate.json \
   --data /absolute/external-cache/development-v1 --stage development \
-  --threads 1 --output /absolute/experiments/iteration-001 \
+  --profile full --threads 1 --output /absolute/experiments/iteration-001 \
   --state /absolute/experiments/state --budget-seconds 3600
 ```
 
-每个 case 先 A→B，再反向 B→A；第二块还反转 case 顺序。每个进程执行一次冷调用和三次 warmed **fresh solves**，每个 arm/case 共八次调用。复用已有原坐标外部 oracle；没有 prepared handle 重用。Float64 数值设置保持现有完整容差 1e-8、外部门槛 1e-6，以及默认 Ruiz/presolve/chordal。线程预算只取 1/2/4/8；Julia/BLAS 各为 1，锥和 Faer 使用记录的预算。
+`pair` 是需要外部相对性能报告时使用的可选成对工具。它会按 A/B 顺序运行
+fresh native CLI processes，分别记录 `api_seconds`（native setup+solve）、
+`native_seconds`（solver timer）、`load_seconds`、CLI wall time 和外部 oracle。
+日常优化只需跑一组匹配配置的完整求解，不要求执行 `pair` 或其多轮矩阵。
+Float64 对照保持既定内部/外部容差以及默认 Ruiz/presolve/chordal。
 
-默认每进程上限 900 秒、4096 MiB；单轮总预算 3600 秒，可在实验开始前固定其他预算。超时、OOM、异常及未执行的 case 都保留，不能从分母排除。进程组清理不能确认时停止后续启动。前后源码、依赖、库、评估器或输入身份变化会使结果失效。
+full 默认每进程上限 900 秒、4096 MiB；单轮总预算 3600 秒，可在实验开始前固定其他预算。超时、OOM、异常及未执行的 case 都保留，不能从分母排除。进程组清理不能确认时停止后续启动。前后源码、依赖、库、评估器或输入身份变化会使结果失效。
 
-### 决策与计量
+### 结果与计量
 
-`baseline.json` / `candidate.json` 保存规范化记录，子目录保存完整 stdout/stderr、原始设置、残差、命令和 wait4 内存记录。`comparison.json` 的决策规则：
+`baseline.json` / `candidate.json` 保存规范化记录，子目录保存 stdout/stderr、原始设置、
+残差、命令和内存记录。日常改动以同一输入、精度、容差及执行配置下的一次完整 E2E
+和原问题审计判断：状态与原问题误差达标才算通过；失败如实保留，不得放宽门槛。
+`pair` 的多样本聚合规则只用于可选的最终相对性能报告，不阻塞普通开发。
 
-- 必须完整匹配输入、精度、数值设置、运行时/provider、线程、计时范围及所有要求的样本；完整准确状态和外部验算都通过。
-- 每个 case 使用 warmed 中位数；类内按 case 等权，LP/SOCP/SDP 类之间等权。AB 与 BA 两块都要求至少 1.02× 提速。
-- 预设每类退化上限 2%，单 case 时间和峰值 RSS 退化上限各 10%。这是工程筛选政策，可在新研究周期开始前收紧；不能见到结果后调整。
-- `keep` 是此阶段的候选保留；`discard` 丢弃实验；`correctness_only` 只记录正确性覆盖改善；`incomplete` 表示证据不完整。失败后不能只比较共同通过的子集来晋级。
+单次计时代表该次机器状态，不是统计显著性结论；如计时受干扰，标注为初步测量。时间、
+内存、迭代数及失败状态分别记录，微核收益不能代替端到端收益。
 
-这些是描述性的成对比较，不是统计显著性证明。接近门槛的候选应在独立时段重复相同协议。时间、内存、迭代数、每轮耗时及失败覆盖率分别保留；微核收益不能当作全求解收益。
-
-当前主指标是 Julia API 的 fresh setup+solve+结果提取/清理时间；解析与外部检查在计时外。冷调用单列。RSS 是整个 Julia 子进程的 OS high-water，包含 JIT、输入和验算；不是单轮原生分配。原生 Rust 的比较使用已有 [build_kernel.py](../float64/build_kernel.py)，必须另外标注计时与内存范围。
+当前主指标是 native `api_seconds`（native setup+solve）。`native_seconds`、
+`load_seconds`、CLI process wall time 和 external audit time retain separate
+scopes; a warm row always means another fresh CLI process. RSS is the OS
+high-water mark of that native child, including input/result serialization. Keep
+Rust-core comparisons and any oracle process memory separately labelled.
 
 `--state/results.jsonl` 追加每次候选决策并保留失败；完成预算内的实验后报告结果，不自动修改主目录或 Git 状态。
 
@@ -131,37 +162,13 @@ python3 benchmark/research/references.py \
 
 本版参考适配器仅支持 **1 线程 Float64**，拒绝保留集，强制 Clarabel 默认预处理；MOSEK 保持产品默认内部容差，报告相同外部门槛及真实设置差异。不可把 API/运行时不同的结果直接送入候选晋级器；参考摘要单独保留。缺少二进制、许可证或依赖是失败/不完整，不能自动跳过。Clarabel 的原生依赖可用 `--provider-file` 显式固定；源码和二进制的独立哈希不构成构建证明。
 
-MPFR 的日常循环使用 `mpfr-dev`、`--precision-bits 256|512 --stage development`。依次执行 1/2/4/8；不同精度分别评分。线程扩展记录 `S(p)=T(1)/T(p)`、效率 `S(p)/p`，与相同宽度的基线比较，不能把多进程批处理吞吐算作单次求解加速。
+MPFR 高精度优化以对应 Ising 完整 E2E 路径验收。单节点线程和 MPI 比较留到并行里程碑；
+每个数据点均为完整求解，不把独立内核计时或批处理吞吐算作单次求解加速。
 
 真实高精度 SDP 的阶段验收继续使用 [Ising controller](../ising/README.md)，复用同一输入、同一精度/容差和同一集群分配比较 SDPX/SDPB。它是独立里程碑，**本模块尚未自动归一化 SDPB/MPI 结果**；不自动提交集群任务。更大的 Ising 和新的 bootstrap 问题先固定数据与门槛，再运行；synthetic sampled 提速不代表 Ising 提速。
 
 ## 验证本工具
 
-```sh
-python3 -m unittest discover -s benchmark/research/tests -v
-```
-
-测试覆盖身份/角色校验、重复或丢失样本、错误状态、精度变化、NaN/无效计时、AB/BA 顺序依赖、内存退化、保留集重命名、命令绑定、生成器变更和进程清理失败。`smoke` 可对同一个已冻结产物做 A/A：应得到准确结果，但没有候选提速信用。
-
-## Fast iteration
-
-The default per-experiment development loop is focused tests, then `run.py pair
---profile screen` with the usual baseline/candidate/data/output arguments, then
-full qualification only at milestones. `pair` itself retains `--profile full` by default.
-Screen uses the pinned development cases LP_afiro, SOCP_sambal and SDP_truss1
-in catalog order, one thread, one cold plus one warmed fresh solve, and AB only.
-Only the development stage is allowed. Process timeout defaults to 120 seconds
-and the campaign budget to 600 seconds (approximately <= 10 minutes per iteration,
-plus orchestration/cleanup); larger explicit values are clamped and recorded.
-Screen verdicts are `screen_pass` or `screen_fail` and never grant speed credit.
-All required samples must pass and each warmed case median must respect the
-existing 1.02 regression ratio. Full evidence rules remain unchanged.
-
-Per iteration, run only affected Rust/Julia test binaries relevant to the change:
-for example, a filtered `cargo test -p sdpx-solver --features sdp-accelerate --lib`
-and the affected integration test file. Reserve the full workspace suite,
-Julia 1.12/1.13 runs, and regression/holdout/MPFR/Ising protocols for milestone
-acceptance. This scheduling policy changes neither tolerances nor required
-milestone coverage.
+工具测试和 `smoke` A/A 可按需运行；它们不替代完整求解，也不是每项求解器性能改动的验收门。
 
 `SOCP_strictmin_2D_43_dual` 来源为 [CBLIB](https://cblib.zib.de/download/all/strictmin_2D_43_dual.cbf.gz)，保留全部连续变量、等式与二阶锥；101676 变量、111757 行。转换仅使用 MOI 文件读取及仿射导出，独立核对原始 CBF 系数与锥嵌入，未求解。来源、哈希、许可见 attribution/strictmin.json 和 CBLIB 许可文件 `data/holdout/attribution/CBLIB-README.md`。最终验收由 runner 自动封顶 180 秒、4096 MiB；超时作为结果保留，不用于开发调参。

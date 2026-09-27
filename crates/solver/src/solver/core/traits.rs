@@ -6,22 +6,48 @@
 //!
 //! In nearly all cases there is no need for a user to implement these traits.
 //! Instead, users should use the collection of types that are provided
-//! in the [Default solver implementation](crate::solver::implementations::default),
+//! in the [Default solver implementation](crate::solver::default),
 //!  which collectively implement support for the problem format described in the top
 //! level crate documentation.
 
-use super::ffi::*;
-use super::{cones::Cone, CoreSettings, ScalingStrategy, SettingsError};
+use super::{CoreSettings, ScalingStrategy, SettingsError};
 use super::{SolverStatus, StepDirection};
 use crate::algebra::*;
+use crate::solver::cones::Cone;
 use crate::timers::*;
+
+/// Cone-level control needed by the common HSD loop, independent of vector storage.
+pub trait ConeCollection<T: FloatT> {
+    /// Whether every member cone is symmetric.
+    fn all_symmetric(&self) -> bool;
+    /// Whether primal-dual scaling is supported by all members.
+    fn supports_primal_dual(&self) -> bool;
+    /// Set identity scaling before the symmetric initializer.
+    fn reset_scaling(&mut self);
+    /// Shared worker pool for independent numerical stages.
+    fn worker_pool(&self) -> Option<std::sync::Arc<rayon::ThreadPool>>;
+}
+impl<T: FloatT> ConeCollection<T> for crate::solver::cones::CompositeCone<T> {
+    fn all_symmetric(&self) -> bool {
+        self.is_symmetric()
+    }
+    fn supports_primal_dual(&self) -> bool {
+        self.allows_primal_dual_scaling()
+    }
+    fn reset_scaling(&mut self) {
+        self.set_identity_scaling()
+    }
+    fn worker_pool(&self) -> Option<std::sync::Arc<rayon::ThreadPool>> {
+        Cone::thread_pool(self)
+    }
+}
 
 /// Data for a conic optimization problem.
 pub trait ProblemData<T: FloatT> {
     /// associated variable type
     type V: Variables<T>;
     /// associated cone type
-    type C: Cone<T>;
+    type C: ConeCollection<T>;
     /// associated settings type
     type SE: Settings<T>;
 
@@ -36,7 +62,7 @@ pub trait Variables<T: FloatT> {
     /// associated problem residuals type
     type R: Residuals<T>;
     /// associated cone type
-    type C: Cone<T>;
+    type C: ConeCollection<T>;
     /// associated settings type
     type SE: Settings<T>;
 
@@ -155,19 +181,34 @@ pub trait Residuals<T: FloatT> {
 }
 
 /// KKT linear solver object.
-pub trait KKTSystem<T: FloatT> {
+pub trait KKTSystem<T: FloatT>: crate::solver::kkt::HasLinearSolverInfo {
     /// associated problem data type
     type D: ProblemData<T>;
     /// associated variable type
     type V: Variables<T>;
     /// associated cone type
-    type C: Cone<T>;
+    type C: ConeCollection<T>;
     /// associated settings type
     type SE: Settings<T>;
+
+    /// Reset per-solve accounting and numerical retry state.
+    fn reset_solve(&mut self) {}
 
     /// Update the KKT system.   In particular, update KKT
     /// matrix entries with new variable and refactor.
     fn update(&mut self, data: &Self::D, cones: &Self::C, settings: &Self::SE) -> bool;
+
+    /// Update with the independent affine RHS available for a batched solve.
+    fn update_affine(
+        &mut self,
+        data: &Self::D,
+        cones: &Self::C,
+        _rhs: &Self::V,
+        _variables: &Self::V,
+        settings: &Self::SE,
+    ) -> bool {
+        self.update(data, cones, settings)
+    }
 
     /// Solve the KKT system for the given RHS.
     #[allow(clippy::too_many_arguments)]
@@ -199,7 +240,7 @@ where
     /// associated problem data type
     type D: ProblemData<T>;
     /// associated cone type
-    type C: Cone<T>;
+    type C: ConeCollection<T>;
     /// associated settings type
     type SE: Settings<T>;
 
@@ -227,7 +268,7 @@ where
 }
 
 /// Internal information for the solver to monitor progress and check for termination.
-pub trait Info<T>: InfoPrint<T> + SolverFFI<Self> + Sized + Clone
+pub trait Info<T>: InfoPrint<T> + Sized + Clone
 where
     T: FloatT,
 {
@@ -238,6 +279,9 @@ where
 
     /// Reset internal data, particularly solve timers.
     fn reset(&mut self, timers: &mut Timers);
+
+    /// Refresh metadata after lazy backend selection, pool changes or fallback.
+    fn set_linear_solver_info(&mut self, _info: crate::solver::kkt::LinearSolverInfo) {}
 
     /// Final convergence checks, e.g. for "almost" convergence cases
     fn post_process(&mut self, residuals: &Self::R, settings: &Self::SE);
@@ -318,7 +362,7 @@ pub trait Solution<T: FloatT> {
 /// specific settings they wish.   They must, however, also maintain
 /// a settings object of type [`CoreSettings`](crate::solver::core::CoreSettings)
 /// and return this to the solver internally.
-pub trait Settings<T: FloatT>: SolverFFI<Self> + Sized + Clone {
+pub trait Settings<T: FloatT>: Sized + Clone {
     /// Return the core settings.
     fn core(&self) -> &CoreSettings<T>;
 

@@ -1,15 +1,7 @@
 #![allow(missing_docs)]
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-
-cfg_if::cfg_if! {
-    if #[cfg(target_family = "wasm")] {
-        use web_time::{Duration, Instant};
-    }
-    else {
-        use std::time::{Duration, Instant};
-    }
-}
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Default)]
 struct InnerTimer {
@@ -81,13 +73,6 @@ impl SubTimersMap {
     fn start_subtimer(&mut self, key: &'static str) {
         let t = self.0.entry(key).or_default();
         t.start();
-    }
-
-    #[allow(dead_code)]
-    //not used but included for symmetry
-    fn stop_subtimer(&mut self, key: &'static str) {
-        let t = self.get_mut(key).unwrap();
-        t.stop();
     }
 
     //this function suspends every timer in the
@@ -194,11 +179,13 @@ impl Timers {
 macro_rules! timeit {
     ($timer:ident => $key:literal; $($tt:tt)+) => {
 
+        let __cpu = $crate::receipt::cpu_start();
         $timer.start_as_current($key);
         $(
             $tt
         )+
         $timer.stop_current();
+        $crate::receipt::cpu_finish(concat!("cpu.", $key), concat!("wall.", $key), __cpu);
     }
 }
 pub(crate) use timeit;

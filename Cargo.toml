@@ -5,3 +5,11 @@ resolver = "2"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Iteration profile for A/B experiments: same optimizations, parallel codegen
+# and incremental rebuilds. Frozen benchmarks still use `release`.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

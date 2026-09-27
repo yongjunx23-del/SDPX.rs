@@ -9,7 +9,7 @@
 
 use crate::solver::chordal::ConeMapEntry;
 use crate::solver::chordal::SparsityPattern;
-use crate::solver::core::cones::*;
+use crate::solver::cones::*;
 use crate::{
     algebra::*,
     solver::{

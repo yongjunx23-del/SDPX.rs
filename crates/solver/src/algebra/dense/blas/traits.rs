@@ -81,10 +81,36 @@ pub trait XpotrsScalar: Sized {
     fn xpotrs(
         uplo: u8, n: i32, nrhs: i32, a: &[Self], lda: i32,  b: &mut [Self], ldb: i32, info: &mut i32
     );
+    /// Solve L*X=B (or L'*X=B), with a square lower-triangular factor.
+    /// MPFR uses the shared fixed-precision arithmetic; native types use TRSM.
+    fn xtrsm_lower(n: usize, a: &[Self], b: &mut [Self], transpose: bool)
+    where Self: crate::algebra::FloatT {
+        use rayon::prelude::*;
+        if n == 0 { return; }
+        assert_eq!(a.len(), n*n);
+        assert_eq!(b.len() % n, 0);
+        let solve = |column: &mut [Self]| {
+            for step in 0..n {
+                let i = if transpose { n-1-step } else { step };
+                let mut v = column[i];
+                let range = if transpose { i+1..n } else { 0..i };
+                for k in range {
+                    let av = if transpose { a[k+i*n] } else { a[i+k*n] };
+                    v = (-av).mul_add(column[k], v);
+                }
+                column[i] = v / a[i+i*n];
+            }
+        };
+        if sdpx_arithmetic::inner_parallel::active() && n*b.len() >= 16384 {
+            b.par_chunks_mut(n).for_each(solve);
+        } else {
+            b.chunks_mut(n).for_each(solve);
+        }
+    }
 }
 
 macro_rules! impl_blas_xpotrfs{
-    ($T:ty, $XPOTRF:path, $XPOTRS:path) => {
+    ($T:ty, $XPOTRF:path, $XPOTRS:path, $XTRSM:path) => {
         impl XpotrfScalar for $T {
             fn xpotrf(
                 uplo: u8, n: i32, a: &mut [Self], lda: i32, info: &mut i32
@@ -97,6 +123,15 @@ macro_rules! impl_blas_xpotrfs{
             }
         }
         impl XpotrsScalar for $T {
+            fn xtrsm_lower(n: usize, a: &[Self], b: &mut [Self], transpose: bool) {
+                if n == 0 { return; }
+                assert_eq!(a.len(), n*n);
+                assert_eq!(b.len() % n, 0);
+                let rows = i32::try_from(n).unwrap();
+                let cols = i32::try_from(b.len()/n).unwrap();
+                unsafe { $XTRSM(b'L', b'L', if transpose { b'T' } else { b'N' },
+                    b'N', rows, cols, 1.0, a, rows, b, rows); }
+            }
             fn xpotrs(
                 uplo: u8, n: i32, nrhs: i32, a: &[Self], lda: i32, b: &mut [Self], ldb: i32, info: &mut i32
             ) {
@@ -110,8 +145,8 @@ macro_rules! impl_blas_xpotrfs{
     };
 }
 
-impl_blas_xpotrfs!(f32, spotrf, spotrs);
-impl_blas_xpotrfs!(f64, dpotrf, dpotrs);
+impl_blas_xpotrfs!(f32, spotrf, spotrs, strsm);
+impl_blas_xpotrfs!(f64, dpotrf, dpotrs, dtrsm);
 
 
 // --------------------------------------
@@ -198,6 +233,31 @@ pub trait XgemmScalar: Sized {
         lda: i32, b: &[Self], ldb: i32, beta: Self, c: &mut [Self], ldc: i32,
         _pool: &rayon::ThreadPool, _column_tile: usize
     ) { Self::xgemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc); }
+    // Upper triangle (`i <= j`) of `op(a)·op(b)` into `c` (ldc = m) when the
+    // exact product is known to be symmetric. Only the exact residue-BLAS
+    // kernel implements it; `false` means nothing was written.
+    // `cache_b` optionally keeps `b`'s residues when it is a constant operand.
+    fn xgemm_upper_exact(
+        _transa: u8, _transb: u8, _m: usize, _n: usize, _k: usize, _a: &[Self], _lda: usize,
+        _b: &[Self], _ldb: usize, _c: &mut [Self], _pool: Option<&rayon::ThreadPool>,
+        _cache_b: Option<&mut ResidueCache>
+    ) -> bool { false }
+    // Whether `xgemm_upper_exact` (and the matching `xgemm` path) uses the
+    // exact residue-BLAS kernel for this shape.
+    fn residue_blas_applies(_m: usize, _n: usize, _k: usize) -> bool { false }
+    // `v[k] = Σ_{i≤j} c_ij·x_t·q_ik·q_jk` (svec `x`, `c_ij = sqrt2` off the
+    // diagonal) for `q` of size h × kmax, rounded once from the exact value.
+    fn xsvec_quadratic_exact(
+        _h: usize, _kmax: usize, _q: &[Self], _x: &[Self], _sqrt2: Self,
+        _pool: Option<&rayon::ThreadPool>, _out: &mut [Self], _cache_q: Option<&mut ResidueCache>
+    ) -> bool where Self: Sized { false }
+    // `op(a)·x·op(a)ᵀ` (m × m, x is k × k) rounded once from the exact value
+    // into `c` (ldc = m); upper triangle only when `upper_only`.
+    fn xcongruence_exact(
+        _transa: u8, _m: usize, _k: usize, _a: &[Self], _lda: usize, _x: &[Self], _ldx: usize,
+        _c: &mut [Self], _upper_only: bool, _pool: Option<&rayon::ThreadPool>,
+        _cache_a: Option<&mut ResidueCache>
+    ) -> bool { false }
 
 }
 
@@ -393,3 +453,8 @@ impl_blas_xgesv!(f64, dgesv);
 // Inline MPFR precision modes share the dense provider boundary.
 #[path = "mpfr.rs"]
 mod mpfr;
+#[path = "rns_blas.rs"]
+mod rns_blas;
+// Integration tests include this file by `#[path]` and use only part of it.
+#[allow(unused_imports)]
+pub(crate) use rns_blas::{measured_ways, with_split_hint, ResidueCache};

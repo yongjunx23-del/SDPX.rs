@@ -1,7 +1,4 @@
 #![allow(non_snake_case)]
-#[cfg(target_family = "wasm")]
-use wasm_bindgen_test::*;
-
 use sdpx_solver::{algebra::*, solver::*};
 
 #[allow(clippy::type_complexity)]
@@ -202,10 +199,3 @@ fn test_qp_dual_infeasible_ill_cond() {
 }
 
 // a minimal test to check that the wasm build is working
-
-#[cfg(target_family = "wasm")]
-#[wasm_bindgen_test]
-fn test_qp_feasible_wasm() {
-    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
-    test_qp_feasible();
-}

@@ -68,7 +68,7 @@ pub struct CscMatrix<T = f64> {
 ///      &[[1.0, 2.0],
 ///        [3.0, 0.0],
 ///        [0.0, 4.0]]);
-///
+/// ```
 impl<'a, I, J, T> From<I> for CscMatrix<T>
 where
     I: IntoIterator<Item = J>,

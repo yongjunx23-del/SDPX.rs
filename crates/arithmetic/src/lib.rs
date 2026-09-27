@@ -1,9 +1,12 @@
 //! Fixed precision, independently owned floating point values.
+
 //!
 //! MPFR descriptors exist only during calls. A value contains no pointers, so
 //! Rust copies, moves and vector reallocations preserve independent ownership.
 //! Arithmetic always specifies nearest, ties-to-even rounding. MPFR's exponent
 //! range is used without changing its process/thread configuration.
+#[cfg(feature = "serde")]
+mod serialization;
 use gmp_mpfr_sys::{gmp, mpfr};
 use num_traits::{FloatConst, FromPrimitive, Num, NumAssign, One, ToPrimitive, Zero};
 use std::{
@@ -17,14 +20,16 @@ use std::{
 
 mod dyadic;
 pub use dyadic::{DyadicKind, DyadicView};
-mod integer;
-pub use integer::{
-    exact_product, scale_by_power_of_two, ExactInteger, ExactProduct, ProductPlan, TermError,
-};
 mod exact;
+mod exactdot;
+/// Exact-integer reference conversions. Test-only oracle for the residue
+/// kernels (see the module docs): not part of the production arithmetic.
+#[cfg(test)]
+mod integer;
 pub use exact::Exact;
 mod rns;
 pub use rns::{EncodeSide, Residues, RnsPlan};
+mod wire;
 
 /// Operations required by the solver, without Float's 64-bit integer_decode.
 pub trait Scalar:
@@ -56,6 +61,24 @@ pub trait Scalar:
     fn infinity() -> Self;
     fn neg_infinity() -> Self;
     fn nan() -> Self;
+    /// Fixed-size canonical payload used by optional MPI state exchange.
+    /// Unsupported scalar implementations return `None`/`0`/`false`.
+    #[doc(hidden)]
+    fn wire_size() -> Option<usize> {
+        None
+    }
+    #[doc(hidden)]
+    fn wire_tag() -> u64 {
+        0
+    }
+    #[doc(hidden)]
+    fn write_wire(self, _out: &mut [u8]) -> bool {
+        false
+    }
+    #[doc(hidden)]
+    fn read_wire(_bytes: &[u8]) -> Option<Self> {
+        None
+    }
     fn abs(self) -> Self;
     fn sqrt(self) -> Self;
     fn cbrt(self) -> Self;
@@ -166,6 +189,25 @@ macro_rules! primitive_scalar {
                 } else {
                     None
                 }
+            }
+            fn wire_size() -> Option<usize> {
+                Some(std::mem::size_of::<$t>())
+            }
+            fn wire_tag() -> u64 {
+                crate::wire::primitive_tag(std::mem::size_of::<$t>())
+            }
+            fn write_wire(self, out: &mut [u8]) -> bool {
+                if out.len() != std::mem::size_of::<$t>() {
+                    return false;
+                }
+                out.copy_from_slice(&self.to_bits().to_le_bytes());
+                true
+            }
+            fn read_wire(bytes: &[u8]) -> Option<Self> {
+                let bytes: [u8; std::mem::size_of::<$t>()] = bytes.try_into().ok()?;
+                let mut word = [0u8; 8];
+                word[..bytes.len()].copy_from_slice(&bytes);
+                Some(Self::from_bits(u64::from_le_bytes(word) as _))
             }
             fn precision_bits() -> usize {
                 Self::MANTISSA_DIGITS as usize
@@ -357,7 +399,7 @@ impl<const N: usize> MpFloat<N> {
     pub fn exact_encode(&self) -> (i32, i64, &[u64; N]) {
         (self.kind, self.exponent as i64, &self.limbs)
     }
-    /// Inverse of [`exact_encode`]. The caller must supply a triple produced
+    /// Inverse of [`Self::exact_encode`]. The caller must supply a triple produced
     /// at the same precision; no validation beyond a precision check is done.
     pub fn exact_decode(kind: i32, exponent: i64, limbs: [u64; N]) -> Self {
         Self::check_precision();
@@ -368,20 +410,78 @@ impl<const N: usize> MpFloat<N> {
         }
     }
 
-    /// Accumulate products in iterator order, rounding each FMA at this precision.
-    /// The accumulator owns its storage and never aliases an input operand.
+    /// Dot product accumulated exactly and rounded once at this precision
+    /// (see `exactdot`). Non-finite operands, or an exponent spread too wide
+    /// for the fixed-point window, keep [`Self::dot_fma_chain`].
     #[inline]
     pub fn dot_fma<'a>(pairs: impl IntoIterator<Item = (&'a Self, &'a Self)>) -> Self {
+        exactdot::dot(pairs, |terms| Self::dot_fma_chain(terms))
+    }
+
+    /// Correctly rounded sum of exactly two products. MPFR evaluates the
+    /// unrounded products together, avoiding the general dot accumulator.
+    #[inline]
+    pub fn dot_fma2(a: &Self, b: &Self, c: &Self, d: &Self) -> Self {
+        if [a, b, c, d]
+            .iter()
+            .any(|v| !matches!(v.kind.abs(), mpfr::ZERO_KIND | mpfr::REGULAR_KIND))
+        {
+            return Self::dot_fma_chain([(a, b), (c, d)]);
+        }
+        let (a, b, c, d) = (
+            a.descriptor(),
+            b.descriptor(),
+            c.descriptor(),
+            d.descriptor(),
+        );
+        Self::output(|r| unsafe {
+            mpfr::fmma(r, &a, &b, &c, &d, ROUND);
+        })
+    }
+
+    /// Accumulate products in iterator order, rounding each FMA at this precision.
+    /// The accumulator owns its storage and never aliases an input operand.
+    pub fn dot_fma_chain<'a>(pairs: impl IntoIterator<Item = (&'a Self, &'a Self)>) -> Self {
         Self::output(|r| {
             for (a, b) in pairs {
                 let x = a.descriptor();
                 let y = b.descriptor();
                 // MPFR permits the destination to alias an input. Here only the
                 // previous accumulator is reused; input limb arrays stay read-only.
-                unsafe { mpfr::fma(r, &x, &y, r, ROUND); }
+                unsafe {
+                    mpfr::fma(r, &x, &y, r, ROUND);
+                }
             }
         })
     }
+
+    /// Correctly rounded Euclidean norm, without squaring at the input scale.
+    pub fn hypot(self, other: Self) -> Self {
+        self.binary(other, mpfr::hypot)
+    }
+
+    /// Exact scaling by `2^shift` in one MPFR step.
+    ///
+    /// `mpfr_mul_2si` is exact while the result stays in the exponent range,
+    /// so no rounding is introduced beyond the destination precision already
+    /// in force; out-of-range results round once to infinity or zero. Where
+    /// `c_long` is narrower than `i64`, two exact half-steps cover the full
+    /// `shift` range with the same semantics.
+    pub fn scale_pow2(self, shift: i64) -> Self {
+        if shift == 0 {
+            return self;
+        }
+        match std::os::raw::c_long::try_from(shift) {
+            Ok(n) => {
+                let d = self.descriptor();
+                Self::output(|r| unsafe {
+                    mpfr::mul_2si(r, &d, n, ROUND);
+                })
+            }
+            Err(_) => self.scale_pow2(shift / 2).scale_pow2(shift - shift / 2),
+        }
+    }
+
     fn unary(
         self,
         f: unsafe extern "C" fn(*mut mpfr::mpfr_t, *const mpfr::mpfr_t, mpfr::rnd_t) -> i32,
@@ -498,12 +598,40 @@ impl<const N: usize> fmt::Debug for MpFloat<N> {
     }
 }
 impl<const N: usize> PartialEq for MpFloat<N> {
+    #[inline]
     fn eq(&self, b: &Self) -> bool {
-        self.partial_cmp(b) == Some(Ordering::Equal)
+        Self::check_precision();
+        if self.kind == mpfr::NAN_KIND || b.kind == mpfr::NAN_KIND {
+            return false;
+        }
+        if self.is_zero() && b.is_zero() {
+            return true;
+        }
+        // Regular significands are normalized; special values may carry stale
+        // exponent/limb storage, which is not part of their numerical value.
+        self.kind == b.kind
+            && (self.kind.abs() != mpfr::REGULAR_KIND
+                || (self.exponent == b.exponent && self.limbs == b.limbs))
     }
 }
 impl<const N: usize> PartialOrd for MpFloat<N> {
+    #[inline]
     fn partial_cmp(&self, b: &Self) -> Option<Ordering> {
+        Self::check_precision();
+        if self.kind.abs() == mpfr::REGULAR_KIND && b.kind.abs() == mpfr::REGULAR_KIND {
+            if self.kind != b.kind {
+                return Some(self.kind.cmp(&b.kind));
+            }
+            let magnitude = self
+                .exponent
+                .cmp(&b.exponent)
+                .then_with(|| self.limbs.iter().rev().cmp(b.limbs.iter().rev()));
+            return Some(if self.kind < 0 {
+                magnitude.reverse()
+            } else {
+                magnitude
+            });
+        }
         if self.is_nan() || b.is_nan() {
             None
         } else {
@@ -548,7 +676,15 @@ impl<const N: usize> Zero for MpFloat<N> {
 }
 impl<const N: usize> One for MpFloat<N> {
     fn one() -> Self {
-        Self::from_u64(1).unwrap()
+        Self::check_precision();
+        // GMP limbs are least-significant first; MPFR stores 1 as 0.5 * 2^1.
+        let mut limbs = [0; N];
+        limbs[N - 1] = 1 << 63;
+        Self {
+            limbs,
+            kind: mpfr::REGULAR_KIND,
+            exponent: 1,
+        }
     }
 }
 impl<const N: usize> Num for MpFloat<N> {
@@ -626,6 +762,19 @@ impl<const N: usize> Scalar for MpFloat<N> {
     fn scalar_exact_decode(kind: i32, exponent: i64, limbs: &[u64]) -> Option<Self> {
         let a: [u64; N] = limbs.try_into().ok()?;
         Some(Self::exact_decode(kind, exponent, a))
+    }
+    fn wire_size() -> Option<usize> {
+        crate::wire::mp_size::<N>()
+    }
+    fn wire_tag() -> u64 {
+        crate::wire::mp_tag(Self::PRECISION_BITS)
+    }
+    fn write_wire(self, out: &mut [u8]) -> bool {
+        crate::wire::write_mp(self.kind, self.exponent, &self.limbs, out)
+    }
+    fn read_wire(bytes: &[u8]) -> Option<Self> {
+        let (kind, exponent, limbs) = crate::wire::read_mp::<N>(bytes)?;
+        Some(Self::exact_decode(kind, exponent, limbs))
     }
     fn precision_bits() -> usize {
         Self::PRECISION_BITS
@@ -812,7 +961,7 @@ impl Drop for Temp {
         }
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Constant {
     Pi,
     E,
@@ -831,8 +980,35 @@ enum Constant {
     FracPi6,
     FracPi8,
 }
+// Precision is part of the key. Cached values contain owned limbs, never MPFR
+// pointers; copying a result cannot mutate the cache. Thread-local storage
+// avoids a lock in the cone/operator pools and does not change MPFR precision.
+thread_local! {
+    static CONSTANTS: std::cell::RefCell<std::collections::HashMap<(usize, Constant), (i32, i64, Vec<u64>)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
 impl<const N: usize> MpFloat<N> {
     fn constant(c: Constant) -> Self {
+        if let Some(value) = CONSTANTS.with(|cache| {
+            cache.borrow().get(&(N, c)).map(|(kind, exponent, data)| {
+                let mut limbs = [0; N];
+                limbs.copy_from_slice(data);
+                Self::exact_decode(*kind, *exponent, limbs)
+            })
+        }) {
+            return value;
+        }
+        let value = Self::constant_uncached(c);
+        CONSTANTS.with(|cache| {
+            cache.borrow_mut().insert(
+                (N, c),
+                (value.kind, value.exponent as i64, value.limbs.to_vec()),
+            );
+        });
+        value
+    }
+
+    fn constant_uncached(c: Constant) -> Self {
         let mut bits = Self::PRECISION_BITS + 32;
         loop {
             let mut lo = Temp::new(bits);
@@ -968,7 +1144,6 @@ impl<const N: usize> FloatConst for MpFloat<N> {
         Self::constant(Constant::Sqrt2)
     }
 }
-
 
 // Inner-operator parallelism gate. Solver-pool lanes set this flag so heavy
 // kernels (e.g. the MPFR SVD) may re-offer independent inner work to the

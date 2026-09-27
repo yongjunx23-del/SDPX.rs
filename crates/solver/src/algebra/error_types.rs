@@ -42,6 +42,4 @@ pub(crate) enum DenseFactorizationError {
     SVD(i32),
     #[error("Cholesky error")]
     Cholesky(i32),
-    #[error("LU error")]
-    LU(i32),
 }

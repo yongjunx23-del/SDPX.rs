@@ -106,7 +106,7 @@ class ReferenceTests(unittest.TestCase):
                 result=ref.run(args)
             self.assertTrue(result['passed'])
             self.assertEqual(commands[0][0][:2], [str(args.python.resolve()),
-                str(args.workspace.resolve()/'SDPX.jl/benchmark/mosek_runner.py')])
+                str(ref.HERE.parent/'float64/adapters/mosek_runner.py')])
 
     def test_unpinned_catalog_is_rejected_before_launch(self):
         with tempfile.TemporaryDirectory() as d:

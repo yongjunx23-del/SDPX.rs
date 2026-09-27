@@ -197,22 +197,22 @@ fn null_and_settings_errors() {
         let mut s = std::mem::MaybeUninit::<Settings>::uninit();
         assert_eq!(sdpx_default_settings(s.as_mut_ptr()), 0);
         let s = s.assume_init();
-        assert_eq!(s.abi_version, 3);
+        assert_eq!(s.abi_version, 4);
         assert_eq!(s.preprocessing_flags, 7);
         assert_eq!(s.kkt_form, 0);
-        assert_eq!(std::mem::size_of::<Settings>(), 80);
-        assert_eq!(std::mem::size_of::<Info>(), 104);
+        assert_eq!(std::mem::size_of::<Settings>(), 88);
+        assert_eq!(std::mem::size_of::<Info>(), 112);
     }
 }
 #[test]
 fn abi_version_and_kkt_form_validation() {
     unsafe {
         let mut s = defaults();
-        for version in [0, 1, 2, 4] {
+        for version in [0, 1, 2, 3, 5] {
             s.abi_version = version;
             let error = settings::<f64>(&s).err().unwrap();
             assert_eq!(error.0, 1);
-            assert!(error.1.contains("requires ABI 3"));
+            assert!(error.1.contains("requires ABI 4"));
         }
         s.abi_version = ABI_VERSION;
         s.kkt_form = 3;
@@ -221,6 +221,11 @@ fn abi_version_and_kkt_form_validation() {
             s.kkt_form = code;
             assert_eq!(settings::<f64>(&s).unwrap().kkt_form, name);
         }
+        s.reserved_0 = 2;
+        assert!(settings::<f64>(&s).is_err());
+        s.reserved_0 = 1;
+        assert!(settings::<f64>(&s).is_err());
+        s.reserved_0 = 0;
         s.max_threads = 4;
         let f64_settings = settings::<f64>(&s).unwrap();
         assert_eq!(f64_settings.max_threads, 4);
@@ -342,7 +347,7 @@ fn solver_name_query_and_actual_info() {
         let mut info = std::mem::MaybeUninit::<Info>::uninit();
         assert_eq!(sdpx_get_info(h, info.as_mut_ptr()), 0);
         let info = info.assume_init();
-        assert_eq!(info.abi_version, 3);
+        assert_eq!(info.abi_version, 4);
         assert_eq!(info.kkt_form, 1);
         assert_eq!(info.backend_threads, 1);
         assert_eq!(info.cone_threads, 1);

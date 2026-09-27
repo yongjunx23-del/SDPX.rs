@@ -30,9 +30,6 @@ pub(crate) struct EigEngine<T> {
     /// Computed eigenvalues in ascending order
     pub λ: Vec<T>,
 
-    /// Computed eigenvectors (optional)
-    pub V: Option<Matrix<T>>,
-
     // BLAS workspace (allocated vecs only)
     pub blas: Option<EigBlasWorkVectors<T>>,
 }
@@ -43,13 +40,12 @@ where
 {
     pub fn new(n: usize) -> Self {
         let λ = vec![T::zero(); n];
-        let V = None;
 
         match n {
-            1..=3 => Self { λ, V, blas: None },
+            1..=3 => Self { λ, blas: None },
             _ => {
                 let blas = Some(EigBlasWorkVectors::new(n));
-                Self { λ, V, blas }
+                Self { λ, blas }
             }
         }
     }
@@ -73,11 +69,11 @@ where
     }
 }
 
-impl<T> FactorEigen<T> for EigEngine<T>
+impl<T> EigEngine<T>
 where
     T: FloatT,
 {
-    fn eigvals<S>(
+    pub(crate) fn eigvals<S>(
         &mut self,
         A: &mut DenseStorageMatrix<S, T>,
     ) -> Result<(), DenseFactorizationError>
@@ -89,21 +85,7 @@ where
             1 => self.eigvals1(A),
             2 => self.eigvals2(A),
             3 => self.eigvals3(A),
-            _ => self.syevr(A, b'N'),
-        }
-    }
-
-    #[allow(dead_code)] //for future use in projection
-    fn eigen<S>(&mut self, A: &mut DenseStorageMatrix<S, T>) -> Result<(), DenseFactorizationError>
-    where
-        S: AsMut<[T]> + AsRef<[T]>,
-    {
-        self.checkdim(A)?;
-        match self.n() {
-            1 => self.eigen1(A),
-            2 => self.eigen2(A),
-            3 => self.eigen3(A),
-            _ => self.syevr(A, b'V'),
+            _ => self.syevr(A),
         }
     }
 }
@@ -135,13 +117,13 @@ where
                 self.eigvals3(A)?;
             }
             _ if T::precision_bits() > 53 => {
-                self.syevr_range(A, b'N', b'I', 1, 1)?;
+                self.syevr_range(A, b'I', 1, 1)?;
                 return Ok(self.λ[0]);
             }
             _ => {
                 // Float64 keeps the proven full-spectrum path; an ulp-level
                 // change in λmin can flip a borderline step length.
-                self.syevr(A, b'N')?;
+                self.syevr(A)?;
             }
         }
         Ok(self.λ.minimum())
@@ -162,16 +144,6 @@ where
         S: AsMut<[T]> + AsRef<[T]>,
     {
         self.λ[0] = A[(0, 0)];
-        Ok(())
-    }
-
-    fn eigen1<S>(&mut self, A: &mut DenseStorageMatrix<S, T>) -> Result<(), DenseFactorizationError>
-    where
-        S: AsMut<[T]> + AsRef<[T]>,
-    {
-        let V = self.V.get_or_insert_with(|| Matrix::<T>::zeros((1, 1)));
-        self.λ[0] = A[(0, 0)];
-        V[(0, 0)] = T::one();
         Ok(())
     }
 }
@@ -195,21 +167,6 @@ where
         self.λ.copy_from_slice(&e);
         Ok(())
     }
-
-    fn eigen2<S>(&mut self, A: &mut DenseStorageMatrix<S, T>) -> Result<(), DenseFactorizationError>
-    where
-        S: AsMut<[T]> + AsRef<[T]>,
-    {
-        let Vout = self.V.get_or_insert_with(|| Matrix::<T>::zeros((2, 2)));
-
-        // symmetric 2x2, stack allocated
-        let mut As = DenseMatrixSym2::<T>::from(A.sym_up());
-        let mut V = DenseMatrix2::<T>::zeros();
-        let e = As.eigen(&mut V);
-        self.λ.copy_from_slice(&e);
-        Vout.data.copy_from(V.data());
-        Ok(())
-    }
 }
 
 // implementation for 3x3 matrices
@@ -231,21 +188,6 @@ where
         self.λ.copy_from_slice(&e);
         Ok(())
     }
-
-    fn eigen3<S>(&mut self, A: &mut DenseStorageMatrix<S, T>) -> Result<(), DenseFactorizationError>
-    where
-        S: AsMut<[T]> + AsRef<[T]>,
-    {
-        let Vout = self.V.get_or_insert_with(|| Matrix::<T>::zeros((3, 3)));
-
-        // symmetric 3x3, stack allocated
-        let mut As = DenseMatrixSym3::<T>::from(A.sym_up());
-        let mut V = DenseMatrix3::<T>::zeros();
-        let e = As.eigen(&mut V);
-        self.λ.copy_from_slice(&e);
-        Vout.data.copy_from(V.data());
-        Ok(())
-    }
 }
 
 // implementation for arbitrary size matrices
@@ -254,21 +196,16 @@ impl<T> EigEngine<T>
 where
     T: FloatT,
 {
-    fn syevr<S>(
-        &mut self,
-        A: &mut DenseStorageMatrix<S, T>,
-        jobz: u8,
-    ) -> Result<(), DenseFactorizationError>
+    fn syevr<S>(&mut self, A: &mut DenseStorageMatrix<S, T>) -> Result<(), DenseFactorizationError>
     where
         S: AsMut<[T]> + AsRef<[T]>,
     {
-        self.syevr_range(A, jobz, b'A', 0, 0)
+        self.syevr_range(A, b'A', 0, 0)
     }
 
     fn syevr_range<S>(
         &mut self,
         A: &mut DenseStorageMatrix<S, T>,
-        jobz: u8,
         range: u8,
         il: i32,
         iu: i32,
@@ -277,11 +214,6 @@ where
         S: AsMut<[T]> + AsRef<[T]>,
     {
         let An = self.n();
-
-        // allocate for eigenvectors on first request
-        if jobz == b'V' && self.V.is_none() {
-            self.V = Some(Matrix::<T>::zeros((An, An)));
-        }
 
         // unwrap or populate on the first call
         let blaswork = self.blas.get_or_insert_with(|| EigBlasWorkVectors::new(An));
@@ -305,17 +237,13 @@ where
         let mut liwork = -1_i32; // -1 => config to request required work size
         let info = &mut 0_i32; // output info
 
-        // target for computed eigenvectors (if any)
-        let mut tmpz = [T::zero()]; //placeholder if V empty
-        let z = match self.V.as_mut() {
-            Some(V) => V.data_mut(),
-            None => tmpz.as_mut_slice(), // fake target
-        };
+        // The eigenvalue-only LAPACK call does not reference z.
+        let mut z = [T::zero()];
 
         for i in 0..2 {
             T::xsyevr(
-                jobz, range, uplo, n, a, lda, vl, vu, il, iu, abstol, m, w, z, ldz, isuppz, work,
-                lwork, iwork, liwork, info,
+                b'N', range, uplo, n, a, lda, vl, vu, il, iu, abstol, m, w, &mut z, ldz, isuppz,
+                work, lwork, iwork, liwork, info,
             );
             if *info != 0 {
                 return Err(DenseFactorizationError::Eigen(*info));
@@ -333,10 +261,10 @@ where
 }
 
 macro_rules! generate_test_eigen {
-    ($fxx:ty, $test_name:ident, $tolfn:ident) => {
+    ($fxx:ty, $test_name:ident) => {
         #[test]
         fn $test_name() {
-            use crate::algebra::{DenseMatrix, MultiplyGEMM, VectorMath};
+            use crate::algebra::VectorMath;
 
             // has to be 4x4 to avoid the special case
             let mut S = Matrix::<$fxx>::from(&[
@@ -346,49 +274,16 @@ macro_rules! generate_test_eigen {
                 [0., 0., 0., 9.], //
             ]);
 
-            let Scopy = S.clone(); //S is corrupted after factorization
-
             let mut eng = EigEngine::<$fxx>::new(4);
             assert!(eng.eigvals(&mut S).is_ok());
             let sol = [-1.0, -1.0, 8., 9.];
             assert!(eng.λ.norm_inf_diff(&sol) < 1e-6);
-
-            let mut S = Scopy.clone(); //S is corrupted after factorization
-            assert!(eng.eigen(&mut S).is_ok());
-            let λ = &eng.λ;
-            let mut M = Matrix::<$fxx>::zeros((4, 4));
-            let V = eng.V.unwrap();
-            let mut Vs = V.clone();
-            for c in 0..4 {
-                for r in 0..4 {
-                    Vs[(r, c)] *= λ[c];
-                }
-            }
-
-            M.mul(&Vs, &V.t(), 1.0, 0.0);
-            assert!(M.data().norm_inf_diff(Scopy.data()) < (1e-11 as $fxx).$tolfn());
         }
     };
 }
 
-generate_test_eigen!(f32, test_eigen_f32, sqrt);
-generate_test_eigen!(f64, test_eigen_f64, abs);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    // minimal test for debugging
-    #[test]
-    fn test_eig2() {
-        let mut S = Matrix::<f64>::from(&[
-            [3., 2.], //
-            [2., 0.], //
-        ]);
-
-        let mut eng = EigEngine::<f64>::new(2);
-        assert!(eng.eigen(&mut S).is_ok());
-    }
-}
+generate_test_eigen!(f32, test_eigen_f32);
+generate_test_eigen!(f64, test_eigen_f64);
 
 #[cfg(all(test, feature = "bench"))]
 mod bench {
@@ -411,7 +306,7 @@ mod bench {
         let mut eng = EigEngine::<f64>::new(3);
 
         for mut A in eig3_bench_iter() {
-            let _ = eng.syevr(&mut A, b'N');
+            let _ = eng.syevr(&mut A);
         }
 
         for mut A in eig3_bench_iter() {

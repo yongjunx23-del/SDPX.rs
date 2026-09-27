@@ -32,18 +32,16 @@ pub(super) fn tridiagonalize<const N: usize>(
             if par {
                 let tail: &[F<N>] = &b[(k + 1) * n..n * n];
                 p.par_iter_mut().enumerate().for_each(|(i, pi)| {
-                    let mut acc = F::zero();
-                    for j in 0..len {
-                        acc += tail[k + 1 + i + j * n] * v[j];
-                    }
+                    let acc = F::dot_fma(
+                        (0..len).map(|j| (&tail[k + 1 + i + j * n], &v[j])),
+                    );
                     *pi = tau * acc;
                 });
             } else {
                 for i in 0..len {
-                    let mut acc = F::zero();
-                    for j in 0..len {
-                        acc += b[k + 1 + i + (k + 1 + j) * n] * v[j];
-                    }
+                    let acc = F::dot_fma(
+                        (0..len).map(|j| (&b[k + 1 + i + (k + 1 + j) * n], &v[j])),
+                    );
                     p[i] = tau * acc;
                 }
             }
@@ -60,15 +58,22 @@ pub(super) fn tridiagonalize<const N: usize>(
                     .par_chunks_mut(n)
                     .enumerate()
                     .for_each(|(j, col)| {
-                        for i in 0..len {
+                        for i in 0..=j {
                             col[k + 1 + i] -= v[i] * p[j] + p[i] * v[j];
                         }
                     });
             } else {
                 for j in 0..len {
-                    for i in 0..len {
+                    for i in 0..=j {
                         b[k + 1 + i + (k + 1 + j) * n] -= v[i] * p[j] + p[i] * v[j];
                     }
+                }
+            }
+            // The update is symmetric: copy the rounded upper value instead
+            // of repeating both MPFR products for its lower counterpart.
+            for j in 0..len {
+                for i in 0..j {
+                    b[k + 1 + j + (k + 1 + i) * n] = b[k + 1 + i + (k + 1 + j) * n];
                 }
             }
         }

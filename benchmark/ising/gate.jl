@@ -1,18 +1,37 @@
-using SDPX, SparseArrays, LinearAlgebra
-startswith(realpath(pathof(SDPX)),realpath(ENV["SDPX_FROZEN_ROOT"])*"/") || error("SDPX is outside frozen source")
-for (T,bits,toltext) in ((Float64,53,"1e-8"),(BigFloat,512,"1e-42"))
-    setprecision(BigFloat,512) do
-        tol=parse(T,toltext)
-        q=T[1]; A=sparse(reshape(T[-1,0,-1],3,1)); b=T[0,sqrt(T(2)),0]
-        settings=SDPX.Settings(T;precision_bits=bits,tolerances=SDPX.Tolerances(T;primal=tol,dual=tol,gap=tol))
-        r=SDPX.solve_conic(q,A,b,[SDPX.PSDTriangleConeT(2)];settings,return_result=true)
-        @assert SDPX.is_optimal(r)
-        accept=T===Float64 ? T(1e-6) : parse(T,"1e-30")
-        @assert abs(r.x[1]-1)<=accept
-        @assert maximum(abs,A*r.x+r.s-b)<=accept
-        @assert maximum(abs,q+transpose(A)*r.y)<=accept
-        @assert abs(dot(q,r.x)+dot(b,r.y))<=accept
-        @assert r.info.precision_bits==bits
-        println("PASS ",T," ",bits," ",r.info)
+# Lightweight receipt gate for a native SDPX CLI result.
+# This script intentionally loads only JSON; it never loads the retired SDPX.jl
+# frontend and performs no solver work.  The original-coordinate numerical
+# gate remains audit_point.jl and runs outside the solve timing.
+using JSON
+
+length(ARGS) == 3 || error("usage: gate.jl RAW_JSON BITS THREADS")
+raw = JSON.parsefile(ARGS[1])
+bits = parse(Int, ARGS[2])
+threads = parse(Int, ARGS[3])
+bits in (512, 768) || error("unsupported precision")
+threads in (1, 2, 4, 8, 16, 32, 64) || error("unsupported thread budget")
+get(raw, "status", "") == "Solved" || error("native status is not Solved")
+get(raw, "precision_bits", 0) == bits || error("native precision mismatch")
+get(raw, "threads_requested", threads) == threads || error("native thread request mismatch")
+for key in ("native_seconds", "api_seconds", "load_seconds")
+    value = Float64(get(raw, key, NaN))
+    isfinite(value) && value >= 0 || error("invalid timing: $key")
+end
+Float64(raw["native_seconds"]) > 0 || error("native solver timing is not positive")
+Float64(raw["api_seconds"]) > 0 || error("native API timing is not positive")
+for key in ("primal_residual", "dual_residual")
+    if haskey(raw, key)
+        value = parse(BigFloat, string(raw[key]))
+        isfinite(value) && value <= parse(BigFloat, "1e-42") ||
+            error("native $key exceeds 1e-42")
     end
 end
+for key in ("x", "s", "z")
+    get(raw, key, nothing) isa AbstractVector || error("missing native vector: $key")
+end
+solver = get(raw, "linear_solver", "")
+solver isa AbstractString && !isempty(solver) || error("missing native linear solver")
+raw["linear_solver_threads"] isa Integer || error("missing native linear solver thread receipt")
+raw["cone_threads"] isa Integer || error("missing native cone thread receipt")
+println("PASS native status=", raw["status"], " precision=", bits,
+        " threads=", threads)

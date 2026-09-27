@@ -517,8 +517,8 @@ pub fn header_precision(path: &Path) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::core::kktsolvers::direct::ldlsolvers::qdldl::QDLDLDirectLDLSolver;
-    use crate::solver::core::kktsolvers::direct::DirectLDLSolver;
+    use crate::solver::kkt::direct::DirectLDLSolver;
+    use crate::solver::kkt::ldl::qdldl::QDLDLDirectLDLSolver;
     use crate::solver::CoreSettings;
     use sdpx_arithmetic::MpFloat;
 

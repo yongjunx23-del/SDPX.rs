@@ -9,6 +9,7 @@ mod provider;
 use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
 use provider::*;
 use sdpx_arithmetic::{MpFloat, Scalar};
+use sdpx_solver::algebra;
 type F<const N: usize> = MpFloat<N>;
 fn f<const N: usize>(x: i64) -> F<N> {
     F::from_i64(x).unwrap()
@@ -1118,4 +1119,57 @@ fn single_index_eigen() {
     // A must be read through the requested triangle only and left intact.
     assert_eq!(a, original);
     let _ = one;
+}
+
+#[test]
+fn reflector_norm_extreme_exponents() {
+    fn check<const N: usize>() {
+        for exponent in [-4096, 0, 4096] {
+            let scale = f::<N>(2).powi(exponent);
+            let mut a = vec![f(3) * scale, f(4) * scale, F::zero(), F::zero()];
+            let mut s = vec![F::zero()];
+            let mut work = vec![F::zero()];
+            let mut info = 0;
+            F::xgesvd(
+                b'N',
+                b'N',
+                4,
+                1,
+                &mut a,
+                4,
+                &mut s,
+                &mut [],
+                1,
+                &mut [],
+                1,
+                &mut work,
+                -1,
+                &mut info,
+            );
+            assert_eq!(info, 0);
+            let size = work[0].to_i32().unwrap();
+            work.resize(size as usize, F::zero());
+            F::xgesvd(
+                b'N',
+                b'N',
+                4,
+                1,
+                &mut a,
+                4,
+                &mut s,
+                &mut [],
+                1,
+                &mut [],
+                1,
+                &mut work,
+                size,
+                &mut info,
+            );
+            assert_eq!(info, 0);
+            close(s[0] / scale, f(5), f(5));
+        }
+    }
+    check::<2>();
+    check::<8>();
+    check::<12>();
 }

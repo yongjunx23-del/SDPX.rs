@@ -14,10 +14,6 @@ where
     pub(crate) fn eigvals(&mut self) -> [T; 2] {
         eig2(self, None)
     }
-
-    pub(crate) fn eigen(&mut self, V: &mut DenseMatrix2<T>) -> [T; 2] {
-        eig2(self, Some(V))
-    }
 }
 
 fn eig2<T>(A: &DenseMatrixSym2<T>, V: Option<&mut DenseMatrix2<T>>) -> [T; 2]

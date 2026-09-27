@@ -79,11 +79,6 @@ impl SuperNodeTree {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn get_post_order(&self, i: usize) -> usize {
-        self.snode_post[i]
-    }
-
     pub(crate) fn get_snode(&self, i: usize) -> &VertexSet {
         &self.snode[self.snode_post[i]]
     }

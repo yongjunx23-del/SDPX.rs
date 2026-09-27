@@ -56,16 +56,17 @@ def _remote_home(remote):
 
 def _remote_base(remote):
     return f'{_remote_home(remote)}/projects/sdpx-families'
-SNAPSHOT_DIRS = ('crates', 'include', 'julia')
-DEFAULT_JULIA = '$HOME/tools/julia-1.12.6/bin/julia'
+SNAPSHOT_DIRS = ('crates', 'include')
 DEFAULT_FEATURES = 'sdp-openblas,faer-sparse'
 JOBID_RE = re.compile(r'^(\d[\w.-]*)')
 LIVE_JOB = ('submitted', 'queued', 'running', 'unknown')
 
 
 def _run(argv, timeout=300):
-    return subprocess.run(argv, capture_output=True, text=True,
-                          timeout=timeout)
+    # ``capture_output`` and ``text`` were added after the Python 3.6 runtime
+    # still used by the cluster bridge.  Keep the equivalent older spelling.
+    return subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True, timeout=timeout)
 
 
 def ssh(remote, script, timeout=300):
@@ -117,27 +118,24 @@ OUT="$NODE_DIR/results"
 mkdir -p "$WORK" "$OUT"
 CARGO="$HOME/.cargo/bin/cargo"
 cd "$CAND_SRC"
-$CARGO build --locked --offline --release -p sdpx-ffi --features "@@FEATURES@@"
-if [ ! -f "$BASE_SRC/target/release/libsdpx.so" ]; then
+$CARGO build --locked --offline --release -p sdpx-solver --bin sdpx --features "@@FEATURES@@"
+if [ ! -x "$BASE_SRC/target/release/sdpx" ]; then
     (
         flock -x 200
-        if [ ! -f "$BASE_SRC/target/release/libsdpx.so" ]; then
+        if [ ! -x "$BASE_SRC/target/release/sdpx" ]; then
             cd "$BASE_SRC"
-            $CARGO build --locked --offline --release -p sdpx-ffi --features "@@FEATURES@@"
+            $CARGO build --locked --offline --release -p sdpx-solver --bin sdpx --features "@@FEATURES@@"
         fi
     ) 200>"$BASE_SRC/.build.lock"
 fi
 HARNESS="$CAND_SRC/benchmark/research"
 python3 "$HARNESS/catalog.py" materialize --suite @@SUITE@@ \
   --workspace "$HOME/projects/sdpx-families/data" --output "$WORK/data"
-JULIA="@@JULIA_BIN@@"
-python3 - "$WORK" "$CAND_SRC" "$BASE_SRC" "$JULIA" <<'EOF'
+python3 - "$WORK" "$CAND_SRC" "$BASE_SRC" <<'EOF'
 import json, sys
-work, cand, base, julia = sys.argv[1:5]
+work, cand, base = sys.argv[1:4]
 def arm(src):
-    lib = src + '/target/release/libsdpx.so'
-    return {'source': src, 'library': lib,
-            'julia': julia, 'julia_project': src + '/julia/SDPX.jl',
+    return {'source': src, 'cli': src + '/target/release/sdpx',
             'blas': 'default'}
 json.dump(arm(cand), open(work + '/candidate.json', 'w'))
 json.dump(arm(base), open(work + '/baseline.json', 'w'))
@@ -156,8 +154,7 @@ def render_job(args, tree_id):
                'WALLTIME': args.walltime, 'CAMPAIGN': args.campaign,
                'TREE': tree_id, 'NODE': args.node,
                'FEATURES': args.features, 'SUITE': args.stage,
-               'PROFILE': args.profile, 'THREADS': str(args.threads),
-               'JULIA_BIN': args.julia_bin}
+               'PROFILE': args.profile, 'THREADS': str(args.threads)}
     for key, value in mapping.items():
         text = text.replace(f'@@{key}@@', value)
     if '@@' in text:
@@ -168,7 +165,7 @@ def render_job(args, tree_id):
 def cmd_preflight(args):
     proc = ssh(args.remote,
                'hostname; echo ---; qstat -q; echo ---; '
-               'command -v julia python3; ls $HOME/.cargo/bin/cargo; echo ---; qstat -an | head -30')
+               'command -v python3; ls $HOME/.cargo/bin/cargo; echo ---; qstat -an | head -30')
     print(proc.stdout, end='')
     if proc.returncode != 0:
         print(proc.stderr, end='', file=sys.stderr)
@@ -176,8 +173,8 @@ def cmd_preflight(args):
     return 0
 
 
-def upload_and_setup(remote, campaign, dest, tarball, julia_bin, timeout):
-    """Upload tarball to dest/source under the campaign; instantiate+fetch."""
+def upload_and_setup(remote, campaign, dest, tarball, timeout):
+    """Upload tarball to dest/source under the campaign and fetch Rust deps."""
     dest = '/'.join(familytree.check_remote_name('dest-part', part)
                     for part in (dest or '').split('/'))
     campaign = familytree.check_remote_name('campaign', campaign)
@@ -199,8 +196,6 @@ def upload_and_setup(remote, campaign, dest, tarball, julia_bin, timeout):
         'mkdir -p "$DIR/source"; '
         f'tar -xzf "$BASE/incoming/{flat}.tar.gz.part" -C "$DIR/source"; '
         f'rm -f "$BASE/incoming/{flat}.tar.gz.part"; '
-        f'{julia_bin} --startup-file=no --project="$DIR/source/julia/SDPX.jl" '
-        '\'-e\' \'using Pkg; Pkg.instantiate()\'; '
         'cd "$DIR/source" && $HOME/.cargo/bin/cargo fetch --locked'
     )
     proc = ssh(remote, script, timeout=timeout)
@@ -214,7 +209,7 @@ def cmd_sync_base(args):
     with tempfile.TemporaryDirectory() as tmp:
         tarball, digest = stage_snapshot(snapshot, Path(tmp))
         upload_and_setup(args.remote, args.campaign, '_base', tarball,
-                         args.julia_bin, args.timeout)
+                         args.timeout)
     print(f'base ready: {args.campaign}/_base sha256={digest}')
     return 0
 
@@ -247,7 +242,7 @@ def cmd_submit(args):
         stagedir = familytree.staging_dir(state, tree_id, args.node)
         tarball, digest = stage_snapshot(snapshot, stagedir)
         upload_and_setup(args.remote, campaign, f'{tree_id}/{args.node}',
-                         tarball, args.julia_bin, args.timeout)
+                         tarball, args.timeout)
         script_text = render_job(args, tree_id)
         script_remote = (f'{_remote_base(args.remote)}/{campaign}/{tree_id}/{args.node}/job.sh')
         with tempfile.NamedTemporaryFile('w', suffix='.sh',
@@ -455,7 +450,6 @@ def build_parser():
     base = sub.add_parser('sync-base')
     base.add_argument('--campaign', required=True)
     base.add_argument('--snapshot', type=Path, required=True)
-    base.add_argument('--julia-bin', default=DEFAULT_JULIA)
     base.set_defaults(func=cmd_sync_base)
     submit = sub.add_parser('submit')
     submit.add_argument('--campaign', required=True)
@@ -472,7 +466,6 @@ def build_parser():
                         default='development')
     submit.add_argument('--threads', type=int, choices=(1, 2, 4, 8),
                         default=1)
-    submit.add_argument('--julia-bin', default=DEFAULT_JULIA)
     submit.add_argument('--features', default=DEFAULT_FEATURES)
     submit.set_defaults(func=cmd_submit)
     poll = sub.add_parser('poll')

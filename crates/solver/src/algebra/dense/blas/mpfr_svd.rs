@@ -1,11 +1,5 @@
 use super::*;
 
-#[path = "mpfr_rotations.rs"]
-mod rot;
-use rot::RotLog;
-#[cfg(test)]
-use rot::RotMode;
-
 // Minimum column count before a reflector update is offered to the ambient
 // solver pool; smaller tails stay serial to avoid dispatch overhead.
 const PAR_COLS: usize = 4;
@@ -14,32 +8,19 @@ pub(super) fn num<const N: usize>(v: usize) -> F<N> {
     <F<N> as num_traits::FromPrimitive>::from_usize(v).unwrap()
 }
 pub(super) fn hypot<const N: usize>(x: F<N>, y: F<N>) -> F<N> {
-    let x = x.abs();
-    let y = y.abs();
-    let h = if x > y { x } else { y };
-    if h == F::zero() {
-        h
-    } else {
-        let x = x / h;
-        let y = y / h;
-        h * (x * x + y * y).sqrt()
-    }
+    x.hypot(y)
 }
 pub(super) fn norm<const N: usize>(a: &[F<N>]) -> F<N> {
-    a.iter().fold(F::zero(), |v, &x| hypot(v, x))
-}
-pub(super) fn rotate<const N: usize>(a: &mut [F<N>], rows: usize, p: usize, q: usize, c: F<N>, s: F<N>) {
-    let ns = -s;
-    for i in 0..rows {
-        let x = a[i + p * rows];
-        let y = a[i + q * rows];
-        a[i + p * rows] = ns.mul_add(y, c * x);
-        a[i + q * rows] = s.mul_add(x, c * y);
-    }
+    // Reuse the solver's scaled sum-of-squares norm. A reflector needs one
+    // square root for the whole vector, rather than one hypot per element.
+    crate::algebra::VectorMath::norm(a)
 }
 // Work is owned and retained by the decomposition engine, as in COSMO's
 // PsdBlasWorkspace lifecycle: query once, resize, then reuse across factors.
-pub(super) fn take_work<'a, const N: usize>(work: &mut &'a mut [F<N>], len: usize) -> &'a mut [F<N>] {
+pub(super) fn take_work<'a, const N: usize>(
+    work: &mut &'a mut [F<N>],
+    len: usize,
+) -> &'a mut [F<N>] {
     let (head, tail) = std::mem::take(work).split_at_mut(len);
     *work = tail;
     head
@@ -82,11 +63,99 @@ pub(super) fn givens<const N: usize>(x: F<N>, y: F<N>) -> (F<N>, F<N>, F<N>) {
         (x / r, y / r, r)
     }
 }
-pub(super) fn svd_rotate<const N: usize>(u: &mut [F<N>], rows: usize, p: usize, c: F<N>, s: F<N>) {
-    if !u.is_empty() {
-        rotate(u, rows, p, p + 1, c, -s);
+/// A Givens rotation of columns `p, p+1` of U (`v == false`) or V.
+#[derive(Clone, Copy)]
+pub(super) struct Rotation<const N: usize> {
+    v: bool,
+    p: usize,
+    c: F<N>,
+    s: F<N>,
+}
+
+/// Apply the logged rotations of one factor (`cols` columns of `rows`
+/// entries, column-major) in log order. Rows are independent: each row
+/// receives exactly the scalar operations of an in-place column rotation, in
+/// the same order, so the result is bitwise identical. The factor is processed
+/// as row-major rows (adjacent `p, p+1`), split across the ambient pool when
+/// inner parallelism is active.
+/// Per-thread reusable scratch, keyed by type: taken out for one call and put
+/// back, so repeated decompositions of one shape make no Rust allocations
+/// (the caller-owned-workspace contract) and reentrant calls stay safe.
+fn with_scratch<V: Default + 'static, R>(f: impl FnOnce(&mut V) -> R) -> R {
+    use std::any::{Any, TypeId};
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<Vec<Box<dyn Any>>> = const { RefCell::new(Vec::new()) };
+    }
+    let taken = SCRATCH.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.iter()
+            .position(|b| (**b).type_id() == TypeId::of::<V>())
+            .map(|i| slot.swap_remove(i))
+    });
+    let mut boxed: Box<V> = match taken.map(|b| b.downcast::<V>()) {
+        Some(Ok(v)) => v,
+        _ => Box::default(),
+    };
+    let result = f(&mut boxed);
+    SCRATCH.with(|slot| slot.borrow_mut().push(boxed));
+    result
+}
+
+fn replay_rotations<const N: usize>(
+    log: &[Rotation<N>],
+    v: bool,
+    a: &mut [F<N>],
+    rows: usize,
+    cols: usize,
+) {
+    if a.is_empty() || !log.iter().any(|r| r.v == v) {
+        return;
+    }
+    with_scratch(|t: &mut Vec<F<N>>| replay_into(log, v, a, rows, cols, t));
+}
+
+fn replay_into<const N: usize>(
+    log: &[Rotation<N>],
+    v: bool,
+    a: &mut [F<N>],
+    rows: usize,
+    cols: usize,
+    t: &mut Vec<F<N>>,
+) {
+    t.clear();
+    t.resize(rows * cols, F::<N>::zero());
+    for j in 0..cols {
+        for i in 0..rows {
+            t[j + i * cols] = a[i + j * rows];
+        }
+    }
+    let apply = |row: &mut [F<N>]| {
+        for r in log.iter().filter(|r| r.v == v) {
+            let (c, s) = (r.c, -r.s);
+            let ns = -s;
+            let (x, y) = (row[r.p], row[r.p + 1]);
+            row[r.p] = F::dot_fma2(&c, &x, &ns, &y);
+            row[r.p + 1] = F::dot_fma2(&s, &x, &c, &y);
+        }
+    };
+    // Rows are independent (each sees the whole rotation sequence in order),
+    // so splitting them is bitwise neutral. On a pool worker, offer the rows
+    // even without granted ways: rayon splits only when idle threads steal,
+    // letting them finish the last, largest cones of a scaling phase.
+    let offer = sdpx_arithmetic::inner_parallel::active() || rayon::current_thread_index().is_some();
+    if offer && rows >= PAR_COLS {
+        t.par_chunks_mut(cols).for_each(apply);
+    } else {
+        t.chunks_mut(cols).for_each(apply);
+    }
+    for j in 0..cols {
+        for i in 0..rows {
+            a[i + j * rows] = t[j + i * cols];
+        }
     }
 }
+
 // Construct H=I-tau*v*v', with v[0]=1 and H*x=beta*e_1.
 pub(super) fn reflector<const N: usize>(x: &mut [F<N>]) -> (F<N>, F<N>) {
     let magnitude = norm(x);
@@ -137,9 +206,7 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
             });
         } else {
             for j in k + 1..n {
-                let mut dot = F::dot_fma(
-                    x.iter().zip(&a[k + j * m..m + j * m]),
-                );
+                let mut dot = F::dot_fma(x.iter().zip(&a[k + j * m..m + j * m]));
                 dot *= tau;
                 let ndot = -dot;
                 for i in k..m {
@@ -172,9 +239,8 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
                     .enumerate()
                     .for_each(|(t, nd)| {
                         let i = k + 1 + t;
-                        let mut dot = F::dot_fma(
-                            (k + 1..n).map(|j| (&a_ro[i + j * m], &x[j - k - 1])),
-                        );
+                        let mut dot =
+                            F::dot_fma((k + 1..n).map(|j| (&a_ro[i + j * m], &x[j - k - 1])));
                         dot *= tau;
                         *nd = -dot;
                     });
@@ -190,9 +256,7 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
                     });
             } else {
                 for i in k + 1..m {
-                    let mut dot = F::dot_fma(
-                        (k + 1..n).map(|j| (&a[i + j * m], &x[j - k - 1])),
-                    );
+                    let mut dot = F::dot_fma((k + 1..n).map(|j| (&a[i + j * m], &x[j - k - 1])));
                     dot *= tau;
                     let ndot = -dot;
                     for j in k + 1..n {
@@ -212,17 +276,13 @@ fn demmel_kahan<const N: usize>(
     e: &mut [F<N>],
     lo: usize,
     hi: usize,
-    u: &mut [F<N>],
-    m: usize,
-    v: &mut [F<N>],
-    n: usize,
-    log: &mut RotLog<N>,
+    log: &mut Vec<Rotation<N>>,
 ) {
     let (mut c, mut oldc, mut olds) = (F::one(), F::one(), F::zero());
     for i in lo..hi {
         let (nc, s, r) = givens(d[i] * c, e[i]);
         c = nc;
-        log.rotate_v(v, n, i, c, s);
+        log.push(Rotation { v: true, p: i, c, s });
         if i > lo {
             e[i - 1] = olds * r;
         }
@@ -230,7 +290,7 @@ fn demmel_kahan<const N: usize>(
         oldc = nc;
         olds = ns;
         d[i] = r;
-        log.rotate_u(u, m, i, oldc, olds);
+        log.push(Rotation { v: false, p: i, c: oldc, s: olds });
     }
     let h = d[hi] * c;
     e[hi - 1] = h * olds;
@@ -242,28 +302,24 @@ fn shifted_qr<const N: usize>(
     lo: usize,
     hi: usize,
     shift: F<N>,
-    u: &mut [F<N>],
-    m: usize,
-    v: &mut [F<N>],
-    n: usize,
-    log: &mut RotLog<N>,
+    log: &mut Vec<Rotation<N>>,
 ) {
     let (c, s, _) = givens(d[lo] - shift * (shift / d[lo]), e[lo]);
-    log.rotate_v(v, n, lo, c, s);
+    log.push(Rotation { v: true, p: lo, c, s });
     let mut di = d[lo] * c + e[lo] * s;
     let mut ei1 = -d[lo] * s + e[lo] * c;
     let mut di1 = d[lo + 1] * c;
     let mut bulge = d[lo + 1] * s;
     for i in lo..hi - 1 {
         let (c, s, _) = givens(di, bulge);
-        log.rotate_u(u, m, i, c, s);
+        log.push(Rotation { v: false, p: i, c, s });
         d[i] = c * di + s * bulge;
         let ei = c * ei1 + s * di1;
         di1 = -s * ei1 + c * di1;
         ei1 = e[i + 1] * c;
         bulge = s * e[i + 1];
         let (c, s, _) = givens(ei, bulge);
-        log.rotate_v(v, n, i + 1, c, s);
+        log.push(Rotation { v: true, p: i + 1, c, s });
         e[i] = ei * c + bulge * s;
         di = di1 * c + ei1 * s;
         ei1 = -di1 * s + ei1 * c;
@@ -271,7 +327,7 @@ fn shifted_qr<const N: usize>(
         di1 = d[i + 2] * c;
     }
     let (c, s, _) = givens(di, bulge);
-    log.rotate_u(u, m, hi - 1, c, s);
+    log.push(Rotation { v: false, p: hi - 1, c, s });
     d[hi - 1] = c * di + s * bulge;
     e[hi - 1] = c * ei1 + s * di1;
     d[hi] = -s * ei1 + c * di1;
@@ -356,11 +412,8 @@ pub(super) fn small_shift<const N: usize>(d1: F<N>, d2: F<N>, e: F<N>) -> F<N> {
 fn bidiagonal_svd<const N: usize>(
     d: &mut [F<N>],
     e: &mut [F<N>],
-    u: &mut [F<N>],
-    m: usize,
-    v: &mut [F<N>],
     n: usize,
-    rot: &mut RotLog<N>,
+    log: &mut Vec<Rotation<N>>,
 ) -> Result<(), i32> {
     if n < 2 {
         return Ok(());
@@ -382,8 +435,7 @@ fn bidiagonal_svd<const N: usize>(
             lo -= 1;
         }
         if d[lo..=hi].iter().any(|&x| x == F::zero()) {
-            demmel_kahan(d, e, lo, hi, u, m, v, n, rot);
-            rot.flush(u, m, v, n);
+            demmel_kahan(d, e, lo, hi, log);
             continue;
         }
         let smallest = estimate_smallest(d, e, lo, hi, tol);
@@ -407,21 +459,19 @@ fn bidiagonal_svd<const N: usize>(
         // Upstream `__svd!` shift guard at its default tolerance:
         // fudge * tol * sigma^- <= eps * sigma^+.
         if num::<N>(hi - lo + 1) * tol * smallest <= F::epsilon() * largest {
-            demmel_kahan(d, e, lo, hi, u, m, v, n, rot);
+            demmel_kahan(d, e, lo, hi, log);
         } else {
             let shift = small_shift(d[hi - 1], d[hi], e[hi - 1]);
             if (shift / d[lo]).abs() < F::epsilon().sqrt() {
-                demmel_kahan(d, e, lo, hi, u, m, v, n, rot);
+                demmel_kahan(d, e, lo, hi, log);
             } else {
-                shifted_qr(d, e, lo, hi, shift, u, m, v, n, rot);
+                shifted_qr(d, e, lo, hi, shift, log);
             }
         }
-        rot.flush(u, m, v, n);
         if d.iter().chain(e.iter()).any(|x| !x.is_finite()) {
             return Err(1);
         }
     }
-    rot.flush(u, m, v, n);
     Err(1)
 }
 // Packed Householder reconstruction, applied backwards as in SDPX's upstream
@@ -439,9 +489,7 @@ pub(super) fn apply_reflectors<const N: usize>(
     let par = sdpx_arithmetic::inner_parallel::active();
     for k in (0..n).rev() {
         let update = |col: &mut [F<N>]| {
-            let mut dot = F::dot_fma(
-                (k + 1..m).map(|i| (&a[i + k * m], &col[i])),
-            ) + col[k];
+            let mut dot = F::dot_fma((k + 1..m).map(|i| (&a[i + k * m], &col[i]))) + col[k];
             dot *= left[k];
             let ndot = -dot;
             col[k] += ndot;
@@ -460,9 +508,7 @@ pub(super) fn apply_reflectors<const N: usize>(
     if !v.is_empty() {
         for k in (0..n.saturating_sub(1)).rev() {
             let update = |col: &mut [F<N>]| {
-                let mut dot = F::dot_fma(
-                    (k + 2..n).map(|i| (&a[k + i * m], &col[i])),
-                ) + col[k + 1];
+                let mut dot = F::dot_fma((k + 2..n).map(|i| (&a[k + i * m], &col[i]))) + col[k + 1];
                 dot *= right[k];
                 let ndot = -dot;
                 col[k + 1] += ndot;
@@ -581,10 +627,17 @@ pub(super) fn svd<'a, const N: usize>(
     if vr > 0 {
         identity(v, n);
     }
-    // Deferred U/V rotations; each sweep (or the capacity bound) flushes them
-    // in order, so d/e never observe stale vector state.
-    let mut rot = RotLog::new();
-    bidiagonal_svd(d, e, u, m, v, n, &mut rot)?;
+    // The bidiagonal QR never reads U or V: log its rotations, then replay
+    // them on U and V (see `replay_rotations`).
+    with_scratch(|log: &mut Vec<Rotation<N>>| {
+        log.clear();
+        bidiagonal_svd(d, e, n, log)?;
+        replay_rotations(log, false, u, m, uc);
+        if vr > 0 {
+            replay_rotations(log, true, v, n, n);
+        }
+        Ok::<(), i32>(())
+    })?;
     apply_reflectors(b, m, n, left, right, u, uc, v);
     for (i, cell) in order.iter_mut().enumerate() {
         *cell = num::<N>(i);
@@ -807,98 +860,6 @@ impl<const N: usize> XgesddScalar for F<N> {
             *info += 1;
         } else if *info == -2 {
             *info = -1;
-        }
-    }
-}
-
-
-#[cfg(test)]
-mod rot_log_tests {
-    use super::*;
-
-    // Numeric equality plus sign distinguishes -0 from +0; for normalized MPFR
-    // values at equal precision this is bitwise identity.
-    fn bitwise_same<const N: usize>(a: &[F<N>], b: &[F<N>]) -> bool {
-        a.len() == b.len()
-            && a.iter()
-                .zip(b)
-                .all(|(x, y)| x == y && x.is_sign_negative() == y.is_sign_negative())
-    }
-
-    fn run<const N: usize>(
-        mode: RotMode,
-        d0: &[F<N>],
-        e0: &[F<N>],
-        m: usize,
-    ) -> (Vec<F<N>>, Vec<F<N>>, Vec<F<N>>, Vec<F<N>>) {
-        let n = d0.len();
-        let mut d = d0.to_vec();
-        let mut e = e0.to_vec();
-        let mut u = vec![F::zero(); m * n];
-        for j in 0..n {
-            u[j + j * m] = F::one();
-        }
-        let mut v = vec![F::zero(); n * n];
-        identity(&mut v, n);
-        let mut rot = RotLog::with_mode(mode);
-        let _guard = sdpx_arithmetic::inner_parallel::Guard::enter();
-        bidiagonal_svd(&mut d, &mut e, &mut u, m, &mut v, n, &mut rot).unwrap();
-        (d, e, u, v)
-    }
-
-    #[test]
-    fn rotation_log_modes_bitwise() {
-        const N: usize = 4;
-        let m = 14;
-        let n = 9;
-        // Mixed-sign nonzero diagonal exercises shifted_qr and the shift-guard
-        // demmel_kahan branch; the interior zero in case B forces demmel_kahan.
-        let d_a: Vec<F<N>> = (0..n)
-            .map(|i| {
-                let v = num::<N>(i + 2) / num::<N>(i + 3);
-                if i % 3 == 1 {
-                    -v
-                } else {
-                    v
-                }
-            })
-            .collect();
-        let e_a: Vec<F<N>> = (0..n - 1)
-            .map(|i| num::<N>(i + 1) / num::<N>(i + 5))
-            .collect();
-        let mut d_b = d_a.clone();
-        d_b[4] = F::zero();
-        // Case C: wide enough that a sweep exceeds LOG_CAP, exercising the
-        // mid-sweep capacity flush.
-        let m_c = 80;
-        let n_c = 56;
-        let d_c: Vec<F<N>> = (0..n_c)
-            .map(|i| {
-                let v = num::<N>(i + 2) / num::<N>(i + 7);
-                if i % 4 == 2 {
-                    -v
-                } else {
-                    v
-                }
-            })
-            .collect();
-        let e_c: Vec<F<N>> = (0..n_c - 1)
-            .map(|i| num::<N>(i % 7 + 1) / num::<N>(i % 11 + 9))
-            .collect();
-
-        for (d0, e0, m) in [
-            (&d_a, &e_a, m),
-            (&d_b, &e_a, m),
-            (&d_c, &e_c, m_c),
-        ] {
-            let base = run::<N>(RotMode::Immediate, d0, e0, m);
-            for mode in [RotMode::Serial, RotMode::Tiled] {
-                let got = run::<N>(mode, d0, e0, m);
-                assert!(bitwise_same(&base.0, &got.0), "d differs in {mode:?}");
-                assert!(bitwise_same(&base.1, &got.1), "e differs in {mode:?}");
-                assert!(bitwise_same(&base.2, &got.2), "u differs in {mode:?}");
-                assert!(bitwise_same(&base.3, &got.3), "v differs in {mode:?}");
-            }
         }
     }
 }

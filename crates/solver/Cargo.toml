@@ -1,6 +1,6 @@
 [package]
 name = "sdpx-solver"
-version = "0.7.0"
+version = "0.8.0"
 authors = ["Paul Goulart <paul.goulart@eng.ox.ac.uk>"]
 edition = "2021"
 rust-version = "1.85.0"
@@ -31,11 +31,13 @@ thiserror      = "1.0"
 default = ["serde"]
 
 # enable reading / writing of problems from json files 
-serde = ["dep:serde", "dep:serde_json"]
+serde = ["dep:serde", "dep:serde_json", "dep:sha2", "sdpx-arithmetic/serde"]
 
 # enables blas/lapack for SDP support, with blas/lapack src unspecified
 # also enable packages required for chordal decomposition 
-sdp = ["blas","lapack", "indexmap"]
+# `blas-src`/`lapack-src` are provider-neutral shims: pick a provider with a
+# `sdp-*` flavour below, or link one directly (e.g. `-l dylib=openblas`).
+sdp = ["blas","lapack", "blas-src", "lapack-src", "indexmap", "dep:gemm"]
 
 # explicit configuration options for different blas flavours
 sdp-accelerate = ["sdp", "blas-src/accelerate", "lapack-src/accelerate"]
@@ -48,6 +50,9 @@ faer-sparse = ["dep:faer", "dep:faer-traits"]
 
 # compile with more exhaustive benchmarking tests 
 bench = []
+
+# opt-in lossless KKT snapshot capture/replay for offline audits (see snapshot.rs)
+snapshot = []
 
 # -------------------------------
 # SDP configuration
@@ -99,6 +104,19 @@ optional = true
 # -------------------------------
 # 3rd party sparse LDL solvers
 # -------------------------------
+
+# Exact per-prime f64 products of the residue kernel: thread-local packing
+# (OpenBLAS packs into a shared global buffer pool, which stops scaling
+# with many concurrent small calls).
+# Worker pinning (Linux sched_setaffinity); already in the lockfile.
+[target.'cfg(target_os = "linux")'.dependencies.libc]
+version = "0.2.189"
+
+[dependencies.gemm]
+version = "0.18.2"
+default-features = false
+features = ["std"]
+optional = true
 
 [dependencies.faer]
 version = "0.21.9"
@@ -159,6 +177,7 @@ required-features = ["serde"]
 [[example]]
 name = "kkt_replay"
 path = "examples/rust/kkt_replay.rs"
+required-features = ["snapshot"]
 
 
 
@@ -168,9 +187,8 @@ path = "examples/rust/kkt_replay.rs"
 
 
 # ------------------------------
-# Optional julia and python interface 
+# JSON input, settings, and CLI receipts
 # ------------------------------
-
 
 [dependencies.serde]
 optional = true 
@@ -182,6 +200,10 @@ optional = true
 version = "1"
 features = ["float_roundtrip"]
 
+[dependencies.sha2]
+version = "=0.10.9"
+optional = true
+
 
 # derive_more is used to implement the Debug trait
 # used for display python objects.  Increases MSRV
@@ -191,9 +213,14 @@ features = ["float_roundtrip"]
 
 [lib]
 name = "sdpx_solver"
-# "cdylib" is necessary to produce a shared libraries for Python/Julia
-# "lib" is necessary to allow the ./examples to build
+# A single static library target: the Rust API, examples, and the
+# `sdpx-ffi` crate (cdylib) are the only consumers.
 crate-type = ["lib"] 
+
+[[bin]]
+name = "sdpx"
+path = "src/bin/sdpx.rs"
+required-features = ["serde"]
 
 
 # ------------------------------
@@ -202,18 +229,10 @@ crate-type = ["lib"]
 # ------------------------------
 
 
-[target.'cfg(target_family = "wasm")'.dependencies]
-web-time = "0.2.3"
-[target.'cfg(target_family = "wasm")'.dev-dependencies]
-wasm-bindgen-test = "0.3"
-
-
 # ------------------------------
 # testing, benchmarking etc 
 # ------------------------------
 [dev-dependencies]
 tempfile = "3"
-
-
 
 

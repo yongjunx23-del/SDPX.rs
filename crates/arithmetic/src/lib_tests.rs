@@ -37,6 +37,7 @@ fn oracle<const N: usize>() {
             (a / b, mpfr::div as Op),
             (a % b, mpfr::fmod as Op),
             (a.atan2(b), mpfr::atan2 as Op),
+            (a.hypot(b), mpfr::hypot as Op),
         ] {
             op(&mut z.0, &x.0, &y.0, ROUND);
             assert_eq!(mpfr::cmp(&actual.descriptor(), &z.0), 0);
@@ -50,6 +51,9 @@ fn oracle<const N: usize>() {
         assert_eq!(mpfr::cmp(&a.mul_add(b, a).descriptor(), &z.0), 0);
     }
     let one = MpFloat::<N>::one();
+    unsafe {
+        assert_eq!(mpfr::cmp_ui(&one.descriptor(), 1), 0);
+    }
     let eps = MpFloat::<N>::epsilon();
     assert_eq!((one + eps) - one, eps);
     assert_eq!(one + eps / MpFloat::from_u64(2).unwrap(), one); // ties to even
@@ -79,6 +83,89 @@ fn all_precisions_oracle_and_ownership() {
     oracle::<12>();
     oracle::<16>();
     oracle::<32>();
+}
+
+#[test]
+fn comparisons_match_mpfr_all_precisions() {
+    fn check<const N: usize>() {
+        type F<const N: usize> = MpFloat<N>;
+        let mut values = vec![
+            F::<N>::zero(),
+            -F::zero(),
+            F::nan(),
+            F::infinity(),
+            F::neg_infinity(),
+            F::one(),
+            -F::one(),
+            F::min_positive_value(),
+            F::max_value(),
+        ];
+        // Include adjacent significands and values produced by arithmetic;
+        // special results retain arbitrary old limb contents in MPFR.
+        values.extend([
+            F::<N>::one() + F::epsilon(),
+            F::one() - F::epsilon(),
+            F::one() - F::one(),
+            F::one() / F::zero(),
+        ]);
+        let mut state = 0xabcddcba12344321_u64;
+        for e in [-4096, -1, 0, 1, 4096] {
+            for _ in 0..8 {
+                let limbs = std::array::from_fn(|i| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    if i == N - 1 {
+                        state | (1 << 63)
+                    } else {
+                        state
+                    }
+                });
+                let value = F::<N>::exact_decode(mpfr::REGULAR_KIND, e, limbs);
+                values.extend([value, -value]);
+            }
+        }
+        for a in &values {
+            for b in &values {
+                let expected = if a.is_nan() || b.is_nan() {
+                    None
+                } else {
+                    Some(unsafe { mpfr::cmp(&a.descriptor(), &b.descriptor()) }.cmp(&0))
+                };
+                assert_eq!(a.partial_cmp(b), expected);
+                assert_eq!(a == b, expected == Some(Ordering::Equal));
+            }
+        }
+    }
+    check::<2>();
+    check::<4>();
+    check::<8>();
+    check::<12>();
+    check::<16>();
+    check::<32>();
+}
+
+#[test]
+fn hypot_extreme_exponents_and_special_values() {
+    fn check<const N: usize>() {
+        type F<const N: usize> = MpFloat<N>;
+        for exponent in [-4096, 0, 4096] {
+            let scale = F::<N>::from_u64(2).unwrap().powi(exponent);
+            let x = F::<N>::from_u64(3).unwrap() * scale;
+            let y = F::<N>::from_u64(4).unwrap() * scale;
+            assert_eq!(x.hypot(-y), F::<N>::from_u64(5).unwrap() * scale);
+            assert_eq!(x.hypot(F::zero()), x);
+        }
+        assert_eq!(F::<N>::infinity().hypot(F::nan()), F::infinity());
+        assert!(F::<N>::one().hypot(F::nan()).is_nan());
+        assert!(!(-F::<N>::zero()).hypot(F::zero()).is_sign_negative());
+    }
+    check::<2>();
+    check::<4>();
+    check::<8>();
+    check::<12>();
+    check::<16>();
+    check::<32>();
 }
 fn assignment_oracle<const N: usize>() {
     fn check<const N: usize>(actual: MpFloat<N>, expected: &mpfr::mpfr_t) {
@@ -204,6 +291,39 @@ fn constants_and_decimal_precision() {
     assert_ne!(a, T::one());
     assert_eq!(a.to_f64(), Some(1.0));
 }
+
+#[test]
+fn constant_cache_precision_ownership_and_threads() {
+    fn check<const N: usize>() {
+        for constant in [
+            Constant::Pi,
+            Constant::Sqrt2,
+            Constant::Frac1Sqrt2,
+            Constant::Ln2,
+        ] {
+            let reference = MpFloat::<N>::constant_uncached(constant);
+            let mut value = MpFloat::<N>::constant(constant);
+            assert_eq!(value, reference);
+            value += MpFloat::one();
+            assert_ne!(value, reference);
+            assert_eq!(MpFloat::<N>::constant(constant), reference);
+            // Returned limbs have independent ownership, including across threads.
+            assert_eq!(
+                std::thread::spawn(move || MpFloat::<N>::constant(constant))
+                    .join()
+                    .unwrap(),
+                reference
+            );
+        }
+    }
+    check::<8>();
+    check::<2>();
+    check::<12>();
+    check::<4>();
+    check::<16>();
+    check::<32>();
+    check::<2>();
+}
 fn ordered_dot_fma<const N: usize>() {
     type F<const N: usize> = MpFloat<N>;
     let one = F::<N>::one();
@@ -212,18 +332,24 @@ fn ordered_dot_fma<const N: usize>() {
     let big = (one + one).powi((N * 64) as i32);
     let a = [big, one, -big];
     let b = [one; 3];
-    // A once-rounded exact dot gives 1; the required ordered FMAs give 0.
-    assert_eq!(F::dot_fma(a.iter().zip(&b)), zero);
+    // The ordered FMA chain gives 0; the exact, once-rounded dot gives 1.
+    assert_eq!(F::dot_fma_chain(a.iter().zip(&b)), zero);
+    assert_eq!(F::dot_fma(a.iter().zip(&b)), one);
     assert_eq!(F::dot_fma(a[..0].iter().zip(&b[..0])).kind, mpfr::ZERO_KIND);
     let a = [-one, one + eps];
     let b = [one, one - eps];
     // Separately rounded multiplication would lose this cancellation term.
+    assert_eq!(F::dot_fma_chain(a.iter().zip(&b)), -(eps * eps));
     assert_eq!(F::dot_fma(a.iter().zip(&b)), -(eps * eps));
-    let mut a: Vec<_> = (0..37).map(|i| F::<N>::from_i32(i - 18).unwrap() / F::from_i32(7).unwrap()).collect();
-    let b: Vec<_> = (0..37).map(|i| F::<N>::from_i32(i % 11 - 5).unwrap() / F::from_i32(13).unwrap()).collect();
+    let mut a: Vec<_> = (0..37)
+        .map(|i| F::<N>::from_i32(i - 18).unwrap() / F::from_i32(7).unwrap())
+        .collect();
+    let b: Vec<_> = (0..37)
+        .map(|i| F::<N>::from_i32(i % 11 - 5).unwrap() / F::from_i32(13).unwrap())
+        .collect();
     let before = (a.clone(), b.clone());
     let expected = a.iter().zip(&b).fold(zero, |v, (&x, &y)| x.mul_add(y, v));
-    let actual = F::dot_fma(a.iter().zip(&b));
+    let actual = F::dot_fma_chain(a.iter().zip(&b));
     assert_eq!(actual, expected);
     assert_eq!((a.clone(), b.clone()), before);
     a.fill(zero);

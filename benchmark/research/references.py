@@ -14,13 +14,13 @@ spec.loader.exec_module(common)
 
 def identity(args, env):
     workspace = args.workspace.resolve()
-    suite = workspace / 'SDPX.jl/benchmark/run_suite.py'
+    suite = HERE.parent / 'float64/adapters/providers.py'
     providers = {str(p.resolve()): common.sha(p) for p in args.provider_file}
     executable = args.python if args.engine == 'mosek' else args.binary
     if executable is None or not executable.is_absolute() or not executable.is_file():
         raise ValueError('reference executable must be an existing absolute path')
     if args.engine == 'mosek':
-        source = [suite, workspace / 'SDPX.jl/benchmark/mosek_runner.py']
+        source = [suite, HERE.parent / 'float64/adapters/mosek_runner.py']
         packages = common.load_module('reference_provider_probe', suite).python_provider_fingerprint(str(executable))
     else:
         if not args.source.is_dir() or any(not (args.source / f).is_file() for f in ('Cargo.toml', 'Cargo.lock')):
@@ -92,7 +92,7 @@ def run(args):
                 raise ValueError('reference provider unavailable or fingerprint incomplete')
             owned = common.supervisor()
             command = ([str(args.binary.resolve())] if args.engine == 'clarabel' else
-                       [str(args.python.resolve()), str(args.workspace.resolve() / 'SDPX.jl/benchmark/mosek_runner.py')])
+                       [str(args.python.resolve()), str(HERE.parent / 'float64/adapters/mosek_runner.py')])
             for entry in entries:
                 row = dict(case_id=entry['name'], passed=False, raw_rows=[])
                 result['rows'].append(row)
