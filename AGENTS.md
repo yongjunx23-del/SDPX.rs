@@ -10,7 +10,7 @@ This file is the single source for **how to work**. Other documents:
 |---|---|
 | [REVIEW_AND_PLAN.md](REVIEW_AND_PLAN.md) | Current status, known failures, priorities, closed directions |
 | [docs/JOURNAL.md](docs/JOURNAL.md) | Completed experiments and their conclusions (append-only) |
-| [README.md](README.md) | Users: build, CLI, API, C ABI, architecture |
+| [README.md](README.md) | Users: overview, quick start, Rust examples, performance |
 | `benchmark/e2e/README.md` | The per-change check tool |
 | `benchmark/{research,ising,float64,parallel,mpfr}/README.md` | Milestone and external comparisons only |
 

@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 560" width="920" height="560" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<title>SDPX vs SDPB on the Ising Λ19 bootstrap SDP</title>
+<style>
+ :root { --bg:#ffffff; --fg:#1f2328; --mute:#656d76; --grid:#d8dee4; --x:#e8590c; --b:#1c7ed6; }
+ @media (prefers-color-scheme: dark) { :root { --bg:#0d1117; --fg:#e6edf3; --mute:#8d96a0; --grid:#30363d; --x:#ff922b; --b:#4dabf7; } }
+ .bg { fill:var(--bg); } .fg { fill:var(--fg); } .mute { fill:var(--mute); }
+ .grid { stroke:var(--grid); stroke-width:1; }
+ .line { fill:none; stroke-width:3; stroke-linecap:round; stroke-linejoin:round; stroke-dasharray:1; stroke-dashoffset:1; }
+ .sx { stroke:var(--x); animation: draw-x 7.0s linear infinite; }
+ .sb { stroke:var(--b); animation: draw-b 7.0s linear infinite; }
+ @keyframes draw-x { 0% {stroke-dashoffset:1} 40.8% {stroke-dashoffset:0} 100% {stroke-dashoffset:0} }
+ @keyframes draw-b { 0% {stroke-dashoffset:1} 80% {stroke-dashoffset:0} 100% {stroke-dashoffset:0} }
+ .done-x { opacity:0; animation: show-x 7.0s step-end infinite; }
+ .done-b { opacity:0; animation: show-b 7.0s step-end infinite; }
+ @keyframes show-x { 0% {opacity:0} 40.8% {opacity:1} }
+ @keyframes show-b { 0% {opacity:0} 80% {opacity:1} }
+ .bar { transform-box: fill-box; transform-origin: left; animation: grow 7.0s ease-out infinite; }
+ @keyframes grow { 0% {transform:scaleX(0)} 25% {transform:scaleX(1)} 100% {transform:scaleX(1)} }
+</style>
+<rect class="bg" width="920" height="560" rx="14"/>
+<text class="fg" x="78" y="38" font-size="21" font-weight="700">Conformal bootstrap: Ising Λ₁₉ at 768-bit precision</text>
+<text class="mute" x="78" y="62" font-size="14">Relative duality gap per iteration, same problem, same node (2× EPYC 7742), 32 cores. Drawn at wall-clock speed.</text>
+<line class="grid" x1="78" x2="890" y1="92.0" y2="92.0"/><text class="mute" x="70" y="96.0" font-size="12" text-anchor="end">1e0</text>
+<line class="grid" x1="78" x2="890" y1="121.7" y2="121.7"/><text class="mute" x="70" y="125.7" font-size="12" text-anchor="end">1e-10</text>
+<line class="grid" x1="78" x2="890" y1="151.5" y2="151.5"/><text class="mute" x="70" y="155.5" font-size="12" text-anchor="end">1e-20</text>
+<line class="grid" x1="78" x2="890" y1="181.2" y2="181.2"/><text class="mute" x="70" y="185.2" font-size="12" text-anchor="end">1e-30</text>
+<line class="grid" x1="78" x2="890" y1="211.0" y2="211.0"/><text class="mute" x="70" y="215.0" font-size="12" text-anchor="end">1e-40</text>
+<line class="grid" x1="78" x2="890" y1="240.7" y2="240.7"/><text class="mute" x="70" y="244.7" font-size="12" text-anchor="end">1e-50</text>
+<line class="grid" x1="78" x2="890" y1="270.5" y2="270.5"/><text class="mute" x="70" y="274.5" font-size="12" text-anchor="end">1e-60</text>
+<line class="grid" x1="78" x2="890" y1="300.2" y2="300.2"/><text class="mute" x="70" y="304.2" font-size="12" text-anchor="end">1e-70</text>
+<line class="grid" x1="78" x2="890" y1="330.0" y2="330.0"/><text class="mute" x="70" y="334.0" font-size="12" text-anchor="end">1e-80</text>
+<text class="mute" x="78.0" y="350" font-size="12" text-anchor="middle">0</text>
+<text class="mute" x="240.4" y="350" font-size="12" text-anchor="middle">50</text>
+<text class="mute" x="402.8" y="350" font-size="12" text-anchor="middle">100</text>
+<text class="mute" x="565.2" y="350" font-size="12" text-anchor="middle">150</text>
+<text class="mute" x="727.6" y="350" font-size="12" text-anchor="middle">200</text>
+<text class="mute" x="890.0" y="350" font-size="12" text-anchor="middle">250</text>
+<text class="mute" x="484.0" y="370" font-size="12" text-anchor="middle">iteration</text>
+<line x1="78" x2="890" y1="216.9" y2="216.9" stroke="var(--mute)" stroke-dasharray="6 5"/><text class="mute" x="493.7" y="210.9" font-size="12">stopping tolerance 1e-42</text>
+<path class="line sb" pathLength="1" d="M84.5,92.0 L87.7,92.0 L91.0,92.0 L94.2,92.0 L97.5,92.0 L100.7,92.0 L104.0,92.0 L107.2,92.0 L110.5,92.0 L113.7,92.0 L117.0,92.0 L120.2,92.0 L123.5,92.0 L126.7,92.0 L130.0,92.0 L133.2,92.0 L136.5,92.0 L139.7,92.0 L143.0,92.0 L146.2,92.0 L149.5,92.0 L152.7,92.0 L156.0,92.0 L159.2,92.0 L162.4,92.0 L165.7,92.0 L168.9,92.0 L172.2,92.0 L175.4,92.0 L178.7,92.0 L181.9,92.0 L185.2,92.0 L188.4,92.0 L191.7,92.0 L194.9,92.0 L198.2,92.0 L201.4,92.0 L204.7,92.0 L207.9,92.0 L211.2,92.0 L214.4,92.0 L217.7,92.0 L220.9,92.0 L224.2,92.0 L227.4,92.0 L230.7,92.0 L233.9,92.0 L237.2,92.0 L240.4,92.0 L243.6,92.0 L246.9,92.0 L250.1,92.0 L253.4,92.0 L256.6,92.0 L259.9,92.0 L263.1,92.0 L266.4,92.0 L269.6,92.0 L272.9,92.0 L276.1,92.0 L279.4,92.0 L282.6,92.0 L285.9,92.0 L289.1,92.0 L292.4,92.0 L295.6,92.0 L298.9,92.0 L302.1,92.0 L305.4,92.0 L308.6,92.0 L311.9,92.0 L315.1,92.0 L318.4,92.0 L321.6,92.0 L324.8,92.0 L328.1,92.0 L331.3,92.0 L334.6,92.0 L337.8,92.0 L341.1,92.0 L344.3,92.0 L347.6,92.0 L350.8,92.0 L354.1,92.0 L357.3,92.0 L360.6,92.0 L363.8,92.0 L367.1,92.0 L370.3,92.0 L373.6,92.0 L376.8,92.0 L380.1,92.0 L383.3,92.0 L386.6,92.0 L389.8,92.0 L393.1,92.0 L396.3,92.0 L399.6,92.0 L402.8,92.0 L406.0,92.0 L409.3,92.0 L412.5,92.0 L415.8,92.0 L419.0,92.0 L422.3,92.0 L425.5,92.0 L428.8,92.0 L432.0,92.0 L435.3,92.0 L438.5,92.0 L441.8,92.0 L445.0,92.0 L448.3,92.0 L451.5,92.0 L454.8,92.0 L458.0,92.0 L461.3,92.0 L464.5,92.0 L467.8,92.0 L471.0,92.0 L474.3,92.0 L477.5,92.0 L480.8,92.0 L484.0,92.0 L487.2,92.0 L490.5,92.0 L493.7,92.0 L497.0,92.0 L500.2,92.0 L503.5,92.0 L506.7,92.0 L510.0,92.0 L513.2,92.0 L516.5,92.0 L519.7,92.0 L523.0,92.0 L526.2,92.0 L529.5,92.0 L532.7,92.2 L536.0,92.5 L539.2,93.2 L542.5,94.1 L545.7,95.2 L549.0,96.4 L552.2,97.7 L555.5,99.0 L558.7,100.3 L562.0,101.6 L565.2,102.6 L568.4,103.3 L571.7,103.9 L574.9,104.4 L578.2,105.0 L581.4,105.6 L584.7,106.3 L587.9,106.9 L591.2,107.4 L594.4,108.1 L597.7,108.7 L600.9,109.3 L604.2,109.9 L607.4,110.7 L610.7,111.4 L613.9,112.2 L617.2,112.8 L620.4,113.6 L623.7,114.8 L626.9,116.0 L630.2,117.2 L633.4,118.4 L636.7,119.7 L639.9,120.9 L643.2,122.1 L646.4,123.3 L649.6,124.5 L652.9,125.7 L656.1,126.9 L659.4,128.1 L662.6,129.3 L665.9,130.5 L669.1,131.7 L672.4,132.9 L675.6,134.1 L678.9,135.2 L682.1,136.4 L685.4,137.6 L688.6,138.8 L691.9,140.0 L695.1,141.2 L698.4,142.4 L701.6,143.6 L704.9,144.7 L708.1,145.9 L711.4,147.1 L714.6,148.3 L717.9,149.5 L721.1,150.7 L724.4,151.9 L727.6,153.1 L730.8,154.3 L734.1,155.5 L737.3,156.7 L740.6,157.9 L743.8,159.1 L747.1,160.3 L750.3,161.5 L753.6,162.8 L756.8,164.0 L760.1,165.2 L763.3,166.5 L766.6,167.7 L769.8,169.0 L773.1,170.4 L776.3,172.0 L779.6,173.5 L782.8,175.1 L786.1,176.6 L789.3,178.2 L792.6,179.7 L795.8,181.3 L799.1,182.8 L802.3,184.4 L805.6,185.9 L808.8,187.5 L812.0,189.1 L815.3,190.6 L818.5,192.2 L821.8,193.7 L825.0,195.3 L828.3,196.8 L831.5,198.4 L834.8,199.9 L838.0,201.5 L841.3,203.1 L844.5,204.6 L847.8,206.2 L851.0,207.7 L854.3,209.3 L857.5,210.8 L860.8,212.4 L864.0,214.0 L867.3,215.5"/>
+<path class="line sx" pathLength="1" d="M81.2,91.0 L84.5,90.8 L87.7,90.9 L91.0,91.1 L94.2,93.2 L97.5,94.2 L100.7,95.3 L104.0,95.7 L107.2,97.1 L110.5,97.4 L113.7,99.4 L117.0,101.7 L120.2,104.1 L123.5,107.4 L126.7,111.5 L130.0,113.2 L133.2,113.6 L136.5,115.1 L139.7,115.1 L143.0,115.7 L146.2,116.8 L149.5,117.1 L152.7,118.3 L156.0,118.2 L159.2,118.8 L162.4,118.9 L165.7,118.9 L168.9,120.4 L172.2,121.3 L175.4,121.6 L178.7,121.5 L181.9,121.0 L185.2,121.0 L188.4,121.0 L191.7,121.6 L194.9,123.2 L198.2,123.2 L201.4,124.2 L204.7,122.9 L207.9,122.6 L211.2,122.6 L214.4,122.7 L217.7,123.4 L220.9,123.7 L224.2,124.1 L227.4,125.4 L230.7,126.8 L233.9,129.0 L237.2,130.5 L240.4,134.1 L243.6,137.0 L246.9,140.2 L250.1,142.5 L253.4,145.0 L256.6,148.0 L259.9,150.9 L263.1,153.3 L266.4,155.8 L269.6,158.4 L272.9,161.1 L276.1,163.6 L279.4,166.1 L282.6,168.4 L285.9,171.0 L289.1,173.7 L292.4,176.2 L295.6,178.6 L298.9,181.2 L302.1,183.8 L305.4,186.2 L308.6,188.6 L311.9,191.0 L315.1,193.7 L318.4,196.2 L321.6,198.5 L324.8,200.9 L328.1,203.6 L331.3,206.4 L334.6,208.8 L337.8,211.2 L341.1,214.2 L344.3,216.6 L347.6,219.2 L350.8,221.8 L354.1,224.3 L357.3,227.0 L360.6,229.6 L363.8,232.3 L367.1,234.6 L370.3,237.2 L373.6,240.2 L376.8,242.5 L380.1,244.8 L383.3,247.5 L386.6,250.2 L389.8,252.6 L393.1,255.2 L396.3,257.9 L399.6,260.6 L402.8,263.1 L406.0,265.7 L409.3,268.5 L412.5,271.0 L415.8,273.6 L419.0,276.4 L422.3,279.0 L425.5,281.3 L428.8,283.8 L432.0,286.7 L435.3,289.3 L438.5,291.6 L441.8,294.2 L445.0,297.0 L448.3,299.8 L451.5,302.1 L454.8,304.7 L458.0,307.7 L461.3,310.5 L464.5,312.9"/>
+<g class="done-x"><circle cx="464.5" cy="312.9" r="5" fill="var(--x)"/><text x="474.5" y="317.9" font-size="14" font-weight="700" fill="var(--x)">SDPX 0.8 · 104 s · 119 it</text></g>
+<g class="done-b"><circle cx="867.3" cy="215.5" r="5" fill="var(--b)"/><text x="857.3" y="239.5" font-size="14" font-weight="700" fill="var(--b)" text-anchor="end">SDPB · 204 s · 243 it</text></g>
+<g font-size="13"><rect x="660" y="92" width="14" height="4" fill="var(--x)"/><text class="fg" x="680" y="98">SDPX (Rust, threads)</text><rect x="660" y="110" width="14" height="4" fill="var(--b)"/><text class="fg" x="680" y="116">SDPB (C++, MPI ranks)</text></g>
+<text class="fg" x="78" y="390" font-size="15" font-weight="700">Audited full solves, wall time (s), lower is better</text>
+<text class="fg" x="78" y="419" font-size="13">Λ₁₉ · 32 cores</text>
+<rect class="bar" x="278" y="404" width="150.5" height="14" rx="3" fill="var(--x)"/><text class="fg" x="434.5" y="416" font-size="12">104</text>
+<rect class="bar" x="278" y="421" width="295.2" height="14" rx="3" fill="var(--b)"/><text class="fg" x="579.2" y="433" font-size="12">204</text>
+<text class="fg" x="890" y="425" font-size="14" font-weight="700" text-anchor="end" fill="var(--x)">2.0×</text>
+<text class="fg" x="78" y="465" font-size="13">Λ₁₉ · 64 cores</text>
+<rect class="bar" x="278" y="450" width="147.6" height="14" rx="3" fill="var(--x)"/><text class="fg" x="431.6" y="462" font-size="12">102</text>
+<rect class="bar" x="278" y="467" width="221.4" height="14" rx="3" fill="var(--b)"/><text class="fg" x="505.4" y="479" font-size="12">153</text>
+<text class="fg" x="890" y="471" font-size="14" font-weight="700" text-anchor="end" fill="var(--x)">1.5×</text>
+<text class="fg" x="78" y="511" font-size="13">Λ₁₉ spins 0–50 · 1 node</text>
+<rect class="bar" x="278" y="496" width="344.4" height="14" rx="3" fill="var(--x)"/><text class="fg" x="628.4" y="508" font-size="12">238</text>
+<rect class="bar" x="278" y="513" width="474.6" height="14" rx="3" fill="var(--b)"/><text class="fg" x="758.6" y="525" font-size="12">328</text>
+<text class="fg" x="890" y="517" font-size="14" font-weight="700" text-anchor="end" fill="var(--x)">1.4×</text>
+</svg>
