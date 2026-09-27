@@ -65,19 +65,38 @@ fn apply_blocks<T: FloatT>(
     gemm: Option<(&rayon::ThreadPool, usize)>,
 ) {
     y.fill(T::zero());
-    let inverse = !matches!(action, ScalingAction::Apply(false));
     let offset = blocks.first().map_or(0, |b| b.rows.start);
     for block in blocks {
         let rows = block.rows.start - offset..block.rows.end - offset;
-        let (y, x) = (&mut y[rows.clone()], &x[rows]);
+        apply_block(block, &mut y[rows.clone()], &x[rows], action, gemm);
+    }
+}
+
+/// One block of [`apply_blocks`]; `y` (the block's rows) must start zeroed.
+pub(super) fn apply_block<T: FloatT>(
+    block: &mut Block<T>,
+    y: &mut [T],
+    x: &[T],
+    action: ScalingAction<'_, T>,
+    gemm: Option<(&rayon::ThreadPool, usize)>,
+) {
+    let inverse = !matches!(action, ScalingAction::Apply(false));
+    {
         match &mut block.scaling {
-            Scaling::Psd(p) => match action {
-                ScalingAction::Condense if p.sampled.is_some() => p.condense_rhs(x, gemm),
-                ScalingAction::Recover(primal) if p.sampled.is_some() => {
-                    p.recover_rhs(y, primal, gemm)
-                }
-                _ => p.apply(y, x, inverse, gemm),
-            },
+            Scaling::Psd(p) => {
+                let a = action_index(&action);
+                let start = std::time::Instant::now();
+                with_split_hint(block.ways[a], || match action {
+                    ScalingAction::Condense if p.sampled.is_some() => p.condense_rhs(x, gemm),
+                    ScalingAction::Recover(primal) if p.sampled.is_some() => {
+                        p.recover_rhs(y, primal, gemm)
+                    }
+                    _ => p.apply(y, x, inverse, gemm),
+                });
+                // Work, not wall time: a split call finishes sooner, and
+                // using its wall time would oscillate the next allocation.
+                block.cost[a] = start.elapsed().as_secs_f64() * block.ways[a] as f64;
+            }
             Scaling::Orthant { w, .. } => {
                 for ((y, &x), &w) in y.iter_mut().zip(x).zip(w.iter()) {
                     *y = if inverse { (x / w) / w } else { w * (w * x) };
@@ -129,6 +148,30 @@ fn apply_blocks<T: FloatT>(
                 y.scale(*mu);
             }
         }
+    }
+}
+
+fn action_index<T>(action: &ScalingAction<'_, T>) -> usize {
+    match action {
+        ScalingAction::Condense => 0,
+        ScalingAction::Recover(_) => 1,
+        ScalingAction::Apply(_) => 2,
+    }
+}
+
+/// Measured load balancing (SDPB 2.0 §2.2.2, worst-fit): a block whose last
+/// measured cost for this action exceeds a worker's fair share `total/W`
+/// gets `floor(cost/share)` ways for its residue products; the rest stay
+/// serial. Costs are data dependent (prime counts follow exponent spreads),
+/// so they are measured rather than modelled; the first call keeps 1 way.
+fn assign_ways<T>(blocks: &mut [Block<T>], action: usize, workers: usize) {
+    let total: f64 = blocks.iter().map(|b| b.cost[action]).sum();
+    if workers <= 1 || total <= 0.0 {
+        return;
+    }
+    let share = total / workers as f64;
+    for block in blocks.iter_mut() {
+        block.ways[action] = measured_ways(block.cost[action], share);
     }
 }
 
@@ -359,6 +402,7 @@ pub(super) fn apply_block_pool_with_world<T: FloatT>(
     }
     if let Some(pool) = pool {
         if lanes.len() > 1 {
+            assign_ways(blocks, action_index(&action), pool.current_num_threads());
             pool.install(|| split_scaling(blocks, y, x, action, lanes, gemm));
             return;
         }

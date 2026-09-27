@@ -190,6 +190,103 @@ where
     }
     α
 }
+/// Certain membership of a trial point computed in binary64: `w` holds the
+/// point and `err` a bound on each entry's distance from the working-precision
+/// point. Returns `Some(inside)` only when the decision cannot differ from the
+/// working-precision test, `None` near the boundary.
+pub(crate) type Screen = fn(w: &[f64], err: &[f64], param: f64) -> Option<bool>;
+
+/// [`backtrack_search`] with a binary64 screen: trials the screen decides
+/// cost no high-precision `log`/`exp`; only boundary cases use the exact
+/// test. The α sequence and every decision are unchanged, so the result is
+/// identical. Native precisions (≤ 64 bits) use the exact test directly.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn backtrack_search_screened<T>(
+    dq: &[T],
+    q: &[T],
+    α_init: T,
+    α_min: T,
+    step: T,
+    is_in_cone_fcn: impl Fn(&[T]) -> bool,
+    screen: Screen,
+    param: T,
+    work: &mut [T],
+) -> T
+where
+    T: FloatT,
+{
+    let native = |v: &[T]| -> Option<Vec<f64>> {
+        v.iter()
+            .map(|x| x.to_f64().filter(|y| y.is_finite() && y.abs() < 1e150))
+            .collect()
+    };
+    let screened = if T::precision_bits() > 64 {
+        match (native(q), native(dq), param.to_f64()) {
+            (Some(q64), Some(dq64), Some(p64)) if p64.is_finite() => Some((q64, dq64, p64)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let Some((q64, dq64, p64)) = screened else {
+        return backtrack_search(dq, q, α_init, α_min, step, is_in_cone_fcn, work);
+    };
+    let (mut w, mut err) = (vec![0f64; q.len()], vec![0f64; q.len()]);
+    let mut α = α_init;
+    loop {
+        let decided = α.to_f64().filter(|a| a.is_finite()).and_then(|a| {
+            for i in 0..q64.len() {
+                let t = a * dq64[i];
+                w[i] = q64[i] + t;
+                err[i] = 8.0 * f64::EPSILON * (q64[i].abs() + t.abs()) + 1e-290;
+            }
+            screen(&w, &err, p64)
+        });
+        let inside = match decided {
+            Some(inside) => inside,
+            None => {
+                work.waxpby(T::one(), q, α, dq);
+                is_in_cone_fcn(work)
+            }
+        };
+        if inside {
+            break;
+        }
+        α *= step;
+        if α < α_min {
+            α = T::zero();
+            break;
+        }
+    }
+    α
+}
+
+/// Decide `r > 0` for a residual `r` computed with absolute error at most
+/// `bound`, leaving a factor-of-two margin; `None` when too close to call.
+pub(crate) fn certain_sign(r: f64, bound: f64) -> Option<bool> {
+    if !r.is_finite() || !bound.is_finite() {
+        None
+    } else if r > 2.0 * bound {
+        Some(true)
+    } else if r < -2.0 * bound {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// A coordinate required positive: `Some(false)` if certainly nonpositive,
+/// `Some(true)` if positive with relative accuracy better than 1e-6.
+pub(crate) fn certain_positive(x: f64, err: f64) -> Option<bool> {
+    if x < -err {
+        Some(false)
+    } else if x > 1e6 * err {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn newton_raphson_onesided<T>(x0: T, f0: impl Fn(T) -> T, f1: impl Fn(T) -> T) -> T
 where
     T: FloatT,

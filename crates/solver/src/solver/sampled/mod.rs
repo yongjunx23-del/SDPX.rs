@@ -41,6 +41,14 @@ fn checked_triangle(n: usize) -> Option<usize> {
 fn tri(n: usize) -> usize {
     n * (n + 1) / 2
 }
+/// `(s, r)` of the `pair`-th level pair in `s`-major, `r <= s` order.
+fn level_pair(pair: usize) -> (usize, usize) {
+    let mut s = 0;
+    while tri(s + 1) <= pair {
+        s += 1;
+    }
+    (s, pair - tri(s))
+}
 fn tri_work(n: usize) -> u128 {
     (n as u128) * (n as u128 + 1) / 2
 }
@@ -184,6 +192,11 @@ pub(crate) fn term_offsets<T>(
     offsets
 }
 
+/// The rows of `x` that belong to block `b`, as the adjoint helpers take them.
+fn block_rows<'a, T>(b: &SampledBlock<T>, x: &'a [T]) -> &'a [T] {
+    &x[b.row_start..b.row_start + b.row_count()]
+}
+
 /// `(min row_start, max row_end)` over a block slice; `(0, 0)` when empty.
 /// PSD row ranges are disjoint by operator construction.
 pub(crate) fn block_row_span<T>(blocks: &[SampledBlock<T>]) -> (usize, usize) {
@@ -209,6 +222,8 @@ pub(crate) fn block_row_span<T>(blocks: &[SampledBlock<T>]) -> (usize, usize) {
 struct SampledBlockConstants<T> {
     wdiag: OnceLock<Vec<T>>,
     qq: OnceLock<Vec<T>>,
+    /// |basis|, for the componentwise dual residual's |A|ᵀ|z|.
+    abs_basis: OnceLock<Vec<T>>,
 }
 
 impl<T> SampledBlockConstants<T> {
@@ -216,6 +231,7 @@ impl<T> SampledBlockConstants<T> {
         Self {
             wdiag: OnceLock::new(),
             qq: OnceLock::new(),
+            abs_basis: OnceLock::new(),
         }
     }
 }
@@ -393,71 +409,211 @@ impl<T: FloatT> SampledOperator<T> {
 
     /// Materialize at T's working precision without changing factor semantics.
     pub fn materialize(&self) -> CscMatrix<T> {
-        self.materialize_impl::<false>()
+        self.materialize_impl::<false>(None)
+            .expect("unchecked materialization")
+    }
+
+    /// True when every PSD cone of `cones` (in row order) is one of this
+    /// operator's blocks and every other cone is a zero cone.
+    pub(crate) fn covers_all_psd(&self, cones: &[crate::solver::SupportedConeT<T>]) -> bool {
+        use crate::solver::SupportedConeT;
+        let mut row = 0;
+        cones.iter().all(|cone| {
+            let start = row;
+            row += cone.nvars();
+            match cone {
+                SupportedConeT::ZeroConeT(_) => true,
+                SupportedConeT::PSDTriangleConeT(n) => self.blocks.iter().any(|b| {
+                    b.row_start == start && b.row_count() == cone.nvars() && b.side() == *n
+                }),
+                _ => false,
+            }
+        })
+    }
+
+    /// [`Self::materialize`] with columns assembled on `pool`.
+    pub(crate) fn materialize_pooled(&self, pool: Option<&rayon::ThreadPool>) -> CscMatrix<T> {
+        self.materialize_impl::<false>(pool)
             .expect("unchecked materialization")
     }
 
     /// Materialize external input while rejecting coefficient range loss.
     pub fn materialize_checked(&self) -> Result<CscMatrix<T>, String> {
-        self.materialize_impl::<true>()
+        self.materialize_impl::<true>(None)
     }
 
-    fn materialize_impl<const CHECK: bool>(&self) -> Result<CscMatrix<T>, String> {
-        let mut rows = self.linear.rowval.clone();
-        let mut vals = self.linear.nzval.clone();
-        let mut cols = Vec::with_capacity(vals.len());
-        for j in 0..self.linear.n {
-            cols.extend(std::iter::repeat_n(
-                j,
-                self.linear.colptr[j + 1] - self.linear.colptr[j],
-            ));
+    /// [`Self::materialize_checked`] with blocks expanded on `pool`. Block
+    /// triplets are concatenated in block order, so the matrix is identical.
+    pub(crate) fn materialize_checked_pooled(
+        &self,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Result<CscMatrix<T>, String> {
+        self.materialize_impl::<true>(pool)
+    }
+
+    /// Build every block's constant `wdiag` table on `pool` ahead of the
+    /// workspaces that would otherwise initialize them one block at a time.
+    pub(crate) fn prepare_constants(&self, pool: Option<&rayon::ThreadPool>) {
+        let init = |(b, c): (&SampledBlock<T>, &Arc<SampledBlockConstants<T>>)| {
+            if !exact_adjoint_applies(b) {
+                c.wdiag.get_or_init(|| build_wdiag(b));
+            }
+        };
+        match pool.filter(|p| p.current_num_threads() > 1) {
+            Some(pool) => pool.install(|| {
+                self.blocks
+                    .par_iter()
+                    .zip(self.constants.par_iter())
+                    .for_each(init)
+            }),
+            None => self.blocks.iter().zip(&self.constants).for_each(init),
         }
-        for b in &self.blocks {
+    }
+
+    /// Assemble the CSC matrix column by column. A column holds the linear
+    /// entries, then each owning block's sample entries in block order; a
+    /// stable row sort and in-order duplicate summation reproduce exactly the
+    /// triplet assembly (`CscMatrix::new_from_triplets`) while the peak stays
+    /// near the final matrix size instead of several triplet copies.
+    fn materialize_impl<const CHECK: bool>(
+        &self,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Result<CscMatrix<T>, String> {
+        let (m, n) = (self.linear.m, self.linear.n);
+        // owners[c] = (block, sample index p) contributing to column c.
+        let mut owners: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+        let mut bound = vec![0usize; n + 1];
+        for c in 0..n {
+            bound[c + 1] = self.linear.colptr[c + 1] - self.linear.colptr[c];
+        }
+        for (bi, b) in self.blocks.iter().enumerate() {
             let h = b.basis_rows;
-            let mut p = 0;
-            for s in 0..b.dim {
-                for r in 0..=s {
-                    for k in 0..b.basis_cols {
-                        for j in 0..h {
-                            for i in 0..if r == s { j + 1 } else { h } {
-                                let row = b.row_start + tri(s * h + j) + r * h + i;
-                                let scale = if r != s {
-                                    T::FRAC_1_SQRT_2()
-                                } else if i != j {
-                                    T::SQRT_2()
-                                } else {
-                                    T::one()
-                                };
-                                let value =
-                                    b.weights[p] * b.basis[i + k * h] * b.basis[j + k * h] * scale;
-                                if CHECK
-                                    && (!value.is_finite()
-                                        || (value.is_zero()
-                                            && !b.weights[p].is_zero()
-                                            && !b.basis[i + k * h].is_zero()
-                                            && !b.basis[j + k * h].is_zero()))
-                                {
-                                    return Err("sampled coefficient overflow or underflow".into());
-                                }
-                                if value != T::zero() {
-                                    rows.push(row);
-                                    cols.push(b.column_start + p);
-                                    vals.push(value);
-                                }
-                            }
-                        }
-                        p += 1;
+            for p in 0..tri(b.dim) * b.basis_cols {
+                let (s, r) = level_pair(p / b.basis_cols.max(1));
+                owners[b.column_start + p].push((bi, p));
+                bound[b.column_start + p + 1] += if r == s { tri(h) } else { h * h };
+                let _ = s;
+            }
+        }
+        for c in 0..n {
+            bound[c + 1] += bound[c];
+        }
+        let total = bound[n];
+        let mut rowval = vec![0usize; total];
+        let mut nzval = vec![T::zero(); total];
+        let mut used = vec![0usize; n];
+        {
+            let mut slots = Vec::with_capacity(n);
+            let (mut rest_r, mut rest_v, mut rest_u) =
+                (&mut rowval[..], &mut nzval[..], &mut used[..]);
+            for c in 0..n {
+                let len = bound[c + 1] - bound[c];
+                let (r, tr) = std::mem::take(&mut rest_r).split_at_mut(len);
+                let (v, tv) = std::mem::take(&mut rest_v).split_at_mut(len);
+                let (u, tu) = std::mem::take(&mut rest_u).split_at_mut(1);
+                (rest_r, rest_v, rest_u) = (tr, tv, tu);
+                slots.push((c, r, v, &mut u[0]));
+            }
+            let fill = |(c, rows, vals, used): (usize, &mut [usize], &mut [T], &mut usize)| -> Result<(), String> {
+                *used = self.fill_column::<CHECK>(c, &owners[c], rows, vals)?;
+                Ok(())
+            };
+            let results: Vec<Result<(), String>> =
+                match pool.filter(|p| p.current_num_threads() > 1) {
+                    Some(pool) => pool.install(|| slots.into_par_iter().map(fill).collect()),
+                    None => slots.into_iter().map(fill).collect(),
+                };
+            results.into_iter().collect::<Result<Vec<()>, String>>()?;
+        }
+        // Compact each column's used prefix to the front.
+        let mut colptr = vec![0usize; n + 1];
+        let mut write = 0;
+        for c in 0..n {
+            let (start, len) = (bound[c], used[c]);
+            if write != start {
+                for t in 0..len {
+                    rowval[write + t] = rowval[start + t];
+                    nzval[write + t] = nzval[start + t];
+                }
+            }
+            write += len;
+            colptr[c + 1] = write;
+        }
+        rowval.truncate(write);
+        nzval.truncate(write);
+        rowval.shrink_to_fit();
+        nzval.shrink_to_fit();
+        Ok(CscMatrix::new(m, n, colptr, rowval, nzval))
+    }
+
+    /// Fill one column slot; returns the number of entries kept after
+    /// dropping zero sampled values and summing repeated rows in order.
+    fn fill_column<const CHECK: bool>(
+        &self,
+        c: usize,
+        owners: &[(usize, usize)],
+        rows: &mut [usize],
+        vals: &mut [T],
+    ) -> Result<usize, String> {
+        let mut len = 0;
+        for idx in self.linear.colptr[c]..self.linear.colptr[c + 1] {
+            rows[len] = self.linear.rowval[idx];
+            vals[len] = self.linear.nzval[idx];
+            len += 1;
+        }
+        for &(bi, p) in owners {
+            let b = &self.blocks[bi];
+            let h = b.basis_rows;
+            let k = p % b.basis_cols;
+            let (s, r) = level_pair(p / b.basis_cols);
+            for j in 0..h {
+                for i in 0..if r == s { j + 1 } else { h } {
+                    let row = b.row_start + tri(s * h + j) + r * h + i;
+                    let scale = if r != s {
+                        T::FRAC_1_SQRT_2()
+                    } else if i != j {
+                        T::SQRT_2()
+                    } else {
+                        T::one()
+                    };
+                    let value = b.weights[p] * b.basis[i + k * h] * b.basis[j + k * h] * scale;
+                    if CHECK
+                        && (!value.is_finite()
+                            || (value.is_zero()
+                                && !b.weights[p].is_zero()
+                                && !b.basis[i + k * h].is_zero()
+                                && !b.basis[j + k * h].is_zero()))
+                    {
+                        return Err("sampled coefficient overflow or underflow".into());
+                    }
+                    if value != T::zero() {
+                        rows[len] = row;
+                        vals[len] = value;
+                        len += 1;
                     }
                 }
             }
         }
-        Ok(CscMatrix::new_from_triplets(
-            self.linear.m,
-            self.linear.n,
-            rows,
-            cols,
-            vals,
-        ))
+        let rows = &mut rows[..len];
+        let vals = &mut vals[..len];
+        if !rows.windows(2).all(|w| w[0] < w[1]) {
+            // Stable by row, then sum repeats in their original order.
+            let mut perm: Vec<usize> = (0..len).collect();
+            perm.sort_by_key(|&t| rows[t]);
+            let (r0, v0): (Vec<usize>, Vec<T>) = perm.iter().map(|&t| (rows[t], vals[t])).unzip();
+            let mut w = 0;
+            for t in 0..len {
+                if t > 0 && r0[t] == r0[t - 1] {
+                    vals[w - 1] += v0[t];
+                } else {
+                    rows[w] = r0[t];
+                    vals[w] = v0[t];
+                    w += 1;
+                }
+            }
+            return Ok(w);
+        }
+        Ok(len)
     }
 
     /// y <- alpha*A*x + beta*y, using persistent per-block scratch.
@@ -491,7 +647,9 @@ impl<T: FloatT> SampledOperator<T> {
             return;
         }
         for (b, w) in self.blocks.iter().zip(&mut work.blocks) {
-            w.adjoint_terms(b, x, alpha, |i, term| y[b.column_start + i] += term);
+            w.adjoint_terms(b, block_rows(b, x), alpha, |i, term| {
+                y[b.column_start + i] += term
+            });
         }
     }
     pub(crate) fn apply_with_pool(
@@ -555,6 +713,11 @@ impl<T: FloatT> SampledOperator<T> {
         let active = world
             .map(|w| w.range(self.blocks.len()))
             .unwrap_or(0..self.blocks.len());
+        assign_block_ways(
+            &mut work.blocks[active.clone()],
+            0,
+            pool.unwrap().current_num_threads(),
+        );
         pool.unwrap().install(|| {
             self.blocks[active.clone()]
                 .par_iter()
@@ -563,49 +726,55 @@ impl<T: FloatT> SampledOperator<T> {
                     if b.basis_cols == 0 {
                         return;
                     }
-                    let mut terms = std::mem::take(&mut w.forward);
-                    terms.resize(b.row_count(), T::zero());
-                    if chunks > 1 {
-                        // The split writer accumulates, so the reused workspace
-                        // buffer must start from zero on every call.
-                        terms.fill(T::zero());
-                        let h = b.basis_rows;
-                        let kmax = b.basis_cols;
-                        let sqrt2 = if h > 1 { T::SQRT_2() } else { T::zero() };
-                        let inv_sqrt2 = if h > 0 && b.dim > 1 {
-                            T::FRAC_1_SQRT_2()
+                    let (ways, start) = (w.ways[0], std::time::Instant::now());
+                    with_split_hint(ways, || {
+                        let mut terms = std::mem::take(&mut w.forward);
+                        terms.resize(b.row_count(), T::zero());
+                        if chunks > 1 {
+                            // The split writer accumulates, so the reused workspace
+                            // buffer must start from zero on every call.
+                            terms.fill(T::zero());
+                            let h = b.basis_rows;
+                            let kmax = b.basis_cols;
+                            let sqrt2 = if h > 1 { T::SQRT_2() } else { T::zero() };
+                            let inv_sqrt2 = if h > 0 && b.dim > 1 {
+                                T::FRAC_1_SQRT_2()
+                            } else {
+                                T::zero()
+                            };
+                            let q = BorrowedMatrix {
+                                size: (h, kmax),
+                                data: b.basis.as_slice(),
+                                phantom: std::marker::PhantomData,
+                            };
+                            let call = w.prepare_fwd_rns(b, x);
+                            let rns = call.as_ref().map(|(p, v)| RnsSide {
+                                plan: p,
+                                cns: &w.rns_fwd.as_ref().unwrap().res,
+                                var: v,
+                            });
+                            forward_split_chunks(
+                                b,
+                                &q,
+                                x,
+                                alpha,
+                                0..b.dim,
+                                &mut terms[..],
+                                sqrt2,
+                                inv_sqrt2,
+                                chunks,
+                                &mut w.square,
+                                &mut w.panel,
+                                rns,
+                                w.q_fwd_cache.as_mut(),
+                            );
                         } else {
-                            T::zero()
-                        };
-                        let q = BorrowedMatrix {
-                            size: (h, kmax),
-                            data: b.basis.as_slice(),
-                            phantom: std::marker::PhantomData,
-                        };
-                        let call = w.prepare_fwd_rns(b, x);
-                        let rns = call.as_ref().map(|(p, v)| RnsSide {
-                            plan: p,
-                            cns: &w.rns_fwd.as_ref().unwrap().res,
-                            var: v,
-                        });
-                        forward_split_chunks(
-                            b,
-                            &q,
-                            x,
-                            alpha,
-                            0..b.dim,
-                            &mut terms[..],
-                            sqrt2,
-                            inv_sqrt2,
-                            chunks,
-                            &mut w.square,
-                            &mut w.panel,
-                            rns,
-                        );
-                    } else {
-                        w.forward_terms(b, x, alpha, |i, term| terms[i] = term);
-                    }
-                    w.forward = terms;
+                            w.forward_terms(b, x, alpha, |i, term| terms[i] = term);
+                        }
+                        w.forward = terms;
+                    });
+                    // Work, not wall time, so a split block keeps its ways.
+                    w.cost[0] = start.elapsed().as_secs_f64() * ways as f64;
                 })
         });
         if let Some(world) = world {
@@ -671,6 +840,11 @@ impl<T: FloatT> SampledOperator<T> {
         let active = world
             .map(|w| w.range(self.blocks.len()))
             .unwrap_or(0..self.blocks.len());
+        assign_block_ways(
+            &mut work.blocks[active.clone()],
+            1,
+            pool.unwrap().current_num_threads(),
+        );
         pool.unwrap().install(|| {
             self.blocks[active.clone()]
                 .par_iter()
@@ -679,51 +853,12 @@ impl<T: FloatT> SampledOperator<T> {
                     if b.basis_cols == 0 {
                         return;
                     }
-                    let mut terms = std::mem::take(&mut w.adjoint);
-                    terms.resize(b.column_count(), T::zero());
-                    if chunks > 1 {
-                        // The split writer assigns into a reused workspace
-                        // buffer, so clear the previous call's contents first.
-                        terms.fill(T::zero());
-                        let h = b.basis_rows;
-                        let kmax = b.basis_cols;
-                        let inv_sqrt2 = if h > 0 && (h > 1 || b.dim > 1) {
-                            T::FRAC_1_SQRT_2()
-                        } else {
-                            T::zero()
-                        };
-                        let q = BorrowedMatrix {
-                            size: (h, kmax),
-                            data: b.basis.as_slice(),
-                            phantom: std::marker::PhantomData,
-                        };
-                        let call = w.prepare_adj_rns(b, x);
-                        let rns = call.as_ref().map(|(p, v)| RnsSide {
-                            plan: p,
-                            cns: &w.rns_adj.as_ref().unwrap().res,
-                            var: v,
-                        });
-                        let wdiag = w.constants.wdiag.get().expect(
-                            "sampled block constants initialized by workspace construction",
-                        );
-                        adjoint_split_chunks(
-                            b,
-                            &q,
-                            wdiag,
-                            x,
-                            alpha,
-                            0..b.dim,
-                            &mut terms[..],
-                            inv_sqrt2,
-                            chunks,
-                            &mut w.square,
-                            &mut w.panel,
-                            rns,
-                        );
-                    } else {
-                        w.adjoint_terms(b, x, alpha, |i, term| terms[i] = term);
-                    }
-                    w.adjoint = terms;
+                    let (ways, start) = (w.ways[1], std::time::Instant::now());
+                    with_split_hint(ways, || {
+                        adjoint_leaf(b, w, block_rows(b, x), alpha, chunks);
+                    });
+                    // Work, not wall time, so a split block keeps its ways.
+                    w.cost[1] = start.elapsed().as_secs_f64() * ways as f64;
                 })
         });
         if let Some(world) = world {
@@ -819,9 +954,75 @@ impl<T: FloatT> SampledOperator<T> {
     }
 }
 
+/// Block `b`'s adjoint terms `alpha·A_bᵀ·x` into `w.adjoint`, where `x` are
+/// the block's own rows: the pooled transpose leaf.
+fn adjoint_leaf<T: FloatT>(
+    b: &SampledBlock<T>,
+    w: &mut SampledBlockWorkspace<T>,
+    x: &[T],
+    alpha: T,
+    chunks: usize,
+) {
+    if b.basis_cols == 0 {
+        return;
+    }
+    let mut terms = std::mem::take(&mut w.adjoint);
+    terms.resize(b.column_count(), T::zero());
+    if w.adjoint_exact(b, x, alpha, &mut terms) {
+        w.adjoint = terms;
+        return;
+    }
+    if chunks > 1 {
+        // The split writer assigns into a reused workspace
+        // buffer, so clear the previous call's contents first.
+        terms.fill(T::zero());
+        let h = b.basis_rows;
+        let kmax = b.basis_cols;
+        let inv_sqrt2 = if h > 0 && (h > 1 || b.dim > 1) {
+            T::FRAC_1_SQRT_2()
+        } else {
+            T::zero()
+        };
+        let q = BorrowedMatrix {
+            size: (h, kmax),
+            data: b.basis.as_slice(),
+            phantom: std::marker::PhantomData,
+        };
+        let call = w.prepare_adj_rns(b, x);
+        let rns = call.as_ref().map(|(p, v)| RnsSide {
+            plan: p,
+            cns: &w.rns_adj.as_ref().unwrap().res,
+            var: v,
+        });
+        let wdiag = w.constants.wdiag.get_or_init(|| build_wdiag(b));
+        adjoint_split_chunks(
+            b,
+            &q,
+            wdiag,
+            x,
+            alpha,
+            0..b.dim,
+            &mut terms[..],
+            inv_sqrt2,
+            chunks,
+            &mut w.square,
+            &mut w.panel,
+            rns,
+        );
+    } else {
+        w.adjoint_terms(b, x, alpha, |i, term| terms[i] = term);
+    }
+    w.adjoint = terms;
+}
+
 mod split;
 use split::*;
 struct SampledBlockWorkspace<T> {
+    /// Last measured work (seconds × ways) of the pooled forward [0] and
+    /// adjoint [1] product, and the ways granted for the next call
+    /// (measured load balancing, see `assign_block_ways`).
+    cost: [f64; 2],
+    ways: [usize; 2],
     // Lazy contribution storage: validated disjoint row ranges bound all
     // forward slices by m; adjoint slices total the primitive column counts.
     forward: Vec<T>,
@@ -844,21 +1045,24 @@ struct SampledBlockWorkspace<T> {
     /// Shared `wdiag`/`qq` exponent range (same values, permuted layout);
     /// `Some(None)` records a permanent non-finite scan failure.
     rns_range: Option<Option<(i64, i64)>>,
+    /// Residues of the basis `Q` for the forward `panel·Qᵀ` and the exact
+    /// adjoint; `Q` is fixed per solve. Only the KKT's workspace enables them
+    /// (`enable_basis_caches`), so short-lived workspaces stay small.
+    q_fwd_cache: Option<ResidueCache>,
+    q_adj_cache: Option<ResidueCache>,
+    q_abs_cache: Option<ResidueCache>,
 }
 impl<T: FloatT> SampledBlockWorkspace<T> {
     /// `dim == 1` adjoint residue context: `wdiagᵀ·x_sub` over the block's
     /// contiguous svec row range. Constant residues land in `self.rns_adj`.
+    /// Adjoint helpers take `x` as the block's own rows (`block_rows`).
     fn prepare_adj_rns(&mut self, b: &SampledBlock<T>, x: &[T]) -> Option<(RnsPlan, Residues)> {
         if b.dim != 1 || b.basis_cols == 0 {
             return None;
         }
         let terms = tri(b.basis_rows);
-        let x_sub = &x[b.row_start..b.row_start + terms];
-        let wdiag = self
-            .constants
-            .wdiag
-            .get()
-            .expect("sampled block constants initialized by workspace construction");
+        let x_sub = &x[..terms];
+        let wdiag = self.constants.wdiag.get_or_init(|| build_wdiag(b));
         rns_call(
             &mut self.rns_adj,
             &mut self.rns_range,
@@ -884,11 +1088,7 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
         if trih > kmax {
             return None;
         }
-        let wdiag = self
-            .constants
-            .wdiag
-            .get()
-            .expect("sampled block constants initialized by workspace construction");
+        let wdiag = self.constants.wdiag.get_or_init(|| build_wdiag(b));
         let qq = self.constants.qq.get_or_init(|| {
             let mut qq = vec![T::zero(); trih * kmax];
             for k in 0..kmax {
@@ -960,18 +1160,15 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
                         p_col[i] = q_col[i] * weight;
                     }
                 }
-                let q_data = q.data();
-                let p_data = self.panel.data();
-                for j in 0..h {
-                    for i in 0..=j {
-                        let v =
-                            T::dot_fma((0..kmax).map(|k| (&p_data[i + k * h], &q_data[j + k * h])));
-                        self.square[(i, j)] = v;
-                        if r != s {
-                            self.square[(j, i)] = v;
-                        }
-                    }
-                }
+                // `panel·Qᵀ` is exactly symmetric; the shared kernel returns the
+                // same correctly rounded upper entries and mirrors them.
+                pooled_gemm_sym_cached(
+                    &mut self.square,
+                    &self.panel,
+                    &q.t(),
+                    None,
+                    self.q_fwd_cache.as_mut(),
+                );
                 for j in 0..h {
                     for i in 0..if r == s { j + 1 } else { h } {
                         let scale = if r != s {
@@ -991,6 +1188,35 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
             }
         }
     }
+    /// `dim == 1` adjoint `alpha·w_k·(q_kᵀ·X·q_k)` as one exact quadratic
+    /// form per block, rounded once (`XgemmScalar::xsvec_quadratic_exact`).
+    /// Returns `false` when the kernel does not apply; `terms` is untouched.
+    fn adjoint_exact(&mut self, b: &SampledBlock<T>, x: &[T], alpha: T, terms: &mut [T]) -> bool {
+        if !exact_adjoint_applies(b) {
+            return false;
+        }
+        let (h, kmax) = (b.basis_rows, b.basis_cols);
+        let x_sub = &x[..tri(h)];
+        self.dvec.clear();
+        self.dvec.resize(kmax, T::zero());
+        if !T::xsvec_quadratic_exact(
+            h,
+            kmax,
+            &b.basis,
+            x_sub,
+            T::SQRT_2(),
+            None,
+            &mut self.dvec,
+            self.q_adj_cache.as_mut(),
+        ) {
+            return false;
+        }
+        for k in 0..kmax {
+            terms[k] = alpha * b.weights[k] * self.dvec[k];
+        }
+        true
+    }
+
     fn adjoint_terms(
         &mut self,
         b: &SampledBlock<T>,
@@ -1003,6 +1229,15 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
         self.check(b);
         if kmax == 0 {
             return;
+        }
+        if exact_adjoint_applies(b) {
+            let mut terms = vec![T::zero(); kmax];
+            if self.adjoint_exact(b, x, alpha, &mut terms) {
+                for (k, v) in terms.into_iter().enumerate() {
+                    store(k, v);
+                }
+                return;
+            }
         }
         let inv_sqrt2 = if h > 0 && (h > 1 || b.dim > 1) {
             T::FRAC_1_SQRT_2()
@@ -1033,16 +1268,11 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
                     // Diagonal pair: `v_k = q'·S·q` with symmetric `S` reduces
                     // to a flat dot over the block's svec triangle against the
                     // precomputed `wdiag` — half the panel product's work.
-                    let wdiag =
-                        self.constants.wdiag.get().expect(
-                            "sampled block constants initialized by workspace construction",
-                        );
+                    let wdiag = self.constants.wdiag.get_or_init(|| build_wdiag(b));
                     for k in 0..kmax {
                         let w = &wdiag[k * trih..(k + 1) * trih];
                         let v = T::dot_fma((0..h).flat_map(|j| {
-                            (0..=j).map(move |i| {
-                                (&x[b.row_start + tri(r * h + j) + r * h + i], &w[tri(j) + i])
-                            })
+                            (0..=j).map(move |i| (&x[tri(r * h + j) + r * h + i], &w[tri(j) + i]))
                         }));
                         store(p + k, alpha * b.weights[p + k] * v);
                     }
@@ -1051,7 +1281,7 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
                         for i in 0..h {
                             let (a, c) = (r * h + i, s * h + j);
                             let scale = if a == c { T::one() } else { inv_sqrt2 };
-                            self.square[(i, j)] = x[b.row_start + tri(c) + a] * scale;
+                            self.square[(i, j)] = x[tri(c) + a] * scale;
                         }
                     }
                     self.panel.mul(&self.square, &q, T::one(), T::zero());
@@ -1075,6 +1305,37 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
         let kmax = b.basis_cols;
         if kmax == 0 {
             return;
+        }
+        // dim == 1: Σ_ij |w_k q_ik q_jk c_ij x_ij| = |w_k|·(|q_k|ᵀ|X||q_k|), the
+        // exact quadratic kernel on |Q| and |x|. Every term is nonnegative,
+        // so the sum is computed exactly and rounded once.
+        if exact_adjoint_applies(b) {
+            let terms = tri(h);
+            let xs: Vec<T> = x[b.row_start..b.row_start + terms]
+                .iter()
+                .map(|v| v.abs())
+                .collect();
+            let qa = self
+                .constants
+                .abs_basis
+                .get_or_init(|| b.basis.iter().map(|v| v.abs()).collect());
+            self.dvec.clear();
+            self.dvec.resize(kmax, T::zero());
+            if T::xsvec_quadratic_exact(
+                h,
+                kmax,
+                qa,
+                &xs,
+                T::SQRT_2(),
+                None,
+                &mut self.dvec,
+                self.q_abs_cache.as_mut(),
+            ) {
+                for k in 0..kmax {
+                    self.adjoint_abs[k] += b.weights[k].abs() * self.dvec[k];
+                }
+                return;
+            }
         }
         let q = BorrowedMatrix {
             size: (h, kmax),
@@ -1130,6 +1391,28 @@ pub struct SampledWorkspace<T> {
 /// Construct the immutable diagonal table using the historical operation
 /// order.  The result is installed in the operator's per-block `OnceLock` by
 /// the first workspace and then borrowed by all later workspaces.
+/// Whether a `dim == 1` block's diagonal adjoint uses the exact residue
+/// quadratic form (no `wdiag` table needed).
+fn exact_adjoint_applies<T: FloatT>(b: &SampledBlock<T>) -> bool {
+    b.dim == 1
+        && T::residue_blas_applies(b.basis_rows, b.basis_cols, b.basis_rows)
+        && !rns_ops_enabled()
+}
+
+/// Measured load balancing (SDPB 2.0 §2.2.2): a block whose last measured
+/// work for product `slot` exceeds a worker's share gets `floor(work/share)`
+/// ways (at most 8) for its residue products; the others stay serial.
+fn assign_block_ways<T>(work: &mut [SampledBlockWorkspace<T>], slot: usize, workers: usize) {
+    let total: f64 = work.iter().map(|w| w.cost[slot]).sum();
+    if workers <= 1 || total <= 0.0 {
+        return;
+    }
+    let share = total / workers as f64;
+    for w in work.iter_mut() {
+        w.ways[slot] = measured_ways(w.cost[slot], share);
+    }
+}
+
 fn build_wdiag<T: FloatT>(b: &SampledBlock<T>) -> Vec<T> {
     let h = b.basis_rows;
     let trih = tri(h);
@@ -1178,6 +1461,26 @@ impl<T: FloatT> SampledWorkspace<T> {
         }
     }
 
+    /// `linear_product` inside `pool` (its lanes split with `rayon::join`,
+    /// which must run on the solver's workers, not the global pool).
+    pub(crate) fn linear_product_in_pool(
+        &mut self,
+        operator: &SampledOperator<T>,
+        transpose: bool,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) {
+        match pool {
+            Some(pool) if pool.current_num_threads() > 1 => pool.install(|| {
+                self.linear_product(operator, transpose, y, x, alpha, beta, Some(pool))
+            }),
+            _ => self.linear_product(operator, transpose, y, x, alpha, beta, None),
+        }
+    }
+
     fn parallel_eligible(
         &self,
         operator: &SampledOperator<T>,
@@ -1196,6 +1499,15 @@ impl<T: FloatT> SampledWorkspace<T> {
         }
         active > 1 && work >= 8192
     }
+    /// Keep residue encodings of every block's basis across calls; for the
+    /// long-lived workspace that applies the operator every refinement pass.
+    pub(crate) fn enable_basis_caches(&mut self) {
+        for w in &mut self.blocks {
+            w.q_fwd_cache.get_or_insert_with(ResidueCache::default);
+            w.q_adj_cache.get_or_insert_with(ResidueCache::default);
+            w.q_abs_cache.get_or_insert_with(ResidueCache::default);
+        }
+    }
     /// Allocate reusable product scratch for the supplied operator.
     pub fn new(operator: &SampledOperator<T>) -> Self {
         Self {
@@ -1206,7 +1518,9 @@ impl<T: FloatT> SampledWorkspace<T> {
                 .map(|(b, constants)| {
                     let h = b.basis_rows;
                     let kmax = b.basis_cols;
-                    constants.wdiag.get_or_init(|| build_wdiag(b));
+                    if !exact_adjoint_applies(b) {
+                        constants.wdiag.get_or_init(|| build_wdiag(b));
+                    }
                     SampledBlockWorkspace {
                         forward: Vec::new(),
                         adjoint: Vec::new(),
@@ -1218,6 +1532,11 @@ impl<T: FloatT> SampledWorkspace<T> {
                         rns_adj: None,
                         rns_fwd: None,
                         rns_range: None,
+                        q_fwd_cache: None,
+                        q_adj_cache: None,
+                        q_abs_cache: None,
+                        cost: [0.0; 2],
+                        ways: [1; 2],
                     }
                 })
                 .collect(),
@@ -1253,6 +1572,8 @@ pub struct SampledSchurWorkspace<T> {
     plan_threads: usize,
     gemm_tile: usize,
     syrk_tile: usize,
+    /// Residues of `V`, reused while the scaling (hence `V`) is unchanged.
+    v_cache: ResidueCache,
 }
 impl<T: FloatT> SampledSchurWorkspace<T> {
     /// Allocate NT Gram storage for a validated sampled block.
@@ -1305,6 +1626,7 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
             plan_threads: 0,
             gemm_tile: 0,
             syrk_tile: 0,
+            v_cache: ResidueCache::default(),
         }
     }
     /// The Gram contribution buffer for the rank-sharded exchange.
@@ -1396,7 +1718,13 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
                 }
             }
         }
-        pooled_gemm_sym(out, &self.product, &self.v.t(), None);
+        pooled_gemm_sym_cached(
+            out,
+            &self.product,
+            &self.v.t(),
+            None,
+            Some(&mut self.v_cache),
+        );
     }
 
     /// Schur entry for zero-based canonical primitive indices in this block.

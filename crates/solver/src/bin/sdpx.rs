@@ -233,8 +233,8 @@ where
                 return Ok(None);
             }
             "--quiet" | "-q" => out.quiet = true,
-            "--precision" | "--threads" | "--settings" | "--output"
-            | "--partitions" | "--cost-history-in" | "--cost-history-out" => {
+            "--precision" | "--threads" | "--settings" | "--output" | "--partitions"
+            | "--cost-history-in" | "--cost-history-out" => {
                 let value = args
                     .next()
                     .ok_or_else(|| format!("missing value for {arg}"))?;
@@ -358,6 +358,7 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
                 #[cfg(feature = "sdp")]
                 {
                     let sampled = read_sdpb_sampled::<T>(path)?;
+                    sdpx_solver::receipt::memory_mark("input read");
                     objective_constant = sampled.objective_constant;
                     equalities = sampled.num_equalities;
                     sampled_metadata = Some(serde_json::json!({
@@ -396,12 +397,7 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
     // another full serialized problem. Recovery metadata is part of identity.
     agree(
         mpi,
-        &(
-            &problem,
-            &sampled_metadata,
-            T::precision_bits(),
-            partitions,
-        ),
+        &(&problem, &sampled_metadata, T::precision_bits(), partitions),
     )?;
     let load_seconds = start.elapsed().as_secs_f64();
     let solve_start = Instant::now();
@@ -463,8 +459,10 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
     agree(mpi, &(s.status as u32, s.iterations))?;
     stage(
         mpi,
-        if mpi.rank() == 0 {
-            solver.try_write_receipt(None).map_err(Into::into)
+        if mpi.rank() == 0 || std::env::var_os("SDPX_RECEIPT_ALL_RANKS").is_some() {
+            solver
+                .try_write_receipt(sdpx_solver::receipt::peak_rss_bytes())
+                .map_err(Into::into)
         } else {
             Ok(())
         },
@@ -545,7 +543,27 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
     Ok(if complete { 0 } else { 2 })
 }
 
+/// Keep the exact kernels' multi-megabyte scratch buffers on the heap: with
+/// glibc's default threshold each is an `mmap`/`munmap` pair, and every unmap
+/// in a many-threaded process costs a TLB shootdown (about 5% of an MPFR SDP
+/// solve at 32 threads). Explicit `MALLOC_*` environment settings still win.
+fn tune_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none() {
+            // SAFETY: mallopt only adjusts allocator parameters; it is called
+            // once, before any worker threads exist.
+            unsafe {
+                libc::mallopt(libc::M_MMAP_THRESHOLD, 32 << 20);
+                libc::mallopt(libc::M_TRIM_THRESHOLD, 256 << 20);
+                libc::mallopt(libc::M_TOP_PAD, 64 << 20);
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    tune_allocator();
     let mpi = MpiContext::initialize();
     if mpi.size() > 1 {
         let previous = std::panic::take_hook();

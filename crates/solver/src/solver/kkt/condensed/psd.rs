@@ -64,6 +64,30 @@ fn pooled_gemm<T: FloatT, MATA, MATB>(
     c.mul(a, b, T::one(), T::zero());
 }
 
+/// Symmetric congruence `c = a·x·aᵀ` (or `aᵀ·x·a` with `transpose_a`). The
+/// exact residue kernel keeps the intermediate exact and rounds once; other
+/// precisions and small blocks keep the two pooled products through `work`.
+fn congruence_sym<T: FloatT>(
+    c: &mut Matrix<T>,
+    a: &Matrix<T>,
+    transpose_a: bool,
+    x: &Matrix<T>,
+    work: &mut Matrix<T>,
+    gemm: Option<(&rayon::ThreadPool, usize)>,
+    cache_a: &mut ResidueCache,
+) {
+    if congruence_exact_sym(c, a, transpose_a, x, gemm.map(|(p, _)| p), Some(cache_a)) {
+        return;
+    }
+    if transpose_a {
+        pooled_gemm(work, &a.t(), x, gemm);
+        pooled_gemm_sym(c, work, a, gemm);
+    } else {
+        pooled_gemm(work, x, &a.t(), gemm);
+        pooled_gemm_sym(c, a, work, gemm);
+    }
+}
+
 /// Lane-private panels for the chunk-parallel dense transform. A lane keeps
 /// its matrices across every chunk it owns, so the number of live panel
 /// allocations is bounded by the lane count rather than by the chunk count.
@@ -738,6 +762,9 @@ impl<T: FloatT> PsdBlock<T> {
             Rinv: Matrix::zeros((n, n)),
             G: Matrix::zeros((n, n)),
             Ginv: Matrix::zeros((n, n)),
+            rinv_cache: ResidueCache::default(),
+            g_cache: ResidueCache::default(),
+            ginv_cache: ResidueCache::default(),
             mat1: Matrix::zeros((n, n)),
             mat2: Matrix::zeros((n, n)),
             mat3: Matrix::zeros((n, n)),
@@ -807,7 +834,8 @@ impl<T: FloatT> PsdBlock<T> {
     // A and column classifications are immutable between explicit updates.
     // q/b and cone scaling changes do not invalidate this exact equality proof.
     fn prepare_coefficients(&mut self, values: &[T]) {
-        if self.coefficient_plan_valid {
+        // Sampled blocks read their Gram, not `values`; no plan is needed.
+        if self.coefficient_plan_valid || self.sampled.is_some() {
             return;
         }
         for (ci, rep) in self.dense_representatives.iter_mut().enumerate() {
@@ -1287,8 +1315,15 @@ impl<T: FloatT> PsdBlock<T> {
     // Half of H^-1 stays factored, so neither fused application squares Rinv.
     pub(super) fn condense_rhs(&mut self, rhs: &[T], gemm: Option<(&rayon::ThreadPool, usize)>) {
         svec_to_mat(&mut self.mat1, rhs);
-        pooled_gemm(&mut self.mat2, &self.mat1, &self.Rinv.t(), gemm);
-        pooled_gemm_sym(&mut self.mat3c, &self.Rinv, &self.mat2, gemm);
+        congruence_sym(
+            &mut self.mat3c,
+            &self.Rinv,
+            false,
+            &self.mat1,
+            &mut self.mat2,
+            gemm,
+            &mut self.rinv_cache,
+        );
         let sampled = self.sampled.as_mut().unwrap();
         sampled.work.inverse_adjoint(
             &sampled.operator.blocks()[sampled.block],
@@ -1310,8 +1345,15 @@ impl<T: FloatT> PsdBlock<T> {
         for (v, &b) in self.mat1.data_mut().iter_mut().zip(self.mat3c.data()) {
             *v -= b;
         }
-        pooled_gemm(&mut self.mat2, &self.Rinv.t(), &self.mat1, gemm);
-        pooled_gemm_sym(&mut self.mat3, &self.mat2, &self.Rinv, gemm);
+        congruence_sym(
+            &mut self.mat3,
+            &self.Rinv,
+            true,
+            &self.mat1,
+            &mut self.mat2,
+            gemm,
+            &mut self.rinv_cache,
+        );
         mat_to_svec(y, &self.mat3);
     }
 
@@ -1323,9 +1365,56 @@ impl<T: FloatT> PsdBlock<T> {
         gemm: Option<(&rayon::ThreadPool, usize)>,
     ) {
         svec_to_mat(&mut self.mat1, x);
-        let g = if inverse { &self.Ginv } else { &self.G };
-        pooled_gemm(&mut self.mat2, &self.mat1, g, gemm);
-        pooled_gemm_sym(&mut self.mat3, g, &self.mat2, gemm);
+        if T::precision_bits() <= 53 {
+            // binary64: apply H = R·Rᵀ (H⁻¹ = Rinvᵀ·Rinv) through its factor
+            // in two congruences. The squared G/Ginv lose cond(R)² accuracy
+            // near convergence, so refinement would converge to a different
+            // operator than the cones' W-based `Δs` and the primal residual
+            // grows.
+            let (r, first, second) = if inverse {
+                (&self.Rinv, false, true)
+            } else {
+                (&self.R, true, false)
+            };
+            let cache = &mut self.rinv_cache;
+            congruence_sym(
+                &mut self.mat3,
+                r,
+                first,
+                &self.mat1,
+                &mut self.mat2,
+                gemm,
+                cache,
+            );
+            mat_to_svec(&mut self.vector, &self.mat3);
+            svec_to_mat(&mut self.mat1, &self.vector);
+            congruence_sym(
+                &mut self.mat3,
+                r,
+                second,
+                &self.mat1,
+                &mut self.mat2,
+                gemm,
+                cache,
+            );
+            mat_to_svec(y, &self.mat3);
+            return;
+        }
+        // `g` is stored exactly symmetric, so `x·gᵀ` equals the former `x·g`.
+        let (g, cache) = if inverse {
+            (&self.Ginv, &mut self.ginv_cache)
+        } else {
+            (&self.G, &mut self.g_cache)
+        };
+        congruence_sym(
+            &mut self.mat3,
+            g,
+            false,
+            &self.mat1,
+            &mut self.mat2,
+            gemm,
+            cache,
+        );
         mat_to_svec(y, &self.mat3);
     }
 }

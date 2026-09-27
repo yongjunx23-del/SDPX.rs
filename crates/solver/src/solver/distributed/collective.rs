@@ -90,6 +90,9 @@ pub(crate) trait Collective<T: Scalar>: Send + Sync {
     }
     /// Take the elementwise maximum in rank order and return it on every rank.
     fn reduce_max(&self, site: usize, local: &[T]) -> Result<Vec<T>, CollectiveError>;
+    /// Concatenate equal-length vectors in rank order on every rank, so a
+    /// caller can fold several reductions of one round in its own order.
+    fn all_gather(&self, site: usize, local: &[T]) -> Result<Vec<T>, CollectiveError>;
     /// Gather rank-local vectors only on `root`. `ranges` gives each rank's
     /// destination interval in canonical rank order; non-root ranks return
     /// `Ok(None)` and do not receive the assembled payload.
@@ -136,6 +139,10 @@ impl<T: Scalar> Collective<T> for SerialCollective {
         Ok(local.to_vec())
     }
 
+    fn all_gather(&self, _site: usize, local: &[T]) -> Result<Vec<T>, CollectiveError> {
+        Ok(local.to_vec())
+    }
+
     fn gather_root(
         &self,
         _site: usize,
@@ -157,21 +164,55 @@ pub(crate) struct WorldCollective(pub(crate) crate::mpi::World);
 
 impl WorldCollective {
     fn check_round(&self, site: usize, operation: Operation) -> Result<(), CollectiveError> {
+        self.handshake(site, operation, None, None).map(|_| ())
+    }
+
+    /// Agree on the site, operation and (optionally) a vector length, and
+    /// carry an optional small payload, in one max-allreduce of paired
+    /// `(x, -x)` entries (max and -min). Errors keep the order of the former
+    /// one-check-per-collective sequence: site, operation, then length.
+    /// Returns the payload's (max, min) over ranks.
+    fn handshake(
+        &self,
+        site: usize,
+        operation: Operation,
+        len: Option<usize>,
+        payload: Option<u32>,
+    ) -> Result<(f64, f64), CollectiveError> {
+        let started = std::time::Instant::now();
         self.0.ensure_collective_thread();
-        let site = self.0.collective_site(site);
-        let site = u32::try_from(site).ok();
-        let site_ok = site.is_some() && self.0.valid_collective_site(site.unwrap_or(0) as usize);
-        if !self.0.all_true(site_ok) {
+        let mapped = self.0.collective_site(site);
+        let site_ok = u32::try_from(mapped).is_ok() && self.0.valid_collective_site(mapped);
+        let len_ok =
+            len.is_none_or(|l| u32::try_from(l).is_ok() && l.checked_mul(self.0.size()).is_some());
+        let s = if site_ok { mapped as f64 } else { -1.0 };
+        let op = f64::from(operation.code());
+        let l = len.map_or(0.0, |l| l as f64);
+        let p = f64::from(payload.unwrap_or(0));
+        let mut v = [
+            f64::from(u8::from(!site_ok)),
+            f64::from(u8::from(!len_ok)),
+            s,
+            -s,
+            op,
+            -op,
+            l,
+            -l,
+            p,
+            -p,
+        ];
+        self.0.allreduce_max_f64_slice(&mut v);
+        crate::receipt::site_record(site, started.elapsed());
+        if v[0] != 0.0 || v[2] != -v[3] {
             return Err(CollectiveError::SiteMismatch);
         }
-        let site = site.expect("site conversion was agreed by all ranks");
-        if !self.0.agree_u32(site) {
-            return Err(CollectiveError::SiteMismatch);
-        }
-        if !self.0.agree_u32(operation.code()) {
+        if v[4] != -v[5] {
             return Err(CollectiveError::OperationMismatch);
         }
-        Ok(())
+        if v[1] != 0.0 || v[6] != -v[7] {
+            return Err(CollectiveError::LengthMismatch);
+        }
+        Ok((v[8], -v[9]))
     }
 
     fn ranges_for(
@@ -184,20 +225,9 @@ impl WorldCollective {
         Ok((crate::mpi::ranges(total, world.size()), total))
     }
 
+    /// Payload exchange after a handshake that agreed on `local.len()`.
     fn gather<T: Scalar>(&self, site: usize, local: &[T]) -> Result<Vec<T>, CollectiveError> {
         self.0.ensure_collective_thread();
-        let local_len = u32::try_from(local.len());
-        if !self.0.all_true(local_len.is_ok()) {
-            return Err(CollectiveError::LengthMismatch);
-        }
-        let local_len = local_len.expect("length conversion was agreed by all ranks");
-        if !self.0.agree_u32(local_len) {
-            return Err(CollectiveError::LengthMismatch);
-        }
-        let total = local.len().checked_mul(self.0.size());
-        if !self.0.all_true(total.is_some()) {
-            return Err(CollectiveError::LengthMismatch);
-        }
         let (ranges, total) = Self::ranges_for(&self.0, local.len())?;
         let mut all = vec![T::zero(); total];
         self.0
@@ -248,25 +278,30 @@ impl<T: Scalar> Collective<T> for WorldCollective {
     }
 
     fn all_true(&self, site: usize, value: bool) -> Result<bool, CollectiveError> {
-        self.check_round(site, Operation::AllTrue)?;
-        Ok(self.0.all_true(value))
+        let (max, _) = self.handshake(site, Operation::AllTrue, None, Some(u32::from(!value)))?;
+        Ok(max == 0.0)
     }
 
     fn agree_u32(&self, site: usize, value: u32) -> Result<bool, CollectiveError> {
-        self.check_round(site, Operation::AgreeU32)?;
-        Ok(self.0.agree_u32(value))
+        let (max, min) = self.handshake(site, Operation::AgreeU32, None, Some(value))?;
+        Ok(max == min)
     }
 
     fn reduce_sum(&self, site: usize, local: &[T]) -> Result<Vec<T>, CollectiveError> {
-        self.check_round(site, Operation::Sum)?;
+        self.handshake(site, Operation::Sum, Some(local.len()), None)?;
         let all = self.gather(site, local)?;
         Ok(Self::fold_sum(&all, self.0.size(), local.len()))
     }
 
     fn reduce_max(&self, site: usize, local: &[T]) -> Result<Vec<T>, CollectiveError> {
-        self.check_round(site, Operation::Max)?;
+        self.handshake(site, Operation::Max, Some(local.len()), None)?;
         let all = self.gather(site, local)?;
         Ok(Self::fold_max(&all, self.0.size(), local.len()))
+    }
+
+    fn all_gather(&self, site: usize, local: &[T]) -> Result<Vec<T>, CollectiveError> {
+        self.handshake(site, Operation::AllGather, Some(local.len()), None)?;
+        self.gather(site, local)
     }
 
     fn gather_root(
@@ -317,6 +352,7 @@ enum Operation {
     Sum,
     Max,
     GatherRoot,
+    AllGather,
 }
 
 impl Operation {
@@ -327,6 +363,7 @@ impl Operation {
             Self::Sum => 3,
             Self::Max => 4,
             Self::GatherRoot => 5,
+            Self::AllGather => 6,
         }
     }
 }
@@ -494,7 +531,14 @@ impl<T: Scalar> MockCollective<T> {
                             .map(|v| v.clone().expect("all vector contributions present"))
                             .collect();
                         let mut result = values[0].clone();
-                        for segment in values.iter().skip(1) {
+                        if operation == Operation::AllGather {
+                            result = values.concat();
+                        }
+                        for segment in values
+                            .iter()
+                            .skip(1)
+                            .filter(|_| operation != Operation::AllGather)
+                        {
                             match operation {
                                 Operation::Sum => {
                                     for (dst, &value) in result.iter_mut().zip(segment) {
@@ -874,6 +918,10 @@ impl<T: Scalar> Collective<T> for MockCollective<T> {
 
     fn reduce_max(&self, site: usize, local: &[T]) -> Result<Vec<T>, CollectiveError> {
         self.vector_round(site, Operation::Max, local)
+    }
+
+    fn all_gather(&self, site: usize, local: &[T]) -> Result<Vec<T>, CollectiveError> {
+        self.vector_round(site, Operation::AllGather, local)
     }
 
     fn gather_root(

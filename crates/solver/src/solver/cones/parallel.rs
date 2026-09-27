@@ -13,6 +13,10 @@ pub(super) struct ConeThreading {
     // when spare workers exist beyond the cone lanes; when lanes already
     // saturate the pool the extra scheduling overhead is a net loss.
     pub(super) inner_parallel: bool,
+    // Workers per lane for split-capable kernels inside a cone (residue
+    // congruences): SDPB-style, a pool wider than its lanes shares each
+    // lane's heavy calls among ways = workers / lanes.
+    pub(super) inner_ways: usize,
     // Paired joins of two independent operations (e.g. the two cone
     // Choleskys) need only one stealer, so they activate with any spare
     // worker — a weaker condition than `inner_parallel`.
@@ -43,6 +47,23 @@ impl ConeThreading {
     pub(super) fn new<T: FloatT>(
         cones: &[SupportedCone<T>],
         requested: usize,
+    ) -> Result<Option<Self>, rayon::ThreadPoolBuildError> {
+        Self::build(cones, requested, None)
+    }
+
+    /// Plan lanes for `cones` on an existing pool (its width is the budget).
+    pub(super) fn with_pool<T: FloatT>(
+        cones: &[SupportedCone<T>],
+        pool: std::sync::Arc<rayon::ThreadPool>,
+    ) -> Option<Self> {
+        let width = pool.current_num_threads();
+        Self::build(cones, width, Some(pool)).ok().flatten()
+    }
+
+    fn build<T: FloatT>(
+        cones: &[SupportedCone<T>],
+        requested: usize,
+        existing: Option<std::sync::Arc<rayon::ThreadPool>>,
     ) -> Result<Option<Self>, rayon::ThreadPoolBuildError> {
         let budget = if requested == 0 {
             std::thread::available_parallelism().map_or(1, usize::from)
@@ -96,9 +117,11 @@ impl ConeThreading {
             .saturating_mul(4)
             .min((total / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
         let lanes = balanced_lanes(cones, &prefix, task_budget.min(cones.len()));
-        // Roughly two workers per lane leaves headroom for inner tasks to
-        // be stolen profitably instead of competing with sibling lanes.
-        let inner_parallel = workers >= 2 * lanes.len().max(1);
+        // Any spare worker may steal a heavy cone's inner work (SVD rotation
+        // replay rows, reflector columns); the slowest cone otherwise sets
+        // the phase (Λ19 spins 0–50: 52 lanes on 64 workers, SVD 200 ms
+        // median, 406 ms max). Inner splits are bitwise neutral.
+        let inner_parallel = workers > lanes.len().max(1);
         // Any spare worker can steal the second half of a paired join.
         let paired = workers > lanes.len().max(1);
         let sym_step_lanes = {
@@ -129,17 +152,61 @@ impl ConeThreading {
                 Vec::new()
             }
         };
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build()?;
+        let pool = match existing {
+            Some(pool) => pool,
+            None => std::sync::Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .start_handler(pin_worker(workers))
+                    .build()?,
+            ),
+        };
+        let inner_ways = (workers / lanes.len().max(1)).max(1);
         Ok(Some(Self {
-            pool: std::sync::Arc::new(pool),
+            pool,
             lanes,
             sym_step_lanes,
             orthant_chunk,
             inner_parallel,
+            inner_ways,
             paired,
         }))
+    }
+}
+
+/// SDPB-style static placement: when the process is bound to exactly as
+/// many CPUs as there are workers (numactl/taskset/MPI binding gave it its
+/// own cores), worker `i` is bound to the i-th of them for its lifetime. A
+/// wider mask is left alone, so unbound processes sharing a node never
+/// collide on the same cores. Measured −4% at 52 threads (Λ19 spins 0–50). Unpinned workers migrate between cores and lose
+/// their caches, and at high thread counts every phase (serial ones too)
+/// measured 20–40% slower per call. Linux only; elsewhere a no-op.
+fn pin_worker(workers: usize) -> impl Fn(usize) + Send + Sync + 'static {
+    #[cfg(target_os = "linux")]
+    let cpus: Vec<usize> = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&c| libc::CPU_ISSET(c, &set))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let cpus: Vec<usize> = Vec::new();
+    let pin = cpus.len() == workers;
+    move |i: usize| {
+        #[cfg(target_os = "linux")]
+        if pin {
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_SET(cpus[i], &mut set);
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (i, pin, &cpus);
     }
 }
 
@@ -211,6 +278,7 @@ pub(super) fn apply<T, B, F>(
     lanes: &[Lane],
     inner: bool,
     paired: bool,
+    ways: usize,
     buffers: B,
     kernel: &F,
 ) -> bool
@@ -223,8 +291,8 @@ where
         // This leaf runs on a solver-pool worker (apply is only ever invoked
         // under `pool.install`), so heavy per-cone kernels may re-offer
         // independent inner work to the ambient pool when spare workers exist.
-        let _inner =
-            (inner || paired).then(|| sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired));
+        let _inner = (inner || paired)
+            .then(|| sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired));
         let mut buffers = buffers;
         let mut row = lanes[0].row_start;
         let mut success = true;
@@ -233,7 +301,7 @@ where
             let (current, remaining) = buffers.split(end - row);
             // Do not short circuit: all block tasks finish before reporting
             // failure; the caller then discards the failed scaling phase.
-            success &= kernel(cone, row..end, current);
+            success &= crate::algebra::with_split_hint(ways, || kernel(cone, row..end, current));
             buffers = remaining;
             row = end;
         }
@@ -244,8 +312,28 @@ where
         let (left_buffers, right_buffers) =
             buffers.split(lanes[mid].row_start - lanes[0].row_start);
         let (a, b) = rayon::join(
-            || apply(left, &lanes[..mid], inner, paired, left_buffers, kernel),
-            || apply(right, &lanes[mid..], inner, paired, right_buffers, kernel),
+            || {
+                apply(
+                    left,
+                    &lanes[..mid],
+                    inner,
+                    paired,
+                    ways,
+                    left_buffers,
+                    kernel,
+                )
+            },
+            || {
+                apply(
+                    right,
+                    &lanes[mid..],
+                    inner,
+                    paired,
+                    ways,
+                    right_buffers,
+                    kernel,
+                )
+            },
         );
         a && b
     }
@@ -262,6 +350,7 @@ pub(super) fn sym_step_bounds<T: FloatT>(
     lanes: &[Lane],
     inner: bool,
     paired: bool,
+    ways: usize,
     dz: &[T],
     ds: &[T],
     z: &[T],
@@ -273,23 +362,25 @@ pub(super) fn sym_step_bounds<T: FloatT>(
         // Leaf task on a pool worker: per-cone step kernels may re-offer
         // independent inner work (paired dz/ds bounds, dense kernels) to
         // the ambient pool when spare workers exist.
-        let _inner =
-            (inner || paired).then(|| sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired));
-        let mut row = lanes[0].row_start;
-        for (cone, bound) in cones.iter_mut().zip(bounds) {
-            let end = row + cone.numel();
-            if cone.is_symmetric() {
-                *bound = cone.step_length(
-                    &dz[row..end],
-                    &ds[row..end],
-                    &z[row..end],
-                    &s[row..end],
-                    settings,
-                    alpha,
-                );
+        let _inner = (inner || paired)
+            .then(|| sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired));
+        crate::algebra::with_split_hint(ways, || {
+            let mut row = lanes[0].row_start;
+            for (cone, bound) in cones.iter_mut().zip(bounds) {
+                let end = row + cone.numel();
+                if cone.is_symmetric() {
+                    *bound = cone.step_length(
+                        &dz[row..end],
+                        &ds[row..end],
+                        &z[row..end],
+                        &s[row..end],
+                        settings,
+                        alpha,
+                    );
+                }
+                row = end;
             }
-            row = end;
-        }
+        })
     } else {
         let mid = lanes.len() / 2;
         let cut = lanes[mid].cone_start - lanes[0].cone_start;
@@ -303,6 +394,7 @@ pub(super) fn sym_step_bounds<T: FloatT>(
                     &lanes[..mid],
                     inner,
                     paired,
+                    ways,
                     dz,
                     ds,
                     z,
@@ -318,6 +410,7 @@ pub(super) fn sym_step_bounds<T: FloatT>(
                     &lanes[mid..],
                     inner,
                     paired,
+                    ways,
                     dz,
                     ds,
                     z,
@@ -353,6 +446,7 @@ mod tests {
                 &threading.lanes,
                 false,
                 false,
+                1,
                 (&mut a[..], &mut b[..]),
                 &|_cone, rows, (a, b)| {
                     assert!(rayon::current_thread_index().is_some());
@@ -378,6 +472,7 @@ pub(super) fn prepare_affine_bounds<T: FloatT>(
     lanes: &[Lane],
     inner: bool,
     paired: bool,
+    ways: usize,
     dz: &mut [T],
     ds: &mut [T],
     z: &[T],
@@ -386,37 +481,40 @@ pub(super) fn prepare_affine_bounds<T: FloatT>(
     alpha: T,
 ) {
     if lanes.len() <= 1 {
-        let _inner =
-            (inner || paired).then(|| sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired));
-        let mut row = 0;
-        for (cone, bound) in cones.iter_mut().zip(bounds) {
-            let end = row + cone.numel();
-            #[cfg(feature = "sdp")]
-            if let SupportedCone::PSDTriangleCone(cone) = cone {
-                *bound = cone.prepare_affine_bounds(&mut dz[row..end], &mut ds[row..end], alpha);
-            } else if cone.is_symmetric() {
-                *bound = cone.step_length(
-                    &dz[row..end],
-                    &ds[row..end],
-                    &z[row..end],
-                    &s[row..end],
-                    settings,
-                    alpha,
-                );
+        let _inner = (inner || paired)
+            .then(|| sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired));
+        crate::algebra::with_split_hint(ways, || {
+            let mut row = 0;
+            for (cone, bound) in cones.iter_mut().zip(bounds) {
+                let end = row + cone.numel();
+                #[cfg(feature = "sdp")]
+                if let SupportedCone::PSDTriangleCone(cone) = cone {
+                    *bound =
+                        cone.prepare_affine_bounds(&mut dz[row..end], &mut ds[row..end], alpha);
+                } else if cone.is_symmetric() {
+                    *bound = cone.step_length(
+                        &dz[row..end],
+                        &ds[row..end],
+                        &z[row..end],
+                        &s[row..end],
+                        settings,
+                        alpha,
+                    );
+                }
+                #[cfg(not(feature = "sdp"))]
+                if cone.is_symmetric() {
+                    *bound = cone.step_length(
+                        &dz[row..end],
+                        &ds[row..end],
+                        &z[row..end],
+                        &s[row..end],
+                        settings,
+                        alpha,
+                    );
+                }
+                row = end;
             }
-            #[cfg(not(feature = "sdp"))]
-            if cone.is_symmetric() {
-                *bound = cone.step_length(
-                    &dz[row..end],
-                    &ds[row..end],
-                    &z[row..end],
-                    &s[row..end],
-                    settings,
-                    alpha,
-                );
-            }
-            row = end;
-        }
+        })
     } else {
         let mid = lanes.len() / 2;
         let cut = lanes[mid].cone_start - lanes[0].cone_start;
@@ -435,6 +533,7 @@ pub(super) fn prepare_affine_bounds<T: FloatT>(
                     &lanes[..mid],
                     inner,
                     paired,
+                    ways,
                     lz,
                     ls,
                     lv,
@@ -450,6 +549,7 @@ pub(super) fn prepare_affine_bounds<T: FloatT>(
                     &lanes[mid..],
                     inner,
                     paired,
+                    ways,
                     rz,
                     rs,
                     rv,

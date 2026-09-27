@@ -22,7 +22,11 @@ fn garner_descending_modulus_boundary() {
     assert_eq!(residues[1], 0);
     let expected: F = s.to_string().parse().unwrap();
     assert_eq!(plan.reconstruct::<2>(&residues), expected);
-    let neg: Vec<u64> = residues.iter().zip(p).map(|(&r, q)| if r == 0 { 0 } else { q-r }).collect();
+    let neg: Vec<u64> = residues
+        .iter()
+        .zip(p)
+        .map(|(&r, q)| if r == 0 { 0 } else { q - r })
+        .collect();
     assert_eq!(plan.reconstruct::<2>(&neg), -expected);
 }
 

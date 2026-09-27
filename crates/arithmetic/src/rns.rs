@@ -99,8 +99,7 @@ pub fn exponent_range<const N: usize>(m: &[MpFloat<N>]) -> Option<(i64, i64)> {
                 // Extreme exponents (subnormal-range values) can sit at
                 // the MPFR exponent floor; a saturating window check is
                 // enough since such values always exceed MAX_SPREAD.
-                let e = (view.exponent as i64)
-                    .saturating_sub(MpFloat::<N>::PRECISION_BITS as i64);
+                let e = (view.exponent as i64).saturating_sub(MpFloat::<N>::PRECISION_BITS as i64);
                 lo = lo.min(e);
                 hi = hi.max(e);
             }
@@ -202,7 +201,11 @@ fn build_tables(k: usize) -> RnsTables {
         .collect();
     // Garner inverse table: inv[j][i] = p_j^{-1} mod p_i for j < i.
     let inv: Vec<Vec<u64>> = (0..k)
-        .map(|i| (0..i).map(|j| mod_inverse(primes[j].p % primes[i].p, primes[i].p)).collect())
+        .map(|i| {
+            (0..i)
+                .map(|j| mod_inverse(primes[j].p % primes[i].p, primes[i].p))
+                .collect()
+        })
         .collect();
     // Prefix products and modulus as little-endian limb vectors.
     let mut prefix = Vec::with_capacity(k);
@@ -320,7 +323,7 @@ impl RnsPlan {
     /// Build a plan for `sum over `terms` products of `a`-by-`b` elements.
     ///
     /// Returns `None` when any value is non-finite or the combined exponent
-    /// spread exceeds [`MAX_SPREAD`]; the caller then keeps the MPFR path.
+    /// spread exceeds `MAX_SPREAD`; the caller then keeps the MPFR path.
     /// The prime count follows the strict bound `|S| < terms * 2^(P+Da+P+Db)`.
     pub fn for_pair<const N: usize>(
         a: &[MpFloat<N>],
@@ -425,7 +428,11 @@ impl RnsPlan {
     /// every later plan: [`RnsPlan::dot_residues_into`] reads only the
     /// first `k` residues of each row. Costs more than a plan-width
     /// encode and is meant for the cached constant side of a product.
-    pub fn encode_wide<const N: usize>(&self, m: &[MpFloat<N>], side: EncodeSide) -> Option<Residues> {
+    pub fn encode_wide<const N: usize>(
+        &self,
+        m: &[MpFloat<N>],
+        side: EncodeSide,
+    ) -> Option<Residues> {
         let t = tables_for(primes().len())?;
         self.encode_with(m, side, &t.primes, &t.pow2)
     }
@@ -582,7 +589,16 @@ impl RnsPlan {
     }
 
     /// Exact dot of two residue columns, allocating the residue vector.
-    pub fn dot_residues(&self, ra: &Residues, a0: usize, da: usize, rb: &Residues, b0: usize, db: usize, terms: usize) -> Vec<u64> {
+    pub fn dot_residues(
+        &self,
+        ra: &Residues,
+        a0: usize,
+        da: usize,
+        rb: &Residues,
+        b0: usize,
+        db: usize,
+        terms: usize,
+    ) -> Vec<u64> {
         let mut out = vec![0u64; self.tables.primes.len()];
         Self::with_scratch(|s| {
             self.dot_residues_into(ra, a0, da, rb, b0, db, terms, s);
@@ -666,55 +682,133 @@ impl RnsPlan {
         } else {
             scratch.mag.extend_from_slice(x);
         }
-        let mag = &scratch.mag;
-        // Import into the pooled mpz, convert to the pooled MPFR, apply the
-        // 2^(shift_a+shift_b) scale. Both objects keep their allocations
-        // across every output of the product.
-        if scratch.z.is_none() {
-            let mut z = MaybeUninit::<gmp::mpz_t>::uninit();
-            unsafe { gmp::mpz_init(z.as_mut_ptr()) };
-            scratch.z = Some(unsafe { z.assume_init() });
+        let mag = std::mem::take(&mut scratch.mag);
+        let value = round_scaled_integer(scratch, negative, &mag, self.shift_a + self.shift_b);
+        scratch.mag = mag;
+        value
+    }
+}
+
+/// Round `(-1)^negative · mag · 2^scale` once, nearest-even, at `N` limbs.
+/// `mag` is little-endian limbs. Reuses the pooled mpz/mpfr in `scratch`.
+fn round_scaled_integer<const N: usize>(
+    scratch: &mut RnsScratch,
+    negative: bool,
+    mag: &[u64],
+    scale: i64,
+) -> MpFloat<N> {
+    if scratch.z.is_none() {
+        let mut z = MaybeUninit::<gmp::mpz_t>::uninit();
+        unsafe { gmp::mpz_init(z.as_mut_ptr()) };
+        scratch.z = Some(unsafe { z.assume_init() });
+    }
+    if scratch.f_prec != MpFloat::<N>::PRECISION_BITS {
+        if let Some(mut f) = scratch.f.take() {
+            unsafe { gmp_mpfr_sys::mpfr::clear(&mut f) };
         }
-        if scratch.f_prec != MpFloat::<N>::PRECISION_BITS {
-            if let Some(mut f) = scratch.f.take() {
-                unsafe { gmp_mpfr_sys::mpfr::clear(&mut f) };
-            }
-            let mut f = MaybeUninit::<gmp_mpfr_sys::mpfr::mpfr_t>::uninit();
-            unsafe {
-                gmp_mpfr_sys::mpfr::init2(f.as_mut_ptr(), MpFloat::<N>::PRECISION_BITS as _)
-            };
-            scratch.f = Some(unsafe { f.assume_init() });
-            scratch.f_prec = MpFloat::<N>::PRECISION_BITS;
+        let mut f = MaybeUninit::<gmp_mpfr_sys::mpfr::mpfr_t>::uninit();
+        unsafe { gmp_mpfr_sys::mpfr::init2(f.as_mut_ptr(), MpFloat::<N>::PRECISION_BITS as _) };
+        scratch.f = Some(unsafe { f.assume_init() });
+        scratch.f_prec = MpFloat::<N>::PRECISION_BITS;
+    }
+    let z = scratch.z.as_mut().unwrap();
+    let f = scratch.f.as_mut().unwrap();
+    unsafe {
+        gmp::mpz_import(z, mag.len(), -1, 8, 0, 0, mag.as_ptr().cast());
+        if negative {
+            gmp::mpz_neg(z, z);
         }
-        let z = scratch.z.as_mut().unwrap();
-        let f = scratch.f.as_mut().unwrap();
-        unsafe {
-            gmp::mpz_import(
-                z,
-                mag.len(),
-                -1, // least significant word first
-                8,
-                0,
-                0,
-                mag.as_ptr().cast(),
-            );
-            if negative {
-                gmp::mpz_neg(z, z);
-            }
-            gmp_mpfr_sys::mpfr::set_z(f, z, gmp_mpfr_sys::mpfr::rnd_t::RNDN);
-            let scale = self.shift_a + self.shift_b;
-            if scale >= 0 {
-                gmp_mpfr_sys::mpfr::mul_2exp(f, f, scale as u64, gmp_mpfr_sys::mpfr::rnd_t::RNDN);
-            } else {
-                gmp_mpfr_sys::mpfr::div_2exp(
-                    f,
-                    f,
-                    scale.unsigned_abs(),
-                    gmp_mpfr_sys::mpfr::rnd_t::RNDN,
-                );
-            }
-            MpFloat::<N>::from_mpfr_descriptor(f)
+        // `set_z_2exp` rounds once; the power-of-two scale is part of it.
+        gmp_mpfr_sys::mpfr::set_z_2exp(
+            f,
+            z,
+            scale as gmp_mpfr_sys::mpfr::exp_t,
+            gmp_mpfr_sys::mpfr::rnd_t::RNDN,
+        );
+        MpFloat::<N>::from_mpfr_descriptor(f)
+    }
+}
+
+impl<const N: usize> MpFloat<N> {
+    /// The value `(-1)^negative · mag · 2^scale` rounded once, nearest-even.
+    /// `mag` holds little-endian 64-bit limbs of an exact integer. Used by
+    /// residue products that reconstruct the exact sum before rounding.
+    pub fn from_scaled_integer(negative: bool, mag: &[u64], scale: i64) -> Self {
+        let mut n = mag.len();
+        while n > 0 && mag[n - 1] == 0 {
+            n -= 1;
         }
+        if n == 0 {
+            return Self::default();
+        }
+        let mag = &mag[..n];
+        let bits = n * 64 - mag[n - 1].leading_zeros() as usize;
+        let p = Self::PRECISION_BITS;
+        // Nearest-even rounding of the top `p` bits, done on the limbs. The
+        // mantissa is `M·2^(e-p)` with `2^(p-1) <= M < 2^p` (see `dyadic`).
+        let (mut limbs, mut shift) = ([0u64; N], bits as i64 - p as i64);
+        let bit = |i: i64| -> bool { i >= 0 && (mag[(i / 64) as usize] >> (i % 64)) & 1 == 1 };
+        for (l, limb) in limbs.iter_mut().enumerate() {
+            // Limb `l` of M holds bits [shift + 64l, shift + 64l + 64) of mag.
+            let start = shift + 64 * l as i64;
+            let mut v = 0u64;
+            for part in 0..2 {
+                let src = start.div_euclid(64) + part;
+                let off = start.rem_euclid(64);
+                if src < 0 || src as usize >= n {
+                    continue;
+                }
+                let w = mag[src as usize];
+                v |= if part == 0 {
+                    w >> off
+                } else if off == 0 {
+                    0
+                } else {
+                    w << (64 - off)
+                };
+            }
+            *limb = v;
+        }
+        if shift > 0 {
+            let round = bit(shift - 1);
+            // Any set bit strictly below the round bit.
+            let below = (shift - 1) as usize;
+            let (full, rem) = (below / 64, below % 64);
+            let sticky = mag[..full].iter().any(|&w| w != 0)
+                || (rem > 0 && mag[full] & ((1u64 << rem) - 1) != 0);
+            if round && (sticky || limbs[0] & 1 == 1) {
+                let mut carry = true;
+                for limb in limbs.iter_mut() {
+                    let (v, o) = limb.overflowing_add(carry as u64);
+                    *limb = v;
+                    carry = o;
+                    if !carry {
+                        break;
+                    }
+                }
+                if carry {
+                    limbs[N - 1] = 1u64 << 63;
+                    shift += 1;
+                }
+            }
+        }
+        let exponent = scale + shift + p as i64;
+        let (emin, emax) = unsafe {
+            (
+                gmp_mpfr_sys::mpfr::get_emin() as i64,
+                gmp_mpfr_sys::mpfr::get_emax() as i64,
+            )
+        };
+        if exponent < emin || exponent > emax {
+            return RNS_SCRATCH
+                .with(|s| round_scaled_integer(&mut s.borrow_mut(), negative, mag, scale));
+        }
+        let kind = if negative {
+            -gmp_mpfr_sys::mpfr::REGULAR_KIND
+        } else {
+            gmp_mpfr_sys::mpfr::REGULAR_KIND
+        };
+        Self::exact_decode(kind, exponent, limbs)
     }
 }
 
@@ -805,7 +899,9 @@ mod tests {
                 .collect();
             let reps = 50;
             let t0 = Instant::now();
-            for _ in 0..reps { std::hint::black_box(dot_mpfr(&a, &b)); }
+            for _ in 0..reps {
+                std::hint::black_box(dot_mpfr(&a, &b));
+            }
             let mpfr = t0.elapsed().as_nanos() as f64 / reps as f64;
             let t0 = Instant::now();
             let mut plan_ns = 0u128;
@@ -845,14 +941,18 @@ mod tests {
         Some(plan.reconstruct(&res))
     }
 
-
     #[test]
     fn rns_debug_single_product() {
         use num_traits::FromPrimitive;
         let a = vec![Bits512::from_f64(1.5).unwrap()];
         let b = vec![Bits512::from_f64(-3.5).unwrap()];
         let plan = RnsPlan::for_pair(&a, &b, 1).unwrap();
-        eprintln!("primes={} shift_a={} shift_b={}", plan.primes(), plan.shift_a, plan.shift_b);
+        eprintln!(
+            "primes={} shift_a={} shift_b={}",
+            plan.primes(),
+            plan.shift_a,
+            plan.shift_b
+        );
         let ra = plan.encode(&a, EncodeSide::A).unwrap();
         let rb = plan.encode(&b, EncodeSide::B).unwrap();
         eprintln!("ra={:?}", &ra.data[..8.min(ra.k)]);
@@ -869,15 +969,24 @@ mod tests {
     fn rns_dot_matches_exact_integer_reference() {
         // Mixed magnitudes and signs; compare against the GMP exact accumulator.
         let a: Vec<Bits512> = [
-            1.5f64, -2.25, 1e30, -4e-18, 0.0, 7.75, -1e-40, 3.0,
-            1.0000000000000002, -0.5, 6.25, -9.5,
+            1.5f64,
+            -2.25,
+            1e30,
+            -4e-18,
+            0.0,
+            7.75,
+            -1e-40,
+            3.0,
+            1.0000000000000002,
+            -0.5,
+            6.25,
+            -9.5,
         ]
         .iter()
         .map(|&x| Bits512::from_f64(x).unwrap())
         .collect();
         let b: Vec<Bits512> = [
-            -3.5f64, 0.75, -2e28, 5e-17, 9.0, -0.125, 1e38, 4.0,
-            2.5, 1.75, -8.0, 0.0625,
+            -3.5f64, 0.75, -2e28, 5e-17, 9.0, -0.125, 1e38, 4.0, 2.5, 1.75, -8.0, 0.0625,
         ]
         .iter()
         .map(|&x| Bits512::from_f64(x).unwrap())
@@ -923,12 +1032,9 @@ mod tests {
         // stride 2: terms a[0],a[2],...,a[38] with b[0..20]
         let res = plan.dot_residues(&ra, 0, 2, &rb, 0, 1, 20);
         let got: Bits256 = plan.reconstruct(&res);
-        let want = exact_product(
-            &a.iter().step_by(2).copied().collect::<Vec<_>>(),
-            &b[..20],
-        )
-        .unwrap()
-        .to_mpfloat::<4>();
+        let want = exact_product(&a.iter().step_by(2).copied().collect::<Vec<_>>(), &b[..20])
+            .unwrap()
+            .to_mpfloat::<4>();
         assert_eq!(got, want);
     }
 
@@ -938,10 +1044,7 @@ mod tests {
         let b = vec![Bits512::one(); 2];
         assert!(RnsPlan::for_pair(&a, &b, 2).is_none());
         // Exponent spread beyond the window: 1 vs 2^5000.
-        let a2 = vec![
-            Bits512::one(),
-            Bits512::from_f64(f64::MAX).unwrap(),
-        ];
+        let a2 = vec![Bits512::one(), Bits512::from_f64(f64::MAX).unwrap()];
         let big = Bits512::from_f64(f64::MAX).unwrap();
         let huge = big * big * big * big * big * big * big * big * big * big * big * big;
         let a3 = vec![Bits512::one(), huge];

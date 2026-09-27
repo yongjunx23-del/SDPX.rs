@@ -36,38 +36,38 @@ fn check<T: FloatT>() {
     }
     assert_eq!(failures, 0);
 }
+// binary64 applies H through its factor (two congruences).
 #[test]
-#[ignore = "known: explicit G*X*G congruence loses the graded tail (see REVIEW_AND_PLAN.md)"]
 fn condensed_graded_f64() {
     check::<f64>();
 }
 #[test]
-#[ignore = "known: explicit G*X*G congruence loses the graded tail (see REVIEW_AND_PLAN.md)"]
+#[ignore = "known: at MPFR precision the explicit G*X*G congruence loses the graded tail (see REVIEW_AND_PLAN.md)"]
 fn condensed_graded_128() {
     check::<MpFloat<2>>();
 }
 #[test]
-#[ignore = "known: explicit G*X*G congruence loses the graded tail (see REVIEW_AND_PLAN.md)"]
+#[ignore = "known: at MPFR precision the explicit G*X*G congruence loses the graded tail (see REVIEW_AND_PLAN.md)"]
 fn condensed_graded_256() {
     check::<MpFloat<4>>();
 }
 #[test]
-#[ignore = "known: explicit G*X*G congruence loses the graded tail (see REVIEW_AND_PLAN.md)"]
+#[ignore = "known: at MPFR precision the explicit G*X*G congruence loses the graded tail (see REVIEW_AND_PLAN.md)"]
 fn condensed_graded_512() {
     check::<MpFloat<8>>();
 }
 #[test]
-#[ignore = "known: explicit G*X*G congruence loses the graded tail (see REVIEW_AND_PLAN.md)"]
+#[ignore = "known: at MPFR precision the explicit G*X*G congruence loses the graded tail (see REVIEW_AND_PLAN.md)"]
 fn condensed_graded_768() {
     check::<MpFloat<12>>();
 }
 #[test]
-#[ignore = "known: explicit G*X*G congruence loses the graded tail (see REVIEW_AND_PLAN.md)"]
+#[ignore = "known: at MPFR precision the explicit G*X*G congruence loses the graded tail (see REVIEW_AND_PLAN.md)"]
 fn condensed_graded_1024() {
     check::<MpFloat<16>>();
 }
 #[test]
-#[ignore = "known: explicit G*X*G congruence loses the graded tail (see REVIEW_AND_PLAN.md)"]
+#[ignore = "known: at MPFR precision the explicit G*X*G congruence loses the graded tail (see REVIEW_AND_PLAN.md)"]
 fn condensed_graded_2048() {
     check::<MpFloat<32>>();
 }

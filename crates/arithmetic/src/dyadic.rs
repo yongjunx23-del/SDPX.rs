@@ -22,8 +22,12 @@ pub enum DyadicKind {
     /// Exactly zero (the sign of zero is not preserved by the solver paths).
     Zero,
     /// A finite non-zero value in `sign · M · 2^shift`.
-    Finite { negative: bool },
-    Infinity { negative: bool },
+    Finite {
+        negative: bool,
+    },
+    Infinity {
+        negative: bool,
+    },
     Nan,
 }
 

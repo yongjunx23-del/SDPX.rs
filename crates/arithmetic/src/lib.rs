@@ -20,12 +20,12 @@ use std::{
 
 mod dyadic;
 pub use dyadic::{DyadicKind, DyadicView};
+mod exact;
+mod exactdot;
 /// Exact-integer reference conversions. Test-only oracle for the residue
 /// kernels (see the module docs): not part of the production arithmetic.
 #[cfg(test)]
 mod integer;
-mod exact;
-mod exactdot;
 pub use exact::Exact;
 mod rns;
 pub use rns::{EncodeSide, Residues, RnsPlan};
@@ -399,7 +399,7 @@ impl<const N: usize> MpFloat<N> {
     pub fn exact_encode(&self) -> (i32, i64, &[u64; N]) {
         (self.kind, self.exponent as i64, &self.limbs)
     }
-    /// Inverse of [`exact_encode`]. The caller must supply a triple produced
+    /// Inverse of [`Self::exact_encode`]. The caller must supply a triple produced
     /// at the same precision; no validation beyond a precision check is done.
     pub fn exact_decode(kind: i32, exponent: i64, limbs: [u64; N]) -> Self {
         Self::check_precision();
@@ -448,7 +448,9 @@ impl<const N: usize> MpFloat<N> {
                 let y = b.descriptor();
                 // MPFR permits the destination to alias an input. Here only the
                 // previous accumulator is reused; input limb arrays stay read-only.
-                unsafe { mpfr::fma(r, &x, &y, r, ROUND); }
+                unsafe {
+                    mpfr::fma(r, &x, &y, r, ROUND);
+                }
             }
         })
     }
@@ -998,7 +1000,10 @@ impl<const N: usize> MpFloat<N> {
         }
         let value = Self::constant_uncached(c);
         CONSTANTS.with(|cache| {
-            cache.borrow_mut().insert((N, c), (value.kind, value.exponent as i64, value.limbs.to_vec()));
+            cache.borrow_mut().insert(
+                (N, c),
+                (value.kind, value.exponent as i64, value.limbs.to_vec()),
+            );
         });
         value
     }
@@ -1139,7 +1144,6 @@ impl<const N: usize> FloatConst for MpFloat<N> {
         Self::constant(Constant::Sqrt2)
     }
 }
-
 
 // Inner-operator parallelism gate. Solver-pool lanes set this flag so heavy
 // kernels (e.g. the MPFR SVD) may re-offer independent inner work to the

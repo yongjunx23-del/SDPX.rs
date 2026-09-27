@@ -69,7 +69,22 @@ where
     // let thresh = faer::sparse::linalg::CHOLESKY_SUPERNODAL_RATIO_FACTOR;
     let thresh = 40.0;
 
-    if (flops / Lnnz) < thresh {
+    // The supernodal, multithreaded factor pays only for large factors; small
+    // ones (e.g. many tiny cones) are faster with QDLDL.
+    const MIN_SUPERNODAL_FLOPS: f64 = 1e8;
+    if crate::receipt::profile_requested() {
+        eprintln!(
+            "LDL_AUTO n={} flops={flops:.3e} lnz={Lnnz:.3e} ratio={:.1} choice={}",
+            KKT.n,
+            flops / Lnnz,
+            if flops / Lnnz < thresh || flops < MIN_SUPERNODAL_FLOPS {
+                "qdldl"
+            } else {
+                "faer"
+            }
+        );
+    }
+    if (flops / Lnnz) < thresh || flops < MIN_SUPERNODAL_FLOPS {
         // use QDLDL
         let solver = QDLDLDirectLDLSolver::<T>::new(KKT, Dsigns, settings, Some(perm));
         Box::new(solver)

@@ -56,8 +56,10 @@ pub(super) fn forward_split_chunks<T: FloatT>(
     square: &mut Matrix<T>,
     panel: &mut Matrix<T>,
     rns: Option<RnsSide<'_>>,
+    mut cache_q: Option<&mut ResidueCache>,
 ) {
-    if s_range.len() == 1 && chunks > 1 {
+    let kernel = T::residue_blas_applies(b.basis_rows, b.basis_rows, b.basis_cols);
+    if s_range.len() == 1 && chunks > 1 && !kernel {
         // A lone `s` level owns a contiguous svec row band; split it into
         // `j` bands so a pool wider than the block count still fills. Each
         // task rebuilds the pair panels (h*kmax) and evaluates every
@@ -79,7 +81,7 @@ pub(super) fn forward_split_chunks<T: FloatT>(
         );
         return;
     }
-    if chunks <= 1 || s_range.len() < 2 {
+    if chunks <= 1 || s_range.len() < 2 || kernel {
         let h = b.basis_rows;
         let kmax = b.basis_cols;
         let s_offset = tri(s_range.start * h);
@@ -90,8 +92,7 @@ pub(super) fn forward_split_chunks<T: FloatT>(
                     if let Some(rc) = rns {
                         // qq rows carry the svec scale; one dot per output.
                         for t in 0..tri(h) {
-                            let v =
-                                T::rns_dot(rc.plan, rc.cns, t * kmax, 1, rc.var, 0, 1, kmax);
+                            let v = T::rns_dot(rc.plan, rc.cns, t * kmax, 1, rc.var, 0, 1, kmax);
                             out[t - s_offset] += alpha * v;
                         }
                         continue;
@@ -105,19 +106,9 @@ pub(super) fn forward_split_chunks<T: FloatT>(
                         p_col[i] = q_col[i] * weight;
                     }
                 }
-                let q_data = q.data();
-                let p_data = panel.data();
-                for j in 0..h {
-                    for i in 0..=j {
-                        let v = T::dot_fma(
-                            (0..kmax).map(|k| (&p_data[i + k * h], &q_data[j + k * h])),
-                        );
-                        square[(i, j)] = v;
-                        if r != s {
-                            square[(j, i)] = v;
-                        }
-                    }
-                }
+                // `panel·Qᵀ` is exactly symmetric: correctly rounded upper
+                // entries, mirrored.
+                pooled_gemm_sym_cached(square, panel, &q.t(), None, cache_q.as_deref_mut());
                 for j in 0..h {
                     for i in 0..if r == s { j + 1 } else { h } {
                         let scale = if r != s {
@@ -159,6 +150,7 @@ pub(super) fn forward_split_chunks<T: FloatT>(
                 square,
                 panel,
                 rns,
+                cache_q,
             )
         },
         || {
@@ -175,6 +167,7 @@ pub(super) fn forward_split_chunks<T: FloatT>(
                 &mut local_square,
                 &mut local_panel,
                 rns,
+                None,
             )
         },
     );
@@ -226,8 +219,7 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
                 if r == s {
                     if let Some(rc) = rns {
                         for k in 0..kmax {
-                            let v =
-                                T::rns_dot(rc.plan, rc.cns, k * trih, 1, rc.var, 0, 1, trih);
+                            let v = T::rns_dot(rc.plan, rc.cns, k * trih, 1, rc.var, 0, 1, trih);
                             out[p + k - s_offset] = alpha * b.weights[p + k] * v;
                         }
                         continue;
@@ -237,12 +229,7 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
                     for k in 0..kmax {
                         let w = &wdiag[k * trih..(k + 1) * trih];
                         let v = T::dot_fma((0..h).flat_map(|j| {
-                            (0..=j).map(move |i| {
-                                (
-                                    &x[b.row_start + tri(r * h + j) + r * h + i],
-                                    &w[tri(j) + i],
-                                )
-                            })
+                            (0..=j).map(move |i| (&x[tri(r * h + j) + r * h + i], &w[tri(j) + i]))
                         }));
                         let idx = p + k - s_offset;
                         out[idx] = alpha * b.weights[p + k] * v;
@@ -253,7 +240,7 @@ pub(super) fn adjoint_split_chunks<T: FloatT>(
                     for i in 0..h {
                         let (a, c) = (r * h + i, s * h + j);
                         let scale = if a == c { T::one() } else { inv_sqrt2 };
-                        square[(i, j)] = x[b.row_start + tri(c) + a] * scale;
+                        square[(i, j)] = x[tri(c) + a] * scale;
                     }
                 }
                 panel.mul(square, q, T::one(), T::zero());
@@ -376,14 +363,10 @@ fn adjoint_diag_chunks<T: FloatT>(
     }
     for k in k_range {
         let w = &wdiag[k * trih..(k + 1) * trih];
-        let v = T::dot_fma((0..h).flat_map(|j| {
-            (0..=j).map(move |i| {
-                (
-                    &x[b.row_start + tri(s * h + j) + s * h + i],
-                    &w[tri(j) + i],
-                )
-            })
-        }));
+        let v =
+            T::dot_fma((0..h).flat_map(|j| {
+                (0..=j).map(move |i| (&x[tri(s * h + j) + s * h + i], &w[tri(j) + i]))
+            }));
         out[k - k0] = alpha * b.weights[p + k] * v;
     }
 }
@@ -474,12 +457,7 @@ fn adjoint_level_chunks<T: FloatT>(
             for k in 0..kmax {
                 let w = &wdiag[k * trih..(k + 1) * trih];
                 let v = T::dot_fma((0..h).flat_map(|j| {
-                    (0..=j).map(move |i| {
-                        (
-                            &x[b.row_start + tri(r * h + j) + r * h + i],
-                            &w[tri(j) + i],
-                        )
-                    })
+                    (0..=j).map(move |i| (&x[tri(r * h + j) + r * h + i], &w[tri(j) + i]))
                 }));
                 out[(r - r0) * kmax + k] = alpha * b.weights[p + k] * v;
             }
@@ -489,7 +467,7 @@ fn adjoint_level_chunks<T: FloatT>(
             for i in 0..h {
                 let (a, c) = (r * h + i, s * h + j);
                 let scale = if a == c { T::one() } else { inv_sqrt2 };
-                square[(i, j)] = x[b.row_start + tri(c) + a] * scale;
+                square[(i, j)] = x[tri(c) + a] * scale;
             }
         }
         panel.mul(square, q, T::one(), T::zero());
@@ -504,6 +482,58 @@ fn adjoint_level_chunks<T: FloatT>(
 
 // Row ranges were checked disjoint at construction. Preserve each row's
 // arithmetic order while allowing independent blocks to update in parallel.
+/// `y_slice += alpha·A_b·x` over block `b`'s own rows: the pooled forward leaf.
+fn forward_leaf<T: FloatT>(
+    b: &SampledBlock<T>,
+    w: &mut SampledBlockWorkspace<T>,
+    y_slice: &mut [T],
+    x: &[T],
+    alpha: T,
+    chunks: usize,
+) {
+    if b.basis_cols == 0 {
+        return;
+    }
+    let h = b.basis_rows;
+    let kmax = b.basis_cols;
+    let sqrt2 = if h > 1 { T::SQRT_2() } else { T::zero() };
+    let inv_sqrt2 = if h > 0 && b.dim > 1 {
+        T::FRAC_1_SQRT_2()
+    } else {
+        T::zero()
+    };
+    let q = BorrowedMatrix {
+        size: (h, kmax),
+        data: b.basis.as_slice(),
+        phantom: std::marker::PhantomData,
+    };
+    if chunks > 1 {
+        let call = w.prepare_fwd_rns(b, x);
+        let rns = call.as_ref().map(|(p, v)| RnsSide {
+            plan: p,
+            cns: &w.rns_fwd.as_ref().unwrap().res,
+            var: v,
+        });
+        forward_split_chunks(
+            b,
+            &q,
+            x,
+            alpha,
+            0..b.dim,
+            y_slice,
+            sqrt2,
+            inv_sqrt2,
+            chunks,
+            &mut w.square,
+            &mut w.panel,
+            rns,
+            w.q_fwd_cache.as_mut(),
+        );
+    } else {
+        w.forward_terms(b, x, alpha, |i, term| y_slice[i] += term);
+    }
+}
+
 pub(super) fn forward_disjoint<T: FloatT>(
     blocks: &[SampledBlock<T>],
     work: &mut [SampledBlockWorkspace<T>],
@@ -515,48 +545,15 @@ pub(super) fn forward_disjoint<T: FloatT>(
 ) {
     if blocks.len() <= 1 {
         if let Some(b) = blocks.first() {
-            if b.basis_cols > 0 {
-                let offset = b.row_start - row_start;
-                let h = b.basis_rows;
-                let kmax = b.basis_cols;
-                let sqrt2 = if h > 1 { T::SQRT_2() } else { T::zero() };
-                let inv_sqrt2 = if h > 0 && b.dim > 1 {
-                    T::FRAC_1_SQRT_2()
-                } else {
-                    T::zero()
-                };
-                let q = BorrowedMatrix {
-                    size: (h, kmax),
-                    data: b.basis.as_slice(),
-                    phantom: std::marker::PhantomData,
-                };
-                let y_slice = &mut y[offset..offset + b.row_count()];
-                if chunks > 1 {
-                    let w0 = &mut work[0];
-                    let call = w0.prepare_fwd_rns(b, x);
-                    let rns = call.as_ref().map(|(p, v)| RnsSide {
-                        plan: p,
-                        cns: &w0.rns_fwd.as_ref().unwrap().res,
-                        var: v,
-                    });
-                    forward_split_chunks(
-                        b,
-                        &q,
-                        x,
-                        alpha,
-                        0..b.dim,
-                        y_slice,
-                        sqrt2,
-                        inv_sqrt2,
-                        chunks,
-                        &mut w0.square,
-                        &mut w0.panel,
-                        rns,
-                    );
-                } else {
-                    work[0].forward_terms(b, x, alpha, |i, term| y_slice[i] += term);
-                }
-            }
+            let offset = b.row_start - row_start;
+            forward_leaf(
+                b,
+                &mut work[0],
+                &mut y[offset..offset + b.row_count()],
+                x,
+                alpha,
+                chunks,
+            );
         }
         return;
     }
@@ -673,9 +670,7 @@ fn forward_band_chunks<T: FloatT>(
         for j in j_range.clone() {
             for i in 0..if r == s { j + 1 } else { h } {
                 let (a, c) = (i.min(j), i.max(j));
-                let v = T::dot_fma(
-                    (0..kmax).map(|k| (&p_data[a + k * h], &q_data[c + k * h])),
-                );
+                let v = T::dot_fma((0..kmax).map(|k| (&p_data[a + k * h], &q_data[c + k * h])));
                 let scale = if r != s {
                     inv_sqrt2
                 } else if i != j {

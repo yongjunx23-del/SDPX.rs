@@ -120,7 +120,7 @@ impl<T: FloatT> ConeCollection<T> for OwnedCones<T> {
     }
     fn reset_scaling(&mut self) {
         if let Some(pool) = &self.pool {
-            debug_assert!(self.blocks.iter().all(|c| c.thread_pool().is_none()));
+            debug_assert!(owner_cone_pools_ok(&self.blocks));
             pool.install(|| {
                 self.blocks
                     .par_iter_mut()
@@ -151,7 +151,7 @@ impl<T: FloatT> OwnedCones<T> {
         }
         let pool = self.pool.as_ref()?;
         let inner = pool.current_num_threads() > self.blocks.len();
-        debug_assert!(self.blocks.iter().all(|c| c.thread_pool().is_none()));
+        debug_assert!(owner_cone_pools_ok(&self.blocks));
         pool.install(|| {
             self.blocks
                 .par_iter_mut()
@@ -207,7 +207,7 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
     }
     fn affine_step_rhs(&mut self, r: &Self::R, v: &Self, c: &Self::C) {
         if let Some(pool) = &c.pool {
-            debug_assert!(c.blocks.iter().all(|block| block.thread_pool().is_none()));
+            debug_assert!(owner_cone_pools_ok(&c.blocks));
             pool.install(|| {
                 self.blocks
                     .par_iter_mut()
@@ -244,7 +244,7 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         m: T,
     ) {
         if let Some(pool) = &c.pool {
-            debug_assert!(c.blocks.iter().all(|block| block.thread_pool().is_none()));
+            debug_assert!(owner_cone_pools_ok(&c.blocks));
             pool.install(|| {
                 self.blocks
                     .par_iter_mut()
@@ -287,7 +287,7 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         mu: T,
     ) {
         if let Some(pool) = &c.pool {
-            debug_assert!(c.blocks.iter().all(|block| block.thread_pool().is_none()));
+            debug_assert!(owner_cone_pools_ok(&c.blocks));
             pool.install(|| {
                 self.blocks
                     .par_iter_mut()
@@ -364,7 +364,7 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         if cap.is_finite() && cap > T::zero() && cones.all_symmetric() {
             if let Some(pool) = &cones.pool {
                 let inner = pool.current_num_threads() > cones.blocks.len();
-                debug_assert!(cones.blocks.iter().all(|c| c.thread_pool().is_none()));
+                debug_assert!(owner_cone_pools_ok(&cones.blocks));
                 pool.install(|| {
                     cones
                         .blocks
@@ -552,7 +552,7 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
     fn scale_cones(&self, cones: &mut Self::C, mu: T, strategy: ScalingStrategy) -> bool {
         let local_ok = if let Some(pool) = &cones.pool {
             let inner = pool.current_num_threads() > cones.blocks.len();
-            debug_assert!(cones.blocks.iter().all(|c| c.thread_pool().is_none()));
+            debug_assert!(owner_cone_pools_ok(&cones.blocks));
             // Complete every independent owner operation before reducing the
             // failure flag. No numerical sums change order, and failure still
             // returns false to the shared HSD strategy/retry path.

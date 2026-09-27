@@ -2,6 +2,7 @@
 use super::*;
 use crate::algebra::*;
 use crate::solver::core::traits::Residuals;
+use rayon::prelude::*;
 
 // ---------------
 // Residuals type for default problem format
@@ -36,7 +37,7 @@ pub struct DefaultResiduals<T> {
     #[cfg(feature = "sdp")]
     pub(crate) sampled_workspace: Option<SampledWorkspace<T>>,
     #[cfg(feature = "sdp")]
-    sampled_pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    pub(crate) sampled_pool: Option<std::sync::Arc<rayon::ThreadPool>>,
 }
 
 impl<T> DefaultResiduals<T>
@@ -177,12 +178,30 @@ where
         // Ordinary CSC entries are authoritative for non-sampled rows. The
         // sampled materialized view contains rounded PSD rows, so use the
         // operator's stripped linear view whenever factors are installed.
+        // Each column accumulates only its own entries, so a column-parallel
+        // pass keeps every value bitwise equal to the serial loop.
+        #[cfg(feature = "sdp")]
+        let pool = self.sampled_pool.clone();
+        #[cfg(not(feature = "sdp"))]
+        let pool: Option<std::sync::Arc<rayon::ThreadPool>> = None;
         let accumulate_linear = |work: &mut [T], a: &CscMatrix<T>| {
-            for col in 0..a.n {
+            let column = |(col, w): (usize, &mut T)| {
                 for idx in a.colptr[col]..a.colptr[col + 1] {
                     let row = a.rowval[idx];
-                    work[col] += T::abs(a.nzval[idx] * variables.z[row]);
+                    *w += T::abs(a.nzval[idx] * variables.z[row]);
                 }
+            };
+            match &pool {
+                Some(pool) if pool.current_num_threads() > 1 && a.nnz() >= 4096 => {
+                    pool.install(|| {
+                        work[..a.n]
+                            .par_iter_mut()
+                            .enumerate()
+                            .with_min_len(8)
+                            .for_each(column)
+                    })
+                }
+                _ => work[..a.n].iter_mut().enumerate().for_each(column),
             }
         };
         #[cfg(feature = "sdp")]
@@ -196,6 +215,7 @@ where
 
         #[cfg(feature = "sdp")]
         if let Some(operator) = &data.sampled {
+            let timer = crate::receipt::start();
             let sampled_workspace = self
                 .sampled_workspace
                 .get_or_insert_with(|| SampledWorkspace::new(operator));
@@ -205,6 +225,7 @@ where
                 sampled_workspace,
                 self.sampled_pool.as_ref(),
             );
+            crate::receipt::finish("ipm_residual.adjoint_abs", timer);
         }
 
         // A zero denominator with a nonzero residual is a genuine failure;
@@ -301,6 +322,7 @@ impl<T: FloatT> DefaultResiduals<T> {
         self.rz_inf.copy_from(&variables.s);
         #[cfg(feature = "sdp")]
         if let Some(operator) = &data.sampled {
+            let timer = crate::receipt::start();
             let work = self
                 .sampled_workspace
                 .get_or_insert_with(|| SampledWorkspace::new(operator));
@@ -320,6 +342,7 @@ impl<T: FloatT> DefaultResiduals<T> {
                 work,
                 self.sampled_pool.as_ref(),
             );
+            crate::receipt::finish("ipm_residual.products", timer);
         } else {
             self.ordinary_products(variables, data);
         }

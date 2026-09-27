@@ -14,6 +14,15 @@ fn same<T: FloatT>(a: T, b: T) {
         assert_eq!(a.is_sign_negative(), b.is_sign_negative());
     }
 }
+/// High-precision norms use exact squares (rounded once), so they may
+/// differ from the scaled recurrence in the last bits; f64 is unchanged.
+fn same_norm<T: FloatT>(a: T, b: T) {
+    if T::precision_bits() > 64 {
+        close(a, b);
+    } else {
+        same(a, b);
+    }
+}
 fn close<T: FloatT>(a: T, b: T) {
     assert!(
         (a - b).abs() <= n::<T>(256) * T::epsilon() * b.abs().max(T::one()),
@@ -92,7 +101,7 @@ fn ownership<T: FloatT>() {
     let single = ResidualSummary::from_owners([all.view()], None).unwrap();
     let original: [T; 8] = std::array::from_fn(|k| values[k].norm_scaled(&scales[k]));
     for (a, b) in single.norms().into_iter().zip(original) {
-        same(a, b);
+        same_norm(a, b);
     }
     same(single.products.qx, n(70));
     same(single.products.xpx, n(225));
@@ -104,7 +113,7 @@ fn ownership<T: FloatT>() {
             .build()
             .unwrap();
         let parallel = ResidualSummary::from_owners([all.view()], Some(&pool)).unwrap();
-        for (a, b) in parallel.norms().into_iter().zip(original) {
+        for (a, b) in parallel.norms().into_iter().zip(single.norms()) {
             same(a, b);
         }
     }
@@ -169,24 +178,24 @@ fn ownership<T: FloatT>() {
     let quadratic = n::<T>(225) * ti * ti / n::<T>(2);
     same(reference.cost_primal, (n::<T>(70) * ti + quadratic) * n(3));
     same(reference.cost_dual, (-n::<T>(20) * ti - quadratic) * n(3));
-    let nx = original[0];
-    let nz = original[1] * n(3);
-    let ns = original[2];
-    same(
-        reference.res_primal_inf,
-        original[3] * n(3) / nz.max(T::one()),
-    );
+    // The formulas are checked on the summary's own norms (compared with
+    // the scaled recurrence above).
+    let norms = single.norms();
+    let nx = norms[0];
+    let nz = norms[1] * n(3);
+    let ns = norms[2];
+    same(reference.res_primal_inf, norms[3] * n(3) / nz.max(T::one()));
     same(
         reference.res_dual_inf,
-        (original[4] / nx.max(T::one())).max(original[5] / (nx + ns).max(T::one())),
+        (norms[4] / nx.max(T::one())).max(norms[5] / (nx + ns).max(T::one())),
     );
     same(
         reference.res_primal,
-        original[6] * ti / (n::<T>(5) + nx * ti + ns * ti).max(T::one()),
+        norms[6] * ti / (n::<T>(5) + nx * ti + ns * ti).max(T::one()),
     );
     same(
         reference.res_dual,
-        original[7] * ti * n(3) / (n::<T>(7) + nx * ti + nz * ti).max(T::one()),
+        norms[7] * ti * n(3) / (n::<T>(7) + nx * ti + nz * ti).max(T::one()),
     );
     same(
         reference.gap_abs,

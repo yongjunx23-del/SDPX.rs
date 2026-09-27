@@ -4,7 +4,10 @@ use crate::{
 };
 
 use super::{
-    nonsymmetric_common::{backtrack_search, Nonsymmetric3DCone, NonsymmetricCone},
+    nonsymmetric_common::{
+        backtrack_search_screened, certain_positive, certain_sign, Nonsymmetric3DCone,
+        NonsymmetricCone,
+    },
     Cone, Nonsymmetric3DConeUtils, PrimalOrDualCone,
 };
 
@@ -166,8 +169,29 @@ where
         let _is_prim_feasible_fcn = |s: &[T]| -> bool { self.is_primal_feasible(s) };
         let _is_dual_feasible_fcn = |s: &[T]| -> bool { self.is_dual_feasible(s) };
 
-        let αz = backtrack_search(dz, z, αmax, αmin, step, _is_dual_feasible_fcn, &mut work);
-        let αs = backtrack_search(ds, s, αmax, αmin, step, _is_prim_feasible_fcn, &mut work);
+        let zero = T::zero();
+        let αz = backtrack_search_screened(
+            dz,
+            z,
+            αmax,
+            αmin,
+            step,
+            _is_dual_feasible_fcn,
+            exp_dual_screen,
+            zero,
+            &mut work,
+        );
+        let αs = backtrack_search_screened(
+            ds,
+            s,
+            αmax,
+            αmin,
+            step,
+            _is_prim_feasible_fcn,
+            exp_primal_screen,
+            zero,
+            &mut work,
+        );
 
         (αz, αs)
     }
@@ -468,5 +492,146 @@ fn test_wright_omega() {
         let zsolved = y + f64::ln(y);
         let err = f64::abs(z - zsolved);
         assert!((err / z) < 1e-9);
+    }
+}
+
+/// Binary64 screen for `is_primal_feasible`: s1, s2 > 0 and
+/// s1·ln(s2/s1) − s0 > 0 (see `backtrack_search_screened`).
+fn exp_primal_screen(w: &[f64], e: &[f64], _: f64) -> Option<bool> {
+    match (certain_positive(w[1], e[1]), certain_positive(w[2], e[2])) {
+        (Some(false), _) | (_, Some(false)) => return Some(false),
+        (Some(true), Some(true)) => {}
+        _ => return None,
+    }
+    let eps = f64::EPSILON;
+    let l = (w[2] / w[1]).ln();
+    let r = w[1] * l - w[0];
+    let dl = 1.01 * (e[2] / w[2] + e[1] / w[1]) + 4.0 * eps * (1.0 + l.abs());
+    let bound =
+        w[1] * dl + 1.01 * l.abs() * e[1] + e[0] + 8.0 * eps * ((w[1] * l).abs() + w[0].abs());
+    certain_sign(r, bound)
+}
+
+/// Binary64 screen for `is_dual_feasible`: z2 > 0, z0 < 0 and
+/// z1 − z0 − z0·ln(−z2/z0) > 0.
+fn exp_dual_screen(w: &[f64], e: &[f64], _: f64) -> Option<bool> {
+    match (certain_positive(w[2], e[2]), certain_positive(-w[0], e[0])) {
+        (Some(false), _) | (_, Some(false)) => return Some(false),
+        (Some(true), Some(true)) => {}
+        _ => return None,
+    }
+    let eps = f64::EPSILON;
+    let l = (-w[2] / w[0]).ln();
+    let r = w[1] - w[0] - w[0] * l;
+    let dl = 1.01 * (e[2] / w[2] + e[0] / -w[0]) + 4.0 * eps * (1.0 + l.abs());
+    let bound = e[1]
+        + e[0]
+        + -w[0] * dl
+        + 1.01 * l.abs() * e[0]
+        + 8.0 * eps * (w[1].abs() + w[0].abs() + (w[0] * l).abs());
+    certain_sign(r, bound)
+}
+
+#[cfg(test)]
+mod screened_step_tests {
+    use super::*;
+    use crate::solver::cones::nonsymmetric_common::backtrack_search;
+    use crate::solver::cones::PowerCone;
+    use num_traits::{FromPrimitive, One, Zero};
+    use sdpx_arithmetic::MpFloat;
+
+    type F = MpFloat<4>;
+
+    fn rand(state: &mut u64) -> f64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    }
+
+    // The screened search must pick exactly the α of the exact search.
+    fn check(
+        points: impl Fn(&mut u64) -> [f64; 3],
+        exact: &dyn Fn(&[F]) -> bool,
+        screen: crate::solver::cones::nonsymmetric_common::Screen,
+        param: F,
+    ) {
+        let mut state = 7u64;
+        let (step, αmin) = (F::from_f64(0.8).unwrap(), F::from_f64(1e-10).unwrap());
+        let mut work = [F::zero(); 3];
+        for case in 0..400 {
+            let q: Vec<F> = points(&mut state)
+                .iter()
+                .map(|&v| F::from_f64(v).unwrap())
+                .collect();
+            let scale = [1e-3, 1.0, 1e3][case % 3];
+            let dq: Vec<F> = (0..3)
+                .map(|_| F::from_f64(rand(&mut state) * scale).unwrap())
+                .collect();
+            let a = backtrack_search(&dq, &q, F::one(), αmin, step, exact, &mut work);
+            let b = backtrack_search_screened(
+                &dq,
+                &q,
+                F::one(),
+                αmin,
+                step,
+                exact,
+                screen,
+                param,
+                &mut work,
+            );
+            assert_eq!(a, b, "case {case}");
+        }
+    }
+
+    #[test]
+    fn exp_screen_matches_exact_search() {
+        let cone = ExponentialCone::<F>::new();
+        let primal = |st: &mut u64| {
+            let (x, y) = (rand(st) * 3.0, rand(st).abs() + 0.1);
+            [x, y, y * (x / y).exp() + rand(st).abs() * 0.1 + 1e-9]
+        };
+        check(
+            primal,
+            &|s: &[F]| cone.is_primal_feasible(s),
+            exp_primal_screen,
+            F::zero(),
+        );
+        let dual = |st: &mut u64| {
+            let (u, w) = (-(rand(st).abs() + 0.1), rand(st).abs() + 0.1);
+            // z1 > z0 + z0·ln(−z2/z0)
+            [u, u + u * (-w / u).ln() + rand(st).abs() * 0.1 + 1e-9, w]
+        };
+        check(
+            dual,
+            &|z: &[F]| cone.is_dual_feasible(z),
+            exp_dual_screen,
+            F::zero(),
+        );
+    }
+
+    #[test]
+    fn pow_screen_matches_exact_search() {
+        for a in [0.2, 0.5, 0.8] {
+            let cone = PowerCone::<F>::new(F::from_f64(a).unwrap());
+            let point = |st: &mut u64| {
+                let (x, y) = (rand(st).abs() + 0.05, rand(st).abs() + 0.05);
+                let g = x.powf(a) * y.powf(1.0 - a);
+                [x, y, g * rand(st) * 0.99]
+            };
+            let fa = F::from_f64(a).unwrap();
+            check(
+                point,
+                &|s: &[F]| cone.is_primal_feasible(s),
+                crate::solver::cones::powcone::pow_primal_screen,
+                fa,
+            );
+            check(
+                point,
+                &|z: &[F]| cone.is_dual_feasible(z),
+                crate::solver::cones::powcone::pow_dual_screen,
+                fa,
+            );
+        }
     }
 }

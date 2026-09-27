@@ -148,6 +148,10 @@ where
     rngs
 }
 
+/// Unchanged step inputs (dz, ds, z, s, settings) for the parallel
+/// nonsymmetric step pass.
+type NonsymStep<'a, T> = (&'a [T], &'a [T], &'a [T], &'a [T], &'a CoreSettings<T>);
+
 impl<T> CompositeCone<T>
 where
     T: FloatT,
@@ -156,34 +160,13 @@ where
         &mut self,
         αmax: T,
         cached_sym: bool,
+        nonsym: Option<NonsymStep<'_, T>>,
         mut evaluate: impl FnMut(&mut SupportedCone<T>, std::ops::Range<usize>, T) -> (T, T),
     ) -> (T, T) {
-        let mut α = αmax;
         let all_symmetric = self.is_symmetric();
-        let mut innerfcn = |α: T, symcond: bool| -> T {
-            let mut α = α;
-            for (_index, (cone, rng)) in zip(&mut self.cones, &self.rng_cones).enumerate() {
-                if cone.is_symmetric() != symcond {
-                    continue;
-                }
-                if cached_sym && cone.is_symmetric() {
-                    let (boundz, bounds) = self.sym_step_bounds[_index];
-                    // Preserve each component's clipping operand order,
-                    // including ties at signed zero, at the current cap.
-                    // Symmetric-cone step lengths are cap-insensitive, so
-                    // evaluating them at αmax folds to the same minimum.
-                    let (nextαz, nextαs) = (T::min(boundz, α), T::min(bounds, α));
-                    α = T::min(α, T::min(nextαz, nextαs));
-                    continue;
-                }
-                let (nextαz, nextαs) = evaluate(cone, rng.clone(), α);
-                α = T::min(α, T::min(nextαz, nextαs));
-            }
-            α
-        };
 
         // Force symmetric cones first.
-        α = innerfcn(α, true);
+        let mut α = self.fold_pass(αmax, true, cached_sym, &mut evaluate);
 
         // if we have any nonsymmetric cones, then back off from full steps slightly
         // so that centrality checks and logarithms don't fail right at the boundaries
@@ -193,9 +176,88 @@ where
         }
 
         // Force asymmetric cones last.
-        α = innerfcn(α, false);
+        if let Some(parallel) = nonsym.and_then(|args| self.nonsym_step_parallel(α, args)) {
+            return (parallel, parallel);
+        }
+        α = self.fold_pass(α, false, cached_sym, &mut evaluate);
 
         (α, α)
+    }
+
+    fn fold_pass(
+        &mut self,
+        α: T,
+        symcond: bool,
+        cached_sym: bool,
+        evaluate: &mut impl FnMut(&mut SupportedCone<T>, std::ops::Range<usize>, T) -> (T, T),
+    ) -> T {
+        let mut α = α;
+        for (_index, (cone, rng)) in zip(&mut self.cones, &self.rng_cones).enumerate() {
+            if cone.is_symmetric() != symcond {
+                continue;
+            }
+            if cached_sym && cone.is_symmetric() {
+                let (boundz, bounds) = self.sym_step_bounds[_index];
+                // Preserve each component's clipping operand order,
+                // including ties at signed zero, at the current cap.
+                // Symmetric-cone step lengths are cap-insensitive, so
+                // evaluating them at αmax folds to the same minimum.
+                let (nextαz, nextαs) = (T::min(boundz, α), T::min(bounds, α));
+                α = T::min(α, T::min(nextαz, nextαs));
+                continue;
+            }
+            let (nextαz, nextαs) = evaluate(cone, rng.clone(), α);
+            α = T::min(α, T::min(nextαz, nextαs));
+        }
+        α
+    }
+
+    /// Nonsymmetric cones backtrack along the common chain α0·stepᵏ. The
+    /// sequential fold (each cone starting from the previous cap) ends at the
+    /// smallest per-cone result when membership is monotone along the ray, as
+    /// for convex cones. So evaluate every cone from α0 in the pool, take the
+    /// minimum and confirm every cone at it (one trial each); on any
+    /// disagreement return `None` and keep the sequential fold.
+    fn nonsym_step_parallel(&mut self, α0: T, args: NonsymStep<'_, T>) -> Option<T> {
+        const MIN_CONES: usize = 64;
+        let threading = self.threading.as_ref()?;
+        if self.cones.iter().filter(|c| !c.is_symmetric()).count() < MIN_CONES {
+            return None;
+        }
+        let (dz, ds, z, s, settings) = args;
+        let rng = &self.rng_cones;
+        let cones = &mut self.cones;
+        let step_at = |i: usize, cone: &mut SupportedCone<T>, cap: T| {
+            let r = rng[i].clone();
+            let (a, b) = cone.step_length(
+                &dz[r.clone()],
+                &ds[r.clone()],
+                &z[r.clone()],
+                &s[r],
+                settings,
+                cap,
+            );
+            T::min(cap, T::min(a, b))
+        };
+        let αstar = threading.pool.install(|| {
+            cones
+                .par_iter_mut()
+                .enumerate()
+                .filter(|(_, c)| !c.is_symmetric())
+                .map(|(i, c)| step_at(i, c, α0))
+                .reduce(|| α0, |a, b| T::min(a, b))
+        });
+        if αstar == α0 {
+            return Some(α0);
+        }
+        let confirmed = threading.pool.install(|| {
+            cones
+                .par_iter_mut()
+                .enumerate()
+                .filter(|(_, c)| !c.is_symmetric())
+                .all(|(i, c)| step_at(i, c, αstar) == αstar)
+        });
+        confirmed.then_some(αstar)
     }
 
     fn shift_one(
@@ -242,6 +304,7 @@ where
                     &threading.lanes,
                     threading.inner_parallel,
                     threading.paired,
+                    threading.inner_ways,
                     (shift, step_z, step_s),
                     &|cone, _rows, (shift, step_z, step_s)| {
                         Self::shift_one(cone, shift, step_z, step_s, σμ, prepared);
@@ -289,7 +352,7 @@ where
                     dz[r.clone()].copy_from_slice(&wz);
                     ds[r].copy_from_slice(&ws);
                 }
-                return self.fold_step_bounds(αmax, true, |cone, rows, cap| {
+                return self.fold_step_bounds(αmax, true, None, |cone, rows, cap| {
                     cone.step_length(
                         &dz[rows.clone()],
                         &ds[rows.clone()],
@@ -310,6 +373,7 @@ where
                             &threading.sym_step_lanes,
                             threading.inner_parallel,
                             threading.paired,
+                            threading.inner_ways,
                             dz,
                             ds,
                             z,
@@ -325,7 +389,7 @@ where
             } else {
                 false
             };
-            return self.fold_step_bounds(αmax, cached, |cone, rows, cap| {
+            return self.fold_step_bounds(αmax, cached, None, |cone, rows, cap| {
                 if let SupportedCone::PSDTriangleCone(cone) = cone {
                     cone.prepare_affine_bounds(&mut dz[rows.clone()], &mut ds[rows], cap)
                 } else {
@@ -350,6 +414,12 @@ where
         let threading = ConeThreading::new(&self.cones, threads)?;
         self.threading = threading;
         Ok(())
+    }
+
+    /// Run this collection's cone lanes on an existing pool (shared with the
+    /// caller, e.g. an MPI rank's owner pool) instead of building a new one.
+    pub(crate) fn share_pool(&mut self, pool: std::sync::Arc<rayon::ThreadPool>) {
+        self.threading = ConeThreading::with_pool(&self.cones, pool);
     }
 
     /// Number of workers actually selected after the small-work cutoff.
@@ -990,6 +1060,41 @@ where
         }
         let mut α = T::max_value();
         let mut β = T::zero();
+        // Each PSD margin is a full eigendecomposition: evaluate the cones in
+        // the pool, then fold in cone order (the same min and sum sequence).
+        let contiguous = self
+            .rng_cones
+            .iter()
+            .scan(0usize, |end, rng| {
+                let ok = rng.start == *end;
+                *end = rng.end;
+                Some(ok)
+            })
+            .all(|ok| ok);
+        if let Some(pool) = self
+            .thread_pool()
+            .filter(|p| p.current_num_threads() > 1 && self.cones.len() > 1 && contiguous)
+        {
+            let mut parts: Vec<&mut [T]> = Vec::with_capacity(self.cones.len());
+            let mut rest = &mut *z;
+            for rng in &self.rng_cones {
+                let (part, tail) = std::mem::take(&mut rest).split_at_mut(rng.len());
+                parts.push(part);
+                rest = tail;
+            }
+            let margins: Vec<(T, T)> = pool.install(|| {
+                self.cones
+                    .par_iter_mut()
+                    .zip(parts.into_par_iter())
+                    .map(|(cone, part)| cone.margins(part, pd))
+                    .collect()
+            });
+            for (αi, βi) in margins {
+                α = T::min(α, αi);
+                β += βi;
+            }
+            return (α, β);
+        }
         for (cone, rng) in zip(&mut self.cones, &self.rng_cones) {
             let (αi, βi) = cone.margins(&mut z[rng.clone()], pd);
             α = T::min(α, αi);
@@ -1041,6 +1146,7 @@ where
                     &threading.lanes,
                     threading.inner_parallel,
                     threading.paired,
+                    threading.inner_ways,
                     (),
                     &|cone, rows, ()| {
                         cone.update_scaling(&s[rows.clone()], &z[rows], μ, scaling_strategy)
@@ -1093,6 +1199,7 @@ where
                     &threading.lanes,
                     threading.inner_parallel,
                     threading.paired,
+                    threading.inner_ways,
                     (y, work),
                     &|cone, rows, (y, work)| {
                         cone.mul_Hs(y, &x[rows], work);
@@ -1138,6 +1245,7 @@ where
                     &threading.lanes,
                     threading.inner_parallel,
                     threading.paired,
+                    threading.inner_ways,
                     (out, work),
                     &|cone, rows, (out, work)| {
                         cone.Δs_from_Δz_offset(out, &ds[rows.clone()], work, &z[rows]);
@@ -1185,6 +1293,7 @@ where
                         &threading.sym_step_lanes,
                         threading.inner_parallel,
                         threading.paired,
+                        threading.inner_ways,
                         dz,
                         ds,
                         z,
@@ -1201,7 +1310,11 @@ where
             false
         };
 
-        self.fold_step_bounds(αmax, cached_sym, |cone, rows, cap| {
+        let nonsym = self
+            .mpi_world()
+            .is_none()
+            .then_some((dz, ds, z, s, settings));
+        self.fold_step_bounds(αmax, cached_sym, nonsym, |cone, rows, cap| {
             cone.step_length(
                 &dz[rows.clone()],
                 &ds[rows.clone()],
@@ -1216,6 +1329,32 @@ where
     fn compute_barrier(&mut self, z: &[T], s: &[T], dz: &[T], ds: &[T], α: T) -> T {
         if let Some(world) = self.mpi_world() {
             return self.compute_barrier_sharded(world, z, s, dz, ds, α);
+        }
+        // Each nonsymmetric barrier costs several logarithms: evaluate the
+        // cones in the pool, then add in cone order (the same sum).
+        if let Some(threading) = self.threading.as_ref().filter(|_| self.cones.len() > 1) {
+            let rng_cones = &self.rng_cones;
+            let values: Vec<T> = threading.pool.install(|| {
+                self.cones
+                    .par_iter_mut()
+                    .zip(rng_cones.par_iter())
+                    .with_min_len(8)
+                    .map(|(cone, rng)| {
+                        cone.compute_barrier(
+                            &z[rng.clone()],
+                            &s[rng.clone()],
+                            &dz[rng.clone()],
+                            &ds[rng.clone()],
+                            α,
+                        )
+                    })
+                    .collect()
+            });
+            let mut barrier = T::zero();
+            for value in values {
+                barrier += value;
+            }
+            return barrier;
         }
         let mut barrier = T::zero();
         for (cone, rng) in zip(&mut self.cones, &self.rng_cones) {

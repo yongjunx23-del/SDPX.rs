@@ -235,25 +235,40 @@ where
         }
 
         // Direct SVD avoids squaring the condition number of L2' * L1.
+        // Only V is needed: with L2'L1 = UΛV', R = L1 V Λ^{-1/2} and its
+        // exact inverse Rinv = Λ^{-1/2} U' L2' = Λ^{1/2} V' L1^{-1}. Recovering
+        // Rinv by one triangular solve replaces the accumulation of U.
         let __ts = std::time::Instant::now();
-        f.SVD.factor(tmp).expect("SVD error");
+        f.SVD.factor_right(tmp).expect("SVD error");
         crate::receipt::phase("cone_svd", __ts.elapsed());
 
         // assemble λ (diagonal), R and Rinv.
         f.λ.copy_from(&f.SVD.s);
         f.Λisqrt.copy_from(&f.λ).sqrt().recip();
 
-        //f.R = L1*(f.SVD.V)*f.Λisqrt and f.Rinv = f.Λisqrt*(f.SVD.U)'*L2'
-        //are independent products; pair them when inner workers are idle.
+        //f.R = L1*V*Λ^{-1/2} and f.Rinv = Λ^{1/2}*(L1^{-T}*V)' are
+        //independent; pair them when inner workers are idle.
         {
-            let (R, Rinv, svd, Λi) = (&mut f.R, &mut f.Rinv, &f.SVD, &f.Λisqrt);
+            let (R, Rinv, svd, Λi, λ) = (&mut f.R, &mut f.Rinv, &f.SVD, &f.Λisqrt, &f.λ);
+            let X = &mut f.workmat2;
+            let n = λ.len();
             let mut build_r = || {
                 R.mul(L1, &svd.Vt.t(), T::one(), T::zero());
                 R.rscale(Λi);
             };
             let mut build_rinv = || {
-                Rinv.mul(&svd.U.t(), &L2.t(), T::one(), T::zero());
-                Rinv.lscale(Λi);
+                for j in 0..n {
+                    for i in 0..n {
+                        X[(i, j)] = svd.Vt[(j, i)];
+                    }
+                }
+                T::xtrsm_lower(n, L1.data(), X.data_mut(), true);
+                for i in 0..n {
+                    let root = λ[i].sqrt();
+                    for j in 0..n {
+                        Rinv[(i, j)] = X[(j, i)] * root;
+                    }
+                }
             };
             if sdpx_arithmetic::inner_parallel::paired() {
                 rayon::join(build_r, build_rinv);
@@ -527,14 +542,18 @@ fn mul_Wx_inner<T>(
         MatrixShape::T => {
             // Y .= α*(R*X*R') + βY        #W^T*x,   or....
             // Y .= α*(Rinv*X*Rinv') + βY  #W^{-T}*x
-            tmp.mul(X, &Rx.t(), T::one(), T::zero());
-            pooled_gemm_sym(Y, Rx, tmp, None);
+            if !congruence_exact_sym(Y, Rx, false, X, None, None) {
+                tmp.mul(X, &Rx.t(), T::one(), T::zero());
+                pooled_gemm_sym(Y, Rx, tmp, None);
+            }
         }
         MatrixShape::N => {
             // Y .= α*(R'*X*R) + βY         #W*x
             // Y .= α*(Rinv'*X*Rinv) + βY   #W^{-1}*x
-            tmp.mul(&Rx.t(), X, T::one(), T::zero());
-            pooled_gemm_sym(Y, tmp, Rx, None);
+            if !congruence_exact_sym(Y, Rx, true, X, None, None) {
+                tmp.mul(&Rx.t(), X, T::one(), T::zero());
+                pooled_gemm_sym(Y, tmp, Rx, None);
+            }
         }
     }
     crate::receipt::phase("cone_wprod", __ts.elapsed());
@@ -584,7 +603,6 @@ where
         X.syr2k(Y, Z, (0.5).as_T(), T::zero());
         mat_to_svec(x, &X.sym_up());
     }
-
 }
 
 //-----------------------------------------
@@ -641,7 +659,15 @@ where
             svec_to_mat(workΔ, d);
             lrscale_symmetric(workΔ, Λisqrt);
             let __ts = std::time::Instant::now();
-            let v = engine.eigval_min(workΔ).expect("Eigval error");
+            let fast = if T::precision_bits() > 64 && workΔ.nrows() > 3 {
+                eigval_min_f64(workΔ, αmax)
+            } else {
+                None
+            };
+            let v = match fast {
+                Some(v) => v,
+                None => engine.eigval_min(workΔ).expect("Eigval error"),
+            };
             crate::receipt::phase("cone_eigmin", __ts.elapsed());
             v
         }
@@ -652,6 +678,144 @@ where
     } else {
         αmax
     }
+}
+
+/// Smallest eigenvalue of the full-precision scaled step matrix `Δ` from a
+/// Float64 copy, when the step length it implies is certified to 1e-10
+/// relative accuracy; `None` falls back to the full-precision solver.
+///
+/// Householder tridiagonalization and Sturm bisection are backward stable:
+/// with the copy's rounding, the true λmin lies within
+/// `B = 2(n+1)²ε‖Δ‖_F` of the computed one (a conservative bound). The step
+/// `min(-1/λ, αmax)` then changes by at most `B / max(|λ|, 1/αmax)`
+/// relatively. Step lengths are a free IPM parameter (the step is scaled by
+/// the step fraction and kept interior), so this accuracy is ample.
+/// Pure Rust: no shared BLAS/LAPACK state across the pool's threads.
+fn eigval_min_f64<T: FloatT>(delta: &Matrix<T>, αmax: T) -> Option<T> {
+    let n = delta.nrows();
+    let amax = αmax.to_f64()?;
+    let mut a = Vec::with_capacity(n * n);
+    let mut sumsq = 0f64;
+    for src in delta.data() {
+        let v = src.to_f64()?;
+        if !v.is_finite() || v.abs() > 1e150 {
+            return None;
+        }
+        sumsq += v * v;
+        a.push(v);
+    }
+    let gamma = min_eigenvalue_f64(&mut a, n)?;
+    let bound = 2.0 * ((n + 1) as f64).powi(2) * f64::EPSILON * sumsq.sqrt();
+    let floor = if amax > 0.0 && amax.is_finite() {
+        1.0 / amax
+    } else {
+        0.0
+    };
+    if bound <= 1e-10 * gamma.abs().max(floor) {
+        T::from_f64(gamma)
+    } else {
+        None
+    }
+}
+
+/// Smallest eigenvalue of a symmetric matrix (`a` column-major, both
+/// triangles stored; overwritten) by Householder tridiagonalization without
+/// vectors and Sturm-count bisection.
+fn min_eigenvalue_f64(a: &mut [f64], n: usize) -> Option<f64> {
+    let at = |i: usize, j: usize| i + j * n;
+    let mut d = vec![0f64; n];
+    let mut e = vec![0f64; n];
+    for i in (1..n).rev() {
+        let l = i - 1;
+        let mut h = 0f64;
+        if l > 0 {
+            let scale: f64 = (0..=l).map(|k| a[at(i, k)].abs()).sum();
+            if scale == 0.0 {
+                e[i] = a[at(i, l)];
+            } else {
+                for k in 0..=l {
+                    a[at(i, k)] /= scale;
+                    h += a[at(i, k)] * a[at(i, k)];
+                }
+                let f = a[at(i, l)];
+                let g = if f >= 0.0 { -h.sqrt() } else { h.sqrt() };
+                e[i] = scale * g;
+                h -= f * g;
+                a[at(i, l)] = f - g;
+                let mut f = 0f64;
+                for j in 0..=l {
+                    let mut g = 0f64;
+                    for k in 0..=j {
+                        g += a[at(j, k)] * a[at(i, k)];
+                    }
+                    for k in j + 1..=l {
+                        g += a[at(k, j)] * a[at(i, k)];
+                    }
+                    e[j] = g / h;
+                    f += e[j] * a[at(i, j)];
+                }
+                let hh = f / (h + h);
+                for j in 0..=l {
+                    let f = a[at(i, j)];
+                    let g = e[j] - hh * f;
+                    e[j] = g;
+                    for k in 0..=j {
+                        a[at(j, k)] -= f * e[k] + g * a[at(i, k)];
+                    }
+                }
+            }
+        } else {
+            e[i] = a[at(i, l)];
+        }
+        d[i] = h;
+    }
+    // e[0] served as scratch above; it is not an off-diagonal entry.
+    e[0] = 0.0;
+    for i in 0..n {
+        d[i] = a[at(i, i)];
+    }
+    // Eigenvalues below x (Sturm sequence of the tridiagonal d, e[1..]).
+    let tiny = f64::MIN_POSITIVE / f64::EPSILON;
+    let below = |x: f64| {
+        let mut count = 0;
+        let mut q = d[0] - x;
+        for i in 0..n {
+            if i > 0 {
+                q = d[i] - x - e[i] * e[i] / q;
+            }
+            if q == 0.0 {
+                q = -tiny;
+            }
+            if q < 0.0 {
+                count += 1;
+            }
+        }
+        count
+    };
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for i in 0..n {
+        let r = e[i].abs() + if i + 1 < n { e[i + 1].abs() } else { 0.0 };
+        lo = lo.min(d[i] - r);
+        hi = hi.max(d[i] + r);
+    }
+    if !lo.is_finite() || !hi.is_finite() {
+        return None;
+    }
+    let width = (hi - lo).max(hi.abs().max(lo.abs()) * f64::EPSILON);
+    lo -= width * f64::EPSILON;
+    hi += width * f64::EPSILON;
+    for _ in 0..128 {
+        let mid = 0.5 * (lo + hi);
+        if mid <= lo || mid >= hi {
+            break;
+        }
+        if below(mid) >= 1 {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some(0.5 * (lo + hi))
 }
 
 // `svec_to_mat` already mirrors this matrix, and congruence uses the same
@@ -811,3 +975,48 @@ fn dump_cone_f64<T: FloatT>(dir: &std::ffi::OsStr, m: &Matrix<T>) {
 #[cfg(test)]
 #[path = "tests/psd_hessian.rs"]
 mod hessian_tests;
+
+#[cfg(test)]
+mod f64_eigmin_tests {
+    use super::*;
+    use sdpx_arithmetic::MpFloat;
+
+    fn check<T: FloatT>() {
+        for (n, seed) in [(4usize, 1u64), (7, 2), (20, 3), (45, 4)] {
+            let mut state = seed;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+            };
+            let mut m = Matrix::<T>::zeros((n, n));
+            for j in 0..n {
+                for i in 0..=j {
+                    let v = T::from_f64(next() * 10.0).unwrap();
+                    m[(i, j)] = v;
+                    m[(j, i)] = v;
+                }
+            }
+            let mut work = Matrix::<T>::zeros((n, n));
+            work.data_mut().copy_from_slice(m.data());
+            let exact = EigEngine::<T>::new(n).eigval_min(&mut work).unwrap();
+            let exact64 = exact.to_f64().unwrap();
+            let mut a: Vec<f64> = m.data().iter().map(|v| v.to_f64().unwrap()).collect();
+            let fast = min_eigenvalue_f64(&mut a, n).unwrap();
+            assert!(
+                (fast - exact64).abs() <= 1e-10 * n as f64,
+                "n={n}: {fast} vs {exact64}"
+            );
+            // The certified path, when it answers, agrees with full precision.
+            if let Some(v) = eigval_min_f64(&m, T::one()) {
+                assert!((v.to_f64().unwrap() - exact64).abs() <= 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn f64_min_eigenvalue_matches_mpfr() {
+        check::<MpFloat<8>>();
+    }
+}

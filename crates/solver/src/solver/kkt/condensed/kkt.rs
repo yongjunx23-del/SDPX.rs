@@ -26,6 +26,12 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 .find(|b| b.rows.start == sampled_block.row_start)
             {
                 if let Scaling::Psd(p) = &mut block.scaling {
+                    // Sampled Schur values come from the Gram workspace; the
+                    // per-column A entry lists (one record per nonzero) are
+                    // only read by the materialized paths.
+                    for column in &mut p.columns {
+                        column.entries = Vec::new();
+                    }
                     p.mat3c = Matrix::zeros(p.Rinv.size());
                     p.sampled = Some(SampledPsd {
                         work: SampledSchurWorkspace::new(sampled_block),
@@ -37,7 +43,25 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 }
             }
         }
-        self.sampled = Some((Arc::clone(&operator), SampledWorkspace::new(&operator)));
+        let mut work = SampledWorkspace::new(&operator);
+        work.enable_basis_caches();
+        self.sampled = Some((Arc::clone(&operator), work));
+        // With every PSD block sampled and only retained (zero-cone) rows
+        // besides, products use the operator's factors and never read this
+        // copy's values; keep its structure and release the values.
+        let values_needed = self.blocks.iter().any(|b| match &b.scaling {
+            Scaling::Psd(p) => p.sampled.is_none(),
+            Scaling::Zero => false,
+            _ => true,
+        });
+        if !values_needed {
+            self.A.nzval = Vec::new();
+        } else {
+            assert!(
+                !self.A.nzval.is_empty() || self.A.rowval.is_empty(),
+                "condensed KKT built without A values needs every PSD block sampled"
+            );
+        }
         self.prepare_shared_pool();
         self.refresh_parallel_plan();
     }
@@ -237,7 +261,10 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         assert_eq!(A.size(), self.A.size());
         assert_eq!(A.colptr, self.A.colptr);
         assert_eq!(A.rowval, self.A.rowval);
-        self.A.nzval.copy_from_slice(&A.nzval);
+        // An empty copy means only the sampled factors define these rows.
+        if !self.A.nzval.is_empty() {
+            self.A.nzval.copy_from_slice(&A.nzval);
+        }
         for block in &mut self.blocks {
             if let Scaling::Psd(psd) = &mut block.scaling {
                 psd.coefficient_plan_valid = false;
@@ -292,6 +319,21 @@ impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
     fn rhs_norm(&self) -> T {
         self.b.norm_inf()
     }
+    fn correction_expected_to_stall(&self, stop_ratio: T) -> bool {
+        self.kernel.mpi_world().is_none()
+            && self.kernel.correction_ratio.is_some_and(|r| r < stop_ratio)
+    }
+    fn record_correction_ratio(&mut self, ratio: T) {
+        self.kernel.correction_ratio = Some(ratio);
+    }
+    fn stall_floor(&self) -> Option<T> {
+        self.kernel
+            .stall_floor
+            .filter(|_| self.kernel.mpi_world().is_none())
+    }
+    fn set_stall_floor(&mut self, floor: T) {
+        self.kernel.stall_floor = Some(floor);
+    }
     fn residual(&mut self, candidate: bool, reuse: bool) -> T {
         self.kernel.residual(
             self.error,
@@ -304,9 +346,7 @@ impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
         self.kernel.solve_raw(self.candidate, self.error, settings)
     }
     fn add_correction(&mut self) {
-        for (c, &v) in self.candidate.iter_mut().zip(self.x.iter()) {
-            *c += v;
-        }
+        crate::algebra::add_assign(self.candidate, self.x);
     }
     fn accept_candidate(&mut self) {
         std::mem::swap(self.x, self.candidate);
@@ -394,6 +434,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         pool: Option<Arc<rayon::ThreadPool>>,
     ) -> bool {
         self.scaled_valid.fill(false);
+        self.correction_ratio = None;
         assert_eq!(self.blocks.len(), cones.len());
         // Follow this update's actual pool, including removal/replacement.
         self.pool = pool;
@@ -486,6 +527,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             true
         };
         let __ts = std::time::Instant::now();
+        let __cs = crate::receipt::cpu_start();
         // Rank split follows block update cost (Gram entries for sampled
         // blocks, ~n^3 proxy otherwise), not block count — a count split
         // turns size skew into allgatherv wait on every collective.
@@ -606,6 +648,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             );
         }
         crate::receipt::phase_record("sync", __ts.elapsed());
+        crate::receipt::cpu_add("sync", __cs);
         // `valid` folds this rank's owned blocks only; a failing owner
         // returning early while peers proceed would hang the next
         // collective. Merge the flag before any rank leaves the call.
@@ -618,13 +661,16 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             return false;
         }
         let __t0 = std::time::Instant::now();
+        let __c0 = crate::receipt::cpu_start();
         if !self.assemble() {
             return false;
         }
         crate::receipt::phase("assemble", __t0.elapsed());
+        crate::receipt::cpu_add("assemble", __c0);
         self.reduced.update_P(&self.schur);
         let retained = &self.retained_indices;
         let __t1 = std::time::Instant::now();
+        let __c1 = crate::receipt::cpu_start();
         let retained_cones = cones
             .iter()
             .enumerate()
@@ -637,6 +683,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             true
         };
         crate::receipt::phase("cones_schur", __t1.elapsed());
+        crate::receipt::cpu_add("cones_schur", __c1);
         __r
     }
 }

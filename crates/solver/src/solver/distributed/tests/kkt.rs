@@ -553,11 +553,12 @@ fn sampled_pair_cache_case<T: FloatT>() {
         );
         if iterative {
             // The nonzero static shift and very tight tolerance force the
-            // reduced refinement stage to perform a correction.  Snapshots
-            // remain distinct after that stage, before either outer lane's
-            // nested scalar correction can overwrite the live mat3c.
+            // reduced refinement stage to perform a correction (later lanes
+            // may skip theirs once that factorization's correction stalled).
+            // Snapshots remain distinct after that stage, before either outer
+            // lane's nested scalar correction can overwrite the live mat3c.
             assert!(pair_solver.shift > T::zero());
-            assert!(pair_solver.refinements >= 4);
+            assert!(pair_solver.refinements >= 1);
             let mut distinct = false;
             for local in &pair_solver.locals {
                 if local.rhs_cache[0].len() == local.rhs_cache[1].len()

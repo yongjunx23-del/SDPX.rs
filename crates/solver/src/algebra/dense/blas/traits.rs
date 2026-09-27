@@ -233,6 +233,31 @@ pub trait XgemmScalar: Sized {
         lda: i32, b: &[Self], ldb: i32, beta: Self, c: &mut [Self], ldc: i32,
         _pool: &rayon::ThreadPool, _column_tile: usize
     ) { Self::xgemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc); }
+    // Upper triangle (`i <= j`) of `op(a)·op(b)` into `c` (ldc = m) when the
+    // exact product is known to be symmetric. Only the exact residue-BLAS
+    // kernel implements it; `false` means nothing was written.
+    // `cache_b` optionally keeps `b`'s residues when it is a constant operand.
+    fn xgemm_upper_exact(
+        _transa: u8, _transb: u8, _m: usize, _n: usize, _k: usize, _a: &[Self], _lda: usize,
+        _b: &[Self], _ldb: usize, _c: &mut [Self], _pool: Option<&rayon::ThreadPool>,
+        _cache_b: Option<&mut ResidueCache>
+    ) -> bool { false }
+    // Whether `xgemm_upper_exact` (and the matching `xgemm` path) uses the
+    // exact residue-BLAS kernel for this shape.
+    fn residue_blas_applies(_m: usize, _n: usize, _k: usize) -> bool { false }
+    // `v[k] = Σ_{i≤j} c_ij·x_t·q_ik·q_jk` (svec `x`, `c_ij = sqrt2` off the
+    // diagonal) for `q` of size h × kmax, rounded once from the exact value.
+    fn xsvec_quadratic_exact(
+        _h: usize, _kmax: usize, _q: &[Self], _x: &[Self], _sqrt2: Self,
+        _pool: Option<&rayon::ThreadPool>, _out: &mut [Self], _cache_q: Option<&mut ResidueCache>
+    ) -> bool where Self: Sized { false }
+    // `op(a)·x·op(a)ᵀ` (m × m, x is k × k) rounded once from the exact value
+    // into `c` (ldc = m); upper triangle only when `upper_only`.
+    fn xcongruence_exact(
+        _transa: u8, _m: usize, _k: usize, _a: &[Self], _lda: usize, _x: &[Self], _ldx: usize,
+        _c: &mut [Self], _upper_only: bool, _pool: Option<&rayon::ThreadPool>,
+        _cache_a: Option<&mut ResidueCache>
+    ) -> bool { false }
 
 }
 
@@ -428,3 +453,8 @@ impl_blas_xgesv!(f64, dgesv);
 // Inline MPFR precision modes share the dense provider boundary.
 #[path = "mpfr.rs"]
 mod mpfr;
+#[path = "rns_blas.rs"]
+mod rns_blas;
+// Integration tests include this file by `#[path]` and use only part of it.
+#[allow(unused_imports)]
+pub(crate) use rns_blas::{measured_ways, with_split_hint, ResidueCache};

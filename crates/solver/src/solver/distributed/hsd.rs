@@ -57,6 +57,16 @@ pub(crate) struct OwnedResiduals<T: FloatT> {
     pub border_residual: Vec<T>,
     pub scalar: DefaultResiduals<T>,
 }
+/// Owner cone collections either have no pool of their own, or all share the
+/// rank's pool because there are fewer owners than its workers.
+pub(crate) fn owner_cone_pools_ok<T: FloatT>(blocks: &[CompositeCone<T>]) -> bool {
+    blocks.iter().all(|c| c.thread_pool().is_none())
+        || blocks.iter().all(|c| {
+            c.thread_pool()
+                .is_some_and(|p| p.current_num_threads() > blocks.len())
+        })
+}
+
 pub(crate) struct OwnedCones<T: FloatT> {
     pub blocks: Vec<CompositeCone<T>>,
     pub collective: CollectiveHandle<T>,
@@ -380,6 +390,16 @@ impl<T: FloatT> OwnedSolver<T> {
             variables.blocks.push(owner.variables);
             residuals.blocks.push(owner.residuals);
             cones.blocks.push(owner.cones);
+        }
+        // Fewer owners than workers (e.g. one owner per MPI rank): owner
+        // tasks alone leave the rank's pool idle, so each owner's cones run
+        // their own lanes on the same pool (a nested install runs inline).
+        if let Some(pool) = &cones.pool {
+            if cones.blocks.len() < pool.current_num_threads() {
+                for owner in &mut cones.blocks {
+                    owner.share_pool(Arc::clone(pool));
+                }
+            }
         }
         // The owned update path already delegates the numerical residual
         // formulas to `DefaultResiduals`, but it intentionally skips the

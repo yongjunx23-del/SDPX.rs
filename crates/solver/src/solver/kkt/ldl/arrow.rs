@@ -22,6 +22,15 @@ use std::sync::Arc;
 /// Hard cap on the dense working set of the arrow representation.  Larger
 /// systems keep using QDLDL rather than densifying without bound.
 const ARROW_MAX_BYTES: u128 = 512 * 1024 * 1024;
+/// Smallest single dense leaf admitted to the arrow backend.
+const SINGLE_LEAF_MIN: usize = 16;
+/// Trailing columns below which a split factor step runs serially.
+const SPLIT_FACTOR_MIN: usize = 32;
+/// Per-step factor tasks are small: split a leaf factor only with at least
+/// this many threads per leaf (at ~2 per leaf it measured slower), and the
+/// border factor only from this dimension.
+const SPLIT_FACTOR_THREADS_PER_LEAF: usize = 4;
+const SPLIT_BORDER_FACTOR_MIN: usize = 128;
 
 fn find(parent: &mut [usize], mut i: usize) -> usize {
     while parent[i] != i {
@@ -49,12 +58,16 @@ impl<T: FloatT> DenseLeaf<T> {
         }
     }
 
+    /// `split`: run each step's trailing update over columns in parallel
+    /// (inside the caller's pool). Every entry receives the same sequence of
+    /// fused updates, so the factor is bitwise identical.
     fn factor(
         &mut self,
         a: &[T],
         sign: i8,
         reg: Option<(T, T)>,
         regularize_count: &mut usize,
+        split: bool,
     ) -> Result<(), &'static str> {
         self.l.copy_from_slice(a);
         let n = self.n;
@@ -79,6 +92,20 @@ impl<T: FloatT> DenseLeaf<T> {
             self.l[k + k * n] = T::one();
             for i in k + 1..n {
                 self.l[i + k * n] *= self.dinv[k];
+            }
+            if split && n - k > SPLIT_FACTOR_MIN {
+                let (head, tail) = self.l.split_at_mut((k + 1) * n);
+                let pivot = &head[k * n..];
+                tail.par_chunks_mut(n)
+                    .enumerate()
+                    .for_each(|(offset, column)| {
+                        let j = k + 1 + offset;
+                        let v = pivot[j] * d;
+                        for i in j..n {
+                            column[i] = (-pivot[i]).mul_add(v, column[i]);
+                        }
+                    });
+                continue;
             }
             for j in k + 1..n {
                 let v = self.l[j + k * n] * d;
@@ -129,6 +156,39 @@ impl<T: FloatT> DenseLeaf<T> {
         }
     }
 
+    /// Apply a batch kernel to `chunks` column ranges of the row-interleaved
+    /// panel `x` (entry (i, c) at `i * cols + c`) in parallel. Columns are
+    /// independent, so the result equals one call over all columns.
+    fn chunked(
+        &self,
+        x: &mut [T],
+        cols: usize,
+        chunks: usize,
+        kernel: impl Fn(&Self, &mut [T], usize) + Sync,
+    ) {
+        let n = self.n;
+        let source: &[T] = x;
+        let parts: Vec<Vec<T>> = (0..chunks)
+            .into_par_iter()
+            .map(|p| {
+                let (c0, c1) = (cols * p / chunks, cols * (p + 1) / chunks);
+                let mut part = Vec::with_capacity(n * (c1 - c0));
+                for i in 0..n {
+                    part.extend_from_slice(&source[i * cols + c0..i * cols + c1]);
+                }
+                kernel(self, &mut part, c1 - c0);
+                part
+            })
+            .collect();
+        for (p, part) in parts.iter().enumerate() {
+            let (c0, c1) = (cols * p / chunks, cols * (p + 1) / chunks);
+            let width = c1 - c0;
+            for i in 0..n {
+                x[i * cols + c0..i * cols + c1].copy_from_slice(&part[i * width..(i + 1) * width]);
+            }
+        }
+    }
+
     fn solve(&self, x: &mut [T]) {
         self.forward(x);
         for (x, d) in x.iter_mut().zip(&self.dinv) {
@@ -171,34 +231,62 @@ impl<T: FloatT> Leaf<T> {
     }
 
     /// H = LDLᵀ, Y = L⁻¹B, contribution = YᵀD⁻¹Y accumulated into S = C - ΣYᵀZ.
+    /// `split`: the pool has more threads than leaves, so the border
+    /// columns of Y and of the contribution also run in parallel (each
+    /// column's arithmetic is unchanged, so results are bitwise identical).
     fn refactor(
         &mut self,
         t: usize,
         reg: Option<(T, T)>,
         regularize_count: &mut usize,
+        split: bool,
+        split_factor: bool,
     ) -> Result<(), &'static str> {
         let g = self.ids.len();
-        self.factor.factor(&self.h, 1, reg, regularize_count)?;
+        self.factor
+            .factor(&self.h, 1, reg, regularize_count, split_factor)?;
         self.y.copy_from_slice(&self.b);
-        for j in 0..t {
-            self.factor.forward(&mut self.y[j * g..(j + 1) * g]);
+        if split && g > 0 {
+            let factor = &self.factor;
+            self.y
+                .par_chunks_mut(g)
+                .for_each(|column| factor.forward(column));
+        } else {
+            for j in 0..t {
+                self.factor.forward(&mut self.y[j * g..(j + 1) * g]);
+            }
         }
         for j in 0..t {
             for i in 0..g {
                 self.z[i + j * g] = self.y[i + j * g] * self.factor.dinv[i];
             }
         }
-        for j in 0..t {
-            for i in 0..=j {
-                let s = T::dot_fma((0..g).map(|k| (&self.y[k + i * g], &self.z[k + j * g])));
-                self.contribution[i + j * t] = s;
-                self.contribution[j + i * t] = s;
+        let (y, z) = (&self.y, &self.z);
+        let entry = |i: usize, j: usize| T::dot_fma((0..g).map(|k| (&y[k + i * g], &z[k + j * g])));
+        if split {
+            let columns: Vec<Vec<T>> = (0..t)
+                .into_par_iter()
+                .map(|j| (0..=j).map(|i| entry(i, j)).collect())
+                .collect();
+            for (j, column) in columns.into_iter().enumerate() {
+                for (i, s) in column.into_iter().enumerate() {
+                    self.contribution[i + j * t] = s;
+                    self.contribution[j + i * t] = s;
+                }
+            }
+        } else {
+            for j in 0..t {
+                for i in 0..=j {
+                    let s = entry(i, j);
+                    self.contribution[i + j * t] = s;
+                    self.contribution[j + i * t] = s;
+                }
             }
         }
         Ok(())
     }
 
-    fn first_many(&mut self, rhs: &[T], n: usize, cols: usize) {
+    fn first_many(&mut self, rhs: &[T], n: usize, cols: usize, chunks: usize) {
         let g = self.ids.len();
         self.batch_w.resize(g * cols, T::zero());
         self.batch_v.resize(g * cols, T::zero());
@@ -207,14 +295,19 @@ impl<T: FloatT> Leaf<T> {
                 self.batch_w[i * cols + c] = rhs[c * n + id];
             }
         }
-        self.factor.forward_many(&mut self.batch_w, cols);
+        if chunks > 1 {
+            self.factor
+                .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::forward_many);
+        } else {
+            self.factor.forward_many(&mut self.batch_w, cols);
+        }
         for i in 0..g {
             for c in 0..cols {
                 self.batch_v[i * cols + c] = self.batch_w[i * cols + c] * self.factor.dinv[i];
             }
         }
     }
-    fn second_many(&mut self, xt: &[T], cols: usize) {
+    fn second_many(&mut self, xt: &[T], cols: usize, chunks: usize) {
         let g = self.ids.len();
         for i in 0..g {
             for c in 0..cols {
@@ -224,7 +317,12 @@ impl<T: FloatT> Leaf<T> {
                 self.batch_w[i * cols + c] = (self.batch_w[i * cols + c] - s) * self.factor.dinv[i];
             }
         }
-        self.factor.backward_many(&mut self.batch_w, cols);
+        if chunks > 1 {
+            self.factor
+                .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::backward_many);
+        } else {
+            self.factor.backward_many(&mut self.batch_w, cols);
+        }
     }
 
     fn first_solve(&mut self, rhs: &[T]) {
@@ -281,6 +379,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return None;
         }
         let mut parent: Vec<usize> = (0..n).collect();
+        // Stored positive-positive entries (upper triangle with diagonal).
+        let mut positive_entries = 0usize;
         for j in 0..n {
             for q in k.colptr[j]..k.colptr[j + 1] {
                 let i = k.rowval[q];
@@ -291,6 +391,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                     return None;
                 }
                 if signs[i] > 0 && signs[j] > 0 {
+                    positive_entries += 1;
                     let a = find(&mut parent, i);
                     let b = find(&mut parent, j);
                     parent[a] = b;
@@ -330,6 +431,14 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let leaf_work: u128 = groups.iter().map(|g| (g.len() as u128).pow(3)).sum();
         let border_work = n_pos * (t as u128).pow(2) + (t as u128).pow(3);
         let work_ok = border_work <= 24 * leaf_work.max(1);
+        // A single leaf pays only when it is a large dense block (an owner
+        // rank holding one sampled PSD block): the dense, pool-parallel leaf
+        // factor then replaces scalar sparse LDL. Sparse single components
+        // (e.g. a connected LP) stay on the sparse backend.
+        let leaves_ok = groups.len() >= 2
+            || groups.first().is_some_and(|g| {
+                g.len() >= SINGLE_LEAF_MIN && 2 * positive_entries >= g.len() * (g.len() + 1) / 2
+            });
         if crate::receipt::profile_requested() {
             // Observation-only grouping stats (plan PR-06): positive-sign
             // components, leaf size spread, border size, leaf-border coupling
@@ -347,12 +456,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 sizes.get(sizes.len() / 2).copied().unwrap_or(0),
                 sizes.last().copied().unwrap_or(0),
                 cells as f64 * std::mem::size_of::<T>() as f64 / 1048576.0,
-                groups.len() >= 2
+                leaves_ok
                     && work_ok
                     && cells * std::mem::size_of::<T>() as u128 <= ARROW_MAX_BYTES,
             );
         }
-        if groups.len() < 2 {
+        if !leaves_ok {
             return None;
         }
         if !work_ok {
@@ -490,6 +599,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         ));
         let t = self.trunk.len();
         let leaves_ok = if let Some(pool) = &self.pool {
+            let threads = pool.current_num_threads();
+            let split = threads > self.leaves.len();
+            let split_factor = threads >= SPLIT_FACTOR_THREADS_PER_LEAF * self.leaves.len();
             // Regularization counts are diagnostic only; accumulate per-leaf
             // counts after the parallel section to stay deterministic.
             let mut counts = vec![0usize; self.leaves.len()];
@@ -497,7 +609,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 self.leaves
                     .par_iter_mut()
                     .zip(counts.par_iter_mut())
-                    .map(|(leaf, c)| leaf.refactor(t, reg, c))
+                    .map(|(leaf, c)| leaf.refactor(t, reg, c, split, split_factor))
                     .collect::<Result<Vec<_>, _>>()
             });
             self.regularize_count += counts.iter().sum::<usize>();
@@ -506,7 +618,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             let count = &mut self.regularize_count;
             self.leaves
                 .iter_mut()
-                .try_for_each(|leaf| leaf.refactor(t, reg, count))
+                .try_for_each(|leaf| leaf.refactor(t, reg, count, false, false))
                 .is_ok()
         };
         if !leaves_ok {
@@ -520,7 +632,15 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             }
         }
         let mut border_count = 0usize;
-        let ok = self.tf.factor(&self.s, -1, reg, &mut border_count).is_ok();
+        // Every pool thread is idle during the border factor.
+        let (tf, s) = (&mut self.tf, &self.s);
+        let ok = match &self.pool {
+            Some(pool) if tf.n >= SPLIT_BORDER_FACTOR_MIN => {
+                pool.install(|| tf.factor(s, -1, reg, &mut border_count, true))
+            }
+            _ => tf.factor(s, -1, reg, &mut border_count, false),
+        }
+        .is_ok();
         self.regularize_count += border_count;
         ok
     }
@@ -545,6 +665,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
 
     fn solve_arrow(&mut self, x: &mut [T], b: &[T]) {
         let t = self.trunk.len();
+        let timer = crate::receipt::start();
         if let Some(pool) = &self.pool {
             pool.install(|| self.leaves.par_iter_mut().for_each(|l| l.first_solve(b)));
         } else {
@@ -552,16 +673,29 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 leaf.first_solve(b);
             }
         }
-        for (v, &i) in self.tx.iter_mut().zip(&self.trunk) {
-            *v = b[i];
-        }
-        for leaf in &self.leaves {
-            let g = leaf.ids.len();
-            for j in 0..t {
-                self.tx[j] -= T::dot_fma((0..g).map(|i| (&leaf.y[i + j * g], &leaf.v[i])));
+        crate::receipt::finish("arrow.leaf_forward", timer);
+        let timer = crate::receipt::start();
+        // Trunk coupling: each entry subtracts the leaves' dots in leaf
+        // order, so splitting over entries keeps every value bitwise equal.
+        let leaves = &self.leaves;
+        let couple = |(j, v): (usize, &mut T)| {
+            *v = b[self.trunk[j]];
+            for leaf in leaves {
+                let g = leaf.ids.len();
+                *v -= T::dot_fma((0..g).map(|i| (&leaf.y[i + j * g], &leaf.v[i])));
             }
+        };
+        match &self.pool {
+            Some(pool) if t > 1 => {
+                pool.install(|| self.tx.par_iter_mut().enumerate().for_each(couple))
+            }
+            _ => self.tx.iter_mut().enumerate().for_each(couple),
         }
+        crate::receipt::finish("arrow.couple", timer);
+        let timer = crate::receipt::start();
         self.tf.solve(&mut self.tx);
+        crate::receipt::finish("arrow.trunk", timer);
+        let timer = crate::receipt::start();
         let tx = &self.tx;
         if let Some(pool) = &self.pool {
             pool.install(|| self.leaves.par_iter_mut().for_each(|l| l.second_solve(tx)));
@@ -578,6 +712,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         for (&id, &value) in self.trunk.iter().zip(&self.tx) {
             x[id] = value;
         }
+        crate::receipt::finish("arrow.leaf_backward", timer);
     }
 }
 
@@ -643,32 +778,48 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
             return;
         }
         self.batch_tx.resize(t * cols, T::zero());
+        // Spare threads (more than leaves) split each leaf's columns; keep
+        // at least four columns per chunk.
+        let chunks = self.pool.as_ref().map_or(1, |pool| {
+            pool.current_num_threads()
+                .div_ceil(self.leaves.len().max(1))
+                .min(cols / 4)
+                .max(1)
+        });
         if let Some(pool) = &self.pool {
             pool.install(|| {
                 self.leaves
                     .par_iter_mut()
-                    .for_each(|l| l.first_many(b, n, cols))
+                    .for_each(|l| l.first_many(b, n, cols, chunks))
             });
         } else {
             self.leaves
                 .iter_mut()
-                .for_each(|l| l.first_many(b, n, cols));
+                .for_each(|l| l.first_many(b, n, cols, 1));
         }
+        // Trunk coupling over entries (j, c): each subtracts the leaves' dots
+        // in leaf order, so splitting over trunk rows keeps values bitwise.
         let tx = &mut self.batch_tx;
-        for (j, &id) in self.trunk.iter().enumerate() {
-            for c in 0..cols {
-                tx[j * cols + c] = b[c * n + id];
+        let (leaves, trunk) = (&self.leaves, &self.trunk);
+        let rhs: &[T] = b;
+        let couple = |(j, row): (usize, &mut [T])| {
+            for (c, v) in row.iter_mut().enumerate() {
+                *v = rhs[c * n + trunk[j]];
             }
-        }
-        for leaf in &self.leaves {
-            let g = leaf.ids.len();
-            for j in 0..t {
-                for c in 0..cols {
-                    tx[j * cols + c] -= T::dot_fma(
+            for leaf in leaves {
+                let g = leaf.ids.len();
+                for (c, v) in row.iter_mut().enumerate() {
+                    *v -= T::dot_fma(
                         (0..g).map(|i| (&leaf.y[i + j * g], &leaf.batch_v[i * cols + c])),
                     );
                 }
             }
+        };
+        match &self.pool {
+            Some(pool) if t > 1 => {
+                pool.install(|| tx.par_chunks_mut(cols).enumerate().for_each(couple))
+            }
+            _ => tx.chunks_mut(cols).enumerate().for_each(couple),
         }
         self.tf.forward_many(tx, cols);
         for j in 0..t {
@@ -681,10 +832,12 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
             pool.install(|| {
                 self.leaves
                     .par_iter_mut()
-                    .for_each(|l| l.second_many(tx, cols))
+                    .for_each(|l| l.second_many(tx, cols, chunks))
             });
         } else {
-            self.leaves.iter_mut().for_each(|l| l.second_many(tx, cols));
+            self.leaves
+                .iter_mut()
+                .for_each(|l| l.second_many(tx, cols, 1));
         }
         for leaf in &self.leaves {
             for (i, &id) in leaf.ids.iter().enumerate() {
@@ -734,7 +887,10 @@ mod tests {
         let settings = CoreSettings::<T>::default();
         let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings).unwrap();
         assert!(solver.refactor(&k));
-        for workers in [1, 4, 1] {
+        // 16 workers over 3 leaves split the refactor's border columns and
+        // chunk the 8/16-column panels; every result must stay bitwise equal.
+        let mut reference: Vec<Vec<T>> = Vec::new();
+        for (round, workers) in [1, 4, 16, 1].into_iter().enumerate() {
             solver.set_pool((workers > 1).then(|| {
                 Arc::new(
                     rayon::ThreadPoolBuilder::new()
@@ -743,7 +899,8 @@ mod tests {
                         .unwrap(),
                 )
             }));
-            for cols in [1, 3, 2] {
+            assert!(solver.refactor(&k));
+            for (case, cols) in [1, 3, 2, 8, 16].into_iter().enumerate() {
                 let rhs: Vec<T> = (0..cols * k.n)
                     .map(|i| T::from_f64((i as f64 - 5.) / 8.).unwrap())
                     .collect();
@@ -753,6 +910,11 @@ mod tests {
                     let mut single = vec![T::zero(); k.n];
                     solver.solve(&k, &mut single, &mut rhs[c * k.n..(c + 1) * k.n].to_vec());
                     assert_eq!(single, out[c * k.n..(c + 1) * k.n]);
+                }
+                if round == 0 {
+                    reference.push(out);
+                } else {
+                    assert_eq!(reference[case], out);
                 }
             }
         }
@@ -769,6 +931,80 @@ mod tests {
         solver.solve(&k, &mut single, &mut rhs[..k.n].to_vec());
         assert_eq!(single, out[..k.n]);
         assert_eq!(single, out[k.n..]);
+    }
+    fn split_factor_parity<T: FloatT>() {
+        let n = 80;
+        let mut a = vec![T::zero(); n * n];
+        for j in 0..n {
+            for i in j..n {
+                let v = if i == j {
+                    n as f64 + (i % 7) as f64
+                } else {
+                    ((i * 31 + j * 17) % 13) as f64 / 13.0 - 0.5
+                };
+                a[i + j * n] = T::from_f64(v).unwrap();
+            }
+        }
+        let mut serial = DenseLeaf::<T>::new(n);
+        let mut count = 0;
+        serial.factor(&a, 1, None, &mut count, false).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        let mut split = DenseLeaf::<T>::new(n);
+        pool.install(|| split.factor(&a, 1, None, &mut count, true))
+            .unwrap();
+        assert_eq!(serial.l, split.l);
+        assert_eq!(serial.dinv, split.dinv);
+    }
+    #[test]
+    fn arrow_single_dense_leaf() {
+        // One dense 20-row leaf plus a two-row border: admitted and exact.
+        let (g, t) = (20usize, 2usize);
+        let n = g + t;
+        let mut colptr = vec![0usize];
+        let (mut rowval, mut nzval) = (Vec::new(), Vec::new());
+        for j in 0..n {
+            for i in 0..=j {
+                let v = if j < g {
+                    if i == j {
+                        2.0 * g as f64
+                    } else {
+                        ((i * 7 + j * 3) % 5) as f64 / 5.0 - 0.4
+                    }
+                } else if i < g {
+                    ((i + j) % 3) as f64 / 3.0
+                } else if i == j {
+                    -3.0
+                } else {
+                    0.1
+                };
+                rowval.push(i);
+                nzval.push(v);
+            }
+            colptr.push(rowval.len());
+        }
+        let k = CscMatrix::new(n, n, colptr, rowval, nzval);
+        let signs: Vec<i8> = (0..n).map(|i| if i < g { 1 } else { -1 }).collect();
+        let settings = CoreSettings::<f64>::default();
+        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings).unwrap();
+        assert!(solver.refactor(&k) && solver.use_arrow);
+        let b: Vec<f64> = (0..n).map(|i| (i as f64 - 7.0) / 5.0).collect();
+        let mut x = vec![0.0; n];
+        solver.solve(&k, &mut x, &mut b.clone());
+        let expect = reference_solve(&k, &b);
+        for i in 0..n {
+            assert!((x[i] - expect[i]).abs() < 1e-10, "{x:?} != {expect:?}");
+        }
+    }
+    #[test]
+    fn arrow_split_factor_f64() {
+        split_factor_parity::<f64>();
+    }
+    #[test]
+    fn arrow_split_factor_512() {
+        split_factor_parity::<MpFloat<8>>();
     }
     #[test]
     fn arrow_batch_f64() {

@@ -86,6 +86,63 @@ fn structural_finish(mut hash: u64) -> u64 {
     }
 }
 
+/// Components above this count keep the plain LPT plan (refinement is
+/// quadratic in the busiest owner's members).
+const REFINE_COMPONENTS: usize = 4096;
+
+/// Improve an LPT plan by moving or swapping one component between the
+/// busiest owner and another while that strictly lowers the pair's maximum.
+/// Each step strictly lowers the sum of squared loads, so it terminates;
+/// the scan order is fixed, so the plan is deterministic.
+fn refine_assignment(roots: &[usize], work: &[u128], owners: usize, assigned: &mut [usize]) {
+    if owners < 2 {
+        return;
+    }
+    let mut members = vec![Vec::new(); owners];
+    let mut loads = vec![0u128; owners];
+    for &root in roots {
+        members[assigned[root]].push(root);
+        loads[assigned[root]] += work[root];
+    }
+    for _ in 0..roots.len().saturating_mul(owners) {
+        let hi = (0..owners)
+            .max_by(|&a, &b| loads[a].cmp(&loads[b]).then_with(|| b.cmp(&a)))
+            .unwrap();
+        // (new pair maximum, lo, index in hi, index in lo or none)
+        let mut best: Option<(u128, usize, usize, Option<usize>)> = None;
+        for lo in (0..owners).filter(|&lo| lo != hi) {
+            for (ia, &a) in members[hi].iter().enumerate() {
+                let candidates = std::iter::once(None).chain((0..members[lo].len()).map(Some));
+                for ib in candidates {
+                    let back = ib.map_or(0, |ib| work[members[lo][ib]]);
+                    if work[a] <= back {
+                        continue;
+                    }
+                    let delta = work[a] - back;
+                    let peak = (loads[hi] - delta).max(loads[lo] + delta);
+                    if peak < loads[hi] && best.is_none_or(|(value, ..)| peak < value) {
+                        best = Some((peak, lo, ia, ib));
+                    }
+                }
+            }
+        }
+        let Some((_, lo, ia, ib)) = best else {
+            break;
+        };
+        let a = members[hi].swap_remove(ia);
+        let back = ib.map(|ib| members[lo].swap_remove(ib));
+        let delta = work[a] - back.map_or(0, |b| work[b]);
+        loads[hi] -= delta;
+        loads[lo] += delta;
+        assigned[a] = lo;
+        members[lo].push(a);
+        if let Some(b) = back {
+            assigned[b] = hi;
+            members[hi].push(b);
+        }
+    }
+}
+
 impl OwnerLayout {
     pub(crate) fn new<T: FloatT>(
         data: &DefaultProblemData<T>,
@@ -343,15 +400,34 @@ impl OwnerLayout {
                 loads[owner] += historical_by_root[root];
             }
         } else {
-            // Keep the no-history path byte-for-byte equivalent to the
-            // structural u128 LPT assignment used before historical costs.
+            // Per-iteration dense work grows cubically with a component's
+            // size: the leaf LDLᵀ over its columns and the SVD/eig of its PSD
+            // cones. The linear structural weight undercounts large blocks
+            // (Λ19 spins 0–50 on 8 owners: 1.13× the mean cubic work on the
+            // busiest owner), so balance a cubic estimate instead.
+            let mut work = vec![0u128; count];
+            let mut columns = vec![0u128; count];
+            for &root in &roots[..n] {
+                columns[root] += 1;
+            }
+            for &root in &component_roots {
+                work[root] = columns[root].pow(3) + cost[root];
+            }
+            for (i, unit) in units.iter().enumerate() {
+                if let SupportedConeT::PSDTriangleConeT(side) = &data.cones[unit.original] {
+                    work[roots[n + i]] += 8 * (*side as u128).pow(3);
+                }
+            }
             let mut order: Vec<_> = component_roots.clone();
-            order.sort_by_key(|&i| (Reverse(cost[i]), i));
+            order.sort_by_key(|&i| (Reverse(work[i]), i));
             let mut queue: BinaryHeap<_> = (0..owners).map(|i| Reverse((0u128, i))).collect();
             for root in order {
                 let Reverse((load, owner)) = queue.pop().unwrap();
                 assigned[root] = owner;
-                queue.push(Reverse((load + cost[root], owner)));
+                queue.push(Reverse((load + work[root], owner)));
+            }
+            if component_roots.len() <= REFINE_COMPONENTS {
+                refine_assignment(&component_roots, &work, owners, &mut assigned);
             }
         }
         let mut owner_structural_weights = vec![0u128; owners];

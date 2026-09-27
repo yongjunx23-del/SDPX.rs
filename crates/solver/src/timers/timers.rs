@@ -179,11 +179,13 @@ impl Timers {
 macro_rules! timeit {
     ($timer:ident => $key:literal; $($tt:tt)+) => {
 
+        let __cpu = $crate::receipt::cpu_start();
         $timer.start_as_current($key);
         $(
             $tt
         )+
         $timer.stop_current();
+        $crate::receipt::cpu_finish(concat!("cpu.", $key), concat!("wall.", $key), __cpu);
     }
 }
 pub(crate) use timeit;

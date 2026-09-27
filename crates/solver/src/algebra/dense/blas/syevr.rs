@@ -146,7 +146,6 @@ where
         self.λ[0] = A[(0, 0)];
         Ok(())
     }
-
 }
 
 // implementation for 2x2 matrices
@@ -168,7 +167,6 @@ where
         self.λ.copy_from_slice(&e);
         Ok(())
     }
-
 }
 
 // implementation for 3x3 matrices
@@ -190,7 +188,6 @@ where
         self.λ.copy_from_slice(&e);
         Ok(())
     }
-
 }
 
 // implementation for arbitrary size matrices

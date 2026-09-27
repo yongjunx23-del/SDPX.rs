@@ -249,6 +249,46 @@ impl<T> SVDEngine<T>
 where
     T: FloatT,
 {
+    /// Singular values and right singular vectors (`Vt`) only; `U` is left
+    /// unspecified. Skipping the left vectors removes their rotation
+    /// accumulation and reflector reconstruction for callers that can
+    /// recover the left factor algebraically.
+    pub(crate) fn factor_right<S>(
+        &mut self,
+        A: &mut DenseStorageMatrix<S, T>,
+    ) -> Result<(), DenseFactorizationError>
+    where
+        S: AsMut<[T]> + AsRef<[T]>,
+    {
+        self.checkdim_factor(A)?;
+        if A.is_square() && A.nrows() <= 3 {
+            return self.factor(A);
+        }
+        let m: i32 = self.U.nrows().try_into().unwrap();
+        let n: i32 = self.Vt.ncols().try_into().unwrap();
+        let ldvt = min(m, n);
+        let blaswork = self.blas.get_or_insert_with(SVDBlasWorkVectors::default);
+        let (a, s, u, vt) = (
+            A.data_mut(),
+            &mut self.s,
+            self.U.data_mut(),
+            self.Vt.data_mut(),
+        );
+        let (work, info) = (&mut blaswork.work, &mut 0_i32);
+        let mut lwork = -1_i32;
+        for i in 0..2 {
+            T::xgesvd(b'N', b'S', m, n, a, m, s, u, 1, vt, ldvt, work, lwork, info);
+            if *info != 0 {
+                return Err(DenseFactorizationError::SVD(*info));
+            }
+            if i == 0 {
+                lwork = work[0].to_i32().unwrap();
+                work.resize(lwork as usize, T::zero());
+            }
+        }
+        Ok(())
+    }
+
     fn factorblas<S>(
         &mut self,
         A: &mut DenseStorageMatrix<S, T>,

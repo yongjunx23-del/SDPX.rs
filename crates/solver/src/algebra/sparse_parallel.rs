@@ -164,8 +164,26 @@ impl SparseParallel {
         world: Option<crate::mpi::World>,
     ) {
         if let Some(world) = world {
-            self.product_sharded(a, true, rx, z, -T::one(), T::zero(), world, crate::mpi::SITE_RX);
-            self.product_sharded(a, false, rz, x, T::one(), T::one(), world, crate::mpi::SITE_RZ);
+            self.product_sharded(
+                a,
+                true,
+                rx,
+                z,
+                -T::one(),
+                T::zero(),
+                world,
+                crate::mpi::SITE_RX,
+            );
+            self.product_sharded(
+                a,
+                false,
+                rz,
+                x,
+                T::one(),
+                T::one(),
+                world,
+                crate::mpi::SITE_RZ,
+            );
             return;
         }
         if let Some(pool) = &self.pool {
@@ -255,7 +273,9 @@ impl SparseParallel {
             if let Some(pool) = &self.pool {
                 let base = o0;
                 pool.install(|| {
-                    split_outputs(&mut local, &lanes, &|offset, value| compute(base + offset, value))
+                    split_outputs(&mut local, &lanes, &|offset, value| {
+                        compute(base + offset, value)
+                    })
                 });
             }
         } else {

@@ -1737,7 +1737,7 @@ dependencies = [
 
 [[package]]
 name = "sdpx-arithmetic"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "gmp-mpfr-sys",
  "num-traits",
@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "sdpx-ffi"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "sdpx-arithmetic",
  "sdpx-solver",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "sdpx-solver"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "amd",
  "blas",
@@ -1765,11 +1765,13 @@ dependencies = [
  "enum_dispatch",
  "faer",
  "faer-traits",
+ "gemm",
  "indexmap",
  "intel-mkl-src",
  "itertools",
  "lapack",
  "lapack-src",
+ "libc",
  "netlib-src",
  "num-traits",
  "openblas-src",

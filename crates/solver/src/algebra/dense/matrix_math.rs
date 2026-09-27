@@ -205,6 +205,46 @@ where
     }
 }
 
+/// Exact symmetric congruence `c = a·x·aᵀ` (`aᵀ·x·a` with `transpose_a`),
+/// rounded once, when the residue kernel applies; the upper triangle is
+/// mirrored. `false` leaves `c` untouched for the caller's two-product path.
+pub(crate) fn congruence_exact_sym<T: FloatT>(
+    c: &mut Matrix<T>,
+    a: &Matrix<T>,
+    transpose_a: bool,
+    x: &Matrix<T>,
+    pool: Option<&rayon::ThreadPool>,
+    cache_a: Option<&mut ResidueCache>,
+) -> bool {
+    let (m, k) = if transpose_a {
+        (a.ncols(), a.nrows())
+    } else {
+        (a.nrows(), a.ncols())
+    };
+    let ta = if transpose_a { b'T' } else { b'N' };
+    if !T::xcongruence_exact(
+        ta,
+        m,
+        k,
+        a.data(),
+        a.nrows(),
+        x.data(),
+        x.nrows(),
+        c.data_mut(),
+        true,
+        pool,
+        cache_a,
+    ) {
+        return false;
+    }
+    for j in 0..m {
+        for i in j + 1..m {
+            c[(i, j)] = c[(j, i)];
+        }
+    }
+    true
+}
+
 /// `a·b` when the exact-arithmetic product is symmetric. Only the upper
 /// triangle is evaluated and then mirrored — the same ascending-k accumulation
 /// order as a dense `mul`, so upper entries stay bitwise identical while the
@@ -214,6 +254,21 @@ pub(crate) fn pooled_gemm_sym<T: FloatT, MATA, MATB>(
     a: &MATA,
     b: &MATB,
     gemm: Option<(&rayon::ThreadPool, usize)>,
+) where
+    MATA: DenseMatrix<T>,
+    MATB: DenseMatrix<T>,
+{
+    pooled_gemm_sym_cached(c, a, b, gemm, None)
+}
+
+/// [`pooled_gemm_sym`] with `b` a constant operand whose residues may be kept
+/// in `cache_b` across calls (the cache checks the operand's exact bits).
+pub(crate) fn pooled_gemm_sym_cached<T: FloatT, MATA, MATB>(
+    c: &mut Matrix<T>,
+    a: &MATA,
+    b: &MATB,
+    gemm: Option<(&rayon::ThreadPool, usize)>,
+    cache_b: Option<&mut ResidueCache>,
 ) where
     MATA: DenseMatrix<T>,
     MATB: DenseMatrix<T>,
@@ -235,12 +290,33 @@ pub(crate) fn pooled_gemm_sym<T: FloatT, MATA, MATB>(
     let lda = if a.shape() == MatrixShape::N { m } else { k };
     let ldb = if b.shape() == MatrixShape::N { k } else { n };
     let (adata, bdata) = (a.data(), b.data());
-    let ae = |i: usize, p: usize| -> &T {
-        &adata[if ta == b'N' { i + p * lda } else { p + i * lda }]
-    };
-    let be = |p: usize, j: usize| -> &T {
-        &bdata[if tb == b'N' { p + j * ldb } else { j + p * ldb }]
-    };
+    // Exact residue-BLAS product: same correctly rounded values as the
+    // per-entry exact dots below.
+    if T::xgemm_upper_exact(
+        ta,
+        tb,
+        m,
+        n,
+        k,
+        adata,
+        lda,
+        bdata,
+        ldb,
+        c.data_mut(),
+        gemm.map(|(p, _)| p),
+        cache_b,
+    ) {
+        for j in 0..n {
+            for i in j + 1..n {
+                c[(i, j)] = c[(j, i)];
+            }
+        }
+        return;
+    }
+    let ae =
+        |i: usize, p: usize| -> &T { &adata[if ta == b'N' { i + p * lda } else { p + i * lda }] };
+    let be =
+        |p: usize, j: usize| -> &T { &bdata[if tb == b'N' { p + j * ldb } else { j + p * ldb }] };
     let column = |j: usize, col: &mut [T]| {
         for i in 0..=j {
             col[i] = T::dot_fma((0..k).map(|p| (ae(i, p), be(p, j))));

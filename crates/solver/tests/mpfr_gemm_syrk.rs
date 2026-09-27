@@ -6,10 +6,10 @@
 #[allow(dead_code)]
 #[path = "../src/algebra/dense/blas/traits.rs"]
 mod provider;
-use sdpx_solver::algebra;
 use num_traits::{FromPrimitive, One, Zero};
 use provider::{XgemmScalar, XsyrkScalar};
 use sdpx_arithmetic::{MpFloat, Scalar};
+use sdpx_solver::algebra;
 type F<const N: usize> = MpFloat<N>;
 type Oracle = F<128>;
 

@@ -109,6 +109,9 @@ pub struct DirectLDLKKTSolver<T> {
     residual_plan: Option<SparseParallel>,
     #[cfg(feature = "sdp")]
     residual_dense: Option<Matrix<T>>,
+    /// Full symmetric row lists of the KKT for exact residuals (MPFR only).
+    exact_rows: Option<ExactRows>,
+    residual_pool: Option<std::sync::Arc<rayon::ThreadPool>>,
 }
 
 impl<T> DirectLDLKKTSolver<T>
@@ -183,6 +186,8 @@ where
             residual_plan: None,
             #[cfg(feature = "sdp")]
             residual_dense: None,
+            exact_rows: None,
+            residual_pool: None,
         }
     }
 }
@@ -243,8 +248,10 @@ where
         };
         self.counters.rhs_applied += 1;
         self.counters.linear_solves += 1;
+        let __c0 = crate::receipt::cpu_start();
         self.ldlsolver.solve(&self.KKT, &mut self.x, &mut self.b);
         let __t_trsv = __t0.elapsed();
+        crate::receipt::cpu_add("trsv", __c0);
         #[cfg(feature = "snapshot")]
         if let Some((idx, rhs)) = snap {
             let ok = self.x.is_finite();
@@ -267,7 +274,9 @@ where
         }
         let is_success = {
             if settings.iterative_refinement_enable {
+                let __c_ir = crate::receipt::cpu_start();
                 let r = self.iterative_refinement(settings);
+                crate::receipt::cpu_add("ir", __c_ir);
                 if crate::receipt::profile_requested() {
                     eprintln!("PHASE trsv {:?} ir {:?}", __t_trsv, __t0.elapsed());
                 }
@@ -501,10 +510,12 @@ where
 
         // Refactor with the (possibly) shifted values.
         let __t0 = std::time::Instant::now();
+        let __c0 = crate::receipt::cpu_start();
         self.counters.factor_attempts += 1;
         let is_success = self.ldlsolver.refactor(KKT);
         self.counters.factorizations += u64::from(is_success);
         crate::receipt::phase("refactor", __t0.elapsed());
+        crate::receipt::cpu_add("refactor", __c0);
 
         if applied_shift {
             // The factor backend intentionally retains the shifted values,
@@ -584,6 +595,9 @@ where
         assert_eq!(out.len(), rhs.len());
         let KKTsym = self.KKT.sym(self.KKTuplo);
         let plan = self.residual_plan.as_ref();
+        if let Some(rows) = &self.exact_rows {
+            return rows.residual(out, rhs, &self.KKT, point, self.residual_pool.as_deref());
+        }
         #[cfg(feature = "sdp")]
         {
             let dense = self.residual_dense.as_ref();
@@ -624,6 +638,7 @@ where
         let pool = pool.filter(|p| {
             p.current_num_threads() > 1 && work >= 4096 * p.current_num_threads() as u128
         });
+        self.residual_pool = pool.clone();
         if pool.is_some() && self.residual_plan.is_none() {
             self.residual_plan = Some(SparseParallel::new_symmetric(&self.KKT));
         }
@@ -648,13 +663,31 @@ where
         let plan = self.residual_plan.as_ref();
         let normb = b.norm_inf();
 
+        if T::precision_bits() > 64
+            && self
+                .exact_rows
+                .as_ref()
+                .map_or(true, |r| r.entries.len() != r.expected(&self.KKT))
+        {
+            self.exact_rows = Some(ExactRows::new(KKT));
+        }
+        let exact = self.exact_rows.as_ref();
+        let pool = self.residual_pool.as_deref();
         #[cfg(feature = "sdp")]
         let dense = self.residual_dense.as_ref();
-        #[cfg(feature = "sdp")]
-        let error =
-            |e: &mut [T], x: &mut [T]| _get_refine_error_dense(e, b, &KKTsym, x, plan, dense);
-        #[cfg(not(feature = "sdp"))]
-        let error = |e: &mut [T], x: &mut [T]| _get_refine_error(e, b, &KKTsym, x, plan);
+        let error = |e: &mut [T], x: &mut [T]| -> T {
+            if let Some(rows) = exact {
+                return rows.residual(e, b, KKT, x, pool);
+            }
+            #[cfg(feature = "sdp")]
+            {
+                _get_refine_error_dense(e, b, &KKTsym, x, plan, dense)
+            }
+            #[cfg(not(feature = "sdp"))]
+            {
+                _get_refine_error(e, b, &KKTsym, x, plan)
+            }
+        };
         //compute the initial error
         let mut norme = error(e, x);
 
@@ -662,9 +695,12 @@ where
             return false;
         }
 
-        for _ in 0..maxiter {
+        for pass in 0..maxiter {
             if norme <= (abstol + reltol * normb) {
                 //within tolerance.  Exit
+                if trace_ir() {
+                    eprintln!("IRI converged pass={pass}");
+                }
                 break;
             }
 
@@ -673,19 +709,33 @@ where
             //make a refinement
             self.counters.linear_solves += 1;
             self.counters.refinements += 1;
+            let timer = crate::receipt::start();
             self.ldlsolver.solve(KKT, dx, e);
+            crate::receipt::finish("ir.solve", timer);
 
             //prospective solution is x + dx.  Use dx space to
             // hold it for a check before applying to x
             dx.axpby(T::one(), x, T::one());
 
+            let timer = crate::receipt::start();
             norme = error(e, dx);
+            crate::receipt::finish("ir.residual", timer);
 
             if !norme.is_finite() {
                 return false;
             }
 
             let improved_ratio = lastnorme / norme;
+            if trace_ir() {
+                eprintln!(
+                    "IRI pass={} before={:.3e} after={:.3e} ratio={:.3e} normb={:.3e}",
+                    self.counters.refinements,
+                    lastnorme.to_f64().unwrap_or(f64::NAN),
+                    norme.to_f64().unwrap_or(f64::NAN),
+                    improved_ratio.to_f64().unwrap_or(f64::NAN),
+                    normb.to_f64().unwrap_or(f64::NAN),
+                );
+            }
             if improved_ratio < stopratio {
                 //insufficient improvement.  Exit
                 if improved_ratio > T::one() {
@@ -700,6 +750,12 @@ where
     }
 }
 
+/// Diagnostic trace of inner refinement passes (`SDPX_TRACE_IR`).
+fn trace_ir() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SDPX_TRACE_IR").is_some())
+}
+
 fn _compute_regularizer<T: FloatT>(diag_kkt: &[T], settings: &CoreSettings<T>) -> T {
     let maxdiag = diag_kkt.norm_inf();
 
@@ -709,6 +765,118 @@ fn _compute_regularizer<T: FloatT>(diag_kkt: &[T], settings: &CoreSettings<T>) -
 
 //  computes e = b - Kξ, overwriting the first argument
 //  and returning its norm
+
+/// Row lists of a symmetric KKT stored as one CSC triangle, for residuals
+/// `b - K x` accumulated exactly and rounded once per row (Wilkinson
+/// refinement with an extra-precise residual). A per-product rounding leaves
+/// an error of eps·Σ|K_ij x_j|, which for badly scaled bootstrap systems
+/// (|x| up to 1e80+) exceeds the residual itself and stalls refinement; the
+/// exact residual keeps the error at eps·|e_i|.
+struct ExactRows {
+    ptr: Vec<usize>,
+    /// (nz position, column) for every entry of each full symmetric row.
+    entries: Vec<(usize, usize)>,
+}
+
+impl ExactRows {
+    fn new<T>(k: &CscMatrix<T>) -> Self {
+        let n = k.n;
+        let mut count = vec![0usize; n + 1];
+        for j in 0..n {
+            for p in k.colptr[j]..k.colptr[j + 1] {
+                let r = k.rowval[p];
+                count[r + 1] += 1;
+                if r != j {
+                    count[j + 1] += 1;
+                }
+            }
+        }
+        for i in 0..n {
+            count[i + 1] += count[i];
+        }
+        let ptr = count.clone();
+        let mut fill = count;
+        let mut entries = vec![(0usize, 0usize); ptr[n]];
+        for j in 0..n {
+            for p in k.colptr[j]..k.colptr[j + 1] {
+                let r = k.rowval[p];
+                entries[fill[r]] = (p, j);
+                fill[r] += 1;
+                if r != j {
+                    entries[fill[j]] = (p, r);
+                    fill[j] += 1;
+                }
+            }
+        }
+        Self { ptr, entries }
+    }
+
+    /// Entry count the current pattern implies (rebuild on mismatch).
+    fn expected<T>(&self, k: &CscMatrix<T>) -> usize {
+        let diag = (0..k.n)
+            .filter(|&j| k.rowval[k.colptr[j]..k.colptr[j + 1]].contains(&j))
+            .count();
+        2 * k.nzval.len() - diag
+    }
+
+    fn residual<T: FloatT>(
+        &self,
+        e: &mut [T],
+        b: &[T],
+        k: &CscMatrix<T>,
+        x: &[T],
+        pool: Option<&rayon::ThreadPool>,
+    ) -> T {
+        use rayon::prelude::*;
+        let neg: Vec<T> = x.iter().map(|&v| -v).collect();
+        let one = T::one();
+        let row = |i: usize| {
+            let terms = &self.entries[self.ptr[i]..self.ptr[i + 1]];
+            T::dot_fma(
+                std::iter::once((&b[i], &one))
+                    .chain(terms.iter().map(|&(p, j)| (&k.nzval[p], &neg[j]))),
+            )
+        };
+        match pool {
+            Some(pool) => {
+                // Border rows hold ~10x the entries of leaf rows; split by
+                // entry count (about four tasks per worker) so no task
+                // collects a run of long rows. Every row is unchanged.
+                let n = e.len();
+                let parts = (4 * pool.current_num_threads()).clamp(1, n.max(1));
+                let total = self.ptr[n];
+                let mut chunks: Vec<(usize, &mut [T])> = Vec::with_capacity(parts);
+                let (mut start, mut rest) = (0usize, &mut *e);
+                for p in 1..=parts {
+                    let end = if p == parts {
+                        n
+                    } else {
+                        self.ptr.partition_point(|&v| v < total * p / parts).min(n)
+                    };
+                    if end > start {
+                        let (chunk, tail) = std::mem::take(&mut rest).split_at_mut(end - start);
+                        chunks.push((start, chunk));
+                        rest = tail;
+                        start = end;
+                    }
+                }
+                pool.install(|| {
+                    chunks.into_par_iter().for_each(|(first, chunk)| {
+                        for (i, v) in chunk.iter_mut().enumerate() {
+                            *v = row(first + i);
+                        }
+                    })
+                })
+            }
+            None => e.iter_mut().enumerate().for_each(|(i, v)| *v = row(i)),
+        }
+        if e.is_finite() {
+            e.norm_inf()
+        } else {
+            T::infinity()
+        }
+    }
+}
 
 fn _get_refine_error<T: FloatT>(
     e: &mut [T],

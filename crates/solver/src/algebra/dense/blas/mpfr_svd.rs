@@ -15,24 +15,6 @@ pub(super) fn norm<const N: usize>(a: &[F<N>]) -> F<N> {
     // square root for the whole vector, rather than one hypot per element.
     crate::algebra::VectorMath::norm(a)
 }
-pub(super) fn rotate<const N: usize>(
-    a: &mut [F<N>],
-    rows: usize,
-    p: usize,
-    q: usize,
-    c: F<N>,
-    s: F<N>,
-) {
-    let ns = -s;
-    for i in 0..rows {
-        let x = a[i + p * rows];
-        let y = a[i + q * rows];
-        // A fixed two-product sum needs one rounding but no general dot
-        // accumulator or per-call scratch.
-        a[i + p * rows] = F::dot_fma2(&c, &x, &ns, &y);
-        a[i + q * rows] = F::dot_fma2(&s, &x, &c, &y);
-    }
-}
 // Work is owned and retained by the decomposition engine, as in COSMO's
 // PsdBlasWorkspace lifecycle: query once, resize, then reuse across factors.
 pub(super) fn take_work<'a, const N: usize>(
@@ -81,11 +63,99 @@ pub(super) fn givens<const N: usize>(x: F<N>, y: F<N>) -> (F<N>, F<N>, F<N>) {
         (x / r, y / r, r)
     }
 }
-pub(super) fn svd_rotate<const N: usize>(u: &mut [F<N>], rows: usize, p: usize, c: F<N>, s: F<N>) {
-    if !u.is_empty() {
-        rotate(u, rows, p, p + 1, c, -s);
+/// A Givens rotation of columns `p, p+1` of U (`v == false`) or V.
+#[derive(Clone, Copy)]
+pub(super) struct Rotation<const N: usize> {
+    v: bool,
+    p: usize,
+    c: F<N>,
+    s: F<N>,
+}
+
+/// Apply the logged rotations of one factor (`cols` columns of `rows`
+/// entries, column-major) in log order. Rows are independent: each row
+/// receives exactly the scalar operations of an in-place column rotation, in
+/// the same order, so the result is bitwise identical. The factor is processed
+/// as row-major rows (adjacent `p, p+1`), split across the ambient pool when
+/// inner parallelism is active.
+/// Per-thread reusable scratch, keyed by type: taken out for one call and put
+/// back, so repeated decompositions of one shape make no Rust allocations
+/// (the caller-owned-workspace contract) and reentrant calls stay safe.
+fn with_scratch<V: Default + 'static, R>(f: impl FnOnce(&mut V) -> R) -> R {
+    use std::any::{Any, TypeId};
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<Vec<Box<dyn Any>>> = const { RefCell::new(Vec::new()) };
+    }
+    let taken = SCRATCH.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.iter()
+            .position(|b| (**b).type_id() == TypeId::of::<V>())
+            .map(|i| slot.swap_remove(i))
+    });
+    let mut boxed: Box<V> = match taken.map(|b| b.downcast::<V>()) {
+        Some(Ok(v)) => v,
+        _ => Box::default(),
+    };
+    let result = f(&mut boxed);
+    SCRATCH.with(|slot| slot.borrow_mut().push(boxed));
+    result
+}
+
+fn replay_rotations<const N: usize>(
+    log: &[Rotation<N>],
+    v: bool,
+    a: &mut [F<N>],
+    rows: usize,
+    cols: usize,
+) {
+    if a.is_empty() || !log.iter().any(|r| r.v == v) {
+        return;
+    }
+    with_scratch(|t: &mut Vec<F<N>>| replay_into(log, v, a, rows, cols, t));
+}
+
+fn replay_into<const N: usize>(
+    log: &[Rotation<N>],
+    v: bool,
+    a: &mut [F<N>],
+    rows: usize,
+    cols: usize,
+    t: &mut Vec<F<N>>,
+) {
+    t.clear();
+    t.resize(rows * cols, F::<N>::zero());
+    for j in 0..cols {
+        for i in 0..rows {
+            t[j + i * cols] = a[i + j * rows];
+        }
+    }
+    let apply = |row: &mut [F<N>]| {
+        for r in log.iter().filter(|r| r.v == v) {
+            let (c, s) = (r.c, -r.s);
+            let ns = -s;
+            let (x, y) = (row[r.p], row[r.p + 1]);
+            row[r.p] = F::dot_fma2(&c, &x, &ns, &y);
+            row[r.p + 1] = F::dot_fma2(&s, &x, &c, &y);
+        }
+    };
+    // Rows are independent (each sees the whole rotation sequence in order),
+    // so splitting them is bitwise neutral. On a pool worker, offer the rows
+    // even without granted ways: rayon splits only when idle threads steal,
+    // letting them finish the last, largest cones of a scaling phase.
+    let offer = sdpx_arithmetic::inner_parallel::active() || rayon::current_thread_index().is_some();
+    if offer && rows >= PAR_COLS {
+        t.par_chunks_mut(cols).for_each(apply);
+    } else {
+        t.chunks_mut(cols).for_each(apply);
+    }
+    for j in 0..cols {
+        for i in 0..rows {
+            a[i + j * rows] = t[j + i * cols];
+        }
     }
 }
+
 // Construct H=I-tau*v*v', with v[0]=1 and H*x=beta*e_1.
 pub(super) fn reflector<const N: usize>(x: &mut [F<N>]) -> (F<N>, F<N>) {
     let magnitude = norm(x);
@@ -206,16 +276,13 @@ fn demmel_kahan<const N: usize>(
     e: &mut [F<N>],
     lo: usize,
     hi: usize,
-    u: &mut [F<N>],
-    m: usize,
-    v: &mut [F<N>],
-    n: usize,
+    log: &mut Vec<Rotation<N>>,
 ) {
     let (mut c, mut oldc, mut olds) = (F::one(), F::one(), F::zero());
     for i in lo..hi {
         let (nc, s, r) = givens(d[i] * c, e[i]);
         c = nc;
-        svd_rotate(v, n, i, c, s);
+        log.push(Rotation { v: true, p: i, c, s });
         if i > lo {
             e[i - 1] = olds * r;
         }
@@ -223,7 +290,7 @@ fn demmel_kahan<const N: usize>(
         oldc = nc;
         olds = ns;
         d[i] = r;
-        svd_rotate(u, m, i, oldc, olds);
+        log.push(Rotation { v: false, p: i, c: oldc, s: olds });
     }
     let h = d[hi] * c;
     e[hi - 1] = h * olds;
@@ -235,27 +302,24 @@ fn shifted_qr<const N: usize>(
     lo: usize,
     hi: usize,
     shift: F<N>,
-    u: &mut [F<N>],
-    m: usize,
-    v: &mut [F<N>],
-    n: usize,
+    log: &mut Vec<Rotation<N>>,
 ) {
     let (c, s, _) = givens(d[lo] - shift * (shift / d[lo]), e[lo]);
-    svd_rotate(v, n, lo, c, s);
+    log.push(Rotation { v: true, p: lo, c, s });
     let mut di = d[lo] * c + e[lo] * s;
     let mut ei1 = -d[lo] * s + e[lo] * c;
     let mut di1 = d[lo + 1] * c;
     let mut bulge = d[lo + 1] * s;
     for i in lo..hi - 1 {
         let (c, s, _) = givens(di, bulge);
-        svd_rotate(u, m, i, c, s);
+        log.push(Rotation { v: false, p: i, c, s });
         d[i] = c * di + s * bulge;
         let ei = c * ei1 + s * di1;
         di1 = -s * ei1 + c * di1;
         ei1 = e[i + 1] * c;
         bulge = s * e[i + 1];
         let (c, s, _) = givens(ei, bulge);
-        svd_rotate(v, n, i + 1, c, s);
+        log.push(Rotation { v: true, p: i + 1, c, s });
         e[i] = ei * c + bulge * s;
         di = di1 * c + ei1 * s;
         ei1 = -di1 * s + ei1 * c;
@@ -263,7 +327,7 @@ fn shifted_qr<const N: usize>(
         di1 = d[i + 2] * c;
     }
     let (c, s, _) = givens(di, bulge);
-    svd_rotate(u, m, hi - 1, c, s);
+    log.push(Rotation { v: false, p: hi - 1, c, s });
     d[hi - 1] = c * di + s * bulge;
     e[hi - 1] = c * ei1 + s * di1;
     d[hi] = -s * ei1 + c * di1;
@@ -348,10 +412,8 @@ pub(super) fn small_shift<const N: usize>(d1: F<N>, d2: F<N>, e: F<N>) -> F<N> {
 fn bidiagonal_svd<const N: usize>(
     d: &mut [F<N>],
     e: &mut [F<N>],
-    u: &mut [F<N>],
-    m: usize,
-    v: &mut [F<N>],
     n: usize,
+    log: &mut Vec<Rotation<N>>,
 ) -> Result<(), i32> {
     if n < 2 {
         return Ok(());
@@ -373,7 +435,7 @@ fn bidiagonal_svd<const N: usize>(
             lo -= 1;
         }
         if d[lo..=hi].iter().any(|&x| x == F::zero()) {
-            demmel_kahan(d, e, lo, hi, u, m, v, n);
+            demmel_kahan(d, e, lo, hi, log);
             continue;
         }
         let smallest = estimate_smallest(d, e, lo, hi, tol);
@@ -397,13 +459,13 @@ fn bidiagonal_svd<const N: usize>(
         // Upstream `__svd!` shift guard at its default tolerance:
         // fudge * tol * sigma^- <= eps * sigma^+.
         if num::<N>(hi - lo + 1) * tol * smallest <= F::epsilon() * largest {
-            demmel_kahan(d, e, lo, hi, u, m, v, n);
+            demmel_kahan(d, e, lo, hi, log);
         } else {
             let shift = small_shift(d[hi - 1], d[hi], e[hi - 1]);
             if (shift / d[lo]).abs() < F::epsilon().sqrt() {
-                demmel_kahan(d, e, lo, hi, u, m, v, n);
+                demmel_kahan(d, e, lo, hi, log);
             } else {
-                shifted_qr(d, e, lo, hi, shift, u, m, v, n);
+                shifted_qr(d, e, lo, hi, shift, log);
             }
         }
         if d.iter().chain(e.iter()).any(|x| !x.is_finite()) {
@@ -565,7 +627,17 @@ pub(super) fn svd<'a, const N: usize>(
     if vr > 0 {
         identity(v, n);
     }
-    bidiagonal_svd(d, e, u, m, v, n)?;
+    // The bidiagonal QR never reads U or V: log its rotations, then replay
+    // them on U and V (see `replay_rotations`).
+    with_scratch(|log: &mut Vec<Rotation<N>>| {
+        log.clear();
+        bidiagonal_svd(d, e, n, log)?;
+        replay_rotations(log, false, u, m, uc);
+        if vr > 0 {
+            replay_rotations(log, true, v, n, n);
+        }
+        Ok::<(), i32>(())
+    })?;
     apply_reflectors(b, m, n, left, right, u, uc, v);
     for (i, cell) in order.iter_mut().enumerate() {
         *cell = num::<N>(i);

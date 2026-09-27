@@ -247,6 +247,8 @@ where
 {
     fn solve(&mut self) {
         let _receipt_scope = crate::receipt::Scope::begin();
+        // Long vector operations on this thread use the cone worker pool.
+        let _vector_pool = crate::algebra::VectorPoolGuard::install(self.cones.worker_pool());
         self.kktsystem.reset_solve();
         // various initializations
         // The generic curve is validated at all precisions, but its extra PSD
@@ -369,6 +371,9 @@ where
             //increment counter here because we only count
             //iterations that produce a KKT update
             iter += 1;
+            if iter <= 2 {
+                crate::receipt::memory_mark(if iter == 1 { "iteration 1 start" } else { "iteration 2 start" });
+            }
 
             // Keep the affine RHS beside the constant RHS so the KKT update
             // can reuse the factorization and multi-RHS solve.
@@ -537,6 +542,7 @@ where
 
         //halt timers
         self.info.finalize(&mut timers);
+        crate::receipt::memory_mark("solved");
         self.solution.finalize(&self.info);
 
         if crate::receipt::profile_requested()
@@ -614,16 +620,22 @@ mod internal {
                 // set all scalings to identity (or zero for the zero cone)
                 self.cones.reset_scaling();
                 // Refactor
+                let timer = crate::receipt::start();
                 self.kktsystem
                     .update(&self.data, &self.cones, &self.settings);
+                crate::receipt::finish("start.update", timer);
                 // solve for primal/dual initial points via KKT
+                let timer = crate::receipt::start();
                 let ok = self.kktsystem.solve_initial_point(
                     &mut self.variables,
                     &self.data,
                     &self.settings,
                 );
+                crate::receipt::finish("start.solve", timer);
                 // fix up (z,s) so that they are in the cone
+                let timer = crate::receipt::start();
                 self.variables.symmetric_initialization(&mut self.cones);
+                crate::receipt::finish("start.shift", timer);
                 // a failed or degenerate KKT initializer is not a valid
                 // starting point; fall back to the unit interior point
                 if !ok {

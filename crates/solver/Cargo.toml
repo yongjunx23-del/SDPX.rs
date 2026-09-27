@@ -1,6 +1,6 @@
 [package]
 name = "sdpx-solver"
-version = "0.7.0"
+version = "0.8.0"
 authors = ["Paul Goulart <paul.goulart@eng.ox.ac.uk>"]
 edition = "2021"
 rust-version = "1.85.0"
@@ -35,7 +35,9 @@ serde = ["dep:serde", "dep:serde_json", "dep:sha2", "sdpx-arithmetic/serde"]
 
 # enables blas/lapack for SDP support, with blas/lapack src unspecified
 # also enable packages required for chordal decomposition 
-sdp = ["blas","lapack", "indexmap"]
+# `blas-src`/`lapack-src` are provider-neutral shims: pick a provider with a
+# `sdp-*` flavour below, or link one directly (e.g. `-l dylib=openblas`).
+sdp = ["blas","lapack", "blas-src", "lapack-src", "indexmap", "dep:gemm"]
 
 # explicit configuration options for different blas flavours
 sdp-accelerate = ["sdp", "blas-src/accelerate", "lapack-src/accelerate"]
@@ -102,6 +104,19 @@ optional = true
 # -------------------------------
 # 3rd party sparse LDL solvers
 # -------------------------------
+
+# Exact per-prime f64 products of the residue kernel: thread-local packing
+# (OpenBLAS packs into a shared global buffer pool, which stops scaling
+# with many concurrent small calls).
+# Worker pinning (Linux sched_setaffinity); already in the lockfile.
+[target.'cfg(target_os = "linux")'.dependencies.libc]
+version = "0.2.189"
+
+[dependencies.gemm]
+version = "0.18.2"
+default-features = false
+features = ["std"]
+optional = true
 
 [dependencies.faer]
 version = "0.21.9"

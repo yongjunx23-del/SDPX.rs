@@ -51,7 +51,9 @@ fn oracle<const N: usize>() {
         assert_eq!(mpfr::cmp(&a.mul_add(b, a).descriptor(), &z.0), 0);
     }
     let one = MpFloat::<N>::one();
-    unsafe { assert_eq!(mpfr::cmp_ui(&one.descriptor(), 1), 0); }
+    unsafe {
+        assert_eq!(mpfr::cmp_ui(&one.descriptor(), 1), 0);
+    }
     let eps = MpFloat::<N>::epsilon();
     assert_eq!((one + eps) - one, eps);
     assert_eq!(one + eps / MpFloat::from_u64(2).unwrap(), one); // ties to even
@@ -339,8 +341,12 @@ fn ordered_dot_fma<const N: usize>() {
     // Separately rounded multiplication would lose this cancellation term.
     assert_eq!(F::dot_fma_chain(a.iter().zip(&b)), -(eps * eps));
     assert_eq!(F::dot_fma(a.iter().zip(&b)), -(eps * eps));
-    let mut a: Vec<_> = (0..37).map(|i| F::<N>::from_i32(i - 18).unwrap() / F::from_i32(7).unwrap()).collect();
-    let b: Vec<_> = (0..37).map(|i| F::<N>::from_i32(i % 11 - 5).unwrap() / F::from_i32(13).unwrap()).collect();
+    let mut a: Vec<_> = (0..37)
+        .map(|i| F::<N>::from_i32(i - 18).unwrap() / F::from_i32(7).unwrap())
+        .collect();
+    let b: Vec<_> = (0..37)
+        .map(|i| F::<N>::from_i32(i % 11 - 5).unwrap() / F::from_i32(13).unwrap())
+        .collect();
     let before = (a.clone(), b.clone());
     let expected = a.iter().zip(&b).fold(zero, |v, (&x, &y)| x.mul_add(y, v));
     let actual = F::dot_fma_chain(a.iter().zip(&b));

@@ -906,7 +906,7 @@ fn rns_dim1_leaves<T: FloatT>() {
     let mut fwd_ref = vec![T::zero(); trih];
     work.blocks[0].forward_terms(&b, &x, T::one(), |i, t| fwd_ref[i] = t);
     let mut adj_ref = vec![T::zero(); kmax];
-    work.blocks[0].adjoint_terms(&b, &z, T::one(), |i, t| adj_ref[i] = t);
+    work.blocks[0].adjoint_terms(&b, block_rows(&b, &z), T::one(), |i, t| adj_ref[i] = t);
 
     let w0 = &mut work.blocks[0];
     let q = BorrowedMatrix {
@@ -940,7 +940,7 @@ fn rns_dim1_leaves<T: FloatT>() {
             &b,
             &q,
             wdiag,
-            &z,
+            block_rows(&b, &z),
             T::one(),
             0..1,
             &mut out,
@@ -992,6 +992,7 @@ fn rns_dim1_leaves<T: FloatT>() {
             &mut sq,
             &mut pa,
             Some(side_f),
+            None,
         );
         for (v, e) in out.iter().zip(&fwd_ref) {
             close(*v, *e);
@@ -1034,7 +1035,7 @@ fn rns_dim1_perf<T: FloatT>() {
     let t0 = std::time::Instant::now();
     let mut acc = T::zero();
     for _ in 0..reps {
-        work.blocks[0].adjoint_terms(&b, &z, T::one(), |_, t| acc += t);
+        work.blocks[0].adjoint_terms(&b, block_rows(&b, &z), T::one(), |_, t| acc += t);
         work.blocks[0].forward_terms(&b, &x, T::one(), |_, t| acc += t);
     }
     eprintln!("serial adj+fwd: {:?} ({:?})", t0.elapsed() / reps, acc);

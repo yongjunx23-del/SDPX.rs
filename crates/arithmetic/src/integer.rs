@@ -274,13 +274,19 @@ fn term_integer<const N: usize>(v: &MpFloat<N>, shift: i64) -> ExactInteger {
 mod tests {
     use super::*;
     use crate::Bits512;
-    use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
     use crate::Scalar;
+    use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
 
     #[test]
     fn exact_product_matches_double_precision_trivial_cases() {
-        let a = [Bits512::from_f64(3.0).unwrap(), Bits512::from_f64(4.0).unwrap()];
-        let b = [Bits512::from_f64(5.0).unwrap(), Bits512::from_f64(6.0).unwrap()];
+        let a = [
+            Bits512::from_f64(3.0).unwrap(),
+            Bits512::from_f64(4.0).unwrap(),
+        ];
+        let b = [
+            Bits512::from_f64(5.0).unwrap(),
+            Bits512::from_f64(6.0).unwrap(),
+        ];
         let p = exact_product(&a, &b).unwrap();
         assert_eq!(p.to_mpfloat::<8>(), Bits512::from_f64(39.0).unwrap());
     }
@@ -305,7 +311,10 @@ mod tests {
         let a = [Bits512::from_i64(9007199254740993).unwrap()];
         let b = [Bits512::one()];
         let p = exact_product(&a, &b).unwrap();
-        assert_eq!(p.to_mpfloat::<8>(), Bits512::from_i64(9007199254740993).unwrap());
+        assert_eq!(
+            p.to_mpfloat::<8>(),
+            Bits512::from_i64(9007199254740993).unwrap()
+        );
         assert_eq!(a[0].to_f64().unwrap(), 9007199254740992.0);
         // The image is NOT 54 bits: every factor's mantissa is a full
         // PRECISION_BITS integer, so a product of two of them is about
@@ -402,7 +411,9 @@ mod tests {
                 term_integer(&v, -540)
             })
             .collect();
-        let block: Vec<&ExactInteger> = (0..(mk + kn)).map(|i| &entries[i % entries.len()]).collect();
+        let block: Vec<&ExactInteger> = (0..(mk + kn))
+            .map(|i| &entries[i % entries.len()])
+            .collect();
 
         let t0 = Instant::now();
         let mut sink = 0u64;
@@ -425,7 +436,10 @@ mod tests {
             mpfr_s * 1e3,
             project_s / mpfr_s
         );
-        println!("GATE worst-case aligned width = {} bits", entries.iter().map(|e| e.bit_length()).max().unwrap());
+        println!(
+            "GATE worst-case aligned width = {} bits",
+            entries.iter().map(|e| e.bit_length()).max().unwrap()
+        );
         assert!(sink > 0);
     }
 }

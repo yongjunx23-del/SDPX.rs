@@ -8,7 +8,7 @@ use std::{fs::File, io, io::Read};
 ///
 /// MPFR scalars use decimal strings; Float64 uses JSON numbers. With `sdp`,
 /// optional sampled blocks define PSD coefficients and `A` stores only the
-/// ordinary linear entries, just as in [`DefaultSolver::new_sampled`].
+/// ordinary linear entries, just as in `DefaultSolver::new_sampled`.
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "T: Serialize + DeserializeOwned", deny_unknown_fields)]
 #[allow(non_snake_case)]

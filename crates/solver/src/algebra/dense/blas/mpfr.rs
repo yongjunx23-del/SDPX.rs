@@ -259,6 +259,33 @@ fn gemm<const N: usize>(
     if m == 0 || n == 0 {
         return;
     }
+    if alpha != F::<N>::zero() && residue_blas_profitable::<N>(m as usize, n as usize, k as usize) {
+        let (mu, nu) = (m as usize, n as usize);
+        let mut product = vec![F::<N>::zero(); mu * nu];
+        if super::rns_blas::gemm(
+            ta,
+            tb,
+            mu,
+            nu,
+            k as usize,
+            a,
+            lda as usize,
+            b,
+            ldb as usize,
+            false,
+            parallel.map(|(pool, _)| pool),
+            &mut product,
+            None,
+        ) {
+            for j in 0..nu {
+                for i in 0..mu {
+                    let dst = &mut c[i + j * ldc as usize];
+                    *dst = axpby(alpha, product[i + j * mu], beta, *dst);
+                }
+            }
+            return;
+        }
+    }
     // Exact residue accumulation replaces the FMA chain when the operand
     // window admits a plan; reconstruction rounds once at the destination.
     let rns = (alpha != F::<N>::zero()
@@ -297,7 +324,65 @@ fn gemm<const N: usize>(
     };
     output_columns(c, m as usize, n as usize, ldc as usize, parallel, column);
 }
+/// Structural gate for the exact residue-BLAS product: enough multiply work
+/// per output to amortize encode and CRT reconstruction. Measured break-even
+/// (Apple M4, 256–768 bits) is near 32×32×32; at 45³ the kernel is 2.1× (256
+/// bits) to 3.7× (768 bits) faster than per-entry exact dots.
+fn residue_blas_profitable<const N: usize>(m: usize, n: usize, k: usize) -> bool {
+    N >= 4 && k >= 40 && m * n >= 1600
+}
+
 impl<const N: usize> XgemmScalar for F<N> {
+    fn residue_blas_applies(m: usize, n: usize, k: usize) -> bool {
+        residue_blas_profitable::<N>(m, n, k)
+    }
+    fn xsvec_quadratic_exact(
+        h: usize,
+        kmax: usize,
+        q: &[Self],
+        x: &[Self],
+        sqrt2: Self,
+        pool: Option<&rayon::ThreadPool>,
+        out: &mut [Self],
+        cache_q: Option<&mut super::ResidueCache>,
+    ) -> bool {
+        // Same work gate as the products: h² per output against kmax outputs.
+        residue_blas_profitable::<N>(h, kmax, h)
+            && super::rns_blas::svec_quadratic(h, kmax, q, x, sqrt2, pool, out, cache_q)
+    }
+    fn xcongruence_exact(
+        ta: u8,
+        m: usize,
+        k: usize,
+        a: &[Self],
+        lda: usize,
+        x: &[Self],
+        ldx: usize,
+        c: &mut [Self],
+        upper_only: bool,
+        pool: Option<&rayon::ThreadPool>,
+        cache_a: Option<&mut super::ResidueCache>,
+    ) -> bool {
+        residue_blas_profitable::<N>(m, m, k)
+            && super::rns_blas::congruence(ta, m, k, a, lda, x, ldx, upper_only, pool, c, cache_a)
+    }
+    fn xgemm_upper_exact(
+        ta: u8,
+        tb: u8,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[Self],
+        lda: usize,
+        b: &[Self],
+        ldb: usize,
+        c: &mut [Self],
+        pool: Option<&rayon::ThreadPool>,
+        cache_b: Option<&mut super::ResidueCache>,
+    ) -> bool {
+        residue_blas_profitable::<N>(m, n, k)
+            && super::rns_blas::gemm(ta, tb, m, n, k, a, lda, b, ldb, true, pool, c, cache_b)
+    }
     fn xgemm(
         ta: u8,
         tb: u8,

@@ -159,8 +159,29 @@ where
         let _is_prim_feasible_fcn = |s: &[T]| -> bool { self.is_primal_feasible(s) };
         let _is_dual_feasible_fcn = |s: &[T]| -> bool { self.is_dual_feasible(s) };
 
-        let αz = backtrack_search(dz, z, αmax, αmin, step, _is_dual_feasible_fcn, &mut work);
-        let αs = backtrack_search(ds, s, αmax, αmin, step, _is_prim_feasible_fcn, &mut work);
+        let α = self.α;
+        let αz = backtrack_search_screened(
+            dz,
+            z,
+            αmax,
+            αmin,
+            step,
+            _is_dual_feasible_fcn,
+            pow_dual_screen,
+            α,
+            &mut work,
+        );
+        let αs = backtrack_search_screened(
+            ds,
+            s,
+            αmax,
+            αmin,
+            step,
+            _is_prim_feasible_fcn,
+            pow_primal_screen,
+            α,
+            &mut work,
+        );
 
         (αz, αs)
     }
@@ -488,4 +509,50 @@ where
         }
     };
     newton_raphson_onesided(x0, f0, f1)
+}
+
+/// Shared binary64 test `exp(2a·ln u + 2(1−a)·ln v) − w2² > 0` for u, v > 0,
+/// where `u`, `v` carry relative errors `ru`, `rv`.
+fn pow_residual_sign(u: f64, v: f64, ru: f64, rv: f64, w2: f64, e2: f64, a: f64) -> Option<bool> {
+    let eps = f64::EPSILON;
+    let (lu, lv) = (u.ln(), v.ln());
+    let x = 2.0 * a * lu + 2.0 * (1.0 - a) * lv;
+    let g = x.exp();
+    let dx = 1.01 * (2.0 * a * ru + 2.0 * (1.0 - a) * rv)
+        + 8.0
+            * eps
+            * ((2.0 * a * lu).abs() + (2.0 * (1.0 - a) * lv).abs() + lu.abs() + lv.abs() + 1.0);
+    let dg = 1.01 * g * dx.exp_m1() + 4.0 * eps * g;
+    let r = g - w2 * w2;
+    let bound = dg + 2.0 * w2.abs() * e2 + e2 * e2 + 4.0 * eps * w2 * w2;
+    certain_sign(r, bound)
+}
+
+/// Binary64 screen for `is_primal_feasible` (see `backtrack_search_screened`).
+pub(super) fn pow_primal_screen(w: &[f64], e: &[f64], a: f64) -> Option<bool> {
+    match (certain_positive(w[0], e[0]), certain_positive(w[1], e[1])) {
+        (Some(false), _) | (_, Some(false)) => return Some(false),
+        (Some(true), Some(true)) => {}
+        _ => return None,
+    }
+    pow_residual_sign(w[0], w[1], e[0] / w[0], e[1] / w[1], w[2], e[2], a)
+}
+
+/// Binary64 screen for `is_dual_feasible`.
+pub(super) fn pow_dual_screen(w: &[f64], e: &[f64], a: f64) -> Option<bool> {
+    match (certain_positive(w[0], e[0]), certain_positive(w[1], e[1])) {
+        (Some(false), _) | (_, Some(false)) => return Some(false),
+        (Some(true), Some(true)) => {}
+        _ => return None,
+    }
+    let eps = f64::EPSILON;
+    pow_residual_sign(
+        w[0] / a,
+        w[1] / (1.0 - a),
+        e[0] / w[0] + 2.0 * eps,
+        e[1] / w[1] + 2.0 * eps,
+        w[2],
+        e[2],
+        a,
+    )
 }

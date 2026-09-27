@@ -135,6 +135,16 @@ where
     }
 }
 
+impl<S, T> DenseStorageMatrix<S, T>
+where
+    S: AsRef<[T]>,
+{
+    /// Transposed read-only view.
+    pub fn t(&self) -> Adjoint<'_, Self> {
+        Adjoint { src: self }
+    }
+}
+
 // Methods that required mutable access to the matrix
 
 impl<S, T> DenseStorageMatrix<S, T>
@@ -152,10 +162,6 @@ where
 
     pub fn copy_from_slice(&mut self, src: &[T]) {
         self.data_mut().copy_from_slice(src);
-    }
-
-    pub fn t(&self) -> Adjoint<'_, Self> {
-        Adjoint { src: self }
     }
 
     /// symmetric view (selects upper or lower triangle source)

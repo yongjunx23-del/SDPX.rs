@@ -26,8 +26,15 @@ impl<T: FloatT> OwnedResiduals<T> {
         &mut self,
         variables: &OwnedVariables<T>,
         data: &OwnedData<T>,
-        pool: Option<&rayon::ThreadPool>,
+        pool: Option<std::sync::Arc<rayon::ThreadPool>>,
     ) {
+        // Fewer owners than workers: lend each owner's sampled products the
+        // rank pool (a nested install on the same pool runs inline).
+        #[cfg(feature = "sdp")]
+        let lend = pool
+            .as_ref()
+            .filter(|p| self.blocks.len() < p.current_num_threads())
+            .cloned();
         let update = |(((residuals, variables), data), ids): (
             (
                 (&mut DefaultResiduals<T>, &DefaultVariables<T>),
@@ -35,10 +42,18 @@ impl<T: FloatT> OwnedResiduals<T> {
             ),
             &OwnerIndices,
         )| {
+            #[cfg(feature = "sdp")]
+            {
+                residuals.sampled_pool = lend.clone();
+            }
             residuals.update_counted(variables, data, Some(&ids.counted_rows));
+            #[cfg(feature = "sdp")]
+            {
+                residuals.sampled_pool = None;
+            }
         };
 
-        if let Some(pool) = pool {
+        if let Some(pool) = pool.as_deref() {
             pool.install(|| {
                 self.blocks
                     .par_iter_mut()
@@ -130,7 +145,7 @@ impl<T: FloatT> OwnedResiduals<T> {
                         }
                     },
                 ),
-                pool,
+                pool.as_deref(),
             )
             .expect("owned residuals share one componentwise setting")
         };
@@ -264,7 +279,7 @@ impl<T: FloatT> Residuals<T> for OwnedResiduals<T> {
         data: &OwnedData<T>,
         pool: Option<std::sync::Arc<rayon::ThreadPool>>,
     ) {
-        self.update_impl(variables, data, pool.as_deref());
+        self.update_impl(variables, data, pool);
     }
 }
 

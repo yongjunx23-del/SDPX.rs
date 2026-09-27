@@ -156,6 +156,10 @@ struct PsdBlock<T> {
     Rinv: Matrix<T>,
     G: Matrix<T>,
     Ginv: Matrix<T>,
+    // Residues of Rinv / G / Ginv reused by every congruence of an iteration.
+    rinv_cache: ResidueCache,
+    g_cache: ResidueCache,
+    ginv_cache: ResidueCache,
     mat1: Matrix<T>,
     mat2: Matrix<T>,
     mat3: Matrix<T>,
@@ -220,6 +224,12 @@ enum Scaling<T> {
 struct Block<T> {
     rows: Range<usize>,
     scaling: Scaling<T>,
+    /// Last measured seconds per scaling action (condense, recover, apply),
+    /// used to give expensive blocks extra workers (SDPB-style measured
+    /// load balancing); 0 until the action has run once.
+    cost: [f64; 3],
+    /// Workers granted to this block for the next call of each action.
+    ways: [usize; 3],
 }
 
 pub(crate) struct CondensedKKTSolver<T: FloatT> {
@@ -261,6 +271,13 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     sampled: Option<(Arc<SampledOperator<T>>, SampledWorkspace<T>)>,
     sparse_products: Option<crate::algebra::sparse_parallel::SparseParallel>,
     counters: crate::solver::kkt::SolveCounters,
+    /// Improvement ratio of the last outer correction with the current
+    /// factorization; refinement's contraction is a property of the
+    /// factorization, so every right-hand side it serves behaves alike.
+    correction_ratio: Option<T>,
+    /// Relative residual a stalled correction last reached (not reset on
+    /// refactor: the floor tracks the problem's conditioning).
+    stall_floor: Option<T>,
 }
 
 fn local_world(local_only: bool) -> Option<crate::mpi::World> {
@@ -295,7 +312,20 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         cones: &CompositeCone<T>,
         settings: &CoreSettings<T>,
     ) -> Self {
-        Self::new_partition_policy(P, A, types, cones, settings, true, false)
+        Self::new_partition_policy(P, A, types, cones, settings, true, false, true)
+    }
+
+    /// [`Self::new`] for a problem whose every PSD cone is a sampled block
+    /// and whose other cones are zero cones: products then use the sampled
+    /// factors, so the solver keeps only A's structure, not a value copy.
+    pub(crate) fn new_fully_sampled(
+        P: &CscMatrix<T>,
+        A: &CscMatrix<T>,
+        types: &[SupportedConeT<T>],
+        cones: &CompositeCone<T>,
+        settings: &CoreSettings<T>,
+    ) -> Self {
+        Self::new_partition_policy(P, A, types, cones, settings, true, false, false)
     }
     pub(crate) fn new_local_partition(
         P: &CscMatrix<T>,
@@ -305,7 +335,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         settings: &CoreSettings<T>,
         keep_equalities: bool,
     ) -> Self {
-        Self::new_partition_policy(P, A, types, cones, settings, keep_equalities, true)
+        Self::new_partition_policy(P, A, types, cones, settings, keep_equalities, true, true)
     }
     fn mpi_world(&self) -> Option<crate::mpi::World> {
         local_world(self.local_only)
@@ -318,6 +348,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         settings: &CoreSettings<T>,
         keep_equalities: bool,
         local_only: bool,
+        keep_values: bool,
     ) -> Self {
         debug_assert!(
             !local_only || cones.is_local_only(),
@@ -459,6 +490,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             blocks.push(Block {
                 rows: cones.rng_cones[ci].clone(),
                 scaling,
+                cost: [0.0; 3],
+                ways: [1; 3],
             });
         }
         let mut colptr = vec![0];
@@ -560,7 +593,19 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             local_only,
             n,
             P: P.clone(),
-            A: A.clone(),
+            A: if keep_values {
+                A.clone()
+            } else {
+                // Structure only: `nzval` is deliberately empty (see
+                // `new_fully_sampled`); nothing in this mode reads it.
+                CscMatrix {
+                    m: A.m,
+                    n: A.n,
+                    colptr: A.colptr.clone(),
+                    rowval: A.rowval.clone(),
+                    nzval: Vec::new(),
+                }
+            },
             blocks,
             retained_indices,
             retained_rows,
@@ -594,6 +639,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 && crate::algebra::sparse_parallel::worthwhile(A))
             .then(|| crate::algebra::sparse_parallel::SparseParallel::new(A)),
             counters: Default::default(),
+            correction_ratio: None,
+            stall_floor: None,
         };
         if let Some(plan) = &mut solver.sparse_products {
             plan.configure(A, solver.pool.clone());
@@ -1010,11 +1057,16 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         );
         self.workx.copy_from_slice(bx);
         if fused {
-            let operator = &self.sampled.as_ref().unwrap().0;
-            operator
-                .linear()
-                .t()
-                .gemv(&mut self.workx, &self.workz, T::one(), T::one());
+            let (operator, work) = self.sampled.as_mut().unwrap();
+            work.linear_product_in_pool(
+                operator,
+                true,
+                &mut self.workx,
+                &self.workz,
+                T::one(),
+                T::one(),
+                self.pool.as_ref(),
+            );
             for block in &self.blocks {
                 if let Scaling::Psd(p) = &block.scaling {
                     if let Some(s) = &p.sampled {
@@ -1058,12 +1110,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let (x, z) = out.split_at_mut(self.n);
         let fused = self.fused_sampled();
         if fused {
-            self.sampled
-                .as_ref()
-                .unwrap()
-                .0
-                .linear()
-                .gemv(&mut self.workz, x, T::one(), T::zero());
+            self.recover_linear(x, bz);
         } else if let Some((operator, work)) = &mut self.sampled {
             operator.apply_with_pool(
                 &mut self.workz,
@@ -1085,8 +1132,10 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 T::zero(),
             );
         }
-        for (v, &b) in self.workz.iter_mut().zip(bz) {
-            *v -= b;
+        if !fused {
+            for (v, &b) in self.workz.iter_mut().zip(bz) {
+                *v -= b;
+            }
         }
         apply_block_pool_with_world(
             self.mpi_world(),
@@ -1111,6 +1160,13 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     }
 
     fn solve_raw(&mut self, out: &mut [T], rhs: &[T], settings: &CoreSettings<T>) -> bool {
+        self.solve_reduced(out, rhs, settings)
+            && local_success(self.local_only, self.recover_rhs(out, rhs))
+    }
+
+    /// The reduced half of `solve_raw`: condense `rhs` and solve for
+    /// `out[..n]` and the retained rows; `recover_rhs` finishes `out`.
+    fn solve_reduced(&mut self, out: &mut [T], rhs: &[T], settings: &CoreSettings<T>) -> bool {
         self.prepare_rhs(rhs);
         self.reduced.setrhs(&self.workx, &self.retained_rhs);
         let reduced_ok = self.reduced.solve(
@@ -1119,13 +1175,14 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             settings,
         );
         local_success(self.local_only, reduced_ok)
-            && local_success(self.local_only, self.recover_rhs(out, rhs))
     }
 
     fn residual(&mut self, out: &mut [T], rhs: &[T], solution: &[T], reuse_forward: bool) -> T {
         let __t0 = std::time::Instant::now();
+        let __c0 = crate::receipt::cpu_start();
         let __r = self.residual_inner(out, rhs, solution, reuse_forward);
         crate::receipt::phase("residual", __t0.elapsed());
+        crate::receipt::cpu_add("residual", __c0);
         __r
     }
 
@@ -1227,13 +1284,39 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             products();
             scaling();
         }
-        for (e, &h) in ez.iter_mut().zip(&self.workh) {
-            *e += h;
-        }
+        crate::algebra::add_assign(ez, &self.workh);
         if out.is_finite() {
             out.norm_inf()
         } else {
             T::infinity()
+        }
+    }
+}
+
+impl<T: FloatT> CondensedKKTSolver<T> {
+    /// `workz <- L*x - bz` for the unsampled part: the first half of the
+    /// fused sampled `recover_rhs`.
+    fn recover_linear(&mut self, x: &[T], bz: &[T]) {
+        let (operator, work) = self.sampled.as_mut().unwrap();
+        work.linear_product_in_pool(
+            operator,
+            false,
+            &mut self.workz,
+            x,
+            T::one(),
+            T::zero(),
+            self.pool.as_ref(),
+        );
+        let subtract = |(v, &b): (&mut T, &T)| *v -= b;
+        match &self.pool {
+            Some(pool) if pool.current_num_threads() > 1 => pool.install(|| {
+                self.workz
+                    .par_iter_mut()
+                    .zip(bz)
+                    .with_min_len(4096)
+                    .for_each(subtract)
+            }),
+            _ => self.workz.iter_mut().zip(bz).for_each(subtract),
         }
     }
 }

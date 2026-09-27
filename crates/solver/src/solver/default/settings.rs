@@ -97,11 +97,11 @@ pub struct DefaultSettings<T: FloatT> {
     pub equilibrate_max_iter: u32,
 
     ///minimum equilibration scaling allowed
-    #[builder(default = "(1e-4).as_T()")]
+    #[builder(default = "equilibrate_bound_default::<T>(1e-4, false)")]
     pub equilibrate_min_scaling: T,
 
     ///maximum equilibration scaling allowed
-    #[builder(default = "(1e+4).as_T()")]
+    #[builder(default = "equilibrate_bound_default::<T>(1e+4, true)")]
     pub equilibrate_max_scaling: T,
 
     ///line search backtracking
@@ -238,6 +238,21 @@ fn accuracy_default<T: FloatT>(primitive: f64) -> T {
 /// gate already rejected, leaving the almost-statuses unreachable above 53
 /// bits. `eps^(1/4)` is exactly one half-order looser than the strict
 /// `eps^(1/2)`, and still far tighter than any binary64 tolerance.
+/// Cumulative Ruiz scaling bound. Binary64 keeps upstream's `1e-4`, which is
+/// about `eps^(1/4)`; MPFR uses the same rule at its own precision. Bootstrap
+/// inputs have column scales spread over 1e80+, and a 1e4 cap leaves the
+/// solution that badly scaled, so every residual carries eps·|K||x| error
+/// and refinement stalls (Λ19 spins 0–50 stopped at gap 1e-28 at 768 bits).
+fn equilibrate_bound_default<T: FloatT>(primitive: f64, upper: bool) -> T {
+    if is_primitive::<T>() {
+        primitive.as_T()
+    } else if upper {
+        T::epsilon().sqrt().sqrt().recip()
+    } else {
+        T::epsilon().sqrt().sqrt()
+    }
+}
+
 fn reduced_accuracy_default<T: FloatT>(primitive: f64) -> T {
     if is_primitive::<T>() {
         primitive.as_T()

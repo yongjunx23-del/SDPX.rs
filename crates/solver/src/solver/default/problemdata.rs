@@ -69,6 +69,21 @@ where
         cones: &[SupportedConeT<T>],
         settings: &DefaultSettings<T>,
     ) -> Self {
+        Self::new_cow(P, q, std::borrow::Cow::Borrowed(A), b, cones, settings)
+    }
+
+    /// [`Self::new`] that takes ownership of an already-private `A`, so the
+    /// unreduced case moves it instead of cloning (a sampled problem's
+    /// materialized matrix is otherwise held twice during setup).
+    pub(crate) fn new_cow(
+        P: &CscMatrix<T>,
+        q: &[T],
+        A_in: std::borrow::Cow<'_, CscMatrix<T>>,
+        b: &[T],
+        cones: &[SupportedConeT<T>],
+        settings: &DefaultSettings<T>,
+    ) -> Self {
+        let A: &CscMatrix<T> = &A_in;
         // clean up the cones by consolidating repeated NNs,
         // eliminate empty cones, transform singletons etc
         // this makes a locally owned copy of the cones
@@ -133,7 +148,7 @@ where
 
         let mut P_new = P_new.unwrap_or_else(|| P.clone());
         let q_new = q_new.unwrap_or_else(|| q.to_vec());
-        let mut A_new = A_new.unwrap_or_else(|| A.clone());
+        let mut A_new = A_new.unwrap_or_else(|| A_in.into_owned());
         let mut b_new = b_new.unwrap_or_else(|| b.to_vec());
 
         // cones was already copied, so can just pass through without cloning
@@ -218,7 +233,11 @@ where
     }
 
     #[cfg(feature = "sdp")]
-    pub(crate) fn install_sampled(&mut self, mut operator: SampledOperator<T>) {
+    pub(crate) fn install_sampled(
+        &mut self,
+        mut operator: SampledOperator<T>,
+        pool: Option<&rayon::ThreadPool>,
+    ) {
         self.sampled_input = true;
         // Chordal lowering currently uses the generic route; row-only reductions
         // preserve the authoritative factors and merely shift their row offsets.
@@ -276,7 +295,9 @@ where
         operator.scale(&self.equilibration.d, &self.equilibration.e);
         // The stored factors define this input. Assembly and operator products
         // are allowed their ordinary working-precision rounding differences.
-        self.A = operator.materialize();
+        // Release the Ruiz-scaled copy before assembling its replacement.
+        self.A = CscMatrix::zeros((0, 0));
+        self.A = operator.materialize_pooled(pool);
         self.sampled = Some(std::sync::Arc::new(operator));
     }
 
@@ -334,6 +355,7 @@ where
 
         let scale_min = settings.equilibrate_min_scaling;
         let scale_max = settings.equilibrate_max_scaling;
+        let pool = cones.thread_pool();
 
         // perform scaling operations for a fixed number of steps
         for _ in 0..settings.equilibrate_max_iter {
@@ -356,7 +378,7 @@ where
 
             // Scale the problem data and update the
             // equilibration matrices
-            scale_data(P, A, q, b, Some(dwork), ework);
+            scale_data(P, A, q, b, Some(dwork), ework, pool.as_deref());
             d.hadamard(dwork);
             e.hadamard(ework);
 
@@ -386,7 +408,7 @@ where
         //bounds on the scalings here
         if cones.rectify_equilibration(ework, e) {
             // only rescale again if some cones were rectified
-            scale_data(P, A, q, b, None, ework);
+            scale_data(P, A, q, b, None, ework, pool.as_deref());
             e.hadamard(ework);
         }
 
@@ -418,18 +440,78 @@ fn scale_data<T: FloatT>(
     b: &mut [T],
     d: Option<&[T]>,
     e: &[T],
+    pool: Option<&rayon::ThreadPool>,
 ) {
     match d {
         Some(d) => {
             P.lrscale(d, d); // P[:,:] = Ds*P*Ds
-            A.lrscale(e, d);
+            lrscale_pooled(A, e, Some(d), pool);
             q.hadamard(d);
         }
         None => {
-            A.lscale(e); // A[:,:] = Es*A
+            lrscale_pooled(A, e, None, pool); // A[:,:] = Es*A
         }
     }
     b.hadamard(e);
+}
+
+// Ruiz rescaling of a large high-precision A is O(nnz) independent entry
+// updates per pass. Column ranges of equal nnz run on the cone pool with the
+// same per-entry expression as `lrscale`/`lscale`, so results are bitwise
+// identical to the serial path.
+fn lrscale_pooled<T: FloatT>(
+    A: &mut CscMatrix<T>,
+    l: &[T],
+    r: Option<&[T]>,
+    pool: Option<&rayon::ThreadPool>,
+) {
+    use rayon::prelude::*;
+    let nnz = A.nzval.len();
+    let workers = pool.map_or(1, |p| p.current_num_threads());
+    // Below this size the serial loop is cheaper than dispatch.
+    if workers <= 1 || nnz < 1 << 16 {
+        match r {
+            Some(r) => A.lrscale(l, r),
+            None => A.lscale(l),
+        }
+        return;
+    }
+    let target = nnz.div_ceil(4 * workers).max(1);
+    let mut parts = Vec::with_capacity(4 * workers + 1);
+    let (colptr, rowval) = (&A.colptr, &A.rowval);
+    let mut rest: &mut [T] = &mut A.nzval;
+    let mut col = 0;
+    while col < A.n {
+        let (first, mut end) = (colptr[col], col + 1);
+        while end < A.n && colptr[end] - first < target {
+            end += 1;
+        }
+        let (chunk, tail) = std::mem::take(&mut rest).split_at_mut(colptr[end] - first);
+        rest = tail;
+        parts.push((col..end, chunk));
+        col = end;
+    }
+    pool.unwrap().install(|| {
+        parts.into_par_iter().for_each(|(cols, vals)| {
+            let base = colptr[cols.start];
+            for c in cols {
+                let range = colptr[c] - base..colptr[c + 1] - base;
+                let rows = &rowval[colptr[c]..colptr[c + 1]];
+                match r {
+                    Some(r) => {
+                        for (val, row) in vals[range].iter_mut().zip(rows) {
+                            *val *= l[*row] * r[c];
+                        }
+                    }
+                    None => {
+                        for (val, row) in vals[range].iter_mut().zip(rows) {
+                            *val *= l[*row];
+                        }
+                    }
+                }
+            }
+        });
+    });
 }
 
 #[cfg(feature = "sdp")]

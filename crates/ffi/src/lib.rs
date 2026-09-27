@@ -25,12 +25,7 @@ type Result<T> = std::result::Result<T, (i32, String)>;
 fn invalid(s: impl Into<String>) -> (i32, String) {
     (1, s.into())
 }
-fn peak_rss_bytes() -> Option<u64> {
-    let s = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = s.lines().find(|l| l.starts_with("VmHWM"))?;
-    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
-}
+use sdpx_solver::receipt::peak_rss_bytes;
 thread_local! { static ERROR: RefCell<String> = const { RefCell::new(String::new()) }; }
 fn boundary(f: impl FnOnce() -> Result<()>) -> i32 {
     match catch_unwind(AssertUnwindSafe(f)) {

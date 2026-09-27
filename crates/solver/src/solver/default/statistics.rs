@@ -44,6 +44,16 @@ impl<'a, T: FloatT> NormView<'a, T> {
     }
     fn scan(&self) -> ScaledNorm<T> {
         assert_eq!(self.values.len(), self.scales.len());
+        if T::precision_bits() > 64 {
+            return match self.indices {
+                Some(ids) => ScaledNorm::from_exact_squares(
+                    ids.iter().map(|&i| self.values[i] * self.scales[i]),
+                ),
+                None => ScaledNorm::from_exact_squares(
+                    self.values.iter().zip(self.scales).map(|(&v, &d)| v * d),
+                ),
+            };
+        }
         if let Some(ids) = self.indices {
             ScaledNorm::from_iter(ids.iter().map(|&i| self.values[i] * self.scales[i]))
         } else {

@@ -114,13 +114,7 @@ fn dense_transform_lanes_match_the_serial_chunk_loop() {
         // even ones. Equal columns would collapse into one representative.
         data.push(
             (0..rows)
-                .map(|row| {
-                    if row % (c + 1) == 0 {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                })
+                .map(|row| if row % (c + 1) == 0 { 1.0 } else { 0.0 })
                 .collect::<Vec<f64>>(),
         );
     }

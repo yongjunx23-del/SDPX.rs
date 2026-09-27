@@ -292,7 +292,7 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
             }
         };
         if let Some(pool) = &cones.pool {
-            debug_assert!(cones.blocks.iter().all(|c| c.thread_pool().is_none()));
+            debug_assert!(owner_cone_pools_ok(&cones.blocks));
             pool.install(|| {
                 self.work
                     .blocks

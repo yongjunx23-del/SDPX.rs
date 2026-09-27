@@ -4,10 +4,10 @@
 #[allow(dead_code)]
 #[path = "../src/algebra/dense/blas/traits.rs"]
 mod provider;
-use sdpx_solver::algebra;
 use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
 use provider::{XgesvdScalar, XsyevrScalar};
 use sdpx_arithmetic::{MpFloat, Scalar};
+use sdpx_solver::algebra;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 

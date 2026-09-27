@@ -82,13 +82,16 @@ where
         };
         #[cfg(feature = "sdp")]
         let mut kktsolver: BoxedKKTSolver<T> = if use_condensed {
-            Box::new(CondensedKKTSolver::<T>::new(
-                &data.P,
-                &data.A,
-                &data.cones,
-                cones,
-                settings.core(),
-            ))
+            let fully_sampled = data
+                .sampled
+                .as_ref()
+                .is_some_and(|op| op.covers_all_psd(&data.cones));
+            let build = if fully_sampled {
+                CondensedKKTSolver::<T>::new_fully_sampled
+            } else {
+                CondensedKKTSolver::<T>::new
+            };
+            Box::new(build(&data.P, &data.A, &data.cones, cones, settings.core()))
         } else {
             augmented()
         };
@@ -437,8 +440,18 @@ pub(crate) fn hsd_tau<T: FloatT>(v: HsdTerms<T>, rt: T, rk: T, tau: T, kappa: T)
     numerator / denominator
 }
 
+/// The solver's `H·z` for a solution column, used for `Δs` in place of
+/// `mul_Hs`. Only above binary64: the solver's `H·z` is rounded along a
+/// different path than the cones' `Wᵀ(W·z)`, and near convergence (an
+/// ill-conditioned `W`) the gap is amplified by cond(W)²: measured up to 1e-2
+/// in binary64 with a squared `G = WᵀW`, enough to corrupt `Δs`. At MPFR
+/// precision it is negligible, and the reuse saves a full-precision product
+/// per block; in binary64 `mul_Hs` is cheap.
 fn copy_scaled<T: FloatT>(solver: &dyn KKTSolver<T>, column: usize, out: &mut Vec<T>) {
-    if let Some(value) = solver.scaled_solution(column) {
+    if let Some(value) = solver
+        .scaled_solution(column)
+        .filter(|_| T::precision_bits() > 53)
+    {
         out.resize(value.len(), T::zero());
         out.copy_from_slice(value);
     } else {

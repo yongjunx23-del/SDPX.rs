@@ -162,6 +162,15 @@ pub(crate) struct OwnedKkt<T: FloatT> {
     collective: Arc<dyn crate::solver::distributed::collective::Collective<T>>,
     last_border: Vec<T>,
     pair_border: Vec<T>,
+    /// First-correction improvement ratio with the current factorization,
+    /// per refinement level (original, reduced); see `refine`.
+    correction_ratio: [Option<T>; 2],
+    stall_floor: [Option<T>; 2],
+    /// Speculative reduced correction prepared with the last fused reduced
+    /// residual: local interior solves and the border right-hand side.
+    fused_interior: Vec<Vec<T>>,
+    fused_border_rhs: Vec<T>,
+    fused_ready: bool,
 }
 
 impl<T: FloatT> OwnedKkt<T> {
@@ -302,6 +311,11 @@ impl<T: FloatT> OwnedKkt<T> {
             collective,
             last_border: vec![T::zero(); border],
             pair_border: vec![T::zero(); 2 * border],
+            correction_ratio: [None; 2],
+            stall_floor: [None; 2],
+            fused_interior: Vec::new(),
+            fused_border_rhs: Vec::new(),
+            fused_ready: false,
         }
     }
 
@@ -392,6 +406,7 @@ impl<T: FloatT> OwnedKkt<T> {
         self.finish_update(settings, valid)
     }
     fn finish_update(&mut self, settings: &CoreSettings<T>, valid: bool) -> bool {
+        self.correction_ratio = [None; 2];
         self.scaled_valid = false;
         let mut diagonal = T::zero();
         for local in &self.locals {
@@ -1180,6 +1195,177 @@ impl<T: FloatT> OwnedKkt<T> {
         success
     }
 
+    /// Reduced residual fused with the next correction's local work: each
+    /// owner also solves its interior with the new residual and forms its
+    /// border contribution, and one all-gather carries the border residual,
+    /// the border right-hand side and the residual norm. A refinement pass
+    /// then waits once instead of at the residual and again inside the
+    /// correction solve. The border residual and norm keep the reduction
+    /// order of [`Self::residual`]; the correction right-hand side is
+    /// `-e_border + Σ_rank Σ_owner C y` in rank order.
+    fn residual_reduced_fused(
+        &mut self,
+        out: &mut Point<T>,
+        rhs: &Point<T>,
+        point: &Point<T>,
+    ) -> T {
+        let border = out.border.len();
+        out.border.fill(T::zero());
+        if self.fused_interior.len() != self.locals.len() {
+            self.fused_interior = out
+                .blocks
+                .iter()
+                .map(|b| vec![T::zero(); b.len()])
+                .collect();
+        }
+        let local = |((((local, e), b), x), y): (
+            (((&mut LocalKkt<T>, &mut Vec<T>), &Vec<T>), &Vec<T>),
+            &mut Vec<T>,
+        )| {
+            local.kernel.interior_residual(e, b, x);
+            local
+                .coupling
+                .t()
+                .gemv(&mut e[..local.n], &point.border, -T::one(), T::one());
+            y.resize(e.len(), T::zero());
+            e.is_finite() && local.kernel.solve_interior_panel(e, y, 1)
+        };
+        let solved = if let Some(pool) = &self.pool {
+            pool.install(|| {
+                self.locals
+                    .par_iter_mut()
+                    .zip(&mut out.blocks)
+                    .zip(&rhs.blocks)
+                    .zip(&point.blocks)
+                    .zip(&mut self.fused_interior)
+                    .map(local)
+                    .reduce(|| true, |a, b| a & b)
+            })
+        } else {
+            self.locals
+                .iter_mut()
+                .zip(&mut out.blocks)
+                .zip(&rhs.blocks)
+                .zip(&point.blocks)
+                .zip(&mut self.fused_interior)
+                .map(local)
+                .fold(true, |a, b| a & b)
+        };
+        // [border residual part | border rhs contribution | local norm | solved]
+        let mut message = vec![T::zero(); 2 * border + 2];
+        let mut local_norm = T::zero();
+        for ((local, e), (x, y)) in self
+            .locals
+            .iter()
+            .zip(&out.blocks)
+            .zip(point.blocks.iter().zip(&self.fused_interior))
+        {
+            local
+                .coupling
+                .gemv(&mut message[..border], &x[..local.n], -T::one(), T::one());
+            local.coupling.gemv(
+                &mut message[border..2 * border],
+                &y[..local.n],
+                T::one(),
+                T::one(),
+            );
+            local_norm = if e.is_finite() {
+                T::max(local_norm, e.norm_inf())
+            } else {
+                T::infinity()
+            };
+        }
+        message[2 * border] = local_norm;
+        message[2 * border + 1] = if solved { T::one() } else { T::zero() };
+        let Ok(all) = self.collective.all_gather(323, &message) else {
+            self.fused_ready = false;
+            return T::infinity();
+        };
+        let width = message.len();
+        let ranks = all.len() / width.max(1);
+        // Border residual: rank-order sum, as `reduce_sum`, plus the RHS.
+        out.border.copy_from_slice(&all[..border]);
+        for r in 1..ranks {
+            for (o, &v) in out
+                .border
+                .iter_mut()
+                .zip(&all[r * width..r * width + border])
+            {
+                *o += v;
+            }
+        }
+        for (e, &b) in out.border.iter_mut().zip(&rhs.border) {
+            *e += b;
+        }
+        let mut norm = if out.border.is_finite() {
+            out.border.norm_inf()
+        } else {
+            T::infinity()
+        };
+        let mut all_solved = true;
+        for r in 0..ranks {
+            let n = all[r * width + 2 * border];
+            norm = if n.is_nan() || norm.is_nan() {
+                T::infinity()
+            } else {
+                T::max(norm, n)
+            };
+            all_solved &= all[r * width + 2 * border + 1] == T::one();
+        }
+        self.fused_border_rhs.clear();
+        self.fused_border_rhs.extend(out.border.iter().map(|&e| -e));
+        for r in 0..ranks {
+            for (o, &v) in self
+                .fused_border_rhs
+                .iter_mut()
+                .zip(&all[r * width + border..r * width + 2 * border])
+            {
+                *o += v;
+            }
+        }
+        self.fused_ready = all_solved && norm.is_finite() && self.fused_border_rhs.is_finite();
+        norm
+    }
+
+    /// Finish the correction prepared by [`Self::residual_reduced_fused`].
+    fn solve_reduced_fused(&mut self, out: &mut Point<T>) -> bool {
+        if !std::mem::take(&mut self.fused_ready) {
+            return false;
+        }
+        if !self
+            .border_factor
+            .solve_factor_panel(&self.fused_border_rhs, &mut out.border, 1)
+        {
+            return false;
+        }
+        let border = &out.border;
+        let correct = |((local, x), y): ((&LocalKkt<T>, &mut Vec<T>), &Vec<T>)| {
+            let d = x.len();
+            for (i, v) in x.iter_mut().enumerate() {
+                *v = y[i]
+                    - T::dot_fma(
+                        (0..border.len()).map(|j| (&local.response[j * d + i], &border[j])),
+                    );
+            }
+        };
+        if let Some(pool) = &self.pool {
+            pool.install(|| {
+                self.locals
+                    .par_iter()
+                    .zip(&mut out.blocks)
+                    .zip(&self.fused_interior)
+                    .for_each(correct)
+            });
+        } else {
+            self.locals
+                .iter()
+                .zip(&mut out.blocks)
+                .zip(&self.fused_interior)
+                .for_each(correct);
+        }
+        out.norm().is_finite()
+    }
+
     fn residual(
         &mut self,
         out: &mut Point<T>,
@@ -1259,6 +1445,13 @@ impl<T: FloatT> OwnedKkt<T> {
     }
 }
 
+/// Fused reduced refinement passes (default on; `SDPX_FUSED_REDUCED=0`
+/// restores the two-round pass for comparison).
+fn fused_reduced_refinement() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SDPX_FUSED_REDUCED").map_or(true, |v| v != "0"))
+}
+
 fn select_rows<T: FloatT>(
     matrix: &CscMatrix<T>,
     rows: &[usize],
@@ -1303,6 +1496,17 @@ impl<T: FloatT> Refinement<T> for OwnedRefinement<'_, T> {
             .unwrap_or(T::infinity())
     }
     fn residual(&mut self, candidate: bool, _reuse: bool) -> T {
+        if self.reduced && fused_reduced_refinement() {
+            return self.solver.residual_reduced_fused(
+                &mut self.work.error,
+                &self.work.b,
+                if candidate {
+                    &self.work.candidate
+                } else {
+                    &self.work.x
+                },
+            );
+        }
         self.solver.residual(
             &mut self.work.error,
             &self.work.b,
@@ -1316,7 +1520,9 @@ impl<T: FloatT> Refinement<T> for OwnedRefinement<'_, T> {
     }
     fn solve_correction(&mut self, settings: &CoreSettings<T>) -> bool {
         self.solver.refinements += 1;
-        if self.reduced {
+        if self.reduced && fused_reduced_refinement() {
+            self.solver.solve_reduced_fused(&mut self.work.candidate)
+        } else if self.reduced {
             self.solver
                 .solve_reduced_raw(&mut self.work.candidate, &self.work.error)
         } else {
@@ -1326,6 +1532,22 @@ impl<T: FloatT> Refinement<T> for OwnedRefinement<'_, T> {
     }
     fn add_correction(&mut self) {
         self.work.candidate.add(&self.work.x);
+    }
+    fn correction_expected_to_stall(&self, stop_ratio: T) -> bool {
+        // Ratios come from globally reduced norms, so every rank holds the
+        // same value; the agreement keeps the collective sequence aligned.
+        let stall =
+            self.solver.correction_ratio[self.reduced as usize].is_some_and(|r| r < stop_ratio);
+        self.decision_agrees(u32::from(stall)) && stall
+    }
+    fn record_correction_ratio(&mut self, ratio: T) {
+        self.solver.correction_ratio[self.reduced as usize] = Some(ratio);
+    }
+    fn stall_floor(&self) -> Option<T> {
+        self.solver.stall_floor[self.reduced as usize]
+    }
+    fn set_stall_floor(&mut self, floor: T) {
+        self.solver.stall_floor[self.reduced as usize] = Some(floor);
     }
     fn accept_candidate(&mut self) {
         std::mem::swap(&mut self.work.x, &mut self.work.candidate);

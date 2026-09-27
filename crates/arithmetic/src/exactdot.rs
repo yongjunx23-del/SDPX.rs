@@ -45,7 +45,8 @@ pub(crate) fn dot<'a, const N: usize>(
     if N > MAX_N {
         return chain(&mut pairs);
     }
-    let scratch = SCRATCH.try_with(|s| s.try_borrow_mut().ok().map(|mut s| std::mem::take(&mut *s)));
+    let scratch =
+        SCRATCH.try_with(|s| s.try_borrow_mut().ok().map(|mut s| std::mem::take(&mut *s)));
     let Ok(Some(mut scratch)) = scratch else {
         return chain(&mut pairs);
     };
@@ -54,8 +55,7 @@ pub(crate) fn dot<'a, const N: usize>(
     for (a, b) in pairs {
         let regular = |k: i32| k.abs() == mpfr::REGULAR_KIND;
         let zero = |k: i32| k.abs() == mpfr::ZERO_KIND;
-        if (zero(a.kind) && (zero(b.kind) || regular(b.kind)))
-            || (zero(b.kind) && regular(a.kind))
+        if (zero(a.kind) && (zero(b.kind) || regular(b.kind))) || (zero(b.kind) && regular(a.kind))
         {
             // An exact zero product adds nothing (the sign of a zero result is
             // not significant to the solver).
@@ -68,7 +68,9 @@ pub(crate) fn dot<'a, const N: usize>(
         } else {
             finite = false;
         }
-        scratch.terms.push((a as *const _ as usize, b as *const _ as usize));
+        scratch
+            .terms
+            .push((a as *const _ as usize, b as *const _ as usize));
     }
     // SAFETY: the addresses were taken from references that outlive this call.
     let view = |&(a, b): &(usize, usize)| -> Pair<'a, N> {
@@ -110,12 +112,21 @@ fn accumulate<const N: usize>(scratch: &mut Scratch, emin: i64, emax: i64) -> Op
         let (a, b) = unsafe { (&*(a as *const MpFloat<N>), &*(b as *const MpFloat<N>)) };
         let offset = (a.exponent as i64 + b.exponent as i64 - emin) as usize;
         let (limb, shift) = (offset / 64, (offset % 64) as u32);
-        let target = if (a.kind < 0) != (b.kind < 0) { &mut *neg } else { &mut *pos };
+        let target = if (a.kind < 0) != (b.kind < 0) {
+            &mut *neg
+        } else {
+            &mut *pos
+        };
         // SAFETY: `prod` holds 2N+1 <= 2*MAX_N+1 limbs; `target[limb..len]`
         // covers the shifted product and its carry by the bound on `len`.
         // In-place mpn operands are identical, which GMP permits.
         unsafe {
-            gmp::mpn_mul_n(prod.as_mut_ptr(), a.limbs.as_ptr(), b.limbs.as_ptr(), N as _);
+            gmp::mpn_mul_n(
+                prod.as_mut_ptr(),
+                a.limbs.as_ptr(),
+                b.limbs.as_ptr(),
+                N as _,
+            );
             let width = if shift == 0 {
                 2 * N
             } else {
@@ -177,15 +188,27 @@ mod tests {
         (0..k)
             .map(|_| {
                 let m = MpFloat::<N>::from_f64(next() as f64 / u64::MAX as f64 - 0.5).unwrap();
-                let third = MpFloat::<N>::one() / MpFloat::<N>::from_u32(3 + (next() % 5) as u32).unwrap();
-                let e = if spread == 0 { 0 } else { (next() % (2 * spread as u64 + 1)) as i32 - spread };
+                let third =
+                    MpFloat::<N>::one() / MpFloat::<N>::from_u32(3 + (next() % 5) as u32).unwrap();
+                let e = if spread == 0 {
+                    0
+                } else {
+                    (next() % (2 * spread as u64 + 1)) as i32 - spread
+                };
                 (m + third).scale_pow2(e as i64)
             })
             .collect()
     }
 
     fn check<const N: usize>() {
-        for (seed, k, spread) in [(1, 1, 0), (2, 2, 0), (3, 7, 3), (4, 64, 40), (5, 33, 300), (6, 128, 900)] {
+        for (seed, k, spread) in [
+            (1, 1, 0),
+            (2, 2, 0),
+            (3, 7, 3),
+            (4, 64, 40),
+            (5, 33, 300),
+            (6, 128, 900),
+        ] {
             let a = values::<N>(seed, k, spread);
             let mut b = values::<N>(seed * 7919, k, spread);
             // Force a near-total cancellation in the middle of the sum.
@@ -193,9 +216,16 @@ mod tests {
                 b[k / 2] = -(a[0] * b[0]) / a[k / 2];
             }
             let expected = exact_product(&a, &b).unwrap().to_mpfloat::<N>();
-            assert_eq!(MpFloat::<N>::dot_fma(a.iter().zip(&b)), expected, "N={N} k={k} spread={spread}");
+            assert_eq!(
+                MpFloat::<N>::dot_fma(a.iter().zip(&b)),
+                expected,
+                "N={N} k={k} spread={spread}"
+            );
             // Order independence: reversing the terms gives the same bits.
-            assert_eq!(MpFloat::<N>::dot_fma(a.iter().rev().zip(b.iter().rev())), expected);
+            assert_eq!(
+                MpFloat::<N>::dot_fma(a.iter().rev().zip(b.iter().rev())),
+                expected
+            );
         }
         // Exact cancellation yields zero; empty and all-zero sums are zero.
         let x = values::<N>(9, 4, 10);
@@ -206,7 +236,10 @@ mod tests {
         let z = [MpFloat::<N>::zero(); 3];
         assert!(MpFloat::<N>::dot_fma(z.iter().zip(&x[..3])).is_zero());
         // An exponent spread wider than the window falls back to the chain.
-        let wide = [MpFloat::<N>::one(), MpFloat::<N>::one().scale_pow2(-100_000)];
+        let wide = [
+            MpFloat::<N>::one(),
+            MpFloat::<N>::one().scale_pow2(-100_000),
+        ];
         let ones = [MpFloat::<N>::one(); 2];
         assert_eq!(
             MpFloat::<N>::dot_fma(wide.iter().zip(&ones)),

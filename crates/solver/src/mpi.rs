@@ -46,12 +46,26 @@ const WIRE_META_BAD: u64 = 0;
 // Main-thread control decisions must agree before a branch enters another
 // numerical collective. Serial calls preserve their existing behavior.
 pub(crate) fn all_succeeded(value: bool) -> bool {
-    World::get().map_or(value, |world| world.all_true(value))
+    World::get().map_or(value, |world| {
+        let started = std::time::Instant::now();
+        let agreed = world.all_true(value);
+        crate::receipt::site_record(SITE_SUCCESS, started.elapsed());
+        agreed
+    })
 }
 
 pub(crate) fn decision_agrees(value: u32) -> bool {
-    World::get().is_none_or(|world| world.agree_u32(value))
+    World::get().is_none_or(|world| {
+        let started = std::time::Instant::now();
+        let agreed = world.agree_u32(value);
+        crate::receipt::site_record(SITE_DECISION, started.elapsed());
+        agreed
+    })
 }
+
+/// Receipt labels for the unnumbered world agreements above.
+const SITE_SUCCESS: usize = 9000;
+const SITE_DECISION: usize = 9001;
 
 /// Branching on a local step decision must never change collective order.
 pub(crate) fn agreed_branch(value: bool) -> bool {
@@ -448,6 +462,10 @@ impl World {
     /// partial reduction or a deadlock.
     pub(crate) fn ensure_collective_thread(&self) {
         if std::thread::current().id() != self.collective_thread {
+            eprintln!(
+                "mpi: collective from a non-control thread:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
             self.abort("MPI collective called from a non-control thread");
         }
     }
@@ -470,9 +488,10 @@ impl World {
 
     pub(crate) fn agree_u32(&self, value: u32) -> bool {
         let value = f64::from(value);
-        let maximum = self.allreduce_max_f64(value);
-        let minimum = -self.allreduce_max_f64(-value);
-        maximum == minimum
+        // One reduction of (v, -v) yields both max and -min.
+        let mut pair = [value, -value];
+        self.allreduce_max_f64_slice(&mut pair);
+        pair[0] == -pair[1]
     }
 
     /// The shared world, initialized once. `None` unless the environment
@@ -1263,9 +1282,40 @@ impl World {
     /// Maximum of `v` over all ranks on the world communicator. Order-free
     /// and deterministic; callers must not invoke it concurrently with other
     /// collectives on the same stream.
+    /// Elementwise maximum of `values` over all ranks, in place. One
+    /// collective for several small agreement values.
+    pub(crate) fn allreduce_max_f64_slice(&self, values: &mut [f64]) {
+        self.ensure_collective_thread();
+        self.ensure_live();
+        if values.is_empty() {
+            return;
+        }
+        let send = values.to_vec();
+        let t0 = std::time::Instant::now();
+        let rc = unsafe {
+            (self.fns.allreduce)(
+                send.as_ptr().cast::<c_void>(),
+                values.as_mut_ptr().cast::<c_void>(),
+                c_int::try_from(values.len()).unwrap_or(c_int::MAX),
+                self.fns.double,
+                self.fns.max,
+                self.fns.comm_world,
+            )
+        };
+        crate::receipt::phase_record("mpi.allreduce", t0.elapsed());
+        if rc != MPI_SUCCESS {
+            self.abort("MPI_Allreduce failed");
+        }
+    }
+
     pub(crate) fn allreduce_max_f64(&self, v: f64) -> f64 {
+        // Every collective shares this world stream; one issued from a pool
+        // worker concurrently with the control thread's would deadlock or
+        // corrupt MPI state, so fail loudly instead.
+        self.ensure_collective_thread();
         self.ensure_live();
         let mut out = 0.0f64;
+        let t0 = std::time::Instant::now();
         let rc = unsafe {
             (self.fns.allreduce)(
                 (&v as *const f64).cast::<c_void>(),
@@ -1276,6 +1326,9 @@ impl World {
                 self.fns.comm_world,
             )
         };
+        // Includes waiting for the slowest rank: the first decision after
+        // unbalanced work absorbs the imbalance.
+        crate::receipt::phase_record("mpi.allreduce", t0.elapsed());
         if rc != MPI_SUCCESS {
             self.abort("MPI_Allreduce failed");
         }

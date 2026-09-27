@@ -177,7 +177,7 @@ pub(crate) fn sampled<T: FloatT>() -> DefaultProblemData<T> {
         &settings,
     );
     data.equilibrate(&CompositeCone::new(&data.cones), &settings);
-    data.install_sampled(operator);
+    data.install_sampled(operator, None);
     assert!(data.sampled.is_some());
     data
 }
