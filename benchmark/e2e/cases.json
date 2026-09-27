@@ -15,7 +15,7 @@
       "verbose": true
     },
     "audit": {"kind": "python", "tolerance": 1e-6},
-    "known_failure": "External audit fails since 2026-09-22 (AlmostSolved, dual residual 2.85e-6 > 1.75e-6, gap 1.12e-6 > 1e-6). Deferred by the user; report it, do not relax it."
+    "known_failure": "External audit fails since 2026-09-22. Since 2026-09-27 (binary64 accuracy fixes) the solver reports Solved/18, but the dual residual 1.92e-6 > 1.75e-6. Deferred by the user; report it, do not relax it."
   },
   "ising11": {
     "description": "MPFR sampled Ising Lambda11 (SDPB pmp2sdp JSON), 512-bit, internal 1e-42, external audit 1e-30",
