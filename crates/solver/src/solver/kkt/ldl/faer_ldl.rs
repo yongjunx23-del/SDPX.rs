@@ -95,13 +95,9 @@ where
 
         // -----------------------------
 
-        // Par::rayon(0) here is equivalent to rayon::current_num_threads()
-        let parallelism = {
-            match settings.max_threads {
-                0 => Par::rayon(0),
-                1 => Par::Seq,
-                _ => Par::rayon(settings.max_threads as usize),
-            }
+        let parallelism = match crate::solver::core::worker_budget(settings.max_threads as usize) {
+            1 => Par::Seq,
+            workers => Par::rayon(workers),
         };
 
         // perm has possibly been passed by LDL auto selector.

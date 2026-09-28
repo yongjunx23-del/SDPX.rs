@@ -224,6 +224,7 @@ struct SampledBlockConstants<T> {
     qq: OnceLock<Vec<T>>,
     /// |basis|, for the componentwise dual residual's |A|ᵀ|z|.
     abs_basis: OnceLock<Vec<T>>,
+    basis_residues: [ResidueCache; 3],
 }
 
 impl<T> SampledBlockConstants<T> {
@@ -232,6 +233,7 @@ impl<T> SampledBlockConstants<T> {
             wdiag: OnceLock::new(),
             qq: OnceLock::new(),
             abs_basis: OnceLock::new(),
+            basis_residues: std::array::from_fn(|_| ResidueCache::default()),
         }
     }
 }
@@ -1503,9 +1505,12 @@ impl<T: FloatT> SampledWorkspace<T> {
     /// long-lived workspace that applies the operator every refinement pass.
     pub(crate) fn enable_basis_caches(&mut self) {
         for w in &mut self.blocks {
-            w.q_fwd_cache.get_or_insert_with(ResidueCache::default);
-            w.q_adj_cache.get_or_insert_with(ResidueCache::default);
-            w.q_abs_cache.get_or_insert_with(ResidueCache::default);
+            w.q_fwd_cache
+                .get_or_insert_with(|| w.constants.basis_residues[0].clone());
+            w.q_adj_cache
+                .get_or_insert_with(|| w.constants.basis_residues[1].clone());
+            w.q_abs_cache
+                .get_or_insert_with(|| w.constants.basis_residues[2].clone());
         }
     }
     /// Allocate reusable product scratch for the supplied operator.
@@ -1574,6 +1579,9 @@ pub struct SampledSchurWorkspace<T> {
     syrk_tile: usize,
     /// Residues of `V`, reused while the scaling (hence `V`) is unchanged.
     v_cache: ResidueCache,
+    adjoint_cache: ResidueCache,
+    packed_rhs: Vec<T>,
+    quadratic: Vec<T>,
 }
 impl<T: FloatT> SampledSchurWorkspace<T> {
     /// Allocate NT Gram storage for a validated sampled block.
@@ -1614,6 +1622,15 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
                 }
             }
         }
+        let v_cache = ResidueCache::default();
+        // Both actions encode the same V. The adjoint generally needs more
+        // primes; forward products can reuse that prefix when their prime
+        // widths agree. Keep separate caches for incompatible dimensions.
+        let adjoint_cache = if ResidueCache::same_prime_width(b.side(), rank) {
+            v_cache.clone()
+        } else {
+            ResidueCache::default()
+        };
         Self {
             ub,
             v: Matrix::zeros((b.side(), rank)),
@@ -1626,7 +1643,10 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
             plan_threads: 0,
             gemm_tile: 0,
             syrk_tile: 0,
-            v_cache: ResidueCache::default(),
+            v_cache,
+            adjoint_cache,
+            packed_rhs: Vec::new(),
+            quadratic: Vec::new(),
         }
     }
     /// The Gram contribution buffer for the rank-sharded exchange.
@@ -1688,7 +1708,54 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
     /// A' H^-1 b from U = Rinv * mat(b) * Rinv'. The transformed
     /// columns V = Rinv * B are already current from the Schur update.
     pub(crate) fn inverse_adjoint(&mut self, b: &SampledBlock<T>, u: &Matrix<T>, out: &mut [T]) {
-        self.product.mul(u, &self.v, T::one(), T::zero());
+        if self.side >= 12 && self.dim * self.count >= 16 && T::precision_bits() >= 256 {
+            // Pack U without svec rounding. Scalar quadratics use scale 2
+            // off the diagonal; bilinear forms expand the symmetric matrix.
+            self.packed_rhs.clear();
+            for j in 0..self.side {
+                self.packed_rhs
+                    .extend_from_slice(&u.data()[j * self.side..j * self.side + j + 1]);
+            }
+            self.quadratic
+                .resize(self.pairs.len().max(self.count), T::zero());
+            if self.dim > 1
+                && T::xsymmetric_bilinear_exact(
+                    self.side,
+                    self.dim * self.count,
+                    self.v.data(),
+                    &self.packed_rhs,
+                    &self.pairs,
+                    &mut self.quadratic,
+                    &mut self.adjoint_cache,
+                )
+            {
+                for ((dst, &value), &weight) in out.iter_mut().zip(&self.quadratic).zip(&b.weights)
+                {
+                    *dst = weight * value;
+                }
+                return;
+            }
+            if self.dim == 1
+                && T::xsvec_quadratic_exact(
+                    self.side,
+                    self.count,
+                    self.v.data(),
+                    &self.packed_rhs,
+                    T::from_u8(2).unwrap(),
+                    None,
+                    &mut self.quadratic,
+                    Some(&mut self.adjoint_cache),
+                )
+            {
+                for ((dst, &(a, _)), &weight) in out.iter_mut().zip(&self.pairs).zip(&b.weights) {
+                    *dst = weight * self.quadratic[a];
+                }
+                return;
+            }
+        }
+        // U is exactly symmetric (the congruence mirrors its triangle).
+        // Reading Uᵀ gives contiguous dot operands at the same term order.
+        self.product.mul(&u.t(), &self.v, T::one(), T::zero());
         let n = self.side;
         for ((value, &(a, c)), &weight) in out.iter_mut().zip(&self.pairs).zip(&b.weights) {
             *value = weight

@@ -1173,3 +1173,1481 @@ cones_schur 1.4、refactor 1.4、ir 1.0、assemble 0.27。**MPFR 时间集中在
 | 10 | 代码规模与大文件职责重叠 | 当前约 41.5k 有效代码行；condensed_psd、sampled、compositecone 较大；内部未使用的 LU 与特征向量包装累计净减 211 个物理行 | 继续按生产调用证据去重，目标生产约 30k 有效代码行。2026-09-23 已完成目录重组（`solver/{core,default,cones,kkt,sampled,distributed,chordal}`，测试移入各模块 `tests/`，`distributed` 仅在 `sdp` 下编译）并删除库与测试均未使用的项；medium 与 Ising Λ11 E2E 输出逐位不变。行数基本未变，真正减量仍需去重 | 中 |
 | 11 | release 构建较慢、debug 产物占用大 | 本轮记录：release 构建约 6 min，target/debug 约 59 GB | 迭代使用 fast profile；清理产物不作为性能里程碑验收。2026-09-23 已清理 target/debug（target 83 GB → 7 GB） | 低 |
 
+## 2026-09-27 — Project review fixes
+
+Kept the six fixes identified by the whole-project review:
+
+- Native MPFR descriptor import is now an `unsafe` API with a documented
+  storage-validity contract.
+- Sampled solver export returns `Unsupported` before writing, avoiding loss
+  of authoritative factors. Retain and serialize the original `JsonProblem`.
+- Indexed matrix/vector updates validate all indices before mutation; paired
+  index/value vectors must have equal lengths.
+- QDLDL honors `dynamic_regularization_enable`; a zero pivot returns a failed
+  factorization instead of panicking.
+- Dynamic regularization settings are immutable after solver construction,
+  preventing accepted updates that leave cached backend settings unchanged.
+- Backtracking requires a finite factor strictly between zero and one, and
+  cone searches stop if the step cannot decrease or underflows to zero.
+
+Removed the README benchmark graphic, performance table, and section link at
+the user's request. No numerical acceptance gates or precision changed.
+
+Verification: rebuilt frozen fast arm `review-fixes-20260927`. Targeted
+standalone reproductions passed for atomic failed updates, setting validation,
+sampled export rejection and exact original-factor serialization. Safe Rust
+descriptor import fails compilation with E0133. The disabled-regularization
+reproduction now solves; a zero-pivot case returns `NumericalError` without a
+panic. Invalid backtracking exits with a settings error; the valid exponential
+cone input still solves. Reproduction sources and logs are under
+`~/.cache/sdpx-e2e/review-20260927/`.
+
+Pinned solves ran sequentially against unchanged settings and precision:
+
+- `medium`: `Solved`, 18 iterations; existing external audit failure remains
+  (`r_d=1.92e-6 > 1.75e-6`). Run `20260927-195346-663200-medium-review-fixes-20260927`.
+- `ising11`: `Solved`, 52 iterations; external audit passes
+  (primal `2.34e-45`, dual `4.29e-44`, gap `1.70e-43`). Run
+  `20260927-195357-404136-ising11-review-fixes-20260927`.
+
+Both cases have identical returned `x`, `s`, and `z` to frozen baseline
+`review-20260927`. These fast-profile checks make no performance claim; no
+headline status or benchmark number changed.
+
+## 2026-09-27 — CSDR alpha-count 3 on the Mac
+
+At the user's request, reconstructed the historical twice-subtracted CSDR
+case from the surviving input generator: J=40, N_mu=200, N_a=15, N_x=1,
+three alpha labels (0, -1/4, -1/2), power-6 quadrature; 8,400 spectral
+variables, 42 equalities and 4,200 SOC3 cones. Cached Julia SDPX `db42fd2`
+was used only by the input generator. BigFloat256 coefficients were exported
+as decimal strings, without a Float64 intermediate.
+
+On this Apple M4 / 16 GiB Mac, frozen release arm `csdr-current-20260927`
+(current reviewed Rust changes) with MPFR256, four requested threads,
+500-iteration/600-second limits and feasibility/absolute-gap/relative-gap
+tolerances of `1e-8` returned `Solved` in 57 iterations. One preliminary run:
+API/setup+solve 120.851 s, native 120.845 s, process wall 121.187 s.
+The selected augmented QDLDL factorization used one thread; cone work used
+four. No solver code or accuracy gate was changed for this experiment.
+
+Independent BigFloat256 original-coordinate audit passed: primal residual
+`1.24e-12`, dual `6.45e-63`, relative gap `3.79e-9`, and reconstructed physical
+equality residual `6.32e-11`. Primal SOC margin was `-9.56e-13`, within the
+existing `1e-8` gate; dual SOC margin was positive. Objective:
+`-31.67385581061044`.
+
+The historical Julia Float64x4 receipt reports a warmed median of 17.532 s,
+101 iterations and objective `-31.672155970636577`. The raw time ratio is
+6.89, with Rust slower in this run. This is not a validated like-for-like
+performance comparison: the deleted frozen input cannot be hash-matched,
+the objective differs by 0.00169984, arithmetic differs, and Julia was not
+retimed. Repeated timings would not resolve those comparability limits.
+
+Input, generator, audit, source hashes, complete logs and comparison receipt:
+`~/.cache/sdpx-e2e/csdr-alpha3-20260927/` (`comparison.json`). Input JSON SHA256:
+`a2c6b822aac133c4cd8ce734c4c2e09bedb218be8fa31c91305c10fa619302a1`.
+
+## 2026-09-27 — Local SOC elimination and parallel equality Schur solve
+
+Kept a structural `local_soc_arrow` backend beneath the existing augmented
+KKT interface. It recognizes disjoint SOC3 blocks with two primal variables
+each, block-local P, and an equality border. The current eligibility guard
+requires at least eight local blocks, 1–128 equality rows and a bounded dense
+working set. Selection is automatic; explicitly requesting `qdldl` preserves
+the baseline route. Other cone structures retain their existing backend.
+
+Reused the arrow implementation for batched RHS, local-factor reuse, parallel
+elimination/recovery, and QDLDL fallback. Each five-coordinate leaf eliminates
+its three negative cone coordinates before its two positive primal coordinates;
+the global CSDR border is only 42 by 42. Local Schur entries use exact MPFR
+dot accumulation rounded once, with fixed term order at every thread count.
+There is no dense border-contribution buffer per SOC. Original augmented
+residual refinement, static shifts, ×100 escalation, dynamic pivot shifts,
+HSD recovery, convergence and infeasibility criteria remain in force.
+
+On the same reconstructed CSDR input as the preceding entry, one serial
+release A–B–B–A batch on the M4 Mac gave:
+
+| Arm | API/setup+solve seconds | Median | Outcome |
+|---|---|---|---|
+| `csdr-current-20260927` (QDLDL) | 121.088, 121.214 | 121.151 s | Both Solved, 57 iterations, external audit pass |
+| `csdr-local-soc-release-20260927` | 19.638, 19.299 | 19.468 s | Both Solved, 57 iterations, external audit pass |
+
+Measured speedup: 6.223× (83.93% less time), at unchanged MPFR256, four-thread
+budget, tolerances, input and preprocessing. Repeated points within each arm
+are bitwise identical. The candidate reports four backend threads. Peak RSS
+was approximately 369–375 MiB versus 280 MiB for QDLDL: extra block storage is
+the memory tradeoff. Refinement corrections fell from 1,055 to 171 without
+relaxing tolerances. The remaining linear-solver work is primarily local Schur
+assembly and RHS coupling; the small border solve is negligible.
+
+Candidate audit: primal `9.77e-13`, dual `2.86e-70`, relative gap `3.37e-9`,
+physical equality residual `3.74e-62`; primal/dual SOC checks pass. The changed
+elimination order changes the accepted point (objective about
+`-31.67370757755`), so no cross-backend bitwise claim is made. The historical
+Julia 17.532 s receipt remains an unmatched comparison, for the reasons above.
+
+Checks: CSDR complete solves at one and four threads return bitwise-identical
+`x/s/z`, objectives, status and iteration count. Pinned fast A–B–B–A checks
+against `review-fixes-20260927` preserve points bitwise on both `ising11`
+(all audits pass, 52 iterations) and `medium` (the same documented external
+dual-residual failure, 18 iterations). Rustfmt checks on edited files and
+`git diff --check` pass. MPI execution was not exercised on this Mac.
+
+Evidence: `~/.cache/sdpx-e2e/csdr-alpha3-20260927/local-soc-release-abba/summary.json`,
+`thread-parity.json`, `local-soc-pinned-checks.json`, and `local-soc-source/`.
+Frozen arms also retain the new untracked source module under `source-extra/`,
+because the harness's ordinary dirty patch includes tracked files only.
+
+## 2026-09-27 — Development documentation cleanup
+
+Rewrote the active plan in concise English, corrected current pinned-case
+status, and separated historical cluster measurements from local evidence.
+Ranked CSDR follow-ups: reproducible harness inputs/source identity, accounting
+for time outside the solve phase, compact SOC panels/Schur assembly, and RHS
+coupling. These are proposals, not new speedup claims. Shortened the development
+skill and added a concise-English documentation rule to AGENTS.md. Historical
+entries remain intact. Documentation links, English-only checks on the active
+development files, and `git diff --check` pass; no solver rerun was needed.
+
+## 2026-09-27 — Compact local SOC panels, reproducible CSDR checks and Ising profile
+
+Kept the four CSDR follow-ups: registered reconstructed `csdr3` in the ignored
+local E2E harness; frozen-arm manifests and copies now cover untracked source;
+receipts retain inclusive setup timings; local SOC B/Y/Z panels store two
+coordinates instead of five. RHS coupling uses one exact MPFR accumulation per
+output, rounded once. Static/dynamic regularization, precision, tolerances,
+accepted-iterate recovery and original augmented refinement are unchanged.
+
+Release A–B–B–A on the M4, MPFR256, four threads, unchanged 1e-8 gates:
+
+| Measure | Previous local SOC | Compact local SOC |
+|---|---:|---:|
+| Median API time | 20.026872 s | 15.956056 s |
+| Median peak RSS | 370.0 MiB | 291.9 MiB |
+| Schur assembly | 4.928 s | 3.155 s |
+| Recorded RHS coupling | 2.009 s | 0.714 s |
+
+One comparison batch: 20.3% less API time. All four points are `Solved`/57 and
+pass the original-coordinate audit. Both arms retain 58 factor attempts and
+171 refinements. Points repeat within each arm; candidate one/four-thread and
+fast/release points are identical. The exact RHS accumulation changes old/new
+low-order digits (maximum componentwise scaled distance below 5e-51), with
+primal 9.77e-13, dual 2.86e-70 and gap 3.37e-9. The reconstructed input hash stays
+`a2c6b822aac133c4cd8ce734c4c2e09bedb218be8fa31c91305c10fa619302a1`;
+the missing historical Julia input still prevents a matched Julia comparison.
+
+Setup now accounts for 6.153 s: presolve 5.991 s, equilibration 0.149 s, KKT
+construction 0.011 s. The presolver performs exact rational equality elimination;
+a conservative modular proof of full row rank is a future candidate, with exact
+elimination retained whenever the proof is inconclusive. Setup timers are
+inclusive and separate from solve timers; phase totals must not be added.
+
+Pinned fast A–B–B–A checks preserve all medium and Ising11 points. Medium remains
+`Solved`/18 with its known external dual-residual failure (1.92e-6 > 1.75e-6).
+Ising11 remains `Solved`/52 and passes every original-coordinate audit. Its fast
+profile was 13.3% slower, so release timing was checked before acceptance:
+A=13.446812/13.435114 s; B=13.377951/14.381593 s, medians 13.440963/13.879772 s
+(+3.3%). A separate diagnostic candidate run was 13.451 s. Preserve this variation;
+no Ising kernel speedup is claimed and the confirmation is excluded from ABBA.
+
+A single preliminary Ising11 release solve with four threads took 4.301 s and
+returned the same point as one thread. One-thread phase medians identify direct
+SVD (3.502 s inside 4.043 s cone scaling), sampled residual work (1.948 s), RHS
+preparation (1.213 s) and recovery (1.368 s) as useful next targets. These timers
+overlap. Four-thread cone scaling wall time is 1.204 s; summed per-cone SVD time
+is not wall time. The plan prioritizes SVD subphase profiling, sampled cache and
+application reuse, then scheduling on larger Ising inputs. No cluster work ran.
+
+Harness checks verified untracked-source capture, rejection of source edits
+during compilation, recovery from a corrupted input cache and rejection of an
+auditor's nonzero exit even when an audit JSON exists. Rust formatting and
+`git diff --check` pass. Active documentation remains concise and English.
+Evidence: `~/.cache/sdpx-e2e/improve-20260927/summary.json`, logs and run paths;
+frozen candidate `compact-soc-release-20260927` (binary SHA256
+`b2ef4379f1a159000226ea378d5317191d3ed5b478b95f1c0e13e778a9e99d20`).
+
+## 2026-09-27 — Ising SVD, sampled RHS and PSD scheduling
+
+Kept three local Ising improvements:
+
+- Direct SVD caches fixed QR constants and records only the requested U/V
+  rotations in separate reusable buffers. QR, replay, bidiagonalization and
+  reflector timings are now separate receipt phases. SVD arithmetic order and
+  direct factorization are preserved; no Gram eigendecomposition is introduced.
+- Scalar sampled RHS adjoints use cached exact quadratic forms at MPFR256 and
+  above for eligible shapes (side >= 12, at least 16 unique basis columns).
+  Packing the symmetric RHS with off-diagonal scale 2 avoids svec rounding;
+  the residue kernel rounds once at the destination. Basis factors remain
+  authoritative, cache validation checks their exact values, and unsupported
+  shapes/exponent ranges retain the existing product path. The fallback reads
+  the exactly symmetric RHS transposed for contiguous dot operands.
+- Local MPFR PSD scaling offers the largest cones first through a shared work
+  queue. Every task owns one cone, output order is preserved, all tasks finish
+  before reporting a failure, and the existing pool/thread budget is reused.
+
+A separate RHS panel-clear shortcut showed no useful complete-solve benefit and
+was reverted. No precision, stopping criteria, regularization, refinement or
+original-coordinate audit gate changed. No tests were removed.
+
+Release A–B–B–A on the M4, pinned Ising11, MPFR512 and unchanged settings:
+
+| Threads | Previous compact-SOC arm | Ising candidate | API reduction |
+|---|---:|---:|---:|
+| 1 | 13.395325 s | 13.208873 s | 1.4% |
+| 8 | 3.238693 s | 3.149282 s | 2.8% |
+
+One batch per width; the gains are modest. A single four-thread candidate run
+was 4.070 s (preliminary). All nine release Ising solves passed the original-
+coordinate audit at `Solved`/52, with 53 factor attempts and 90 refinements.
+Candidate outputs repeat bitwise and are identical at one/four/eight threads.
+The exact quadratic calculation changes old/new low-order digits: maximum
+componentwise scaled distance below 6e-87. External primal/dual/gap remain
+2.34e-45 / 4.29e-44 / 1.70e-43, with SDPB-reference agreement 4.62e-35.
+
+One-thread phase medians: RHS preparation 1.125960 → 0.944683 s; total SVD
+3.488466 → 3.456315 s. Candidate SVD subphases: bidiagonalization 0.349710 s,
+QR 1.511023 s, replay 1.366551 s, reflectors 0.187023 s. Recovery remains
+1.284668 s. Phase timers overlap, and per-cone totals are not threaded wall time.
+
+The release medium A–B–B–A check returns identical points and the unchanged
+known dual-residual audit failure (`Solved`/18; 1.92e-6 > 1.75e-6). Its median
+API times are 2.126702/2.125896 s. Formatting and `git diff --check` pass.
+
+Only Lambda11 is available locally. Larger Lambda19/spins 0–50 inputs were
+requested; no cluster work ran and no larger-case performance claim is made.
+Evidence: `~/.cache/sdpx-e2e/ising-opt-20260927/summary.json`, phase receipts,
+rounding-distance report and logs. Frozen candidate `ising-opt-release-20260927`:
+binary SHA256 `84bca7f66c81a9be425d60eba7a693a2deb644715e915ba16ef67abd5030688c`;
+source manifest `0361d4e83c254b87b18699341ae623f9bbbd14814ff1036cd38d4e9f02fc9c6e`.
+
+
+## 2026-09-27 — Official SDPB pilot and reconstructed Lambda43 input correction
+
+Built official SDPB 3.1.0 (tag commit
+`fec8e934bf03eb59b0f35ad76dd9b205dde537e6`) and the current SDPX release in
+`hpc:~/projects/sdpx-ising43-20260927`. A same-node, four-physical-core
+Lambda19 single-correlator pilot at 768 bits passed both original-coordinate
+audits. One run per solver: SDPB 1101.777 s wall / 243 iterations /
+445.36 MiB sampled peak PSS; SDPX 451.558 s / 119 iterations / 1524.34 MiB.
+These are preliminary release measurements, not the requested Lambda43 result.
+The SDPB solve/audit completed before its wrapper hit a process-exit memory
+sampling race; the corrected SDPX retry skipped vanished process samples.
+Raw outputs were retained, and both audited points remain accepted.
+
+The 2019 paper's input is unavailable. The campaign reconstructs one fixed
+3D mixed-correlator model at Lambda43, 1265 components, 117 blocks and 1216
+bits. Review of arXiv:1603.04436 Eq. (2.5) found a missing cos²(theta) weight
+on the isolated odd contribution. The first generation is excluded and
+preserved; its converter and calibration are user-held. The v2 driver fixes
+that coefficient and stamps the definition in metadata. Corrected generation
+221696 follows the old job, conversion 221697 follows generation, and bounded
+four-core calibration 221699 waits for conversion and release build 221698.
+The 16/64-core scripts are prepared but unsubmitted; 256-core execution and
+complete target audits remain pending. Three-iteration calibration does not
+count as a successful numerical solve.
+
+Evidence: `~/.cache/sdpx-e2e/ising43-cluster-20260927/pilot-evidence`,
+`precision-grid-campaign.json`, and `generator/RECONSTRUCTION-v2.md`.
+Old jobs 221692/221693/221695 and all their outputs remain preserved.
+
+
+## 2026-09-27 — Exact MPFR precision grid in the CLI and C ABI
+
+Kept support for every 64-bit increment from 128 through 2048 bits, including
+1216. Binary64 remains 53 bits. Both frontends expand one shared registry,
+so their supported types cannot drift. The Rust API retains `MpFloat<N>`
+(`64*N` bits) and adds the convenience alias `Bits1216`. No arithmetic,
+precision rounding, tolerances, convergence or refinement rules changed.
+Unsupported widths, including 1000, still fail explicitly.
+
+Verification: locked offline compiler check passed for the solver and C ABI;
+the pinned Ising11 solve is `Solved`/52 and passes its existing audit. Medium
+is `Solved`/18 and retains its documented dual residual 1.92e-6 > 1.75e-6
+failure. Both solutions' x/s/z arrays are bitwise identical to the preceding
+`ising-opt-release-20260927` results. The existing C ABI sampled-PSD solve
+passed at 53, 512 and newly added 1216 bits, including reported working
+precision and solved objective checks. Rustfmt and `git diff --check` pass.
+The first exact test filter selected zero tests; rerunning the fully qualified
+name executed and passed the intended test. No timing claim uses this fast arm.
+
+Frozen arm: `precision-grid-20260927`; binary `d86a3bfeb06ec6dd36c09a5a960bc167c3f6f794d0909e74cf05139d4e40216f`;
+source manifest `b65d94406d6558df0effecd29bc80e851464ee5120e5df397d5209b2dfa4f414`. Run records and summary are in
+`~/.cache/sdpx-e2e/ising43-cluster-20260927/precision-validation.json`.
+Cluster source archive SHA256:
+`de8ef119a97e60c3c04d9a53d1f42f590b302c15b810fbe141c6a6fa6cdbd5fa`.
+Release job 221698 builds into a new target directory; the previous binary
+remains preserved. Its dependent calibration requires exact 1216-bit output
+and accepts exit code 2 only with `MaxIterations`, which is a calibration
+termination, never numerical success.
+
+
+## 2026-09-27 — Lambda19 memory and runtime diagnosis
+
+A diagnostic replay on node9 (job 221700, four physical cores, frozen release,
+768 bits and unchanged settings) completed `Solved`/119, passed the external
+audit and reproduced the earlier pilot's x/s/z bitwise. No numerical code
+changed. Profiled aggregate peak PSS was 1538.89 MiB; retain the uninstrumented
+1524.34 MiB and 451.558 s as the preliminary comparison row.
+
+Cumulative process peak RSS by stage: input 31 MiB; sampled materialization
+322; equilibration 432; KKT construction 751; first iteration 1283; second
+iteration 1375; solved 1529. These high-water marks do not constitute a heap
+allocation census. The retained A accounts for 274.44 MiB of allocated value
+and index payload. Generic PSD axpy plans retain another 53.39 MiB of capacity
+although the installed sampled path does not use them. Other live storage
+includes scaling/Gram/recovery panels and residue caches. RNS idle scratch is
+capped at 32 MiB per participating thread, while its process-global weight
+and CRT table caches have no eviction policy; their actual share of this
+run's peak is not yet measured.
+
+Top-level solve phases in this instrumented release: KKT update 194.49 s
+(43.4%), cone scaling 147.10 s (32.8%), KKT solve 48.27 s (10.8%). Setup is
+3.45 s. SVD rotation replay is 62.9% of summed per-cone SVD time; per-cone
+observations overlap across workers. Arrow refactor alone is 33.12 s.
+
+Prioritize removing unused sampled metadata and retained expanded A for RAM,
+then budget/share residue caches without discarding useful hot encodings.
+For speed, investigate direct-SVD rotation replay and the full KKT update
+path. Preserve the existing rounding, refinement and convergence rules.
+No optimization or savings claim follows from this diagnosis alone.
+Evidence: `~/.cache/sdpx-e2e/ising43-cluster-20260927/memory-profile/report.md`,
+`summary.json`, raw receipt, memory trace and original-coordinate audit.
+
+
+## 2026-09-28 — Sampled memory candidate and Rust PMP converter
+
+Implemented in the shared checkout (uncommitted):
+
+- Avoid generic PSD coefficient/AXPY plans for fully sampled KKT blocks;
+  release those plans when installing partially sampled blocks too.
+- Release `DefaultProblemData.A`'s expanded sampled coefficients after KKT
+  construction. Preserve the full matrix norm/nnz for initialization and
+  reporting. Its public `A` now contains the explicit linear component;
+  `materialize_A()` reconstructs the equilibrated matrix on demand. Prepared
+  preprocessing and distributed construction still receive the full matrix.
+- Share immutable basis residue encodings across operator workspaces.
+  Idle scratch has a process-wide 128 MiB cap and a 32 MiB per-thread cap;
+  weight and CRT table caches each retain at most 64 MiB. Active kernel
+  buffers and input-dependent caches are outside these retained-storage caps.
+- Replay direct-SVD rotations in four-row tiles, reusing MPFR descriptors.
+  Each destination still uses the same correctly rounded two-product sum.
+
+Frozen fast arm `sampled-memory-fast-20260928`, source
+`2205d2e21c0788c40a8ff39ae216099060d2c6bd08f601c1566cc797148c494e`,
+binary `60e6beae0ee96f4df70b75cab2c01cac015b37cbb1fd99f0e3fd066487784a68`.
+Ising11 A–B–B–A against `precision-grid-20260927`: all four points identical,
+`Solved`/52, all original-coordinate audits pass. Medium: identical points,
+`Solved`/18, existing dual-residual failure unchanged. Ising one/four-thread
+points are identical; four-thread audit passed. Fast timings are development
+checks, not release performance claims.
+
+Cluster source archive SHA256
+`fbbc9f2b8da5cfc5767762414043f936e401dbee316cf506229245687233b4f5`.
+Release build job `221703.node220`; node9 four-core Lambda19 comparison job
+`221704.node220` depends on that build. The driver runs A–B–B–A at MPFR768
+with unchanged settings, audits outside the timer, and simultaneous process
+PSS sampling. Existing binaries and pilot outputs are preserved. Submission
+manifest: `~/.cache/sdpx-e2e/ising43-cluster-20260927/sampled-memory-v2-campaign.json`.
+
+Added `sdpx-pmp`, a standalone Rust PMP conversion library and CLI. Adapted
+SDPB 3.1.0's normalization, density sampling, moment basis and sampled block
+format, retaining MIT provenance. Inputs are JSON or legacy XML; decimal
+strings go straight to MPFR. General square polynomial matrices, both basis
+parities, reduced prefactors, supplied sampling data, and automatic sampling
+are supported. Output is uncompressed SDPB JSON, written block by block.
+Mathematica, NSV, binary/ZIP output and MPI conversion are not implemented.
+
+Initial converter checks (MPFR768 unless stated): supplied, generated, XML,
+repeated-pole and isolated-zero upstream inputs converted; scalar outputs
+match their reference files (largest scaled differences below 1e-190 for the
+four reference comparisons). The upstream 2×2 XML coefficients agree below
+3e-231. Nontrivial normalization agrees below 6e-77 against an upstream
+512-bit reference (whose sampling stops at half precision). Three scalar
+solves and the upstream 2×2 solve pass independent original-coordinate
+1e-30 audits at unchanged 1e-42 solver tolerances; scalar objective also
+agrees with `(sqrt(145)-1)/6`. All 31 CLI MPFR choices pass a constant PMP
+conversion. Malformed shapes, normalization, samples and nonfinite inputs
+are rejected, and existing output files are preserved.
+Evidence: `~/.cache/sdpx-e2e/pmp-rust-20260928/`.
+
+A separately constructed normalized 2×2 diagnostic returns `AlmostSolved`
+after 24 iterations in both old and new binaries, with bitwise-identical
+points. It is not accepted or promoted. Input SHA256 `b5dac5b0848b35f5fa47cdfaa52a57e1416a91817f3be872c247d75439dc1f81`;
+analytical optimum 0.75; MPFR512, unchanged 1e-42 tolerances. This newly
+observed baseline limitation does not invalidate the upstream converter
+comparisons or the pinned solves.
+
+Integration checking also exposed an existing no-SDP build failure from
+unconditional split-hint calls; added a no-SDP passthrough. Five standalone
+provider test harnesses lacked the public receipt import after earlier SVD
+instrumentation; imports are repaired. Workspace release tests are pending.
+
+Final standalone converter source was rebuilt with the workspace lockfile in
+`pmp-rust-20260928/target-final`. JSON reading now avoids a whole-file text
+copy; XML concatenates comment/CDATA-split scalar text, and supplied bases
+accept trailing zero padding. All reference comparisons were repeated;
+the three audited scalar SDP payloads are unchanged. Final binary/source
+hashes and additional XML/padding checks are in `validation-v2/manifest.json`.
+
+## 2026-09-28 — Move remaining integration work to the cluster
+
+At the user's request, stopped the local release workspace compilation and
+its two remaining rustc children. That interrupted run is not a test pass.
+Large builds, full-suite checks and substantial numerical runs now use PBS;
+local work is limited to editing, inspection and lightweight preparation.
+
+Submitted `221705.node220` (8 cores, 64 GiB, four-hour limit), dependent on
+completion of the Lambda19 comparison `221704.node220`. It builds and checks
+the Rust converter against six upstream fixtures, exercises all 31 MPFR
+choices and malformed-input rejection, solves four converted inputs and
+runs independent original-coordinate audits. It then runs the release
+workspace tests with the cluster's dynamic OpenBLAS provider and faer.
+These checks are queued, not yet passed. The dependency keeps compilation
+from interfering with the time/memory comparison.
+
+Source hashes and the offline dependency closure were verified before PBS
+submission. Archive SHA256:
+`2fd7b083017ccbf4abf71b21adc1763e12a2e4a7383a048382d82d66c15814df`.
+Local preparation: `~/.cache/sdpx-e2e/cluster-integration-20260928-v1/`.
+Remote evidence: `~/projects/sdpx-ising43-20260927/integration-20260928-v1/`.
+Existing remote sources, binaries, jobs and results are preserved.
+
+## 2026-09-28 — Lambda19 memory qualification and remaining cluster checks
+
+Kept sampled memory and SVD replay changes after release A–B–B–A job
+`221704.node220` completed successfully. MPFR768, four physical cores on
+node9, unchanged input and tolerances. All four solves are `Solved`/119 and
+pass the original-coordinate audit; x/s/z are bitwise identical. Canonical
+point SHA256: `5d7108b5a6066ca96103235f04ec3ae20c7d9d7735c32d46a118bd7a8255446f`.
+
+| Arm | Wall seconds | Peak PSS MiB |
+|---|---:|---:|
+| A1 | 451.460906 | 1527.8730 |
+| B1 | 448.820576 | 1112.7305 |
+| B2 | 449.110645 | 1108.8076 |
+| A2 | 451.758012 | 1538.1641 |
+
+Medians: 451.609459 → 448.965610 seconds (−0.6%) and
+1533.018555 → 1110.769043 MiB (−27.5%). One batch on shared hardware;
+this establishes a memory improvement, with no substantial speed claim.
+Evidence: `~/.cache/sdpx-e2e/ising43-cluster-20260927/memory-paired-v2/`;
+remote `~/projects/sdpx-ising43-20260927/results/memory-v2-*` and
+`results-sdpx-memory-v2.json`. Frozen source archive:
+`fbbc9f2b8da5cfc5767762414043f936e401dbee316cf506229245687233b4f5`.
+
+Linux converter checks in job `221705.node220` pass: six upstream fixtures,
+all 31 MPFR dispatch choices, malformed-input/output-preservation checks,
+and four complete solves with independent audits. Workspace release tests
+are still pending; do not interpret the converter pass as a suite pass.
+
+Additional candidates implemented, awaiting complete-solve qualification:
+
+- Exact finite-field full-row-rank proof, with existing rational fallback.
+- Exact bilinear sampled RHS for matrix-valued blocks, rounded once.
+- Owned MPI matrix compaction and shared residual basis-cache preparation.
+- Shared automatic worker budget respecting `RAYON_NUM_THREADS`.
+- Public declaration for the existing `sdpx_mpi_world_size` C ABI function.
+
+Release pinned and enlarged-matrix checks run in `221706.node220`, source
+archive `a66d9db676f28d7494e96c63c6e7ac006c6f72c13cbdeeacbe3b6d4afb7c3bc7`.
+Intermediate real MPI qualification is `221707.node220`. Final source,
+including later cache/thread/argument-guard changes, is qualified separately
+by `221708.node220`, archive
+`3568263f750877c266e8e1d6f219b3d2be0c53b4202ef09c9b3d8f1cc2d622fc`.
+That job requires release workspace tests, pinned and matrix solves, real
+MPI CLI/C ABI audits, and automatic/explicit thread parity before writing
+its accepted completion marker. Existing medium failure remains explicit.
+
+Submitted the finite Lambda43 controller `221711.node220`, after successful
+`221708` and corrected-input calibration `221699`. It freezes input and
+binaries, calibrates 16/64/256 cores, then runs matched full 4/16/64/256-core
+SDPX/SDPB comparisons sequentially. Multi-node memory uses simultaneous
+summed process PSS, with physical CPU binding and output/input hashes.
+Failures stop the chain; measured resource estimates above 120 hours also
+stop for a resource decision. No full Lambda43 result is claimed.
+Harness: `~/projects/sdpx-ising43-20260927/mixed-scaling-20260928-v3/`, archive
+`67c14b75eb3cddd5f7a0efb3cc98e107eb85c5cbc179ea124c0cd4d7ac1ee02e`.
+Eight malformed-result fixtures were rejected by its lightweight gate check.
+Queued calibration now uses isolated Python 3.12 with NumPy 1.26.4; system
+Python 3.6 lacks the harness's monotonic clock API. All heavy work uses PBS.
+
+## 2026-09-28 — Integration failures observed in cluster status check
+
+Job `221705.node220` ended with exit 101: solver library tests reported
+440 passed, 5 failed and 43 ignored. Failures: sampled-factor residual sparse
+plan assertion, arrow fallback refactor, and arrow storage updates at Float64,
+MPFR512 and MPFR768. Converter comparisons and four audits had passed before
+the workspace tests. These failures require diagnosis; the suite is not passed.
+
+Job `221706.node220` ended with exit 1. Medium and Ising11 A–B–B–A points
+match bitwise; all four Ising solves return `Solved`/52. The Ising audit process
+could not load the required Julia `JSON` package, so no numerical audit result
+was produced. CSDR and matrix checks were not reached. Existing outputs are
+preserved for re-auditing after environment repair.
+
+Dependent jobs `221707`, `221708` and `221711` have no execution artifacts and
+are no longer recognized by PBS. They must not be reported as running or
+queued. The Lambda43 generation chain remains active/held separately; full
+scaling results are unavailable. The accepted Lambda19 memory result stands.
+
+## 2026-09-28 — PMP converter speed candidate
+
+Hoisted full-precision density constants, pole square roots and sampled-basis
+scale roots from inner loops. Operation order and bracketed root convergence
+are unchanged. Added optional `--threads N` and library
+`write_sdp_with_threads`: independent blocks are claimed dynamically, written
+one at a time per worker, and metadata retains input order. All workers join
+before failure cleanup; the existing serial API and CLI default stay serial.
+No solver engine or numerical tolerance changed.
+
+Submitted cluster release qualification `221717.node220` (8 cores, 32 GiB,
+two hours). The timing workload repeats the upstream pole fixture 16 times
+at MPFR768, in old/new-serial/new-eight-worker/reverse order. This is a
+converter workload, not an Ising solve or Lambda43 performance result.
+Validation requires byte-identical files, a nontrivial MPFR1216 comparison,
+all 31 registered precisions through the parallel API, error cleanup and
+output preservation, plus four original-coordinate audited complete solves.
+
+Source/harness archive SHA256:
+`6d3f0d5d47b137d9814a75bb9040061d55d545109db2c48370b0fc7f0ee1c224`.
+Evidence: `~/.cache/sdpx-e2e/pmp-speed-20260928-v1/` and remote
+`~/projects/sdpx-ising43-20260927/pmp-speed-20260928-v1/`.
+Results pending; no speedup is claimed at submission.
+
+## 2026-09-28 — PMP speed candidate accepted
+
+Cluster job `221717.node220` finished with exit 0 on node33. Release converter
+medians on the same MPFR768 input (16 copies of the upstream pole fixture),
+run sequentially in A–B–C–C–B–A order:
+
+| Converter | Workers | Wall seconds |
+|---|---:|---:|
+| Previous | 1 | 20.472284 |
+| Candidate | 1 | 18.794936 |
+| Candidate | 8 | 2.818450 |
+
+Serial time fell 8.2%; eight workers were 7.26× faster than the preceding
+serial converter. One batch on shared cluster hardware; this does not
+establish large-Ising conversion performance. Retained all changes.
+
+All output JSON files (including metadata) are byte-identical across the
+six upstream fixtures, timed runs and nontrivial 1216-bit comparison.
+Parallel dispatch at all 31 MPFR precisions, invalid-worker cleanup, zero
+worker rejection and preservation of existing output passed. Four converted
+inputs returned `Solved` and passed independent original-coordinate audits:
+supplied/automatic/XML/XML2, respectively 39/39/34/39 iterations, unchanged
+768-bit precision and 1e-42 solver tolerances, audit threshold 1e-30.
+
+Old binary SHA256:
+`3352e9d4a9c71ac3b74787de98102390119ed770e67873e13ebadb48e5f4b1cc`.
+New binary SHA256:
+`947413c1ce80d4187a0d4af17c79d535ff193f7ad81e1f660ca80cbf3b755535`.
+Timing input SHA256:
+`3d2a9dbac2187bac629ddd2248ba0294ec4de7d42716f3a33bd75ff3b42628b8`.
+Local evidence: `~/.cache/sdpx-e2e/pmp-speed-20260928-v1/evidence/`;
+remote: `~/projects/sdpx-ising43-20260927/pmp-speed-20260928-v1/`.
+`speed/summary.json` contains the full run rows and acceptance fields.
+The original B1 timing/log files were copied to `evidence/timing-original/`
+before the output-preservation check reused the B1 output path.
+
+## 2026-09-28 — Rust converter versus SDPB pmp2sdp
+
+Job `221720.node220` passed on node33, eight allocated physical CPU slots
+with explicit affinity. Frozen Rust converter from `221717` and the existing
+SDPB 3.1.0 build (`--version` reports `3.1.0-dirty`). Same input bytes,
+precision and uncompressed JSON output; serial BLAS/OpenMP. SDPB uses MPI
+ranks at width eight, Rust uses block workers. Each case/width runs sequential
+SDPB–Rust–Rust–SDPB. No solver changes or new solve-performance claim.
+
+Whole-command medians, including process/MPI startup and I/O:
+
+| Input | Bits | Workers | Rust seconds | SDPB seconds |
+|---|---:|---:|---:|---:|
+| 16 repeated pole blocks, automatic sampling | 768 | 1 | 17.495162 | 3.403778 |
+| Same | 768 | 8 | 2.443195 | 0.915778 |
+| Ising Λ11 preflight XML, supplied sampling/bases | 1216 | 1 | 3.448615 | 4.056028 |
+| Same | 1216 | 8 | 0.890525 | 2.527379 |
+
+One preliminary batch on shared hardware. Startup variability is material:
+SDPB's serial pole commands took 5.541 and 1.266 s, while its own conversion
+timer reported 0.991 and 0.921 s. At eight workers Ising's SDPB conversion
+timer reported 0.904/0.914 s versus 2.556/2.499 s whole-command time. Therefore
+the 2.84× end-to-end Rust advantage on that input is largely startup; it is
+not a demonstrated 2.84× arithmetic-kernel improvement. For automatic pole
+sampling Rust is 2.67× slower end-to-end at eight workers. SDPB uses Newton
+iteration with a half-precision stopping target; Rust retains full-working-
+precision bisection. Safeguarded full-precision Newton is a future candidate,
+requiring independent root/output and solve validation before adoption.
+
+Objective, block dimensions, bases and coefficients were compared on every
+run. Maximum scaled differences versus SDPB: 6.524e-229 for poles and
+2.221e-351 for Ising, both below the predeclared 1e-100 comparison gate.
+Each converter's numerical payload files are byte-identical across repeats
+and thread/rank counts. The Ising input is the existing preflight model,
+not corrected Λ43 or an original paper input; no scientific solve result is
+claimed for this conversion benchmark.
+
+Harness archive SHA256:
+`d58bbe2bdab936a3d283b3906c17b6cd37836c9a15fab29579741ca64a970b6a`.
+Local evidence: `~/.cache/sdpx-e2e/pmp-sdpb-compare-20260928-v1/evidence/`.
+Remote inputs, raw outputs, affinity receipts and commands:
+`~/projects/sdpx-ising43-20260927/pmp-sdpb-compare-20260928-v1/`.
+`manifest.json` pins both binaries and inputs; `results/summary.json` retains
+all timings and coefficient comparisons. Existing failed solver integration
+checks remain open independently of this converter comparison.
+
+## 2026-09-28 — Full-precision Newton and PMP memory candidate
+
+Implemented safeguarded Newton with analytic density derivatives. A Newton
+step is accepted only inside the sign bracket; invalid/non-improving steps
+fall back to bisection. Near rounding noise, test a local sign bracket and
+bisect to adjacent representable values. As before, an exactly zero computed
+residual also stops. No half-precision target or relaxed root tolerance was
+introduced. Root last digits may change, so complete solve audits are required.
+
+Replaced the full-document XML tree with a buffered quick-xml event reader,
+retaining comments/CDATA and numeric entity handling, duplicate-field checks,
+DTD rejection and shape validation. Replaced roxmltree with pinned quick-xml
+0.37.5 (existing memchr dependency). Parse MPFR polynomial coefficients for
+one upper-triangle matrix entry at a time; nonidentical text in symmetric
+entries still receives numeric equality checks.
+
+Cluster job `221721.node220` (8 cores, 32 GiB, two hours) builds a frozen
+release, runs upstream conversion checks and four solve audits, compares
+sample points against prior bisection at every supported precision, exercises
+XML validation and threaded cleanup, then compares old/new/SDPB on the two
+existing workloads. Time runs are sequential, old–new–SDPB–SDPB–new–old.
+Separate untimed memory runs sample the simultaneous sum of converter process
+PSS, excluding launchers, at 20 ms intervals. No candidate result claimed yet.
+Archive SHA256:
+`9cd9d498fa925d04bd19252610cb334775c714d3bd42604c9194db69aae50905`.
+Local preparation: `~/.cache/sdpx-e2e/pmp-newton-20260928-v1/`;
+remote evidence: `~/projects/sdpx-ising43-20260927/pmp-newton-20260928-v1/`.
+
+## 2026-09-28 — Newton/streaming XML candidate qualified
+
+Job `221721.node220` completed with exit 0. All six upstream reference checks
+and four original-coordinate solve audits passed. Sample points at every
+64-bit precision from 128 through 2048 agree with the previous bisection
+within the predeclared 64-epsilon scaled comparison. This comparison is a
+validation bound, not a new root stopping tolerance. XML entities, CDATA,
+comments, malformed-input rejection and parallel failure cleanup passed.
+Repeated and threaded payloads are byte-identical within each converter;
+the supplied-sampling Ising payload is also identical to the old converter.
+Automatic sampling changes the last digits (maximum coefficient difference
+from the prior Rust payload 9.565e-230 at MPFR768).
+
+First candidate results at eight workers on node33, one preliminary paired
+release batch, whole-command seconds:
+
+| Input | Prior Rust | Newton/streaming Rust | SDPB 3.1.0 |
+|---|---:|---:|---:|
+| Automatic pole fixture, MPFR768 | See timing rows | 0.164588 | 1.118690 |
+| Ising Λ11 preflight XML, MPFR1216 | 1.044801 | 0.915550 | 2.167771 |
+
+Separate 20-ms PSS measurements on Ising: serial prior/new/SDPB
+77.029/48.889/125.638 MiB; eight workers 100.369/94.436/160.401 MiB.
+These are simultaneous sums over converter processes, not sums of independent
+rank maxima. Timing includes process/MPI startup and JSON I/O; this is not a
+large-Λ43 result or an arithmetic-kernel speed ratio. Candidate retained.
+Local summaries: `~/.cache/sdpx-e2e/pmp-newton-20260928-v1/evidence/`.
+
+A subsequent bounded memory refinement removes the temporary copy of each
+entry's MPFR polynomial vectors and reuses the first XML scalar text buffer.
+The normalization/Horner arithmetic order is unchanged. A fresh source and
+separate namespace `pmp-memory-20260928-v2` will verify exact payload parity,
+repeat the converter solve audits, and measure paired time and process PSS.
+
+## 2026-09-28 — PMP coefficient buffer refinement accepted
+
+Job `221722.node220` passed on node33. Kept direct parsing into normalized
+polynomial vectors and reuse of the first XML text buffer. All six fixture
+outputs and 31 precision-dispatch outputs are byte-identical to the qualified
+Newton version. Split comment/CDATA/entity XML text and numerically equal,
+textually different symmetric coefficients also produce identical output.
+Four complete solves again pass unchanged original-coordinate audit gates.
+The Newton source is unchanged from the 31-precision root qualification.
+
+Release whole-command medians from old–new–SDPB–SDPB–new–old ("old" here is
+Newton/streaming XML v1), fixed CPU affinity, same input bytes and precision:
+
+| Input | Workers | Old seconds | Final Rust seconds | SDPB seconds |
+|---|---:|---:|---:|---:|
+| Automatic pole fixture, MPFR768 | 1 | 0.640312 | 0.615409 | 2.276507 |
+| Same | 8 | 0.164680 | 0.164694 | 0.790443 |
+| Ising Λ11 preflight XML, MPFR1216 | 1 | 3.324595 | 3.277324 | 4.242533 |
+| Same | 8 | 0.941652 | 0.915465 | 2.120863 |
+
+Separate untimed peak-PSS measurements, simultaneous sum over converter
+processes at 20 ms intervals:
+
+| Workers | Old MiB | Final Rust MiB | SDPB MiB |
+|---|---:|---:|---:|
+| 1 | 48.833984 | 48.130859 | 125.629883 |
+| 8 | 93.345703 | 88.728516 | 159.581055 |
+
+Final eight-worker whole-command speed ratios are 4.80× for automatic
+sampling and 2.32× for Ising versus SDPB. Ising PSS is 44.4% lower at eight
+workers and 61.7% lower serially. The incremental copy removal cuts PSS
+another 4.9% at eight workers relative to the qualified Newton candidate.
+Times and memory are preliminary single batches/probes on shared hardware.
+Startup contributes materially to SDPB wall time; these are not universal
+kernel-speed claims. Neither workload qualifies large-Λ43 conversion scaling.
+
+Final source/harness archive SHA256:
+`8759518cbd864b135213e6994b74d81f9c51f347cf84e9e0d447e26615748f89`.
+Evidence: `~/.cache/sdpx-e2e/pmp-memory-20260928-v2/evidence/` and
+`~/projects/sdpx-ising43-20260927/pmp-memory-20260928-v2/`.
+The manifest pins inputs/binaries; bench rows, raw output payloads, audit
+files, physical-CPU receipts and simultaneous-PSS traces remain on the cluster.
+Local summaries retain all timing rows, memory peaks, parity results and
+solve-audit status. No numerical tolerance or working precision was reduced.
+
+## 2026-09-28 — Eight-hour improvement campaign and integration repair
+
+Started the user-authorized eight-hour window at 03:04 China time, ending
+11:04. SDPX remains the main task; PMP conversion is secondary. All substantial
+builds, tests and solves run through PBS. No commits are requested.
+
+The five integration assertions from 221705 assume pre-compaction matrix
+storage or QDLDL regularization despite an explicitly disabled setting. The
+sampled check now examines `materialize_A()` and verifies compact storage.
+Arrow checks require both backends to reject the zero singleton pivot with
+regularization disabled, preserve lazy materialization and recover when the
+pivot is restored. Existing successful fallback/batch coverage is retained.
+No production regularization or numerical acceptance rule was relaxed.
+
+Installed the exact pinned Julia audit dependencies into the new campaign
+namespace. Job 221727 stopped during compilation because a copied Cargo
+cache reused an older arithmetic library lacking the modular-rank method.
+Job 221728 excludes all workspace crate artifacts/fingerprints from its cache
+and rebuilds the complete integration snapshot. Its source/harness archive is
+`f417fbdb37c6d510b0c73da835b21c0ae7a5ed913e43d6ec5de498338f562d93`.
+The failed artifacts remain intact; no numerical result is accepted yet.
+
+A separate candidate reuses the cone's R·Rᵀ in KKT updates and applies the
+existing exact residue-BLAS kernel to suitable MPFR symmetric products.
+Aliased operand views share one encoding. The upper-triangle and rounding
+contracts are retained. Job 221729 is the release/pinned/Lambda19/MPI gate;
+archive `5e143f1b43946f303d6e840eb424542cbb6ed15fc1d2cc2b908ddbbfb07f3195`.
+Comparisons are sequential per host with BLAS at one thread and explicit
+physical CPU affinity. These are unqualified candidates, not measured gains.
+
+### 2026-09-28 — Bounded PMP input and lazy solver workspace candidates
+
+- PMP job `221730.node220` freezes bounded two-pass JSON/XML conversion with
+  one block per worker plus the reader. Existing API, byte parity, all 31
+  precisions, malformed-input cleanup and four complete solve audits precede
+  matched Rust/SDPB conversion timing and simultaneous memory measurements.
+  Archive SHA-256: `56b734b841af32523db87f23a52167e715c998b40062df9ffe7d16025f56a952`.
+- Solver job `221739.node220` follows `221729` on node9. It removes unused left
+  SVD storage, allocates paired PSD step work only when used, and reconstructs
+  eligible exact residue products into their destination matrix. Numerical
+  operations and gates are unchanged. It includes an eight-thread matrix solve
+  to exercise paired workspaces, full integration and MPI/C ABI validation.
+  Four distributed state checks now distinguish full operator nonzeros from
+  compact linear storage. Archive SHA-256:
+  `9d42114bb8a7a7da16219f4e6e7f802d1cac5ff75433d7632d9ed08c912642c4`.
+- Both are pending candidates. No speed, memory or correctness outcome is
+  claimed before the cluster evidence completes.
+
+### 2026-09-28 — Integration fixture diagnosis and candidate repairs
+
+- `221728` completed compilation but failed its solver suite: 438 passed,
+  seven failed, 43 ignored. Four state assertions compared compact storage
+  with expanded counts; three KKT checks rebuilt kernels from compact runtime
+  state. Tests now restore construction matrices from the sampled factors.
+  Independent original-operator residual checks remain unchanged. The initial
+  sparse-plan and disabled-regularization repairs passed this run.
+- Held unstarted `221739` to preserve its snapshot without repeating known
+  fixture failures. Replacement workspace candidate `221743` includes the
+  final test repair; archive SHA-256
+  `ada675ba0bd5a06dc39ad9f48ea09fc719fc556855450fe9565d90b5c2a34906`.
+- `221730` failed to compile because the cancellation flag was declared inside
+  the thread scope. Moving it outside repairs its lifetime. `221742` compiled
+  the corrected PMP snapshot and began conversion validation. Archive SHA-256:
+  `bba7037c01eb2876751f5bfe7fb8397422084727a09f2a23664b01e4e8574459`.
+- `221744` follows PMP validation. Its fast-profile A/B arms isolate skipping
+  zero products during MPFR SVD rotation replay, preserving signed zeros. The
+  rule matches the pinned MPFR 4.2.2 `fmma.c`/`add.c` zero paths. Nonzero and
+  nonfinite paths are unchanged. Archive SHA-256:
+  `2593a745b7beed3905960c0d30ba1114f67537fa4458c385004aa589287353f7`.
+  No performance claim is made before complete-solve evidence and release
+  confirmation.
+
+### 2026-09-28 — Bounded PMP file conversion retained
+
+`221742.node220` exited 0. Six fixture payload checks, every precision from
+128 to 2048 in 64-bit steps, four complete original-coordinate solve audits,
+12 in-memory API calls, header ordering, normalization, serial/threaded parity
+and malformed/late/worker-error cleanup all passed. Existing output is refused;
+workers finish before removing a failed call's own output directory.
+
+One release A–B–C–C–B–A batch on node13, old Rust / streaming Rust / SDPB 3.1.0:
+
+| Input | Workers | Old Rust (s) | Streaming Rust (s) | SDPB (s) |
+|---|---:|---:|---:|---:|
+| Automatic 16-pole, MPFR768 | 1 | 0.666 | 0.615 | 3.699 |
+| Automatic 16-pole, MPFR768 | 8 | 0.164 | 0.189 | 0.922 |
+| Ising Λ11 XML, MPFR1216 | 1 | 3.244 | 3.343 | 3.992 |
+| Ising Λ11 XML, MPFR1216 | 8 | 0.791 | 0.740 | 1.967 |
+
+Separate 20 ms simultaneous process-PSS passes on the Ising XML: serial
+48.14 → 10.84 MiB (−77.5%); eight workers 88.63 → 77.79 MiB (−12.2%).
+SDPB used 123.23 / 158.60 MiB. Retained for bounded memory and overlap of
+parsing with conversion. Serial Ising time increased 3.1%; eight-worker time
+fell 6.4%. Automatic eight-worker runs varied from about 0.11 to 0.21 s, so
+its apparent Rust regression is not a reliable timing distinction. All times
+include command startup and output; SDPB parallel time also includes MPI.
+These are preliminary workload-specific measurements, not a Λ43 result.
+
+Evidence: `~/.cache/sdpx-e2e/pmp-stream-20260928-v2/evidence/`; source archive
+SHA-256 `bba7037c01eb2876751f5bfe7fb8397422084727a09f2a23664b01e4e8574459`.
+
+### 2026-09-28 — PMP polynomial evaluation candidate submitted
+
+`221745.node220` follows the solver replay comparison on node13. It removes
+redundant leading Horner work after polynomial normalization; original lengths
+still determine sample counts and basis sizes. Remaining arithmetic keeps its
+order. All-zero polynomials are shortened only when their zero signs permit
+it. Payload checks include signed zeros, sample `-0`, normalization and 128,
+768 and 2048-bit inputs, followed by the existing complete converted-input
+solve audits and matched conversion/memory comparison. Results are pending.
+Archive SHA-256: `8d7368469d178f193492fe4fff44f724c888830e171566dad8de7e289a22b716`.
+
+### 2026-09-28 — Sampled-input reader candidate submitted
+
+`221751.node220` follows the PMP candidate on node13. It parses decimal strings
+directly into the working scalar type without retaining each block's strings.
+B rows retain only nonzeros plus their full width for dimension validation.
+String-only wire input, finite/underflow checks, CSC ordering and factor values
+are preserved; malformed decimals now carry JSON source positions. No Float64
+intermediate is introduced for MPFR. The isolated fast comparison requires
+pinned medium/Ising11 point parity, full Lambda19 audits and real MPI. Profiled
+large solves also record peak memory reached at input completion. Release
+confirmation is required before quoting a gain. Archive SHA-256:
+`9c585463100d67111eaf0de09bd4bd078540a2a0adcb329469b0d6201f96013f`.
+
+### 2026-09-28 — Shared transformed-basis cache candidate submitted
+
+`221754.node220` isolates sharing the sampled forward/adjoint V encoding when
+both inner dimensions select the same prime width. Different widths retain
+separate caches. The existing exact-bit, exponent-alignment and prime-count
+checks still control reuse; the larger adjoint encoding can serve a forward
+prefix. No arithmetic or output ordering changes. Required checks are pinned
+and Lambda19 complete solves, matrix-valued one/eight-thread parity, and real
+MPI. This fast build is for selection; release confirmation remains required.
+Archive SHA-256: `14b33dc290aa183cdf28724ed4a8bf0aed8f65eddcbdbb9d9a7d92ef6559a06e`.
+
+### 2026-09-28 — Gram reuse retained after release and MPI checks
+
+`221729.node220` exited 0. One release A–B–B–A batch on node9, four fixed
+physical cores: Lambda19 MPFR768 median wall time 457.112 → 421.484 s
+(−7.8%), simultaneous peak PSS 1121.23 → 1129.57 MiB (+0.7%). Every run
+was `Solved`/119 with identical points and passing original-coordinate audit.
+Medium and Ising11 one/four-thread points match; medium retains exactly its
+known external failure. Real two-rank MPI A–B–B–A also preserves both cases'
+points and audits. This qualifies the isolated Gram change against its frozen
+preceding arm; it does not replace the pending full integration checks.
+
+Retained cone Gram reuse, exact residue SYRK and encoding one copy of identical
+GEMM operands. Evidence: `~/.cache/sdpx-e2e/gram-reuse-20260928-v1/evidence/`.
+Source archive SHA-256:
+`5e143f1b43946f303d6e840eb424542cbb6ed15fc1d2cc2b908ddbbfb07f3195`.
+
+### 2026-09-28 — PMP output-row streaming candidate submitted
+
+`221755.node220` follows workspace checks on node9 and successful polynomial
+qualification. Basis and B rows are serialized immediately; c entries stream
+individually. Decimal arrays no longer remain allocated for an entire output
+block. JSON field order and decimal formatting stay unchanged. Normalized
+constant coefficients are parsed again for B to bound retained memory; the
+per-entry arithmetic sequence is unchanged. Worker joins and whole-call error
+cleanup still precede publication of control.json. Byte parity, all precision
+and converted-solve audits, signed zeros, error cleanup and matched SDPB/Rust
+conversion time/PSS are required. Results are pending. Archive SHA-256:
+`280baecde00c0c580c839c4ba288aefcdc52e371f7e581bc3ea6ba364bdc4e22`.
+
+### 2026-09-28 — Packed residue-cache candidate submitted
+
+`221758.node220` follows successful shared-V qualification on node13. Balanced
+residues for prime widths up to 24 lie strictly between −2^23 and 2^23, so
+three signed bytes preserve each integer exactly. Wider cached residues keep
+f32 storage. Decoding sign-extends to i32 and converts exactly to the f64 BLAS
+operand; cache identity and CRT arithmetic remain unchanged. This reduces
+eligible retained residue payloads by 25%, not necessarily whole-process
+peak memory. Fast-profile pinned/Lambda19, matrix one/eight-thread and real
+MPI complete-solve checks will determine whether the tradeoff is worthwhile.
+Release confirmation is required for performance claims. Archive SHA-256:
+`af1e0c6f116ed35f3526f430dd777cf8e44839dd09ad9363ff580b769be0028d`.
+
+### 2026-09-28 — Zero-pair SVD shortcut removed
+
+The complete isolated fast-profile A–B–B–A comparisons from `221744` showed
+no speed or memory benefit on medium, Ising11 or Lambda19. All four large
+runs were `Solved`/119 with identical points and passing audits; the candidate
+was slightly slower and its peak PSS slightly higher. No release performance
+claim is made from this development selection. Removed only the zero-pair
+branch and its lazy canonical-zero variable, restoring the frozen preceding
+arithmetic file byte for byte. Earlier replay improvements are preserved.
+The live job is allowed to finish its remaining MPI checks; all artifacts stay
+under `~/.cache/sdpx-e2e/replay-zero-fast-20260928-v1/` and the matching cluster
+namespace. This direction is closed without new profiling evidence.
+
+`221744` subsequently exited 0: real two-rank MPI also preserved points and
+audits. Numerical checks passed; the performance rejection is unchanged.
+Reports are in `~/.cache/sdpx-e2e/replay-zero-fast-20260928-v1/evidence/`.
+
+### 2026-09-28 — PMP zero-term shortcut removed
+
+`221745.node220` exited 0. Six fixture payload checks, all 31 precisions, four
+converted-input solve audits, in-memory API/thread parity, signed-zero padding
+and failure cleanup passed. One release A–B–C–C–B–A batch on node13 measured
+Ising1216 serial time 3.293 → 3.296 s; eight-worker medians 0.777 → 0.766 s,
+with candidate runs spanning 0.666–0.866 s. Serial PSS was 10.84 MiB for both;
+eight-worker PSS 77.28 → 77.47 MiB. This does not establish a useful gain.
+Automatic short runs and SDPB runs also varied substantially; no new speedup
+claim is drawn from them. Removed the trimming helper and calls, preserving
+the independent row-output candidate. That frozen row experiment still
+compares against this numerically qualified zero-term arm; the combined
+release will compare final output streaming against accepted input streaming.
+
+### 2026-09-28 — Workspace tests repaired; doctest link environment corrected
+
+`221743` completed all compiled unit/integration suites without failures.
+The solver unit suite reported 445 passed, zero failed, 43 ignored; all seven
+previously failing distributed state/KKT fixtures passed with their original
+residual checks. The final doctest stage failed one CscMatrix example because
+rustdoc's linker lacked the external OpenBLAS search path (`-lopenblas`).
+This is a harness link failure, not a numerical failure, and the full workspace
+check is not yet marked passed.
+
+Retry `221761.node220` preserves the exact frozen v2 source and copies its
+build artifacts into a fresh target directory. RUSTDOCFLAGS and LIBRARY_PATH
+now include the pinned provider directory. It reruns the full suite, then
+continues release solve, matrix, MPI and C ABI qualification. The final
+combined harness has the same environment repair. The original log is stored
+under `~/.cache/sdpx-e2e/solver-workspace-20260928-v2/evidence/`.
+Retry package SHA-256:
+`c5c7a06039f5e952e179ed67840c89decae806b1ebc77c3080022ed3553d0c57`.
+
+### 2026-09-28 — PMP row output retained after release qualification
+
+`221755.node220` exited 0. Output files match the preceding converter byte
+for byte. Six fixture checks, 31 precisions, signed zeros, 12 in-memory API
+calls, thread parity and malformed/late/worker-error cleanup passed. All four
+converted-input complete solves passed original-coordinate audits.
+
+One release A–B–C–C–B–A batch on node9, preceding Rust / row-streaming Rust /
+SDPB 3.1.0, including command startup and uncompressed JSON output:
+
+| Input | Workers | Previous Rust (s) | Row output (s) | SDPB (s) |
+|---|---:|---:|---:|---:|
+| Automatic 16-pole, MPFR768 | 1 | 0.640 | 0.615 | 2.142 |
+| Automatic 16-pole, MPFR768 | 8 | 0.164 | 0.164 | 0.690 |
+| Ising Λ11 XML, MPFR1216 | 1 | 3.194 | 3.243 | 4.820 |
+| Ising Λ11 XML, MPFR1216 | 8 | 0.865 | 0.690 | 1.967 |
+
+Separate 20 ms PSS passes: serial 10.84 → 6.74 MiB (−37.9%), eight workers
+77.62 → 39.98 MiB (−48.5%). SDPB used 125.81 / 158.65 MiB. Retained for
+bounded output memory and the parallel improvement; serial time rose 1.5%.
+These remain preliminary workload-specific numbers. Automatic/SDPB short
+runs varied; no Λ43 result is inferred.
+
+The frozen row experiment includes zero-term trimming in both Rust arms.
+That independent shortcut was removed locally after showing no benefit. The
+final combined converter will be compared directly with accepted input
+streaming, including byte parity and complete converted-input solves.
+Evidence: `~/.cache/sdpx-e2e/pmp-row-output-20260928-v1/evidence/`.
+Archive SHA-256: `280baecde00c0c580c839c4ba288aefcdc52e371f7e581bc3ea6ba364bdc4e22`.
+
+`221761` again passed the compiled suites but rustdoc rejected `-l`, a
+compiler-only flag incorrectly copied into RUSTDOCFLAGS. Second scoped retry
+`221766.node220` uses only `-L native=<provider>` there and keeps the provider
+in LIBRARY_PATH. The pinned rustdoc accepts that option in a brief preflight.
+Source and numerical settings remain unchanged; earlier outputs are preserved.
+The combined harness has the same correction. Retry package SHA-256:
+`50daaec583b342de9e9eecd1eb3f75d9e1783c319b066c4bdf346b7a487cee60`.
+
+`221766` passed the entire Linux release workspace suite, including all four
+solver doctests. The repaired rustdoc search path resolved the harness issue.
+The solver unit suite remains 445 passed / zero failed / 43 ignored. Release
+binary construction and complete-solve/MPI/C ABI checks follow in the same
+job. Log: `~/.cache/sdpx-e2e/solver-workspace-20260928-v4/evidence/workspace-tests.log`.
+This snapshot predates the later reader/cache/converter candidates; final
+combined integration is still required.
+
+### 2026-09-28 — Converter timing resolution corrected for final comparison
+
+Inspection found that the earlier converter timing harness used
+subprocess.run(timeout=...) with file outputs. Python's POSIX timeout wait
+polls with delays up to 50 ms, visible in the short timings above. Those are
+observed whole-command waits with coarse resolution; the reported 1.5%
+serial row-output difference is inconclusive. Memory sampling, byte checks
+and original-coordinate audits are unaffected. The larger parallel difference
+exceeds this quantization, but precise final confirmation is still required.
+
+The final combined harness now times a blocking Popen.wait(), with a separate
+1200-second watchdog and its cancellation/join outside the measured interval.
+It will compare accepted input streaming, final row streaming and SDPB anew.
+The solver's pinned harness already uses blocking os.wait4 and is unaffected.
+
+### 2026-09-28 — Direct sampled decimal reader retained for loading
+
+Job `221751.node220` completed all pinned, Lambda19 and real two-rank MPI
+A–B–B–A checks. Every point is identical; Ising audits pass and medium retains
+its known failure. Direct MPFR parsing and sparse B-row construction remove
+duplicate decimal buffers. The fast-profile input stage became faster and
+used slightly less memory; whole-solve PSS increased slightly, so this is not
+claimed as a solve-peak memory reduction. Retained for input loading, with
+release timing deferred to the final combined comparison.
+
+Evidence: `~/.cache/sdpx-e2e/sampled-reader-fast-20260928-v1/evidence/`.
+Source archive: `9c585463100d67111eaf0de09bd4bd078540a2a0adcb329469b0d6201f96013f`.
+
+### 2026-09-28 — Honor explicit glibc allocator thresholds
+
+The CLI previously skipped its allocator defaults only when
+MALLOC_MMAP_THRESHOLD_ was set, despite promising to respect user settings.
+It now also skips them for MALLOC_TRIM_THRESHOLD_ or MALLOC_TOP_PAD_. Default
+allocator behavior is unchanged. This compatibility fix is included in the
+pending final CLI/pinned integration; no allocator performance gain is claimed.
+
+### 2026-09-28 — Remaining MPI coverage and bounded cache candidate
+
+Queued `221773.node220` after workspace qualification: ordinary two-rank MPI
+exponential-cone and forced augmented-LP solves, compared with the accepted
+release baseline. Analytical original-coordinate primal, dual, cone, gap and
+objective checks cover routing outside the partitioned PSD cases. This is a
+short validation job on the existing node9 allocation footprint.
+
+A separate scratch candidate builds cached residues in 16-prime groups,
+compressing each immediately instead of holding a full f64 encoding alongside
+the final cache. Mathematical integer GEMM and residue order are unchanged.
+It follows the packed-cache experiment on node13 and is not yet in production.
+Pinned, Lambda19, matrix one/eight-thread and real MPI checks decide retention.
+Package: `bounded-cache-fast-20260928-v1`, SHA-256
+`90513e3b6d4003dc5fa95f3b0832e895aa3f98f2e17551affa9215a4e0b17c6a`.
+
+### 2026-09-28 — Bootstrap example documentation path
+
+Corrected the root README's bootstrap example link to its workspace location,
+`crates/solver/examples/rust/example_bootstrap.rs`, and wrapped the sampled
+storage description. No benchmark table was added. `git diff --check` passes.
+
+### 2026-09-28 — PMP decimal formatting candidate
+
+Queued `221779.node220` on node9 after the ordinary MPI check. A scratch-only
+candidate uses Serde collect_str for MPFR values and serializes borrowed
+numeric rows, avoiding an outer decimal String copy and Vec<String> rows.
+JSON escaping and the scalar's Display format are preserved. The frozen
+baseline is current row streaming without the rejected zero-term shortcut.
+
+Acceptance includes fixture/precision byte parity, public API/thread/error
+cleanup, four converted-input audits, and a matched release comparison with
+blocking process waits plus a separate memory pass. No production formatting
+change is kept yet. Package `pmp-format-stream-20260928-v1`, SHA-256
+`1102bde3d80592ee02e2cd5fa340cdbff3c1e3ad897c8502f0575a86640ccddf`.
+
+### 2026-09-28 — Shared transformed-basis residues retained
+
+`221754.node220` exited zero. Compatible forward and adjoint products now
+share one V residue cache; incompatible prime widths retain separate caches.
+The existing fingerprint/alignment/prime-count checks remain unchanged.
+All pinned and Lambda19 A–B–B–A points are identical, as are the matrix
+one/eight-thread points and real two-rank MPI comparisons. External Ising and
+matrix audits pass; medium retains its unchanged known failure.
+
+The complete fast-profile comparison used less peak PSS with no observed
+speed penalty. Retained for memory; performance figures await the final
+release comparison. Evidence:
+`~/.cache/sdpx-e2e/shared-v-cache-fast-20260928-v1/evidence/`.
+Source package SHA-256:
+`14b33dc290aa183cdf28724ed4a8bf0aed8f65eddcbdbb9d9a7d92ef6559a06e`.
+
+### 2026-09-28 — Lazy workspaces/direct MPFR output retained; MPI qualified
+
+`221766.node220` exited zero. Retained right-only SVD storage, lazy paired
+PSD step workspaces and direct reconstruction into compact GEMM destinations.
+The complete release workspace suite, pinned medium/Ising11/CSDR, Lambda19,
+matrix one/eight-thread, real partitioned MPI, C ABI MPI and automatic-thread
+budget checks pass their existing gates. Medium's known external failure is
+unchanged. All refactor/thread comparison points are identical; all five
+matrix original-coordinate audits pass.
+
+One release A–B–B–A batch on node9 (AMD EPYC 7742, four physical cores),
+Lambda19 MPFR768: median wall 422.058 → 420.344 s; peak PSS 1135.71 →
+1106.67 MiB (−2.6%). The small timing difference is preliminary. Every arm
+reports Solved/119 and passes the unchanged audit. This compares against
+Gram reuse; the final combined comparison still uses the accepted sampled
+memory baseline. Evidence:
+`~/.cache/sdpx-e2e/solver-workspace-20260928-v4/evidence/qualification/`.
+Frozen production source SHA-256:
+`ada675ba0bd5a06dc39ad9f48ea09fc719fc556855450fe9565d90b5c2a34906`.
+
+Additional job `221773.node220` exited zero. Ordinary MPI exponential and
+forced augmented-LP cases pass independent MPFR512 primal/dual/cone/gap and
+analytical-objective audits at unchanged tolerances. Baseline/candidate and
+serial/two-rank points are identical. Evidence:
+`~/.cache/sdpx-e2e/ordinary-mpi-20260928-v1/evidence/complete/`.
+
+### 2026-09-28 — Serde formatting candidate rejected
+
+`221779.node220` exited zero: all six fixture byte checks, 31 precisions,
+API/thread/error cleanup and four original-coordinate audits pass. However,
+serial Ising Λ11 XML at MPFR1216 slowed from 3.207 to 3.393 s in one precise
+release comparison; both candidate runs were slower than both baseline runs.
+Eight-worker medians were 0.646 / 0.659 s, with substantial run variation.
+Peak PSS was essentially unchanged (6.72 / 6.73 MiB serial, 39.99 / 39.90 MiB
+at eight workers). The automatic-pole case improved, but this did not justify
+the Ising regression and added wrappers. Rejected; production was never edited.
+Evidence: `~/.cache/sdpx-e2e/pmp-format-stream-20260928-v1/evidence/`.
+
+A smaller alternative will bypass Display's outer String copy using MPFR's
+existing direct decimal conversion, retaining ordinary Serde string encoding.
+This avoids the streaming formatter overhead tested above and requires no new
+JSON wrapper types or changes to public converter bounds.
+
+The direct-decimal alternative is `221785.node220`, in the same node9 budget
+with no overlapping timed run. Scalar gains a default decimal_string method;
+MPFR delegates directly to its existing to_decimal(None). Four converter
+formatting sites use it; custom scalar types retain Display through the default.
+The candidate remains scratch-only pending the same full conversion checks.
+Package `pmp-decimal-string-20260928-v1`, SHA-256
+`b02d008b7aa9456f5485cb78f7ea2dda3dfdf0cb8c0cd4f81430b71a81a34c8d`.
+
+### 2026-09-28 — Direct decimal strings retained
+
+`221785.node220` exited zero. All six fixtures, 31 precisions, signed-zero
+cases, API/thread/error cleanup and four converted-input audits pass with
+byte-identical output. Retained the small Scalar default/MPFR override and
+four PMP call-site substitutions; no Serde wrapper types were added.
+
+One release A–B–C–C–B–A batch on node9, using blocking process waits:
+
+| Input | Workers | Row-stream baseline | Direct decimal strings | SDPB 3.1.0 |
+|---|---:|---:|---:|---:|
+| Automatic 16-pole, MPFR768 | 1 | 0.612 s | 0.577 s | 2.173 s |
+| Automatic 16-pole, MPFR768 | 8 | 0.150 s | 0.134 s | 0.633 s |
+| Ising Λ11 XML, MPFR1216 | 1 | 3.218 s | 3.222 s | 3.994 s |
+| Ising Λ11 XML, MPFR1216 | 8 | 0.695 s | 0.637 s | 2.056 s |
+
+Serial Ising is essentially unchanged; both eight-worker candidate runs were
+faster than both baseline runs (median −8.3%). Separate peak-PSS measurements
+are similar: 6.73 / 6.77 MiB serial, 39.99 / 40.19 MiB with eight workers.
+No memory reduction is claimed for this formatting change. SDPB short-run
+variation is substantial, so these are preliminary workload-specific results.
+Final composition will still be compared to accepted input streaming.
+Evidence: `~/.cache/sdpx-e2e/pmp-decimal-string-20260928-v1/evidence/`.
+
+### 2026-09-28 — Invalid cache lifetime candidate
+
+Queued `221786.node220` on the now-free node9 allocation. On a cache miss,
+the scratch candidate takes the invalid entry under its mutex and drops it
+outside the lock before encoding a replacement. Active products retain their
+own Arc, so their storage stays valid. Hit checks and numerical encoding are
+unchanged. The earlier implementation retained the invalid storage through
+replacement construction.
+
+This is isolated against the packed-cache binary and is independent of bounded
+prime-group encoding. Both changes require final combined qualification if
+retained. Pinned, Lambda19, matrix one/eight-thread and real MPI checks run
+sequentially within the job. Package `cache-release-fast-20260928-v1`, SHA-256
+`804689dd5d20e8612489e9f47adaa6dbd16bd99cd5d8e75b0f6758d4910d8e50`.
+
+### 2026-09-28 — Packed residue storage retained
+
+`221758.node220` exited zero. Retained signed three-byte storage for balanced
+residues at prime widths up to 24 bits, with exact f32 storage for 25-bit
+primes. Complete pinned, Lambda19, matrix one/eight-thread and real MPI
+comparisons preserve solution points. All applicable original-coordinate
+audits pass; medium's known failure is unchanged. All five matrix audits pass.
+
+The fast development comparison showed lower peak PSS with a small runtime
+tradeoff. No release performance number is claimed for this isolated change;
+the combined release comparison will determine the overall effect. Evidence:
+`~/.cache/sdpx-e2e/packed-residue-fast-20260928-v1/evidence/`. Package SHA-256:
+`af1e0c6f116ed35f3526f430dd777cf8e44839dd09ad9363ff580b769be0028d`.
+
+The bounded-construction experiment `221774.node220` has started on node13.
+Its candidate remains outside production until the same checks finish.
+
+### 2026-09-28 — Early invalid-cache release retained
+
+`221786.node220` exited zero. Pinned medium/Ising11, Lambda19, matrix
+one/eight-thread and real two-rank MPI comparisons preserve solution points.
+All applicable original-coordinate audits pass, including all five matrix
+audits; medium's known failure is unchanged.
+
+Retained the cache-miss lifetime change: take the invalid entry under the
+mutex, then release it outside the lock before constructing its replacement.
+Products already using an entry retain their own Arc. The complete fast
+development batch showed a modest memory reduction with essentially unchanged
+runtime; final release numbers remain pending. Production matches the frozen
+candidate, with no other changes to its residue source. Evidence:
+`~/.cache/sdpx-e2e/cache-release-fast-20260928-v1/evidence/`. Package SHA-256:
+`804689dd5d20e8612489e9f47adaa6dbd16bd99cd5d8e75b0f6758d4910d8e50`.
+
+### 2026-09-28 — Buffer streamed CLI result files
+
+Code inspection found that the CLI already borrows solution vectors and
+streams JSON, but writes result files through an unbuffered File. Added the
+standard BufWriter around that file handle. The existing explicit flush
+continues to propagate write errors; serialization and stdout behavior are
+unchanged. This avoids repeated small file writes without materializing the
+point. Final medium/Ising11 and combined release checks will qualify it; no
+isolated speed claim is made.
+
+### 2026-09-28 — Bounded cache construction retained
+
+`221774.node220` exited zero. Pinned medium/Ising11, Lambda19, matrix
+one/eight-thread and real two-rank MPI comparisons preserve solution points.
+All applicable original-coordinate audits pass, including all five matrix
+audits; medium's known failure is unchanged.
+
+Retained cache construction in 16-prime groups. Each group is compressed
+immediately into the final three-byte/f32 storage, avoiding a complete f64
+encoding alongside the compressed cache. The fast development batch showed
+lower peak PSS with essentially unchanged runtime. No isolated release number
+is claimed. Combined it with the separately qualified early invalid-cache
+release; the union differs from the bounded candidate only in that lifetime
+block. Final combined release qualification remains required. Evidence:
+`~/.cache/sdpx-e2e/bounded-cache-fast-20260928-v1/evidence/`. Package SHA-256:
+`90513e3b6d4003dc5fa95f3b0832e895aa3f98f2e17551affa9215a4e0b17c6a`.
+
+### 2026-09-28 — Combined release integration submitted
+
+Submitted `221792.node220` after both final cache experiments exited zero.
+The frozen source includes all retained solver/converter changes and buffered
+CLI result files. The allocation consolidates the earlier two eight-core jobs
+into 16 cores on node9; timed solver arms use the same four-core subset, and
+matrix/converter arms use the same eight-core subset. Comparisons remain
+sequential. Third-party build artifacts are reused, while production crate
+fingerprints/artifacts are excluded from that cache.
+
+Required checks: full release workspace suite; pinned medium/Ising11/CSDR;
+Lambda19 A–B–B–A against the accepted sampled-memory baseline; matrix audits
+and thread parity; partitioned and ordinary MPI; C ABI and automatic thread
+budgets; final PMP byte/precision/API/cleanup/audits and matched comparisons
+against accepted input streaming and SDPB 3.1.0. All numerical gates remain
+unchanged. The automatic-budget check has 16 available CPUs and an explicit
+RAYON_NUM_THREADS=4 cap.
+
+Package `combined-release-20260928-v1`, SHA-256:
+`bd26af0d3f7447e21674c59554fb974cedc428f339245f556d3474f402f9a4bc`.
+Submission receipt and frozen source are under `~/.cache/sdpx-e2e/` in that
+namespace. No combined performance result is available yet.
+
+### 2026-09-28 — Clarify user documentation during release integration
+
+Corrected the README to distinguish the standard solution JSON from detailed
+phase receipts, enabled with SDPX_RECEIPT. Added the locked dependency and
+single-test-thread options to its release test command. Replaced the stale
+Ising11 limitation about all larger inputs with the specific pending Lambda43
+comparison. These are documentation-only changes; the frozen production
+source remains unchanged. Verified with git diff --check.
+
+### 2026-09-28 — Combined source passes the full workspace suite
+
+`221792.node220` completed the full release workspace suite: 697 passed,
+0 failed, 59 ignored across 38 result groups, with no compiler warnings.
+All four solver doctests pass. This source includes the combined packed,
+bounded and early-release caches, direct decimal strings and buffered CLI
+result files. Evidence: `combined-release-20260928-v1/evidence/progress/`
+under `~/.cache/sdpx-e2e/`. The ordinary release build is now running; the
+final numerical and performance comparisons remain pending.
+
+### 2026-09-28 — Recover monitoring after intermittent SSH timeouts
+
+The SSH monitor disconnected during release compilation. Read-only checks
+confirmed that the route used PC's Tailscale subnet and that PC could reach
+the cluster endpoint. A temporary SSH jump query confirmed the existing PBS
+job was running; subsequent direct access recovered. No PBS job was restarted
+or canceled, and no persistent network or SSH settings were changed.
+
+The monitor now has bounded reconnection handling. `221792.node220` was again
+confirmed running at approximately 01:28 UTC, still in the ordinary release
+build. Its previously completed 697/0/59 workspace result is saved locally.
+The unrelated request to cancel obsolete Lambda43 generation remains
+unanswered; network recovery does not authorize that cancellation.
+
+### 2026-09-28 — Final pinned release comparisons pass parity
+
+Combined release job `221792.node220` completed the medium, Ising11 and CSDR
+A–B–B–A checks against the accepted sampled-memory binary on node9. Every
+comparison preserves solution points exactly; Ising11 and CSDR also match
+across one/four threads and pass every external audit. Medium retains exactly
+the same known dual-residual failure.
+
+Preliminary API-time medians from this single batch: Ising11 25.505 → 24.901 s
+at one thread and 7.594 → 7.469 s at four; CSDR 68.292 → 56.268 s at one
+and 29.555 → 17.822 s at four. CSDR remains Solved/57 and Ising11 Solved/52.
+These cluster results must not be compared directly with earlier Mac timings.
+The larger Lambda19, matrix, MPI and PMP final checks are still running.
+Evidence: `combined-release-20260928-v1/pinned-report.json` on the cluster;
+final local evidence export will follow job completion.
+
+### 2026-09-28 — Combined Lambda19 release comparison completed
+
+Final job `221792.node220` completed A–B–B–A on node9 with four physical
+cores, MPFR768 and unchanged settings/audits. Against the accepted
+sampled-memory Rust binary, median whole-command time fell from 456.267684
+to 422.140830 s (7.5%), and median sampled peak PSS from 1111.833984 to
+911.539063 MiB (18.0%). Baseline runs took 456.509 and 456.026 s; candidate
+runs took 422.020 and 422.261 s. All four are Solved/119, pass the original-
+coordinate audit, and have identical points (`5d7108b5a6066ca9`).
+
+This is one preliminary release batch, with sequential arms and a roughly
+one-second process-memory sampler. PSS excludes compilation. Input loading
+medians were 0.481 and 0.446 s; no separate strong loading-speed claim is
+made from this small difference. These numbers compare the complete retained
+composition directly; isolated optimization percentages are not added.
+No new matched SDPB solver run was performed.
+
+Stable reports are saved in
+`~/.cache/sdpx-e2e/combined-release-20260928-v1/evidence/progress/`.
+The final matrix, MPI/C ABI and PMP checks are still running.
+
+### 2026-09-28 — Final combined integration and PMP comparison passed
+
+`221792.node220` exited zero with `complete.json` accepted. The final frozen
+source passes the full release workspace, pinned/Lambda19, matrix, partitioned
+and ordinary MPI, C ABI, automatic thread-budget and PMP checks. Matrix
+exact bilinear accumulation differs from the accepted baseline by at most
+1.24e-131 in componentwise scaled distance; all five original-coordinate
+audits pass and candidate one/eight-thread points agree exactly. The automatic
+budget check had 16 available CPUs and respected the explicit four-thread cap.
+Medium's known audit failure remains unchanged.
+
+Final PMP results, one precise release A–B–C–C–B–A batch on node9:
+
+| Case | Workers | Previous Rust (s) | Final Rust (s) | SDPB 3.1.0 (s) |
+|---|---|---|---|---|
+| 16 poles, MPFR768 | 1 | 0.611352 | 0.608633 | 2.326840 |
+| 16 poles, MPFR768 | 8 | 0.133676 | 0.139603 | 0.673751 |
+| Ising11 XML, MPFR1216 | 1 | 3.265003 | 3.207380 | 4.687906 |
+| Ising11 XML, MPFR1216 | 8 | 0.855637 | 0.632936 | 2.520807 |
+
+Separate 20 ms memory runs for Ising11 measured peak PSS of 10.868 →
+6.771 MiB serial and 77.177 → 40.013 MiB at eight workers. SDPB used
+125.620 and 160.474 MiB respectively. The eight-worker Rust Ising gain is
+26.0% in time and 48.2% in memory; final Rust takes about one quarter of
+SDPB's whole-command time on this input. The small eight-worker pole case
+is slightly slower than preceding Rust, so these are case-specific results.
+
+Comparisons include process/MPI startup and uncompressed JSON output, with
+blocking process waits. Sampling stopping targets differ between tools; Rust
+keeps full working precision. Six fixtures, all 31 precisions, signed-zero
+byte parity, 12 library API checks, threaded output/error cleanup and four
+converted-input audits pass. No Lambda43 conversion result is available.
+
+Evidence: `~/.cache/sdpx-e2e/combined-release-20260928-v1/evidence/`. Full
+artifact export is in progress; completed summary metadata is already local.
+The development plan now keeps current results and open work together and
+leaves isolated experiment history in this journal.
+
+### 2026-09-28 — Final diagnostic profile submitted
+
+After final integration exited zero, submitted `221805.node220` on idle node9
+with four physical cores, 32 GiB and a 20-minute limit. It reuses the final
+release binary at MPFR768 with unchanged Lambda19 settings. A 720-second
+solver timeout plus the existing 300-second audit bound fit within that job.
+Every preceding release solve took below 600 seconds and more than 25 minutes
+remained in the requested campaign window at submission.
+
+This is one diagnostic complete solve to refresh SVD/KKT phase priorities,
+not another performance comparison. The point must equal the uninstrumented
+release point and pass the same external audit. Package SHA-256:
+`97f34de21474488c470f6262f6fa243813309c7dee37c4a60f6264683d76d5cf`.
+
+### 2026-09-28 — Final profile confirms the next solver priorities
+
+`221805.node220` exited zero. The instrumented Lambda19 MPFR768 run is
+Solved/119, passes the original-coordinate audit and reproduces the final
+uninstrumented x/s/z/sampled-y strings exactly. No production changes followed
+this diagnostic. Current production was separately checked against all 244
+files in the qualified frozen source.
+
+Using the inclusive `wall.solve` timer (420.075534 s) as denominator:
+
+| Phase | Wall seconds | Share | Average busy cores |
+|---|---|---|---|
+| KKT update | 168.394 | 40.1% | 3.53 |
+| PSD cone scaling | 142.025 | 33.8% | 3.90 |
+| KKT solve | 50.239 | 12.0% | 3.46 |
+| Residual update | 15.158 | 3.6% | 3.54 |
+| Combined RHS | 15.024 | 3.6% | 3.50 |
+
+The KKT update scope includes the batched constant/affine RHS solves. The
+refactor timer totals 33.153 s, about 7.9% of solver-loop wall time; the
+40.1% update share must not be described as factorization alone. SVD rotation
+replay is 62.3% of summed SVD phase time (298.644 of 479.357 s). Those
+per-cone totals overlap across workers and cannot be added to outer wall
+timings. The profile supports prioritizing remaining sampled RHS transforms
+and SVD replay while retaining direct SVD, exact accumulation and unchanged
+complete-solve gates. Previously rejected shortcuts stay closed.
+
+Evidence: `~/.cache/sdpx-e2e/final-profile-20260928-v1/evidence/`. This profile
+is diagnostic; its elapsed time and memory are not a paired speed comparison.
+
+### 2026-09-28 — Release evidence export verified
+
+Downloaded and verified 1,309 final release evidence files. The compressed
+archive is 59,194,221 bytes with SHA-256
+`70d60f4c01fe55125d4490fb8ad23b4dcb8c61569635c688d40fb99b70724f61`.
+The export inventory records each file hash and any large omitted artifact
+retained remotely. Local reports are under
+`~/.cache/sdpx-e2e/combined-release-20260928-v1/evidence/complete/`; derived
+comparison numbers are in the adjacent `release-summary.json`.
+
+The maximum scaled SDP-coefficient differences from SDPB in the matched
+PMP benchmark were 6.524e-229 for the 768-bit pole case and 2.221e-351 for
+the 1216-bit Ising case. Rust outputs remain byte-identical to the accepted
+input-streaming baseline.
+
+### 2026-09-28 — SDPB comparison provenance checked
+
+The benchmark manifest correctly records `SDPB 3.1.0-dirty`. A read-only
+comparison against upstream commit `fec8e934bf03eb59b0f35ad76dd9b205dde537e6`
+confirmed that all 314 production/build files match byte for byte. The only
+tracked differences are end-of-line whitespace in `.gitignore` and
+`docs/site_installs/EPFL.md`; transfer-created AppleDouble sidecars are also
+present. No numerical source change was found, and no remote file was altered
+or deleted. The plan now states the exact build provenance.
+
+Evidence: `combined-release-20260928-v1/evidence/sdpb-source-provenance.json`
+and `sdpb-upstream-source-manifest.json` under `~/.cache/sdpx-e2e/`. Manifest
+SHA-256: `9a8ce7e617d5020d9361eb4c57cef6d9f2161c8339575772882ff0c0c3536bfb`.
+
+The official [release page](https://github.com/davidsd/sdpb/releases/tag/3.1.0)
+still marks 3.1.0 as the latest release, checked on 2026-09-28.
+
+### 2026-09-28 — Preserve a concrete Lambda43 restart handoff
+
+Saved final solver/converter hashes, upstream binary identities, corrected
+input checks and pending jobs in
+`~/.cache/sdpx-e2e/eight-hours-20260928/cluster-handoff.json` with a short
+`CLUSTER_HANDOFF.md`. The held 221699 calibration still targets the older
+precision-grid solver; its artifacts must remain historical, with a fresh
+final-binary calibration before full scaling. The canonical conversion uses
+one SDPB rank despite reserving eight cores, so a future converter comparison
+must explicitly match workers/ranks. No job, dependency or held state was changed.
+
+At the latest check the obsolete generator had run 11h43m without producing
+its XML; corrected generation/conversion/calibration remained held. The
+separate cancellation request is still unanswered. The full corrected
+4/16/64/256-core scientific comparison is not complete.
+
+### 2026-09-28 — Eight-hour optimization window completed
+
+The requested 03:04–11:04 China-time window is complete. Final release and
+diagnostic jobs exited zero, evidence is downloaded and verified, and the
+retained production source and public C header match their qualified snapshots.
+All substantial builds, solves and benchmarks ran in PBS. No commit was made.
+
+The current plan records the measured solver/converter gains and the profile
+priorities. Known numerical failures remain visible, and the corrected Lambda43
+input and 4/16/64/256-core scientific comparison remain pending. No cancellation
+approval arrived; the existing generation chain and its artifacts were preserved.

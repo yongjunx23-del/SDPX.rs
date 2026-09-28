@@ -2,8 +2,11 @@
 //! This is an input adapter; direction, scaling and solves use the shared core.
 use super::*;
 use crate::solver::SupportedConeT;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{fs::File, io::BufReader, path::Path, str::FromStr};
+use serde::{
+    de::{DeserializeOwned, Error, SeqAccess, Visitor},
+    Deserialize, Serialize,
+};
+use std::{fmt, fs::File, io::BufReader, marker::PhantomData, path::Path, str::FromStr};
 
 /// Original SDPB matrix location in the conic slack and dual vectors.
 #[derive(Debug, Serialize)]
@@ -39,10 +42,10 @@ struct Control {
     _command: String,
 }
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Objectives {
-    constant: String,
-    b: Vec<String>,
+#[serde(deny_unknown_fields, bound(deserialize = "T: FloatT + FromStr"))]
+struct Objectives<T> {
+    constant: Decimal<T>,
+    b: Vec<Decimal<T>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,13 +54,67 @@ struct BlockInfo {
     num_points: usize,
 }
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BlockData {
-    bilinear_bases_even: Vec<Vec<String>>,
-    bilinear_bases_odd: Vec<Vec<String>>,
-    c: Vec<String>,
+#[serde(deny_unknown_fields, bound(deserialize = "T: FloatT + FromStr"))]
+struct BlockData<T> {
+    bilinear_bases_even: Vec<Vec<Decimal<T>>>,
+    bilinear_bases_odd: Vec<Vec<Decimal<T>>>,
+    c: Vec<Decimal<T>>,
     #[serde(rename = "B")]
-    b: Vec<Vec<String>>,
+    b: Vec<SparseRow<T>>,
+}
+
+// Parse transient JSON string slices directly at the working precision.
+// Deserializing T itself would also admit JSON numbers for some backends.
+struct Decimal<T>(T);
+impl<'de, T: FloatT + FromStr> Deserialize<'de> for Decimal<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct DecimalVisitor<T>(PhantomData<T>);
+        impl<'de, T: FloatT + FromStr> Visitor<'de> for DecimalVisitor<T> {
+            type Value = Decimal<T>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a finite decimal string")
+            }
+            fn visit_str<E: Error>(self, value: &str) -> Result<Self::Value, E> {
+                decimal(value).map(Decimal).map_err(E::custom)
+            }
+        }
+        d.deserialize_str(DecimalVisitor(PhantomData))
+    }
+}
+
+// B rows become CSC columns. Drop zeros while reading, but retain the full
+// width so sparse storage cannot hide a malformed input row.
+struct SparseRow<T> {
+    width: usize,
+    entries: Vec<(usize, T)>,
+}
+impl<'de, T: FloatT + FromStr> Deserialize<'de> for SparseRow<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct RowVisitor<T>(PhantomData<T>);
+        impl<'de, T: FloatT + FromStr> Visitor<'de> for RowVisitor<T> {
+            type Value = SparseRow<T>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an array of decimal strings")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut row = SparseRow {
+                    width: 0,
+                    entries: Vec::new(),
+                };
+                while let Some(Decimal(value)) = seq.next_element::<Decimal<T>>()? {
+                    if !value.is_zero() {
+                        row.entries.push((row.width, value));
+                    }
+                    row.width = row
+                        .width
+                        .checked_add(1)
+                        .ok_or_else(|| A::Error::custom("sampled B width overflow"))?;
+                }
+                Ok(row)
+            }
+        }
+        d.deserialize_seq(RowVisitor(PhantomData))
+    }
 }
 
 fn read<D: DeserializeOwned>(directory: &Path, name: &str) -> Result<D, SolverError> {
@@ -131,13 +188,9 @@ where
             return Err(bad(&format!("unexpected sampled JSON file: {name}")));
         }
     }
-    let objective: Objectives = read(directory, "objectives.json")?;
-    let objective_constant = decimal(&objective.constant)?;
-    let mut rhs: Vec<T> = objective
-        .b
-        .iter()
-        .map(|s| decimal(s))
-        .collect::<Result<_, _>>()?;
+    let objective: Objectives<T> = read(directory, "objectives.json")?;
+    let objective_constant = objective.constant.0;
+    let mut rhs: Vec<T> = objective.b.into_iter().map(|v| v.0).collect();
     let equalities = rhs.len();
     let mut cones = Vec::new();
     if equalities > 0 {
@@ -152,7 +205,7 @@ where
     let mut rows = equalities;
     for block_index in 0..control.num_blocks {
         let info: BlockInfo = read(directory, &format!("block_info_{block_index}.json"))?;
-        let data: BlockData = read(directory, &format!("block_data_{block_index}.json"))?;
+        let data: BlockData<T> = read(directory, &format!("block_data_{block_index}.json"))?;
         let count = triangle(info.dim)?
             .checked_mul(info.num_points)
             .ok_or_else(|| bad("sampled column count overflow"))?;
@@ -160,17 +213,14 @@ where
             return Err(bad("inconsistent sampled block dimensions"));
         }
         let column_start = q.len();
-        for (c, b) in data.c.iter().zip(&data.b) {
-            if b.len() != equalities {
+        for (Decimal(c), b) in data.c.into_iter().zip(data.b) {
+            if b.width != equalities {
                 return Err(bad("sampled B width mismatch"));
             }
-            q.push(decimal(c)?);
-            for (row, text) in b.iter().enumerate() {
-                let value: T = decimal(text)?;
-                if !value.is_zero() {
-                    rowval.push(row);
-                    nzval.push(value);
-                }
+            q.push(c);
+            for (row, value) in b.entries {
+                rowval.push(row);
+                nzval.push(value);
             }
             colptr.push(nzval.len());
         }
@@ -198,7 +248,7 @@ where
             let mut values = Vec::with_capacity(size);
             for k in 0..info.num_points {
                 for row in &basis {
-                    values.push(decimal(&row[k])?);
+                    values.push(row[k].0);
                 }
             }
             sampled.push(SampledBlock {

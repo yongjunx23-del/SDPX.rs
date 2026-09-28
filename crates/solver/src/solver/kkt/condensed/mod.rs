@@ -453,7 +453,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             let scaling = match cone {
                 SupportedCone::PSDTriangleCone(c) => {
                     let (columns, numel) = psd_taken.next().expect("one column set per PSD cone");
-                    Scaling::Psd(PsdBlock::from_columns(c.n, numel, columns))
+                    Scaling::Psd(PsdBlock::from_columns(c.n, numel, columns, keep_values))
                 }
                 SupportedCone::NonnegativeCone(c) => {
                     let entries = orthant_taken.next().expect("one entry set per orthant");
@@ -1041,6 +1041,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let phase_timer = crate::receipt::start();
         let (bx, bz) = rhs.split_at(self.n);
         let fused = self.fused_sampled();
+        let block_timer = crate::receipt::start();
         apply_block_pool_with_world(
             self.mpi_world(),
             &self.pool,
@@ -1055,6 +1056,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 ScalingAction::Apply(true)
             },
         );
+        crate::receipt::finish("prepare_rhs.scaling", block_timer);
         self.workx.copy_from_slice(bx);
         if fused {
             let (operator, work) = self.sampled.as_mut().unwrap();
@@ -1137,6 +1139,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 *v -= b;
             }
         }
+        let block_timer = crate::receipt::start();
         apply_block_pool_with_world(
             self.mpi_world(),
             &self.pool,
@@ -1154,6 +1157,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         for (&v, &row) in self.retained_rhs.iter().zip(&self.retained_rows) {
             z[row] = v;
         }
+        crate::receipt::finish("recover_rhs.scaling", block_timer);
         let finite = out.is_finite();
         crate::receipt::finish("recover_rhs", phase_timer);
         finite

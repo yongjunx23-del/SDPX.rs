@@ -265,6 +265,11 @@ fn redundant_equalities<T: FloatT>(
             }
         }
     }
+    // A full row rank image proves that no exact row can be removed. A
+    // singular image proves nothing: preserve the rational fallback below.
+    if modular_full_row_rank(&rows) {
+        return Some(Vec::new());
+    }
     let mut basis: BTreeMap<usize, BTreeMap<usize, Exact>> = BTreeMap::new();
     let mut redundant = Vec::new();
     for (id, mut row) in ids.into_iter().zip(rows) {
@@ -298,6 +303,54 @@ fn redundant_equalities<T: FloatT>(
         }
     }
     Some(redundant)
+}
+
+fn modular_full_row_rank(
+    rows: &[std::collections::BTreeMap<usize, sdpx_arithmetic::Exact>],
+) -> bool {
+    use std::collections::BTreeMap;
+    const P: u64 = (1 << 31) - 1;
+    let mut basis: BTreeMap<usize, BTreeMap<usize, u64>> = BTreeMap::new();
+    for source in rows {
+        let mut row = BTreeMap::new();
+        for (&column, value) in source {
+            let Some(value) = value.modulo_mersenne31() else {
+                return false;
+            };
+            if value != 0 {
+                row.insert(column, u64::from(value));
+            }
+        }
+        loop {
+            let Some((&pivot, &factor)) = row.first_key_value() else {
+                return false;
+            };
+            if let Some(previous) = basis.get(&pivot) {
+                for (&column, &value) in previous {
+                    let entry = row.entry(column).or_default();
+                    *entry = (*entry + P - factor * value % P) % P;
+                    if *entry == 0 {
+                        row.remove(&column);
+                    }
+                }
+            } else {
+                let (mut power, mut exponent, mut inverse) = (factor, P - 2, 1u64);
+                while exponent != 0 {
+                    if exponent & 1 != 0 {
+                        inverse = inverse * power % P;
+                    }
+                    power = power * power % P;
+                    exponent >>= 1;
+                }
+                for value in row.values_mut() {
+                    *value = *value * inverse % P;
+                }
+                basis.insert(pivot, row);
+                break;
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]

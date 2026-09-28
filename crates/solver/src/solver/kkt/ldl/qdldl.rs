@@ -35,7 +35,7 @@ where
         let mut opts = QDLDLSettingsBuilder::default()
             .logical(true) //allocate memory only on init
             .Dsigns(Dsigns.to_vec())
-            .regularize_enable(true)
+            .regularize_enable(settings.dynamic_regularization_enable)
             .regularize_eps(settings.dynamic_regularization_eps)
             .regularize_delta(settings.dynamic_regularization_delta)
             .amd_dense_scale(1.5)
@@ -101,8 +101,7 @@ where
         //QDLDL has maintained its own version of the permuted
         //KKT matrix through custom update/scale/offset methods,
         //so we ignore the KKT matrix provided by the caller
-        self.factors.refactor().unwrap();
-        self.factors.Dinv.is_finite()
+        self.factors.refactor().is_ok() && self.factors.Dinv.is_finite()
     }
 
     fn set_pool(&mut self, pool: Option<std::sync::Arc<rayon::ThreadPool>>) {

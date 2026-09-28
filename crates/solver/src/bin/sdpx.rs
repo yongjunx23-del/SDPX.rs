@@ -1,5 +1,5 @@
 //! Native entry point; all numerical work stays in the shared solver.
-use sdpx_arithmetic::MpFloat;
+use sdpx_arithmetic::{with_frontend_precisions, FRONTEND_PRECISION_HELP};
 use sdpx_solver::{algebra::FloatT, io::ConfigurablePrintTarget, solver::*, MpiContext};
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
@@ -7,7 +7,7 @@ use std::{
     env,
     error::Error,
     fs::File,
-    io::{self, BufReader, Write},
+    io::{self, BufReader, BufWriter, Write},
     path::PathBuf,
     process::ExitCode,
     str::FromStr,
@@ -18,7 +18,7 @@ const USAGE: &str = "SDPX — native conic solver\n\
 Usage: sdpx INPUT [--precision BITS] [--settings FILE] [--output FILE]\n\
                      [--threads N] [--partitions N|auto]\n\
                      [--cost-history-in FILE] [--cost-history-out FILE] [--quiet]\n\
-BITS: 53 (Float64, default), 128, 256, 512, 768, 1024, 2048.\n\
+BITS: 53 (Float64, default), or multiples of 64 from 128 through 2048 (MPFR).\n\
 INPUT is conic JSON, an SDPB sampled JSON directory (requires sdp), or '-'\n\
 for stdin. MPFR coefficients use decimal strings, never fractional\n\
 JSON numbers. --settings replaces input settings; unspecified settings use core\n\
@@ -531,7 +531,7 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
                 output_rank: mpi.rank(),
             };
             let mut output: Box<dyn Write> = match options.output {
-                Some(path) => Box::new(File::create(path)?),
+                Some(path) => Box::new(BufWriter::new(File::create(path)?)),
                 None => Box::new(io::stdout().lock()),
             };
             serde_json::to_writer(&mut output, &result)?;
@@ -546,11 +546,19 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
 /// Keep the exact kernels' multi-megabyte scratch buffers on the heap: with
 /// glibc's default threshold each is an `mmap`/`munmap` pair, and every unmap
 /// in a many-threaded process costs a TLB shootdown (about 5% of an MPFR SDP
-/// solve at 32 threads). Explicit `MALLOC_*` environment settings still win.
+/// solve at 32 threads). Explicit threshold or padding environment settings
+/// leave allocator tuning to glibc.
 fn tune_allocator() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
-        if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none() {
+        let configured = [
+            "MALLOC_MMAP_THRESHOLD_",
+            "MALLOC_TRIM_THRESHOLD_",
+            "MALLOC_TOP_PAD_",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+        if !configured {
             // SAFETY: mallopt only adjusts allocator parameters; it is called
             // once, before any worker threads exist.
             unsafe {
@@ -561,6 +569,18 @@ fn tune_allocator() {
         }
     }
 }
+
+macro_rules! precision_runner {
+    ([] $(($bits:literal, $variant:ident, $scalar:ty),)*) => {
+        fn run_precision(options: Options, mpi: MpiContext) -> CliResult<u8> {
+            match options.precision.unwrap_or(53) {
+                $($bits => run::<$scalar>(options, mpi),)*
+                _ => Err(format!("unsupported precision; use {FRONTEND_PRECISION_HELP}").into()),
+            }
+        }
+    };
+}
+with_frontend_precisions!(precision_runner);
 
 fn main() -> ExitCode {
     tune_allocator();
@@ -593,16 +613,7 @@ fn main() -> ExitCode {
     .and_then(|_| stage(mpi, options(mpi)))
     .and_then(|options| match options {
         None => Ok(0),
-        Some(options) => match options.precision.unwrap_or(53) {
-            53 => run::<f64>(options, mpi),
-            128 => run::<MpFloat<2>>(options, mpi),
-            256 => run::<MpFloat<4>>(options, mpi),
-            512 => run::<MpFloat<8>>(options, mpi),
-            768 => run::<MpFloat<12>>(options, mpi),
-            1024 => run::<MpFloat<16>>(options, mpi),
-            2048 => run::<MpFloat<32>>(options, mpi),
-            _ => Err("unsupported precision; use 53, 128, 256, 512, 768, 1024 or 2048".into()),
-        },
+        Some(options) => run_precision(options, mpi),
     });
     mpi.finish();
     match result {

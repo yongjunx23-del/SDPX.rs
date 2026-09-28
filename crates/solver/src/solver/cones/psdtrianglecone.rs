@@ -23,13 +23,27 @@ pub struct PSDConeData<T> {
     workmat2: Matrix<T>,
     workmat3: Matrix<T>,
     workvec: Vec<T>,
-    // Second scratch set so the independent dz and ds step-bound
-    // evaluations can run on two workers at once.
-    eig2: EigEngine<T>,
-    workmat4: Matrix<T>,
-    workmat5: Matrix<T>,
-    workmat6: Matrix<T>,
-    workvec2: Vec<T>,
+    // Allocated only when dz/ds bounds actually run on two workers.
+    second_step: Option<Box<StepWorkspace<T>>>,
+}
+
+struct StepWorkspace<T> {
+    eig: EigEngine<T>,
+    mat1: Matrix<T>,
+    mat2: Matrix<T>,
+    mat3: Matrix<T>,
+    vector: Vec<T>,
+}
+impl<T: FloatT> StepWorkspace<T> {
+    fn new(n: usize) -> Self {
+        Self {
+            eig: EigEngine::new(n),
+            mat1: Matrix::zeros((n, n)),
+            mat2: Matrix::zeros((n, n)),
+            mat3: Matrix::zeros((n, n)),
+            vector: vec![T::zero(); triangular_number(n)],
+        }
+    }
 }
 
 impl<T> PSDConeData<T>
@@ -40,7 +54,7 @@ where
         Self {
             chol1: CholeskyEngine::<T>::new(n),
             chol2: CholeskyEngine::<T>::new(n),
-            SVD: SVDEngine::<T>::new((n, n)),
+            SVD: SVDEngine::<T>::new_right((n, n)),
             Eig: EigEngine::<T>::new(n),
 
             λ: vec![T::zero(); n],
@@ -54,11 +68,7 @@ where
             workmat2: Matrix::zeros((n, n)),
             workmat3: Matrix::zeros((n, n)),
             workvec: vec![T::zero(); triangular_number(n)],
-            eig2: EigEngine::<T>::new(n),
-            workmat4: Matrix::zeros((n, n)),
-            workmat5: Matrix::zeros((n, n)),
-            workmat6: Matrix::zeros((n, n)),
-            workvec2: vec![T::zero(); triangular_number(n)],
+            second_step: None,
         }
     }
 }
@@ -88,6 +98,11 @@ where
 
     pub(crate) fn scaling_Rinv(&self) -> &Matrix<T> {
         &self.data.Rinv
+    }
+
+    /// Cached R·Rᵀ; only the upper triangle is authoritative.
+    pub(crate) fn scaling_gram(&self) -> &Matrix<T> {
+        &self.data.G
     }
 
     /// Number of `T` values the scaling state exchange carries per cone:
@@ -336,13 +351,18 @@ where
                 workmat2,
                 workmat3,
                 Eig,
-                workvec2,
-                workmat4,
-                workmat5,
-                workmat6,
-                eig2,
+                second_step,
                 ..
             } = f;
+            let StepWorkspace {
+                eig: eig2,
+                mat1: workmat4,
+                mat2: workmat5,
+                mat3: workmat6,
+                vector: workvec2,
+            } = second_step
+                .get_or_insert_with(|| Box::new(StepWorkspace::new(self.n)))
+                .as_mut();
             rayon::join(
                 || {
                     step_component_inner(
@@ -405,13 +425,18 @@ where
                 workmat2,
                 workmat3,
                 Eig,
-                workvec2,
-                workmat4,
-                workmat5,
-                workmat6,
-                eig2,
+                second_step,
                 ..
             } = f;
+            let StepWorkspace {
+                eig: eig2,
+                mat1: workmat4,
+                mat2: workmat5,
+                mat3: workmat6,
+                vector: workvec2,
+            } = second_step
+                .get_or_insert_with(|| Box::new(StepWorkspace::new(self.n)))
+                .as_mut();
             let (αz, αs) = rayon::join(
                 || {
                     let α = step_component_inner(

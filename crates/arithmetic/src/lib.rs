@@ -18,6 +18,9 @@ use std::{
     str::FromStr,
 };
 
+mod precisions;
+pub use precisions::FRONTEND_PRECISION_HELP;
+
 mod dyadic;
 pub use dyadic::{DyadicKind, DyadicView};
 mod exact;
@@ -51,6 +54,11 @@ pub trait Scalar:
     /// Exact value for bounded structural presolve; unsupported types retain rows.
     fn exact(&self) -> Option<Exact> {
         None
+    }
+    /// Decimal text matching Display without formatting flags. Backends may
+    /// avoid the extra formatted String allocation when producing JSON strings.
+    fn decimal_string(&self) -> String {
+        self.to_string()
     }
     /// Number of significant binary digits in arithmetic.
     fn precision_bits() -> usize;
@@ -311,6 +319,7 @@ pub type Bits256 = MpFloat<4>;
 pub type Bits512 = MpFloat<8>;
 pub type Bits768 = MpFloat<12>;
 pub type Bits1024 = MpFloat<16>;
+pub type Bits1216 = MpFloat<19>;
 pub type Bits2048 = MpFloat<32>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -384,9 +393,12 @@ impl<const N: usize> MpFloat<N> {
     }
     /// Adopt the value held by a native descriptor at this precision.
     ///
-    /// Exact: the descriptor already carries `PRECISION_BITS` significant bits.
-    /// Used to return from a one-rounding integer conversion.
-    pub fn from_mpfr_descriptor(desc: &mpfr::mpfr_t) -> Self {
+    /// Rounded to this precision; exact when the source is representable.
+    ///
+    /// # Safety
+    /// `desc` must be an initialized MPFR value with valid limb storage that
+    /// remains readable and is not mutated for the duration of this call.
+    pub unsafe fn from_mpfr_descriptor(desc: &mpfr::mpfr_t) -> Self {
         Self::output(|r| unsafe {
             mpfr::set(r, desc, ROUND);
         })
@@ -437,6 +449,36 @@ impl<const N: usize> MpFloat<N> {
         Self::output(|r| unsafe {
             mpfr::fmma(r, &a, &b, &c, &d, ROUND);
         })
+    }
+
+    /// Apply `[c s; -s c]` to adjacent entries of independent strided rows.
+    /// Each destination is the correctly rounded sum of two products, exactly
+    /// as in two calls to `dot_fma2`. Coefficient descriptors are reused across
+    /// rows; descriptors never outlive the owned values they borrow.
+    pub fn rotate_adjacent_rows(rows: &mut [Self], stride: usize, p: usize, c: &Self, s: &Self) {
+        assert!(stride > 0 && p + 1 < stride && rows.len() % stride == 0);
+        let negative_s = -*s;
+        let (cd, sd, nsd) = (c.descriptor(), s.descriptor(), negative_s.descriptor());
+        for row in rows.chunks_exact_mut(stride) {
+            if [c, s, &row[p], &row[p + 1]]
+                .iter()
+                .any(|v| !matches!(v.kind.abs(), mpfr::ZERO_KIND | mpfr::REGULAR_KIND))
+            {
+                let (x, y) = (row[p], row[p + 1]);
+                row[p] = Self::dot_fma2(c, &x, s, &y);
+                row[p + 1] = Self::dot_fma2(&negative_s, &x, c, &y);
+                continue;
+            }
+            let (x, y) = (row[p].descriptor(), row[p + 1].descriptor());
+            let first = Self::output(|r| unsafe {
+                mpfr::fmma(r, &cd, &x, &sd, &y, ROUND);
+            });
+            let second = Self::output(|r| unsafe {
+                mpfr::fmma(r, &nsd, &x, &cd, &y, ROUND);
+            });
+            row[p] = first;
+            row[p + 1] = second;
+        }
     }
 
     /// Accumulate products in iterator order, rounding each FMA at this precision.
@@ -742,6 +784,10 @@ impl<const N: usize> ToPrimitive for MpFloat<N> {
     }
 }
 impl<const N: usize> Scalar for MpFloat<N> {
+    fn decimal_string(&self) -> String {
+        self.to_decimal(None)
+    }
+
     fn exact(&self) -> Option<Exact> {
         if *self == Self::zero() {
             return Some(Exact::default());

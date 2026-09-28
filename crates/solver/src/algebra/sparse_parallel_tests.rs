@@ -289,8 +289,9 @@ fn sampled_factor_residuals_do_not_build_sparse_row_plan() {
         settings,
     )
     .unwrap();
-    assert!(worthwhile(&solver.data.A));
     assert!(solver.data.sampled.is_some());
+    assert!(worthwhile(&solver.data.materialize_A().unwrap()));
+    assert_eq!(solver.data.A.nnz(), 0);
     assert!(solver.residuals.sparse_parallel.is_none());
 }
 #[cfg(test)]

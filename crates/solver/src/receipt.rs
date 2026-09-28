@@ -295,6 +295,7 @@ pub fn try_write<T: crate::algebra::FloatT>(
         solver.cones.cone_threads(),
         1,
         peak_rss,
+        solver.timers.as_ref().map(|t| t.setup_times()),
     )
 }
 
@@ -311,6 +312,7 @@ pub fn try_write_partitioned<T: crate::algebra::FloatT>(
         solver.cone_threads(),
         solver.partitions(),
         peak_rss,
+        None,
     )
 }
 
@@ -322,6 +324,7 @@ fn try_write_parts<T: crate::algebra::FloatT>(
     cone_threads: usize,
     partitions: usize,
     peak_rss: Option<u64>,
+    setup: Option<BTreeMap<String, f64>>,
 ) -> std::io::Result<()> {
     let Some(mut path) = std::env::var_os("SDPX_RECEIPT") else {
         return Ok(());
@@ -392,6 +395,7 @@ fn try_write_parts<T: crate::algebra::FloatT>(
             "batches": ctr.batches,
         },
         "phases": phase_map,
+        "setup_seconds_inclusive": setup,
         "memory": {"peak_rss_bytes": peak_rss},
         "env": {
             "SDPX_DIRECT_SOLVE": env("SDPX_DIRECT_SOLVE"),

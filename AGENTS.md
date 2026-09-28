@@ -36,7 +36,7 @@ Pick the check by what the change touches:
 |---|---|
 | Refactor, move, dead-code removal | `ab` on both cases; `points identical: yes` required |
 | Float64 numerics or performance | `ab medium` (release arms for quoted numbers) |
-| MPFR, cones, sampled operator, condensed KKT | `ab ising11` |
+| MPFR, cones, sampled operator, condensed KKT | `ab ising11`; local SOC also `ab csdr3` |
 | Input/output, CLI, settings | `run` on both cases |
 | Threading | `run CASE --threads N` for the affected widths |
 | MPI | real MPI E2E on a host with MPI; mock tests are not enough |
@@ -58,6 +58,9 @@ Rules for results:
   digits.
 - Timing: `fast` for development, `release` for any number you quote. Run arms
   sequentially on one host, never concurrently. A single run is preliminary; say so.
+- Run large builds, full-suite tests and substantial numerical runs on the
+  cluster through PBS. Keep local work to editing, inspection and lightweight
+  preparation.
 - Record: when a candidate is kept or reverted, add one dated entry to
   `docs/JOURNAL.md` and update the plan's status table if a headline number
   moved. Raw run rows are appended automatically.
@@ -99,6 +102,8 @@ Rules for results:
   (`provenance/`).
 - Fix warnings in touched code. Run `rustfmt` on files you edit, not on the
   whole tree.
+- Write maintained documentation in concise English; keep experiment detail
+  in `docs/JOURNAL.md` and current decisions in `REVIEW_AND_PLAN.md`.
 - Commit only when asked. End commit messages with the attribution line the
   harness supplies.
 

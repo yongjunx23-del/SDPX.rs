@@ -261,29 +261,40 @@ fn gemm<const N: usize>(
     }
     if alpha != F::<N>::zero() && residue_blas_profitable::<N>(m as usize, n as usize, k as usize) {
         let (mu, nu) = (m as usize, n as usize);
-        let mut product = vec![F::<N>::zero(); mu * nu];
-        if super::rns_blas::gemm(
-            ta,
-            tb,
-            mu,
-            nu,
-            k as usize,
-            a,
-            lda as usize,
-            b,
-            ldb as usize,
-            false,
-            parallel.map(|(pool, _)| pool),
-            &mut product,
-            None,
-        ) {
-            for j in 0..nu {
-                for i in 0..mu {
-                    let dst = &mut c[i + j * ldc as usize];
-                    *dst = axpby(alpha, product[i + j * mu], beta, *dst);
-                }
+        let exact_product = |out: &mut [F<N>]| {
+            super::rns_blas::gemm(
+                ta,
+                tb,
+                mu,
+                nu,
+                k as usize,
+                a,
+                lda as usize,
+                b,
+                ldb as usize,
+                false,
+                parallel.map(|(pool, _)| pool),
+                out,
+                None,
+            )
+        };
+        if alpha == F::<N>::one() && beta == F::<N>::zero() && ldc == m {
+            // Most scaling products overwrite a compact matrix. Reconstruct
+            // directly into it, avoiding a full MPFR temporary and copy.
+            if exact_product(&mut c[..mu * nu]) {
+                return;
             }
-            return;
+        } else {
+            let mut product = vec![F::<N>::zero(); mu * nu];
+            if exact_product(&mut product) {
+                for j in 0..nu {
+                    for i in 0..mu {
+                        let dst = &mut c[i + j * ldc as usize];
+                        *dst = axpby(alpha, product[i + j * mu], beta, *dst);
+                    }
+                }
+                return;
+            }
         }
     }
     // Exact residue accumulation replaces the FMA chain when the operand
@@ -346,9 +357,29 @@ impl<const N: usize> XgemmScalar for F<N> {
         out: &mut [Self],
         cache_q: Option<&mut super::ResidueCache>,
     ) -> bool {
-        // Same work gate as the products: h² per output against kmax outputs.
-        residue_blas_profitable::<N>(h, kmax, h)
+        // A cached dense quadratic form reconstructs only kmax outputs,
+        // so it amortizes residue work at smaller shapes than a full GEMM.
+        let cached_dense = N >= 4
+            && h >= 12
+            && kmax >= 16
+            && sqrt2 == num_traits::FromPrimitive::from_u8(2).unwrap()
+            && cache_q.is_some();
+        (residue_blas_profitable::<N>(h, kmax, h) || cached_dense)
             && super::rns_blas::svec_quadratic(h, kmax, q, x, sqrt2, pool, out, cache_q)
+    }
+    fn xsymmetric_bilinear_exact(
+        h: usize,
+        columns: usize,
+        q: &[Self],
+        x: &[Self],
+        pairs: &[(usize, usize)],
+        out: &mut [Self],
+        cache_q: &mut super::ResidueCache,
+    ) -> bool {
+        N >= 4
+            && h >= 12
+            && columns >= 16
+            && super::rns_blas::symmetric_bilinear(h, columns, q, x, pairs, out, cache_q)
     }
     fn xcongruence_exact(
         ta: u8,
@@ -525,6 +556,32 @@ fn syrk<const N: usize>(
         lda
     ));
     if n == 0 {
+        return;
+    }
+    // The common Gram update writes a compact upper triangle. Reuse the
+    // exact residue-BLAS product, which shares this operand's encoding and
+    // rounds each dot once, just like the per-entry exact path below.
+    if upper(u) == b'U'
+        && ldc == n
+        && alpha == F::<N>::one()
+        && beta == F::<N>::zero()
+        && residue_blas_profitable::<N>(n as usize, n as usize, k as usize)
+        && super::rns_blas::gemm(
+            t,
+            if upper(t) == b'N' { b'T' } else { b'N' },
+            n as usize,
+            n as usize,
+            k as usize,
+            a,
+            lda as usize,
+            a,
+            lda as usize,
+            true,
+            parallel.map(|(pool, _)| pool),
+            c,
+            None,
+        )
+    {
         return;
     }
     // Same operand on both sides: one encode serves both residue columns.

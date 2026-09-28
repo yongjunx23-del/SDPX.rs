@@ -2,6 +2,7 @@
 //! default): `cargo test --release --features sdp,... --test rns_scaling --
 //! --ignored --nocapture`.
 #![cfg(feature = "sdp")]
+use sdpx_solver::receipt;
 #[allow(dead_code)]
 #[path = "../src/algebra/dense/blas/traits.rs"]
 mod provider;

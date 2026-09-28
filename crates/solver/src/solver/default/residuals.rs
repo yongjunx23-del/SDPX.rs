@@ -103,6 +103,15 @@ where
         let is_sampled = data.sampled.is_some();
         #[cfg(not(feature = "sdp"))]
         let is_sampled = false;
+        #[cfg(feature = "sdp")]
+        if self.sampled_workspace.is_none() {
+            if let Some(operator) = &data.sampled {
+                operator.prepare_constants(pool.as_deref());
+                let mut work = SampledWorkspace::new(operator);
+                work.enable_basis_caches();
+                self.sampled_workspace = Some(work);
+            }
+        }
         if !is_sampled
             && self.sparse_parallel.is_none()
             && (pool.as_ref().is_some_and(|p| p.current_num_threads() > 1)

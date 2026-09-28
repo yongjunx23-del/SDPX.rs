@@ -110,6 +110,26 @@ pub struct Timers {
 }
 
 impl Timers {
+    /// Inclusive construction timings retained across solve-scope resets.
+    #[cfg(feature = "serde")]
+    pub(crate) fn setup_times(&self) -> std::collections::BTreeMap<String, f64> {
+        fn collect(
+            timer: &InnerTimer,
+            path: String,
+            out: &mut std::collections::BTreeMap<String, f64>,
+        ) {
+            out.insert(path.clone(), timer.elapsed.as_secs_f64());
+            for (name, child) in timer.subtimers.iter() {
+                collect(child, format!("{path}.{name}"), out);
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        if let Some(setup) = self.subtimers.get("setup") {
+            collect(setup, "setup".into(), &mut out);
+        }
+        out
+    }
+
     fn mut_active_timer(&mut self) -> Option<&mut InnerTimer> {
         if self.stack.is_empty() {
             return None;

@@ -117,7 +117,7 @@ pub struct DefaultSettings<T: FloatT> {
     pub min_terminate_step_length: T,
 
     ///maximum worker budget for cone phases and multithreaded KKT solvers
-    ///choosing 0 lets the solver choose for itself
+    ///0 uses available CPUs, capped by a positive RAYON_NUM_THREADS limit
     #[builder(default = "0")]
     pub max_threads: u32,
 
@@ -145,15 +145,15 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "T::epsilon()*T::epsilon()")]
     pub static_regularization_proportional: T,
 
-    ///enable KKT dynamic regularization
+    ///enable KKT dynamic regularization (immutable after setup)
     #[builder(default = "true")]
     pub dynamic_regularization_enable: bool,
 
-    ///KKT dynamic regularization threshold
+    ///KKT dynamic regularization threshold (immutable after setup)
     #[builder(default = "linear_default::<T>(1e-13)")]
     pub dynamic_regularization_eps: T,
 
-    ///KKT dynamic regularization shift
+    ///KKT dynamic regularization shift (immutable after setup)
     #[builder(default = "accuracy_default::<T>(2e-7)")]
     pub dynamic_regularization_delta: T,
 
@@ -312,8 +312,7 @@ where
         self
     }
 
-    /// Checks that the settings are valid.  This only ensures that fields specified
-    /// by strings contain valid options.   It does not sanity check numerical values
+    /// Check option names and numerical values required for safe control flow.
     fn validate(&self) -> Result<(), SettingsError> {
         // this direct check avoids an internal panic since indirect
         // solvers are not yet available at all
@@ -324,6 +323,7 @@ where
         //check that the choice of LDL solver (string) is valid
         validate_direct_solve_method(&self.direct_solve_method)?;
         validate_kkt_form(&self.kkt_form)?;
+        validate_linesearch_backtrack_step(self.linesearch_backtrack_step)?;
 
         if let Some(tol) = self.tol_feas_componentwise {
             if !tol.is_finite() || tol <= T::zero() {
@@ -354,6 +354,9 @@ where
         check_immutable_setting!(self, prev, direct_kkt_solver);
         check_immutable_setting!(self, prev, direct_solve_method);
         check_immutable_setting!(self, prev, kkt_form);
+        check_immutable_setting!(self, prev, dynamic_regularization_enable);
+        check_immutable_setting!(self, prev, dynamic_regularization_eps);
+        check_immutable_setting!(self, prev, dynamic_regularization_delta);
         check_immutable_setting!(self, prev, presolve_enable);
         check_immutable_setting!(self, prev, input_sparse_dropzeros);
         // Enabling the metric changes the residual update work allocated at
@@ -395,6 +398,9 @@ where
         if let Some(ref kkt_form) = self.kkt_form {
             validate_kkt_form(kkt_form)?;
         }
+        if let Some(step) = self.linesearch_backtrack_step {
+            validate_linesearch_backtrack_step(step)?;
+        }
 
         if let Some(Some(tol)) = self.tol_feas_componentwise.as_ref() {
             if !tol.is_finite() || *tol <= T::zero() {
@@ -417,6 +423,13 @@ where
 // ---------------------------------------------------------
 // individual validation functions go here
 // ---------------------------------------------------------
+
+fn validate_linesearch_backtrack_step<T: FloatT>(step: T) -> Result<(), SettingsError> {
+    if !step.is_finite() || step <= T::zero() || step >= T::one() {
+        return Err(SettingsError::BadFieldValue("linesearch_backtrack_step"));
+    }
+    Ok(())
+}
 
 fn validate_kkt_form(form: &str) -> Result<(), SettingsError> {
     match form {

@@ -661,19 +661,24 @@ impl<T: FloatT> PsdBlock<T> {
                 });
             }
         }
-        Self::from_columns(n, rows.len(), columns)
+        Self::from_columns(n, rows.len(), columns, true)
     }
 
     /// Build from pre-collected columns in increasing column order: exactly the
     /// non-empty columns of this block's rows, each entry in CSC position
     /// order. The shared A scan in `CondensedKKTSolver::new` produces this.
-    pub(super) fn from_columns(n: usize, rows_len: usize, mut columns: Vec<Column>) -> Self {
+    pub(super) fn from_columns(
+        n: usize,
+        rows_len: usize,
+        mut columns: Vec<Column>,
+        generic: bool,
+    ) -> Self {
         // Only the local assembly order changes; indices and CSC destinations
         // stay in the original coordinates. Sparse left coefficients occur in
         // more triangular dot products, reducing total dot work (MOSEK ISMP 2012).
         columns.sort_by_key(|c| c.entries.len());
         let mut prefix_entries = 0u128;
-        for column in &mut columns {
+        for column in columns.iter_mut().filter(|_| generic) {
             prefix_entries += column.entries.len() as u128;
             let rate: u128 = if T::precision_bits() <= 53 { 64 } else { 1 };
             let expanded = column
@@ -693,23 +698,23 @@ impl<T: FloatT> PsdBlock<T> {
         // Structural grouping is independent of coefficients and survives A
         // updates. Numerical equality is checked again before every assembly.
         let mut groups = HashMap::<Vec<(usize, usize)>, Vec<usize>>::new();
-        for (ci, column) in columns.iter().enumerate() {
+        for (ci, column) in columns.iter().enumerate().filter(|_| generic) {
             let key = column.entries.iter().map(|e| (e.i, e.j)).collect();
             groups.entry(key).or_default().push(ci);
         }
         let column_groups = groups.into_values().filter(|g| g.len() > 1).collect();
-        let dense_representatives = vec![usize::MAX; columns.len()];
-        let dense_column_map = vec![usize::MAX; columns.len()];
+        let dense_representatives = vec![usize::MAX; if generic { columns.len() } else { 0 }];
+        let dense_column_map = vec![usize::MAX; if generic { columns.len() } else { 0 }];
         let dense_indices = columns
             .iter()
             .enumerate()
-            .filter(|(_, column)| !column.sparse)
+            .filter(|(_, column)| generic && !column.sparse)
             .map(|(index, _)| index)
             .collect();
         // A packed coordinate is read only by left columns containing it.
         // Cache its first local use, including stored zeros and sparse columns.
         let mut dense_row_first = Vec::new();
-        if T::precision_bits() <= 53 {
+        if generic && T::precision_bits() <= 53 {
             dense_row_first.resize(rows_len, columns.len());
             for (ci, column) in columns.iter().enumerate() {
                 for e in &column.entries {
@@ -720,6 +725,7 @@ impl<T: FloatT> PsdBlock<T> {
         }
         let axpy_plans = columns
             .iter()
+            .filter(|_| generic)
             .map(|column| {
                 let mut plan = Vec::with_capacity(2 * column.entries.len());
                 for (eidx, e) in column.entries.iter().enumerate() {
@@ -742,7 +748,7 @@ impl<T: FloatT> PsdBlock<T> {
                 plan
             })
             .collect();
-        let coefficient_support = if T::precision_bits() <= 53 {
+        let coefficient_support = if generic && T::precision_bits() <= 53 {
             columns
                 .iter()
                 .map(|column| {

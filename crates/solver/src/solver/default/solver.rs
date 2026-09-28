@@ -105,7 +105,10 @@ impl<T: FloatT> PreparedProblem<T> {
         let input_fingerprint = with_identity
             .then(|| crate::solver::distributed::input_fingerprint(P, q, A, b, cones, None));
         #[cfg(not(all(feature = "sdp", feature = "serde")))]
-        let input_fingerprint = None;
+        let input_fingerprint = {
+            let _ = with_identity;
+            None
+        };
         Self::new_with_setup(
             P,
             q,
@@ -170,7 +173,10 @@ impl<T: FloatT> PreparedProblem<T> {
             crate::solver::distributed::input_fingerprint(P, q, A_linear, b, cones, Some(&blocks))
         });
         #[cfg(not(feature = "serde"))]
-        let input_fingerprint = None;
+        let input_fingerprint = {
+            let _ = with_identity;
+            None
+        };
         let mut sampled_timers = Timers::default();
         sampled_timers.start_as_current("setup");
         let operator =
@@ -196,11 +202,12 @@ impl<T: FloatT> PreparedProblem<T> {
             }
         }
         // The solver's pool does not exist yet; expand the blocks on a
-        // setup-only pool of the configured width (0 = available CPUs).
-        let setup_pool = (settings.max_threads != 1)
+        // setup-only pool with the same budget as the runtime phases.
+        let workers = crate::solver::core::worker_budget(settings.max_threads as usize);
+        let setup_pool = (workers > 1)
             .then(|| {
                 rayon::ThreadPoolBuilder::new()
-                    .num_threads(settings.max_threads as usize)
+                    .num_threads(workers)
                     .build()
                     .ok()
             })
@@ -314,24 +321,19 @@ impl<T: FloatT> DefaultSolver<T> {
             mut timers,
             cost_input_fingerprint: _,
         } = prepared;
+        #[cfg(feature = "sdp")]
+        let mut data = data;
         timers.start_as_current("setup");
         let variables = DefaultVariables::<T>::new(data.n, data.m);
         let mut residuals = DefaultResiduals::<T>::new(data.n, data.m);
-        #[cfg(feature = "sdp")]
-        if let Some(operator) = &data.sampled {
-            operator.prepare_constants(cones.thread_pool().as_deref());
-            // Applied twice per iteration for the IPM residuals: keep the
-            // basis residues across calls as the KKT workspace does.
-            let mut work = SampledWorkspace::new(operator);
-            work.enable_basis_caches();
-            residuals.sampled_workspace = Some(work);
-        }
         residuals.prepare_sparse(&data, cones.thread_pool());
         crate::receipt::memory_mark("residual workspace");
         let kktsystem;
         timeit! {timers => "kktinit"; {
             kktsystem = DefaultKKTSystem::<T>::new(&data,&cones,&settings);
         }}
+        #[cfg(feature = "sdp")]
+        data.compact_sampled_matrix();
         crate::receipt::memory_mark("kkt system");
         let mut info = DefaultInfo::<T>::new();
         info.linsolver = kktsystem.linear_solver_info();

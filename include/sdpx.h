@@ -42,6 +42,7 @@ typedef struct {
  sdpx_scalars basis, weights;
 } sdpx_sampled_block;
 typedef struct {
+ /* precision_bits: 53 (binary64), or 128..2048 in steps of 64 (MPFR). */
  uint32_t abi_version, struct_size, precision_bits, max_iter;
  /* max_threads budgets the cone worker pool and eligible KKT factorization.
   * It is not a total process thread limit. Native BLAS threads are separate.
@@ -72,6 +73,9 @@ typedef struct {
 /* Versioned first handshake prevents old clients from allocating ABI-3 storage. */
 int32_t sdpx_default_settings_v4(sdpx_settings *out);
 #define sdpx_default_settings sdpx_default_settings_v4
+/* Initialize optional MPI and return the active world size (1 in serial).
+ * Every MPI rank must enter the same sequence of solver operations. */
+int32_t sdpx_mpi_world_size(void);
 int32_t sdpx_prepare(const sdpx_csc *P, const sdpx_scalars *q, const sdpx_csc *A, const sdpx_scalars *b, const sdpx_cone *cones, uint64_t cone_count, const sdpx_settings *settings, sdpx_handle **out);
 /* Sampled input entrypoint, introduced in ABI 3; uses current settings layout.
  * Factor arrays and blocks are copied before return, as with CSC inputs. */

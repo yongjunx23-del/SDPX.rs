@@ -32,6 +32,14 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                     for column in &mut p.columns {
                         column.entries = Vec::new();
                     }
+                    // Also release generic plans for partially sampled problems.
+                    p.axpy_plans = Vec::new();
+                    p.column_groups = Vec::new();
+                    p.dense_indices = Vec::new();
+                    p.dense_representatives = Vec::new();
+                    p.dense_column_map = Vec::new();
+                    p.dense_row_first = Vec::new();
+                    p.coefficient_support = Vec::new();
                     p.mat3c = Matrix::zeros(p.Rinv.size());
                     p.sampled = Some(SampledPsd {
                         work: SampledSchurWorkspace::new(sampled_block),
@@ -474,7 +482,9 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                             );
                         }
                     }
-                    p.G.syrk(&p.R, T::one(), T::zero(), MatrixTriangle::Triu);
+                    // Cone scaling already formed this exact same product.
+                    // Copy its authoritative triangle before mirroring below.
+                    p.G.copy_from_slice(c.scaling_gram().data());
                     p.Ginv
                         .syrk(&p.Rinv.t(), T::one(), T::zero(), MatrixTriangle::Triu);
                     for j in 0..c.n {

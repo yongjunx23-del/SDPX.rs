@@ -303,10 +303,10 @@ where
         rscale: &[T],
         cscale: Option<T>,
     ) -> Result<(), SparseFormatError> {
+        if self.clone().any(|(&idx, _)| idx >= M.nzval.len()) {
+            return Err(SparseFormatError::IncompatibleDimension);
+        }
         for (&idx, &value) in self.clone() {
-            if idx >= M.nzval.len() {
-                return Err(SparseFormatError::IncompatibleDimension);
-            }
             let (row, col) = M.index_to_coord(idx);
             if let Some(c) = cscale {
                 M.nzval[idx] = lscale[row] * rscale[col] * c * value;
@@ -323,7 +323,7 @@ where
     T: FloatT,
 {
     fn is_empty_update(&self) -> bool {
-        self.0.is_empty() || self.1.is_empty()
+        self.0.is_empty() && self.1.is_empty()
     }
     fn update_matrix(
         &self,
@@ -332,6 +332,9 @@ where
         rscale: &[T],
         cscale: Option<T>,
     ) -> Result<(), SparseFormatError> {
+        if self.0.len() != self.1.len() {
+            return Err(SparseFormatError::IncompatibleDimension);
+        }
         let z = zip(self.0.iter(), self.1.iter());
         z.update_matrix(M, lscale, rscale, cscale)
     }
@@ -405,10 +408,10 @@ where
         vscale: &[T],
         cscale: Option<T>,
     ) -> Result<(), SparseFormatError> {
+        if self.clone().any(|(&idx, _)| idx >= v.len()) {
+            return Err(SparseFormatError::IncompatibleDimension);
+        }
         for (&idx, &value) in self.clone() {
-            if idx >= v.len() {
-                return Err(SparseFormatError::IncompatibleDimension);
-            }
             if let Some(c) = cscale {
                 v[idx] = value * vscale[idx] * c;
             } else {
@@ -429,6 +432,9 @@ where
         vscale: &[T],
         cscale: Option<T>,
     ) -> Result<(), SparseFormatError> {
+        if self.0.len() != self.1.len() {
+            return Err(SparseFormatError::IncompatibleDimension);
+        }
         let z = zip(self.0.iter(), self.1.iter());
         z.update_vector(v, vscale, cscale)
     }

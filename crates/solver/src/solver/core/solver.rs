@@ -116,7 +116,9 @@ pub trait SolverJSONReadWrite<T>: Sized
 where
     T: FloatT,
 {
-    /// write internal problem data to a JSON file
+    /// Write internal problem data to a JSON file. Sampled solvers return
+    /// `Unsupported`; retain and write the original `JsonProblem` to preserve
+    /// authoritative factors.
     fn save_to_file(&self, file: &mut std::fs::File) -> Result<(), std::io::Error>;
     /// load problem data from a JSON file previously saved using [`save_to_file`](self::SolverJSONReadWrite::save_to_file)
     fn load_from_file(

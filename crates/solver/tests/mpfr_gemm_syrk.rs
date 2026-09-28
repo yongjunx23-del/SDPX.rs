@@ -2,6 +2,7 @@
 //! The reference shares the production MpFloat wrapper and decimal conversion;
 //! it is not a binding-independent native MPFR oracle.
 #![cfg(feature = "sdp")]
+use sdpx_solver::receipt;
 // This test imports the whole provider but exercises only selected operations.
 #[allow(dead_code)]
 #[path = "../src/algebra/dense/blas/traits.rs"]

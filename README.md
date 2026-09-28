@@ -15,7 +15,6 @@
   <a href="#features">Features</a> •
   <a href="#quick-start">Quick start</a> •
   <a href="#bootstrap-example">Bootstrap example</a> •
-  <a href="#performance">Performance</a> •
   <a href="#license">License</a>
 </p>
 
@@ -35,16 +34,15 @@ power and positive-semidefinite cones. It reads SDPB's `pmp2sdp` output
 directly, so a polynomial-matrix bootstrap problem goes from `pmp2sdp` to an
 audited 768-bit solution with no Julia or Python runtime in the solver.
 
-<p align="center">
-  <img src="docs/assets/bootstrap-race.svg" width="100%" alt="SDPX vs SDPB on the Ising Λ19 bootstrap SDP">
-</p>
-
 ## Features
 
 - **Bootstrap-native input.** Sampled PSD blocks from `pmp2sdp` stay in
-  factored form (bilinear bases × sample weights). They are never expanded
-  into dense coefficient matrices.
-- **Precision you choose.** Binary64, or 128/256/512/768/1024/2048-bit MPFR.
+  factored form (bilinear bases × sample weights). Expanded sparse coefficients
+  are released after preprocessing and KKT setup; iterations apply the factors
+  directly.
+- **Precision you choose.** Binary64, or MPFR from 128 to 2048 bits in
+  64-bit increments in the CLI and C ABI, including 1216. The Rust API
+  accepts `MpFloat<N>` for `64*N` bits.
   Dense high-precision products use an exact residue-number-system kernel:
   they accumulate exactly and round once.
 - **Fast at scale.** Threads work per block (SDPB-style load balancing), and
@@ -99,10 +97,23 @@ fn main() {
 }
 ```
 
+## PMP conversion
+
+Convert SDPB JSON or XML directly in Rust:
+
+```sh
+cargo build --locked --release -p sdpx-pmp
+./target/release/sdpx-pmp2sdp --input problem.json --output problem-sdp --precision 768
+sdpx problem-sdp --precision 768
+```
+
+The [converter guide](crates/pmp/README.md) covers normalization, prefactors,
+sampling, supported formats and the Rust API.
+
 ## Bootstrap example
 
 Solve an SDPB-format bootstrap problem at 768 bits with 32 threads, to a
-10⁻⁴² gap. This is `examples/rust/example_bootstrap.rs`; run it with
+10⁻⁴² gap. See [the Rust example](crates/solver/examples/rust/example_bootstrap.rs); run it with
 `cargo run --release --example bootstrap --features sdp-openblas -- ising-lambda19/`.
 
 ```rust
@@ -134,32 +145,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The first `sdp.num_equalities` entries of `-solution.z` are SDPB's `y`. The
-CLI writes the same point, plus a JSON receipt of status, precision, thread
-use and per-phase timings.
+CLI writes the same point with status, precision and thread use. Set
+`SDPX_RECEIPT=receipt.json` to record detailed phase timings.
 
-## Performance
+`max_threads = 0` uses available CPUs, capped by a positive
+`RAYON_NUM_THREADS` value. Explicit thread settings take precedence.
 
-Audited full solves at 768 bits on the same 2× AMD EPYC 7742 node, same
-input and tolerances (gap and residuals ≤ 1e-42). Every SDPX point passes an
-independent original-coordinate audit.
-
-| Problem | SDPX 0.8 | SDPB |
-|---|---|---|
-| Ising Λ19, 32 cores | **104 s** · 119 it | 204 s · 243 it |
-| Ising Λ19, 64 cores | **102 s** | 153 s |
-| Λ19 spins 0–50, one node | **238 s** · 177 it | 328 s · 265 it |
-
-Binary64 uses QDLDL, or faer's supernodal LDLᵀ for high-fill systems
-(`faer-sparse`). Release notes and measurements are in
-[CHANGELOG.md](CHANGELOG.md).
-
-**Tips for large runs.**
-- One process per node with `--threads` equal to the core count is usually
-  fastest.
-- For several nodes, use `--partitions auto` under `mpirun` with one rank
-  per 8–16 cores.
-- If OpenMPI's `openib` transport hangs, select TCP:
-  `--mca btl self,vader,tcp`.
+For sampled solvers, `solver.data.A` retains only the explicit linear
+component after setup. Use `solver.data.materialize_A()` when you need the
+full equilibrated matrix; this allocates its expanded coefficients.
 
 ## Crates
 
@@ -167,15 +161,17 @@ Binary64 uses QDLDL, or faer's supernodal LDLᵀ for high-fill systems
 |---|---|
 | `sdpx-solver` | Solver, cones, KKT systems, sampled bootstrap operator, `sdpx` CLI |
 | `sdpx-arithmetic` | Fixed-precision MPFR scalars (`Bits128` … `Bits2048`) and exact dot products |
+| `sdpx-pmp` | PMP conversion library and `sdpx-pmp2sdp` CLI (JSON/XML → sampled SDP) |
 | `sdpx-ffi` | Stable C ABI over the solver, for non-Rust hosts |
 
 Run the test suite with
-`cargo test --release --workspace --features sdpx-ffi/sdp-openblas,sdpx-ffi/faer-sparse`.
+`cargo test --locked --release --workspace --features sdpx-ffi/sdp-openblas,sdpx-ffi/faer-sparse -- --test-threads=1`.
 
 ## Citing
 
 If SDPX helps your bootstrap study, please cite this repository and the
 works it builds on:
+
 - [Clarabel](https://link.springer.com/article/10.1007/s12532-026-00320-7)
   (interior-point algorithm and Rust core);
 - [SDPB](https://arxiv.org/abs/1909.09745) (sampled bootstrap SDP form);
@@ -188,3 +184,6 @@ Apache-2.0. The Rust core is adapted from
 attribution. The provenance of adapted code is in
 [`provenance/`](provenance/). GMP, MPFR, BLAS and LAPACK keep their own
 licenses.
+
+The PMP converter is adapted from SDPB 3.1.0 under the
+[MIT license](provenance/SDPB-LICENSE).

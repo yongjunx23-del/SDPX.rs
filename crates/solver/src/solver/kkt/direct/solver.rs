@@ -160,6 +160,12 @@ where
         // provided, the solver finds one for itself
         let ldlsolver = if KKT.n == 0 {
             Box::new(EmptyDirectLDLSolver) as BoxedDirectLDLSolver<T>
+        } else if settings.direct_solve_method == "auto" {
+            crate::solver::kkt::ldl::arrow::ArrowLDLSolver::try_local_soc(
+                &KKT, &dsigns, A, cones, settings,
+            )
+            .map(|solver| Box::new(solver) as BoxedDirectLDLSolver<T>)
+            .unwrap_or_else(|| ldl_ctor(&KKT, &dsigns, settings, None))
         } else {
             ldl_ctor(&KKT, &dsigns, settings, None)
         };

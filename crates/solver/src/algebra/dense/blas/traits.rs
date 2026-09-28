@@ -247,10 +247,17 @@ pub trait XgemmScalar: Sized {
     fn residue_blas_applies(_m: usize, _n: usize, _k: usize) -> bool { false }
     // `v[k] = Σ_{i≤j} c_ij·x_t·q_ik·q_jk` (svec `x`, `c_ij = sqrt2` off the
     // diagonal) for `q` of size h × kmax, rounded once from the exact value.
+    // Passing scale 2 instead of sqrt2 accepts an unscaled packed symmetric X.
     fn xsvec_quadratic_exact(
         _h: usize, _kmax: usize, _q: &[Self], _x: &[Self], _sqrt2: Self,
         _pool: Option<&rayon::ThreadPool>, _out: &mut [Self], _cache_q: Option<&mut ResidueCache>
     ) -> bool where Self: Sized { false }
+    // Selected q_aᵀ X q_b values for symmetric, unscaled packed X, rounded
+    // once from each exact bilinear form. Use the outputs only on success.
+    fn xsymmetric_bilinear_exact(
+        _h: usize, _columns: usize, _q: &[Self], _x: &[Self],
+        _pairs: &[(usize, usize)], _out: &mut [Self], _cache_q: &mut ResidueCache
+    ) -> bool { false }
     // `op(a)·x·op(a)ᵀ` (m × m, x is k × k) rounded once from the exact value
     // into `c` (ldc = m); upper triangle only when `upper_only`.
     fn xcongruence_exact(

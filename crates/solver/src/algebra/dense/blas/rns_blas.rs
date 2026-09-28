@@ -18,9 +18,9 @@
 //! and stream primes in small groups with an incremental CRT, so a call's
 //! working set fits a core's share of cache. Constant operands can keep their
 //! residues in a fingerprint-checked [`ResidueCache`].
+use num_traits::Zero;
 use rayon::prelude::*;
 use sdpx_arithmetic::{DyadicKind, MpFloat};
-use num_traits::Zero;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -36,19 +36,40 @@ const MAX_PRIMES: usize = 1024;
 /// Largest admitted per-operand exponent spread (bits).
 const MAX_SPREAD: i64 = 4096;
 
-/// Process-wide cache of plan-dependent tables (never invalidated: they
-/// depend only on the prime width, count and chunk width).
-fn cached<K: std::hash::Hash + Eq, V>(
+/// Retained plan tables are capped at 64 MiB per table family. Eviction
+/// releases only the cache's references; active kernels keep their Arc.
+trait CacheBytes {
+    fn cache_bytes(&self) -> usize;
+}
+impl CacheBytes for Vec<f64> {
+    fn cache_bytes(&self) -> usize {
+        self.capacity() * 8
+    }
+}
+fn cached<K: std::hash::Hash + Eq, V: CacheBytes>(
     cache: &'static OnceLock<Mutex<HashMap<K, Arc<V>>>>,
     key: K,
     build: impl FnOnce() -> V,
 ) -> Arc<V> {
+    const LIMIT: usize = 64 << 20;
     let map = cache.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(v) = map.lock().unwrap().get(&key) {
         return v.clone();
     }
     let v = Arc::new(build());
-    map.lock().unwrap().entry(key).or_insert(v).clone()
+    let mut map = map.lock().unwrap();
+    if let Some(existing) = map.get(&key) {
+        return existing.clone();
+    }
+    let bytes = v.cache_bytes();
+    if bytes > LIMIT {
+        return v;
+    }
+    if map.values().map(|v| v.cache_bytes()).sum::<usize>() + bytes > LIMIT {
+        map.clear();
+    }
+    map.insert(key, v.clone());
+    v
 }
 
 fn is_prime(n: u64) -> bool {
@@ -145,15 +166,34 @@ fn ceil_log2(x: usize) -> u32 {
     usize::BITS - x.saturating_sub(1).leading_zeros()
 }
 
+fn prime_bits(k: usize) -> u32 {
+    // |residue| < 2^(bits-1); k·2^(2bits-2) must stay below 2^53.
+    let bits = ((EXACT_BITS + 2.0 - ceil_log2(k.max(1)) as f64) / 2.0).floor() as u32;
+    bits.clamp(MIN_PRIME_BITS, MAX_PRIME_BITS)
+}
+
 thread_local! {
     static SPLIT_HINT: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
-    static BUFFERS: std::cell::RefCell<Vec<Vec<f64>>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BUFFERS: std::cell::RefCell<BufferPool> = const { std::cell::RefCell::new(BufferPool(Vec::new())) };
 }
 
 /// Buffers kept per thread (enough for one call's operands, scratch and
 /// accumulator) and their total size cap, in entries (32 MiB).
 const POOLED_BUFFERS: usize = 16;
 const POOLED_ENTRIES: usize = 4 << 20;
+// The per-thread limit prevents monopolization; this process-wide cap keeps
+// idle storage bounded even with hundreds of workers or multiple solver pools.
+const GLOBAL_POOLED_ENTRIES: usize = 16 << 20;
+static POOLED_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct BufferPool(Vec<Vec<f64>>);
+impl Drop for BufferPool {
+    fn drop(&mut self) {
+        POOLED_TOTAL.fetch_sub(
+            self.0.iter().map(Vec::capacity).sum(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
 
 /// A zeroed buffer of `len` entries, reusing one this thread released.
 /// Kernel calls repeat with the same shapes every iteration; reuse avoids
@@ -162,13 +202,16 @@ const POOLED_ENTRIES: usize = 4 << 20;
 fn take_buffer(len: usize) -> Vec<f64> {
     let mut v = BUFFERS
         .with(|b| {
-            let mut b = b.borrow_mut();
+            let mut pool = b.borrow_mut();
+            let b = &mut pool.0;
             // Smallest buffer that fits, else the largest (it grows once).
             let i = (0..b.len()).min_by_key(|&i| match b[i].capacity() {
                 c if c >= len => (0, c),
                 c => (1, usize::MAX - c),
             })?;
-            Some(b.swap_remove(i))
+            let v = b.swap_remove(i);
+            POOLED_TOTAL.fetch_sub(v.capacity(), std::sync::atomic::Ordering::Relaxed);
+            Some(v)
         })
         .unwrap_or_default();
     v.clear();
@@ -181,10 +224,21 @@ fn release_buffer(v: Vec<f64>) {
         return;
     }
     BUFFERS.with(|b| {
-        let mut b = b.borrow_mut();
+        let mut pool = b.borrow_mut();
+        let b = &mut pool.0;
         let held: usize = b.iter().map(Vec::capacity).sum();
         if b.len() < POOLED_BUFFERS && held + v.capacity() <= POOLED_ENTRIES {
-            b.push(v);
+            let capacity = v.capacity();
+            if POOLED_TOTAL
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |held| (held + capacity <= GLOBAL_POOLED_ENTRIES).then_some(held + capacity),
+                )
+                .is_ok()
+            {
+                b.push(v);
+            }
         }
     });
 }
@@ -219,7 +273,9 @@ enum Split<'a> {
 }
 
 fn split_plan(pool: Option<&rayon::ThreadPool>) -> Split<'_> {
-    if let Some(p) = pool.filter(|p| p.current_num_threads() > 1 && rayon::current_thread_index().is_none()) {
+    if let Some(p) =
+        pool.filter(|p| p.current_num_threads() > 1 && rayon::current_thread_index().is_none())
+    {
         return Split::Pool(p);
     }
     let ways = SPLIT_HINT.with(|c| c.get());
@@ -294,11 +350,25 @@ fn local_gemm(
     accumulate: bool,
 ) {
     // (row stride, column stride) of op(x) for a column-major x.
-    let strides = |t: u8, ld: usize| if t == b'N' { (1, ld as isize) } else { (ld as isize, 1) };
+    let strides = |t: u8, ld: usize| {
+        if t == b'N' {
+            (1, ld as isize)
+        } else {
+            (ld as isize, 1)
+        }
+    };
     let (a_rs, a_cs) = strides(ta, lda);
     let (b_rs, b_cs) = strides(tb, ldb);
-    let a_end = if ta == b'N' { (m - 1) + (k.max(1) - 1) * lda } else { (k.max(1) - 1) + (m - 1) * lda };
-    let b_end = if tb == b'N' { (k.max(1) - 1) + (n - 1) * ldb } else { (n - 1) + (k.max(1) - 1) * ldb };
+    let a_end = if ta == b'N' {
+        (m - 1) + (k.max(1) - 1) * lda
+    } else {
+        (k.max(1) - 1) + (m - 1) * lda
+    };
+    let b_end = if tb == b'N' {
+        (k.max(1) - 1) + (n - 1) * ldb
+    } else {
+        (n - 1) + (k.max(1) - 1) * ldb
+    };
     assert!(k == 0 || (a_end < a.len() && b_end < b.len()));
     assert!((m - 1) + (n - 1) * ldc < c.len());
     // SAFETY: the asserts bound every strided access of the three operands.
@@ -382,9 +452,7 @@ struct Plan {
 
 impl Plan {
     fn new(k: usize, needed_bits: f64) -> Option<Self> {
-        // |residue| < 2^(bits-1); k·2^(2bits-2) must stay below 2^53.
-        let bits = ((EXACT_BITS + 2.0 - ceil_log2(k.max(1)) as f64) / 2.0).floor() as u32;
-        let bits = bits.clamp(MIN_PRIME_BITS, MAX_PRIME_BITS);
+        let bits = prime_bits(k);
         let k_chunk = 1usize << (53 + 2 - 2 * bits).min(40);
         let table = primes(bits);
         let (mut have, mut count) = (0.0f64, 0usize);
@@ -450,7 +518,13 @@ impl Drop for ChunkMatrix {
 /// Rows encoded per way, at least; below this a split costs more than it saves.
 const MIN_ROWS_PER_WAY: usize = 256;
 
-fn chunk_matrix<const N: usize>(x: View<'_, N>, lo: i64, spread: i64, plan: &Plan, split: &Split<'_>) -> ChunkMatrix {
+fn chunk_matrix<const N: usize>(
+    x: View<'_, N>,
+    lo: i64,
+    spread: i64,
+    plan: &Plan,
+    split: &Split<'_>,
+) -> ChunkMatrix {
     let len = x.len();
     let int_bits = F::<N>::PRECISION_BITS as i64 + spread;
     let mut c = 30u32;
@@ -478,7 +552,9 @@ fn chunk_matrix<const N: usize>(x: View<'_, N>, lo: i64, spread: i64, plan: &Pla
             let delta = view.exponent as i64 - F::<N>::PRECISION_BITS as i64 - lo;
             let limbs = value.exact_encode().2;
             let j0 = (delta / c as i64) as usize;
-            let j1 = ((delta + F::<N>::PRECISION_BITS as i64) as usize).div_ceil(c as usize).min(chunks);
+            let j1 = ((delta + F::<N>::PRECISION_BITS as i64) as usize)
+                .div_ceil(c as usize)
+                .min(chunks);
             for (j, slot) in row.iter_mut().enumerate().take(j1).skip(j0) {
                 let bits = bits_at(limbs, c as i64 * j as i64 - delta, c) as f64;
                 *slot = if negative { -bits } else { bits };
@@ -490,17 +566,27 @@ fn chunk_matrix<const N: usize>(x: View<'_, N>, lo: i64, spread: i64, plan: &Pla
         fill(0, &mut e);
     } else {
         let per = len.div_ceil(ways);
-        let mut run = || e.par_chunks_mut(per * chunks).enumerate().for_each(|(w, rows)| fill(w * per, rows));
+        let mut run = || {
+            e.par_chunks_mut(per * chunks)
+                .enumerate()
+                .for_each(|(w, rows)| fill(w * per, rows))
+        };
         match split {
             Split::Pool(p) => p.install(run),
             _ => run(),
         }
     }
-    ChunkMatrix { e, chunks, width: c, len }
+    ChunkMatrix {
+        e,
+        chunks,
+        width: c,
+        len,
+    }
 }
 
 fn weights(plan: &Plan, width: u32, chunks: usize) -> Arc<Vec<f64>> {
-    static WEIGHTS: OnceLock<Mutex<HashMap<(u32, usize, u32, usize), Arc<Vec<f64>>>>> = OnceLock::new();
+    static WEIGHTS: OnceLock<Mutex<HashMap<(u32, usize, u32, usize), Arc<Vec<f64>>>>> =
+        OnceLock::new();
     let kp = plan.count();
     cached(&WEIGHTS, (plan.bits, kp, width, chunks), || {
         let mut w = vec![0.0f64; chunks * kp];
@@ -522,7 +608,19 @@ fn group_residues(m: &ChunkMatrix, plan: &Plan, q0: usize, q1: usize, out: &mut 
     out.clear();
     out.resize(m.len * g, 0.0);
     let w = weights(plan, m.width, m.chunks);
-    int_gemm(b'T', b'N', m.len, g, m.chunks, &m.e, m.chunks, &w[q0 * m.chunks..q1 * m.chunks], m.chunks, out, m.len);
+    int_gemm(
+        b'T',
+        b'N',
+        m.len,
+        g,
+        m.chunks,
+        &m.e,
+        m.chunks,
+        &w[q0 * m.chunks..q1 * m.chunks],
+        m.chunks,
+        out,
+        m.len,
+    );
     for (qi, col) in out.chunks_mut(m.len.max(1)).enumerate().take(g) {
         let q = q0 + qi;
         for x in col {
@@ -533,15 +631,16 @@ fn group_residues(m: &ChunkMatrix, plan: &Plan, q0: usize, q1: usize, out: &mut 
 
 /// Residues of an operand that stays constant across many products (the
 /// sampled basis for a whole solve, a scaling factor for an iteration),
-/// stored as f32 (exact: |r| < 2^24 for prime widths <= 25 bits). An entry is
-/// used only when the operand's exact-bit fingerprint, alignment and prime
+/// stored as signed 24-bit integers or f32, both exact at their prime width.
+/// An entry is used only when the operand's exact-bit fingerprint, alignment and prime
 /// width match, so a changed operand can never reuse stale residues; it is
 /// simply re-encoded.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ResidueCache {
-    entry: Option<CacheEntry>,
+    entry: Arc<Mutex<Option<Arc<CacheEntry>>>>,
 }
 
+#[derive(Debug)]
 struct CacheEntry {
     fingerprint: u64,
     bits: u32,
@@ -549,7 +648,55 @@ struct CacheEntry {
     spread: i64,
     len: usize,
     count: usize,
-    res: Vec<f32>,
+    res: CachedResidues,
+}
+
+#[derive(Debug)]
+enum CachedResidues {
+    // Balanced residues for primes below 2^24 lie strictly inside ±2^23.
+    Narrow(Vec<[u8; 3]>),
+    Wide(Vec<f32>),
+}
+
+impl CachedResidues {
+    fn from_chunks(chunks: &ChunkMatrix, plan: &Plan) -> Self {
+        let len = chunks.len * plan.count();
+        let mut stored = if plan.bits <= 24 {
+            Self::Narrow(Vec::with_capacity(len))
+        } else {
+            Self::Wide(Vec::with_capacity(len))
+        };
+        // Compress each prime group immediately. A full f64 encoding would
+        // coexist with the cache and multiply the construction memory peak.
+        let mut scratch = Vec::new();
+        for first in (0..plan.count()).step_by(STREAM_GROUP) {
+            group_residues(
+                chunks,
+                plan,
+                first,
+                (first + STREAM_GROUP).min(plan.count()),
+                &mut scratch,
+            );
+            match &mut stored {
+                Self::Narrow(values) => values.extend(scratch.iter().map(|&value| {
+                    let [a, b, c, _] = (value as i32).to_le_bytes();
+                    [a, b, c]
+                })),
+                Self::Wide(values) => values.extend(scratch.iter().map(|&value| value as f32)),
+            }
+        }
+        stored
+    }
+
+    fn extend(&self, range: std::ops::Range<usize>, out: &mut Vec<f64>) {
+        match self {
+            Self::Narrow(values) => out.extend(values[range].iter().map(|&[a, b, c]| {
+                // Sign-extend the stored 24-bit two's-complement integer.
+                ((u32::from_le_bytes([a, b, c, 0]) << 8) as i32 >> 8) as f64
+            })),
+            Self::Wide(values) => out.extend(values[range].iter().map(|&value| value as f64)),
+        }
+    }
 }
 
 /// Spare primes encoded beyond the current plan, so later calls whose other
@@ -578,59 +725,78 @@ fn fingerprint<const N: usize>(x: View<'_, N>) -> u64 {
 }
 
 /// Where one operand's per-group residues come from.
-enum Operand<'a> {
+enum Operand {
     Chunks(ChunkMatrix),
-    Cached(&'a CacheEntry),
+    Cached(Arc<CacheEntry>),
 }
 
-impl Operand<'_> {
+impl Operand {
     fn residues(&self, plan: &Plan, q0: usize, q1: usize, out: &mut Vec<f64>) {
         match self {
             Operand::Chunks(m) => group_residues(m, plan, q0, q1, out),
             Operand::Cached(c) => {
                 out.clear();
-                out.extend(c.res[q0 * c.len..q1 * c.len].iter().map(|&v| v as f64));
+                c.res.extend(q0 * c.len..q1 * c.len, out);
             }
         }
     }
 }
 
 impl ResidueCache {
+    /// Products with these inner dimensions use the same prime sequence, so
+    /// one operand cache can serve both without alternating prime widths.
+    pub(crate) fn same_prime_width(first: usize, second: usize) -> bool {
+        prime_bits(first) == prime_bits(second)
+    }
+
     /// The operand's residues for `plan` (`lo`/`spread` are its alignment),
     /// from the cache when it matches, otherwise freshly encoded and stored.
-    fn operand<'a, const N: usize>(
-        &'a mut self,
+    fn operand<const N: usize>(
+        &mut self,
         x: View<'_, N>,
         lo: i64,
         spread: i64,
         plan: &Plan,
         split: &Split<'_>,
-    ) -> Operand<'a> {
+    ) -> Operand {
         if plan.bits > CACHE_MAX_BITS {
             return Operand::Chunks(chunk_matrix(x, lo, spread, plan, split));
         }
         let fp = fingerprint(x);
-        let hit = self.entry.as_ref().is_some_and(|c| {
-            c.fingerprint == fp && c.bits == plan.bits && c.lo == lo && c.spread == spread
-                && c.len == x.len() && c.count >= plan.count()
-        });
-        if !hit {
+        let stale = {
+            let mut entry = self.entry.lock().unwrap();
+            if let Some(c) = entry.as_ref() {
+                if c.fingerprint == fp
+                    && c.bits == plan.bits
+                    && c.lo == lo
+                    && c.spread == spread
+                    && c.len == x.len()
+                    && c.count >= plan.count()
+                {
+                    return Operand::Cached(c.clone());
+                }
+            }
+            entry.take()
+        };
+        // Release invalid storage before encoding its replacement. Active
+        // products retain their own Arc, and deallocation occurs outside the lock.
+        drop(stale);
+        {
             let count = (plan.count() + CACHE_SPARE_PRIMES).min(primes(plan.bits).len());
             let wide = Plan::with_count(plan.bits, count);
             let chunks = chunk_matrix(x, lo, spread, &wide, split);
-            let mut res = Vec::new();
-            group_residues(&chunks, &wide, 0, count, &mut res);
-            self.entry = Some(CacheEntry {
+            let entry = Arc::new(CacheEntry {
                 fingerprint: fp,
                 bits: plan.bits,
                 lo,
                 spread,
                 len: x.len(),
                 count,
-                res: res.iter().map(|&v| v as f32).collect(),
+                res: CachedResidues::from_chunks(&chunks, &wide),
             });
+            *self.entry.lock().unwrap() = Some(entry.clone());
+            Operand::Cached(entry)
         }
-        Operand::Cached(self.entry.as_ref().unwrap())
     }
 }
 
@@ -652,7 +818,13 @@ impl CrtAccumulator {
         let crt = cached(&CRT, (plan.bits, plan.count()), || crt(plan));
         let n = selected.len();
         let y = take_buffer(n * crt.chunks);
-        Self { crt, selected, y, frac: take_buffer(n), r: take_buffer(0) }
+        Self {
+            crt,
+            selected,
+            y,
+            frac: take_buffer(n),
+            r: take_buffer(0),
+        }
     }
 
     /// Fold primes `q0..q1`, whose reduced residues are `prod[(q-q0)·outputs + o]`.
@@ -671,7 +843,19 @@ impl CrtAccumulator {
                 *f += v * pinv;
             }
         }
-        int_gemm_acc(b'N', b'N', n, self.crt.chunks, g, &self.r, n, &self.crt.table[q0..], rows, &mut self.y, n);
+        int_gemm_acc(
+            b'N',
+            b'N',
+            n,
+            self.crt.chunks,
+            g,
+            &self.r,
+            n,
+            &self.crt.table[q0..],
+            rows,
+            &mut self.y,
+            n,
+        );
     }
 
     /// Fold another range's accumulator in. Digit sums are exact integers
@@ -688,7 +872,13 @@ impl CrtAccumulator {
 
     /// Subtract `round(frac)·M`, then pack and round each output once;
     /// outputs are independent, so a split call shares them over its ways.
-    fn finish<const N: usize>(mut self, plan: &Plan, scale: i64, out: &mut [F<N>], split: &Split<'_>) -> bool {
+    fn finish<const N: usize>(
+        mut self,
+        plan: &Plan,
+        scale: i64,
+        out: &mut [F<N>],
+        split: &Split<'_>,
+    ) -> bool {
         let (n, rows, kp) = (self.selected.len(), plan.count() + 1, plan.count());
         let ways = split_ways(split).min(n.div_ceil(64)).max(1);
         let failed = std::sync::atomic::AtomicBool::new(false);
@@ -756,7 +946,14 @@ impl Default for Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        for v in [&mut self.a, &mut self.b, &mut self.c, &mut self.prod, &mut self.t, &mut self.u] {
+        for v in [
+            &mut self.a,
+            &mut self.b,
+            &mut self.c,
+            &mut self.prod,
+            &mut self.t,
+            &mut self.u,
+        ] {
             release_buffer(std::mem::take(v));
         }
     }
@@ -798,7 +995,9 @@ fn stream_primes(
     group: impl Fn(&mut CrtAccumulator, usize, usize, &mut Scratch) + Sync + Send,
 ) -> CrtAccumulator {
     let kp = plan.count();
-    let ways = split_ways(split).min(kp.div_ceil(MIN_PRIMES_PER_WAY)).max(1);
+    let ways = split_ways(split)
+        .min(kp.div_ceil(MIN_PRIMES_PER_WAY))
+        .max(1);
     let run = |w: usize| {
         let (lo, hi) = (w * kp / ways, (w + 1) * kp / ways);
         let mut acc = CrtAccumulator::new(plan, selected.to_vec());
@@ -853,17 +1052,19 @@ struct Crt {
     chunks: usize,
 }
 
+impl CacheBytes for Crt {
+    fn cache_bytes(&self) -> usize {
+        (self.u.capacity() + self.table.capacity()) * 8
+    }
+}
+
 fn crt(plan: &Plan) -> Crt {
     let kp = plan.count();
     let mut modulus = vec![1u64];
     for &p in &plan.primes {
         mul_word(&mut modulus, p);
     }
-    let cofactors: Vec<Vec<u64>> = plan
-        .primes
-        .iter()
-        .map(|&p| div_word(&modulus, p))
-        .collect();
+    let cofactors: Vec<Vec<u64>> = plan.primes.iter().map(|&p| div_word(&modulus, p)).collect();
     let u = plan
         .primes
         .iter()
@@ -871,7 +1072,8 @@ fn crt(plan: &Plan) -> Crt {
         .map(|(&p, cof)| symmetric(inverse(rem_word(cof, p), p), p))
         .collect();
     // (K+1)·2^(bits-1)·2^width < 2^53.
-    let width = (EXACT_BITS - 0.5 - (plan.bits - 1) as f64 - ((kp + 1) as f64).log2()).floor() as u32;
+    let width =
+        (EXACT_BITS - 0.5 - (plan.bits - 1) as f64 - ((kp + 1) as f64).log2()).floor() as u32;
     let total_bits = modulus.len() * 64;
     let chunks = total_bits.div_ceil(width as usize) + 1;
     let rows = kp + 1;
@@ -925,7 +1127,12 @@ fn rem_word(x: &[u64], d: u64) -> u64 {
 /// Pack signed base-`2^width` digit sums into a sign and magnitude limbs.
 /// Returns `None` if the value does not fit the digit range (never for a
 /// correctly sized plan).
-fn pack(digits: impl Iterator<Item = f64>, width: u32, chunks: usize, mag: &mut Vec<u64>) -> Option<bool> {
+fn pack(
+    digits: impl Iterator<Item = f64>,
+    width: u32,
+    chunks: usize,
+    mag: &mut Vec<u64>,
+) -> Option<bool> {
     let nbits = width as usize * chunks;
     mag.clear();
     mag.resize(nbits.div_ceil(64) + 1, 0);
@@ -1011,7 +1218,15 @@ pub(super) fn gemm<const N: usize>(
         cols: if tb_n { n } else { k },
         ld: ldb,
     };
-    let (Some((lo_a, hi_a)), Some((lo_b, hi_b))) = (av.exponent_range(), bv.exponent_range()) else {
+    let same_operand =
+        a.as_ptr() == b.as_ptr() && av.rows == bv.rows && av.cols == bv.cols && av.ld == bv.ld;
+    let range_a = av.exponent_range();
+    let range_b = if same_operand {
+        range_a
+    } else {
+        bv.exponent_range()
+    };
+    let (Some((lo_a, hi_a)), Some((lo_b, hi_b))) = (range_a, range_b) else {
         return false;
     };
     if lo_a == i64::MAX || lo_b == i64::MAX {
@@ -1036,31 +1251,50 @@ pub(super) fn gemm<const N: usize>(
     };
     let (len_a, len_b) = (av.len(), bv.len());
     let outputs = m * n;
-    let shape = GemmShape { ta, tb, m, n, k, lda, ldb };
+    let shape = GemmShape {
+        ta,
+        tb,
+        m,
+        n,
+        k,
+        lda,
+        ldb,
+    };
     let split = split_plan(pool);
     let ca = chunk_matrix(av, lo_a, da, &plan, &split);
-    let cb = match cache_b {
+    let cb = (!same_operand).then(|| match cache_b {
         Some(cache) => cache.operand(bv, lo_b, db, &plan, &split),
         None => Operand::Chunks(chunk_matrix(bv, lo_b, db, &plan, &split)),
-    };
-    let acc = stream_primes(&plan, &split, &selection(m, n, upper_only), |acc, q0, q1, s| {
-        group_residues(&ca, &plan, q0, q1, &mut s.a);
-        cb.residues(&plan, q0, q1, &mut s.b);
-        s.prod.clear();
-        s.prod.resize((q1 - q0) * outputs, 0.0);
-        for q in q0..q1 {
-            let qi = q - q0;
-            shape.prime_product(
-                &plan,
-                q,
-                &s.a[qi * len_a..(qi + 1) * len_a],
-                &s.b[qi * len_b..(qi + 1) * len_b],
-                &mut s.prod[qi * outputs..(qi + 1) * outputs],
-                &mut s.t,
-            );
-        }
-        acc.add(&plan, q0, q1, &s.prod, outputs);
     });
+    let acc = stream_primes(
+        &plan,
+        &split,
+        &selection(m, n, upper_only),
+        |acc, q0, q1, s| {
+            group_residues(&ca, &plan, q0, q1, &mut s.a);
+            if let Some(cb) = &cb {
+                cb.residues(&plan, q0, q1, &mut s.b);
+            }
+            s.prod.clear();
+            s.prod.resize((q1 - q0) * outputs, 0.0);
+            for q in q0..q1 {
+                let qi = q - q0;
+                shape.prime_product(
+                    &plan,
+                    q,
+                    &s.a[qi * len_a..(qi + 1) * len_a],
+                    if same_operand {
+                        &s.a[qi * len_a..(qi + 1) * len_a]
+                    } else {
+                        &s.b[qi * len_b..(qi + 1) * len_b]
+                    },
+                    &mut s.prod[qi * outputs..(qi + 1) * outputs],
+                    &mut s.t,
+                );
+            }
+            acc.add(&plan, q0, q1, &s.prod, outputs);
+        },
+    );
     acc.finish(&plan, lo_a + lo_b, out, &split)
 }
 
@@ -1079,8 +1313,19 @@ struct GemmShape {
 impl GemmShape {
     /// Exact residue product for prime `q` into `cq` (`m × n`), reduced; the
     /// inner dimension is chunked so every binary64 sum stays below 2^53.
-    fn prime_product(&self, plan: &Plan, q: usize, aq: &[f64], bq: &[f64], cq: &mut [f64], part: &mut Vec<f64>) {
-        let (ta_n, tb_n) = (self.ta.to_ascii_uppercase() == b'N', self.tb.to_ascii_uppercase() == b'N');
+    fn prime_product(
+        &self,
+        plan: &Plan,
+        q: usize,
+        aq: &[f64],
+        bq: &[f64],
+        cq: &mut [f64],
+        part: &mut Vec<f64>,
+    ) {
+        let (ta_n, tb_n) = (
+            self.ta.to_ascii_uppercase() == b'N',
+            self.tb.to_ascii_uppercase() == b'N',
+        );
         let (m, n, k, outputs) = (self.m, self.n, self.k, self.m * self.n);
         let mut k0 = 0;
         while k0 < k {
@@ -1088,16 +1333,44 @@ impl GemmShape {
             let a_off = if ta_n { k0 * self.lda } else { k0 };
             let b_off = if tb_n { k0 } else { k0 * self.ldb };
             if k0 == 0 {
-                int_gemm(self.ta, self.tb, m, n, kc, &aq[a_off..], self.lda, &bq[b_off..], self.ldb, cq, m);
+                int_gemm(
+                    self.ta,
+                    self.tb,
+                    m,
+                    n,
+                    kc,
+                    &aq[a_off..],
+                    self.lda,
+                    &bq[b_off..],
+                    self.ldb,
+                    cq,
+                    m,
+                );
                 for x in cq.iter_mut() {
                     *x = reduce(*x, plan.p[q], plan.pinv[q]);
                 }
             } else {
                 part.clear();
                 part.resize(outputs, 0.0);
-                int_gemm(self.ta, self.tb, m, n, kc, &aq[a_off..], self.lda, &bq[b_off..], self.ldb, part, m);
+                int_gemm(
+                    self.ta,
+                    self.tb,
+                    m,
+                    n,
+                    kc,
+                    &aq[a_off..],
+                    self.lda,
+                    &bq[b_off..],
+                    self.ldb,
+                    part,
+                    m,
+                );
                 for (x, y) in cq.iter_mut().zip(part.iter()) {
-                    *x = reduce(*x + reduce(*y, plan.p[q], plan.pinv[q]), plan.p[q], plan.pinv[q]);
+                    *x = reduce(
+                        *x + reduce(*y, plan.p[q], plan.pinv[q]),
+                        plan.p[q],
+                        plan.pinv[q],
+                    );
                 }
             }
             k0 += kc;
@@ -1136,7 +1409,8 @@ pub(super) fn congruence<const N: usize>(
         cols: k,
         ld: ldx,
     };
-    let (Some((lo_a, hi_a)), Some((lo_x, hi_x))) = (av.exponent_range(), xv.exponent_range()) else {
+    let (Some((lo_a, hi_a)), Some((lo_x, hi_x))) = (av.exponent_range(), xv.exponent_range())
+    else {
         return false;
     };
     if lo_a == i64::MAX || lo_x == i64::MAX {
@@ -1184,23 +1458,28 @@ pub(super) fn congruence<const N: usize>(
         None => Operand::Chunks(chunk_matrix(av, lo_a, da, &plan, &split)),
     };
     let cx = chunk_matrix(xv, lo_x, dx, &plan, &split);
-    let acc = stream_primes(&plan, &split, &selection(m, m, upper_only), |acc, q0, q1, s| {
-        ca.residues(&plan, q0, q1, &mut s.a);
-        group_residues(&cx, &plan, q0, q1, &mut s.b);
-        s.prod.clear();
-        s.prod.resize((q1 - q0) * outputs, 0.0);
-        for q in q0..q1 {
-            let qi = q - q0;
-            prime(
-                q,
-                &s.a[qi * len_a..(qi + 1) * len_a],
-                &s.b[qi * len_x..(qi + 1) * len_x],
-                &mut s.prod[qi * outputs..(qi + 1) * outputs],
-                &mut s.t,
-            );
-        }
-        acc.add(&plan, q0, q1, &s.prod, outputs);
-    });
+    let acc = stream_primes(
+        &plan,
+        &split,
+        &selection(m, m, upper_only),
+        |acc, q0, q1, s| {
+            ca.residues(&plan, q0, q1, &mut s.a);
+            group_residues(&cx, &plan, q0, q1, &mut s.b);
+            s.prod.clear();
+            s.prod.resize((q1 - q0) * outputs, 0.0);
+            for q in q0..q1 {
+                let qi = q - q0;
+                prime(
+                    q,
+                    &s.a[qi * len_a..(qi + 1) * len_a],
+                    &s.b[qi * len_x..(qi + 1) * len_x],
+                    &mut s.prod[qi * outputs..(qi + 1) * outputs],
+                    &mut s.t,
+                );
+            }
+            acc.add(&plan, q0, q1, &s.prod, outputs);
+        },
+    );
     acc.finish(&plan, 2 * lo_a + lo_x, out, &split)
 }
 
@@ -1222,12 +1501,29 @@ pub(super) fn svec_quadratic<const N: usize>(
     cache_q: Option<&mut ResidueCache>,
 ) -> bool {
     let trih = h * (h + 1) / 2;
-    let qv = View { data: q, rows: h, cols: kmax, ld: h };
-    let xv = View { data: x, rows: trih, cols: 1, ld: trih };
-    let sv = View { data: std::slice::from_ref(&sqrt2), rows: 1, cols: 1, ld: 1 };
-    let (Some((lo_q, hi_q)), Some((lo_x, hi_x)), Some((sigma, _))) =
-        (qv.exponent_range(), xv.exponent_range(), sv.exponent_range())
-    else {
+    let qv = View {
+        data: q,
+        rows: h,
+        cols: kmax,
+        ld: h,
+    };
+    let xv = View {
+        data: x,
+        rows: trih,
+        cols: 1,
+        ld: trih,
+    };
+    let sv = View {
+        data: std::slice::from_ref(&sqrt2),
+        rows: 1,
+        cols: 1,
+        ld: 1,
+    };
+    let (Some((lo_q, hi_q)), Some((lo_x, hi_x)), Some((sigma, _))) = (
+        qv.exponent_range(),
+        xv.exponent_range(),
+        sv.exponent_range(),
+    ) else {
         return false;
     };
     if lo_q == i64::MAX || lo_x == i64::MAX {
@@ -1250,7 +1546,13 @@ pub(super) fn svec_quadratic<const N: usize>(
         return false;
     }
     let (len_q, len_x) = (qv.len(), xv.len());
-    let prime = |qi: usize, qq: &[f64], xq: &[f64], s: f64, vq: &mut [f64], m: &mut Vec<f64>, t: &mut Vec<f64>| {
+    let prime = |qi: usize,
+                 qq: &[f64],
+                 xq: &[f64],
+                 s: f64,
+                 vq: &mut [f64],
+                 m: &mut Vec<f64>,
+                 t: &mut Vec<f64>| {
         let (p, pinv, pu) = (plan.p[qi], plan.pinv[qi], plan.primes[qi]);
         let diag = symmetric(pow2_mod(-sigma as u64, pu), pu);
         m.clear();
@@ -1278,7 +1580,10 @@ pub(super) fn svec_quadratic<const N: usize>(
         Some(cache) => cache.operand(qv, lo_q, dq, &plan, &split),
         None => Operand::Chunks(chunk_matrix(qv, lo_q, dq, &plan, &split)),
     };
-    let (cx, cs) = (chunk_matrix(xv, lo_x, dx, &plan, &split), chunk_matrix(sv, sigma, 0, &plan, &split));
+    let (cx, cs) = (
+        chunk_matrix(xv, lo_x, dx, &plan, &split),
+        chunk_matrix(sv, sigma, 0, &plan, &split),
+    );
     let selected: Vec<usize> = (0..kmax).collect();
     let acc = stream_primes(&plan, &split, &selected, |acc, q0, q1, s| {
         cq.residues(&plan, q0, q1, &mut s.a);
@@ -1301,6 +1606,107 @@ pub(super) fn svec_quadratic<const N: usize>(
         acc.add(&plan, q0, q1, &s.prod, kmax);
     });
     acc.finish(&plan, scale, out, &split)
+}
+
+/// Selected exact q_aᵀ X q_b forms. X is symmetric and packed without svec
+/// factors; Q is column-major. Only requested forms are reconstructed in MPFR.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn symmetric_bilinear<const N: usize>(
+    h: usize,
+    columns: usize,
+    q: &[F<N>],
+    x: &[F<N>],
+    pairs: &[(usize, usize)],
+    out: &mut [F<N>],
+    cache_q: &mut ResidueCache,
+) -> bool {
+    let Some(qlen) = h.checked_mul(columns) else {
+        return false;
+    };
+    let Some(trih) = h
+        .checked_add(1)
+        .and_then(|v| h.checked_mul(v))
+        .map(|v| v / 2)
+    else {
+        return false;
+    };
+    if h == 0
+        || q.len() < qlen
+        || x.len() < trih
+        || out.len() < pairs.len()
+        || pairs.iter().any(|&(a, b)| a >= columns || b >= columns)
+    {
+        return false;
+    }
+    let qv = View {
+        data: q,
+        rows: h,
+        cols: columns,
+        ld: h,
+    };
+    let xv = View {
+        data: x,
+        rows: trih,
+        cols: 1,
+        ld: trih,
+    };
+    let (Some((lo_q, hi_q)), Some((lo_x, hi_x))) = (qv.exponent_range(), xv.exponent_range())
+    else {
+        return false;
+    };
+    if lo_q == i64::MAX || lo_x == i64::MAX {
+        out[..pairs.len()].iter_mut().for_each(|v| *v = F::zero());
+        return true;
+    }
+    let (dq, dx) = (hi_q - lo_q, hi_x - lo_x);
+    if dq > MAX_SPREAD || dx > MAX_SPREAD {
+        return false;
+    }
+    // Each output has at most h² signed products of three integer mantissas.
+    let bits = F::<N>::PRECISION_BITS as i64;
+    let needed = (3 * bits + 2 * dq + dx) as f64 + 2.0 * (h.max(1) as f64).log2() + 3.0;
+    let Some(plan) = Plan::new(h, needed) else {
+        return false;
+    };
+    if plan.k_chunk < h {
+        return false;
+    }
+    let split = split_plan(None);
+    let cq = cache_q.operand(qv, lo_q, dq, &plan, &split);
+    let cx = chunk_matrix(xv, lo_x, dx, &plan, &split);
+    let (len_q, len_x, count) = (qv.len(), xv.len(), pairs.len());
+    let selected: Vec<usize> = (0..count).collect();
+    let acc = stream_primes(&plan, &split, &selected, |acc, q0, q1, s| {
+        cq.residues(&plan, q0, q1, &mut s.a);
+        group_residues(&cx, &plan, q0, q1, &mut s.b);
+        s.prod.clear();
+        s.prod.resize((q1 - q0) * count, 0.0);
+        s.t.resize(h * h, 0.0);
+        s.u.resize(h * columns, 0.0);
+        for qi in q0..q1 {
+            let g = qi - q0;
+            let (p, pinv) = (plan.p[qi], plan.pinv[qi]);
+            let qq = &s.a[g * len_q..(g + 1) * len_q];
+            let xx = &s.b[g * len_x..(g + 1) * len_x];
+            for j in 0..h {
+                for i in 0..=j {
+                    let value = xx[j * (j + 1) / 2 + i];
+                    s.t[i + j * h] = value;
+                    s.t[j + i * h] = value;
+                }
+            }
+            int_gemm(b'N', b'N', h, columns, h, &s.t, h, qq, h, &mut s.u, h);
+            for (k, &(a, b)) in pairs.iter().enumerate() {
+                let mut value = 0.0;
+                for i in 0..h {
+                    value += qq[i + a * h] * reduce(s.u[i + b * h], p, pinv);
+                }
+                s.prod[g * count + k] = reduce(value, p, pinv);
+            }
+        }
+        acc.add(&plan, q0, q1, &s.prod, count);
+    });
+    acc.finish(&plan, lo_x + 2 * lo_q, out, &split)
 }
 
 fn pow2_mod(e: u64, p: u64) -> u64 {
