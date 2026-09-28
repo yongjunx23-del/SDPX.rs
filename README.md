@@ -1,7 +1,7 @@
 <h1 align="center">SDPX</h1>
 
 <p align="center">
-  <b>Arbitrary-precision interior-point conic optimization in Rust,<br>built for the conformal bootstrap.</b>
+  <b>Arbitrary-precision interior-point conic optimization in Rust,<br>built for the  bootstrap.</b>
 </p>
 
 <p align="center">
