@@ -1,16 +1,17 @@
 ---
 name: sdpx-development
-description: Build, run and check the SDPX Rust solver (CLI, C ABI, Float64/MPFR paths) with the pinned end-to-end harness.
+description: Build and verify the SDPX Rust solver, CLI and C ABI with pinned Float64/MPFR solves.
 ---
 
 # SDPX development
 
-Rules, contracts and the per-change check table are in
-[AGENTS.md](../../../AGENTS.md). This skill covers only environment details.
+Follow [AGENTS.md](../../../AGENTS.md) for rules and checks, and
+[REVIEW_AND_PLAN.md](../../../REVIEW_AND_PLAN.md) for current priorities.
 
-## Toolchain
+## Build
 
-`benchmark/e2e/e2e.py build` sets these automatically when `CARGO_HOME` is unset:
+`benchmark/e2e/e2e.py build --arm NAME` configures the local toolchain when
+`CARGO_HOME` is unset. For direct Cargo commands:
 
 ```sh
 export CARGO_HOME=/Users/xuyongjun/.local/share/sdpx-toolchain/cargo
@@ -18,28 +19,25 @@ export RUSTUP_HOME=/Users/xuyongjun/.local/share/sdpx-toolchain/rustup
 export PATH="$CARGO_HOME/bin:$PATH"
 ```
 
-Builds are `--locked --offline`. Features are `sdp-accelerate,faer-sparse` on
-macOS and `sdp-openblas,faer-sparse` on Linux. `fast` (no LTO, parallel
-codegen, incremental) is for development; `release` is for quoted timings.
-`target/fast/sdpx` is overwritten by every build, so always compare frozen arms
-(`e2e.py build --arm NAME`).
+Build offline with the lockfile. Use `sdp-accelerate,faer-sparse` on macOS or
+`sdp-openblas,faer-sparse` on Linux. Use `fast` for development and
+`--profile release` for reported timings. Compare frozen arms: builds overwrite
+`target/PROFILE/sdpx`.
 
-## Harness state
+## Evidence
 
-`$SDPX_E2E_HOME` (default `~/.cache/sdpx-e2e`) contains `arms/` (frozen
-binaries with commit and dirty-patch identity), `data/` (unpacked inputs,
-hash-checked), `runs/` (result, stderr, settings and audit per solve) and
-`journal.jsonl`. The Ising audit uses the committed Julia project
-`benchmark/e2e/audit-env` (JSON, GenericLinearAlgebra, SHA); set
-`SDPX_E2E_JULIA` to choose the Julia binary.
+`$SDPX_E2E_HOME` (default `~/.cache/sdpx-e2e`) stores frozen `arms/`, verified
+`data/`, audited `runs/` and `journal.jsonl`. Preserve input/settings hashes,
+binary identity and source changes. Frozen arms include tracked patches, a
+build-input manifest and copies of untracked source files.
 
-## Beyond the pinned cases
+- Pinned cases: `medium`, `ising11` and `csdr3`; commands are in AGENTS.md.
+- Ising audit: `benchmark/e2e/audit-env`; set `SDPX_E2E_JULIA` to select Julia.
+- Other Float64 inputs: CLI solve, then `benchmark/research/native.py` audit.
+- `csdr3` pins the reconstructed CSDR input and audit. It is not the missing
+  historical Julia input. Check one/four-thread parity for SOC changes.
+- External comparisons: `benchmark/{research,ising}/README.md`.
+- Cluster work: use `ucas-hpc` within the user's authorized scope.
 
-- Other Float64 inputs: `sdpx INPUT.json --settings S.json --output R.json`, then
-  audit with `benchmark/research/native.py` (`native.audit`).
-- MOSEK/Clarabel comparisons, the 9-case development set and holdout:
-  `benchmark/research/README.md`.
-- Ising scaling and SDPB comparisons: `benchmark/ising/README.md`; cluster work
-  uses the `ucas-hpc` skill.
-- If testing sibling BFLA/MFLA providers, use separate processes and
-  environments with `--gcthreads=1`.
+Julia is for input generation and audits. For BFLA/MFLA provider experiments,
+use separate processes/environments and `--gcthreads=1`. Use fresh output paths.

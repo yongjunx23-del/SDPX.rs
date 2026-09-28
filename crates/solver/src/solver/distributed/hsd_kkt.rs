@@ -606,7 +606,7 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
             scale = scale
                 .max(d.b.norm_inf())
                 .max(d.q.norm_inf())
-                .max(d.A.nzval.norm_inf());
+                .max(d.constraint_norm_inf());
             nx = nx.max(v.x.norm_inf());
             nz = nz.max(v.z.norm_inf());
         }

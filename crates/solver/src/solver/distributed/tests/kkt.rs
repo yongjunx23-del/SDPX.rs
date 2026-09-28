@@ -14,6 +14,17 @@ fn close<T: FloatT>(a: T, b: T) {
         "{a} != {b}"
     );
 }
+fn materialize_for_new_kkt<T: FloatT>(state: &mut OwnedSolver<T>) {
+    // Production builds its KKT before compacting sampled storage. These
+    // checks construct additional kernels with different pools/settings, so
+    // restore the full construction input from the authoritative operator.
+    for data in &mut state.data.blocks {
+        if data.sampled.is_some() {
+            data.A = data.materialize_A().unwrap();
+            data.sampled_matrix_stats = None;
+        }
+    }
+}
 fn split<T: FloatT>(state: &OwnedSolver<T>, flat: &[T]) -> OwnedVariables<T> {
     let mut result = state.variables.new_like();
     for (rhs, ids) in result.blocks.iter_mut().zip(&state.data.layout.owners) {
@@ -48,6 +59,7 @@ fn check_pair_pool_widths<T: FloatT>(make: impl Fn() -> DefaultProblemData<T>) {
             },
             (data.n, data.m),
         );
+        materialize_for_new_kkt(&mut state);
         let mut mono = CondensedKKTSolver::new(&data.P, &data.A, &data.cones, &cones, &settings);
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
@@ -271,6 +283,7 @@ fn check<T: FloatT>(make: impl Fn() -> DefaultProblemData<T>) {
             },
             (data.n, data.m),
         );
+        materialize_for_new_kkt(&mut state);
         let mut mono = CondensedKKTSolver::new(&data.P, &data.A, &data.cones, &cones, &settings);
         if let Some(sampled) = &data.sampled {
             mono.set_sampled_operator(Arc::clone(sampled));
@@ -483,6 +496,7 @@ fn sampled_pair_cache_case<T: FloatT>() {
             },
             (data.n, data.m),
         );
+        materialize_for_new_kkt(&mut state);
         let mut mono = CondensedKKTSolver::new(&data.P, &data.A, &data.cones, &cones, &settings);
         if let Some(sampled) = &data.sampled {
             mono.set_sampled_operator(Arc::clone(sampled));
@@ -659,7 +673,7 @@ fn owned_ising_linear_direction() {
     let make = || {
         let mut problem = read_sdpb_sampled::<T>(&input).unwrap().problem;
         problem.settings = settings.clone();
-        problem.into_solver().unwrap()
+        problem.into_prepared().unwrap()
     };
     let mut full = make();
     assert!(full.data.presolver.is_none() && full.data.chordal_info.is_none());
@@ -708,6 +722,7 @@ fn owned_ising_linear_direction() {
     assert!(reference_residual <= gate);
     for count in [1, 2, 4, 8] {
         let mut state = runtime(make().data, count, settings.clone(), (d.n, d.m));
+        materialize_for_new_kkt(&mut state);
         scatter(&mut state.variables, &point);
         assert!(state
             .variables

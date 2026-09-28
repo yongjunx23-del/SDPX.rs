@@ -253,6 +253,7 @@ impl<T: FloatT> OwnedState<T> {
                 P: p,
                 q,
                 A: a,
+                sampled_matrix_stats: None,
                 b,
                 cones,
                 n: ids.columns.len(),

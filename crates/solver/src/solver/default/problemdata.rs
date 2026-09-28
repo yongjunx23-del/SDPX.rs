@@ -22,8 +22,11 @@ pub struct DefaultProblemData<T> {
     pub P: CscMatrix<T>,
     /// The vector q in the quadratic objective term
     pub q: Vec<T>,
-    /// The matrix A in the constraints
+    /// The explicit matrix A in the constraints. For sampled solvers this
+    /// holds only the linear component after KKT construction; use
+    /// [`Self::materialize_A`] to obtain all coefficients.
     pub A: CscMatrix<T>,
+    pub(crate) sampled_matrix_stats: Option<(T, usize)>,
     #[cfg(feature = "sdp")]
     pub(crate) sampled: Option<std::sync::Arc<SampledOperator<T>>>,
     #[cfg(feature = "sdp")]
@@ -182,6 +185,7 @@ where
             P: P_new,
             q: q_new,
             A: A_new,
+            sampled_matrix_stats: None,
             #[cfg(feature = "sdp")]
             sampled: None,
             #[cfg(feature = "sdp")]
@@ -198,6 +202,35 @@ where
             presolver,
             #[cfg(feature = "sdp")]
             chordal_info,
+        }
+    }
+
+    /// Materialize the equilibrated constraint matrix, including sampled rows.
+    /// This may allocate a large matrix; solver products use the factors directly.
+    #[allow(non_snake_case)]
+    pub fn materialize_A(&self) -> Result<CscMatrix<T>, String> {
+        #[cfg(feature = "sdp")]
+        if let Some(operator) = &self.sampled {
+            return operator.materialize_checked();
+        }
+        Ok(self.A.clone())
+    }
+
+    pub(crate) fn constraint_norm_inf(&self) -> T {
+        self.sampled_matrix_stats
+            .map_or_else(|| self.A.nzval.norm_inf(), |s| s.0)
+    }
+
+    pub(crate) fn constraint_nnz(&self) -> usize {
+        self.sampled_matrix_stats
+            .map_or_else(|| self.A.nnz(), |s| s.1)
+    }
+
+    #[cfg(feature = "sdp")]
+    pub(crate) fn compact_sampled_matrix(&mut self) {
+        if let Some(operator) = &self.sampled {
+            self.sampled_matrix_stats = Some((self.A.nzval.norm_inf(), self.A.nnz()));
+            self.A = operator.linear().clone();
         }
     }
 

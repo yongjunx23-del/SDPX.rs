@@ -29,6 +29,7 @@ fn ffi_preserves_core_ktratio_defaults() {
     check::<MpFloat<8>>(512);
     check::<MpFloat<12>>(768);
     check::<MpFloat<16>>(1024);
+    check::<MpFloat<19>>(1216);
     check::<MpFloat<32>>(2048);
 }
 fn lp() -> *mut Handle {
@@ -125,7 +126,7 @@ fn sampled_descriptor_validation() {
 #[test]
 fn sampled_public_abi_scalar_psd() {
     unsafe {
-        for bits in [53, 512] {
+        for bits in [53, 512, 1216] {
             let mut settings = defaults();
             settings.precision_bits = bits;
             let p = Csc {
@@ -272,6 +273,7 @@ fn preprocessing_flags_map_all_modes() {
     preprocessing_mapping::<MpFloat<8>>(512);
     preprocessing_mapping::<MpFloat<12>>(768);
     preprocessing_mapping::<MpFloat<16>>(1024);
+    preprocessing_mapping::<MpFloat<19>>(1216);
     preprocessing_mapping::<MpFloat<32>>(2048);
 }
 

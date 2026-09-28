@@ -19,6 +19,8 @@ use crate::solver::kkt::{HasLinearSolverInfo, LinearSolverInfo};
 use rayon::prelude::*;
 use std::sync::Arc;
 
+mod local_soc;
+
 /// Hard cap on the dense working set of the arrow representation.  Larger
 /// systems keep using QDLDL rather than densifying without bound.
 const ARROW_MAX_BYTES: u128 = 512 * 1024 * 1024;
@@ -69,10 +71,21 @@ impl<T: FloatT> DenseLeaf<T> {
         regularize_count: &mut usize,
         split: bool,
     ) -> Result<(), &'static str> {
+        self.factor_signed(a, &[sign], reg, regularize_count, split)
+    }
+
+    fn factor_signed(
+        &mut self,
+        a: &[T],
+        signs: &[i8],
+        reg: Option<(T, T)>,
+        regularize_count: &mut usize,
+        split: bool,
+    ) -> Result<(), &'static str> {
         self.l.copy_from_slice(a);
         let n = self.n;
-        let s = T::from_i8(sign).unwrap();
         for k in 0..n {
+            let s = T::from_i8(signs[if signs.len() == 1 { 0 } else { k }]).unwrap();
             let mut d = self.l[k + k * n];
             if !d.is_finite() {
                 return Err("nonfinite_pivot");
@@ -118,9 +131,15 @@ impl<T: FloatT> DenseLeaf<T> {
     }
 
     fn forward(&self, x: &mut [T]) {
-        for i in 0..self.n {
+        self.forward_suffix(x, 0);
+    }
+
+    // Omitted leading RHS coordinates are structurally zero. Forward solve
+    // leaves them zero, so compact coupling panels need only the suffix.
+    fn forward_suffix(&self, x: &mut [T], start: usize) {
+        for i in 0..x.len() {
             for k in 0..i {
-                x[i] = (-self.l[i + k * self.n]).mul_add(x[k], x[i]);
+                x[i] = (-self.l[i + start + (k + start) * self.n]).mul_add(x[k], x[i]);
             }
         }
     }
@@ -200,6 +219,10 @@ impl<T: FloatT> DenseLeaf<T> {
 
 struct Leaf<T> {
     ids: Vec<usize>,
+    signs: Vec<i8>,
+    // SOC dual coordinates precede the two local primal coordinates. Their
+    // coupling to the equality border is structurally zero after forward solve.
+    coupling_start: usize,
     h: Vec<T>,
     b: Vec<T>,
     factor: DenseLeaf<T>,
@@ -217,6 +240,8 @@ impl<T: FloatT> Leaf<T> {
         let g = ids.len();
         Self {
             ids,
+            signs: vec![1],
+            coupling_start: 0,
             h: vec![T::zero(); g * g],
             b: vec![T::zero(); g * t],
             factor: DenseLeaf::new(g),
@@ -228,6 +253,10 @@ impl<T: FloatT> Leaf<T> {
             batch_w: Vec::new(),
             batch_v: Vec::new(),
         }
+    }
+
+    fn coupling_index(&self, row: usize, col: usize) -> usize {
+        row - self.coupling_start + col * (self.ids.len() - self.coupling_start)
     }
 
     /// H = LDLᵀ, Y = L⁻¹B, contribution = YᵀD⁻¹Y accumulated into S = C - ΣYᵀZ.
@@ -244,22 +273,28 @@ impl<T: FloatT> Leaf<T> {
     ) -> Result<(), &'static str> {
         let g = self.ids.len();
         self.factor
-            .factor(&self.h, 1, reg, regularize_count, split_factor)?;
+            .factor_signed(&self.h, &self.signs, reg, regularize_count, split_factor)?;
+        let start = self.coupling_start;
+        let width = g - start;
         self.y.copy_from_slice(&self.b);
-        if split && g > 0 {
+        if split && width > 0 {
             let factor = &self.factor;
             self.y
-                .par_chunks_mut(g)
-                .for_each(|column| factor.forward(column));
+                .par_chunks_mut(width)
+                .for_each(|column| factor.forward_suffix(column, start));
         } else {
             for j in 0..t {
-                self.factor.forward(&mut self.y[j * g..(j + 1) * g]);
+                self.factor
+                    .forward_suffix(&mut self.y[j * width..(j + 1) * width], start);
             }
         }
         for j in 0..t {
-            for i in 0..g {
-                self.z[i + j * g] = self.y[i + j * g] * self.factor.dinv[i];
+            for i in 0..width {
+                self.z[i + j * width] = self.y[i + j * width] * self.factor.dinv[i + start];
             }
+        }
+        if self.contribution.is_empty() {
+            return Ok(());
         }
         let (y, z) = (&self.y, &self.z);
         let entry = |i: usize, j: usize| T::dot_fma((0..g).map(|k| (&y[k + i * g], &z[k + j * g])));
@@ -311,9 +346,14 @@ impl<T: FloatT> Leaf<T> {
         let g = self.ids.len();
         for i in 0..g {
             for c in 0..cols {
-                let s = T::dot_fma(
-                    (0..xt.len() / cols).map(|j| (&self.y[i + j * g], &xt[j * cols + c])),
-                );
+                let s = if i < self.coupling_start {
+                    T::zero()
+                } else {
+                    T::dot_fma(
+                        (0..xt.len() / cols)
+                            .map(|j| (&self.y[self.coupling_index(i, j)], &xt[j * cols + c])),
+                    )
+                };
                 self.batch_w[i * cols + c] = (self.batch_w[i * cols + c] - s) * self.factor.dinv[i];
             }
         }
@@ -338,7 +378,11 @@ impl<T: FloatT> Leaf<T> {
     fn second_solve(&mut self, xt: &[T]) {
         let g = self.ids.len();
         for i in 0..g {
-            let s = T::dot_fma((0..xt.len()).map(|j| (&self.y[i + j * g], &xt[j])));
+            let s = if i < self.coupling_start {
+                T::zero()
+            } else {
+                T::dot_fma((0..xt.len()).map(|j| (&self.y[self.coupling_index(i, j)], &xt[j])))
+            };
             self.w[i] = (self.w[i] - s) * self.factor.dinv[i];
         }
         self.factor.backward(&mut self.w);
@@ -366,6 +410,7 @@ pub struct ArrowLDLSolver<T: FloatT> {
     regularize_count: usize,
     fallback: Option<BoxedDirectLDLSolver<T>>,
     use_arrow: bool,
+    local_soc: bool,
 }
 
 impl<T: FloatT> ArrowLDLSolver<T> {
@@ -470,6 +515,18 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         if cells * std::mem::size_of::<T>() as u128 > ARROW_MAX_BYTES {
             return None;
         }
+        Some(Self::from_groups(k, signs, settings, groups, trunk, false))
+    }
+
+    fn from_groups(
+        k: &CscMatrix<T>,
+        signs: &[i8],
+        settings: &CoreSettings<T>,
+        groups: Vec<Vec<usize>>,
+        trunk: Vec<usize>,
+        local_soc: bool,
+    ) -> Self {
+        let (n, t) = (k.n, trunk.len());
         let mut owner = vec![usize::MAX; n];
         let mut local = vec![0usize; n];
         for (gi, g) in groups.iter().enumerate() {
@@ -481,7 +538,21 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         for (i, &id) in trunk.iter().enumerate() {
             local[id] = i;
         }
-        let leaves = groups.into_iter().map(|g| Leaf::new(g, t)).collect();
+        let leaves = groups
+            .into_iter()
+            .map(|g| {
+                // Avoid a dense t-by-t contribution allocation for every SOC.
+                let mut leaf = Leaf::new(g, if local_soc { 0 } else { t });
+                if local_soc {
+                    leaf.signs = vec![-1, -1, -1, 1, 1];
+                    leaf.coupling_start = 3;
+                    leaf.b.resize(2 * t, T::zero());
+                    leaf.y.resize(2 * t, T::zero());
+                    leaf.z.resize(2 * t, T::zero());
+                }
+                leaf
+            })
+            .collect();
         let mut solver = Self {
             colptr: k.colptr.clone(),
             rowval: k.rowval.clone(),
@@ -501,9 +572,10 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             regularize_count: 0,
             fallback: None,
             use_arrow: false,
+            local_soc,
         };
         solver.update_entries(0..k.nzval.len(), |q, value| *value = k.nzval[q]);
-        Some(solver)
+        solver
     }
 
     /// Route sparse-position updates directly to the owned numeric blocks.
@@ -536,13 +608,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 }
                 (x, _) if x != usize::MAX => {
                     let leaf = &mut self.leaves[x];
-                    let g = leaf.ids.len();
-                    update(q, &mut leaf.b[li + lj * g]);
+                    let index = leaf.coupling_index(li, lj);
+                    update(q, &mut leaf.b[index]);
                 }
                 (_, y) => {
                     let leaf = &mut self.leaves[y];
-                    let g = leaf.ids.len();
-                    update(q, &mut leaf.b[lj + li * g]);
+                    let index = leaf.coupling_index(lj, li);
+                    update(q, &mut leaf.b[index]);
                 }
             }
         }
@@ -566,11 +638,11 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                     }
                     (x, _) if x != usize::MAX => {
                         let leaf = &self.leaves[x];
-                        leaf.b[li + lj * leaf.ids.len()]
+                        leaf.b[leaf.coupling_index(li, lj)]
                     }
                     (_, y) => {
                         let leaf = &self.leaves[y];
-                        leaf.b[lj + li * leaf.ids.len()]
+                        leaf.b[leaf.coupling_index(lj, li)]
                     }
                 });
             }
@@ -625,10 +697,14 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return false;
         }
         self.s.copy_from_slice(&self.c);
-        // Deterministic merge order regardless of leaf scheduling.
-        for leaf in &self.leaves {
-            for (s, a) in self.s.iter_mut().zip(&leaf.contribution) {
-                *s -= *a;
+        if self.local_soc {
+            self.assemble_local_schur();
+        } else {
+            // Deterministic merge order regardless of leaf scheduling.
+            for leaf in &self.leaves {
+                for (s, a) in self.s.iter_mut().zip(&leaf.contribution) {
+                    *s -= *a;
+                }
             }
         }
         let mut border_count = 0usize;
@@ -675,14 +751,22 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         crate::receipt::finish("arrow.leaf_forward", timer);
         let timer = crate::receipt::start();
-        // Trunk coupling: each entry subtracts the leaves' dots in leaf
-        // order, so splitting over entries keeps every value bitwise equal.
+        // Local SOC coupling uses one exact MPFR accumulation per output,
+        // avoiding thousands of rounded two-term dots. Each output retains
+        // the same leaf order at every thread count.
         let leaves = &self.leaves;
         let couple = |(j, v): (usize, &mut T)| {
             *v = b[self.trunk[j]];
-            for leaf in leaves {
-                let g = leaf.ids.len();
-                *v -= T::dot_fma((0..g).map(|i| (&leaf.y[i + j * g], &leaf.v[i])));
+            if self.local_soc {
+                *v -=
+                    T::dot_fma(leaves.iter().flat_map(|leaf| {
+                        (0..2).map(move |i| (&leaf.y[i + j * 2], &leaf.v[i + 3]))
+                    }));
+            } else {
+                for leaf in leaves {
+                    let g = leaf.ids.len();
+                    *v -= T::dot_fma((0..g).map(|i| (&leaf.y[i + j * g], &leaf.v[i])));
+                }
             }
         };
         match &self.pool {
@@ -730,7 +814,12 @@ impl<T: FloatT> HasLinearSolverInfo for ArrowLDLSolver<T> {
             }
         }
         LinearSolverInfo {
-            name: "arrow".to_string(),
+            name: if self.local_soc {
+                "local_soc_arrow"
+            } else {
+                "arrow"
+            }
+            .to_string(),
             threads: self.pool.as_ref().map_or(1, |p| p.current_num_threads()),
             direct: true,
             nnzA: self.rowval.len(),
@@ -797,8 +886,7 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
                 .iter_mut()
                 .for_each(|l| l.first_many(b, n, cols, 1));
         }
-        // Trunk coupling over entries (j, c): each subtracts the leaves' dots
-        // in leaf order, so splitting over trunk rows keeps values bitwise.
+        // Use the same coupling accumulation as the single-RHS solve.
         let tx = &mut self.batch_tx;
         let (leaves, trunk) = (&self.leaves, &self.trunk);
         let rhs: &[T] = b;
@@ -806,12 +894,20 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
             for (c, v) in row.iter_mut().enumerate() {
                 *v = rhs[c * n + trunk[j]];
             }
-            for leaf in leaves {
-                let g = leaf.ids.len();
+            if self.local_soc {
                 for (c, v) in row.iter_mut().enumerate() {
-                    *v -= T::dot_fma(
-                        (0..g).map(|i| (&leaf.y[i + j * g], &leaf.batch_v[i * cols + c])),
-                    );
+                    *v -= T::dot_fma(leaves.iter().flat_map(|leaf| {
+                        (0..2).map(move |i| (&leaf.y[i + j * 2], &leaf.batch_v[(i + 3) * cols + c]))
+                    }));
+                }
+            } else {
+                for leaf in leaves {
+                    let g = leaf.ids.len();
+                    for (c, v) in row.iter_mut().enumerate() {
+                        *v -= T::dot_fma(
+                            (0..g).map(|i| (&leaf.y[i + j * g], &leaf.batch_v[i * cols + c])),
+                        );
+                    }
                 }
             }
         };
@@ -1135,27 +1231,26 @@ mod tests {
         assert!(solver.refactor(&k2));
         assert!(solver.use_arrow);
         assert!(solver.regularize_count > 0);
-        // zero leaf pivot without dynamic regularization: refactor falls
-        // back to QDLDL, which applies its own internal regularization
+        // Both backends must reject a zero singleton pivot when dynamic
+        // regularization is disabled, then recover after restoring it.
         let (k3, s3) = arrow_kkt();
         let mut settings3 = CoreSettings::<f64>::default();
         settings3.dynamic_regularization_enable = false;
         let diag4 = k3.colptr[5] - 1; // (4,4)
         let mut solver = ArrowLDLSolver::try_new(&k3, &s3, &settings3).unwrap();
         solver.update_values(&[diag4], &[0.0]);
-        assert!(solver.refactor(&k3));
+        assert!(!solver.refactor(&k3));
         assert!(!solver.use_arrow);
+        assert!(solver.fallback.is_some());
+        solver.update_values(&[diag4], &[k3.nzval[diag4]]);
+        assert!(solver.refactor(&k3));
+        assert!(solver.use_arrow);
         let mut rhs = b.clone();
         let mut x = vec![0.0; k3.n];
         solver.solve(&k3, &mut x, &mut rhs);
-        // the fallback solved the perturbed system (K[4,4] = 0), so the
-        // reference must use the same values; QDLDL applies its own pivot
-        // floor to the singular leaf so a loose tolerance is expected
-        let mut k3p = k3.clone();
-        k3p.nzval[diag4] = 0.0;
-        let expect = reference_solve(&k3p, &b);
+        let expect = reference_solve(&k3, &b);
         for i in 0..k3.n {
-            assert!((x[i] - expect[i]).abs() < 1e-4, "{x:?} != {expect:?}");
+            assert!((x[i] - expect[i]).abs() < 1e-10, "{x:?} != {expect:?}");
         }
     }
 

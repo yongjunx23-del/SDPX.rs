@@ -1,5 +1,5 @@
 //! Rust-owned SDPX ABI. See include/sdpx.h for pointer and ownership contracts.
-use sdpx_arithmetic::MpFloat;
+use sdpx_arithmetic::{with_frontend_precisions, MpFloat, FRONTEND_PRECISION_HELP};
 use sdpx_solver::solver::traits::Settings as SolverSettings;
 use sdpx_solver::{
     algebra::{CscMatrix, FloatT},
@@ -551,25 +551,33 @@ impl<T: Scalar> Typed<T> {
         Ok(bytes)
     }
 }
-enum Engine {
-    F64(Typed<f64>),
-    B128(Typed<MpFloat<2>>),
-    B256(Typed<MpFloat<4>>),
-    B512(Typed<MpFloat<8>>),
-    B768(Typed<MpFloat<12>>),
-    B1024(Typed<MpFloat<16>>),
-    B2048(Typed<MpFloat<32>>),
+macro_rules! define_engine {
+    ([] $(($bits:literal, $variant:ident, $scalar:ty),)*) => {
+        enum Engine {
+            $($variant(Typed<$scalar>),)*
+        }
+    };
+}
+with_frontend_precisions!(define_engine);
+
+macro_rules! dispatch_engine {
+    ([($engine:expr, $s:ident, $body:expr)] $(($bits:literal, $variant:ident, $scalar:ty),)*) => {
+        match $engine {
+            $(Engine::$variant($s) => $body,)*
+        }
+    };
 }
 macro_rules! dispatch {
-    ($engine:expr,$s:ident,$body:expr) => {
-        match $engine {
-            Engine::F64($s) => $body,
-            Engine::B128($s) => $body,
-            Engine::B256($s) => $body,
-            Engine::B512($s) => $body,
-            Engine::B768($s) => $body,
-            Engine::B1024($s) => $body,
-            Engine::B2048($s) => $body,
+    ($engine:expr, $s:ident, $body:expr) => {
+        with_frontend_precisions!(dispatch_engine, ($engine, $s, $body))
+    };
+}
+macro_rules! prepare_engine {
+    ([($p:ident, $q:ident, $a:ident, $b:ident, $c:ident, $s:ident, $blocks:ident)]
+     $(($bits:literal, $variant:ident, $scalar:ty),)*) => {
+        match $s.precision_bits {
+            $($bits => Engine::$variant(Typed::prepare($p, $q, $a, $b, $c, $s, $blocks)?),)*
+            _ => return Err((2, format!("unsupported precision; use {FRONTEND_PRECISION_HELP}"))),
         }
     };
 }
@@ -660,21 +668,7 @@ unsafe fn prepare_entry(
         );
         validate_settings_layout(s)?;
         let blocks = blocks.map(|(p, n)| array(p, n)).transpose()?;
-        let engine = match s.precision_bits {
-            53 => Engine::F64(Typed::prepare(p, q, a, b, c, s, blocks)?),
-            128 => Engine::B128(Typed::prepare(p, q, a, b, c, s, blocks)?),
-            256 => Engine::B256(Typed::prepare(p, q, a, b, c, s, blocks)?),
-            512 => Engine::B512(Typed::prepare(p, q, a, b, c, s, blocks)?),
-            768 => Engine::B768(Typed::prepare(p, q, a, b, c, s, blocks)?),
-            1024 => Engine::B1024(Typed::prepare(p, q, a, b, c, s, blocks)?),
-            2048 => Engine::B2048(Typed::prepare(p, q, a, b, c, s, blocks)?),
-            _ => {
-                return Err((
-                    2,
-                    "unsupported precision; use 53,128,256,512,768,1024,2048".into(),
-                ))
-            }
-        };
+        let engine = with_frontend_precisions!(prepare_engine, (p, q, a, b, c, s, blocks));
         ptr::write(
             out,
             Box::into_raw(Box::new(Handle {

@@ -184,8 +184,9 @@ fn storage_update_parity<T: FloatT>() {
     storage_matrix_same(&solver.materialize(), &expected);
     storage_check_solve(&mut solver, &expected, &signs, true);
 
-    // Zero singleton leaf forces the existing QDLDL fallback. All other
-    // changed/shifted values must survive lazy CSC reconstruction exactly.
+    // A zero singleton pivot fails in both backends when regularization is
+    // disabled. Lazy fallback reconstruction must preserve every update,
+    // and restoring the pivot must recover a valid solve.
     let before_fallback_shift = expected.clone();
     let restore_diag: Vec<_> = diagonal.iter().map(|&p| expected.nzval[p]).collect();
     solver.offset_values(&diagonal, shift, &signs);
@@ -197,9 +198,12 @@ fn storage_update_parity<T: FloatT>() {
     let original = expected.nzval[singleton];
     solver.update_values(&[singleton], &[T::zero()]);
     expected.nzval[singleton] = T::zero();
-    storage_check_solve(&mut solver, &expected, &signs, false);
+    assert!(!solver.refactor(&expected));
     assert!(!solver.use_arrow);
     assert!(solver.fallback.is_some());
+    storage_matrix_same(&solver.materialize(), &expected);
+    let mut fresh = ArrowLDLSolver::try_new(&expected, &signs, &solver.settings).unwrap();
+    assert!(!fresh.refactor(&expected));
     solver.update_values(&[singleton], &[original]);
     expected.nzval[singleton] = original;
     storage_check_solve(&mut solver, &expected, &signs, true);

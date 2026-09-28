@@ -231,8 +231,13 @@ fn check<T: FloatT>(make: impl Fn() -> DefaultProblemData<T>) {
             reference.P.nnz()
         );
         assert_eq!(
-            owned.data.blocks.iter().map(|o| o.A.nnz()).sum::<usize>(),
-            reference.A.nnz()
+            owned
+                .data
+                .blocks
+                .iter()
+                .map(|o| o.constraint_nnz())
+                .sum::<usize>(),
+            reference.constraint_nnz()
         );
         assert_eq!(
             owned
@@ -269,6 +274,12 @@ fn check<T: FloatT>(make: impl Fn() -> DefaultProblemData<T>) {
         }
         #[cfg(feature = "sdp")]
         if let Some(operator) = &reference.sampled {
+            for block in &owned.data.blocks {
+                let linear = block.sampled.as_ref().unwrap().linear();
+                assert_eq!(block.A.colptr, linear.colptr);
+                assert_eq!(block.A.rowval, linear.rowval);
+                assert_eq!(block.A.nzval, linear.nzval);
+            }
             assert_eq!(
                 owned
                     .data

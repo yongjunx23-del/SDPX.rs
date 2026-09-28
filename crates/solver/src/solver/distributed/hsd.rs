@@ -216,11 +216,7 @@ impl<T: FloatT> OwnedSolver<T> {
         // Ruiz is complete. Release the global cone workspaces and their pool
         // before allocating persistent local state and the one shared pool.
         drop(global_cones);
-        let budget = if settings.max_threads == 0 {
-            std::thread::available_parallelism().map_or(1, usize::from)
-        } else {
-            settings.max_threads as usize
-        };
+        let budget = crate::solver::core::worker_budget(settings.max_threads as usize);
         let provider = super::costs::provider_tag();
         if let Some(history) = options.history.as_ref() {
             history.validate_runtime(
@@ -441,6 +437,9 @@ impl<T: FloatT> OwnedSolver<T> {
         cones.degree = global_degree;
         let kktsystem =
             OwnedKktSystem::new_with_collective(&data, &cones, &settings, Arc::clone(&collective));
+        for block in &mut data.blocks {
+            block.compact_sampled_matrix();
+        }
         let mut info = DefaultInfo::new();
         use crate::solver::kkt::HasLinearSolverInfo;
         info.linsolver = kktsystem.linear_solver_info();

@@ -219,6 +219,13 @@ where
     T: FloatT + DeserializeOwned + Serialize,
 {
     fn save_to_file(&self, file: &mut File) -> Result<(), io::Error> {
+        #[cfg(feature = "sdp")]
+        if self.data.sampled_input {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "sampled solver export cannot preserve original factors; use JsonProblem::write before constructing the solver",
+            ));
+        }
         let mut json_data = JsonProblem {
             P: self.data.P.clone(),
             q: self.data.q.clone(),

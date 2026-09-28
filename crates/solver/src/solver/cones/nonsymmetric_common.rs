@@ -182,8 +182,9 @@ where
         if is_in_cone_fcn(work) {
             break;
         }
+        let previous = α;
         α *= step;
-        if α < α_min {
+        if !α.is_finite() || α >= previous || α <= T::zero() || α < α_min {
             α = T::zero();
             break;
         }
@@ -252,8 +253,9 @@ where
         if inside {
             break;
         }
+        let previous = α;
         α *= step;
-        if α < α_min {
+        if !α.is_finite() || α >= previous || α <= T::zero() || α < α_min {
             α = T::zero();
             break;
         }

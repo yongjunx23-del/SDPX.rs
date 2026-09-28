@@ -1,0 +1,22 @@
+{
+  "upstream": "https://github.com/davidsd/sdpb",
+  "tag": "3.1.0",
+  "commit": "fec8e934bf03eb59b0f35ad76dd9b205dde537e6",
+  "license": "SDPB-LICENSE",
+  "destination": "crates/pmp",
+  "adaptations": [
+    "Owned MPFR scalars and Rust JSON/streaming XML parsing",
+    "Safeguarded Newton density roots with full-precision bracket polishing",
+    "Scalar Cholesky of moment matrices",
+    "Bounded parallel block conversion and sampled JSON output"
+  ],
+  "files": {
+    "src/pmp/convert/sample_points.cxx": "22aba8438f2b62ed878c2a83a961ebb000408e5b4b8f87807933606b3d496af2",
+    "src/pmp/convert/sample_scalings.cxx": "d9bbc7969c7df3c05a3580a9a3e251160ab3623a5457b744e254c788bb037727",
+    "src/pmp/convert/bilinear_basis/bilinear_basis.cxx": "6903231c398763e6a309c6d00d990813eec236a7bf2c4b53011dbd188ece011b",
+    "src/pmp/Polynomial_Vector_Matrix.cxx": "ff0e0a3f715e5a2d775bbdff6477967a8c3158703fa292fd5a205774b28f506c",
+    "src/pmp2sdp/Output_SDP/Output_SDP.cxx": "6f7180c3d37afa88a8f00ab31bf2bd6016aa2b2ccfc7178109a88caa30569552",
+    "src/pmp2sdp/Dual_Constraint_Group/Dual_Constraint_Group.cxx": "a72e8ba799fa51ab7c8f5f17eccc3a6ebfc161449298c1fef42051af514c5eb2",
+    "src/pmp2sdp/Dual_Constraint_Group/sample_bilinear_basis.cxx": "4116992cdd71bc6bdfcc9773db69e8e0f525e4af0b8402ebf6e7143eeecaaa6a"
+  }
+}

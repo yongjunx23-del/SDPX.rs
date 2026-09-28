@@ -111,6 +111,10 @@ Results:
 
 ### Structure
 
+- The repository publishes only the solver: benchmark inputs, harnesses and
+  archived plans are no longer tracked (the tracked tree drops from 11.6 MB
+  to 2.8 MB). The README is rewritten around Rust usage. A new
+  `bootstrap` example solves a `pmp2sdp` directory at 768 bits.
 - Solver modules were reorganized into a flat, responsibility-based layout,
   with dead code removed. The owner-partitioned MPI implementation is gated
   on the `sdp` feature.

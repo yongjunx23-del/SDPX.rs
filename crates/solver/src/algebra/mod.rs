@@ -26,7 +26,14 @@ pub use matrix_traits::*;
 pub(crate) use matrix_types::*;
 pub(crate) use scalarmath::*;
 pub(crate) use utils::*;
-pub(crate) use vecmath::{add_assign, ScaledNorm, VectorPoolGuard};
+#[cfg(feature = "sdp")]
+pub(crate) use vecmath::add_assign;
+pub(crate) use vecmath::{ScaledNorm, VectorPoolGuard};
+
+#[cfg(not(feature = "sdp"))]
+pub(crate) fn with_split_hint<R>(_ways: usize, f: impl FnOnce() -> R) -> R {
+    f()
+}
 
 // matrix implementations
 mod csc;

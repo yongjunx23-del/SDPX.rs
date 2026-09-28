@@ -165,6 +165,11 @@ path = "examples/rust/example_sdp.rs"
 required-features = ["sdp"]
 
 [[example]]
+name = "bootstrap"
+path = "examples/rust/example_bootstrap.rs"
+required-features = ["sdp"]
+
+[[example]]
 name = "box_faer"
 path = "examples/rust/example_box_faer.rs"
 required-features = ["faer-sparse"]

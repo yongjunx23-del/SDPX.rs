@@ -83,7 +83,7 @@ where
         writeln!(out, "  variables     = {}", data.n)?;
         writeln!(out, "  constraints   = {}", data.m)?;
         writeln!(out, "  nnz(P)        = {}", data.P.nnz())?;
-        writeln!(out, "  nnz(A)        = {}", data.A.nnz())?;
+        writeln!(out, "  nnz(A)        = {}", data.constraint_nnz())?;
         writeln!(out, "  cones (total) = {}", cones.len())?;
 
         //All dims here are dummies since we just care about the cone type

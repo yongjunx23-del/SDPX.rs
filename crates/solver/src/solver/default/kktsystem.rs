@@ -472,7 +472,7 @@ fn initial_point_degenerate<T: FloatT>(
         .b
         .norm_inf()
         .max(data.q.norm_inf())
-        .max(data.A.nzval.norm_inf())
+        .max(data.constraint_norm_inf())
         .max(T::one());
     let bound = T::from_f64(1e12).unwrap() * scale;
     !(variables.x.norm_inf() <= bound && variables.z.norm_inf() <= bound)

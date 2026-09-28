@@ -48,6 +48,29 @@ impl Exact {
                 && gmp::mpz_sizeinbase(&self.raw.den, 2) <= 2048
         }
     }
+    /// Exact image in the prime field F_(2^31 - 1), when the denominator
+    /// is invertible. A nonzero minor here proves rational independence.
+    pub fn modulo_mersenne31(&self) -> Option<u32> {
+        const P: u64 = (1 << 31) - 1;
+        let (num, den) = unsafe {
+            (
+                gmp::mpz_fdiv_ui(&self.raw.num, P as _) as u64,
+                gmp::mpz_fdiv_ui(&self.raw.den, P as _) as u64,
+            )
+        };
+        if den == 0 {
+            return None;
+        }
+        let (mut power, mut exponent, mut inverse) = (den, P - 2, 1u64);
+        while exponent != 0 {
+            if exponent & 1 != 0 {
+                inverse = inverse * power % P;
+            }
+            power = power * power % P;
+            exponent >>= 1;
+        }
+        Some((num * inverse % P) as u32)
+    }
     pub fn divide(&mut self, other: &Self) {
         assert!(!other.is_zero());
         unsafe {

@@ -50,9 +50,19 @@ where
     T: FloatT,
 {
     pub fn new(size: (usize, usize)) -> Self {
+        Self::with_left_vectors(size, true)
+    }
+
+    /// Reserve only the requested right vectors. A later full factorization
+    /// allocates its left vectors on demand.
+    pub(crate) fn new_right(size: (usize, usize)) -> Self {
+        Self::with_left_vectors(size, false)
+    }
+
+    fn with_left_vectors(size: (usize, usize), left: bool) -> Self {
         let (m, n) = size;
         let s = vec![T::zero(); min(m, n)];
-        let U = Matrix::<T>::zeros((m, min(m, n)));
+        let U = Matrix::<T>::zeros((m, if left { min(m, n) } else { 0 }));
         let Vt = Matrix::<T>::zeros((min(m, n), n));
         let blas = None;
         let algorithm = SVDEngineAlgorithm::default();
@@ -126,6 +136,7 @@ where
         S: AsMut<[T]> + AsRef<[T]>,
     {
         self.checkdim_factor(A)?;
+        self.U.resize((A.nrows(), min(A.nrows(), A.ncols())));
 
         // all special cases are square
         if A.is_square() {

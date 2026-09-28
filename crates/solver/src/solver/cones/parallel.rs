@@ -60,16 +60,73 @@ impl ConeThreading {
         Self::build(cones, width, Some(pool)).ok().flatten()
     }
 
+    // Scale heavy PSD cones first. Whole cones remain independent; workers
+    // pull the next largest job instead of waiting for a fixed lane's tail.
+    // Cheap cone collections and wider-than-block pools keep the lane path.
+    pub(super) fn update_scaling<T: FloatT>(
+        &self,
+        cones: &mut [SupportedCone<T>],
+        s: &[T],
+        z: &[T],
+        mu: T,
+        strategy: ScalingStrategy,
+    ) -> Option<bool> {
+        let workers = self.pool.current_num_threads();
+        if T::precision_bits() <= 64
+            || cones.len() <= workers
+            || !cones.iter().any(|c| {
+                #[cfg(feature = "sdp")]
+                if matches!(c, SupportedCone::PSDTriangleCone(_)) {
+                    return true;
+                }
+                let _ = c;
+                false
+            })
+        {
+            return None;
+        }
+        let mut row = 0;
+        let mut jobs: Vec<_> = cones
+            .iter_mut()
+            .map(|cone| {
+                let rows = row..row + cone.numel();
+                row = rows.end;
+                (cone_cost(cone), cone, rows)
+            })
+            .collect();
+        jobs.sort_unstable_by_key(|job| job.0);
+        let jobs = std::sync::Mutex::new(jobs);
+        Some(self.pool.install(|| {
+            (0..workers)
+                .into_par_iter()
+                .map(|_| {
+                    let mut ok = true;
+                    loop {
+                        let Some((_, cone, rows)) = jobs.lock().unwrap().pop() else {
+                            break;
+                        };
+                        let _inner = (self.inner_parallel || self.paired).then(|| {
+                            sdpx_arithmetic::inner_parallel::Guard::enter_levels(
+                                self.inner_parallel,
+                                self.paired,
+                            )
+                        });
+                        ok &= crate::algebra::with_split_hint(self.inner_ways, || {
+                            cone.update_scaling(&s[rows.clone()], &z[rows], mu, strategy)
+                        });
+                    }
+                    ok
+                })
+                .reduce(|| true, |a, b| a && b)
+        }))
+    }
+
     fn build<T: FloatT>(
         cones: &[SupportedCone<T>],
         requested: usize,
         existing: Option<std::sync::Arc<rayon::ThreadPool>>,
     ) -> Result<Option<Self>, rayon::ThreadPoolBuildError> {
-        let budget = if requested == 0 {
-            std::thread::available_parallelism().map_or(1, usize::from)
-        } else {
-            requested
-        };
+        let budget = crate::solver::core::worker_budget(requested);
         let single_orthant = matches!(cones, [SupportedCone::NonnegativeCone(_)]);
         let has_psd = cones.iter().any(|cone| {
             #[cfg(feature = "sdp")]

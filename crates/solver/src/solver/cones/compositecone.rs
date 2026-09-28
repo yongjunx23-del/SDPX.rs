@@ -268,6 +268,8 @@ where
         σμ: T,
         prepared: bool,
     ) {
+        #[cfg(not(feature = "sdp"))]
+        let _ = prepared;
         #[cfg(feature = "sdp")]
         if prepared {
             if let SupportedCone::PSDTriangleCone(cone) = cone {
@@ -485,6 +487,8 @@ where
     }
 
     fn pack_scaling_state(cone: &SupportedCone<T>, out: &mut Vec<T>) {
+        #[cfg(not(feature = "sdp"))]
+        let _ = out;
         match cone {
             #[cfg(feature = "sdp")]
             SupportedCone::PSDTriangleCone(c) => c.pack_scaling_state(out),
@@ -493,6 +497,8 @@ where
     }
 
     fn unpack_scaling_state(cone: &mut SupportedCone<T>, src: &[T]) {
+        #[cfg(not(feature = "sdp"))]
+        let _ = src;
         match cone {
             #[cfg(feature = "sdp")]
             SupportedCone::PSDTriangleCone(c) => c.unpack_scaling_state(src),
@@ -1132,6 +1138,10 @@ where
             return self.update_scaling_sharded(world, s, z, μ, scaling_strategy);
         }
         if let Some(threading) = &self.threading {
+            if let Some(ok) = threading.update_scaling(&mut self.cones, s, z, μ, scaling_strategy)
+            {
+                return ok;
+            }
             if let (Some(chunk), [SupportedCone::NonnegativeCone(cone)]) =
                 (threading.orthant_chunk, self.cones.as_mut_slice())
             {

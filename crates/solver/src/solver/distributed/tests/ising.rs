@@ -26,7 +26,7 @@ fn owned_ising_accepted_point() {
     let make = || {
         let mut problem = read_sdpb_sampled::<T>(&input).unwrap().problem;
         problem.settings = settings.clone();
-        problem.into_solver().unwrap().data
+        problem.into_prepared().unwrap().data
     };
     let mut data = make();
     assert!(
@@ -101,7 +101,12 @@ fn owned_ising_accepted_point() {
         assert!(info.res_dual_componentwise.unwrap() <= settings.tol_feas_componentwise.unwrap());
         let columns: Vec<_> = owned.data.blocks.iter().map(|o| o.n).collect();
         let conic_rows: Vec<_> = owned.data.blocks.iter().map(|o| o.m).collect();
-        let nnz: Vec<_> = owned.data.blocks.iter().map(|o| o.A.nnz()).collect();
+        let nnz: Vec<_> = owned
+            .data
+            .blocks
+            .iter()
+            .map(|o| o.constraint_nnz())
+            .collect();
         let sampled: Vec<_> = owned
             .data
             .blocks
@@ -109,7 +114,7 @@ fn owned_ising_accepted_point() {
             .map(|o| o.sampled.as_ref().unwrap().blocks().len())
             .collect();
         assert_eq!(columns.iter().sum::<usize>(), data.n);
-        assert_eq!(nnz.iter().sum::<usize>(), data.A.nnz());
+        assert_eq!(nnz.iter().sum::<usize>(), data.constraint_nnz());
         assert_eq!(
             conic_rows.iter().sum::<usize>(),
             data.m + (count - 1) * owned.data.layout.border_rows.len()
