@@ -94,20 +94,37 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 }
             }
         }
-        Some(Self::from_groups(k, signs, settings, groups, trunk, true))
+        Some(Self::from_groups(
+            k,
+            signs,
+            settings,
+            groups,
+            trunk,
+            Some(LocalStructure::Soc),
+        ))
     }
 
     pub(super) fn assemble_local_schur(&mut self) {
         let timer = crate::receipt::start();
+        #[cfg(feature = "faer-sparse")]
+        if self.assemble_bound_schur_faer() {
+            crate::receipt::finish("arrow.local_schur", timer);
+            return;
+        }
+        if self.assemble_bound_schur_exact() {
+            crate::receipt::finish("arrow.local_schur", timer);
+            return;
+        }
         let t = self.trunk.len();
         let leaves = &self.leaves;
-        // A border column couples only to the final two leaf coordinates.
+        // A border column couples only to the leaf's primal suffix.
         // MPFR's dot uses exact accumulation rounded once; each entry has the
         // same leaf/coordinate order at every thread count. No parallel sum.
         let column = |(j, values): (usize, &mut [T])| {
             for (i, value) in values.iter_mut().enumerate().skip(j) {
                 *value -= T::dot_fma(leaves.iter().flat_map(|leaf| {
-                    (0..2).map(move |r| (&leaf.y[r + i * 2], &leaf.z[r + j * 2]))
+                    let width = leaf.ids.len() - leaf.coupling_start;
+                    (0..width).map(move |r| (&leaf.y[r + i * width], &leaf.z[r + j * width]))
                 }));
             }
         };

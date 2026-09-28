@@ -19,7 +19,7 @@ use std::{
 };
 
 mod precisions;
-pub use precisions::FRONTEND_PRECISION_HELP;
+pub use precisions::{DEFAULT_FRONTEND_PRECISION_HELP, FRONTEND_PRECISION_HELP};
 
 mod dyadic;
 pub use dyadic::{DyadicKind, DyadicView};

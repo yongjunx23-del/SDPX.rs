@@ -14,6 +14,7 @@ Completed experiments: [docs/JOURNAL.md](docs/JOURNAL.md).
 
 | Case | Latest evidence | Limitations |
 |---|---|---|
+| Gravity LP, Mac M4 | Latest packed kernels: Float64 0.182→0.093 s, MPFR128 4.54→4.19 s, MPFR256 8.46→5.80 s at one thread; MPFR128 1.92 s at four | One release batch per width; peak RSS decreases. MPFR points identical and audits pass; unbounded Float64 retains its dual-residual failure |
 | Medium, Float64 | `Solved`, 18 iterations; dual residual 1.92e-6 exceeds the 1.75e-6 external gate | Still fails; user deferred numerical work |
 | Ising11, MPFR512, node9 | Final release A–B–B–A: 25.505 → 24.901 s at one thread; 7.594 → 7.469 s at four; `Solved`/52, all audits pass | One batch per width; exact points across versions and threads; Lambda43 scaling pending |
 | CSDR alpha-count 3, MPFR256, node9 | Final release A–B–B–A: 68.292 → 56.268 s at one thread; 29.555 → 17.822 s at four; `Solved`/57, all audits pass | One batch per width; exact points across versions and threads |
@@ -30,8 +31,14 @@ below 5e-51 in scaled distance from its preceding backend.
 The old Julia CSDR median (17.532 s) is **not a matched comparison**: its frozen
 input is missing, the reconstructed objective differs, and arithmetic differs.
 
+The solver CLI now builds Float64, MPFR128/256/512/768/1024 by default.
+Add `all-precisions` when rebuilding the CLI for Lambda43 at 1216 bits or
+other nondefault precisions. Existing cluster arms, native Rust, PMP and C ABI
+precision support are unchanged.
+
 ## Known failures
 
+- **Gravity Float64:** `Solved`/17 at 1e-6, but original dual residual 4.011564682e-6 exceeds the 2e-6 external gate. The solver normalizes residuals by variable norms as well as data norms; retain those convergence rules. MPFR128/256 pass.
 - **Medium:** external dual-residual failure above; investigate any new worsening.
 - **SDP_control3:** 29 iterations, primal residual about 4.98e-4; input hash
   `d3a7cc27…6e84`. Deferred by the user; retain in the full input collection.

@@ -247,9 +247,14 @@ fn redundant_equalities<T: FloatT>(
         return None;
     }
     let mut lookup = vec![usize::MAX; b.len()];
-    let mut rows: Vec<BTreeMap<usize, Exact>> = (0..ids.len()).map(|_| BTreeMap::new()).collect();
     for (i, &r) in ids.iter().enumerate() {
         lookup[r] = i;
+    }
+    if short_equalities_full_rank(A, b, &ids, &lookup) {
+        return Some(Vec::new());
+    }
+    let mut rows: Vec<BTreeMap<usize, Exact>> = (0..ids.len()).map(|_| BTreeMap::new()).collect();
+    for (i, &r) in ids.iter().enumerate() {
         if b[r] != T::zero() {
             rows[i].insert(A.n, b[r].exact()?);
         }
@@ -305,6 +310,92 @@ fn redundant_equalities<T: FloatT>(
     Some(redundant)
 }
 
+// A nonsingular minor over F_(2^31 - 1) proves independence over the exact
+// input field. For a short, wide equality system, build that minor a column
+// at a time and stop at full rank, before allocating rational rows for every
+// coefficient. Bound dense workspace; all inconclusive cases keep the sparse
+// modular/rational path below, including genuine dependencies.
+fn short_equalities_full_rank<T: FloatT>(
+    a: &CscMatrix<T>,
+    b: &[T],
+    ids: &[usize],
+    lookup: &[usize],
+) -> bool {
+    const P: u64 = (1 << 31) - 1;
+    let m = ids.len();
+    if m == 0 || m > 256 || a.n < m {
+        return false;
+    }
+    // Validate the complete pattern before an early rank proof, so duplicate
+    // coordinates cannot be mistaken for the matrix consumed by the solver.
+    if (0..a.n).any(|c| {
+        a.rowval[a.colptr[c]..a.colptr[c + 1]]
+            .windows(2)
+            .any(|rows| rows[0] >= rows[1])
+    }) {
+        return false;
+    }
+    let mut basis: Vec<Option<Vec<u64>>> = vec![None; m];
+    let mut rank = 0;
+    for c in 0..=a.n {
+        let mut column = vec![0u64; m];
+        if c == a.n {
+            for (i, &r) in ids.iter().enumerate() {
+                let Some(value) = b[r].exact().and_then(|v| v.modulo_mersenne31()) else {
+                    return false;
+                };
+                column[i] = u64::from(value);
+            }
+        } else {
+            for k in a.colptr[c]..a.colptr[c + 1] {
+                let i = lookup[a.rowval[k]];
+                if i != usize::MAX {
+                    let Some(value) = a.nzval[k].exact().and_then(|v| v.modulo_mersenne31()) else {
+                        return false;
+                    };
+                    column[i] = u64::from(value);
+                }
+            }
+        }
+        for pivot in 0..m {
+            let factor = column[pivot];
+            if factor == 0 {
+                continue;
+            }
+            if let Some(previous) = &basis[pivot] {
+                for i in pivot..m {
+                    column[i] = (column[i] + P - factor * previous[i] % P) % P;
+                }
+            } else {
+                let inverse = inverse_mersenne31(factor);
+                for value in &mut column[pivot..] {
+                    *value = *value * inverse % P;
+                }
+                basis[pivot] = Some(column);
+                rank += 1;
+                break;
+            }
+        }
+        if rank == m {
+            return true;
+        }
+    }
+    false
+}
+
+fn inverse_mersenne31(value: u64) -> u64 {
+    const P: u64 = (1 << 31) - 1;
+    let (mut power, mut exponent, mut inverse) = (value, P - 2, 1u64);
+    while exponent != 0 {
+        if exponent & 1 != 0 {
+            inverse = inverse * power % P;
+        }
+        power = power * power % P;
+        exponent >>= 1;
+    }
+    inverse
+}
+
 fn modular_full_row_rank(
     rows: &[std::collections::BTreeMap<usize, sdpx_arithmetic::Exact>],
 ) -> bool {
@@ -334,14 +425,7 @@ fn modular_full_row_rank(
                     }
                 }
             } else {
-                let (mut power, mut exponent, mut inverse) = (factor, P - 2, 1u64);
-                while exponent != 0 {
-                    if exponent & 1 != 0 {
-                        inverse = inverse * power % P;
-                    }
-                    power = power * power % P;
-                    exponent >>= 1;
-                }
+                let inverse = inverse_mersenne31(factor);
                 for value in row.values_mut() {
                     *value = *value * inverse % P;
                 }

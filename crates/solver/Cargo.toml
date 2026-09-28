@@ -30,6 +30,10 @@ thiserror      = "1.0"
 [features]
 default = ["serde"]
 
+# Opt in to every MPFR frontend precision (128..2048 in steps of 64).
+# Native Rust types and other frontends retain their full precision support.
+all-precisions = []
+
 # enable reading / writing of problems from json files 
 serde = ["dep:serde", "dep:serde_json", "dep:sha2", "sdpx-arithmetic/serde"]
 

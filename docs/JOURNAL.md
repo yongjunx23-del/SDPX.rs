@@ -2651,3 +2651,135 @@ The current plan records the measured solver/converter gains and the profile
 priorities. Known numerical failures remain visible, and the corrected Lambda43
 input and 4/16/64/256-core scientific comparison remain pending. No cancellation
 approval arrived; the existing generation chain and its artifacts were preserved.
+
+
+### 2026-09-28 — Keep short-wide equality rank presolve
+
+For at most 256 equality rows, stream exact columns through modular elimination
+before allocating the rational sparse-row fallback. A full-rank proof skips
+redundancy work; inconclusive cases retain the existing fallback. No retained
+coefficient or output coordinate changes.
+
+Apple M4 (10 CPUs, 16 GiB), one thread, release arms
+`gravity-lp-base-20260928` and `gravity-lp-column-rank-20260928`:
+fixed-a gravity NN=50, nn=100, jj=100 has 49 equalities and 5,100 rho bounds.
+One serial L–A–B–B–A–L batch compares the legacy local executable, published
+source and the presolve candidate. Native medians in seconds:
+
+| Precision / tolerance | Legacy | Published | Presolve candidate |
+|---|---:|---:|---:|
+| Float64 / 1e-6 | 6.242066 | 0.492486 | 0.350203 |
+| MPFR128 / 1e-12 | 51.037731 | 23.674592 | 23.740829 |
+| MPFR256 / 1e-18 | 37.574531 | 35.610655 | 35.660526 |
+
+The new rank proof saves about 29% in Float64; MPFR totals are effectively
+unchanged. All x/s/z outputs are identical across all three arms. MPFR audits
+pass. Float64 is an existing failure: original dual residual 4.011564682e-6
+exceeds its 2e-6 external gate, despite `Solved`/17. It remains a failure.
+The first candidate Float64 process had a cold-start delay outside the native
+timer; these figures exclude process startup, input loading and matrix assembly.
+One balanced batch is preliminary evidence.
+
+Pinned medium and Ising11 A–B–B–A checks preserve exact points. Ising11 passes
+all audits; medium's known dual-residual failure is unchanged. Evidence:
+`~/.cache/sdpx-e2e/gravity-lp-presolve-20260928/`.
+
+### 2026-09-28 — Reject the gravity canonical-dual pilot
+
+A separate 49-variable canonical-dual formulation returned `Solved`/29 at
+MPFR128, but recovered original equality residual 2.895741356e-12 exceeded
+its 1.840220876e-12 gate, both with augmented and forced condensed KKT.
+The runner retains the original primal formulation. Diagnostic runs overlapped
+compilation and supply no matched performance conclusion. Evidence: the
+`dual-*` files in the preceding gravity cache directory.
+
+
+### 2026-09-28 — Keep analytical local bounds and packed faer kernels
+
+Frozen release `gravity-local-bounds-faer-six-20260928-v1` eliminates one/two
+scalar bound rows per variable into a signed border system. Eligibility is
+structural (at least 64 bounded variables, border at most 128, diagonal P).
+The gravity border is 51×51. Float64 uses persistent faer panels for Schur
+assembly and single/batched RHS; MPFR uses exact dot products. Original KKT
+regularization, escalation, refinement, status and recovery remain unchanged.
+
+One serial A–B–B–A batch per case/width on the Mac M4, against the frozen
+column-rank-presolve release; native seconds:
+
+| Bounds | Bits | Threads requested | Before | After |
+|---|---:|---:|---:|---:|
+| rho>=0 | 53 | 1 | 0.352648 | 0.181549 |
+| rho>=0 | 128 | 1 | 23.660321 | 4.646493 |
+| rho>=0 | 256 | 1 | 35.877941 | 8.707559 |
+| rho>=0 | 128 | 4 | 22.573686 | 2.593730 |
+| 0<=rho<=0.5 | 53 | 1 | 0.384939 | 0.316177 |
+| 0<=rho<=0.5 | 128 | 1 | 19.222789 | 6.773212 |
+| 0<=rho<=0.5 | 128 | 4 | 17.812955 | 3.991943 |
+
+All MPFR and boxed Float64 audits pass. Unbounded Float64 retains its existing
+4.01e-6 dual-residual failure against 2e-6; low-order differences from faer are
+about 8e-15 in that residual, not a corrected audit. Algorithms differ in
+low-order output digits; MPFR exact accumulation is retained. Candidate
+one/four-thread MPFR x/s/z agree bitwise for both bounds. Float64 one/four-thread
+parity was also verified in development (its dense products remain serial SIMD).
+Peak process RSS is essentially unchanged: Float64 38.39→38.45 MiB,
+MPFR128 84.56→84.60 MiB, MPFR256 114.64→117.13 MiB (median peaks).
+
+Pinned medium and Ising11 A–B–B–A preserve exact points; medium's known failure
+remains, Ising passes. CSDR4 A–B–B–A and CSDR1 A–B preserve exact points and
+pass all audits. CSDR4 API median increases 11.036→11.647 s in this batch;
+CSDR1 changes 30.778→30.498 s. No CSDR performance improvement is claimed.
+
+User requested six compiled solver-CLI choices: Float64 (53), 128, 256, 512,
+768 and 1024 bits, while LP comparisons stay at 53/128/256. The default release
+built in 3m23s. `all-precisions` retains the former full CLI dispatch; native Rust,
+PMP and C ABI precision support is unchanged. The preceding full-range compile
+was deliberately stopped before completion when this preference arrived.
+The external gravity runner adds `--rho-ub` and `--threads`; default unbounded
+inputs remain identical. Its README records the new results and audit limitation.
+
+Evidence: `~/.cache/sdpx-e2e/gravity-local-bounds-20260928/` (release summaries,
+raw points, audits, receipts and qualification logs). Timings are preliminary,
+from one balanced batch; all timing runs were isolated from compilation.
+
+
+### 2026-09-28 — Keep packed LP residuals and exact coupling panels
+
+Frozen release `gravity-lp-packed-20260928-v2`, compared against the preceding
+six-precision local-bound release on the same Mac. Float64 now evaluates the
+complete KKT residual with packed faer products plus the remaining sparse
+entries, reading the unshifted parent KKT for every diagonal/local term.
+Refinement tolerances, passes, stopping rules and regularization are unchanged.
+MPFR packs coupling operands for contiguous exact dot products. Scalar leaves
+reuse B as Y=L^-1 B and no longer retain duplicate Y/Z buffers. The selected
+Schur triangle and exact accumulation preserve MPFR points bitwise.
+
+One serial A–B–B–A release batch per case/width; medians:
+
+| Bounds | Bits | Threads | Native seconds, before→after | Peak RSS MiB, before→after |
+|---|---:|---:|---:|---:|
+| rho>=0 | 53 | 1 | 0.181813→0.093192 | 38.41→34.61 |
+| rho>=0 | 128 | 1 | 4.539465→4.192009 | 84.69→83.13 |
+| rho>=0 | 256 | 1 | 8.462872→5.803461 | 117.10→110.15 |
+| rho>=0 | 128 | 4 | 2.646597→1.921216 | 98.40→96.93 |
+| 0<=rho<=0.5 | 53 | 1 | 0.312249→0.158931 | 41.95→38.11 |
+| 0<=rho<=0.5 | 128 | 1 | 6.805359→5.732973 | 102.85→93.35 |
+| 0<=rho<=0.5 | 128 | 4 | 4.392771→2.984800 | 116.92→107.54 |
+
+These are preliminary results from one batch, excluding process startup,
+JSON I/O and model generation. MPFR and boxed Float64 audits pass. The original
+Float64 dual-residual failure persists (4.011564697e-6 against 2e-6); changes
+relative to the preceding failed point are rounding-level, not an audit fix.
+All MPFR A/B points are identical. Medium, Ising11 and CSDR A–B–B–A preserve
+points exactly; Ising/CSDR pass and medium's known failure remains. CSDR is also
+checked at one thread with A–B. No unrelated speed improvement is claimed.
+
+Rejected before release: residue-BLAS Schur assembly on these very tall panels.
+It preserves exact points but uses substantially more memory than packed exact
+dots, especially with four threads. Diagnostic binaries, receipts and the
+rejected source patch are retained under `speed-v2/rns-*` and `probe-compact*`.
+
+The default release built in 3m23s without warnings. The opt-in full-precision
+CLI passes `cargo check`. The minimal library also typechecks, with dead-code
+warnings for optional SDP/MPI helpers; the normal release configuration is clean.
+Evidence: `~/.cache/sdpx-e2e/gravity-local-bounds-20260928/speed-v2/`.

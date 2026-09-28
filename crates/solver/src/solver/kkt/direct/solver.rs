@@ -164,6 +164,11 @@ where
             crate::solver::kkt::ldl::arrow::ArrowLDLSolver::try_local_soc(
                 &KKT, &dsigns, A, cones, settings,
             )
+            .or_else(|| {
+                crate::solver::kkt::ldl::arrow::ArrowLDLSolver::try_local_bounds(
+                    &KKT, &dsigns, A, cones, settings,
+                )
+            })
             .map(|solver| Box::new(solver) as BoxedDirectLDLSolver<T>)
             .unwrap_or_else(|| ldl_ctor(&KKT, &dsigns, settings, None))
         } else {
@@ -599,6 +604,9 @@ where
         assert_eq!(rhs.len(), self.factor_dimension());
         assert_eq!(point.len(), rhs.len());
         assert_eq!(out.len(), rhs.len());
+        if let Some(norm) = self.ldlsolver.residual(&self.KKT, out, rhs, point) {
+            return norm;
+        }
         let KKTsym = self.KKT.sym(self.KKTuplo);
         let plan = self.residual_plan.as_ref();
         if let Some(rows) = &self.exact_rows {
@@ -681,9 +689,12 @@ where
         let pool = self.residual_pool.as_deref();
         #[cfg(feature = "sdp")]
         let dense = self.residual_dense.as_ref();
-        let error = |e: &mut [T], x: &mut [T]| -> T {
+        let error = |e: &mut [T], x: &mut [T], backend: &dyn DirectLDLSolver<T>| -> T {
             if let Some(rows) = exact {
                 return rows.residual(e, b, KKT, x, pool);
+            }
+            if let Some(norm) = backend.residual(KKT, e, b, x) {
+                return norm;
             }
             #[cfg(feature = "sdp")]
             {
@@ -695,7 +706,7 @@ where
             }
         };
         //compute the initial error
-        let mut norme = error(e, x);
+        let mut norme = error(e, x, self.ldlsolver.as_ref());
 
         if !norme.is_finite() {
             return false;
@@ -724,7 +735,7 @@ where
             dx.axpby(T::one(), x, T::one());
 
             let timer = crate::receipt::start();
-            norme = error(e, dx);
+            norme = error(e, dx, self.ldlsolver.as_ref());
             crate::receipt::finish("ir.residual", timer);
 
             if !norme.is_finite() {

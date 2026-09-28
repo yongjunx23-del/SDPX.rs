@@ -30,6 +30,10 @@ pub trait DirectLDLSolver<T: FloatT>: DirectLDLSolverReqs + HasLinearSolverInfo 
             self.solve(kkt, x, b);
         }
     }
+    /// Optional structure-aware residual against the complete unshifted KKT.
+    fn residual(&self, _kkt: &CscMatrix<T>, _out: &mut [T], _rhs: &[T], _point: &[T]) -> Option<T> {
+        None
+    }
     fn refactor(&mut self, kkt: &CscMatrix<T>) -> bool;
     /// Share the solver thread pool with factorisation/solve kernels that
     /// support it.  Solvers without a parallel path ignore the pool.

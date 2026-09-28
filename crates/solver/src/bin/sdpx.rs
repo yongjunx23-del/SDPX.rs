@@ -1,4 +1,10 @@
 //! Native entry point; all numerical work stays in the shared solver.
+#[cfg(not(feature = "all-precisions"))]
+use sdpx_arithmetic::{
+    with_default_precisions as with_frontend_precisions,
+    DEFAULT_FRONTEND_PRECISION_HELP as FRONTEND_PRECISION_HELP,
+};
+#[cfg(feature = "all-precisions")]
 use sdpx_arithmetic::{with_frontend_precisions, FRONTEND_PRECISION_HELP};
 use sdpx_solver::{algebra::FloatT, io::ConfigurablePrintTarget, solver::*, MpiContext};
 use serde::{de::DeserializeOwned, Serialize};
@@ -18,7 +24,7 @@ const USAGE: &str = "SDPX — native conic solver\n\
 Usage: sdpx INPUT [--precision BITS] [--settings FILE] [--output FILE]\n\
                      [--threads N] [--partitions N|auto]\n\
                      [--cost-history-in FILE] [--cost-history-out FILE] [--quiet]\n\
-BITS: 53 (Float64, default), or multiples of 64 from 128 through 2048 (MPFR).\n\
+BITS defaults to 53 (Float64); see the compiled precision list below.\n\
 INPUT is conic JSON, an SDPB sampled JSON directory (requires sdp), or '-'\n\
 for stdin. MPFR coefficients use decimal strings, never fractional\n\
 JSON numbers. --settings replaces input settings; unspecified settings use core\n\
@@ -222,7 +228,7 @@ where
         match arg.as_str() {
             "--help" | "-h" => {
                 if rank == 0 {
-                    println!("{USAGE}");
+                    println!("{USAGE}\nSupported precisions: {FRONTEND_PRECISION_HELP}");
                 }
                 return Ok(None);
             }
@@ -273,7 +279,10 @@ where
         }
     }
     if out.input.is_none() {
-        return Err(format!("missing input\n{USAGE}").into());
+        return Err(format!(
+            "missing input\n{USAGE}\nSupported precisions: {FRONTEND_PRECISION_HELP}"
+        )
+        .into());
     }
     Ok(Some(out))
 }

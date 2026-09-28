@@ -25,7 +25,7 @@ where $\mathcal{K}$ is any Cartesian product of **Zero**, **Nonnegative**, **Sec
 ## Key Features
 
 - **Built for the Numerical Bootstrap:** Designed for general numerical bootstrap problems (conformal bootstrap, S-matrix bootstrap, matrix models, and polynomial optimization). Ingests Polynomial Matrix Programs (PMP) directly via built-in `sdpx-pmp2sdp`. Sampled PSD blocks stay in memory-efficient factored form (bilinear bases $\times$ sample weights), avoiding expanding massive coefficient matrices into RAM.
-- **Precision You Choose:** Binary64 (`f64`), or MPFR arbitrary precision from 128 to 2048 bits in 64-bit steps (e.g., 768, 1024, 1216 bits). Dense high-precision products use an exact Residue Number System (RNS) kernel that accumulates exactly without intermediate rounding.
+- **Precision You Choose:** The solver CLI defaults to Float64 and MPFR 128, 256, 512, 768 and 1024 bits. Build with `all-precisions` to include every 64-bit step from 128 through 2048. Eligible dense high-precision products use an exact Residue Number System (RNS) kernel that accumulates exactly without intermediate rounding.
 - **Fast & Scalable:** Multi-threaded block-level parallelism (SDPB-style load balancing via Rayon), parallel Arrow $\text{LDL}^\top$, Faer sparse solver, certified binary64 step-length screening, and optional multi-node MPI partitioning.
 - **Zero Runtime Dependencies:** Standalone CLI tools and pure Rust libraries. No Julia, Python, or Mathematica required at solve time. Includes a stable C ABI (`include/sdpx.h`) for foreign language integration.
 
@@ -37,15 +37,16 @@ Requires **Rust $\ge$ 1.85** and system **GMP/MPFR** libraries (`brew install gm
 
 ```sh
 # macOS (Apple Accelerate + Faer)
-cargo build --release --workspace --features sdp-accelerate,faer-sparse
+cargo build --release -p sdpx-solver --bin sdpx --features sdp-accelerate,faer-sparse
 
 # Linux (OpenBLAS + Faer)
-cargo build --release --workspace --features sdp-openblas,faer-sparse
+cargo build --release -p sdpx-solver --bin sdpx --features sdp-openblas,faer-sparse
 ```
 
-Binaries produced in `target/release/`:
-- `sdpx`: The conic solver CLI.
-- `sdpx-pmp2sdp`: The PMP-to-SDP converter CLI.
+These commands build `target/release/sdpx` with six precision choices. Add
+`all-precisions` to the feature list for the complete precision range.
+Build the converter separately with `cargo build --release -p sdpx-pmp`.
+The native Rust API, converter and C ABI retain their complete precision support.
 
 ---
 
@@ -103,6 +104,23 @@ sdpx problem.json --output solution.json
 # Solve at 256-bit precision with 8 threads:
 sdpx problem.json --precision 256 --threads 8 --output solution.json
 ```
+
+---
+
+## LPs with local bounds
+
+Encode `rho >= 0` as `-rho + s = 0`, and an optional upper bound
+`rho <= c` as `rho + s = c`, using nonnegative slack cones. With automatic
+KKT selection, eligible problems eliminate these local directions and factor
+only the equality/free-variable border. Eligibility requires at least 64
+bounded variables, one or two bound rows per variable, a border of at most
+128 coordinates, and diagonal `P`.
+
+Float64 builds with `faer-sparse` use packed faer matrix products and batched
+RHS kernels (`local_bounds_faer`). MPFR uses exact accumulation
+(`local_bounds_arrow`). Both retain full-system regularization and refinement;
+failed factorizations fall back to QDLDL. Explicit `direct_solve_method="qdldl"`
+selects the original backend.
 
 ---
 

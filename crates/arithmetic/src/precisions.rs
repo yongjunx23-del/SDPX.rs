@@ -47,3 +47,24 @@ macro_rules! with_frontend_precisions {
         }
     };
 }
+
+/// Common precisions for smaller solver CLI builds. The complete dispatch
+/// remains available through `with_frontend_precisions`.
+pub const DEFAULT_FRONTEND_PRECISION_HELP: &str =
+    "53 (Float64), 128, 256, 512, 768, or 1024 (MPFR); build with all-precisions for the full range";
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! with_default_precisions {
+    ($callback:ident $(, $arg:tt)*) => {
+        $callback! {
+            [$($arg),*]
+            (53, F64, f64),
+            (128, B128, $crate::MpFloat<2>),
+            (256, B256, $crate::MpFloat<4>),
+            (512, B512, $crate::MpFloat<8>),
+            (768, B768, $crate::MpFloat<12>),
+            (1024, B1024, $crate::MpFloat<16>),
+        }
+    };
+}

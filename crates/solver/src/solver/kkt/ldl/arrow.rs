@@ -10,8 +10,8 @@
 //! for dense leaf factorizations that parallelize trivially and reuse the
 //! same coupling transforms across refactorizations.  Eligibility is decided
 //! once from the structure (stored zeros count as edges); refactor failures
-//! delegate to a lazily constructed QDLDL fallback, so the path can never do
-//! worse than the baseline backend.
+//! delegate to a lazily constructed QDLDL fallback. Local SOC and scalar-bound
+//! leaves also admit mixed signs, with explicit signs for the retained border.
 use crate::algebra::*;
 use crate::solver::core::CoreSettings;
 use crate::solver::kkt::direct::{BoxedDirectLDLSolver, DirectLDLSolver, DirectLDLSolverReqs};
@@ -19,7 +19,14 @@ use crate::solver::kkt::{HasLinearSolverInfo, LinearSolverInfo};
 use rayon::prelude::*;
 use std::sync::Arc;
 
+mod local_bounds;
 mod local_soc;
+
+#[derive(Clone, Copy)]
+enum LocalStructure {
+    Soc,
+    Bounds,
+}
 
 /// Hard cap on the dense working set of the arrow representation.  Larger
 /// systems keep using QDLDL rather than densifying without bound.
@@ -63,6 +70,7 @@ impl<T: FloatT> DenseLeaf<T> {
     /// `split`: run each step's trailing update over columns in parallel
     /// (inside the caller's pool). Every entry receives the same sequence of
     /// fused updates, so the factor is bitwise identical.
+    #[cfg(test)]
     fn factor(
         &mut self,
         a: &[T],
@@ -259,6 +267,14 @@ impl<T: FloatT> Leaf<T> {
         row - self.coupling_start + col * (self.ids.len() - self.coupling_start)
     }
 
+    fn coupling_values(&self) -> &[T] {
+        if self.y.is_empty() {
+            &self.b
+        } else {
+            &self.y
+        }
+    }
+
     /// H = LDLᵀ, Y = L⁻¹B, contribution = YᵀD⁻¹Y accumulated into S = C - ΣYᵀZ.
     /// `split`: the pool has more threads than leaves, so the border
     /// columns of Y and of the contribution also run in parallel (each
@@ -274,6 +290,11 @@ impl<T: FloatT> Leaf<T> {
         let g = self.ids.len();
         self.factor
             .factor_signed(&self.h, &self.signs, reg, regularize_count, split_factor)?;
+        // A scalar primal suffix has L=1: Y=B. Packed bound panels own Z,
+        // so these leaves need neither a duplicate Y nor a duplicate Z.
+        if self.y.is_empty() {
+            return Ok(());
+        }
         let start = self.coupling_start;
         let width = g - start;
         self.y.copy_from_slice(&self.b);
@@ -349,10 +370,12 @@ impl<T: FloatT> Leaf<T> {
                 let s = if i < self.coupling_start {
                     T::zero()
                 } else {
-                    T::dot_fma(
-                        (0..xt.len() / cols)
-                            .map(|j| (&self.y[self.coupling_index(i, j)], &xt[j * cols + c])),
-                    )
+                    T::dot_fma((0..xt.len() / cols).map(|j| {
+                        (
+                            &self.coupling_values()[self.coupling_index(i, j)],
+                            &xt[j * cols + c],
+                        )
+                    }))
                 };
                 self.batch_w[i * cols + c] = (self.batch_w[i * cols + c] - s) * self.factor.dinv[i];
             }
@@ -381,7 +404,10 @@ impl<T: FloatT> Leaf<T> {
             let s = if i < self.coupling_start {
                 T::zero()
             } else {
-                T::dot_fma((0..xt.len()).map(|j| (&self.y[self.coupling_index(i, j)], &xt[j])))
+                T::dot_fma(
+                    (0..xt.len())
+                        .map(|j| (&self.coupling_values()[self.coupling_index(i, j)], &xt[j])),
+                )
             };
             self.w[i] = (self.w[i] - s) * self.factor.dinv[i];
         }
@@ -410,7 +436,11 @@ pub struct ArrowLDLSolver<T: FloatT> {
     regularize_count: usize,
     fallback: Option<BoxedDirectLDLSolver<T>>,
     use_arrow: bool,
-    local_soc: bool,
+    local_structure: Option<LocalStructure>,
+    border_signs: Vec<i8>,
+    exact_bound_panels: Option<local_bounds::ExactBoundPanels<T>>,
+    #[cfg(feature = "faer-sparse")]
+    bound_panels: Option<local_bounds::BoundPanels>,
 }
 
 impl<T: FloatT> ArrowLDLSolver<T> {
@@ -515,7 +545,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         if cells * std::mem::size_of::<T>() as u128 > ARROW_MAX_BYTES {
             return None;
         }
-        Some(Self::from_groups(k, signs, settings, groups, trunk, false))
+        Some(Self::from_groups(k, signs, settings, groups, trunk, None))
     }
 
     fn from_groups(
@@ -524,7 +554,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         settings: &CoreSettings<T>,
         groups: Vec<Vec<usize>>,
         trunk: Vec<usize>,
-        local_soc: bool,
+        local_structure: Option<LocalStructure>,
     ) -> Self {
         let (n, t) = (k.n, trunk.len());
         let mut owner = vec![usize::MAX; n];
@@ -538,17 +568,28 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         for (i, &id) in trunk.iter().enumerate() {
             local[id] = i;
         }
+        let bound_count = groups.len();
         let leaves = groups
             .into_iter()
             .map(|g| {
-                // Avoid a dense t-by-t contribution allocation for every SOC.
-                let mut leaf = Leaf::new(g, if local_soc { 0 } else { t });
-                if local_soc {
-                    leaf.signs = vec![-1, -1, -1, 1, 1];
-                    leaf.coupling_start = 3;
-                    leaf.b.resize(2 * t, T::zero());
-                    leaf.y.resize(2 * t, T::zero());
-                    leaf.z.resize(2 * t, T::zero());
+                // Local constraints couple through their primal coordinates only.
+                let mut leaf = Leaf::new(g, if local_structure.is_some() { 0 } else { t });
+                if let Some(kind) = local_structure {
+                    let width = match kind {
+                        LocalStructure::Soc => 2,
+                        LocalStructure::Bounds => 1,
+                    };
+                    leaf.signs = leaf.ids.iter().map(|&i| signs[i]).collect();
+                    leaf.coupling_start = leaf.ids.len() - width;
+                    leaf.b.resize(width * t, T::zero());
+                    let packed = matches!(kind, LocalStructure::Bounds)
+                        && ((T::precision_bits() > 64)
+                            || (cfg!(feature = "faer-sparse")
+                                && std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>()));
+                    if !packed {
+                        leaf.y.resize(width * t, T::zero());
+                        leaf.z.resize(width * t, T::zero());
+                    }
                 }
                 leaf
             })
@@ -559,6 +600,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             signs: signs.to_vec(),
             settings: settings.clone(),
             n,
+            border_signs: trunk.iter().map(|&i| signs[i]).collect(),
             trunk,
             owner,
             local,
@@ -572,8 +614,34 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             regularize_count: 0,
             fallback: None,
             use_arrow: false,
-            local_soc,
+            local_structure,
+            exact_bound_panels: if matches!(local_structure, Some(LocalStructure::Bounds))
+                && T::precision_bits() > 64
+            {
+                Some(local_bounds::ExactBoundPanels::new(bound_count, t))
+            } else {
+                None
+            },
+            #[cfg(feature = "faer-sparse")]
+            bound_panels: if matches!(local_structure, Some(LocalStructure::Bounds))
+                && std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>()
+            {
+                Some(local_bounds::BoundPanels::new(bound_count, t))
+            } else {
+                None
+            },
         };
+        #[cfg(feature = "faer-sparse")]
+        if let Some(panels) = solver.bound_panels.as_mut() {
+            for j in 0..k.n {
+                for q in k.colptr[j]..k.colptr[j + 1] {
+                    let i = k.rowval[q];
+                    if (solver.owner[i] == usize::MAX) == (solver.owner[j] == usize::MAX) {
+                        panels.residual_entries.push((q, i, j));
+                    }
+                }
+            }
+        }
         solver.update_entries(0..k.nzval.len(), |q, value| *value = k.nzval[q]);
         solver
     }
@@ -697,7 +765,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return false;
         }
         self.s.copy_from_slice(&self.c);
-        if self.local_soc {
+        if self.local_structure.is_some() {
             self.assemble_local_schur();
         } else {
             // Deterministic merge order regardless of leaf scheduling.
@@ -711,10 +779,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         // Every pool thread is idle during the border factor.
         let (tf, s) = (&mut self.tf, &self.s);
         let ok = match &self.pool {
-            Some(pool) if tf.n >= SPLIT_BORDER_FACTOR_MIN => {
-                pool.install(|| tf.factor(s, -1, reg, &mut border_count, true))
-            }
-            _ => tf.factor(s, -1, reg, &mut border_count, false),
+            Some(pool) if tf.n >= SPLIT_BORDER_FACTOR_MIN => pool
+                .install(|| tf.factor_signed(s, &self.border_signs, reg, &mut border_count, true)),
+            _ => tf.factor_signed(s, &self.border_signs, reg, &mut border_count, false),
         }
         .is_ok();
         self.regularize_count += border_count;
@@ -740,6 +807,10 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     }
 
     fn solve_arrow(&mut self, x: &mut [T], b: &[T]) {
+        #[cfg(feature = "faer-sparse")]
+        if self.solve_bounds_faer(x, b, 1) {
+            return;
+        }
         let t = self.trunk.len();
         let timer = crate::receipt::start();
         if let Some(pool) = &self.pool {
@@ -751,21 +822,28 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         crate::receipt::finish("arrow.leaf_forward", timer);
         let timer = crate::receipt::start();
-        // Local SOC coupling uses one exact MPFR accumulation per output,
+        // Local constraint coupling uses one exact MPFR accumulation per output,
         // avoiding thousands of rounded two-term dots. Each output retains
         // the same leaf order at every thread count.
         let leaves = &self.leaves;
         let couple = |(j, v): (usize, &mut T)| {
             *v = b[self.trunk[j]];
-            if self.local_soc {
-                *v -=
-                    T::dot_fma(leaves.iter().flat_map(|leaf| {
-                        (0..2).map(move |i| (&leaf.y[i + j * 2], &leaf.v[i + 3]))
-                    }));
+            if self.local_structure.is_some() {
+                *v -= T::dot_fma(leaves.iter().flat_map(|leaf| {
+                    let width = leaf.ids.len() - leaf.coupling_start;
+                    (0..width).map(move |i| {
+                        (
+                            &leaf.coupling_values()[i + j * width],
+                            &leaf.v[i + leaf.coupling_start],
+                        )
+                    })
+                }));
             } else {
                 for leaf in leaves {
                     let g = leaf.ids.len();
-                    *v -= T::dot_fma((0..g).map(|i| (&leaf.y[i + j * g], &leaf.v[i])));
+                    *v -= T::dot_fma(
+                        (0..g).map(|i| (&leaf.coupling_values()[i + j * g], &leaf.v[i])),
+                    );
                 }
             }
         };
@@ -814,10 +892,12 @@ impl<T: FloatT> HasLinearSolverInfo for ArrowLDLSolver<T> {
             }
         }
         LinearSolverInfo {
-            name: if self.local_soc {
-                "local_soc_arrow"
-            } else {
-                "arrow"
+            name: match self.local_structure {
+                Some(LocalStructure::Soc) => "local_soc_arrow",
+                #[cfg(feature = "faer-sparse")]
+                Some(LocalStructure::Bounds) if self.bound_panels.is_some() => "local_bounds_faer",
+                Some(LocalStructure::Bounds) => "local_bounds_arrow",
+                None => "arrow",
             }
             .to_string(),
             threads: self.pool.as_ref().map_or(1, |p| p.current_num_threads()),
@@ -850,6 +930,15 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
         });
     }
 
+    fn residual(&self, kkt: &CscMatrix<T>, out: &mut [T], rhs: &[T], point: &[T]) -> Option<T> {
+        #[cfg(feature = "faer-sparse")]
+        if self.use_arrow {
+            return self.residual_bounds_faer(kkt, out, rhs, point);
+        }
+        let _ = (kkt, out, rhs, point);
+        None
+    }
+
     fn refactor(&mut self, _kkt: &CscMatrix<T>) -> bool {
         self.use_arrow = self.factor_arrow();
         self.use_arrow || self.factor_fallback()
@@ -864,6 +953,10 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
         assert_eq!(x.len(), n * cols);
         assert_eq!(b.len(), x.len());
         if cols == 0 {
+            return;
+        }
+        #[cfg(feature = "faer-sparse")]
+        if self.solve_bounds_faer(x, b, cols) {
             return;
         }
         self.batch_tx.resize(t * cols, T::zero());
@@ -894,19 +987,28 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
             for (c, v) in row.iter_mut().enumerate() {
                 *v = rhs[c * n + trunk[j]];
             }
-            if self.local_soc {
+            if self.local_structure.is_some() {
                 for (c, v) in row.iter_mut().enumerate() {
                     *v -= T::dot_fma(leaves.iter().flat_map(|leaf| {
-                        (0..2).map(move |i| (&leaf.y[i + j * 2], &leaf.batch_v[(i + 3) * cols + c]))
+                        let width = leaf.ids.len() - leaf.coupling_start;
+                        (0..width).map(move |i| {
+                            (
+                                &leaf.coupling_values()[i + j * width],
+                                &leaf.batch_v[(i + leaf.coupling_start) * cols + c],
+                            )
+                        })
                     }));
                 }
             } else {
                 for leaf in leaves {
                     let g = leaf.ids.len();
                     for (c, v) in row.iter_mut().enumerate() {
-                        *v -= T::dot_fma(
-                            (0..g).map(|i| (&leaf.y[i + j * g], &leaf.batch_v[i * cols + c])),
-                        );
+                        *v -= T::dot_fma((0..g).map(|i| {
+                            (
+                                &leaf.coupling_values()[i + j * g],
+                                &leaf.batch_v[i * cols + c],
+                            )
+                        }));
                     }
                 }
             }
