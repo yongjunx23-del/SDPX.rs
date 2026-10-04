@@ -343,57 +343,9 @@ pub(super) fn apply_block_pool_with_world<T: FloatT>(
     if let Some(world) = world {
         // Rank-sharded scaling products. Block row ranges are disjoint, so
         // each rank fills its own y segment; gathered segments reproduce the
-        // serial result bitwise. Ranks split by cost, not count: a PSD block's
-        // congruence product is ~n^3 while orthant rows are ~n.
-        let costs: Vec<u64> = blocks
-            .iter()
-            .map(|b| {
-                let n = (b.rows.end - b.rows.start) as f64;
-                match &b.scaling {
-                    Scaling::Psd(_) => n.powf(1.5).max(1.0) as u64,
-                    _ => n.max(1.0) as u64,
-                }
-            })
-            .collect();
-        let block_parts = crate::mpi::cost_ranges(&costs, world.size());
-        let (b0, blen) = block_parts[world.rank()];
-        let block_range = b0..b0 + blen;
-        let span = |slice: &[Block<T>]| {
-            let (s, e) = slice
-                .iter()
-                .map(|b| (b.rows.start, b.rows.end))
-                .fold((usize::MAX, 0usize), |(a0, a1), (s, e)| {
-                    (a0.min(s), a1.max(e))
-                });
-            if s > e {
-                (0, 0)
-            } else {
-                (s, e)
-            }
-        };
-        let (y0, y1) = span(&blocks[block_range.clone()]);
-        let gather_ranges: Vec<(usize, usize)> = block_parts
-            .iter()
-            .map(|&(b0, len)| {
-                if len == 0 {
-                    (0, 0)
-                } else {
-                    let (s, e) = span(&blocks[b0..b0 + len]);
-                    (s, e - s)
-                }
-            })
-            .collect();
-        let mut local = vec![T::zero(); y1 - y0];
-        let owned = &mut blocks[block_range];
-        // One lane per owned block keeps block-level parallelism inside the
-        // rank; a serial block walk would leave the pool idle between the
-        // per-block GEMM tiles.
-        if let Some(pool) = pool.as_ref().filter(|_| owned.len() > 1) {
-            let lanes: Vec<usize> = (0..owned.len()).collect();
-            pool.install(|| split_scaling(owned, &mut local, &x[y0..y1], action, &lanes, gemm));
-        } else {
-            apply_blocks(owned, &mut local, &x[y0..y1], action, gemm);
-        }
+        // serial result bitwise.
+        let ((y0, y1), gather_ranges) = rank_rows(blocks, world);
+        let local = scale_owned(world, pool, tiles, blocks, &x[y0..y1], action);
         y.fill(T::zero());
         world.gather_slice(crate::mpi::SITE_SCALING, &local, &gather_ranges, &mut y[..]);
         return;
@@ -406,6 +358,86 @@ pub(super) fn apply_block_pool_with_world<T: FloatT>(
         }
     }
     apply_blocks(blocks, y, x, action, gemm);
+}
+
+/// Per-rank contiguous block ranges of the sharded scaling. Ranks split by
+/// cost, not count: a PSD block's congruence product is ~n^3 while orthant
+/// rows are ~n.
+pub(super) fn scaling_parts<T>(blocks: &[Block<T>], ranks: usize) -> Vec<(usize, usize)> {
+    let costs: Vec<u64> = blocks
+        .iter()
+        .map(|b| {
+            let n = (b.rows.end - b.rows.start) as f64;
+            match &b.scaling {
+                Scaling::Psd(_) => n.powf(1.5).max(1.0) as u64,
+                _ => n.max(1.0) as u64,
+            }
+        })
+        .collect();
+    crate::mpi::cost_ranges(&costs, ranks)
+}
+
+/// This rank's row span and every rank's `(offset, len)` row range under
+/// [`scaling_parts`].
+pub(super) fn rank_rows<T>(
+    blocks: &[Block<T>],
+    world: crate::mpi::World,
+) -> ((usize, usize), Vec<(usize, usize)>) {
+    let span = |slice: &[Block<T>]| {
+        let (s, e) = slice
+            .iter()
+            .map(|b| (b.rows.start, b.rows.end))
+            .fold((usize::MAX, 0usize), |(a0, a1), (s, e)| {
+                (a0.min(s), a1.max(e))
+            });
+        if s > e {
+            (0, 0)
+        } else {
+            (s, e)
+        }
+    };
+    let parts = scaling_parts(blocks, world.size());
+    let (b0, len) = parts[world.rank()];
+    let ranges = parts
+        .iter()
+        .map(|&(b0, len)| {
+            if len == 0 {
+                (0, 0)
+            } else {
+                let (s, e) = span(&blocks[b0..b0 + len]);
+                (s, e - s)
+            }
+        })
+        .collect();
+    (span(&blocks[b0..b0 + len]), ranges)
+}
+
+/// Scale this rank's blocks of `x` (its row span) without exchanging:
+/// returns the rank's output segment.
+pub(super) fn scale_owned<T: FloatT>(
+    world: crate::mpi::World,
+    pool: &Option<Arc<rayon::ThreadPool>>,
+    tiles: usize,
+    blocks: &mut [Block<T>],
+    x: &[T],
+    action: ScalingAction<'_, T>,
+) -> Vec<T> {
+    let gemm = pool.as_ref().map(|pool| (pool.as_ref(), tiles.max(1)));
+    let (b0, len) = scaling_parts(blocks, world.size())[world.rank()];
+    let owned = &mut blocks[b0..b0 + len];
+    let mut local = vec![T::zero(); x.len()];
+    // One lane per owned block keeps block-level parallelism inside the
+    // rank; a serial block walk would leave the pool idle between the
+    // per-block GEMM tiles.
+    let timer = crate::receipt::start();
+    if let Some(pool) = pool.as_ref().filter(|_| owned.len() > 1) {
+        let lanes: Vec<usize> = (0..owned.len()).collect();
+        pool.install(|| split_scaling(owned, &mut local, x, action, &lanes, gemm));
+    } else {
+        apply_blocks(owned, &mut local, x, action, gemm);
+    }
+    crate::receipt::finish("scale.local", timer);
+    local
 }
 
 pub(super) fn split_scaling<T: FloatT>(

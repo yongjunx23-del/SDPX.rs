@@ -222,8 +222,9 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 && self.refine_solution(&mut x, rhs, settings);
             if flags[c] {
                 if settings.iterative_refinement_enable {
-                    self.scaled_solutions[c * self.A.m..(c + 1) * self.A.m]
-                        .copy_from_slice(&self.workh);
+                    let m = self.A.m;
+                    let product = self.scaled_product().to_vec();
+                    self.scaled_solutions[c * m..(c + 1) * m].copy_from_slice(&product);
                     self.scaled_valid[c] = true;
                 }
                 out[c * width..(c + 1) * width].copy_from_slice(&x);
@@ -259,7 +260,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             }
             if settings.iterative_refinement_enable {
                 self.scaled_solutions.resize(self.A.m, T::zero());
-                self.scaled_solutions.copy_from_slice(&self.workh);
+                let product = self.scaled_product().to_vec();
+                self.scaled_solutions.copy_from_slice(&product);
                 self.scaled_valid[0] = true;
             }
             // As in upstream DirectLDL, refinement may stop at a finite

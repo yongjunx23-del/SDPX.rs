@@ -149,7 +149,13 @@ allocating temporaries. BLAS providers must support concurrent calls from
 workers (source-built OpenBLAS needs `USE_LOCKING=1`).
 
 MPI is loaded at runtime. The ordinary MPI path replicates input data and
-combines sampled products. The generic `arrow` backend distributes its
+shards the expensive work by blocks. Sampled forward/adjoint products and
+condensed scaling share one rank partition, so a condensed solve keeps
+intermediate vectors on their owning rank and exchanges each result once;
+the sampled operator's linear part is sharded by columns (adjoint) or by
+its entry-holding rows (forward). Sharded, pooled and serial sparse products
+use the same per-output arithmetic, so results do not depend on the thread
+count. The generic `arrow` backend distributes its
 leaves: each rank factors a cost-balanced contiguous range of leaves, the
 border Schur complement is summed in rank order and factored on every rank,
 and solves gather the leaf solutions. Exact refinement residual rows are

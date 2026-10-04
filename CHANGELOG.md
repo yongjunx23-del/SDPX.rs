@@ -6,6 +6,23 @@ solves; the experiment log is [docs/JOURNAL.md](docs/JOURNAL.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- MPFR sparse products (pooled lanes, MPI-sharded products and residual
+  products) now use exactly the CSC gemv arithmetic. In 0.9.0 a solve's
+  point depended on the thread count for sampled MPFR problems.
+
+### Performance
+
+- Generic arrow leaves skip border columns they are not coupled to (Y
+  columns, Schur contributions and solve dots), cutting refactor work about
+  10% on mixed Λ27; points are unchanged.
+- Sampled JSON block files are parsed in parallel (Λ11 load 0.30 → 0.07 s).
+- MPI: condensed scaling and the sampled products share one block
+  partition; prepare/recover/residual keep rank-local rows and exchange once,
+  and the sampled linear part is sharded. Mixed Λ27 (1024 bits, 4 nodes ×
+  32 threads, same allocation): 3 iterations 124.8 → 117 s (−6%).
+
 ## [0.9.0] - 2026-10-04
 
 ### Performance: SOC elimination, dense panels, distributed arrow (2026-10-04)

@@ -5815,3 +5815,87 @@ Test-suite repair after the g0 work (all 442 + 201 tests pass):
 Pinned after these changes: medium Solved/19 point `fd1437ee79ac39e0`,
 csdr3 Solved/57 PASS, ising11 Solved/52 PASS; ising11 at 1/2/3 MPI ranks
 Solved/52 (6.4/4.1/4.4 s, 2 threads each).
+
+## 2026-10-05 — Multi-node Λ27 after 0.9.0; SDPB at matched precision/threads
+
+Input: mixed Λ27 (m 544,653, n 18,703, 117 sampled PSD blocks, arrow border
+524), 1024 bits, 32 threads per node (SDPX: one rank per node; SDPB: 32 ranks
+per node), UCAS cluster, OpenMPI over ib0 TCP, node70 excluded (it hangs
+multi-node jobs: 222592, 222616, 222619, 222620 were deleted for that).
+
+SDPX 0.9.0, 3 iterations (`wall.solve` includes the start iteration):
+
+| Nodes | wall.solve | IP (3 it) | refactor | kkt solve | scale cones | process |
+|---|---|---|---|---|---|---|
+| 1 (222600) | 190.7 s | 152.4 s | 81.0 s | 13.6 s | 24.0 s | 5:52 |
+| 2 (222621) | 162.2 s | 137.0 s | 50.5 s | 24.5 s | 19.3 s | 5:33 |
+| 4 (222602) | 132.9 s | 109.5 s | 31.1 s | 20.7 s | 14.8 s | 5:20 |
+
+Per-rank load 65–77 s and setup ~90 s (presolve_rank 24 s) are replicated.
+Scaling stops at the parts every rank repeats: border solves, residual
+scaling and sampled products in the KKT solves (~45 s at 4 nodes, not
+shrinking), m-vector gathers (11.6 s), and cone-scaling tails.
+
+SDPB (same input via `pmp2sdp --precision 1024`, thresholds 1e-30), cumulative
+solver time after iterations 1/2/3: 1 node 112/255/398 s (process 12:20);
+2 nodes 39/105/181 s (4:52); 4 nodes 54/111/195 s (5:22). A 4-node run
+sharing node31 with the 1-node job took 477 s and is discarded.
+
+Full solve, 4 nodes: SDPX (arm with rejected balance changes, numerically
+identical to 0.9.0) Solved in 42 iterations, solve 1608 s, process 28:59
+(job 222615).
+
+Rejected (same-allocation A/B, 4 nodes, 3 iterations, job 222629:
+0.9.0 128.4/124.9 s vs 132.4 s):
+
+- Fused sampled RHS under MPI (owners condense/recover, adjoints gathered):
+  works at 1–4 ranks but disables forward reuse in the residual (26 instead
+  of 12 forward products) and doubles recover scaling; 4 nodes 161.9 s vs
+  132.9 s.
+- Cost-balanced (h²·kmax) block partition for sharded sampled products,
+  largest-first cone scaling under MPI with inner splitting, and rank-local
+  scaling tiles: bitwise identical, no gain (sampled adjoint and solves
+  slightly slower).
+- Leaf cost model by coupled border width: leaves finish unevenly
+  (`arrow.border_sum` wait 2 → 6 s on rank 0).
+
+### MPFR thread-count dependence in sparse products (bug in 0.9.0, fixed)
+
+0.9.0 made MPFR CSC `gemv` exact per output (columns with ≥ 4 entries; rows
+when nnz ≥ 4m) but the pooled `SparseParallel` lanes and the rank-sharded
+`product_sharded` kept the rounded per-term chain. One-thread and pooled runs
+therefore differed: ising11 512-bit point `fecc053686f5` at 1 thread vs
+`2930df70fec0` at 4 threads (both Solved/52, audits pass); mixed Λ11 differed
+likewise; g0 256 was unaffected. Fix: one per-output kernel
+(`csc::wide_output`) used by gemv, the pooled lanes, the sharded product and
+the residual products (the separate all-exact residual kernel is removed).
+After the fix ising11 and Λ11 points agree at 1 and 4 threads
+(`fecc053686f5`); g0 256 changes to `01a08d6b4f` (Solved/117, audit accepted,
+primal 7.5e-44); medium/csdr3/ising11 audits pass. A regression test
+(`wide_exact_parity_*`) covers long columns and dense rows; the old
+`kernel_equivalence` matrix only had short columns.
+
+### Kept after 0.9.0: aligned single-exchange products (same allocation A/B)
+
+Measurement method: `aba.pbs` runs A B A B in one PBS allocation (4 nodes ×
+32 threads, exclusive request, node70 excluded); cross-allocation runs vary
+±5% and are not used for decisions.
+
+| Arm (job) | wall.solve A/B/A/B | Verdict |
+|---|---|---|
+| coupled columns (222634, 2 nodes) | 161.0 / 155.6 / 161.7 / 160.8 | −2.0%, refactor −10%: kept |
+| coupled columns (222635, 4 nodes) | 132.3 / 132.9 / 135.0 / 128.4 | −1.4%: kept |
+| + exact-rule fix, sharded linear part (222640) | 132.2 / 141.7 / 131.7 / 142.8 | +8%: linear forward gathered all m rows |
+| + aligned partition, active-row linear forward (222647) | 132.3 / 128.1 / 131.1 / 132.4 | −1%: forward rows ran 8 tasks only |
+| + one task per active row (222652) | 124.8 / 118.9 / 124.7 / 115.2 | −6.2%: kept |
+
+The sampled linear part of Λ27 is 544,653 × 18,703 with 5.2 M entries in
+525 rows (the equalities). Aligned partition: the sampled products use the
+condensed scaling partition, so prepare skips the scaling exchange, recover
+skips the forward exchange, and the residual exchanges `ez` once; the
+partial `H·z` is gathered once when copied out after refinement. Points are
+bitwise identical to the non-aligned path at 1–4 local ranks.
+
+Full solves, 4 nodes × 32 threads, 1024 bits: SDPX Solved/42, solve 1608 s,
+process 28:59 (222615); SDPB "found primal-dual optimal solution"/125,
+solver runtime 2592 s, process 43:17, 689 MB per process (222630, node3/4/5/7).

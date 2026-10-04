@@ -186,24 +186,15 @@ impl SparseParallel {
             );
             return;
         }
-        // MPFR uses one exact accumulation per output, serial and pooled
-        // alike, so every thread count produces the same residual bits.
-        let exact = T::precision_bits() > 64;
+        // Pooled and serial products share the CSC gemv arithmetic, so every
+        // thread count produces the same residual bits.
         if let Some(pool) = &self.pool {
             // One entry into the pool for both products. Phases are joined;
             // no outer tasks compete with a nested full-budget product.
             pool.install(|| {
-                if exact {
-                    self.apply_exact(a, true, rx, z, -T::one(), T::zero());
-                    self.apply_exact(a, false, rz, x, T::one(), T::one());
-                } else {
-                    self.apply_in_pool(a, true, rx, z, -T::one(), T::zero());
-                    self.apply_in_pool(a, false, rz, x, T::one(), T::one());
-                }
+                self.apply_in_pool(a, true, rx, z, -T::one(), T::zero());
+                self.apply_in_pool(a, false, rz, x, T::one(), T::one());
             });
-        } else if exact {
-            self.apply_exact(a, true, rx, z, -T::one(), T::zero());
-            self.apply_exact(a, false, rz, x, T::one(), T::one());
         } else {
             a.t().gemv(rx, z, -T::one(), T::zero());
             a.gemv(rz, x, T::one(), T::one());
@@ -261,21 +252,8 @@ impl SparseParallel {
         // the same base as the serial product.
         let mut local = y[o0..o0 + len].to_vec();
         let ptr = if transpose { &a.colptr } else { &self.rowptr };
-        let compute = |output: usize, value: &mut T| {
-            scale_output(value, beta);
-            if alpha == T::zero() {
-                return;
-            }
-            if transpose {
-                for position in a.colptr[output]..a.colptr[output + 1] {
-                    accumulate(value, a.nzval[position], x[a.rowval[position]], alpha);
-                }
-            } else {
-                for entry in &self.entries[self.rowptr[output]..self.rowptr[output + 1]] {
-                    accumulate(value, a.nzval[entry.position], x[entry.column], alpha);
-                }
-            }
-        };
+        let compute =
+            |output: usize, value: &mut T| self.output(a, transpose, output, value, x, alpha, beta);
         // Two-level parallelism: the rank's output span also splits across
         // the thread pool; every output keeps its original order either way.
         let workers = self.pool.as_ref().map_or(1, |p| p.current_num_threads());
@@ -298,53 +276,71 @@ impl SparseParallel {
         world.gather_slice(site, &local, &gather_ranges, y);
     }
 
-    // Same outputs as apply_in_pool but each is one exact accumulation
-    // rounded once, so serial and pooled runs agree bitwise at MPFR width.
-    fn apply_exact<T: FloatT>(
+    /// Rows of `a` holding entries, and their prefix work (entries plus one
+    /// per row) for [`Self::forward_sharded_active`].
+    pub(crate) fn active_rows(&self) -> (Vec<usize>, Vec<usize>) {
+        let rows: Vec<usize> = (0..self.rowptr.len() - 1)
+            .filter(|&r| self.rowptr[r + 1] > self.rowptr[r])
+            .collect();
+        let mut ptr = Vec::with_capacity(rows.len() + 1);
+        ptr.push(0);
+        for &r in &rows {
+            ptr.push(ptr.last().unwrap() + self.rowptr[r + 1] - self.rowptr[r] + 1);
+        }
+        (rows, ptr)
+    }
+
+    /// Rank-sharded forward product exchanging only the rows that hold
+    /// entries (`active`, with work prefix `ptr` from [`Self::active_rows`]);
+    /// every other output takes the `beta` scaling alone, as gemv does.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_sharded_active<T: FloatT>(
         &self,
         a: &CscMatrix<T>,
-        transpose: bool,
         y: &mut [T],
         x: &[T],
         alpha: T,
         beta: T,
+        world: crate::mpi::World,
+        site: usize,
+        (active, ptr): (&[usize], &[usize]),
     ) {
-        let compute = |output: usize, y: &mut T| {
-            scale_output(y, beta);
-            if alpha == T::zero() {
-                return;
+        let count = active.len();
+        let lanes = partitions(ptr, world.size());
+        let ranges: Vec<(usize, usize)> = (0..world.size())
+            .map(|r| {
+                let begin = lanes.get(r).copied().unwrap_or(count);
+                let end = lanes.get(r + 1).copied().unwrap_or(count);
+                (begin, end - begin)
+            })
+            .collect();
+        let (o0, len) = ranges[world.rank()];
+        let mut local: Vec<T> = active[o0..o0 + len].iter().map(|&r| y[r]).collect();
+        let compute =
+            |k: usize, value: &mut T| self.output(a, false, active[o0 + k], value, x, alpha, beta);
+        match &self.pool {
+            // Active rows are few and long (one per equality): one task each.
+            Some(pool) if pool.current_num_threads() > 1 && len > 1 => {
+                use rayon::prelude::*;
+                pool.install(|| {
+                    local
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(k, v)| compute(k, v))
+                });
             }
-            let dot = if transpose {
-                T::dot_fma(
-                    (a.colptr[output]..a.colptr[output + 1])
-                        .map(|p| (&a.nzval[p], &x[a.rowval[p]])),
-                )
-            } else {
-                T::dot_fma(
-                    self.entries[self.rowptr[output]..self.rowptr[output + 1]]
-                        .iter()
-                        .map(|e| (&a.nzval[e.position], &x[e.column])),
-                )
-            };
-            if alpha == -T::one() {
-                *y -= dot;
-            } else if alpha == T::one() {
-                *y += dot;
-            } else {
-                *y += alpha * dot;
-            }
-        };
-        let lanes = if transpose {
-            &self.column_lanes
-        } else {
-            &self.row_lanes
-        };
-        if lanes.len() <= 1 {
-            for (output, y) in y.iter_mut().enumerate() {
-                compute(output, y);
-            }
-        } else {
-            split_outputs(y, lanes, &compute);
+            _ => local
+                .iter_mut()
+                .enumerate()
+                .for_each(|(k, v)| compute(k, v)),
+        }
+        for value in y.iter_mut() {
+            scale_output(value, beta);
+        }
+        let mut all = vec![T::zero(); count];
+        world.gather_slice(site, &local, &ranges, &mut all);
+        for (&r, v) in active.iter().zip(all) {
+            y[r] = v;
         }
     }
 
@@ -371,21 +367,57 @@ impl SparseParallel {
             return;
         }
         split_outputs(y, lanes, &|output, y| {
-            scale_output(y, beta);
-            if alpha == T::zero() {
-                return;
-            }
-            if transpose {
-                for position in a.colptr[output]..a.colptr[output + 1] {
-                    accumulate(y, a.nzval[position], x[a.rowval[position]], alpha);
-                }
-            } else {
-                for entry in &self.entries[self.rowptr[output]..self.rowptr[output + 1]] {
-                    accumulate(y, a.nzval[entry.position], x[entry.column], alpha);
-                }
-            }
+            self.output(a, transpose, output, y, x, alpha, beta)
         });
     }
+
+    /// One output of `y = alpha·op(A)·x + beta·y` with exactly the CSC gemv
+    /// arithmetic, so serial, pooled and rank-sharded products agree bitwise.
+    /// Wide precision: a column with at least four entries (and, when
+    /// nnz ≥ 4m, every row) is one exact accumulation including the incoming
+    /// y for alpha = ±1, rounded once; other outputs use the rounded chain.
+    #[allow(clippy::too_many_arguments)]
+    fn output<T: FloatT>(
+        &self,
+        a: &CscMatrix<T>,
+        transpose: bool,
+        output: usize,
+        y: &mut T,
+        x: &[T],
+        alpha: T,
+        beta: T,
+    ) {
+        scale_output(y, beta);
+        if alpha == T::zero() {
+            return;
+        }
+        let wide = T::precision_bits() > 64;
+        if transpose {
+            let (s, e) = (a.colptr[output], a.colptr[output + 1]);
+            let terms = (s..e).map(|p| (&a.nzval[p], &x[a.rowval[p]]));
+            if wide && e - s >= 4 {
+                exact_output(y, terms, alpha);
+            } else {
+                terms.for_each(|(&v, &xv)| accumulate(y, v, xv, alpha));
+            }
+        } else {
+            let row = &self.entries[self.rowptr[output]..self.rowptr[output + 1]];
+            let terms = row.iter().map(|e| (&a.nzval[e.position], &x[e.column]));
+            if wide && a.nnz() >= 4 * a.m {
+                exact_output(y, terms, alpha);
+            } else {
+                terms.for_each(|(&v, &xv)| accumulate(y, v, xv, alpha));
+            }
+        }
+    }
+}
+
+fn exact_output<'a, T: FloatT + 'a>(
+    y: &mut T,
+    terms: impl Iterator<Item = (&'a T, &'a T)>,
+    alpha: T,
+) {
+    *y = crate::algebra::csc::wide_output(*y, terms, alpha, T::one());
 }
 
 // Preserve CSC gemv's scalar branches, including zero-beta clearing NaNs and

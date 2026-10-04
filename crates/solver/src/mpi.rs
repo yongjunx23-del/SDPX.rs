@@ -727,11 +727,6 @@ impl World {
     }
 
     /// The `[begin, end)` range of `count` items owned by this rank.
-    pub(crate) fn range(&self, count: usize) -> std::ops::Range<usize> {
-        let r = ranges(count, self.size as usize)[self.rank as usize];
-        r.0..r.0 + r.1
-    }
-
     pub(crate) fn abort(&self, reason: &str) -> ! {
         eprintln!(
             "mpi: rank {}/{} fatal collective error: {reason}",

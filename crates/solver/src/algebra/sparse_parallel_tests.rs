@@ -101,6 +101,56 @@ fn kernel_equivalence<T: FloatT>() {
     }
 }
 
+// Long columns and dense rows take the wide-precision exact path in CSC
+// gemv; pooled lanes must reproduce it bitwise at every thread count.
+fn wide_exact_parity<T: FloatT>() {
+    let (m, n) = (6, 40);
+    let mut colptr = vec![0];
+    let (mut rowval, mut nzval) = (Vec::new(), Vec::new());
+    for j in 0..n {
+        for i in 0..m {
+            if (i + j) % 7 != 0 {
+                rowval.push(i);
+                nzval.push(num::<T>(i * 13 + j * 7 + 1) / num::<T>(j % 9 + 3));
+            }
+        }
+        colptr.push(rowval.len());
+    }
+    let a = CscMatrix::new(m, n, colptr, rowval, nzval);
+    let mut plan = SparseParallel::new(&a);
+    let mut cones = CompositeCone::<T>::new(&[NonnegativeConeT(32768)]);
+    for threads in [2, 4] {
+        cones.configure_threads(threads).unwrap();
+        plan.configure(&a, cones.thread_pool());
+        for transpose in [false, true] {
+            let len = if transpose { n } else { m };
+            let xlen = if transpose { m } else { n };
+            let x: Vec<T> = (0..xlen).map(|i| num::<T>(i + 2) / num::<T>(11)).collect();
+            for alpha in [T::one(), -T::one(), num::<T>(3) / num::<T>(7)] {
+                let mut serial: Vec<T> = (0..len).map(|i| num::<T>(i + 1) / num::<T>(3)).collect();
+                let mut pooled = serial.clone();
+                if transpose {
+                    a.t().gemv(&mut serial, &x, alpha, T::one());
+                } else {
+                    a.gemv(&mut serial, &x, alpha, T::one());
+                }
+                plan.pool.as_ref().unwrap().install(|| {
+                    plan.apply_in_pool(&a, transpose, &mut pooled, &x, alpha, T::one())
+                });
+                same(&serial, &pooled);
+            }
+        }
+    }
+}
+#[test]
+fn wide_exact_parity_f64() {
+    wide_exact_parity::<f64>();
+}
+#[test]
+fn wide_exact_parity_mpfr256() {
+    wide_exact_parity::<sdpx_arithmetic::Bits256>();
+}
+
 #[test]
 fn sparse_products_f64() {
     kernel_equivalence::<f64>();

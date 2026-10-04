@@ -277,6 +277,10 @@ struct Leaf<T> {
     signs: Vec<i8>,
     // Structurally zero prefix of the border coupling (zero for shared SOCs).
     coupling_start: usize,
+    // Border columns with a structural B entry (all for local structures).
+    // Other Y columns stay exactly zero, so they are skipped everywhere.
+    coupled: Vec<usize>,
+    couples: Vec<bool>,
     h: Vec<T>,
     b: Vec<T>,
     factor: DenseLeaf<T>,
@@ -296,6 +300,8 @@ impl<T: FloatT> Leaf<T> {
             ids,
             signs: vec![1],
             coupling_start: 0,
+            coupled: (0..t).collect(),
+            couples: vec![true; t],
             h: vec![T::zero(); g * g],
             b: vec![T::zero(); g * t],
             factor: DenseLeaf::new(g),
@@ -348,15 +354,16 @@ impl<T: FloatT> Leaf<T> {
         let start = self.coupling_start;
         let width = g - start;
         self.y.copy_from_slice(&self.b);
+        let (factor, couples) = (&self.factor, &self.couples);
         if split && width > 0 {
-            let factor = &self.factor;
             self.y
                 .par_chunks_mut(width)
-                .for_each(|column| factor.forward_suffix(column, start));
+                .enumerate()
+                .filter(|(j, _)| couples[*j])
+                .for_each(|(_, column)| factor.forward_suffix(column, start));
         } else {
-            for j in 0..t {
-                self.factor
-                    .forward_suffix(&mut self.y[j * width..(j + 1) * width], start);
+            for &j in &self.coupled {
+                factor.forward_suffix(&mut self.y[j * width..(j + 1) * width], start);
             }
         }
         if !self.z.is_empty() {
@@ -375,30 +382,35 @@ impl<T: FloatT> Leaf<T> {
     /// column max(r, c), so columns update disjoint entries in parallel.
     fn subtract_contribution(&self, s: &mut [T], t: usize, pool: Option<&rayon::ThreadPool>) {
         let g = self.ids.len();
-        let (y, dinv) = (&self.y, &self.factor.dinv);
-        let column = |j: usize| -> Vec<T> {
+        let (y, dinv, coupled) = (&self.y, &self.factor.dinv, &self.coupled);
+        // Only coupled columns are nonzero; uncoupled entries would add 0.
+        let column = |c: usize| -> Vec<T> {
+            let j = coupled[c];
             let z: Vec<T> = (0..g).map(|k| y[k + j * g] * dinv[k]).collect();
-            (0..=j)
-                .map(|i| T::dot_fma(y[i * g..(i + 1) * g].iter().zip(&z)))
+            coupled[..=c]
+                .iter()
+                .map(|&i| T::dot_fma(y[i * g..(i + 1) * g].iter().zip(&z)))
                 .collect()
         };
-        let mut apply = |j: usize, values: Vec<T>| {
-            for (i, a) in values.into_iter().enumerate() {
+        let mut apply = |c: usize, values: Vec<T>| {
+            let j = coupled[c];
+            for (&i, a) in coupled.iter().zip(values) {
                 s[i + j * t] -= a;
                 if i != j {
                     s[j + i * t] -= a;
                 }
             }
         };
+        let k = coupled.len();
         match pool {
-            Some(pool) if t > 1 => {
+            Some(pool) if k > 1 => {
                 let columns: Vec<Vec<T>> =
-                    pool.install(|| (0..t).into_par_iter().map(column).collect());
-                for (j, values) in columns.into_iter().enumerate() {
-                    apply(j, values);
+                    pool.install(|| (0..k).into_par_iter().map(column).collect());
+                for (c, values) in columns.into_iter().enumerate() {
+                    apply(c, values);
                 }
             }
-            _ => (0..t).for_each(|j| apply(j, column(j))),
+            _ => (0..k).for_each(|c| apply(c, column(c))),
         }
     }
 
@@ -435,7 +447,7 @@ impl<T: FloatT> Leaf<T> {
                 let s = if i < self.coupling_start {
                     T::zero()
                 } else {
-                    T::dot_fma((0..xt.len() / cols).map(|j| {
+                    T::dot_fma(self.coupled.iter().map(|&j| {
                         (
                             &self.coupling_values()[self.coupling_index(i, j)],
                             &xt[j * cols + c],
@@ -475,8 +487,9 @@ impl<T: FloatT> Leaf<T> {
                 T::zero()
             } else {
                 T::dot_fma(
-                    (0..xt.len())
-                        .map(|j| (&self.coupling_values()[self.coupling_index(i, j)], &xt[j])),
+                    self.coupled
+                        .iter()
+                        .map(|&j| (&self.coupling_values()[self.coupling_index(i, j)], &xt[j])),
                 )
             };
             self.w[i] = (self.w[i] - s) * self.factor.dinv[i];
@@ -754,6 +767,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         leaf.y.resize(width * t, T::zero());
                         leaf.z.resize(width * t, T::zero());
                     }
+                    leaf.coupled = (0..t).collect();
+                    leaf.couples = vec![true; t];
                 }
                 leaf
             })
@@ -812,6 +827,28 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         panels.residual_entries.push((q, i, j));
                     }
                 }
+            }
+        }
+        if local_structure.is_none() {
+            for leaf in &mut solver.leaves {
+                leaf.couples.fill(false);
+            }
+            for j in 0..k.n {
+                for q in k.colptr[j]..k.colptr[j + 1] {
+                    let i = k.rowval[q];
+                    match (solver.owner[i], solver.owner[j]) {
+                        (x, usize::MAX) if x != usize::MAX => {
+                            solver.leaves[x].couples[solver.local[j]] = true
+                        }
+                        (usize::MAX, y) if y != usize::MAX => {
+                            solver.leaves[y].couples[solver.local[i]] = true
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for leaf in &mut solver.leaves {
+                leaf.coupled = (0..t).filter(|&j| leaf.couples[j]).collect();
             }
         }
         solver.update_entries(0..k.nzval.len(), |q, value| *value = k.nzval[q]);
@@ -1112,7 +1149,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                     (0..width).map(move |i| (&leaf.coupling_values()[i + j * width], &leaf.v[i]))
                 }));
             } else {
-                for leaf in &leaves[owned.clone()] {
+                for leaf in leaves[owned.clone()].iter().filter(|l| l.couples[j]) {
                     let g = leaf.ids.len();
                     *v -= T::dot_fma(
                         (0..g).map(|i| (&leaf.coupling_values()[i + j * g], &leaf.v[i])),
@@ -1314,7 +1351,7 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
                     }));
                 }
             } else {
-                for leaf in &leaves[owned.clone()] {
+                for leaf in leaves[owned.clone()].iter().filter(|l| l.couples[j]) {
                     let g = leaf.ids.len();
                     for (c, v) in row.iter_mut().enumerate() {
                         *v -= T::dot_fma((0..g).map(|i| {
@@ -1411,7 +1448,9 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
             .filter(|w| w.size() > 1 && self.local_structure.is_none())
             .map(|world| {
                 let t = self.trunk.len() as u64;
-                // Leaf work: contribution g·t²/2, Y = L⁻¹B g²·t/2, factor g³/3.
+                // Leaf work: contribution g·t²/2, Y = L⁻¹B g²·t/2, factor
+                // g³/3. Measured on Λ27, the full border width balances ranks
+                // better than the coupled width (whose leaves finish early).
                 let costs: Vec<u64> = self
                     .leaves
                     .iter()

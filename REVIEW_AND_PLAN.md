@@ -56,6 +56,13 @@ The g0 audit's primal residual uses the reported s; SDPX reports its iterate
 (1.6e-4 consistency on tiny rows), MOSEK reports b − Ax. Ruiz bounds
 1e-4/1e4 (a settings option) cut 256-bit to 65 iterations / ~1.95 s.
 
+Mixed Λ27 at 1024 bits, 4 nodes × 32 threads (SDPX one rank per node, SDPB
+32 ranks per node, thresholds 1e-30), full solves: SDPX Solved/42, solve
+1608 s, process 29 min; SDPB optimal/125, solver 2592 s, process 43 min.
+Per iteration (3-iteration runs) SDPX 51/46/37 s on 1/2/4 nodes vs SDPB
+143/70/65 s. Kept since 0.9.0 (same-allocation A/B, 4 nodes): coupled-column
+arrow work and aligned single-exchange sampled/scaling products, −6%.
+
 Distributed arrow (mixed Λ27, MPFR1024, 3 iterations, 32 threads per node,
 UCAS cluster): per-iteration time ~670 s → ~50 s on one node (leaf
 contributions on the fly, column-parallel leaves, cap by KKT size). Two
@@ -140,7 +147,7 @@ regularization and refinement stay unchanged.
 
 | Order | Action | Acceptance / constraint |
 |---|---|---|
-| 0 | Multi-node scaling of the ordinary MPI path | Distributed arrow is in place. Next: shard cone scaling (`affine_ds` and friends need all λ), avoid replicated m-vector gathers, fused sampled path under MPI, then a 1/2/4-node Λ27 campaign avoiding node70. Retire the owner-partitioned path only after it is beaten. |
+| 0 | Multi-node scaling of the ordinary MPI path | Distributed arrow and aligned sampled/scaling exchanges are in place. Remaining replicated work at 4 nodes: border (trunk) solves ~8 s, Gram republish (`sync`) ~6.5 s, cone-scaling tails, m-vector exchanges ~9 s, per-rank load/setup ~2.5 min. Measure with same-allocation A/B (`aba.pbs`), never across node sets (±5%). Avoid node70. Retire the owner-partitioned path only after it is beaten. |
 | 1 | Profile remaining exact residual and sampled/PSD work | Diagonal reserve222441 is kept; single-product scratch gate passes. Target measured complete-solve costs with unchanged exact operator/rounding. |
 | 2 | Optimize Lambda sampled RHS/KKT and PSD scaling | Target current dominant costs; ≥2% audited solve gain or clear memory/correctness benefit. Preserve exact operator/rounding contracts. |
 | 3 | Inspect remaining storage/setup lifetimes | Preserve shifted factorization versus unshifted residual operators; structural counts alone do not establish RSS. |

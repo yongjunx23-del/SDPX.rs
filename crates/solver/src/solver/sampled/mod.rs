@@ -564,6 +564,48 @@ impl<T: FloatT> SampledOperator<T> {
         work: &mut SampledWorkspace<T>,
         pool: Option<&Arc<rayon::ThreadPool>>,
     ) {
+        self.apply_forward(y, x, alpha, beta, work, pool, true);
+    }
+
+    /// `apply_with_pool` that, under MPI, leaves only this rank's sampled
+    /// block rows (and the linear rows) valid in `y`, skipping the exchange;
+    /// the caller gathers its own combined result over the same partition.
+    pub(crate) fn apply_owned_with_pool(
+        &self,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+        work: &mut SampledWorkspace<T>,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) {
+        self.apply_forward(y, x, alpha, beta, work, pool, false);
+    }
+
+    /// Per-rank `(first block, count)` for the sharded products: the
+    /// workspace's assigned partition (shared with the caller's scaling)
+    /// or an even split.
+    fn rank_parts(
+        &self,
+        work: &SampledWorkspace<T>,
+        world: crate::mpi::World,
+    ) -> Vec<(usize, usize)> {
+        work.parts
+            .clone()
+            .unwrap_or_else(|| crate::mpi::ranges(self.blocks.len(), world.size()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_forward(
+        &self,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+        work: &mut SampledWorkspace<T>,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+        gather: bool,
+    ) {
         if !work.parallel_eligible(self, pool) || alpha == T::zero() {
             return self.apply(y, x, alpha, beta, work);
         }
@@ -577,21 +619,23 @@ impl<T: FloatT> SampledOperator<T> {
                 // Rank-sharded forward pass. Each rank evaluates a contiguous
                 // block range on its own row segment; gathered segments
                 // reproduce the serial result bitwise.
-                let block_range = world.range(self.blocks.len());
+                let parts = self.rank_parts(work, world);
+                let (b0, len) = parts[world.rank()];
+                let block_range = b0..b0 + len;
                 let (row_begin, row_end) = block_row_span(&self.blocks[block_range.clone()]);
-                let gather_ranges: Vec<(usize, usize)> =
-                    crate::mpi::ranges(self.blocks.len(), world.size())
-                        .iter()
-                        .map(|&(b0, len)| {
-                            if len == 0 {
-                                (0, 0)
-                            } else {
-                                let (begin, end) = block_row_span(&self.blocks[b0..b0 + len]);
-                                (begin, end - begin)
-                            }
-                        })
-                        .collect();
+                let gather_ranges: Vec<(usize, usize)> = parts
+                    .iter()
+                    .map(|&(b0, len)| {
+                        if len == 0 {
+                            (0, 0)
+                        } else {
+                            let (begin, end) = block_row_span(&self.blocks[b0..b0 + len]);
+                            (begin, end - begin)
+                        }
+                    })
+                    .collect();
                 let mut local = y[row_begin..row_end].to_vec();
+                let timer = crate::receipt::start();
                 pool.unwrap().install(|| {
                     forward_disjoint(
                         &self.blocks[block_range.clone()],
@@ -603,7 +647,12 @@ impl<T: FloatT> SampledOperator<T> {
                         chunks,
                     );
                 });
-                world.gather_slice(crate::mpi::SITE_FORWARD, &local, &gather_ranges, y);
+                crate::receipt::finish("sampled.fwd.local", timer);
+                if gather {
+                    world.gather_slice(crate::mpi::SITE_FORWARD, &local, &gather_ranges, y);
+                } else {
+                    y[row_begin..row_end].copy_from_slice(&local);
+                }
                 return;
             }
             pool.unwrap().install(|| {
@@ -613,9 +662,12 @@ impl<T: FloatT> SampledOperator<T> {
         }
         let chunks = block_chunks(&self.blocks, pool);
         let world = self.mpi_world();
-        let active = world
-            .map(|w| w.range(self.blocks.len()))
-            .unwrap_or(0..self.blocks.len());
+        let parts = world.map(|w| self.rank_parts(work, w));
+        let active = match (&parts, world) {
+            (Some(parts), Some(w)) => parts[w.rank()].0..parts[w.rank()].0 + parts[w.rank()].1,
+            _ => 0..self.blocks.len(),
+        };
+        let local_timer = crate::receipt::start();
         assign_block_ways(
             &mut work.blocks[active.clone()],
             0,
@@ -675,15 +727,28 @@ impl<T: FloatT> SampledOperator<T> {
                     w.cost[0] = start.elapsed().as_secs_f64() * ways as f64;
                 })
         });
+        crate::receipt::finish("sampled.fwd.local", local_timer);
+        if world.is_some() && !gather {
+            for (b, w) in self.blocks[active.clone()].iter().zip(&work.blocks[active]) {
+                if b.basis_cols == 0 {
+                    continue;
+                }
+                for (i, term) in w.forward[..b.row_count()].iter().enumerate() {
+                    y[b.row_start + i] += *term;
+                }
+            }
+            return;
+        }
         if let Some(world) = world {
             // Gather per-block terms in block order; column ranges may
             // overlap, so the exchange layout is a per-block concatenation.
             let offsets = term_offsets(&self.blocks, SampledBlock::row_count);
-            let gather_ranges: Vec<(usize, usize)> =
-                crate::mpi::ranges(self.blocks.len(), world.size())
-                    .iter()
-                    .map(|&(b0, len)| (offsets[b0], offsets[b0 + len] - offsets[b0]))
-                    .collect();
+            let gather_ranges: Vec<(usize, usize)> = parts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|&(b0, len)| (offsets[b0], offsets[b0 + len] - offsets[b0]))
+                .collect();
             let (t0, t1) = (offsets[active.start], offsets[active.end]);
             let mut local = Vec::with_capacity(t1 - t0);
             for (b, w) in self.blocks[active.clone()].iter().zip(&work.blocks[active]) {
@@ -735,9 +800,12 @@ impl<T: FloatT> SampledOperator<T> {
         work.linear_product(self, true, y, x, alpha, beta, pool);
         let chunks = block_chunks(&self.blocks, pool);
         let world = self.mpi_world();
-        let active = world
-            .map(|w| w.range(self.blocks.len()))
-            .unwrap_or(0..self.blocks.len());
+        let parts = world.map(|w| self.rank_parts(work, w));
+        let active = match (&parts, world) {
+            (Some(parts), Some(w)) => parts[w.rank()].0..parts[w.rank()].0 + parts[w.rank()].1,
+            _ => 0..self.blocks.len(),
+        };
+        let local_timer = crate::receipt::start();
         assign_block_ways(
             &mut work.blocks[active.clone()],
             1,
@@ -759,15 +827,17 @@ impl<T: FloatT> SampledOperator<T> {
                     w.cost[1] = start.elapsed().as_secs_f64() * ways as f64;
                 })
         });
+        crate::receipt::finish("sampled.adj.local", local_timer);
         if let Some(world) = world {
             // Gather per-block adjoint terms in block order; column ranges
             // may overlap, so the exchange layout is a concatenation.
             let offsets = term_offsets(&self.blocks, SampledBlock::column_count);
-            let gather_ranges: Vec<(usize, usize)> =
-                crate::mpi::ranges(self.blocks.len(), world.size())
-                    .iter()
-                    .map(|&(b0, len)| (offsets[b0], offsets[b0 + len] - offsets[b0]))
-                    .collect();
+            let gather_ranges: Vec<(usize, usize)> = parts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|&(b0, len)| (offsets[b0], offsets[b0 + len] - offsets[b0]))
+                .collect();
             let (t0, t1) = (offsets[active.start], offsets[active.end]);
             let mut local = Vec::with_capacity(t1 - t0);
             for (b, w) in self.blocks[active.clone()].iter().zip(&work.blocks[active]) {
@@ -1153,6 +1223,10 @@ pub struct SampledWorkspace<T> {
     // the immutable pattern and reconfigured only when the pool width changes.
     linear_plan: SparseParallel,
     linear_plan_workers: usize,
+    // Rows of the linear part holding entries, with their work prefix.
+    linear_active: Option<(Vec<usize>, Vec<usize>)>,
+    // Rank block partition shared with the caller's scaling (MPI).
+    parts: Option<Vec<(usize, usize)>>,
 }
 
 /// Construct the immutable diagonal table using the historical operation
@@ -1197,9 +1271,45 @@ fn build_wdiag<T: FloatT>(b: &SampledBlock<T>) -> Vec<T> {
 }
 
 impl<T: FloatT> SampledWorkspace<T> {
+    /// Assign the per-rank block partition of the sharded products (MPI);
+    /// `None` restores the even split.
+    pub(crate) fn set_rank_parts(&mut self, parts: Option<Vec<(usize, usize)>>) {
+        self.parts = parts;
+    }
+
     /// Configure the ordinary-product plan for the current pool width. Called
     /// on every pooled product; the lane plan is rebuilt only on width changes.
     fn linear_product(
+        &mut self,
+        operator: &SampledOperator<T>,
+        transpose: bool,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) {
+        if self.linear_plan_workers == 0 && crate::receipt::profile_requested() {
+            let a = &operator.linear;
+            let mut seen = vec![false; a.m];
+            for &r in &a.rowval {
+                seen[r] = true;
+            }
+            eprintln!(
+                "SAMPLED_LINEAR m={} n={} nnz={} active_rows={}",
+                a.m,
+                a.n,
+                a.nnz(),
+                seen.iter().filter(|&&v| v).count()
+            );
+        }
+        let timer = crate::receipt::start();
+        self.linear_product_inner(operator, transpose, y, x, alpha, beta, pool);
+        crate::receipt::finish("sampled.linear", timer);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_product_inner(
         &mut self,
         operator: &SampledOperator<T>,
         transpose: bool,
@@ -1214,6 +1324,38 @@ impl<T: FloatT> SampledWorkspace<T> {
             self.linear_plan
                 .configure(&operator.linear, pool.map(Arc::clone));
             self.linear_plan_workers = workers;
+        }
+        if let Some(world) = operator.mpi_world() {
+            // Ranks split the outputs (columns, or the leading rows that
+            // carry entries) with the same arithmetic as the pooled product.
+            if transpose {
+                self.linear_plan.product_sharded(
+                    &operator.linear,
+                    true,
+                    y,
+                    x,
+                    alpha,
+                    beta,
+                    world,
+                    crate::mpi::SITE_ADJOINT,
+                );
+            } else {
+                if self.linear_active.is_none() {
+                    self.linear_active = Some(self.linear_plan.active_rows());
+                }
+                let (rows, ptr) = self.linear_active.as_ref().unwrap();
+                self.linear_plan.forward_sharded_active(
+                    &operator.linear,
+                    y,
+                    x,
+                    alpha,
+                    beta,
+                    world,
+                    crate::mpi::SITE_FORWARD,
+                    (rows, ptr),
+                );
+            }
+            return;
         }
         if self.linear_plan_workers > 1 && self.linear_plan.has_lanes() {
             self.linear_plan
@@ -1301,6 +1443,8 @@ impl<T: FloatT> SampledWorkspace<T> {
                 .collect(),
             linear_plan: SparseParallel::new(&operator.linear),
             linear_plan_workers: 0,
+            linear_active: None,
+            parts: None,
         }
     }
 }
