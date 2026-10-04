@@ -186,13 +186,24 @@ impl SparseParallel {
             );
             return;
         }
+        // MPFR uses one exact accumulation per output, serial and pooled
+        // alike, so every thread count produces the same residual bits.
+        let exact = T::precision_bits() > 64;
         if let Some(pool) = &self.pool {
             // One entry into the pool for both products. Phases are joined;
             // no outer tasks compete with a nested full-budget product.
             pool.install(|| {
-                self.apply_in_pool(a, true, rx, z, -T::one(), T::zero());
-                self.apply_in_pool(a, false, rz, x, T::one(), T::one());
+                if exact {
+                    self.apply_exact(a, true, rx, z, -T::one(), T::zero());
+                    self.apply_exact(a, false, rz, x, T::one(), T::one());
+                } else {
+                    self.apply_in_pool(a, true, rx, z, -T::one(), T::zero());
+                    self.apply_in_pool(a, false, rz, x, T::one(), T::one());
+                }
             });
+        } else if exact {
+            self.apply_exact(a, true, rx, z, -T::one(), T::zero());
+            self.apply_exact(a, false, rz, x, T::one(), T::one());
         } else {
             a.t().gemv(rx, z, -T::one(), T::zero());
             a.gemv(rz, x, T::one(), T::one());
@@ -285,6 +296,56 @@ impl SparseParallel {
         }
         y.fill(T::zero());
         world.gather_slice(site, &local, &gather_ranges, y);
+    }
+
+    // Same outputs as apply_in_pool but each is one exact accumulation
+    // rounded once, so serial and pooled runs agree bitwise at MPFR width.
+    fn apply_exact<T: FloatT>(
+        &self,
+        a: &CscMatrix<T>,
+        transpose: bool,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+    ) {
+        let compute = |output: usize, y: &mut T| {
+            scale_output(y, beta);
+            if alpha == T::zero() {
+                return;
+            }
+            let dot = if transpose {
+                T::dot_fma(
+                    (a.colptr[output]..a.colptr[output + 1])
+                        .map(|p| (&a.nzval[p], &x[a.rowval[p]])),
+                )
+            } else {
+                T::dot_fma(
+                    self.entries[self.rowptr[output]..self.rowptr[output + 1]]
+                        .iter()
+                        .map(|e| (&a.nzval[e.position], &x[e.column])),
+                )
+            };
+            if alpha == -T::one() {
+                *y -= dot;
+            } else if alpha == T::one() {
+                *y += dot;
+            } else {
+                *y += alpha * dot;
+            }
+        };
+        let lanes = if transpose {
+            &self.column_lanes
+        } else {
+            &self.row_lanes
+        };
+        if lanes.len() <= 1 {
+            for (output, y) in y.iter_mut().enumerate() {
+                compute(output, y);
+            }
+        } else {
+            split_outputs(y, lanes, &compute);
+        }
     }
 
     fn apply_in_pool<T: FloatT>(

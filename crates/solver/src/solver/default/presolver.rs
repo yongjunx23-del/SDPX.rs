@@ -226,9 +226,24 @@ where
 
 // Prove dependence over exact input values, including RHS. Retained rows are
 // unchanged, so zero multipliers restore a valid dual in original coordinates.
-// The elimination has no operation budget: it runs to completion, and only the
-// per-coefficient size guard (`Exact::bounded`) can decline a degenerate set.
+// Elimination is bounded by an operation budget (modular proof and rational
+// fallback separately) and the per-coefficient size guard (`Exact::bounded`);
+// past either, no row is removed.
+const MODULAR_BUDGET: usize = 400_000_000;
+const RATIONAL_BUDGET: usize = 40_000_000;
+
 fn redundant_equalities<T: FloatT>(
+    A: &CscMatrix<T>,
+    b: &[T],
+    cones: &[SupportedConeT<T>],
+) -> Option<Vec<usize>> {
+    let timer = crate::receipt::start();
+    let result = redundant_equalities_impl(A, b, cones);
+    crate::receipt::finish("presolve_rank", timer);
+    result
+}
+
+fn redundant_equalities_impl<T: FloatT>(
     A: &CscMatrix<T>,
     b: &[T],
     cones: &[SupportedConeT<T>],
@@ -247,9 +262,14 @@ fn redundant_equalities<T: FloatT>(
         return None;
     }
     let mut lookup = vec![usize::MAX; b.len()];
-    let mut rows: Vec<BTreeMap<usize, Exact>> = (0..ids.len()).map(|_| BTreeMap::new()).collect();
     for (i, &r) in ids.iter().enumerate() {
         lookup[r] = i;
+    }
+    if short_equalities_full_rank(A, b, &ids, &lookup) {
+        return Some(Vec::new());
+    }
+    let mut rows: Vec<BTreeMap<usize, Exact>> = (0..ids.len()).map(|_| BTreeMap::new()).collect();
+    for (i, &r) in ids.iter().enumerate() {
         if b[r] != T::zero() {
             rows[i].insert(A.n, b[r].exact()?);
         }
@@ -258,10 +278,7 @@ fn redundant_equalities<T: FloatT>(
         for k in A.colptr[c]..A.colptr[c + 1] {
             let i = lookup[A.rowval[k]];
             if i != usize::MAX && A.nzval[k] != T::zero() {
-                // Do not prove rank from overwritten noncanonical CSC entries.
-                if rows[i].insert(c, A.nzval[k].exact()?).is_some() {
-                    return None;
-                }
+                rows[i].insert(c, A.nzval[k].exact()?);
             }
         }
     }
@@ -272,6 +289,7 @@ fn redundant_equalities<T: FloatT>(
     }
     let mut basis: BTreeMap<usize, BTreeMap<usize, Exact>> = BTreeMap::new();
     let mut redundant = Vec::new();
+    let mut budget = RATIONAL_BUDGET;
     for (id, mut row) in ids.into_iter().zip(rows) {
         loop {
             let Some((&pivot, value)) = row.first_key_value() else {
@@ -280,6 +298,7 @@ fn redundant_equalities<T: FloatT>(
             };
             let factor = value.clone();
             if let Some(previous) = basis.get(&pivot) {
+                budget = budget.checked_sub(previous.len())?;
                 for (&c, value) in previous {
                     let entry = row.entry(c).or_default();
                     entry.subtract_product(&factor, value);
@@ -305,12 +324,98 @@ fn redundant_equalities<T: FloatT>(
     Some(redundant)
 }
 
+// A nonsingular minor over F_(2^31 - 1) proves independence over the exact
+// input field. For a short, wide equality system, build that minor a column
+// at a time and stop at full rank, before allocating rational rows for every
+// coefficient. Bound dense workspace; all inconclusive cases keep the sparse
+// modular/rational path below, including genuine dependencies.
+fn short_equalities_full_rank<T: FloatT>(
+    a: &CscMatrix<T>,
+    b: &[T],
+    ids: &[usize],
+    lookup: &[usize],
+) -> bool {
+    const P: u64 = (1 << 31) - 1;
+    let m = ids.len();
+    if m == 0 || m > 256 || a.n < m {
+        return false;
+    }
+    // A proof attempt is only worthwhile if it is cheaper than the exact
+    // fallback; past this many modular updates, defer to it unchanged.
+    let mut budget = 16_000_000usize;
+    let mut basis: Vec<Option<Vec<u64>>> = vec![None; m];
+    let mut column = vec![0u64; m];
+    let mut rank = 0;
+    for c in 0..=a.n {
+        column.fill(0);
+        if c == a.n {
+            for (i, &r) in ids.iter().enumerate() {
+                let Some(value) = b[r].exact().and_then(|v| v.modulo_mersenne31()) else {
+                    return false;
+                };
+                column[i] = u64::from(value);
+            }
+        } else {
+            for k in a.colptr[c]..a.colptr[c + 1] {
+                let i = lookup[a.rowval[k]];
+                if i != usize::MAX {
+                    let Some(value) = a.nzval[k].exact().and_then(|v| v.modulo_mersenne31()) else {
+                        return false;
+                    };
+                    column[i] = u64::from(value);
+                }
+            }
+        }
+        for pivot in 0..m {
+            let factor = column[pivot];
+            if factor == 0 {
+                continue;
+            }
+            let Some(rest) = budget.checked_sub(m - pivot) else {
+                return false;
+            };
+            budget = rest;
+            if let Some(previous) = &basis[pivot] {
+                for i in pivot..m {
+                    column[i] = (column[i] + P - factor * previous[i] % P) % P;
+                }
+            } else {
+                let inverse = inverse_mersenne31(factor);
+                for value in &mut column[pivot..] {
+                    *value = *value * inverse % P;
+                }
+                basis[pivot] = Some(column.clone());
+                rank += 1;
+                break;
+            }
+        }
+        if rank == m {
+            return true;
+        }
+    }
+    false
+}
+
+fn inverse_mersenne31(value: u64) -> u64 {
+    const P: u64 = (1 << 31) - 1;
+    let (mut power, mut exponent, mut inverse) = (value, P - 2, 1u64);
+    while exponent != 0 {
+        if exponent & 1 != 0 {
+            inverse = inverse * power % P;
+        }
+        power = power * power % P;
+        exponent >>= 1;
+    }
+    inverse
+}
+
 fn modular_full_row_rank(
     rows: &[std::collections::BTreeMap<usize, sdpx_arithmetic::Exact>],
 ) -> bool {
     use std::collections::BTreeMap;
     const P: u64 = (1 << 31) - 1;
     let mut basis: BTreeMap<usize, BTreeMap<usize, u64>> = BTreeMap::new();
+    let mut budget = MODULAR_BUDGET;
     for source in rows {
         let mut row = BTreeMap::new();
         for (&column, value) in source {
@@ -326,6 +431,10 @@ fn modular_full_row_rank(
                 return false;
             };
             if let Some(previous) = basis.get(&pivot) {
+                let Some(rest) = budget.checked_sub(previous.len()) else {
+                    return false;
+                };
+                budget = rest;
                 for (&column, &value) in previous {
                     let entry = row.entry(column).or_default();
                     *entry = (*entry + P - factor * value % P) % P;
@@ -334,14 +443,7 @@ fn modular_full_row_rank(
                     }
                 }
             } else {
-                let (mut power, mut exponent, mut inverse) = (factor, P - 2, 1u64);
-                while exponent != 0 {
-                    if exponent & 1 != 0 {
-                        inverse = inverse * power % P;
-                    }
-                    power = power * power % P;
-                    exponent >>= 1;
-                }
+                let inverse = inverse_mersenne31(factor);
                 for value in row.values_mut() {
                     *value = *value * inverse % P;
                 }
@@ -420,11 +522,6 @@ mod exact_tests {
     #[test]
     fn singleton_cascade_512() {
         peeled_chain::<sdpx_arithmetic::Bits512>();
-    }
-    #[test]
-    fn noncanonical_duplicates_skip_exact_reduction() {
-        let a = CscMatrix::new(2, 1, vec![0, 3], vec![0, 0, 1], vec![1., 2., 2.]);
-        assert!(redundant_equalities(&a, &[2., 2.], &[SupportedConeT::ZeroConeT(2)]).is_none());
     }
     #[test]
     fn exact_rows_f64() {

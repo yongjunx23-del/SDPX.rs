@@ -1,16 +1,18 @@
 //! Dense quasi-definite block elimination using the configured BLAS/LAPACK.
 //! K = [H B; B' -C], H = L L', Y = L^-1 B, S = C + Y'Y.
-use crate::algebra::{CscMatrix, MatrixTriangle};
+use crate::algebra::{CscMatrix, VectorMath};
 use crate::solver::{
     core::CoreSettings,
     kkt::{
-        direct::{BoxedDirectLDLSolver, DirectLDLSolver, DirectLDLSolverReqs},
+        direct::{BoxedDirectLDLSolver, DirectLDLSolver},
         HasLinearSolverInfo, LinearSolverInfo,
     },
 };
+use rayon::prelude::*;
+use std::sync::Arc;
 
 pub(super) struct DenseBlockSolver {
-    matrix: CscMatrix<f64>,
+    nnz: usize,
     signs: Vec<i8>,
     settings: CoreSettings<f64>,
     n: usize,
@@ -20,6 +22,10 @@ pub(super) struct DenseBlockSolver {
     s: Vec<f64>,
     fallback: Option<BoxedDirectLDLSolver<f64>>,
     use_dense: bool,
+    packed_leading: bool,
+    pool: Option<Arc<rayon::ThreadPool>>,
+    // Pooled factorization tiles, kept across refactors (fully overwritten).
+    tiles: Vec<Vec<Vec<f64>>>,
 }
 
 impl DenseBlockSolver {
@@ -60,7 +66,7 @@ impl DenseBlockSolver {
     fn new(k: &CscMatrix<f64>, signs: &[i8], settings: &CoreSettings<f64>, n: usize) -> Self {
         let m = k.n - n;
         Self {
-            matrix: k.clone(),
+            nnz: k.nzval.len(),
             signs: signs.to_vec(),
             settings: settings.clone(),
             n,
@@ -70,18 +76,27 @@ impl DenseBlockSolver {
             s: vec![0.; m * m],
             fallback: None,
             use_dense: false,
+            packed_leading: k.colptr[n] == n * (n + 1) / 2,
+            pool: None,
+            tiles: Vec::new(),
         }
     }
 
-    fn factor_dense(&mut self) -> bool {
+    fn factor_dense(&mut self, k: &CscMatrix<f64>) -> bool {
         let (n, m) = (self.n, self.m);
-        self.h.fill(0.);
+        // Only the upper triangle of H and S is read (`U` factorizations and
+        // solves), so clear just the columns' upper parts as they are filled.
+        for j in 0..n {
+            self.h[j * n..j * n + j + 1].fill(0.);
+        }
         self.y.fill(0.);
-        self.s.fill(0.);
-        for j in 0..self.matrix.n {
-            for p in self.matrix.colptr[j]..self.matrix.colptr[j + 1] {
-                let i = self.matrix.rowval[p];
-                let v = self.matrix.nzval[p];
+        for j in 0..m {
+            self.s[j * m..j * m + j + 1].fill(0.);
+        }
+        for j in 0..k.n {
+            for p in k.colptr[j]..k.colptr[j + 1] {
+                let i = k.rowval[p];
+                let v = k.nzval[p];
                 if !v.is_finite() {
                     return false;
                 }
@@ -94,9 +109,20 @@ impl DenseBlockSolver {
                 }
             }
         }
+        let pool = self
+            .pool
+            .as_deref()
+            .filter(|pool| pool.current_num_threads() > 1 && n >= 2 * TILE);
         let mut info = 0;
-        unsafe {
-            lapack::dpotrf(b'U', n as i32, &mut self.h, n as i32, &mut info);
+        match pool {
+            Some(pool) => {
+                if !tiled_potrf(&mut self.h, n, pool, &mut self.tiles) {
+                    return false;
+                }
+            }
+            None => unsafe {
+                lapack::dpotrf(b'U', n as i32, &mut self.h, n as i32, &mut info);
+            },
         }
         if info != 0 || !self.valid_factor(&self.h, n) {
             return false;
@@ -104,20 +130,32 @@ impl DenseBlockSolver {
         if m == 0 {
             return true;
         }
-        unsafe {
+        // Columns of Y are independent right-hand sides: split them across
+        // the pool. Each column's triangular solve is unchanged.
+        let h = &self.h;
+        let trsm = |y: &mut [f64]| unsafe {
             blas::dtrsm(
                 b'L',
                 b'U',
                 b'T',
                 b'N',
                 n as i32,
-                m as i32,
+                (y.len() / n) as i32,
                 1.,
-                &self.h,
+                h,
                 n as i32,
-                &mut self.y,
+                y,
                 n as i32,
             );
+        };
+        match pool {
+            Some(pool) => {
+                let per = m.div_ceil(pool.current_num_threads()).max(1);
+                pool.install(|| self.y.par_chunks_mut(per * n).for_each(trsm));
+            }
+            None => trsm(&mut self.y),
+        }
+        unsafe {
             blas::dsyrk(
                 b'U',
                 b'T',
@@ -145,34 +183,130 @@ impl DenseBlockSolver {
             })
     }
 
-    fn factor_fallback(&mut self) -> bool {
+    fn factor_fallback(&mut self, k: &CscMatrix<f64>) -> bool {
         if self.fallback.is_none() {
             #[cfg(feature = "faer-sparse")]
-            let solver = super::auto::ldl_auto_select(&self.matrix, &self.signs, &self.settings);
+            let solver = super::auto::ldl_auto_select(k, &self.signs, &self.settings);
             #[cfg(not(feature = "faer-sparse"))]
-            let solver: BoxedDirectLDLSolver<f64> =
-                Box::new(super::qdldl::QDLDLDirectLDLSolver::new(
-                    &self.matrix,
-                    &self.signs,
-                    &self.settings,
-                    None,
-                ));
+            let solver: BoxedDirectLDLSolver<f64> = Box::new(
+                super::qdldl::QDLDLDirectLDLSolver::new(k, &self.signs, &self.settings, None),
+            );
             self.fallback = Some(solver);
         }
         let solver = self.fallback.as_mut().unwrap();
+        solver.set_pool(self.pool.clone());
         // Fallback can be dormant across many dense updates. Synchronize all
         // current values, including the caller's temporary static shift.
-        let indices: Vec<_> = (0..self.matrix.nzval.len()).collect();
-        solver.update_values(&indices, &self.matrix.nzval);
-        solver.refactor(&self.matrix)
+        let indices: Vec<_> = (0..k.nzval.len()).collect();
+        solver.update_values(&indices, &k.nzval);
+        solver.refactor(k)
     }
 }
 
-impl DirectLDLSolverReqs for DenseBlockSolver {
-    fn required_matrix_shape() -> MatrixTriangle {
-        MatrixTriangle::Triu
+/// Tile width of the pooled Cholesky. Tile boundaries depend only on `n`, and
+/// every tile operation is one BLAS call, so factors do not depend on the
+/// number of workers.
+const TILE: usize = 128;
+
+/// Right-looking tiled Cholesky `A = U'U` of the upper triangle of the
+/// column-major `a` (n x n), run on `pool`. Tiles are packed into separate
+/// buffers so lanes borrow disjoint storage. Returns false on a failed pivot.
+fn tiled_potrf(
+    a: &mut [f64],
+    n: usize,
+    pool: &rayon::ThreadPool,
+    tiles: &mut Vec<Vec<Vec<f64>>>,
+) -> bool {
+    let p = n.div_ceil(TILE);
+    let size = |b: usize| TILE.min(n - b * TILE);
+    // tiles[j][i], i <= j: rows of block i, columns of block j, ld = size(i).
+    // Buffers are reused across calls; packing overwrites every element.
+    tiles.resize_with(p, Vec::new);
+    for (j, column) in tiles.iter_mut().enumerate() {
+        column.resize_with(j + 1, Vec::new);
+        for (i, t) in column.iter_mut().enumerate() {
+            let (ri, cj) = (size(i), size(j));
+            t.resize(ri * cj, 0.);
+            for c in 0..cj {
+                let src = (j * TILE + c) * n + i * TILE;
+                t[c * ri..][..ri].copy_from_slice(&a[src..src + ri]);
+            }
+        }
     }
+    let ok = pool.install(|| {
+        for k in 0..p {
+            let kk = size(k) as i32;
+            let mut info = 0;
+            unsafe { lapack::dpotrf(b'U', kk, &mut tiles[k][k], kk, &mut info) };
+            if info != 0 {
+                return false;
+            }
+            // Panel row k: U_kk' X = A_kj for every later block column.
+            let (done, rest) = tiles.split_at_mut(k + 1);
+            let diag = &done[k][k];
+            rest.par_iter_mut().enumerate().for_each(|(r, column)| {
+                let cj = size(k + 1 + r) as i32;
+                unsafe {
+                    blas::dtrsm(
+                        b'L',
+                        b'U',
+                        b'T',
+                        b'N',
+                        kk,
+                        cj,
+                        1.,
+                        diag,
+                        kk,
+                        &mut column[k],
+                        kk,
+                    )
+                };
+            });
+            // Trailing update A_ij -= A_ki' A_kj, k < i <= j.
+            let panel: Vec<Vec<f64>> = rest.iter_mut().map(|c| std::mem::take(&mut c[k])).collect();
+            rest.par_iter_mut().enumerate().for_each(|(r, column)| {
+                let j = k + 1 + r;
+                let cj = size(j) as i32;
+                let akj = &panel[r];
+                column[k + 1..=j]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(s, tile)| {
+                        let i = k + 1 + s;
+                        let ri = size(i) as i32;
+                        unsafe {
+                            if i == j {
+                                blas::dsyrk(b'U', b'T', cj, kk, -1., akj, kk, 1., tile, cj);
+                            } else {
+                                blas::dgemm(
+                                    b'T', b'N', ri, cj, kk, -1., &panel[s], kk, akj, kk, 1., tile,
+                                    ri,
+                                );
+                            }
+                        }
+                    });
+            });
+            for (column, tile) in rest.iter_mut().zip(panel) {
+                column[k] = tile;
+            }
+        }
+        true
+    });
+    if !ok {
+        return false;
+    }
+    for (j, column) in tiles.iter().enumerate() {
+        for (i, t) in column.iter().enumerate() {
+            let (ri, cj) = (size(i), size(j));
+            for c in 0..cj {
+                let dst = (j * TILE + c) * n + i * TILE;
+                a[dst..dst + ri].copy_from_slice(&t[c * ri..][..ri]);
+            }
+        }
+    }
+    true
 }
+
 impl HasLinearSolverInfo for DenseBlockSolver {
     fn linear_solver_info(&self) -> LinearSolverInfo {
         if !self.use_dense {
@@ -182,32 +316,71 @@ impl HasLinearSolverInfo for DenseBlockSolver {
         }
         LinearSolverInfo {
             name: "dense_block".into(),
-            threads: 1,
+            threads: self.pool.as_ref().map_or(1, |pool| {
+                if self.n >= 2 * TILE {
+                    pool.current_num_threads()
+                } else {
+                    1
+                }
+            }),
             direct: true,
-            nnzA: self.matrix.nzval.len(),
+            nnzA: self.nnz,
             nnzL: self.n * (self.n + 1) / 2 + self.n * self.m + self.m * (self.m + 1) / 2,
         }
     }
 }
 impl DirectLDLSolver<f64> for DenseBlockSolver {
-    fn update_values(&mut self, indices: &[usize], values: &[f64]) {
-        for (&i, &v) in indices.iter().zip(values) {
-            self.matrix.nzval[i] = v;
+    // Refactor reads the caller's complete KKT, including temporary shifts.
+    // A dormant sparse fallback is synchronized there before factorization.
+    fn update_values(&mut self, _indices: &[usize], _values: &[f64]) {}
+    fn scale_values(&mut self, _indices: &[usize], _scale: f64) {}
+    fn set_pool(&mut self, pool: Option<Arc<rayon::ThreadPool>>) {
+        if let Some(solver) = &mut self.fallback {
+            solver.set_pool(pool.clone());
         }
+        self.pool = pool;
     }
-    fn scale_values(&mut self, indices: &[usize], scale: f64) {
-        for &i in indices {
-            self.matrix.nzval[i] *= scale;
+    fn residual(
+        &self,
+        k: &CscMatrix<f64>,
+        out: &mut [f64],
+        rhs: &[f64],
+        point: &[f64],
+    ) -> Option<f64> {
+        if !self.packed_leading {
+            return None;
         }
-    }
-    fn offset_values(&mut self, indices: &[usize], offset: f64, signs: &[i8]) {
-        for (&i, &s) in indices.iter().zip(signs) {
-            self.matrix.nzval[i] += offset * s as f64;
+        out.copy_from_slice(rhs);
+        let n = self.n;
+        unsafe {
+            blas::dspmv(
+                b'U',
+                n as i32,
+                -1.,
+                &k.nzval[..k.colptr[n]],
+                &point[..n],
+                1,
+                1.,
+                &mut out[..n],
+                1,
+            );
         }
+        for col in n..k.n {
+            for p in k.colptr[col]..k.colptr[col + 1] {
+                let row = k.rowval[p];
+                let value = -k.nzval[p];
+                out[row] = value.mul_add(point[col], out[row]);
+                if row != col {
+                    out[col] = value.mul_add(point[row], out[col]);
+                }
+            }
+        }
+        Some(out.norm_inf())
     }
-    fn refactor(&mut self, _k: &CscMatrix<f64>) -> bool {
-        self.use_dense = self.factor_dense();
-        self.use_dense || self.factor_fallback()
+
+    fn refactor(&mut self, k: &CscMatrix<f64>) -> bool {
+        self.use_dense = self.factor_dense(k);
+        self.use_dense || self.factor_fallback(k)
     }
     fn solve(&mut self, k: &CscMatrix<f64>, x: &mut [f64], b: &mut [f64]) {
         if !self.use_dense {
@@ -233,14 +406,13 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn check(s: &mut DenseBlockSolver) {
-        let k = s.matrix.clone();
-        assert!(s.refactor(&k));
+    fn check(s: &mut DenseBlockSolver, k: &CscMatrix<f64>) {
+        assert!(s.refactor(k));
         let rhs = vec![1., -2., 3., 4.];
         let mut b = rhs.clone();
         let mut x = vec![0.; 4];
         // Caller restores original diagonals after refactor; factors must
-        // still represent the shifted matrix held inside the backend.
+        // still represent the shifted matrix passed to refactor.
         let mut restored = k.clone();
         restored.nzval[0] -= 0.01;
         s.solve(&restored, &mut x, &mut b);
@@ -262,7 +434,7 @@ mod tests {
     }
     #[test]
     fn dense_block_updates_and_fallback() {
-        let k = CscMatrix::new(
+        let mut k = CscMatrix::new(
             4,
             4,
             vec![0, 1, 3, 6, 10],
@@ -270,25 +442,32 @@ mod tests {
             vec![4., 1., 3., 1., 2., -3., 2., -1., -0.5, -2.],
         );
         let mut s = DenseBlockSolver::new(&k, &[1, 1, -1, -1], &CoreSettings::default(), 2);
-        check(&mut s);
+        check(&mut s, &k);
         assert!(s.use_dense);
+        k.nzval[0] *= 2.;
         s.scale_values(&[0], 2.);
-        s.offset_values(&[2], 0.5, &[1]);
-        check(&mut s);
+        k.nzval[2] += 0.5;
+        s.update_values(&[2], &[k.nzval[2]]);
+        check(&mut s, &k);
         // H indefinite but full K invertible: sparse fallback and later recovery.
+        k.nzval[0] = -4.;
         s.update_values(&[0], &[-4.]);
-        assert!(!s.factor_dense());
+        assert!(!s.factor_dense(&k));
         assert!(s.refactor(&k));
         assert!(!s.use_dense);
+        k.nzval[0] = 5.;
         s.update_values(&[0], &[5.]);
-        check(&mut s);
+        check(&mut s, &k);
         assert!(s.use_dense);
+        k.nzval[0] = -5.;
         s.update_values(&[0], &[-5.]);
+        k.nzval[3] *= 0.5;
         s.scale_values(&[3], 0.5);
-        s.offset_values(&[9], 1., &[-1]);
+        k.nzval[9] -= 1.;
+        s.update_values(&[9], &[k.nzval[9]]);
         assert!(s.refactor(&k));
         assert!(!s.use_dense);
-        let mut fresh = DenseBlockSolver::new(&s.matrix, &s.signs, &s.settings, 2);
+        let mut fresh = DenseBlockSolver::new(&k, &s.signs, &s.settings, 2);
         assert!(fresh.refactor(&k));
         let mut b = vec![1., 2., 3., 4.];
         let mut b2 = b.clone();
@@ -299,9 +478,62 @@ mod tests {
         assert_eq!(x, x2);
     }
     #[test]
+    fn tiled_potrf_matches_lapack_and_is_thread_invariant() {
+        let n = 2 * TILE + 45;
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let b: Vec<f64> = (0..n * n).map(|_| next()).collect();
+        let mut a = vec![0.; n * n];
+        for j in 0..n {
+            for i in 0..=j {
+                a[i + j * n] = (0..n).map(|k| b[k + i * n] * b[k + j * n]).sum::<f64>()
+                    + if i == j { n as f64 } else { 0. };
+            }
+        }
+        let mut reference = a.clone();
+        let mut info = 0;
+        unsafe { lapack::dpotrf(b'U', n as i32, &mut reference, n as i32, &mut info) };
+        assert_eq!(info, 0);
+        let factor = |threads| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut u = a.clone();
+            assert!(tiled_potrf(&mut u, n, &pool, &mut Vec::new()));
+            u
+        };
+        let (two, five) = (factor(2), factor(5));
+        assert!(two
+            .iter()
+            .zip(&five)
+            .all(|(x, y)| x.to_bits() == y.to_bits()));
+        for j in 0..n {
+            for i in 0..=j {
+                let (x, y) = (two[i + j * n], reference[i + j * n]);
+                assert!(
+                    (x - y).abs() <= 1e-12 * y.abs().max(1.),
+                    "({i},{j}) {x} vs {y}"
+                );
+            }
+        }
+        let mut indefinite = a.clone();
+        indefinite[(n - 1) * (n + 1)] = -1e6;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        assert!(!tiled_potrf(&mut indefinite, n, &pool, &mut Vec::new()));
+    }
+    #[test]
     fn dense_block_rejects_tiny_pivot() {
         let k = CscMatrix::new(1, 1, vec![0, 1], vec![0], vec![1e-30]);
         let mut s = DenseBlockSolver::new(&k, &[1], &CoreSettings::default(), 1);
-        assert!(!s.factor_dense());
+        assert!(!s.factor_dense(&k));
     }
 }

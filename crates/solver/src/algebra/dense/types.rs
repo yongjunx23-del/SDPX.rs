@@ -1,6 +1,5 @@
 // Some supporting functions are used only for factorization
 // engine objects that support SDPs.
-#![allow(dead_code)]
 
 use crate::algebra::*;
 use std::ops::{Index, IndexMut};
@@ -184,6 +183,7 @@ impl<T> Symmetric<'_, Matrix<T>>
 where
     T: FloatT,
 {
+    #[cfg(test)]
     pub(crate) fn pack_triu(&self, v: &mut [T]) {
         let n = self.ncols();
         let numel = triangular_number(n);

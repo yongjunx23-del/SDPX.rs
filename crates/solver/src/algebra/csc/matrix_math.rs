@@ -195,14 +195,19 @@ fn _csc_symv_unsafe<T: FloatT>(
         for (col, &xcol) in x.iter().enumerate() {
             let first = *A.colptr.get_unchecked(col);
             let last = *A.colptr.get_unchecked(col + 1);
-
+            // y[col] is held in a register: within this column it is written
+            // only here, so the operation sequence on it is unchanged.
+            let mut ycol = *y.get_unchecked(col);
             for (&row, &Aij) in zip(&A.rowval[first..last], &A.nzval[first..last]) {
-                *y.get_unchecked_mut(row) += a * Aij * xcol;
-                if row != col {
+                if row == col {
+                    ycol += a * Aij * xcol;
+                } else {
+                    *y.get_unchecked_mut(row) += a * Aij * xcol;
                     //don't double up on the diagonal
-                    *y.get_unchecked_mut(col) += a * Aij * (*x.get_unchecked(row));
+                    ycol += a * Aij * (*x.get_unchecked(row));
                 }
             }
+            *y.get_unchecked_mut(col) = ycol;
         }
     }
 }
@@ -217,6 +222,13 @@ fn _csc_quad_form<T: FloatT>(M: &CscMatrix<T>, uplo: MatrixTriangle, y: &[T], x:
     assert!(M.nzval.len() == M.rowval.len());
 
     if M.n == 0 {
+        return T::zero();
+    }
+    if T::precision_bits() > 53
+        && M.nzval.is_empty()
+        && x.iter().all(|v| v.is_finite())
+        && y.iter().all(|v| v.is_finite())
+    {
         return T::zero();
     }
 
@@ -277,6 +289,47 @@ fn _csc_axpby_N<T: FloatT>(A: &CscMatrix<T>, y: &mut [T], x: &[T], a: T, b: T) {
     assert_eq!(A.nzval.len(), *A.colptr.last().unwrap());
     assert_eq!(x.len(), A.n);
 
+    // Wide precision with dense enough rows: group the entries by row and
+    // accumulate each output exactly, rounded once (see `_csc_axpby_T`).
+    if T::precision_bits() > 64 && A.nnz() >= 4 * A.m {
+        let mut ptr = vec![0usize; A.m + 1];
+        for &r in &A.rowval {
+            ptr[r + 1] += 1;
+        }
+        for i in 0..A.m {
+            ptr[i + 1] += ptr[i];
+        }
+        let mut next = ptr.clone();
+        let mut entries = vec![(0usize, 0usize); A.nnz()];
+        for j in 0..A.n {
+            for k in A.colptr[j]..A.colptr[j + 1] {
+                let r = A.rowval[k];
+                entries[next[r]] = (k, j);
+                next[r] += 1;
+            }
+        }
+        let negated: Vec<T>;
+        let (xs, scale) = if a == T::one() {
+            (x, None)
+        } else if a == -T::one() {
+            negated = x.iter().map(|&v| -v).collect();
+            (negated.as_slice(), None)
+        } else {
+            (x, Some(a))
+        };
+        let one = T::one();
+        for (i, yi) in y.iter_mut().enumerate() {
+            let terms = entries[ptr[i]..ptr[i + 1]]
+                .iter()
+                .map(|&(k, j)| (&A.nzval[k], &xs[j]));
+            *yi = match scale {
+                None => T::dot_fma(std::iter::once((&*yi, &one)).chain(terms)),
+                Some(a) => *yi + a * T::dot_fma(terms),
+            };
+        }
+        return;
+    }
+
     //y += A*x
     if a == T::one() {
         for (j, xj) in x.iter().enumerate().take(A.n) {
@@ -320,24 +373,79 @@ fn _csc_axpby_T<T: FloatT>(A: &CscMatrix<T>, y: &mut [T], x: &[T], a: T, b: T) {
     assert_eq!(A.nzval.len(), *A.colptr.last().unwrap());
     assert_eq!(x.len(), A.m);
 
-    //y += A*x
-    if a == T::one() {
+    // Wide precision: each output is one exact accumulation of y_j and its
+    // column's products, rounded once (a general scale rounds a·dot once
+    // more). Short columns keep the FMA chain below.
+    if T::precision_bits() > 64 {
+        let negated: Vec<T>;
+        let (xs, scale) = if a == T::one() {
+            (x, None)
+        } else if a == -T::one() {
+            negated = x.iter().map(|&v| -v).collect();
+            (negated.as_slice(), None)
+        } else {
+            (x, Some(a))
+        };
+        let one = T::one();
         for (j, yj) in y.iter_mut().enumerate().take(A.n) {
-            for k in A.colptr[j]..A.colptr[j + 1] {
-                *yj += A.nzval[k] * x[A.rowval[k]];
+            let (s, e) = (A.colptr[j], A.colptr[j + 1]);
+            if e - s < 4 {
+                for k in s..e {
+                    *yj += match scale {
+                        None => A.nzval[k] * xs[A.rowval[k]],
+                        Some(a) => a * A.nzval[k] * x[A.rowval[k]],
+                    };
+                }
+                continue;
+            }
+            let terms = (s..e).map(|k| (&A.nzval[k], &xs[A.rowval[k]]));
+            *yj = match scale {
+                None => T::dot_fma(std::iter::once((&*yj, &one)).chain(terms)),
+                Some(a) => *yj + a * T::dot_fma(terms),
+            };
+        }
+        return;
+    }
+
+    //y += A*x, a column dot each. Four columns run in lockstep for
+    // independent add chains; every column keeps its own term order and the
+    // same separate multiply and add, so values are unchanged.
+    // Same products as the scalar loops: v·x, -(v·x) (y - p == y + -p), and
+    // (a·v)·x for a general scale.
+    let (one, minus_one) = (a == T::one(), a == -T::one());
+    let column = |j: usize| (A.colptr[j], A.colptr[j + 1]);
+    let term = |k: usize| {
+        let (v, xr) = (A.nzval[k], x[A.rowval[k]]);
+        if one {
+            v * xr
+        } else if minus_one {
+            -(v * xr)
+        } else {
+            a * v * xr
+        }
+    };
+    let mut j = 0;
+    while j + 4 <= A.n {
+        let c = [column(j), column(j + 1), column(j + 2), column(j + 3)];
+        let mut acc = [y[j], y[j + 1], y[j + 2], y[j + 3]];
+        let common = c.iter().map(|&(s, e)| e - s).min().unwrap();
+        for t in 0..common {
+            for q in 0..4 {
+                acc[q] += term(c[q].0 + t);
             }
         }
-    } else if a == -T::one() {
-        for (j, yj) in y.iter_mut().enumerate().take(A.n) {
-            for k in A.colptr[j]..A.colptr[j + 1] {
-                *yj -= A.nzval[k] * x[A.rowval[k]];
+        for q in 0..4 {
+            for k in c[q].0 + common..c[q].1 {
+                acc[q] += term(k);
             }
+            y[j + q] = acc[q];
         }
-    } else {
-        for (j, yj) in y.iter_mut().enumerate().take(A.n) {
-            for k in A.colptr[j]..A.colptr[j + 1] {
-                *yj += a * A.nzval[k] * x[A.rowval[k]];
-            }
+        j += 4;
+    }
+    for (j, yj) in y.iter_mut().enumerate().take(A.n).skip(j) {
+        let (s, e) = column(j);
+        for k in s..e {
+            *yj += term(k);
         }
     }
 }

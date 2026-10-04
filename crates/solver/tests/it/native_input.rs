@@ -47,7 +47,11 @@ fn native_cli_status_settings_and_precision() {
             .output()
             .unwrap()
     };
-    for precision in ["53", "128", "256", "512", "768", "1024", "2048"] {
+    let widest = cfg!(feature = "all-precisions").then_some("2048");
+    for precision in ["53", "128", "256", "512", "768", "1024"]
+        .into_iter()
+        .chain(widest)
+    {
         let output = run(&["--precision", precision, "--threads", "1"]);
         assert!(
             output.status.success(),
@@ -62,7 +66,6 @@ fn native_cli_status_settings_and_precision() {
         assert_eq!(point["output_rank"], 0);
         assert_eq!(point["settings"]["equilibrate_enable"], true);
         assert_eq!(point["settings"]["presolve_enable"], true);
-        #[cfg(feature = "sdp")]
         assert_eq!(point["settings"]["chordal_decomposition_enable"], true);
         assert!(point["api_seconds"].as_f64().unwrap() > 0.0);
         assert_eq!(point["x"][0].is_string(), precision != "53");
@@ -151,7 +154,6 @@ fn native_cli_rejects_bad_cones_and_reports_infeasibility() {
     }
 }
 
-#[cfg(feature = "sdp")]
 fn sampled_fixture(path: &std::path::Path) {
     for (name, text) in [
         ("control.json", r#"{"num_blocks":1,"command":"pmp2sdp"}"#),
@@ -166,7 +168,6 @@ fn sampled_fixture(path: &std::path::Path) {
     }
 }
 
-#[cfg(feature = "sdp")]
 #[test]
 fn sdpb_reader_matches_trace_map_and_native_results() {
     let temp = tempfile::tempdir().unwrap();
@@ -216,7 +217,6 @@ fn sdpb_reader_matches_trace_map_and_native_results() {
     assert!(read_sdpb_sampled::<MpFloat<4>>(temp.path()).is_err());
 }
 
-#[cfg(feature = "sdp")]
 #[test]
 fn sampled_input_boundary_checks_and_optional_command() {
     let temp = tempfile::tempdir().unwrap();
@@ -242,7 +242,6 @@ fn sampled_input_boundary_checks_and_optional_command() {
     }
 }
 
-#[cfg(feature = "sdp")]
 #[test]
 fn sampled_reader_keeps_matrix_sample_and_parity_order() {
     let temp = tempfile::tempdir().unwrap();

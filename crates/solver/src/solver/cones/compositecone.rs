@@ -268,9 +268,6 @@ where
         σμ: T,
         prepared: bool,
     ) {
-        #[cfg(not(feature = "sdp"))]
-        let _ = prepared;
-        #[cfg(feature = "sdp")]
         if prepared {
             if let SupportedCone::PSDTriangleCone(cone) = cone {
                 cone.combined_shift_prepared(shift, dz, ds, σμ);
@@ -309,7 +306,13 @@ where
                     threading.inner_ways,
                     (shift, step_z, step_s),
                     &|cone, _rows, (shift, step_z, step_s)| {
-                        Self::shift_one(cone, shift, step_z, step_s, σμ, prepared);
+                        if let (Some(chunk), SupportedCone::NonnegativeCone(c)) =
+                            (threading.orthant_chunk, &mut *cone)
+                        {
+                            c.combined_ds_shift_parallel(shift, step_z, step_s, σμ, chunk);
+                        } else {
+                            Self::shift_one(cone, shift, step_z, step_s, σμ, prepared);
+                        }
                         true
                     },
                 )
@@ -341,7 +344,6 @@ where
         settings: &CoreSettings<T>,
         αmax: T,
     ) -> (T, T) {
-        #[cfg(feature = "sdp")]
         if self
             .cones
             .iter()
@@ -461,7 +463,6 @@ where
     /// recomputes its (cheap, deterministic) update on all ranks.
     fn scaling_state_len(cone: &SupportedCone<T>) -> usize {
         match cone {
-            #[cfg(feature = "sdp")]
             SupportedCone::PSDTriangleCone(c) => c.scaling_state_len(),
             _ => 0,
         }
@@ -487,20 +488,14 @@ where
     }
 
     fn pack_scaling_state(cone: &SupportedCone<T>, out: &mut Vec<T>) {
-        #[cfg(not(feature = "sdp"))]
-        let _ = out;
         match cone {
-            #[cfg(feature = "sdp")]
             SupportedCone::PSDTriangleCone(c) => c.pack_scaling_state(out),
             _ => {}
         }
     }
 
     fn unpack_scaling_state(cone: &mut SupportedCone<T>, src: &[T]) {
-        #[cfg(not(feature = "sdp"))]
-        let _ = src;
         match cone {
-            #[cfg(feature = "sdp")]
             SupportedCone::PSDTriangleCone(c) => c.unpack_scaling_state(src),
             _ => {}
         }
@@ -941,7 +936,6 @@ where
             if !cone.is_symmetric() {
                 return Vec::new();
             }
-            #[cfg(feature = "sdp")]
             if let SupportedCone::PSDTriangleCone(cone) = cone {
                 if prepared {
                     let n = r.len();
@@ -1159,7 +1153,14 @@ where
                     threading.inner_ways,
                     (),
                     &|cone, rows, ()| {
-                        cone.update_scaling(&s[rows.clone()], &z[rows], μ, scaling_strategy)
+                        if let (Some(chunk), SupportedCone::NonnegativeCone(c)) =
+                            (threading.orthant_chunk, &mut *cone)
+                        {
+                            c.update_scaling_parallel(&s[rows.clone()], &z[rows], chunk);
+                            true
+                        } else {
+                            cone.update_scaling(&s[rows.clone()], &z[rows], μ, scaling_strategy)
+                        }
                     },
                 )
             });
@@ -1212,7 +1213,13 @@ where
                     threading.inner_ways,
                     (y, work),
                     &|cone, rows, (y, work)| {
-                        cone.mul_Hs(y, &x[rows], work);
+                        if let (Some(chunk), SupportedCone::NonnegativeCone(c)) =
+                            (threading.orthant_chunk, &mut *cone)
+                        {
+                            c.mul_Hs_parallel(y, &x[rows], chunk);
+                        } else {
+                            cone.mul_Hs(y, &x[rows], work);
+                        }
                         true
                     },
                 )
@@ -1258,7 +1265,13 @@ where
                     threading.inner_ways,
                     (out, work),
                     &|cone, rows, (out, work)| {
-                        cone.Δs_from_Δz_offset(out, &ds[rows.clone()], work, &z[rows]);
+                        if let (Some(chunk), SupportedCone::NonnegativeCone(c)) =
+                            (threading.orthant_chunk, &mut *cone)
+                        {
+                            c.offset_parallel(out, &ds[rows.clone()], &z[rows], chunk);
+                        } else {
+                            cone.Δs_from_Δz_offset(out, &ds[rows.clone()], work, &z[rows]);
+                        }
                         true
                     },
                 )
@@ -1294,7 +1307,11 @@ where
                     .pool
                     .install(|| cone.step_length_parallel(dz, ds, z, s, chunk, αmax));
             }
-            if αmax.is_finite() && αmax > T::zero() && threading.sym_step_lanes.len() > 1 {
+            if threading.orthant_chunk.is_none()
+                && αmax.is_finite()
+                && αmax > T::zero()
+                && threading.sym_step_lanes.len() > 1
+            {
                 self.sym_step_bounds.resize(self.cones.len(), (αmax, αmax));
                 threading.pool.install(|| {
                     cone_parallel::sym_step_bounds(
@@ -1324,7 +1341,29 @@ where
             .mpi_world()
             .is_none()
             .then_some((dz, ds, z, s, settings));
+        let orthant = self
+            .threading
+            .as_ref()
+            .filter(|_| !cached_sym)
+            .and_then(|threading| {
+                threading
+                    .orthant_chunk
+                    .map(|chunk| (std::sync::Arc::clone(&threading.pool), chunk))
+            });
         self.fold_step_bounds(αmax, cached_sym, nonsym, |cone, rows, cap| {
+            if let (Some((pool, chunk)), SupportedCone::NonnegativeCone(c)) = (&orthant, &mut *cone)
+            {
+                return pool.install(|| {
+                    c.step_length_parallel(
+                        &dz[rows.clone()],
+                        &ds[rows.clone()],
+                        &z[rows.clone()],
+                        &s[rows],
+                        *chunk,
+                        cap,
+                    )
+                });
+            }
             cone.step_length(
                 &dz[rows.clone()],
                 &ds[rows.clone()],

@@ -31,7 +31,6 @@ pub enum SparseFormatError {
 /// Error type returned by BLAS-like dense factorization routines.  Errors
 /// return the internal BLAS error codes.
 #[allow(clippy::upper_case_acronyms)]
-#[allow(dead_code)]
 #[derive(Error, Debug)]
 pub(crate) enum DenseFactorizationError {
     #[error("Matrix dimension fields and/or array lengths are incompatible")]

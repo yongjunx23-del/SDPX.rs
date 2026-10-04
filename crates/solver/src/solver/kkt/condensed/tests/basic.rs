@@ -9,7 +9,7 @@ fn dense_panels_are_lazy_and_reused() {
         let rows = triangular_number(side);
         let a = CscMatrix::from(&vec![vec![T::one()]; rows]);
         let mut block = PsdBlock::new(side, &a, &(0..rows));
-        block.columns[0].schur_positions = vec![0];
+        block.columns[0].schur_positions = vec![0u32];
         block.Ginv = Matrix::identity(side);
         assert!(block.mat3c.data().is_empty());
         assert!(block.transform_lanes.is_empty());
@@ -79,7 +79,7 @@ fn dense_dot_tiles_match_the_serial_store_loop() {
     let count = block.columns.len();
     assert!(count > 256, "fixture must exceed one tile, got {count}");
     for column in block.columns.iter_mut() {
-        column.schur_positions = (0..count).collect();
+        column.schur_positions = (0..count as u32).collect();
     }
     block.compute_schur(&a.nzval, |_, _, _, _| {});
     assert!(block.dense_indices.len() > 256, "dense axis must tile");
@@ -128,7 +128,7 @@ fn dense_transform_lanes_match_the_serial_chunk_loop() {
     let columns = block.columns.len();
     assert!(columns >= 2, "fixture needs two dense columns");
     for column in block.columns.iter_mut() {
-        column.schur_positions = (0..columns).collect();
+        column.schur_positions = (0..columns as u32).collect();
     }
     // Warm the derived plans and row offsets the way an assembly does.
     block.compute_schur(&a.nzval, |_, _, _, _| {});
@@ -214,7 +214,7 @@ fn reordered_original_coordinates<T: FloatT>() {
         psd.columns.iter().map(|c| c.index).collect::<Vec<_>>(),
         [1, 3, 4, 2, 0]
     );
-    assert!(solver.schur.check_format().is_ok());
+    assert!(solver.reduced.kkt_matrix().check_format().is_ok());
     let (mut z, mut slack) = (vec![T::zero(); rows], vec![T::zero(); rows]);
     cones.unit_initialization(&mut z, &mut slack);
     for update in 0..2 {
@@ -232,7 +232,8 @@ fn reordered_original_coordinates<T: FloatT>() {
                     .fold(if i == j { T::one() } else { T::zero() }, |sum, row| {
                         row[i].mul_add(row[j], sum)
                     });
-                let got = solver.schur.nzval[schur_position(&solver.schur, i, j)];
+                let kkt = solver.reduced.kkt_matrix();
+                let got = kkt.nzval[schur_position(kkt, i, j)];
                 assert!(
                     (got - expected).abs()
                         <= T::from_f64(4096.).unwrap() * T::epsilon() * (T::one() + expected.abs())
@@ -289,7 +290,7 @@ fn check_compact_panel(n: usize) {
         }
     }
     for (b, c) in p.columns.iter_mut().enumerate() {
-        c.schur_positions = (0..=b).map(|a| triangular_number(b) + a).collect();
+        c.schur_positions = (0..=b).map(|a| (triangular_number(b) + a) as u32).collect();
         c.sparse = false;
     }
     let mut previous_width = usize::MAX;
@@ -314,13 +315,20 @@ fn check_compact_panel(n: usize) {
             for skip in [false, true] {
                 let mut generic = vec![f64::NAN; triangular_number(cols)];
                 let mut accelerated = generic.clone();
-                p.compute_schur_dense_impl(&a.nzval, skip, |_, _, pos, v| generic[pos] = v, None);
+                let mut plain = |_: usize, _: usize, pos: usize, v: f64| generic[pos] = v;
+                p.compute_schur_dense_sink(
+                    &a.nzval,
+                    skip,
+                    &mut SchurSink::Mapped(&mut plain, std::marker::PhantomData),
+                    None,
+                );
+                let mut fast = |_: usize, _: usize, pos: usize, v: f64| accelerated[pos] = v;
                 // SAFETY: both CPU features were checked above.
                 unsafe {
                     p.compute_schur_dense_fma(
                         &a.nzval,
                         skip,
-                        |_, _, pos, v| accelerated[pos] = v,
+                        &mut SchurSink::Mapped(&mut fast, std::marker::PhantomData),
                         None,
                     );
                 }
@@ -379,7 +387,7 @@ fn equal_columns_reuse_matches_explicit_congruence_and_updates() {
         }
     }
     for (b, c) in p.columns.iter_mut().enumerate() {
-        c.schur_positions = (0..=b).map(|a| triangular_number(b) + a).collect();
+        c.schur_positions = (0..=b).map(|a| (triangular_number(b) + a) as u32).collect();
         c.sparse = b % 5 == 0;
     }
     for update in 0..2 {
@@ -446,7 +454,7 @@ fn streamed_exact_reuse<T: FloatT>() {
     }
     for (b, c) in p.columns.iter_mut().enumerate() {
         c.sparse = false;
-        c.schur_positions = (0..=b).map(|a| triangular_number(b) + a).collect();
+        c.schur_positions = (0..=b).map(|a| (triangular_number(b) + a) as u32).collect();
     }
     for update in 0..2 {
         if update == 1 {
@@ -646,7 +654,7 @@ fn mixed_operator<T: FloatT>() {
             }
         }
         assert!(solver.assemble());
-        let sparse = solver.schur.nzval.clone();
+        let sparse = solver.reduced.kkt_matrix().nzval[..solver.schur_nnz].to_vec();
         for block in &mut solver.blocks {
             if let Scaling::Psd(p) = &mut block.scaling {
                 for c in &mut p.columns {
@@ -656,7 +664,7 @@ fn mixed_operator<T: FloatT>() {
         }
         assert!(solver.assemble());
         assert!(
-            solver.schur.nzval.norm_inf_diff(&sparse)
+            solver.reduced.kkt_matrix().nzval[..solver.schur_nnz].norm_inf_diff(&sparse)
                 <= settings.iterative_refinement_abstol * sparse.norm_inf()
         );
     }
@@ -765,13 +773,11 @@ fn structural_psd_blocks_remain_sparse_with_global_equalities() {
     ]);
     let solver = CondensedKKTSolver::new(&P, &A, &types, &cones, &CoreSettings::default());
     // Two 2x2 primal cliques plus one explicitly stored P edge, even zero.
-    assert_eq!(solver.schur.nnz(), 7);
+    assert_eq!(solver.schur_nnz, 7);
     assert_eq!(solver.retained_rows, vec![6]);
     assert_eq!(solver.retained_A.nnz(), 4);
-    assert_eq!(
-        solver.schur.rowval[solver.schur.colptr[3]..solver.schur.colptr[4]],
-        [2, 3]
-    );
+    let kkt = solver.reduced.kkt_matrix();
+    assert_eq!(kkt.rowval[kkt.colptr[3]..kkt.colptr[4]], [2, 3]);
 }
 
 #[test]

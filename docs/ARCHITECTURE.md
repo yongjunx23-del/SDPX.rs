@@ -1,0 +1,175 @@
+# SDPX architecture
+
+SDPX is one homogeneous self-dual (HSD) interior-point engine, derived from
+Clarabel.rs, generic over the scalar
+`FloatT = Scalar + BlasFloatT + LDLConfiguration`. The same code serves
+Float64 and every MPFR width. The native Rust API, the `sdpx` CLI and the C
+ABI are thin frontends over it; the PMP converter only produces inputs, and
+Julia scripts only generate inputs or audit outputs.
+
+This file describes the design. Working rules and numerical contracts are in
+[AGENTS.md](../AGENTS.md); measured status, known failures and open work are
+in [REVIEW_AND_PLAN.md](../REVIEW_AND_PLAN.md); experiment evidence (timings,
+job IDs, rejected trials) is in [JOURNAL.md](JOURNAL.md).
+
+## Crates
+
+| Crate | Responsibility |
+|---|---|
+| `crates/arithmetic` | `Scalar` trait, `MpFloat<N>` (MPFR value with owned limbs), inline rounded arithmetic, `exactdot`, decimal and wire formats. |
+| `crates/solver` | Generic solver, native Rust API and the `sdpx` CLI. |
+| `crates/pmp` | PMP JSON/XML reader and the `sdpx-pmp2sdp` converter to sampled SDP inputs. |
+| `crates/ffi` | C ABI and prepared handles; header in `include/sdpx.h`. |
+
+## Solver modules
+
+| Module | Responsibility |
+|---|---|
+| `solver/core` | HSD predictor/corrector loop and the traits it drives (data, variables, residuals, KKT, info, solution); callbacks and checkpoints. |
+| `solver/default` | The standard problem: `PreparedProblem` setup, Ruiz equilibration, presolve, settings, convergence tests, JSON I/O, data updates. |
+| `solver/cones` | Zero, nonnegative, SOC, exponential, power, generalized power and PSD-triangle cones; the composite cone and its worker pool. |
+| `solver/kkt` | Augmented (`direct`) and condensed formulations, LDL backends (`ldl`) and iterative refinement. |
+| `solver/sampled` | Factored PSD operators (bases × sample weights) for bootstrap SDPs. |
+| `solver/chordal` | Sparse PSD chordal decomposition and solution recovery. |
+| `solver/distributed`, `mpi.rs` | Owner-partitioned implementation of the core traits; MPI loaded at runtime. |
+| `algebra` | CSC/dense matrices, `BlasFloatT`, MPFR dense kernels, exact residue (RNS) products in `dense/blas/rns_blas.rs`, per-thread scratch. |
+| `qdldl` | QDLDL factorization with elimination-tree parallel scheduling. |
+| `receipt`, `timers` | Phase wall/CPU timings and peak RSS (`SDPX_RECEIPT`, `SDPX_PROFILE`); the solve clock. |
+
+## Setup
+
+External input is validated once, at the boundary: `PreparedProblem` setup,
+the JSON readers and the C ABI check dimensions, CSC structure, cone
+descriptions and settings. Internal code trusts the structures the solver
+builds and uses `debug_assert!` for its invariants.
+
+Ordinary direct solves apply presolve, chordal decomposition and Ruiz
+equilibration. Prepared handles keep Ruiz but disable structural
+preprocessing so later data updates keep the prepared structure. Consumed
+JSON problems move their owned P, q, b and A into setup instead of copying.
+Solutions, residuals and checkpoints are reported in original coordinates.
+
+Sampled problems keep the factored operator authoritative: once installed,
+the retained linear-A values are released and the reduced KKT storage owns
+the coefficients. Rounded materializations never replace the operator.
+
+## Iteration
+
+Each HSD iteration:
+
+1. updates residuals and the convergence/infeasibility tests;
+2. scales the cones (NT scaling; PSD blocks use Cholesky + SVD);
+3. updates and factors the KKT operator;
+4. solves the affine and combined predictor/corrector directions — the
+   constant and affine right-hand sides share one batched solve;
+5. chooses the step (Float64 symmetric problems also try a quadratic curve
+   on the two existing directions) and updates the iterate, keeping the
+   previous accepted iterate for recovery.
+
+Newton solves use iterative refinement against the true, unshifted operator.
+At MPFR precision every refinement residual row is an exact dot product
+rounded once, so refinement keeps working on badly scaled bootstrap systems.
+Clarabel stopping rules, reduced tolerances, infeasibility detection,
+regularization with escalation and the distinct `AlmostSolved` status are
+part of the engine. There is no low-precision solver, mixed-precision
+factorization or precision-ladder warm start.
+
+## KKT formulation and backends
+
+`kkt_form` is `auto`, `augmented` or `condensed`.
+
+- **Augmented** factors the full quasi-definite system.
+- **Condensed** eliminates PSD, nonnegative and small (dimension ≤ 16)
+  second-order rows into a Schur complement on the primal variables and keeps
+  the other cone rows. An eliminated SOC block contributes BᵀB with
+  B = W⁻¹A_K, using the explicit NT factor
+  W⁻¹ = η⁻¹[[w₀, −w₁ᵀ], [−w₁, I + w₁w₁ᵀ/(1+w₀)]]. Orthant and SOC rows share one
+  Gram: columns present in at least half the rows form a dense panel (one
+  SYRK), the rest use a precomputed pair plan; at MPFR precision every entry
+  is an exact sum rounded once, and rows touching only panel columns use a
+  cached exact residue congruence Aᵀdiag(1/w²)A. `auto` condenses
+  ordinary PSD data when it has at least 256 PSD `svec` coordinates and the
+  reduced dimension is at most a quarter of that, comparing structural
+  storage estimates of both forms. Sampled blocks apply their factored
+  operator directly. Condensed assembly writes into the primal prefix of the
+  direct layer's KKT matrix, so there is one authoritative KKT CSC.
+
+With `direct_solve_method = "auto"`, the direct layer tries the structural
+backends in order, then the scalar's general backend. The active backend is
+reported as `linear_solver`.
+
+| Order | Backend | Selection |
+|---|---|---|
+| 1 | `local_soc_arrow` | ≥ 8 SOC3 leaves with a nonempty equality border of ≤ 128 coordinates and no cross-leaf coupling. |
+| 2 | `shared_soc_arrow` | Zero and ≥ 8 SOC3 cones only (augmented form; condensed eliminates SOC3), shared primal border of ≤ 128 coordinates, workspace ≤ `shared_soc_max_bytes` (default 2 GiB; 0 disables). |
+| 3 | `local_bounds_faer` / `local_bounds_arrow` | ≥ 64 variables with one or two local bound rows, diagonal `P` and a nonempty equality/free border, admitted by added storage. Float64 needs `faer-sparse`; MPFR uses exact bound Gram products. |
+| 4 | `dense_block` | Float64: an eligible dense leading positive block, pooled tiled Cholesky. |
+| 5 | `arrow` | Disconnected positive dense leaves around a negative border, estimated workspace ≤ max(512 MiB, 8 × KKT storage) (Float64 and MPFR). Leaf contributions are formed on the fly, not stored. |
+| 6 | `faer` / `qdldl` | General sparse LDL. Float64 with `faer-sparse` uses faer when estimated flops ≥ 1e8 and flops per factor nonzero ≥ 40, else QDLDL. MPFR uses QDLDL. |
+
+`qdldl` can be pinned for any scalar and `faer` for Float64. A failed arrow
+factorization falls back to QDLDL and a failed dense block to its sparse
+backend; both keep the requested precision and refine against the original
+operator. Static shifts are applied to the factorization only; the residual
+operator stays unshifted.
+
+## Arithmetic
+
+`MpFloat<N>` owns its limbs. For regular values, multiplication through 1280
+bits and addition/subtraction through 512 bits round inline to nearest-even;
+128/256-bit FMA and two-product FMMA use exact stack kernels with one
+rounding. All other cases call MPFR and produce the same bits.
+
+`exactdot` accumulates the exact sum of products in fixed point and rounds
+once (inline limb products through 256 bits, GMP above). The result does not
+depend on term order, partitioning or thread count. Large dense MPFR
+products, congruences (`Aᵀdiag(d)A`) and bound Grams use exact residue (RNS)
+kernels with caches for operands that stay fixed during a solve; CRT
+reconstruction rounds each entry once. MPFR sparse products `Ax`/`Aᵀx`
+accumulate each output row/column exactly when it has enough entries.
+Ordinary scalar operations and factorizations stay at the requested
+precision. Binary64 products with A route columns that are at least a quarter
+full through a dense BLAS panel (`algebra/csc/dense_columns.rs`), independent
+of the thread count.
+
+`BlasFloatT` maps Float64 to system BLAS/LAPACK and wide scalars to the MPFR
+dense kernels (GEMM/SYRK through `exactdot`/RNS, Cholesky, triangular
+solves, symmetric eigensolver and a bidiagonal-QR SVD whose rotations are
+logged and replayed row-parallel). Float32 is configured only for dense
+kernel tests.
+
+## Parallelism and memory
+
+One worker pool per solve (`max_threads`) runs cone blocks, factorization
+and long vector work; dominant blocks split their tiles over the same pool.
+Splits preserve each output's operation order, so results are independent of
+the thread count. Scratch is per thread (`algebra/scratch.rs`) and reused
+across iterations; dense kernels reuse dead input/output storage instead of
+allocating temporaries. BLAS providers must support concurrent calls from
+workers (source-built OpenBLAS needs `USE_LOCKING=1`).
+
+MPI is loaded at runtime. The ordinary MPI path replicates input data and
+combines sampled products. The generic `arrow` backend distributes its
+leaves: each rank factors a cost-balanced contiguous range of leaves, the
+border Schur complement is summed in rank order and factored on every rank,
+and solves gather the leaf solutions. Exact refinement residual rows are
+split across ranks by work. `--partitions N|auto` selects owner partitioning,
+where ranks own whole blocks and share the equality Schur complement, and
+`--cost-history-in/out` feeds measured block costs to the balancer. Both
+paths plug into the same core HSD loop.
+
+## Build features
+
+BLAS/LAPACK are always linked. Choose one provider feature or supply direct
+linkage (for example `RUSTFLAGS="-l dylib=openblas"`).
+
+| Feature | Effect |
+|---|---|
+| `sdp-accelerate`, `sdp-openblas`, `sdp-mkl`, `sdp-netlib` | BLAS/LAPACK provider (solver and FFI crates). |
+| `faer-sparse` | Float64 faer sparse LDL and packed local-bound kernels. |
+| `serde` (solver default) | JSON input, output and settings; required by `sdpx`. |
+| `all-precisions` | Frontend MPFR dispatch for 128–2048 bits in steps of 64 (default: 128, 256, 512, 768, 1024). Native `MpFloat<N>` types are unaffected. |
+
+The converter dispatches only MPFR widths. Build and verification commands
+are in [AGENTS.md](../AGENTS.md) and the
+[development skill](../.agents/skills/sdpx-development/SKILL.md).

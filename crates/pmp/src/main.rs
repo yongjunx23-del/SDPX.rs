@@ -1,13 +1,13 @@
 use sdpx_pmp::Result;
 use std::path::PathBuf;
 fn usage() {
-    println!("sdpx-pmp2sdp --input PMP.json|PMP.xml --output NEW_DIRECTORY [--precision BITS] [--threads N]\n\nBITS: multiples of 64 from 128 through 2048 (default 768).\nN: concurrent blocks (default 1); more workers use more memory.\nWrites uncompressed SDPB sampled JSON. Existing output paths are refused.");
+    println!("sdpx-pmp2sdp --input PMP.json|PMP.xml --output NEW_DIRECTORY [--precision BITS] [--threads N]\n\nBITS: MPFR widths from {} (default 768).\nN: concurrent blocks (default 1); more workers use more memory.\nWrites uncompressed SDPB sampled JSON. Existing output paths are refused.", sdpx_arithmetic::FRONTEND_PRECISION_HELP);
 }
 macro_rules! dispatch {
     ( [] (53,$variant:ident,$scalar:ty), $(($bits:literal,$name:ident,$ty:ty),)* ) => {
         fn convert(bits:usize,input:&std::path::Path,output:&std::path::Path,threads:usize)->Result<usize> {
             match bits { $($bits => sdpx_pmp::convert_file::<$ty>(input,output,threads),)*
-                _ => Err("precision must be a multiple of 64 from 128 through 2048".into()), }
+                _ => Err(format!("unsupported precision; use an MPFR width from: {}", sdpx_arithmetic::FRONTEND_PRECISION_HELP).into()), }
         }
     }
 }

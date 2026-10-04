@@ -15,7 +15,6 @@ pub trait SymmetricCone<T: FloatT>: JordanAlgebra<T> {
     // x = λ \ z
     // Included as a special case since q \ z for general q is difficult
     // to implement for general q i PSD cone and never actually needed.
-    #[cfg_attr(not(feature = "sdp"), allow(dead_code))]
     fn λ_inv_circ_op(&mut self, x: &mut [T], z: &[T]);
 }
 

@@ -10,7 +10,7 @@
 use super::*;
 use num_traits::{One, ToPrimitive, Zero};
 use rayon::prelude::*;
-use sdpx_arithmetic::{EncodeSide, MpFloat, RnsPlan, Scalar};
+use sdpx_arithmetic::{MpFloat, Scalar};
 type F<const N: usize> = MpFloat<N>;
 
 // Minimum trailing column/element count before a kernel offers independent
@@ -297,18 +297,6 @@ fn gemm<const N: usize>(
             }
         }
     }
-    // Exact residue accumulation replaces the FMA chain when the operand
-    // window admits a plan; reconstruction rounds once at the destination.
-    let rns = (alpha != F::<N>::zero()
-        && RnsPlan::worth_planning(k as usize, m as usize * n as usize))
-    .then(|| RnsPlan::for_pair(a, b, k as usize))
-    .flatten()
-    .filter(|plan| plan.profitable(k as usize, m as usize * n as usize, a.len() + b.len(), N))
-    .and_then(|plan| {
-        plan.encode(a, EncodeSide::A)
-            .zip(plan.encode(b, EncodeSide::B))
-            .map(|(ra, rb)| (plan, ra, rb))
-    });
     let column = |j: usize, column: &mut [F<N>]| {
         for i in 0..m as usize {
             let mut v = F::<N>::zero();
@@ -325,10 +313,8 @@ fn gemm<const N: usize>(
                 } else {
                     (j, ldb as usize)
                 };
-                v = match &rns {
-                    Some((plan, ra, rb)) => plan.dot(ra, a0, da, rb, b0, db, k as usize),
-                    None => F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &b[b0 + p * db]))),
-                };
+                // Exact accumulation, rounded once at the destination.
+                v = F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &b[b0 + p * db])));
             }
             column[i] = axpby(alpha, v, beta, column[i]);
         }
@@ -336,11 +322,12 @@ fn gemm<const N: usize>(
     output_columns(c, m as usize, n as usize, ldc as usize, parallel, column);
 }
 /// Structural gate for the exact residue-BLAS product: enough multiply work
-/// per output to amortize encode and CRT reconstruction. Measured break-even
-/// (Apple M4, 256–768 bits) is near 32×32×32; at 45³ the kernel is 2.1× (256
-/// bits) to 3.7× (768 bits) faster than per-entry exact dots.
+/// per output to amortize encode and CRT reconstruction. Both paths return the
+/// same correctly rounded values. Measured serial square GEMM break-even on
+/// AMD EPYC 7742 (2026-09-30): the residue kernel wins from 24³ (1.14× at 512
+/// bits, 1.20× at 768, 1.50× at 1024) and is 1.7–2.4× faster at 40³.
 fn residue_blas_profitable<const N: usize>(m: usize, n: usize, k: usize) -> bool {
-    N >= 4 && k >= 40 && m * n >= 1600
+    N >= 4 && k >= 24 && m * n >= 576
 }
 
 impl<const N: usize> XgemmScalar for F<N> {
@@ -351,6 +338,7 @@ impl<const N: usize> XgemmScalar for F<N> {
         h: usize,
         kmax: usize,
         q: &[Self],
+        abs_q: bool,
         x: &[Self],
         sqrt2: Self,
         pool: Option<&rayon::ThreadPool>,
@@ -365,7 +353,7 @@ impl<const N: usize> XgemmScalar for F<N> {
             && sqrt2 == num_traits::FromPrimitive::from_u8(2).unwrap()
             && cache_q.is_some();
         (residue_blas_profitable::<N>(h, kmax, h) || cached_dense)
-            && super::rns_blas::svec_quadratic(h, kmax, q, x, sqrt2, pool, out, cache_q)
+            && super::rns_blas::svec_quadratic(h, kmax, q, abs_q, x, sqrt2, pool, out, cache_q)
     }
     fn xsymmetric_bilinear_exact(
         h: usize,
@@ -396,6 +384,17 @@ impl<const N: usize> XgemmScalar for F<N> {
     ) -> bool {
         residue_blas_profitable::<N>(m, m, k)
             && super::rns_blas::congruence(ta, m, k, a, lda, x, ldx, upper_only, pool, c, cache_a)
+    }
+    fn diag_congruence_upper_exact(
+        m: usize,
+        k: usize,
+        a: &[Self],
+        d: &[Self],
+        c: &mut [Self],
+        pool: Option<&rayon::ThreadPool>,
+        cache_a: &mut super::ResidueCache,
+    ) -> bool {
+        super::rns_blas::diag_congruence(m, k, a, d, true, pool, c, cache_a)
     }
     fn xgemm_upper_exact(
         ta: u8,
@@ -464,48 +463,6 @@ impl<const N: usize> XgemmScalar for F<N> {
             ldc,
             Some((pool, column_tile)),
         );
-    }
-}
-impl<const N: usize> XgemvScalar for F<N> {
-    fn xgemv(
-        t: u8,
-        m: i32,
-        n: i32,
-        alpha: Self,
-        a: &[Self],
-        lda: i32,
-        x: &[Self],
-        incx: i32,
-        beta: Self,
-        y: &mut [Self],
-        incy: i32,
-    ) {
-        assert!(trans(t) && valid(a.len(), m, n, lda) && incx != 0 && incy != 0);
-        let (r, k) = if upper(t) == b'N' {
-            (m as usize, n as usize)
-        } else {
-            (n as usize, m as usize)
-        };
-        if m == 0 || n == 0 {
-            return;
-        }
-        assert!(
-            x.len() > vi(0, k, incx).max(vi(k - 1, k, incx))
-                && y.len() > vi(0, r, incy).max(vi(r - 1, r, incy))
-        );
-        for i in 0..r {
-            let mut v = Self::zero();
-            if alpha != Self::zero() {
-                let (a0, da) = if upper(t) == b'N' {
-                    (i, lda as usize)
-                } else {
-                    (i * lda as usize, 1)
-                };
-                v = F::dot_fma((0..k).map(|p| (&a[a0 + p * da], &x[vi(p, k, incx)])));
-            }
-            let q = vi(i, r, incy);
-            y[q] = axpby(alpha, v, beta, y[q]);
-        }
     }
 }
 impl<const N: usize> XsymvScalar for F<N> {
@@ -584,13 +541,6 @@ fn syrk<const N: usize>(
     {
         return;
     }
-    // Same operand on both sides: one encode serves both residue columns.
-    let rns = (alpha != F::<N>::zero()
-        && RnsPlan::worth_planning(k as usize, n as usize * (n as usize + 1) / 2))
-    .then(|| RnsPlan::for_pair(a, a, k as usize))
-    .flatten()
-    .filter(|plan| plan.profitable(k as usize, n as usize * (n as usize + 1) / 2, a.len(), N))
-    .and_then(|plan| plan.encode(a, EncodeSide::A).map(|ra| (plan, ra)));
     let column = |j: usize, column: &mut [F<N>]| {
         for i in 0..n as usize {
             if (upper(u) == b'U' && i > j) || (upper(u) == b'L' && i < j) {
@@ -608,10 +558,7 @@ fn syrk<const N: usize>(
                 } else {
                     (j * lda as usize, 1)
                 };
-                v = match &rns {
-                    Some((plan, ra)) => plan.dot(ra, a0, da, ra, b0, db, k as usize),
-                    None => F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &a[b0 + p * db]))),
-                };
+                v = F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &a[b0 + p * db])));
             }
             column[i] = axpby(alpha, v, beta, column[i]);
         }

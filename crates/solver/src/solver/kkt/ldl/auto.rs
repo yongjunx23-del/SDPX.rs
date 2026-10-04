@@ -1,43 +1,10 @@
 #![allow(non_snake_case)]
-#[cfg(feature = "faer-sparse")]
 use crate::solver::kkt::ldl::qdldl::QDLDLDirectLDLSolver;
 use crate::{
     algebra::*,
-    solver::{
-        core::CoreSettings,
-        kkt::direct::{BoxedDirectLDLSolver, DirectLDLSolverReqs},
-    },
+    solver::{core::CoreSettings, kkt::direct::BoxedDirectLDLSolver},
 };
 
-pub struct AutoDirectLDLSolver<T> {
-    T: std::marker::PhantomData<T>,
-}
-
-impl<T> DirectLDLSolverReqs for AutoDirectLDLSolver<T>
-where
-    T: FloatT,
-{
-    fn required_matrix_shape() -> MatrixTriangle {
-        MatrixTriangle::Triu
-    }
-}
-
-impl<T> AutoDirectLDLSolver<T>
-where
-    T: FloatT,
-{
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(
-        KKT: &CscMatrix<T>,
-        Dsigns: &[i8],
-        settings: &CoreSettings<T>,
-        _perm: Option<Vec<usize>>,
-    ) -> BoxedDirectLDLSolver<T> {
-        T::auto_ldlsolver(KKT, Dsigns, settings)
-    }
-}
-
-#[cfg(feature = "faer-sparse")]
 pub(super) fn ldl_auto_select<T>(
     KKT: &CscMatrix<T>,
     Dsigns: &[i8],

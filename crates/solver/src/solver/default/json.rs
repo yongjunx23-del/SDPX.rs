@@ -6,8 +6,8 @@ use std::{fs::File, io, io::Read};
 
 /// Portable conic input using Clarabel's CSC JSON layout.
 ///
-/// MPFR scalars use decimal strings; Float64 uses JSON numbers. With `sdp`,
-/// optional sampled blocks define PSD coefficients and `A` stores only the
+/// MPFR scalars use decimal strings; Float64 uses JSON numbers. Optional
+/// sampled blocks define PSD coefficients and `A` stores only the
 /// ordinary linear entries, just as in `DefaultSolver::new_sampled`.
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "T: Serialize + DeserializeOwned", deny_unknown_fields)]
@@ -27,7 +27,6 @@ pub struct JsonProblem<T: FloatT> {
     #[serde(default, serialize_with = "serialize_settings")]
     pub settings: DefaultSettings<T>,
     /// Factor-authoritative PSD input, without a materialized copy in JSON.
-    #[cfg(feature = "sdp")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sampled: Vec<SampledBlock<T>>,
 }
@@ -54,7 +53,6 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
     /// Build the partitioned backend through the same validated preparation.
     /// An active MPI world selects the rank-local owner transport internally;
     /// an explicit count must equal the MPI world size in that mode.
-    #[cfg(feature = "sdp")]
     pub fn into_partitioned_solver(
         self,
         partitions: usize,
@@ -64,7 +62,7 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
 
     /// Import optional historical owner costs while constructing an explicit
     /// partition plan.  Metadata is checked against the exact prepared input.
-    #[cfg(all(feature = "sdp", feature = "serde"))]
+    #[cfg(feature = "serde")]
     pub fn into_partitioned_solver_with_cost_history(
         self,
         partitions: usize,
@@ -85,14 +83,13 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
     /// Choose structural tasks for the requested thread budget, limiting
     /// replicated equality storage. In MPI this selects one global owner per
     /// rank and the returned solver reports the global owner count.
-    #[cfg(feature = "sdp")]
     pub fn into_auto_partitioned_solver(self) -> Result<PartitionedSolver<T>, SolverError> {
         PartitionedSolver::from_prepared_auto(self.into_prepared()?)
     }
 
     /// Choose bounded structural tasks, optionally using validated historical
     /// owner costs and opt-in training timers.
-    #[cfg(all(feature = "sdp", feature = "serde"))]
+    #[cfg(feature = "serde")]
     pub fn into_auto_partitioned_solver_with_cost_history(
         self,
         options: CostHistoryOptions,
@@ -112,14 +109,6 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
         self,
         with_cost_identity: bool,
     ) -> Result<super::PreparedProblem<T>, SolverError> {
-        for matrix in [&self.P, &self.A] {
-            if matrix.n.checked_add(1) != Some(matrix.colptr.len())
-                || matrix.colptr.first() != Some(&0)
-                || matrix.check_format().is_err()
-            {
-                return Err(SolverError::BadInputData("invalid CSC matrix"));
-            }
-        }
         let mut rows = 0usize;
         for cone in &self.cones {
             let invalid = || SolverError::BadInputData("invalid cone dimensions or parameters");
@@ -145,7 +134,6 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
                     }
                     alpha.len().checked_add(*dim2).ok_or_else(invalid)?
                 }
-                #[cfg(feature = "sdp")]
                 SupportedConeT::PSDTriangleConeT(n) => n
                     .checked_add(1)
                     .and_then(|next| n.checked_mul(next))
@@ -157,49 +145,26 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
         if rows != self.b.len() {
             return Err(SolverError::BadInputData("cone dimensions do not match b"));
         }
-        #[cfg(feature = "sdp")]
         if !self.sampled.is_empty() {
-            if with_cost_identity {
-                #[cfg(feature = "serde")]
-                return super::PreparedProblem::new_sampled_with_cost_identity(
-                    &self.P,
-                    &self.q,
-                    &self.A,
-                    &self.b,
-                    &self.cones,
-                    self.sampled,
-                    self.settings,
-                    true,
-                );
-            }
-            return super::PreparedProblem::new_sampled(
-                &self.P,
-                &self.q,
-                &self.A,
-                &self.b,
+            return super::PreparedProblem::new_sampled_cow_with_identity(
+                std::borrow::Cow::Owned(self.P),
+                std::borrow::Cow::Owned(self.q),
+                std::borrow::Cow::Owned(self.A),
+                std::borrow::Cow::Owned(self.b),
                 &self.cones,
                 self.sampled,
                 self.settings,
+                with_cost_identity,
             );
         }
-        if with_cost_identity {
-            #[cfg(feature = "serde")]
-            return super::PreparedProblem::new_with_cost_identity(
-                &self.P,
-                &self.q,
-                &self.A,
-                &self.b,
-                &self.cones,
-                self.settings,
-            );
-        }
-        super::PreparedProblem::new(
-            &self.P,
-            &self.q,
-            &self.A,
-            &self.b,
+        super::PreparedProblem::new_with_cost_identity_impl(
+            std::borrow::Cow::Owned(self.P),
+            std::borrow::Cow::Owned(self.q),
+            std::borrow::Cow::Owned(self.A),
+            std::borrow::Cow::Owned(self.b),
             &self.cones,
             self.settings,
+            with_cost_identity,
         )
     }
 }
@@ -219,7 +184,6 @@ where
     T: FloatT + DeserializeOwned + Serialize,
 {
     fn save_to_file(&self, file: &mut File) -> Result<(), io::Error> {
-        #[cfg(feature = "sdp")]
         if self.data.sampled_input {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -233,7 +197,6 @@ where
             b: self.data.b.clone(),
             cones: self.data.cones.clone(),
             settings: self.settings.clone(),
-            #[cfg(feature = "sdp")]
             sampled: Vec::new(),
         };
 
@@ -255,10 +218,9 @@ where
         sanitize_settings(&mut json_data.settings);
 
         // write to file
-        let json = serde_json::to_string(&json_data)?;
-        file.write_all(json.as_bytes())?;
-
-        Ok(())
+        let mut writer = io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &json_data)?;
+        writer.flush()
     }
 
     fn load_from_file(
@@ -289,7 +251,6 @@ mod tests {
                 equilibrate_enable: false,
                 ..DefaultSettings::default()
             },
-            #[cfg(feature = "sdp")]
             sampled: Vec::new(),
         }
     }

@@ -30,8 +30,6 @@ mod exactdot;
 #[cfg(test)]
 mod integer;
 pub use exact::Exact;
-mod rns;
-pub use rns::{EncodeSide, Residues, RnsPlan};
 mod wire;
 
 /// Operations required by the solver, without Float's 64-bit integer_decode.
@@ -99,6 +97,12 @@ pub trait Scalar:
             .into_iter()
             .fold(Self::zero(), |acc, (x, y)| x.mul_add(*y, acc))
     }
+    /// `dot_fma` over two equal-length slices. Same value; high-precision
+    /// types can scan contiguous operands without collecting the terms.
+    fn dot_slices(a: &[Self], b: &[Self]) -> Self {
+        debug_assert_eq!(a.len(), b.len());
+        Self::dot_fma(a.iter().zip(b))
+    }
     fn ln(self) -> Self;
     fn exp(self) -> Self;
     fn sin(self) -> Self;
@@ -117,86 +121,12 @@ pub trait Scalar:
     fn is_sign_negative(self) -> bool;
     fn min(self, other: Self) -> Self;
     fn max(self, other: Self) -> Self;
-    /// Exact residue-domain dot support (arbitrary-precision backends only).
-    /// The default reports `None` so callers keep `dot_fma`.
-    #[doc(hidden)]
-    fn rns_plan(_a: &[Self], _b: &[Self], _terms: usize) -> Option<crate::rns::RnsPlan> {
-        None
-    }
-    /// [`Scalar::rns_plan`] variant with precomputed `(lo, hi)` exponent ranges.
-    #[doc(hidden)]
-    fn rns_plan_ranges(
-        _a_range: (i64, i64),
-        _b_range: (i64, i64),
-        _terms: usize,
-    ) -> Option<crate::rns::RnsPlan> {
-        None
-    }
-    #[doc(hidden)]
-    fn rns_encode(
-        _plan: &crate::rns::RnsPlan,
-        _side: crate::rns::EncodeSide,
-        _m: &[Self],
-    ) -> Option<crate::rns::Residues> {
-        None
-    }
-    /// Full-width encode for cached constant operands; see
-    /// [`crate::rns::RnsPlan::encode_wide`].
-    #[doc(hidden)]
-    fn rns_encode_wide(
-        _plan: &crate::rns::RnsPlan,
-        _side: crate::rns::EncodeSide,
-        _m: &[Self],
-    ) -> Option<crate::rns::Residues> {
-        None
-    }
-    #[doc(hidden)]
-    fn rns_dot(
-        _plan: &crate::rns::RnsPlan,
-        _ra: &crate::rns::Residues,
-        _a0: usize,
-        _da: usize,
-        _rb: &crate::rns::Residues,
-        _b0: usize,
-        _db: usize,
-        _terms: usize,
-    ) -> Self {
-        unimplemented!("rns_dot requires rns_plan support")
-    }
-    /// Reusable exponent range scan shared by `rns_plan` implementations.
-    #[doc(hidden)]
-    fn rns_exponent_range(_m: &[Self]) -> Option<(i64, i64)> {
-        None
-    }
-    /// Lossless value encoding for solver-state snapshots: `(kind, exponent,
-    /// limbs)`. `None` (the default) means the type has no exact snapshot
-    /// encoding. Only concrete payload words are serialized — never
-    /// descriptor pointers.
-    #[doc(hidden)]
-    fn scalar_exact_encode(&self) -> Option<(i32, i64, Vec<u64>)> {
-        None
-    }
-    /// Inverse of [`Scalar::scalar_exact_encode`].
-    #[doc(hidden)]
-    fn scalar_exact_decode(_kind: i32, _exponent: i64, _limbs: &[u64]) -> Option<Self> {
-        None
-    }
 }
 macro_rules! primitive_scalar {
     ($t:ty) => {
         impl Scalar for $t {
             fn exact(&self) -> Option<Exact> {
                 self.is_finite().then(|| Exact::from_f64(*self as f64))
-            }
-            fn scalar_exact_encode(&self) -> Option<(i32, i64, Vec<u64>)> {
-                Some((0, 0, vec![self.to_bits() as u64]))
-            }
-            fn scalar_exact_decode(kind: i32, exponent: i64, limbs: &[u64]) -> Option<Self> {
-                if kind == 0 && exponent == 0 && limbs.len() == 1 {
-                    Some(Self::from_bits(limbs[0] as _))
-                } else {
-                    None
-                }
             }
             fn wire_size() -> Option<usize> {
                 Some(std::mem::size_of::<$t>())
@@ -217,84 +147,111 @@ macro_rules! primitive_scalar {
                 word[..bytes.len()].copy_from_slice(&bytes);
                 Some(Self::from_bits(u64::from_le_bytes(word) as _))
             }
+            #[inline]
             fn precision_bits() -> usize {
                 Self::MANTISSA_DIGITS as usize
             }
+            #[inline]
             fn epsilon() -> Self {
                 Self::EPSILON
             }
+            #[inline]
             fn max_value() -> Self {
                 Self::MAX
             }
+            #[inline]
             fn min_value() -> Self {
                 Self::MIN
             }
+            #[inline]
             fn min_positive_value() -> Self {
                 Self::MIN_POSITIVE
             }
+            #[inline]
             fn infinity() -> Self {
                 Self::INFINITY
             }
+            #[inline]
             fn neg_infinity() -> Self {
                 Self::NEG_INFINITY
             }
+            #[inline]
             fn nan() -> Self {
                 Self::NAN
             }
+            #[inline]
             fn abs(self) -> Self {
                 self.abs()
             }
+            #[inline]
             fn sqrt(self) -> Self {
                 self.sqrt()
             }
+            #[inline]
             fn cbrt(self) -> Self {
                 self.cbrt()
             }
+            #[inline]
             fn mul_add(self, a: Self, b: Self) -> Self {
                 self.mul_add(a, b)
             }
+            #[inline]
             fn ln(self) -> Self {
                 self.ln()
             }
+            #[inline]
             fn exp(self) -> Self {
                 self.exp()
             }
+            #[inline]
             fn sin(self) -> Self {
                 self.sin()
             }
+            #[inline]
             fn cos(self) -> Self {
                 self.cos()
             }
+            #[inline]
             fn atan(self) -> Self {
                 self.atan()
             }
+            #[inline]
             fn atan2(self, other: Self) -> Self {
                 self.atan2(other)
             }
+            #[inline]
             fn powi(self, n: i32) -> Self {
                 self.powi(n)
             }
+            #[inline]
             fn powf(self, n: Self) -> Self {
                 self.powf(n)
             }
+            #[inline]
             fn signum(self) -> Self {
                 self.signum()
             }
+            #[inline]
             fn is_nan(self) -> bool {
                 self.is_nan()
             }
+            #[inline]
             fn is_infinite(self) -> bool {
                 self.is_infinite()
             }
+            #[inline]
             fn is_finite(self) -> bool {
                 self.is_finite()
             }
+            #[inline]
             fn is_sign_negative(self) -> bool {
                 self.is_sign_negative()
             }
+            #[inline]
             fn min(self, b: Self) -> Self {
                 self.min(b)
             }
+            #[inline]
             fn max(self, b: Self) -> Self {
                 self.max(b)
             }
@@ -404,7 +361,7 @@ impl<const N: usize> MpFloat<N> {
         })
     }
 
-    /// Lossless snapshot encoding: `(kind, exponent, limbs)`. Round-trips
+    /// Lossless encoding: `(kind, exponent, limbs)`. Round-trips
     /// every representable state — finite values, ±0, ±inf, NaN — without
     /// text or f64 intermediates. Only the three public fields are exposed;
     /// no MPFR descriptor pointers are serialized.
@@ -440,15 +397,29 @@ impl<const N: usize> MpFloat<N> {
         {
             return Self::dot_fma_chain([(a, b), (c, d)]);
         }
-        let (a, b, c, d) = (
-            a.descriptor(),
-            b.descriptor(),
-            c.descriptor(),
-            d.descriptor(),
-        );
-        Self::output(|r| unsafe {
-            mpfr::fmma(r, &a, &b, &c, &d, ROUND);
-        })
+        let fmma = || {
+            let (a, b, c, d) = (
+                a.descriptor(),
+                b.descriptor(),
+                c.descriptor(),
+                d.descriptor(),
+            );
+            Self::output(|r| unsafe {
+                mpfr::fmma(r, &a, &b, &c, &d, ROUND);
+            })
+        };
+        // The narrow exact kernel declines to fmma, preserving one rounding.
+        // Zero operands use MPFR so the sign of an all-zero sum is retained.
+        if N <= exactdot::INLINE_N
+            && [a, b, c, d]
+                .iter()
+                .all(|v| v.kind.abs() == mpfr::REGULAR_KIND)
+        {
+            Self::fmma_regular(a, b, c, d)
+                .unwrap_or_else(|| exactdot::dot([(a, b), (c, d)], |_| fmma()))
+        } else {
+            fmma()
+        }
     }
 
     /// Apply `[c s; -s c]` to adjacent entries of independent strided rows.
@@ -460,6 +431,12 @@ impl<const N: usize> MpFloat<N> {
         let negative_s = -*s;
         let (cd, sd, nsd) = (c.descriptor(), s.descriptor(), negative_s.descriptor());
         for row in rows.chunks_exact_mut(stride) {
+            if N <= exactdot::INLINE_N {
+                let (x, y) = (row[p], row[p + 1]);
+                row[p] = Self::dot_fma2(c, &x, s, &y);
+                row[p + 1] = Self::dot_fma2(&negative_s, &x, c, &y);
+                continue;
+            }
             if [c, s, &row[p], &row[p + 1]]
                 .iter()
                 .any(|v| !matches!(v.kind.abs(), mpfr::ZERO_KIND | mpfr::REGULAR_KIND))
@@ -531,6 +508,437 @@ impl<const N: usize> MpFloat<N> {
         let a = self.descriptor();
         Self::output(|r| unsafe {
             f(r, &a, ROUND);
+        })
+    }
+    /// Correctly rounded (nearest-even) product of two regular values,
+    /// rounded inline after the limb product. Round-to-nearest
+    /// has one answer, so this equals `mpfr_mul` bit for bit; `None` (zero,
+    /// infinity, NaN, wider mantissas, exponents near the MPFR range limits)
+    /// leaves the product to MPFR.
+    #[inline]
+    fn mul_regular(&self, b: &Self) -> Option<Self> {
+        // Inline rounding wins through 19 limbs on Apple M4 (512 bits: 35 vs
+        // 46 ns, 1216 bits: 142 vs 152 ns); MPFR is faster at 32 limbs.
+        if N > 20 || self.kind.abs() != mpfr::REGULAR_KIND || b.kind.abs() != mpfr::REGULAR_KIND {
+            return None;
+        }
+        // Bound inline exponent arithmetic; current MPFR limits are checked
+        // after rounding.
+        const SAFE: i64 = 1 << 29;
+        let e = self.exponent as i64 + b.exponent as i64;
+        if !(-SAFE..=SAFE).contains(&e) {
+            return None;
+        }
+        let power =
+            |a: &Self| a.limbs[N - 1] == 1 << 63 && a.limbs[..N - 1].iter().all(|&l| l == 0);
+        let other = if power(self) {
+            Some(b)
+        } else if power(b) {
+            Some(self)
+        } else {
+            None
+        };
+        if let Some(other) = other {
+            let exponent = e - 1;
+            if !Self::exponent_in_range(exponent) {
+                return None;
+            }
+            let negative = (self.kind < 0) != (b.kind < 0);
+            return Some(Self {
+                kind: if negative {
+                    -mpfr::REGULAR_KIND
+                } else {
+                    mpfr::REGULAR_KIND
+                },
+                exponent: exponent as mpfr::exp_t,
+                ..*other
+            });
+        }
+        if N > exactdot::SCHOOLBOOK_N {
+            // GMP writes all 2N product limbs: no buffer clearing.
+            let mut buf = MaybeUninit::<[u64; 2 * exactdot::MAX_N]>::uninit();
+            let ptr = buf.as_mut_ptr().cast::<u64>();
+            // SAFETY: the buffer holds 2N <= 2*MAX_N limbs and does not overlap
+            // the operands; mpn_mul_n initializes exactly those 2N limbs, and
+            // only they are referenced afterwards.
+            let prod = unsafe {
+                gmp::mpn_mul_n(ptr, self.limbs.as_ptr(), b.limbs.as_ptr(), N as _);
+                std::slice::from_raw_parts_mut(ptr, 2 * N)
+            };
+            return self.round_product(b, prod, e);
+        }
+        exactdot::with_limbs::<N, _>(|prod| {
+            let prod = &mut prod[..2 * N];
+            exactdot::mul_limbs::<N>(&self.limbs, &b.limbs, prod);
+            self.round_product(b, prod, e)
+        })
+    }
+    #[inline]
+    fn exponent_in_range(e: i64) -> bool {
+        unsafe { mpfr::get_emin() as i64 <= e && e <= mpfr::get_emax() as i64 }
+    }
+    /// Normalize and round an exact `2N`-limb product to nearest-even.
+    #[inline(always)]
+    fn round_product(&self, b: &Self, prod: &mut [u64], mut e: i64) -> Option<Self> {
+        // 0.Ma * 0.Mb lies in [1/4, 1): normalize by at most one bit.
+        if prod[2 * N - 1] >> 63 == 0 {
+            let mut carry = 0;
+            for limb in prod.iter_mut() {
+                let next = *limb >> 63;
+                *limb = (*limb << 1) | carry;
+                carry = next;
+            }
+            e -= 1;
+        }
+        let round = prod[N - 1] >> 63 == 1;
+        let sticky = prod[N - 1] << 1 != 0 || prod[..N - 1].iter().any(|&l| l != 0);
+        let mut limbs = [0u64; N];
+        limbs.copy_from_slice(&prod[N..]);
+        if round && (sticky || limbs[0] & 1 == 1) {
+            let mut carry = true;
+            for limb in limbs.iter_mut() {
+                let (v, c) = limb.overflowing_add(carry as u64);
+                *limb = v;
+                carry = c;
+                if !carry {
+                    break;
+                }
+            }
+            if carry {
+                // Rounded up to 1.0: the mantissa becomes 0.1000... one binade up.
+                limbs[N - 1] = 1 << 63;
+                e += 1;
+            }
+        }
+        if !Self::exponent_in_range(e) {
+            return None;
+        }
+        let negative = (self.kind < 0) != (b.kind < 0);
+        Some(Self {
+            limbs,
+            kind: if negative {
+                -mpfr::REGULAR_KIND
+            } else {
+                mpfr::REGULAR_KIND
+            },
+            exponent: e as mpfr::exp_t,
+        })
+    }
+    /// One exact product plus an exact addend in a bounded limb window.
+    #[inline]
+    fn fma_regular(&self, a: &Self, b: &Self) -> Option<Self> {
+        if N > exactdot::SCHOOLBOOK_N
+            || [self, a, b]
+                .iter()
+                .any(|v| v.kind.abs() != mpfr::REGULAR_KIND)
+        {
+            return None;
+        }
+        const SAFE: i64 = 1 << 29;
+        if [self, a, b]
+            .iter()
+            .any(|v| !(-SAFE..=SAFE).contains(&(v.exponent as i64)))
+        {
+            return None;
+        }
+        let p = Self::PRECISION_BITS as i64;
+        let ep = self.exponent as i64 + a.exponent as i64;
+        let d = ep - b.exponent as i64;
+        // 2N+2 limbs hold the full product, shifted addend, and one carry bit.
+        if !(-127..=p + 127).contains(&d) {
+            return None;
+        }
+        let sp = ep - 2 * p;
+        let sb = b.exponent as i64 - p;
+        let scale = sp.min(sb);
+        let sx = (self.kind < 0) != (a.kind < 0);
+        let sy = b.kind < 0;
+        Some(exactdot::with_limbs::<N, _>(|xb| {
+            exactdot::with_limbs::<N, _>(|yb| {
+                let w = 2 * N + 2;
+                let xb = &mut xb[..w];
+                let yb = &mut yb[..w];
+                exactdot::mul_limbs::<N>(&self.limbs, &a.limbs, &mut xb[..2 * N]);
+                let shift = (sp - scale) as usize;
+                Self::shift_exact_limbs(xb, shift);
+                let shift = (sb - scale) as usize;
+                let (q, r) = (shift / 64, shift % 64);
+                for (i, &limb) in b.limbs.iter().enumerate() {
+                    yb[q + i] |= limb << r;
+                    if r != 0 {
+                        yb[q + i + 1] |= limb >> (64 - r);
+                    }
+                }
+                Self::add_exact_limbs(xb, sx, yb, sy, scale)
+            })
+        }))
+    }
+    #[inline(always)]
+    fn shift_exact_limbs(limbs: &mut [u64], shift: usize) {
+        if shift != 0 {
+            let (q, r) = (shift / 64, shift % 64);
+            for i in (0..limbs.len()).rev() {
+                let lo = if i >= q { limbs[i - q] } else { 0 };
+                let hi = if i > q { limbs[i - q - 1] } else { 0 };
+                limbs[i] = if r == 0 {
+                    lo
+                } else {
+                    (lo << r) | (hi >> (64 - r))
+                };
+            }
+        }
+    }
+    #[inline(always)]
+    fn add_exact_limbs(xb: &mut [u64], sx: bool, yb: &[u64], sy: bool, scale: i64) -> Self {
+        let w = xb.len();
+        let negative;
+        if sx == sy {
+            let mut carry = false;
+            for (x, &y) in xb.iter_mut().zip(yb.iter()) {
+                let (v, c1) = x.overflowing_add(y);
+                let (v, c2) = v.overflowing_add(carry as u64);
+                *x = v;
+                carry = c1 | c2;
+            }
+            debug_assert!(!carry);
+            negative = sx;
+        } else {
+            let x_ge = xb.iter().rev().cmp(yb.iter().rev()) != Ordering::Less;
+            let mut borrow = false;
+            for i in 0..w {
+                let (big, small) = if x_ge { (xb[i], yb[i]) } else { (yb[i], xb[i]) };
+                let (v, b1) = big.overflowing_sub(small);
+                let (v, b2) = v.overflowing_sub(borrow as u64);
+                xb[i] = v;
+                borrow = b1 | b2;
+            }
+            debug_assert!(!borrow);
+            negative = if x_ge { sx } else { sy };
+        }
+        Self::from_scaled_integer(negative, xb, scale)
+    }
+    /// Two unrounded products in the same bounded exact window as scalar FMA.
+    #[inline]
+    fn fmma_regular(a: &Self, b: &Self, c: &Self, d: &Self) -> Option<Self> {
+        debug_assert!(N <= exactdot::INLINE_N);
+        const SAFE: i64 = 1 << 29;
+        if [a, b, c, d]
+            .iter()
+            .any(|v| !(-SAFE..=SAFE).contains(&(v.exponent as i64)))
+        {
+            return None;
+        }
+        let ep = a.exponent as i64 + b.exponent as i64;
+        let eq = c.exponent as i64 + d.exponent as i64;
+        let delta = ep - eq;
+        // Each product needs 2P bits; 127 shift bits leave one bit for carry.
+        if !(-127..=127).contains(&delta) {
+            return None;
+        }
+        let scale = ep.min(eq) - 2 * Self::PRECISION_BITS as i64;
+        let sx = (a.kind < 0) != (b.kind < 0);
+        let sy = (c.kind < 0) != (d.kind < 0);
+        Some(exactdot::with_limbs::<N, _>(|xb| {
+            exactdot::with_limbs::<N, _>(|yb| {
+                let w = 2 * N + 2;
+                let (xb, yb) = (&mut xb[..w], &mut yb[..w]);
+                exactdot::mul_limbs::<N>(&a.limbs, &b.limbs, &mut xb[..2 * N]);
+                exactdot::mul_limbs::<N>(&c.limbs, &d.limbs, &mut yb[..2 * N]);
+                if delta >= 0 {
+                    Self::shift_exact_limbs(xb, delta as usize);
+                } else {
+                    Self::shift_exact_limbs(yb, (-delta) as usize);
+                }
+                Self::add_exact_limbs(xb, sx, yb, sy, scale)
+            })
+        }))
+    }
+    /// Correctly rounded (nearest-even) `self + b` (or `self - b` when
+    /// `negate_b`) for regular operands. Exact in a 2N+2-limb buffer, then one rounding: equal to
+    /// `mpfr_add`/`mpfr_sub` bit for bit. `None` defers to MPFR.
+    #[inline]
+    fn add_regular(&self, b: &Self, negate_b: bool) -> Option<Self> {
+        // Inline wins through 8 limbs on Apple M4 (512 bits: 18 vs 19 ns);
+        // MPFR's O(N) assembly is faster from 12 limbs.
+        if N > 8 || self.kind.abs() != mpfr::REGULAR_KIND || b.kind.abs() != mpfr::REGULAR_KIND {
+            return None;
+        }
+        const SAFE: i64 = 1 << 29;
+        let (ea, eb) = (self.exponent as i64, b.exponent as i64);
+        if !(-SAFE..=SAFE).contains(&ea) || !(-SAFE..=SAFE).contains(&eb) {
+            return None;
+        }
+        let sa = self.kind < 0;
+        let sb = (b.kind < 0) != negate_b;
+        // x is the operand with the larger exponent (ties: either).
+        let (x, sx, ex, y, sy, ey) = if ea >= eb {
+            (self, sa, ea, b, sb, eb)
+        } else {
+            (b, sb, eb, self, sa, ea)
+        };
+        let p = Self::PRECISION_BITS as i64;
+        let d = ex - ey;
+        let regular = |negative: bool| {
+            if negative {
+                -mpfr::REGULAR_KIND
+            } else {
+                mpfr::REGULAR_KIND
+            }
+        };
+        if d >= p + 2 {
+            // |y| < 2^(ex-P-2): below half an ulp of x on either side, even
+            // when x is a power of two. Nearest-even returns x.
+            if !Self::exponent_in_range(ex) {
+                return None;
+            }
+            return Some(Self {
+                kind: regular(sx),
+                ..*x
+            });
+        }
+        // X = Mx * 2^(64(N+1)), Y = My * 2^(64(N+1) - d), both exact in W limbs
+        // (top limb spare for the carry); value = (X +- Y) * 2^(ex - P - 64(N+1)).
+        exactdot::with_limbs::<N, _>(|xb| {
+            exactdot::with_limbs::<N, _>(|yb| Self::add_aligned(x, sx, ex, y, sy, d, xb, yb))
+        })
+    }
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn add_aligned(
+        x: &Self,
+        sx: bool,
+        ex: i64,
+        y: &Self,
+        sy: bool,
+        d: i64,
+        xb: &mut [u64],
+        yb: &mut [u64],
+    ) -> Option<Self> {
+        let p = Self::PRECISION_BITS as i64;
+        let regular = |negative: bool| {
+            if negative {
+                -mpfr::REGULAR_KIND
+            } else {
+                mpfr::REGULAR_KIND
+            }
+        };
+        let w = 2 * N + 2;
+        xb[N + 1..2 * N + 1].copy_from_slice(&x.limbs);
+        {
+            let (q, r) = ((d / 64) as usize, (d % 64) as u32);
+            // y placed at limbs N+1.., shifted right by d bits.
+            for (i, &l) in y.limbs.iter().enumerate() {
+                let at = N + 1 + i - q;
+                if r == 0 {
+                    yb[at] |= l;
+                } else {
+                    yb[at] |= l >> r;
+                    yb[at - 1] |= l << (64 - r);
+                }
+            }
+        }
+        let xb = &mut xb[..w];
+        let yb = &yb[..w];
+        let negative;
+        if sx == sy {
+            let mut carry = false;
+            for (a, &c) in xb.iter_mut().zip(yb) {
+                let (v, c1) = a.overflowing_add(c);
+                let (v, c2) = v.overflowing_add(carry as u64);
+                *a = v;
+                carry = c1 | c2;
+            }
+            debug_assert!(!carry);
+            negative = sx;
+        } else {
+            // |X| vs |Y|: subtract the smaller magnitude from the larger.
+            let x_ge = xb
+                .iter()
+                .rev()
+                .zip(yb.iter().rev())
+                .find(|(a, c)| a != c)
+                .map_or(true, |(a, c)| a > c);
+            // In place: each limb of X is read once before it is written.
+            let mut borrow = false;
+            for i in 0..w {
+                let (big, small) = if x_ge { (xb[i], yb[i]) } else { (yb[i], xb[i]) };
+                let (v, b1) = big.overflowing_sub(small);
+                let (v, b2) = v.overflowing_sub(borrow as u64);
+                xb[i] = v;
+                borrow = b1 | b2;
+            }
+            negative = if x_ge { sx } else { sy };
+        }
+        let Some(top) = xb.iter().rposition(|&l| l != 0) else {
+            // Exact cancellation: +0 under nearest-even.
+            return Some(Self::default());
+        };
+        // Highest set bit h; mantissa = bits [h-P+1, h].
+        let h = top as i64 * 64 + 63 - xb[top].leading_zeros() as i64;
+        let mut e = h + ex - p - 64 * (N as i64 + 1) + 1;
+        let shift = h + 1 - p; // right shift of X giving the mantissa (may be <= 0)
+        let mut limbs = [0u64; N];
+        let bit = |i: i64| -> u64 {
+            if i < 0 || i >= 64 * w as i64 {
+                0
+            } else {
+                (xb[(i / 64) as usize] >> (i % 64)) & 1
+            }
+        };
+        let (round, sticky) = if shift > 0 {
+            let (q, r) = ((shift / 64) as usize, (shift % 64) as u32);
+            for (k, limb) in limbs.iter_mut().enumerate() {
+                let lo = xb.get(q + k).copied().unwrap_or(0);
+                let hi = xb.get(q + k + 1).copied().unwrap_or(0);
+                *limb = if r == 0 {
+                    lo
+                } else {
+                    (lo >> r) | (hi << (64 - r))
+                };
+            }
+            let round = bit(shift - 1) == 1;
+            let rb = shift - 1;
+            let sticky = (0..(rb / 64) as usize).any(|i| xb[i] != 0)
+                || (rb % 64 != 0 && xb[(rb / 64) as usize] & ((1u64 << (rb % 64)) - 1) != 0);
+            (round, sticky)
+        } else {
+            // Fewer than P significant bits: exact, shift left.
+            let left = -shift;
+            let (q, r) = ((left / 64) as usize, (left % 64) as u32);
+            for k in 0..N {
+                let src = k as i64 - q as i64;
+                let lo = if src >= 0 { xb[src as usize] } else { 0 };
+                let below = if src >= 1 { xb[src as usize - 1] } else { 0 };
+                limbs[k] = if r == 0 {
+                    lo
+                } else {
+                    (lo << r) | (below >> (64 - r))
+                };
+            }
+            (false, false)
+        };
+        if round && (sticky || limbs[0] & 1 == 1) {
+            let mut carry = true;
+            for limb in limbs.iter_mut() {
+                let (v, c) = limb.overflowing_add(carry as u64);
+                *limb = v;
+                carry = c;
+                if !carry {
+                    break;
+                }
+            }
+            if carry {
+                limbs[N - 1] = 1 << 63;
+                e += 1;
+            }
+        }
+        if !Self::exponent_in_range(e) {
+            return None;
+        }
+        Some(Self {
+            limbs,
+            kind: regular(negative),
+            exponent: e as mpfr::exp_t,
         })
     }
     fn binary(
@@ -622,11 +1030,9 @@ impl<const N: usize> FromStr for MpFloat<N> {
 }
 impl<const N: usize> fmt::Display for MpFloat<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        {
-            let text = self.to_decimal(f.precision().map(|p| p.saturating_add(1)));
-            let positive = !text.starts_with('-');
-            f.pad_integral(positive, "", text.strip_prefix('-').unwrap_or(&text))
-        }
+        let text = self.to_decimal(f.precision().map(|p| p.saturating_add(1)));
+        let positive = !text.starts_with('-');
+        f.pad_integral(positive, "", text.strip_prefix('-').unwrap_or(&text))
     }
 }
 impl<const N: usize> fmt::LowerExp for MpFloat<N> {
@@ -696,9 +1102,45 @@ macro_rules! binary_op {
         }
     };
 }
-binary_op!(Add, add, AddAssign, add_assign, add);
-binary_op!(Sub, sub, SubAssign, sub_assign, sub);
-binary_op!(Mul, mul, MulAssign, mul_assign, mul);
+impl<const N: usize> Add for MpFloat<N> {
+    type Output = Self;
+    #[inline]
+    fn add(self, b: Self) -> Self {
+        self.add_regular(&b, false)
+            .unwrap_or_else(|| self.binary(b, mpfr::add))
+    }
+}
+impl<const N: usize> AddAssign for MpFloat<N> {
+    fn add_assign(&mut self, b: Self) {
+        *self = *self + b;
+    }
+}
+impl<const N: usize> Sub for MpFloat<N> {
+    type Output = Self;
+    #[inline]
+    fn sub(self, b: Self) -> Self {
+        self.add_regular(&b, true)
+            .unwrap_or_else(|| self.binary(b, mpfr::sub))
+    }
+}
+impl<const N: usize> SubAssign for MpFloat<N> {
+    fn sub_assign(&mut self, b: Self) {
+        *self = *self - b;
+    }
+}
+impl<const N: usize> Mul for MpFloat<N> {
+    type Output = Self;
+    #[inline]
+    fn mul(self, b: Self) -> Self {
+        self.mul_regular(&b)
+            .unwrap_or_else(|| self.binary(b, mpfr::mul))
+    }
+}
+impl<const N: usize> MulAssign for MpFloat<N> {
+    fn mul_assign(&mut self, b: Self) {
+        *self = *self * b;
+    }
+}
 binary_op!(Div, div, DivAssign, div_assign, div);
 binary_op!(Rem, rem, RemAssign, rem_assign, fmod);
 impl<const N: usize> Neg for MpFloat<N> {
@@ -801,14 +1243,6 @@ impl<const N: usize> Scalar for MpFloat<N> {
         }
         Some(value)
     }
-    fn scalar_exact_encode(&self) -> Option<(i32, i64, Vec<u64>)> {
-        let (k, e, l) = self.exact_encode();
-        Some((k, e, l.to_vec()))
-    }
-    fn scalar_exact_decode(kind: i32, exponent: i64, limbs: &[u64]) -> Option<Self> {
-        let a: [u64; N] = limbs.try_into().ok()?;
-        Some(Self::exact_decode(kind, exponent, a))
-    }
     fn wire_size() -> Option<usize> {
         crate::wire::mp_size::<N>()
     }
@@ -870,6 +1304,9 @@ impl<const N: usize> Scalar for MpFloat<N> {
         self.unary(mpfr::cbrt)
     }
     fn mul_add(self, a: Self, b: Self) -> Self {
+        if let Some(value) = self.fma_regular(&a, &b) {
+            return value;
+        }
         let x = self.descriptor();
         let y = a.descriptor();
         let z = b.descriptor();
@@ -880,44 +1317,8 @@ impl<const N: usize> Scalar for MpFloat<N> {
     fn dot_fma<'a>(pairs: impl IntoIterator<Item = (&'a Self, &'a Self)>) -> Self {
         MpFloat::dot_fma(pairs)
     }
-    fn rns_plan(a: &[Self], b: &[Self], terms: usize) -> Option<crate::rns::RnsPlan> {
-        crate::rns::RnsPlan::for_pair(a, b, terms)
-    }
-    fn rns_plan_ranges(
-        a_range: (i64, i64),
-        b_range: (i64, i64),
-        terms: usize,
-    ) -> Option<crate::rns::RnsPlan> {
-        crate::rns::RnsPlan::for_ranges::<N>(a_range, b_range, terms)
-    }
-    fn rns_encode(
-        plan: &crate::rns::RnsPlan,
-        side: crate::rns::EncodeSide,
-        m: &[Self],
-    ) -> Option<crate::rns::Residues> {
-        plan.encode(m, side)
-    }
-    fn rns_encode_wide(
-        plan: &crate::rns::RnsPlan,
-        side: crate::rns::EncodeSide,
-        m: &[Self],
-    ) -> Option<crate::rns::Residues> {
-        plan.encode_wide(m, side)
-    }
-    fn rns_dot(
-        plan: &crate::rns::RnsPlan,
-        ra: &crate::rns::Residues,
-        a0: usize,
-        da: usize,
-        rb: &crate::rns::Residues,
-        b0: usize,
-        db: usize,
-        terms: usize,
-    ) -> Self {
-        plan.dot::<N>(ra, a0, da, rb, b0, db, terms)
-    }
-    fn rns_exponent_range(m: &[Self]) -> Option<(i64, i64)> {
-        crate::rns::exponent_range(m)
+    fn dot_slices(a: &[Self], b: &[Self]) -> Self {
+        exactdot::dot_slices(a, b, |terms| Self::dot_fma_chain(terms))
     }
     fn ln(self) -> Self {
         self.unary(mpfr::log)
@@ -968,18 +1369,14 @@ impl<const N: usize> Scalar for MpFloat<N> {
         self.kind < 0
     }
     fn min(self, b: Self) -> Self {
-        if b.is_nan() || self < b {
-            self
-        } else if self.is_zero() && b.is_zero() && self.is_sign_negative() {
+        if b.is_nan() || self < b || (self.is_zero() && b.is_zero() && self.is_sign_negative()) {
             self
         } else {
             b
         }
     }
     fn max(self, b: Self) -> Self {
-        if b.is_nan() || self > b {
-            self
-        } else if self.is_zero() && b.is_zero() && !self.is_sign_negative() {
+        if b.is_nan() || self > b || (self.is_zero() && b.is_zero() && !self.is_sign_negative()) {
             self
         } else {
             b

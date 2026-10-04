@@ -1,16 +1,12 @@
 //! Thread scaling of one exact residue-kernel product (benchmark, ignored by
 //! default): `cargo test --release --features sdp,... --test rns_scaling --
 //! --ignored --nocapture`.
-#![cfg(feature = "sdp")]
-use sdpx_solver::receipt;
 #[allow(dead_code)]
-#[path = "../src/algebra/dense/blas/traits.rs"]
+#[path = "../../src/algebra/dense/blas/traits.rs"]
 mod provider;
 use num_traits::{FromPrimitive, One};
 use provider::*;
 use sdpx_arithmetic::MpFloat;
-#[allow(unused_imports)]
-use sdpx_solver::algebra;
 use std::time::Instant;
 
 type F = MpFloat<12>;

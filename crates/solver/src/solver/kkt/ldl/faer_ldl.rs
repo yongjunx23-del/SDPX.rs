@@ -21,12 +21,8 @@ use faer::{
 use crate::algebra::*;
 use crate::solver::{
     core::CoreSettings,
-    kkt::{
-        direct::{DirectLDLSolver, DirectLDLSolverReqs},
-        HasLinearSolverInfo, LinearSolverInfo,
-    },
+    kkt::{direct::DirectLDLSolver, HasLinearSolverInfo, LinearSolverInfo},
 };
-use std::iter::zip;
 
 #[derive(Debug)]
 
@@ -188,15 +184,6 @@ where
     }
 }
 
-impl<T> DirectLDLSolverReqs for FaerDirectLDLSolver<T>
-where
-    T: FloatT + faer_traits::RealField,
-{
-    fn required_matrix_shape() -> MatrixTriangle {
-        MatrixTriangle::Triu
-    }
-}
-
 impl<T> HasLinearSolverInfo for FaerDirectLDLSolver<T>
 where
     T: FloatT + faer_traits::RealField,
@@ -233,17 +220,6 @@ where
 
         for &idx in index.iter() {
             nzval[AtoPAPt[idx]] *= scale;
-        }
-    }
-
-    fn offset_values(&mut self, index: &[usize], offset: T, signs: &[i8]) {
-        // PJG: this is replicating the offset_values function in qdldl
-        let nzval = &mut self.perm_kkt.nzval; // post perm internal data
-        let AtoPAPt = &self.perm_map; //mapping from input matrix entries
-
-        for (&idx, &sign) in zip(index, signs) {
-            let sign: T = T::from_i8(sign).unwrap();
-            nzval[AtoPAPt[idx]] += offset * sign;
         }
     }
 
@@ -338,7 +314,7 @@ where
         map[*j] = i;
     }
 
-    M.check_format().unwrap();
+    debug_assert!(M.check_format().is_ok());
 }
 
 // ---------------------------------------------------------------------
@@ -399,8 +375,6 @@ fn test_faer_ldl() {
     ];
     assert!(x.norm_inf_diff(&xsol) < 1e-10);
 
-    // scale and update everything for codecov.
-    solver.offset_values(&[1, 2], 3., &[1, -1]);
     solver.scale_values(&[1, 2], 2.);
 }
 

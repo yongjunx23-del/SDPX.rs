@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(feature = "sdp")]
 use crate::algebra::triangular_number;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -47,7 +46,6 @@ pub enum SupportedConeT<T> {
     ///
     /// The parameter indicates the matrix dimension, i.e. size = n
     /// means that the variable is the upper triangle of an nxn matrix.
-    #[cfg(feature = "sdp")]
     PSDTriangleConeT(usize),
 }
 
@@ -63,7 +61,6 @@ impl<T> SupportedConeT<T> {
             SupportedConeT::SecondOrderConeT(dim) => *dim,
             SupportedConeT::ExponentialConeT() => 3,
             SupportedConeT::PowerConeT(_) => 3,
-            #[cfg(feature = "sdp")]
             SupportedConeT::PSDTriangleConeT(dim) => triangular_number(*dim),
             SupportedConeT::GenPowerConeT(α, dim2) => α.len() + *dim2,
         }
@@ -93,7 +90,6 @@ pub fn make_cone<T: FloatT>(cone: &SupportedConeT<T>) -> SupportedCone<T> {
         SupportedConeT::GenPowerConeT(α, dim2) => {
             GenPowerCone::<T>::new((*α).clone(), *dim2).into()
         }
-        #[cfg(feature = "sdp")]
         SupportedConeT::PSDTriangleConeT(dim) => PSDTriangleCone::<T>::new(*dim).into(),
     }
 }
@@ -122,7 +118,6 @@ where
                         // collapsible cones.
                         SupportedConeT::NonnegativeConeT(dim) => total_dim += dim,
                         SupportedConeT::SecondOrderConeT(1) => total_dim += 1,
-                        #[cfg(feature = "sdp")]
                         SupportedConeT::PSDTriangleConeT(1) => total_dim += 1,
 
                         // stop when we hit a non-collapsible cone
@@ -146,7 +141,6 @@ where
                     SupportedConeT::SecondOrderConeT(dim) if *dim == 1 => {
                         collapse(&mut iter, &mut newcones, *dim)
                     }
-                    #[cfg(feature = "sdp")]
                     SupportedConeT::PSDTriangleConeT(dim) if *dim == 1 => {
                         collapse(&mut iter, &mut newcones, *dim)
                     }
@@ -179,7 +173,6 @@ where
     ExponentialCone(ExponentialCone<T>),
     PowerCone(PowerCone<T>),
     GenPowerCone(GenPowerCone<T>),
-    #[cfg(feature = "sdp")]
     PSDTriangleCone(PSDTriangleCone<T>),
 }
 
@@ -204,7 +197,6 @@ pub(crate) enum SupportedConeTag {
     ExponentialCone,
     PowerCone,
     GenPowerCone,
-    #[cfg(feature = "sdp")]
     PSDTriangleCone,
 }
 
@@ -221,7 +213,6 @@ impl<T> SupportedConeAsTag for SupportedConeT<T> {
             SupportedConeT::SecondOrderConeT(_) => SupportedConeTag::SecondOrderCone,
             SupportedConeT::ExponentialConeT() => SupportedConeTag::ExponentialCone,
             SupportedConeT::PowerConeT(_) => SupportedConeTag::PowerCone,
-            #[cfg(feature = "sdp")]
             SupportedConeT::PSDTriangleConeT(_) => SupportedConeTag::PSDTriangleCone,
             SupportedConeT::GenPowerConeT(_, _) => SupportedConeTag::GenPowerCone,
         }
@@ -237,7 +228,6 @@ impl<T: FloatT> SupportedConeAsTag for SupportedCone<T> {
             SupportedCone::SecondOrderCone(_) => SupportedConeTag::SecondOrderCone,
             SupportedCone::ExponentialCone(_) => SupportedConeTag::ExponentialCone,
             SupportedCone::PowerCone(_) => SupportedConeTag::PowerCone,
-            #[cfg(feature = "sdp")]
             SupportedCone::PSDTriangleCone(_) => SupportedConeTag::PSDTriangleCone,
             SupportedCone::GenPowerCone(_) => SupportedConeTag::GenPowerCone,
         }
@@ -253,7 +243,6 @@ impl SupportedConeTag {
             SupportedConeTag::SecondOrderCone => "SecondOrderCone",
             SupportedConeTag::ExponentialCone => "ExponentialCone",
             SupportedConeTag::PowerCone => "PowerCone",
-            #[cfg(feature = "sdp")]
             SupportedConeTag::PSDTriangleCone => "PSDTriangleCone",
             SupportedConeTag::GenPowerCone => "GenPowerCone",
         }
@@ -266,14 +255,12 @@ impl SupportedConeTag {
 //PJG: type names are not satisfactory.   Try to combine
 //with the internal cone generators.
 
-#[cfg_attr(not(feature = "sdp"), allow(dead_code))]
 pub(crate) struct RangeSupportedConesIterator<'a, T> {
     cones: &'a [SupportedConeT<T>],
     index: usize,
     start: usize,
 }
 
-#[cfg_attr(not(feature = "sdp"), allow(dead_code))]
 impl<T> Iterator for RangeSupportedConesIterator<'_, T> {
     type Item = std::ops::Range<usize>;
 
@@ -290,12 +277,10 @@ impl<T> Iterator for RangeSupportedConesIterator<'_, T> {
         }
     }
 }
-#[cfg_attr(not(feature = "sdp"), allow(dead_code))]
 pub(crate) trait ConeRanges<'a, T> {
     fn rng_cones_iter(&'a self) -> RangeSupportedConesIterator<'a, T>;
 }
 
-#[cfg_attr(not(feature = "sdp"), allow(dead_code))]
 impl<'a, T> ConeRanges<'a, T> for [SupportedConeT<T>] {
     fn rng_cones_iter(&'a self) -> RangeSupportedConesIterator<'a, T> {
         RangeSupportedConesIterator::<'a, T> {
@@ -390,7 +375,6 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    #[cfg(feature = "sdp")]
     #[test]
     fn test_new_collapsed_psd_to_nonnegative() {
         let cones = vec![
@@ -428,7 +412,6 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    #[cfg(feature = "sdp")]
     #[test]
     fn test_new_collapsed_mixed_sdp() {
         let cones = vec![

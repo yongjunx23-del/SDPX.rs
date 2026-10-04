@@ -93,9 +93,6 @@ pub trait VectorMath<T> {
     /// Inf-norm of an elementwise scaling of `self` by `v`
     fn norm_inf_scaled(&self, v: &Self) -> T;
 
-    /// Inf-norm of an elementwise scaling of `self` by `v`
-    fn norm_one_scaled(&self, v: &Self) -> T;
-
     /// Inf-norm of vector difference
     fn norm_inf_diff(&self, b: &Self) -> T;
 

@@ -94,7 +94,6 @@ fn congruence_sym<T: FloatT>(
 pub(super) struct TransformPanels<T> {
     pub(super) mat2c: Matrix<T>,
     pub(super) mat3c: Matrix<T>,
-    pub(super) support_product: Vec<T>,
 }
 
 impl<T: FloatT> Default for TransformPanels<T> {
@@ -102,7 +101,6 @@ impl<T: FloatT> Default for TransformPanels<T> {
         Self {
             mat2c: Matrix::zeros((0, 0)),
             mat3c: Matrix::zeros((0, 0)),
-            support_product: Vec::new(),
         }
     }
 }
@@ -150,7 +148,7 @@ fn publish_tile<T: FloatT, F: FnMut(usize, usize, usize, T)>(
 /// SAFETY: dense tiles write disjoint `(b, a)` sets (each pair has one `a`, so
 /// one tile) and the sparse loop writes only pairs with sparse `b`; the buffer
 /// outlives every lane.
-struct PackedSchur<T> {
+pub(super) struct PackedSchur<T> {
     out: *mut T,
     len: usize,
 }
@@ -179,7 +177,7 @@ unsafe impl<T: Send> Sync for PackedSchur<T> {}
 /// Where a dense-tile assembly publishes a Schur entry: a caller closure over
 /// precomputed global positions, or this block's packed buffer. Both arms are
 /// monomorphized, so the store loop keeps a direct call.
-enum SchurSink<'a, F, T> {
+pub(super) enum SchurSink<'a, F, T> {
     Mapped(&'a mut F, std::marker::PhantomData<T>),
     Packed(PackedSchur<T>),
 }
@@ -200,7 +198,7 @@ impl<T: FloatT, F: FnMut(usize, usize, usize, T)> SchurSink<'_, F, T> {
 /// no later column can produce a store either. Shared by the serial and tiled
 /// paths so both fold every accumulator in exactly the same order.
 #[allow(clippy::too_many_arguments)]
-#[inline]
+#[inline(always)]
 fn accumulate_column<T: FloatT>(
     acc: &mut [T],
     columns: &[Column],
@@ -322,7 +320,7 @@ fn accumulate_column<T: FloatT>(
 
 /// Accumulate and publish one tile of left columns `[a0, a1)`.
 #[allow(clippy::too_many_arguments)]
-#[inline]
+#[inline(always)]
 fn dot_tile<T: FloatT>(
     acc: &mut [T],
     columns: &[Column],
@@ -404,31 +402,94 @@ fn dot_tiles_parallel<T: FloatT>(
     let lanes = pool.current_num_threads().min(tiles).max(1);
     #[cfg(test)]
     PARALLEL_DOT_LANES.fetch_add(lanes, std::sync::atomic::Ordering::Relaxed);
+    // Rayon lanes do not inherit the caller's CPU features; see
+    // `transform_chunk_avx2`.
+    #[cfg(target_arch = "x86_64")]
+    let lanes_fma = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
     pool.install(|| {
         (0..lanes).into_par_iter().for_each(|lane| {
-            let mut acc = vec![T::zero(); tile * width];
-            let mut index = lane;
-            while index < tiles {
-                let a0 = index * tile;
-                let a1 = (a0 + tile).min(column_count);
-                dot_tile(
-                    &mut acc,
-                    columns,
-                    dense_indices,
-                    dense_representatives,
-                    dense_column_map,
-                    dense_row_offsets,
-                    dense_vectors,
-                    values,
-                    width,
-                    a0,
-                    a1,
-                    packed,
-                );
-                index += lanes;
-            }
+            crate::algebra::scratch::with_scratch(|acc: &mut Vec<T>| {
+                // No clearing: see the serial path in `compute_schur_dense_sink`.
+                acc.resize(tile * width, T::zero());
+                let mut index = lane;
+                while index < tiles {
+                    let a0 = index * tile;
+                    let a1 = (a0 + tile).min(column_count);
+                    #[cfg(target_arch = "x86_64")]
+                    if lanes_fma {
+                        // SAFETY: both features were detected above.
+                        unsafe {
+                            dot_tile_avx2(
+                                acc,
+                                columns,
+                                dense_indices,
+                                dense_representatives,
+                                dense_column_map,
+                                dense_row_offsets,
+                                dense_vectors,
+                                values,
+                                width,
+                                a0,
+                                a1,
+                                packed,
+                            )
+                        };
+                        index += lanes;
+                        continue;
+                    }
+                    dot_tile(
+                        acc,
+                        columns,
+                        dense_indices,
+                        dense_representatives,
+                        dense_column_map,
+                        dense_row_offsets,
+                        dense_vectors,
+                        values,
+                        width,
+                        a0,
+                        a1,
+                        packed,
+                    );
+                    index += lanes;
+                }
+            });
         });
     });
+}
+
+/// `dot_tile` under the x86_64 features LLVM needs for hardware FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn dot_tile_avx2<T: FloatT>(
+    acc: &mut [T],
+    columns: &[Column],
+    dense_indices: &[usize],
+    dense_representatives: &[usize],
+    dense_column_map: &[usize],
+    dense_row_offsets: &[usize],
+    dense_vectors: &[T],
+    values: &[T],
+    width: usize,
+    a0: usize,
+    a1: usize,
+    packed: &PackedSchur<T>,
+) {
+    dot_tile(
+        acc,
+        columns,
+        dense_indices,
+        dense_representatives,
+        dense_column_map,
+        dense_row_offsets,
+        dense_vectors,
+        values,
+        width,
+        a0,
+        a1,
+        packed,
+    );
 }
 
 /// Transform one chunk of dense columns into the packed dense vectors: pack
@@ -553,45 +614,50 @@ fn transform_chunk_body<T: FloatT>(
     }
     // Omit structurally zero intermediate columns. The coefficient support is
     // exact and survives value updates; this is not a rank approximation.
-    // Require a large work reduction to amortize the extra packing and
-    // per-column BLAS calls.
-    if n >= 64
-        && chunk
-            .iter()
-            .all(|&ci| 3 * coefficient_support[ci].len() <= n)
-    {
+    // Route each column on its own: a narrow support multiplies only its k
+    // live columns (2n^2k flops), a wide one takes a full n^3 product. One
+    // wide column no longer drags its whole chunk onto the full path, and
+    // small blocks (n < 64) take the support path too.
+    // An empty support means no plan was built (wide precision): full path.
+    let narrow = |ci: usize| {
+        let k = coefficient_support.get(ci).map_or(0, Vec::len);
+        k > 0 && 3 * k <= n
+    };
+    if chunk.iter().all(|&ci| !narrow(ci)) {
+        panels.mat3c.mul(&panels.mat2c, ginv, T::one(), T::zero());
+    } else {
         for (t, &ci) in chunk.iter().enumerate() {
-            let support = &coefficient_support[ci];
-            let k = support.len();
-            panels.support_product.resize(2 * n * k, T::zero());
-            let (left, right) = panels.support_product.split_at_mut(n * k);
-            for (j, &q) in support.iter().enumerate() {
-                left[j * n..(j + 1) * n]
-                    .copy_from_slice(&panels.mat2c.data()[q * ld + t * n..q * ld + (t + 1) * n]);
+            if !narrow(ci) {
+                T::xgemm(
+                    b'N',
+                    b'N',
+                    n as i32,
+                    n as i32,
+                    n as i32,
+                    T::one(),
+                    &panels.mat2c.data()[t * n..],
+                    ld as i32,
+                    ginv.data(),
+                    n as i32,
+                    T::zero(),
+                    &mut panels.mat3c.data_mut()[t * n..],
+                    ld as i32,
+                );
+                continue;
             }
-            for j in 0..n {
-                for (i, &q) in support.iter().enumerate() {
-                    right[j * k + i] = ginv[(q, j)];
-                }
-            }
-            T::xgemm(
-                b'N',
-                b'N',
-                n as i32,
-                n as i32,
-                k as i32,
-                T::one(),
-                left,
-                n as i32,
-                right,
-                k as i32,
-                T::zero(),
-                &mut panels.mat3c.data_mut()[t * n..],
-                ld as i32,
+            // Narrow support: a direct FMA loop over the k live columns of
+            // mat2, ascending q per output, which is the order a full product
+            // folds the same nonzero terms in (the others are exact zeros).
+            // Tiny per-column BLAS calls would cost more than their flops.
+            support_product(
+                panels.mat3c.data_mut(),
+                panels.mat2c.data(),
+                ld,
+                t * n,
+                ginv,
+                &coefficient_support[ci],
             );
         }
-    } else {
-        panels.mat3c.mul(&panels.mat2c, ginv, T::one(), T::zero());
     }
     // Pack only used row suffixes; writes remain contiguous across the chunk's
     // live columns. Unused coordinates have empty rows.
@@ -631,7 +697,86 @@ fn transform_chunk_body<T: FloatT>(
     }
 }
 
+/// `out = mat2[:, support] * ginv[support, :]` for one stacked column block
+/// (rows `r0..r0 + n` of the `ld`-strided panels). Each output folds the
+/// support terms in ascending order from zero, as a full product folds the
+/// same nonzero terms, so the values match the dense path bit for bit. An
+/// 8 x 4 register tile keeps accumulators out of memory for the k-term loop.
+#[inline(always)]
+fn support_product<T: FloatT>(
+    out: &mut [T],
+    mat2: &[T],
+    ld: usize,
+    r0: usize,
+    ginv: &Matrix<T>,
+    support: &[usize],
+) {
+    const I: usize = 8;
+    const J: usize = 4;
+    let n = ginv.nrows();
+    let g = ginv.data();
+    let (ni, nj) = (n - n % I, n - n % J);
+    for j0 in (0..nj).step_by(J) {
+        for i0 in (0..ni).step_by(I) {
+            let mut acc = [[T::zero(); I]; J];
+            for &q in support {
+                let x: &[T; I] = mat2[q * ld + r0 + i0..][..I].try_into().unwrap();
+                for jj in 0..J {
+                    let gq = g[(j0 + jj) * n + q];
+                    for ii in 0..I {
+                        acc[jj][ii] = x[ii].mul_add(gq, acc[jj][ii]);
+                    }
+                }
+            }
+            for jj in 0..J {
+                out[(j0 + jj) * ld + r0 + i0..][..I].copy_from_slice(&acc[jj]);
+            }
+        }
+    }
+    // Ragged edges: same per-element order, scalar accumulators.
+    for j in 0..n {
+        let rows = if j < nj { ni..n } else { 0..n };
+        for i in rows {
+            let mut acc = T::zero();
+            for &q in support {
+                acc = mat2[q * ld + r0 + i].mul_add(g[j * n + q], acc);
+            }
+            out[j * ld + r0 + i] = acc;
+        }
+    }
+}
+
+// Per-call panels of one block. Every call writes them before reading, so a
+// worker thread shares one set across the blocks it serves.
+struct BlockWork<T> {
+    n: usize,
+    mat1: Matrix<T>,
+    mat2: Matrix<T>,
+    mat3: Matrix<T>,
+    vector: Vec<T>,
+}
+
+fn with_block_work<T: FloatT, R>(n: usize, f: impl FnOnce(&mut BlockWork<T>) -> R) -> R {
+    crate::algebra::scratch::with_scratch(|slot: &mut Option<BlockWork<T>>| {
+        if slot.as_ref().map_or(true, |w| w.n != n) {
+            *slot = Some(BlockWork {
+                n,
+                mat1: Matrix::zeros((n, n)),
+                mat2: Matrix::zeros((n, n)),
+                mat3: Matrix::zeros((n, n)),
+                vector: Vec::new(),
+            });
+        }
+        f(slot.as_mut().unwrap())
+    })
+}
+
 impl<T: FloatT> PsdBlock<T> {
+    /// Length of this block's packed (svec) rows.
+    fn svec_len(&self) -> usize {
+        triangular_number(self.Rinv.nrows())
+    }
+
     /// Single-block constructor used by tests. The solver routes one shared
     /// pass over A through `from_columns` instead.
     #[cfg(test)]
@@ -762,22 +907,24 @@ impl<T: FloatT> PsdBlock<T> {
         } else {
             Vec::new()
         };
+        // Only binary64 applies H through R; wide arithmetic uses G.
+        let r_size = if T::precision_bits() <= 53 {
+            (n, n)
+        } else {
+            (0, 0)
+        };
         Self {
             sqrt2: if n > 1 { T::SQRT_2() } else { T::zero() },
-            R: Matrix::zeros((n, n)),
+            R: Matrix::zeros(r_size),
             Rinv: Matrix::zeros((n, n)),
             G: Matrix::zeros((n, n)),
             Ginv: Matrix::zeros((n, n)),
             rinv_cache: ResidueCache::default(),
             g_cache: ResidueCache::default(),
             ginv_cache: ResidueCache::default(),
-            mat1: Matrix::zeros((n, n)),
-            mat2: Matrix::zeros((n, n)),
-            mat3: Matrix::zeros((n, n)),
             // Only fused sampled recovery needs this workspace. Every other
             // block must not reserve 128*n² unused scalars.
             mat3c: Matrix::zeros((0, 0)),
-            vector: vec![T::zero(); rows_len],
             columns,
             schur_values: Vec::new(),
             sampled: None,
@@ -809,7 +956,7 @@ impl<T: FloatT> PsdBlock<T> {
                 if column.sparse {
                     8 * prefix_entries * column.entries.len() as u128 * words * words
                 } else {
-                    let n = self.R.size().0 as u128;
+                    let n = self.Rinv.size().0 as u128;
                     let expanded = column
                         .entries
                         .iter()
@@ -939,7 +1086,7 @@ impl<T: FloatT> PsdBlock<T> {
                         right.index - block.column_start,
                         left.index - block.column_start,
                     );
-                    store(b, a, right.schur_positions[a], value);
+                    store(b, a, right.schur_position(left, a), value);
                 }
             }
             return;
@@ -958,84 +1105,57 @@ impl<T: FloatT> PsdBlock<T> {
         let dense_count = self.dense_indices.len();
         let batched = dense_count > 0
             && T::precision_bits() <= 53
-            && (self.vector.len() as u128) * (dense_count as u128) <= (1u128 << 26);
+            && (self.svec_len() as u128) * (dense_count as u128) <= (1u128 << 26);
         if batched {
             self.compute_schur_dense_batched(values, skip_sparse, &mut store, pool);
             return;
         }
-        for (b, right) in self.columns.iter().enumerate() {
-            if self.dense_representatives[b] != b {
-                continue;
-            }
-            if skip_sparse && right.sparse {
-                continue;
-            }
-            if !right.sparse {
-                coefficient_product(
-                    self.mat2.data_mut(),
-                    self.Ginv.nrows(),
-                    0,
-                    &self.Ginv,
-                    right,
-                    &self.axpy_plans[b],
-                    values,
-                );
-                pooled_gemm_sym(&mut self.mat3, &self.mat2, &self.Ginv, None);
-                mat_to_svec(&mut self.vector, &self.mat3);
-            }
-            // Stream one transform per exact representative at every precision.
-            // Float64 may batch these transforms; wide arithmetic keeps O(n²) scratch.
-            for (target, column) in self.columns[..=b].iter().enumerate() {
-                if self.dense_representatives[target] != b {
+        with_block_work(self.Ginv.nrows(), |w: &mut BlockWork<T>| {
+            for (b, right) in self.columns.iter().enumerate() {
+                if self.dense_representatives[b] != b {
                     continue;
                 }
-                for (a, left) in self.columns[..=target].iter().enumerate() {
-                    let mut v = T::zero();
-                    if right.sparse {
-                        v = sparse_schur_value(left, right, &self.Ginv, values, self.sqrt2);
-                    } else {
-                        for e in &left.entries {
-                            v = values[e.position]
-                                .mul_add(self.vector[triangular_number(e.j) + e.i], v);
-                        }
+                if skip_sparse && right.sparse {
+                    continue;
+                }
+                if !right.sparse {
+                    coefficient_product(
+                        w.mat2.data_mut(),
+                        self.Ginv.nrows(),
+                        0,
+                        &self.Ginv,
+                        right,
+                        &self.axpy_plans[b],
+                        values,
+                    );
+                    pooled_gemm_sym(&mut w.mat3, &w.mat2, &self.Ginv, None);
+                    w.vector.resize(triangular_number(w.n), T::zero());
+                    mat_to_svec(&mut w.vector, &w.mat3);
+                }
+                // Stream one transform per exact representative at every precision.
+                // Float64 may batch these transforms; wide arithmetic keeps O(n²) scratch.
+                for (target, column) in self.columns[..=b].iter().enumerate() {
+                    if self.dense_representatives[target] != b {
+                        continue;
                     }
-                    store(target, a, column.schur_positions[a], v);
+                    for (a, left) in self.columns[..=target].iter().enumerate() {
+                        let mut v = T::zero();
+                        if right.sparse {
+                            v = sparse_schur_value(left, right, &self.Ginv, values, self.sqrt2);
+                        } else {
+                            for e in &left.entries {
+                                v = values[e.position]
+                                    .mul_add(w.vector[triangular_number(e.j) + e.i], v);
+                            }
+                        }
+                        store(target, a, column.schur_position(left, a), v);
+                    }
                 }
             }
-        }
+        });
     }
 
     pub(super) fn compute_schur_dense_batched(
-        &mut self,
-        values: &[T],
-        skip_sparse: bool,
-        store: impl FnMut(usize, usize, usize, T),
-        pool: Option<&rayon::ThreadPool>,
-    ) {
-        #[cfg(target_arch = "x86_64")]
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            // SAFETY: both required CPU features were checked above.
-            return unsafe { self.compute_schur_dense_fma(values, skip_sparse, store, pool) };
-        }
-        self.compute_schur_dense_impl(values, skip_sparse, store, pool);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn compute_schur_dense_fma(
-        &mut self,
-        values: &[T],
-        skip_sparse: bool,
-        store: impl FnMut(usize, usize, usize, T),
-        pool: Option<&rayon::ThreadPool>,
-    ) {
-        self.compute_schur_dense_impl(values, skip_sparse, store, pool);
-    }
-
-    // One arithmetic implementation, inlined into either CPU context. The
-    // per-accumulator FMA order is unchanged; there is no fast-math reduction.
-    #[inline(always)]
-    pub(super) fn compute_schur_dense_impl(
         &mut self,
         values: &[T],
         skip_sparse: bool,
@@ -1043,7 +1163,36 @@ impl<T: FloatT> PsdBlock<T> {
         pool: Option<&rayon::ThreadPool>,
     ) {
         let mut sink = SchurSink::Mapped(&mut store, std::marker::PhantomData);
-        self.compute_schur_dense_sink(values, skip_sparse, &mut sink, pool);
+        self.compute_schur_dense_dispatch(values, skip_sparse, &mut sink, pool);
+    }
+
+    /// Select hardware FMA on x86_64 for both publish targets. Without it
+    /// `mul_add` lowers to a libm call; the values are identical either way.
+    fn compute_schur_dense_dispatch<F: FnMut(usize, usize, usize, T)>(
+        &mut self,
+        values: &[T],
+        skip_sparse: bool,
+        sink: &mut SchurSink<'_, F, T>,
+        pool: Option<&rayon::ThreadPool>,
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: both required CPU features were checked above.
+            return unsafe { self.compute_schur_dense_fma(values, skip_sparse, sink, pool) };
+        }
+        self.compute_schur_dense_sink(values, skip_sparse, sink, pool);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn compute_schur_dense_fma<F: FnMut(usize, usize, usize, T)>(
+        &mut self,
+        values: &[T],
+        skip_sparse: bool,
+        sink: &mut SchurSink<'_, F, T>,
+        pool: Option<&rayon::ThreadPool>,
+    ) {
+        self.compute_schur_dense_sink(values, skip_sparse, sink, pool);
     }
 
     /// Packed publish used by the parallel assembly: entries land in this
@@ -1061,11 +1210,11 @@ impl<T: FloatT> PsdBlock<T> {
         let batched = self.sampled.is_none()
             && dense_count > 0
             && T::precision_bits() <= 53
-            && (self.vector.len() as u128) * (dense_count as u128) <= (1u128 << 26);
+            && (self.svec_len() as u128) * (dense_count as u128) <= (1u128 << 26);
         if batched {
             let mut sink: SchurSink<'_, fn(usize, usize, usize, T), T> =
                 SchurSink::Packed(PackedSchur::new(out));
-            self.compute_schur_dense_sink(values, skip_sparse, &mut sink, pool);
+            self.compute_schur_dense_dispatch(values, skip_sparse, &mut sink, pool);
             return;
         }
         // Sampled and wide-precision blocks keep the closure path; only the
@@ -1081,14 +1230,14 @@ impl<T: FloatT> PsdBlock<T> {
 
     /// The one dense-tile implementation, parameterized by its publish target.
     #[inline(always)]
-    fn compute_schur_dense_sink<F: FnMut(usize, usize, usize, T)>(
+    pub(super) fn compute_schur_dense_sink<F: FnMut(usize, usize, usize, T)>(
         &mut self,
         values: &[T],
         skip_sparse: bool,
         sink: &mut SchurSink<'_, F, T>,
         pool: Option<&rayon::ThreadPool>,
     ) {
-        let svec_n = self.vector.len();
+        let svec_n = self.svec_len();
         let width = self.dense_indices.len();
         self.dense_vectors
             .resize(self.dense_row_offsets[svec_n], T::zero());
@@ -1116,7 +1265,9 @@ impl<T: FloatT> PsdBlock<T> {
         // exact aliases. Bound the accumulator to 4 MiB at Float64 (or one
         // row for very wide blocks) rather than growing it with both axes.
         let tile = 256.min((524288 / width).max(1));
-        self.dense_acc.clear();
+        // No clearing: `accumulate_column` initializes the live suffix of every
+        // row it touches, and a row it skips (dense axis exhausted) has no
+        // dense right column left to publish, so stale values are never read.
         self.dense_acc.resize(tile * width, T::zero());
         let per_lane = chunk_count.div_ceil(lanes);
         {
@@ -1274,7 +1425,7 @@ impl<T: FloatT> PsdBlock<T> {
                     a0,
                     a1,
                     |b, a, _d, v| {
-                        let position = columns[b].schur_positions[a];
+                        let position = columns[b].schur_position(&columns[a], a);
                         sink.write(b, a, position, v);
                     },
                 );
@@ -1304,7 +1455,7 @@ impl<T: FloatT> PsdBlock<T> {
             }
             for (a, left) in self.columns[..=b].iter().enumerate() {
                 let v = sparse_schur_value(left, right, &self.Ginv, values, self.sqrt2);
-                sink.write(b, a, right.schur_positions[a], v);
+                sink.write(b, a, right.schur_position(left, a), v);
             }
         }
         crate::receipt::finish("schur.sparse", sparse_timer);
@@ -1312,24 +1463,27 @@ impl<T: FloatT> PsdBlock<T> {
 
     pub(super) fn scatter_schur(&self, S: &mut CscMatrix<T>) {
         for (b, column) in self.columns.iter().enumerate() {
-            for (a, &position) in column.schur_positions.iter().enumerate() {
-                S.nzval[position] += self.schur_values[triangular_number(b) + a];
+            for (a, left) in self.columns[..=b].iter().enumerate() {
+                S.nzval[column.schur_position(left, a)] +=
+                    self.schur_values[triangular_number(b) + a];
             }
         }
     }
 
     // Half of H^-1 stays factored, so neither fused application squares Rinv.
     pub(super) fn condense_rhs(&mut self, rhs: &[T], gemm: Option<(&rayon::ThreadPool, usize)>) {
-        svec_to_mat(&mut self.mat1, rhs);
-        congruence_sym(
-            &mut self.mat3c,
-            &self.Rinv,
-            false,
-            &self.mat1,
-            &mut self.mat2,
-            gemm,
-            &mut self.rinv_cache,
-        );
+        with_block_work(self.Rinv.nrows(), |w: &mut BlockWork<T>| {
+            svec_to_mat(&mut w.mat1, rhs);
+            congruence_sym(
+                &mut self.mat3c,
+                &self.Rinv,
+                false,
+                &w.mat1,
+                &mut w.mat2,
+                gemm,
+                &mut self.rinv_cache,
+            );
+        });
         let sampled = self.sampled.as_mut().unwrap();
         sampled.work.inverse_adjoint(
             &sampled.operator.blocks()[sampled.block],
@@ -1344,23 +1498,25 @@ impl<T: FloatT> PsdBlock<T> {
         x: &[T],
         gemm: Option<(&rayon::ThreadPool, usize)>,
     ) {
-        let sampled = self.sampled.as_mut().unwrap();
-        sampled
-            .work
-            .inverse_forward(&sampled.operator.blocks()[sampled.block], x, &mut self.mat1);
-        for (v, &b) in self.mat1.data_mut().iter_mut().zip(self.mat3c.data()) {
-            *v -= b;
-        }
-        congruence_sym(
-            &mut self.mat3,
-            &self.Rinv,
-            true,
-            &self.mat1,
-            &mut self.mat2,
-            gemm,
-            &mut self.rinv_cache,
-        );
-        mat_to_svec(y, &self.mat3);
+        with_block_work(self.Rinv.nrows(), |w: &mut BlockWork<T>| {
+            let sampled = self.sampled.as_mut().unwrap();
+            sampled
+                .work
+                .inverse_forward(&sampled.operator.blocks()[sampled.block], x, &mut w.mat1);
+            for (v, &b) in w.mat1.data_mut().iter_mut().zip(self.mat3c.data()) {
+                *v -= b;
+            }
+            congruence_sym(
+                &mut w.mat3,
+                &self.Rinv,
+                true,
+                &w.mat1,
+                &mut w.mat2,
+                gemm,
+                &mut self.rinv_cache,
+            );
+            mat_to_svec(y, &w.mat3);
+        })
     }
 
     pub(super) fn apply(
@@ -1370,57 +1526,37 @@ impl<T: FloatT> PsdBlock<T> {
         inverse: bool,
         gemm: Option<(&rayon::ThreadPool, usize)>,
     ) {
-        svec_to_mat(&mut self.mat1, x);
-        if T::precision_bits() <= 53 {
-            // binary64: apply H = R·Rᵀ (H⁻¹ = Rinvᵀ·Rinv) through its factor
-            // in two congruences. The squared G/Ginv lose cond(R)² accuracy
-            // near convergence, so refinement would converge to a different
-            // operator than the cones' W-based `Δs` and the primal residual
-            // grows.
-            let (r, first, second) = if inverse {
-                (&self.Rinv, false, true)
+        with_block_work(self.Rinv.nrows(), |w: &mut BlockWork<T>| {
+            svec_to_mat(&mut w.mat1, x);
+            if T::precision_bits() <= 53 {
+                // binary64: apply H = R·Rᵀ (H⁻¹ = Rinvᵀ·Rinv) through its factor
+                // in two congruences. The squared G/Ginv lose cond(R)² accuracy
+                // near convergence, so refinement would converge to a different
+                // operator than the cones' W-based `Δs` and the primal residual
+                // grows. At MPFR precision the IPM's grading stays far above
+                // eps·‖G‖, and the single congruence is 5.5% faster end to end.
+                let (r, first, second) = if inverse {
+                    (&self.Rinv, false, true)
+                } else {
+                    (&self.R, true, false)
+                };
+                let cache = &mut self.rinv_cache;
+                congruence_sym(&mut w.mat3, r, first, &w.mat1, &mut w.mat2, gemm, cache);
+                w.vector.resize(triangular_number(w.n), T::zero());
+                mat_to_svec(&mut w.vector, &w.mat3);
+                svec_to_mat(&mut w.mat1, &w.vector);
+                congruence_sym(&mut w.mat3, r, second, &w.mat1, &mut w.mat2, gemm, cache);
+                mat_to_svec(y, &w.mat3);
+                return;
+            }
+            // `g` is stored exactly symmetric, so `x·gᵀ` equals the former `x·g`.
+            let (g, cache) = if inverse {
+                (&self.Ginv, &mut self.ginv_cache)
             } else {
-                (&self.R, true, false)
+                (&self.G, &mut self.g_cache)
             };
-            let cache = &mut self.rinv_cache;
-            congruence_sym(
-                &mut self.mat3,
-                r,
-                first,
-                &self.mat1,
-                &mut self.mat2,
-                gemm,
-                cache,
-            );
-            mat_to_svec(&mut self.vector, &self.mat3);
-            svec_to_mat(&mut self.mat1, &self.vector);
-            congruence_sym(
-                &mut self.mat3,
-                r,
-                second,
-                &self.mat1,
-                &mut self.mat2,
-                gemm,
-                cache,
-            );
-            mat_to_svec(y, &self.mat3);
-            return;
-        }
-        // `g` is stored exactly symmetric, so `x·gᵀ` equals the former `x·g`.
-        let (g, cache) = if inverse {
-            (&self.Ginv, &mut self.ginv_cache)
-        } else {
-            (&self.G, &mut self.g_cache)
-        };
-        congruence_sym(
-            &mut self.mat3,
-            g,
-            false,
-            &self.mat1,
-            &mut self.mat2,
-            gemm,
-            cache,
-        );
-        mat_to_svec(y, &self.mat3);
+            congruence_sym(&mut w.mat3, g, false, &w.mat1, &mut w.mat2, gemm, cache);
+            mat_to_svec(y, &w.mat3);
+        })
     }
 }

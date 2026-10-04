@@ -74,15 +74,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         if trunk.iter().any(|&id| signs[id] != -1) {
             return None;
         }
-        // Reject nonlocal P coupling and any noncanonical CSC pattern before
-        // constructing the block map. Stored zeros count as structural edges,
-        // so later data updates cannot silently invalidate this decomposition.
+        // Reject nonlocal P coupling before constructing the block map.
+        // Stored zeros count as structural edges, so later data updates
+        // cannot silently invalidate this decomposition.
         for j in 0..k.n {
             for p in k.colptr[j]..k.colptr[j + 1] {
                 let i = k.rowval[p];
-                if i > j || (p > k.colptr[j] && k.rowval[p - 1] >= i) {
-                    return None;
-                }
                 if owner[i] != usize::MAX && owner[j] != usize::MAX && owner[i] != owner[j] {
                     return None;
                 }
@@ -94,20 +91,37 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 }
             }
         }
-        Some(Self::from_groups(k, signs, settings, groups, trunk, true))
+        Some(Self::from_groups(
+            k,
+            signs,
+            settings,
+            groups,
+            trunk,
+            Some(LocalStructure::Soc),
+        ))
     }
 
     pub(super) fn assemble_local_schur(&mut self) {
         let timer = crate::receipt::start();
+        #[cfg(feature = "faer-sparse")]
+        if self.assemble_bound_schur_faer() {
+            crate::receipt::finish("arrow.local_schur", timer);
+            return;
+        }
+        if self.assemble_bound_schur_exact() {
+            crate::receipt::finish("arrow.local_schur", timer);
+            return;
+        }
         let t = self.trunk.len();
         let leaves = &self.leaves;
-        // A border column couples only to the final two leaf coordinates.
+        // Use the leaf's structurally nonzero coupling suffix.
         // MPFR's dot uses exact accumulation rounded once; each entry has the
         // same leaf/coordinate order at every thread count. No parallel sum.
         let column = |(j, values): (usize, &mut [T])| {
             for (i, value) in values.iter_mut().enumerate().skip(j) {
                 *value -= T::dot_fma(leaves.iter().flat_map(|leaf| {
-                    (0..2).map(move |r| (&leaf.y[r + i * 2], &leaf.z[r + j * 2]))
+                    let width = leaf.ids.len() - leaf.coupling_start;
+                    (0..width).map(move |r| (&leaf.y[r + i * width], &leaf.z[r + j * width]))
                 }));
             }
         };

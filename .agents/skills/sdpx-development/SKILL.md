@@ -20,7 +20,8 @@ export PATH="$CARGO_HOME/bin:$PATH"
 ```
 
 Build offline with the lockfile. Use `sdp-accelerate,faer-sparse` on macOS or
-`sdp-openblas,faer-sparse` on Linux. Use `fast` for development and
+`sdp-openblas,faer-sparse` on ordinary Linux builds. On the cluster, keep
+the validated dynamic OpenBLAS linkage described by `ucas-hpc`. Use `fast` for development and
 `--profile release` for reported timings. Compare frozen arms: builds overwrite
 `target/PROFILE/sdpx`.
 

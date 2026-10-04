@@ -170,13 +170,6 @@ impl<T: FloatT> ParallelPlan<T> {
         if n == 0 {
             return None;
         }
-        // Fixed at launch like the other opt-in gates; caching keeps getenv
-        // out of factorization setup.
-        static SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *SERIAL.get_or_init(|| std::env::var_os("SDPX_SERIAL_QDLDL").is_some()) {
-            return None;
-        }
-
         // Trunk = junction nodes (two or more etree children) and every
         // ancestor of a junction.
         let mut children = vec![0usize; n];

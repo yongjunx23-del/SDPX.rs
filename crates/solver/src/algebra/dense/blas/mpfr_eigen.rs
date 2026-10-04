@@ -2,8 +2,8 @@ use super::*;
 
 // Householder tridiagonalization of the scaled symmetric matrix in `b`
 // (n×n, column-major, both triangles filled). Produces the diagonal `d`,
-// the subdiagonal `e` (e[k] = T[k+1,k]), and packs each reflector's v[1..]
-// into b[k+2..n, k] with its tau in `taus` for backward accumulation.
+// the subdiagonal `e` (e[k] = T[k+1,k]). With nonempty `taus`, packs each
+// reflector's v[1..] into b[k+2..n, k] for backward vector accumulation.
 pub(super) fn tridiagonalize<const N: usize>(
     b: &mut [F<N>],
     n: usize,
@@ -21,7 +21,9 @@ pub(super) fn tridiagonalize<const N: usize>(
         }
         let (beta, tau) = reflector(v);
         e[k] = beta;
-        taus[k] = tau;
+        if !taus.is_empty() {
+            taus[k] = tau;
+        }
         if tau != F::zero() {
             // Two-sided update of the trailing block B = b[k+1..n, k+1..n]:
             // p = tau * B v; w = p - (tau/2)(p·v) v; B -= v wᵀ + w vᵀ.
@@ -32,16 +34,13 @@ pub(super) fn tridiagonalize<const N: usize>(
             if par {
                 let tail: &[F<N>] = &b[(k + 1) * n..n * n];
                 p.par_iter_mut().enumerate().for_each(|(i, pi)| {
-                    let acc = F::dot_fma(
-                        (0..len).map(|j| (&tail[k + 1 + i + j * n], &v[j])),
-                    );
+                    let acc = F::dot_fma((0..len).map(|j| (&tail[k + 1 + i + j * n], &v[j])));
                     *pi = tau * acc;
                 });
             } else {
                 for i in 0..len {
-                    let acc = F::dot_fma(
-                        (0..len).map(|j| (&b[k + 1 + i + (k + 1 + j) * n], &v[j])),
-                    );
+                    let acc =
+                        F::dot_fma((0..len).map(|j| (&b[k + 1 + i + (k + 1 + j) * n], &v[j])));
                     p[i] = tau * acc;
                 }
             }
@@ -77,9 +76,11 @@ pub(super) fn tridiagonalize<const N: usize>(
                 }
             }
         }
-        // v[0] == 1 is implicit; only the tail is stored.
-        for i in 1..len {
-            b[k + 1 + i + k * n] = v[i];
+        // v[0] == 1 is implicit; only vector requests need the packed tail.
+        if !taus.is_empty() {
+            for i in 1..len {
+                b[k + 1 + i + k * n] = v[i];
+            }
         }
     }
     if n >= 2 {
@@ -492,14 +493,21 @@ impl<const N: usize> XsyevrScalar for F<N> {
             return;
         }
         let nn = n as usize;
-        // Owned scratch: b (n²) + d (n) + e (n) + v/p (2n) + taus (n),
-        // plus Q (n²) when vectors are requested and a 7n block for the
-        // single-index eigenvalue path (Sturm + RQI).
+        // Owned scratch: b (n²) + d/e (2n) + v/p (2n), plus taus (n)
+        // and Q (n²) for vectors, or a 7n single-index block (Sturm + RQI).
         let indexed = job == b'N' && range == b'I' && il == iu;
         let Some(required) = nn
             .checked_mul(nn)
             .and_then(|cells| cells.checked_mul(if job == b'V' { 2 } else { 1 }))
-            .and_then(|cells| cells.checked_add(nn.checked_mul(if indexed { 12 } else { 5 })?))
+            .and_then(|cells| {
+                cells.checked_add(nn.checked_mul(if job == b'V' {
+                    5
+                } else if indexed {
+                    11
+                } else {
+                    4
+                })?)
+            })
             .map(|cells| cells.max(1))
             .filter(|&cells| cells <= i32::MAX as usize)
         else {
@@ -533,7 +541,7 @@ impl<const N: usize> XsyevrScalar for F<N> {
         let d = take_work(&mut tail, nn);
         let e = take_work(&mut tail, nn);
         let scratch = take_work(&mut tail, 2 * nn);
-        let taus = take_work(&mut tail, nn);
+        let taus = take_work(&mut tail, if job == b'V' { nn } else { 0 });
         let idx = take_work(&mut tail, if indexed { 7 * nn } else { 0 });
         let q = if job == b'V' {
             take_work(&mut tail, nn * nn)
@@ -590,9 +598,7 @@ impl<const N: usize> XsyevrScalar for F<N> {
         }
         order.sort_unstable_by(|&i, &j| {
             let (i, j) = (i as usize, j as usize);
-            d[i].partial_cmp(&d[j])
-                .unwrap()
-                .then(i.cmp(&j))
+            d[i].partial_cmp(&d[j]).unwrap().then(i.cmp(&j))
         });
         let selected = |k: usize, p: usize| {
             range == b'A'

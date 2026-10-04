@@ -8,7 +8,6 @@ use crate::solver::core::{
     SolverStatus,
 };
 use crate::timers::Timers;
-use rayon::prelude::*;
 
 impl<T: FloatT> ProblemData<T> for OwnedData<T> {
     type V = OwnedVariables<T>;
@@ -30,46 +29,35 @@ impl<T: FloatT> OwnedResiduals<T> {
     ) {
         // Fewer owners than workers: lend each owner's sampled products the
         // rank pool (a nested install on the same pool runs inline).
-        #[cfg(feature = "sdp")]
         let lend = pool
             .as_ref()
             .filter(|p| self.blocks.len() < p.current_num_threads())
             .cloned();
-        let update = |(((residuals, variables), data), ids): (
-            (
-                (&mut DefaultResiduals<T>, &DefaultVariables<T>),
-                &DefaultProblemData<T>,
-            ),
+        let update = |(residuals, variables, data, ids): (
+            &mut DefaultResiduals<T>,
+            &DefaultVariables<T>,
+            &DefaultProblemData<T>,
             &OwnerIndices,
         )| {
-            #[cfg(feature = "sdp")]
             {
                 residuals.sampled_pool = lend.clone();
             }
             residuals.update_counted(variables, data, Some(&ids.counted_rows));
-            #[cfg(feature = "sdp")]
             {
                 residuals.sampled_pool = None;
             }
         };
 
-        if let Some(pool) = pool.as_deref() {
-            pool.install(|| {
-                self.blocks
-                    .par_iter_mut()
-                    .zip(&variables.blocks)
-                    .zip(&data.blocks)
-                    .zip(&data.layout.owners)
-                    .for_each(update)
-            });
-        } else {
-            self.blocks
-                .iter_mut()
-                .zip(&variables.blocks)
-                .zip(&data.blocks)
-                .zip(&data.layout.owners)
-                .for_each(update);
-        }
+        for_blocks!(
+            pool.as_deref(),
+            (
+                &mut self.blocks,
+                &variables.blocks,
+                &data.blocks,
+                &data.layout.owners
+            ),
+            update
+        );
 
         // Equality rows are replicated in every owner.  Add their local
         // operator contributions once, then apply the affine b term from the
@@ -632,15 +620,11 @@ impl<T: FloatT> Solution<T> for OwnedSolution<T> {
             return;
         }
 
-        #[cfg(feature = "sdp")]
         let reversed = data
             .chordal_info
             .as_ref()
             .map(|chordal| chordal.decomp_reverse(&point, &data.internal_cones, settings));
-        #[cfg(feature = "sdp")]
         let point = reversed.as_ref().unwrap_or(&point);
-        #[cfg(not(feature = "sdp"))]
-        let point = &point;
 
         if let Some(presolver) = &data.presolver {
             presolver.reverse_presolve(&mut self.0, point);

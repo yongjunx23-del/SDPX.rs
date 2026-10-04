@@ -81,7 +81,6 @@ fn settings<T: FloatT>() -> DefaultSettings<T> {
     DefaultSettings {
         verbose: false,
         presolve_enable: false,
-        #[cfg(feature = "sdp")]
         chordal_decomposition_enable: false,
         input_sparse_dropzeros: false,
         equilibrate_enable: true,
@@ -129,7 +128,6 @@ pub(crate) fn ordinary<T: FloatT>() -> DefaultProblemData<T> {
     d
 }
 
-#[cfg(feature = "sdp")]
 pub(crate) fn sampled<T: FloatT>() -> DefaultProblemData<T> {
     let mut ptr = vec![0];
     let mut rows = Vec::new();
@@ -219,10 +217,8 @@ fn check<T: FloatT>(make: impl Fn() -> DefaultProblemData<T>) {
     for count in [1, 2, 8] {
         let mut reference = make();
         let input = make();
-        #[cfg(feature = "sdp")]
         let weak = input.sampled.as_ref().map(Arc::downgrade);
         let mut owned = runtime(input, count, settings(), (reference.n, reference.m));
-        #[cfg(feature = "sdp")]
         if let Some(weak) = weak {
             assert!(weak.upgrade().is_none(), "retained global sampled operator");
         }
@@ -272,7 +268,6 @@ fn check<T: FloatT>(make: impl Fn() -> DefaultProblemData<T>) {
         if count == 8 {
             assert!(owned.variables.blocks.iter().any(|o| o.x.is_empty()));
         }
-        #[cfg(feature = "sdp")]
         if let Some(operator) = &reference.sampled {
             for block in &owned.data.blocks {
                 let linear = block.sampled.as_ref().unwrap().linear();
@@ -426,22 +421,18 @@ fn owned_state_mpfr512() {
 fn owned_state_mpfr768() {
     check(ordinary::<MpFloat<12>>);
 }
-#[cfg(feature = "sdp")]
 #[test]
 fn owned_sampled_state_f64() {
     check(sampled::<f64>);
 }
-#[cfg(feature = "sdp")]
 #[test]
 fn owned_sampled_state_mpfr256() {
     check(sampled::<MpFloat<4>>);
 }
-#[cfg(feature = "sdp")]
 #[test]
 fn owned_sampled_state_mpfr512() {
     check(sampled::<MpFloat<8>>);
 }
-#[cfg(feature = "sdp")]
 #[test]
 fn owned_sampled_state_mpfr768() {
     check(sampled::<MpFloat<12>>);

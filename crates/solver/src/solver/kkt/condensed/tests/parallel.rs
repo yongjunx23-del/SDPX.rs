@@ -164,7 +164,7 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
     // Buffers are bounded by whichever limit admitted them: the two-copy
     // rule or the byte budget.
     let budget_cells = (PARALLEL_ASSEMBLY_BUDGET_BYTES / std::mem::size_of::<T>()) as u128;
-    let allowed = (2 * pooled.schur.nnz() as u128).max(budget_cells);
+    let allowed = (2 * pooled.schur_nnz as u128).max(budget_cells);
     assert!(buffer_cells(&pooled) as u128 <= allowed);
     assert!(buffer_cells(&pooled) > 0);
     let saved_buffers = buffer_cells(&pooled);
@@ -209,9 +209,18 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
         }
         assert_eq!(pooled.parallel_assembly, width > 1);
         assert_eq!(buffer_cells(&pooled), saved_buffers);
-        assert_eq!(serial.schur.colptr, pooled.schur.colptr);
-        assert_eq!(serial.schur.rowval, pooled.schur.rowval);
-        assert_eq!(serial.schur.nzval, pooled.schur.nzval);
+        assert_eq!(
+            serial.reduced.kkt_matrix().colptr[..serial.n + 1],
+            pooled.reduced.kkt_matrix().colptr[..pooled.n + 1]
+        );
+        assert_eq!(
+            serial.reduced.kkt_matrix().rowval[..serial.schur_nnz],
+            pooled.reduced.kkt_matrix().rowval[..pooled.schur_nnz]
+        );
+        assert_eq!(
+            serial.reduced.kkt_matrix().nzval[..serial.schur_nnz],
+            pooled.reduced.kkt_matrix().nzval[..pooled.schur_nnz]
+        );
         assert_eq!(serial.retained_rows, pooled.retained_rows);
         assert_eq!(serial.retained_A.nzval, pooled.retained_A.nzval);
         assert!(!pooled.retained_rows.is_empty());
@@ -252,7 +261,10 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
                 serial_cones.mul_Hs(&mut oracle, &yp, &mut scratch);
                 let mut expected = probe.clone();
                 for block in &pooled.blocks {
-                    if !matches!(block.scaling, Scaling::Psd(_) | Scaling::Orthant { .. }) {
+                    if !matches!(
+                        block.scaling,
+                        Scaling::Psd(_) | Scaling::Orthant { .. } | Scaling::SocElim { .. }
+                    ) {
                         expected[block.rows.clone()].fill(T::zero());
                         assert!(yp[block.rows.clone()].iter().all(|x| *x == T::zero()));
                     }
@@ -324,7 +336,10 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
     assert_eq!(serial.pool.as_ref().unwrap().current_num_threads(), 2);
     assert!(!serial.parallel_assembly);
     assert_eq!(buffer_cells(&serial), 0);
-    assert_eq!(serial.schur.nzval, pooled.schur.nzval);
+    assert_eq!(
+        serial.reduced.kkt_matrix().nzval[..serial.schur_nnz],
+        pooled.reduced.kkt_matrix().nzval[..pooled.schur_nnz]
+    );
 }
 
 #[test]
@@ -386,8 +401,11 @@ fn orthant_fma<T: FloatT>() {
         }
     }
     assert!(solver.assemble());
-    let position = schur_position(&solver.schur, 0, 1);
-    assert_eq!(solver.schur.nzval[position], -delta * delta);
+    let position = schur_position(solver.reduced.kkt_matrix(), 0, 1);
+    assert_eq!(
+        solver.reduced.kkt_matrix().nzval[..solver.schur_nnz][position],
+        -delta * delta
+    );
     for inverse in [false, true] {
         let mut y = [T::nan()];
         apply_scaling_pool(
@@ -634,7 +652,10 @@ fn dominant_sparse_psd<T: FloatT>() {
         assert_eq!(pooled.inner_schur, workers > 1);
         assert_eq!(pooled.parallel_assembly, workers > 1);
         assert_eq!(pooled.scaling_lanes, vec![0]);
-        assert_eq!(serial.schur.nzval, pooled.schur.nzval);
+        assert_eq!(
+            serial.reduced.kkt_matrix().nzval[..serial.schur_nnz],
+            pooled.reduced.kkt_matrix().nzval[..pooled.schur_nnz]
+        );
         let Scaling::Psd(block) = &pooled.blocks[0].scaling else {
             unreachable!()
         };
@@ -650,7 +671,10 @@ fn dominant_sparse_psd<T: FloatT>() {
         assert_eq!(block.sparse_column_lanes.as_ptr(), plan_pointer);
         assert_eq!(block.schur_values.as_ptr(), output_pointer);
         assert_eq!(pooled.scaling_lanes.as_ptr(), scaling_pointer);
-        assert_eq!(serial.schur.nzval, pooled.schur.nzval);
+        assert_eq!(
+            serial.reduced.kkt_matrix().nzval[..serial.schur_nnz],
+            pooled.reduced.kkt_matrix().nzval[..pooled.schur_nnz]
+        );
     }
 }
 
@@ -760,7 +784,10 @@ fn dominant_sampled_pool_mode<T: FloatT>(external: bool, blocks: usize) {
             }
         );
         assert_eq!(pooled.parallel_assembly, workers > 1);
-        assert_eq!(serial.schur.nzval, pooled.schur.nzval);
+        assert_eq!(
+            serial.reduced.kkt_matrix().nzval[..serial.schur_nnz],
+            pooled.reduced.kkt_matrix().nzval[..pooled.schur_nnz]
+        );
         let Scaling::Psd(psd) = &pooled.blocks[0].scaling else {
             unreachable!()
         };
@@ -927,23 +954,39 @@ fn cached_orthant_division<T: FloatT>() {
                 w.fill(num::<T>(7) / num::<T>(turn + 1));
             }
         }
-        let mut expected = vec![T::zero(); solver.schur.nzval.len()];
+        // Quotients use one reciprocal per row; binary64 chains FMAs in row
+        // order, wide precision rounds each entry's exact sum once.
+        let mut terms = vec![Vec::new(); solver.schur_nnz];
         for block in &solver.blocks {
             if let Scaling::Orthant { w, rows, .. } = &block.scaling {
                 for (r, entries) in rows.iter().enumerate() {
+                    let inv = w[r].recip();
                     for (b, &(j, q)) in entries.iter().enumerate() {
-                        let aj = solver.A.nzval[q] / w[r];
+                        let aj = solver.A.nzval[q] * inv;
                         for &(i, k) in &entries[..=b] {
-                            let ai = solver.A.nzval[k] / w[r];
-                            let pos = schur_position(&solver.schur, i, j);
-                            expected[pos] = ai.mul_add(aj, expected[pos]);
+                            let ai = solver.A.nzval[k] * inv;
+                            let pos = schur_position(solver.reduced.kkt_matrix(), i, j);
+                            terms[pos].push((ai, aj));
                         }
                     }
                 }
             }
         }
+        let expected: Vec<T> = terms
+            .iter()
+            .map(|t| {
+                if T::precision_bits() <= 53 {
+                    t.iter().fold(T::zero(), |v, &(a, b)| a.mul_add(b, v))
+                } else {
+                    T::dot_fma(t.iter().map(|(a, b)| (a, b)))
+                }
+            })
+            .collect();
         assert!(solver.assemble());
-        assert_eq!(solver.schur.nzval, expected);
+        assert_eq!(
+            solver.reduced.kkt_matrix().nzval[..solver.schur_nnz],
+            expected
+        );
     }
 }
 #[test]
@@ -1145,7 +1188,10 @@ fn external_ordinary<T: FloatT>(blocks: usize) {
         assert_shared_pool(&pooled, &pool);
         assert!(cones.thread_pool().is_none());
         assert_eq!(pooled.plan_threads, width);
-        assert_eq!(serial.schur.nzval, pooled.schur.nzval);
+        assert_eq!(
+            serial.reduced.kkt_matrix().nzval[..serial.schur_nnz],
+            pooled.reduced.kkt_matrix().nzval[..pooled.schur_nnz]
+        );
         // Two fully overlapping cliques can exceed the original contribution
         // cap; operator tiling still applies when assembly stays serial.
         let before = wide_pool_tiles();
@@ -1208,7 +1254,10 @@ fn external_ordinary<T: FloatT>(blocks: usize) {
     pooled.update_P(&p);
     assert!(pooled.update_partition_with_pool(&cones, &settings, true, None));
     assert_shared_pool(&pooled, &None);
-    assert_eq!(pooled.schur.nzval, serial.schur.nzval);
+    assert_eq!(
+        pooled.reduced.kkt_matrix().nzval[..pooled.schur_nnz],
+        serial.reduced.kkt_matrix().nzval[..serial.schur_nnz]
+    );
     assert!(pooled.update_partition_with_pool(&cones, &settings, false, pool));
     // The existing/default entry must still follow the cone configuration,
     // rather than retaining a pool supplied by an earlier explicit call.

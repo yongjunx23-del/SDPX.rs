@@ -8,7 +8,6 @@ use crate::algebra::*;
 // for 3x3 matrix decompositions.
 
 // NB: S = 9 here because the matrix has 3^2 elements
-#[allow(dead_code)] // used in tests even with `sdp` not selected
 pub(crate) type DenseMatrix3<T> = DenseMatrixN<9, T>;
 
 // NB: S = 6 here because the upper triangle has 6 elements

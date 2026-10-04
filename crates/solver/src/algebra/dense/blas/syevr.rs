@@ -284,33 +284,3 @@ macro_rules! generate_test_eigen {
 
 generate_test_eigen!(f32, test_eigen_f32);
 generate_test_eigen!(f64, test_eigen_f64);
-
-#[cfg(all(test, feature = "bench"))]
-mod bench {
-
-    use super::*;
-
-    fn eig3_bench_iter() -> impl Iterator<Item = Matrix<f64>> {
-        use itertools::iproduct;
-
-        let v = [-4., -2., 0., 1., 3.14, 5., 12.];
-
-        iproduct!(v, v, v, v, v, v).map(move |(a, b, c, d, e, f)| {
-            let data = [a, b, c, 0., d, e, 0., 0., f];
-            Matrix::new_from_slice((3, 3), &data)
-        })
-    }
-
-    #[test]
-    fn bench_eig3_vs_blas() {
-        let mut eng = EigEngine::<f64>::new(3);
-
-        for mut A in eig3_bench_iter() {
-            let _ = eng.syevr(&mut A);
-        }
-
-        for mut A in eig3_bench_iter() {
-            let _ = eng.eigvals3(&mut A);
-        }
-    }
-}

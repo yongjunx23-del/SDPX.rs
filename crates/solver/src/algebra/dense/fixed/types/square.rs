@@ -1,7 +1,6 @@
 #![allow(non_snake_case)]
 // some functions are only used with 3x3 eigen or svd
-// decompositions, which are only used in the sdp feature
-#![allow(dead_code)]
+// decompositions
 
 use crate::algebra::*;
 use std::ops::{Index, IndexMut};
@@ -45,7 +44,7 @@ impl<const S: usize, T: FloatT> DenseMatrixN<S, T> {
         }
     }
 
-    #[allow(dead_code)] //used in tests.
+    #[cfg(test)]
     pub(crate) fn col_slice(&self, j: usize) -> &[T] {
         let start = j * Self::N;
         &self.data[start..(start + Self::N)]
@@ -75,7 +74,7 @@ impl<const S: usize, T: FloatT> DenseMatrixN<S, T> {
 
     // duplicating the mul strait defined elsewhere
     // for now.  Possibly better for performance.
-    #[allow(dead_code)] //used in tests.
+    #[cfg(test)]
     pub(crate) fn mul(&self, y: &mut [T], x: &[T]) {
         assert!(Self::N == x.len());
         assert!(Self::N == y.len());

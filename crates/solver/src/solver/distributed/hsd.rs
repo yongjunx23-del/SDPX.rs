@@ -212,7 +212,7 @@ impl<T: FloatT> OwnedSolver<T> {
             mut timers,
             cost_input_fingerprint,
         } = prepared;
-        timers.start_as_current("setup");
+        timers.start_setup();
         // Ruiz is complete. Release the global cone workspaces and their pool
         // before allocating persistent local state and the one shared pool.
         drop(global_cones);
@@ -464,7 +464,7 @@ impl<T: FloatT> OwnedSolver<T> {
             callbacks: crate::solver::core::callbacks::SolverCallbacks::default(),
             phantom: std::marker::PhantomData,
         };
-        timers.stop_current();
+        timers.stop_setup();
         output.timers.replace(timers);
         Ok(output)
     }

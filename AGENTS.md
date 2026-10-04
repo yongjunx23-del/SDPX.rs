@@ -1,117 +1,172 @@
 # SDPX
 
-One Rust HSD conic solver (Clarabel.rs-derived) with a native Rust API, the
-`sdpx` CLI and a C ABI. Float64 and MPFR share one engine. Julia in this repo
-only generates inputs or audits results; it is never a solver frontend.
+One Rust conic solver (HSD interior point, Clarabel.rs-derived) with a native
+Rust API, the `sdpx` CLI, a C ABI (`crates/ffi`) and the `sdpx-pmp2sdp`
+converter (`crates/pmp`). Julia in this repo only generates inputs or audits
+results; it never loads or drives the solver.
 
-This file is the single source for **how to work**. Other documents:
+Priorities: [REVIEW_AND_PLAN.md](REVIEW_AND_PLAN.md). Architecture, backend
+selection and build features: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Experiment history: [docs/JOURNAL.md](docs/JOURNAL.md). Toolchain and pinned
+cases: [sdpx-development](.agents/skills/sdpx-development/SKILL.md).
 
-| Document | Holds |
-|---|---|
-| [REVIEW_AND_PLAN.md](REVIEW_AND_PLAN.md) | Current status, known failures, priorities, closed directions |
-| [docs/JOURNAL.md](docs/JOURNAL.md) | Completed experiments and their conclusions (append-only) |
-| [README.md](README.md) | Users: overview, quick start, Rust examples, performance |
-| `benchmark/e2e/README.md` | The per-change check tool |
-| `benchmark/{research,ising,float64,parallel,mpfr}/README.md` | Milestone and external comparisons only |
+## Architecture
 
-`benchmark/` and `docs/archive/` are local working copies, git-ignored and not
-published; keep inputs and harness changes there, never in commits.
+One generic engine, `FloatT = Scalar + BlasFloatT + LDLConfiguration`, serves
+Float64 and every MPFR width. BLAS/LAPACK are always linked (no SDP-less build).
 
-## Development loop
+- `crates/arithmetic` — `MpFloat<N>` (MPFR storage, owned limbs). Products and
+  sums of regular values round inline to nearest-even (multiply through 1280
+  bits, add/sub through 512; MPFR otherwise, bitwise equal). `exactdot`:
+  every dot product is the exact sum rounded once (inlined limb kernel through
+  256 bits, GMP above). Wire/serde formats.
+- `crates/solver/src/algebra` — CSC and dense matrices, `BlasFloatT` (system
+  BLAS/LAPACK for f64; MPFR kernels for wide types), exact residue GEMMs
+  (`rns_blas`: products, congruences, `Aᵀdiag(d)A`, with constant-operand
+  residue caches), per-thread scratch.
+- `solver/core` — the Clarabel-derived HSD predictor/corrector loop and its
+  traits. `solver/default` — problem setup (Ruiz, presolve, chordal), variables,
+  residuals, info, settings, JSON I/O.
+- `solver/cones` — zero, nonnegative, SOC, exponential, power, generalized
+  power and PSD-triangle cones, plus the cone worker pool.
+- `solver/kkt` — `direct`: the augmented system factored by QDLDL (serial or
+  elimination-tree parallel), faer, `dense_block` (pooled tiled Cholesky) or an
+  arrow LDL that eliminates local structure (`local_bounds`, `local_soc`,
+  `shared_soc`), chosen by `auto`; `condensed`: PSD/orthant blocks eliminated
+  into a Schur complement, factored by the direct layer. Iterative refinement.
+- `solver/sampled` — SDPB-style factored PSD blocks (bases × sample weights).
+- `solver/chordal`; `solver/distributed`: owner-partitioned data, variables,
+  residuals and KKT for MPI, plugged into the same core HSD loop
+  (`for_blocks!`/`all_blocks!` run owner blocks on the pool or serially);
+  `mpi.rs`.
+- `receipt` (phase wall/CPU timings via `timeit!`, RSS), `timers` (the solve
+  clock).
+- `crates/pmp` — PMP → sampled SDP converter. `crates/ffi` — C ABI.
 
-Every change is judged by one complete solve of the matching pinned case:
-status, original-coordinate audit, and time at unchanged precision and
-tolerances.
+## How to work
+
+Highest priority: a fast, memory-efficient solver at unchanged accuracy.
+This is a personal research project: favor fast development and quick
+end-to-end verification over broad test coverage. Make a small useful change,
+run one matching solve, and continue once it passes.
+
+- **No over-design.** Solve the current problem. No speculative options,
+  traits, feature flags, config knobs or abstraction layers "for later".
+- **No over-defensive code.** Validate external input once at the boundary
+  (`PreparedProblem` setup, JSON reader, C ABI). Internal code trusts
+  internal invariants: no re-checking CSC format, dimensions or signs that
+  the solver itself built. Use `debug_assert!` for internal invariants, not
+  runtime fallbacks. No catch-all fallback paths for states that cannot occur.
+- **Keep code compact.** Prefer deleting duplication over adding wrappers.
+  Code size is secondary to measured solver performance. Do not rewrite fast
+  code to meet a line-count target. Don't change comments without reason.
+- Preserve edits made by others in the shared checkout; never reset or clean
+  the tree wholesale. Temporary logs, profiles and frozen copies go outside
+  the repo.
+- Preserve upstream attribution and licenses.
+
+## Numerical contracts (do not change without explicit approval)
+
+- Precision: no silent precision lowering, mixed-precision factorization,
+  or precision-ladder warm starts. MPFR values own their storage.
+  Correctly rounded exact accumulation (RNS, `exactdot`) is allowed.
+- Keep Clarabel-style convergence, reduced tolerances, infeasibility
+  detection, regularization (including escalation) and iterative refinement.
+  Never promote `AlmostSolved`; `tol_feas_componentwise` stays off by default.
+- Keep original-coordinate outputs and accepted-iterate recovery. Sampled
+  factors define their operator; never swap in rounded materializations.
+- Direct solves default to Ruiz + presolve + chordal; prepared handles keep
+  Ruiz and disable structural preprocessing.
+- No benchmark-name branches. Never weaken an accuracy gate to pass a check.
+  Known failures stay labeled as failures (see the plan).
+
+## Build: recompile only what changed
 
 ```sh
-python3 benchmark/e2e/e2e.py build                  # fast profile → frozen arm
-python3 benchmark/e2e/e2e.py run medium             # Float64 path
-python3 benchmark/e2e/e2e.py run ising11 --arm NAME # MPFR / sampled path
-python3 benchmark/e2e/e2e.py ab ising11 BASE CAND   # performance: A-B-B-A
+export CARGO_HOME=/Users/xuyongjun/.local/share/sdpx-toolchain/cargo
+export RUSTUP_HOME=/Users/xuyongjun/.local/share/sdpx-toolchain/rustup
+export PATH="$CARGO_HOME/bin:$PATH"
+F=sdp-accelerate,faer-sparse   # macOS; cluster uses its validated BLAS provider
 ```
 
-Pick the check by what the change touches:
+- Always `--locked --offline`, and always `-p <crate>` for the crate you
+  touched. Never build `--workspace` in the edit loop.
+- Keep one feature set per session (`$F`). Changing features rebuilds the
+  whole solver.
+- Build directly for the matching E2E run. Use `cargo check --locked --offline
+  -p sdpx-solver --features $F` only when it helps resolve compile errors;
+  do not require both check and build on every change.
+- Dev/test profile keeps only line tables; dependencies are prebuilt at
+  opt-level 2. Don't change profiles to chase one run.
+- `fast` profile for local end-to-end runs; `release` only for quoted timings.
+- Frontends compile six precisions by default (53, 128, 256, 512, 768, 1024).
+  Add `all-precisions` only when you need another width (e.g. 1216 for
+  Lambda43) — it makes the C ABI build ~6× slower.
 
-| Change | Check |
-|---|---|
-| Refactor, move, dead-code removal | `ab` on both cases; `points identical: yes` required |
-| Float64 numerics or performance | `ab medium` (release arms for quoted numbers) |
-| MPFR, cones, sampled operator, condensed KKT | `ab ising11`; local SOC also `ab csdr3` |
-| Input/output, CLI, settings | `run` on both cases |
-| Threading | `run CASE --threads N` for the affected widths |
-| MPI | real MPI E2E on a host with MPI; mock tests are not enough |
-| Docs only | `git diff --check` |
+## Verification: one quick end-to-end check
 
-Do not add unit tests, multi-case screens, repeated A/B, microbenchmarks or the
-full suite as routine gates. Run them only when asked or when the change is to
-that tooling. Before a release or integration milestone, run
-`cargo test --locked --release --workspace --features sdpx-ffi/sdp-accelerate,sdpx-ffi/faer-sparse -- --test-threads=1`.
+The default gate is one small complete solve that exercises the changed
+path. Reuse an existing input and its original-coordinate audit. Do not run
+unit tests or integration suites in addition as a routine gate.
 
-Rules for results:
+```sh
+python3 benchmark/e2e/e2e.py build --arm NAME
+python3 benchmark/e2e/e2e.py run CASE --arm NAME
+# CASE: medium (Float64), ising11 (MPFR/SDP), csdr3 (SOC)
+```
 
-- A numerical outcome passes only if status and the external audit pass the
-  existing gates. Known failures are listed in the plan. They stay failures and
-  do not block unrelated work. A new failure or a worse residual must be
-  investigated.
-- Iterations and time are diagnostics unless performance is the subject. A
-  valid algorithm change need not reproduce old iteration counts or objective
-  digits.
-- Timing: `fast` for development, `release` for any number you quote. Run arms
-  sequentially on one host, never concurrently. A single run is preliminary; say so.
-- Run large builds, full-suite tests and substantial numerical runs on the
-  cluster through PBS. Keep local work to editing, inspection and lightweight
-  preparation.
-- Record: when a candidate is kept or reverted, add one dated entry to
-  `docs/JOURNAL.md` and update the plan's status table if a headline number
-  moved. Raw run rows are appended automatically.
-- Scratch files, logs and profiles go in `$SDPX_E2E_HOME` (default
-  `~/.cache/sdpx-e2e`) or the session scratchpad, never in the repo. Do not rely
-  on `/tmp` for anything a later session needs.
+- Docs/comments: `git diff --check`; no build or solve.
+- Full suites only when asked or for a risky change:
+  `cargo test --locked --offline --profile fast -p sdpx-solver --features $F`
+  (also `-p sdpx-arithmetic`, `-p sdpx-pmp`, `-p sdpx-ffi --features $F`);
+  the solver suite takes about five minutes cold.
+- Solver change: pick the smallest relevant case, one precision and one
+  thread count. Do not run all three pinned cases or all precision widths.
+- CLI/API/C ABI/converter change: one small E2E through the affected entry
+  point; converter checks include solving the converted output.
+- Threading change: the same small solve at one and the affected thread
+  count, comparing points and audits. MPI changes need an actual MPI run.
+- Reuse the frozen baseline. A pure refactor must preserve its points;
+  algorithm changes must pass status and the original-coordinate audit.
+- Known failures remain labeled; they do not block unrelated work. Investigate
+  a new failure or worse residual with the smallest reproducer.
+- Stop verification when the matching check passes. Extra tests are only for
+  a concrete unresolved failure/risk or an explicit user request. Do not add
+  test scaffolding, defensive cases or coverage campaigns by default.
+- Existing tests may help diagnose a specific problem; no mass test deletion
+  or suite reorganization is part of this workflow change.
+- No automatic full-suite, clippy, cross-solver comparison or release gate.
+  Publishing alone does not trigger a broad test campaign.
 
-## Numerical contracts (never weaken)
+## Performance evidence without slowing the edit loop
 
-- Keep working precision, original-coordinate outputs, accepted-iterate
-  recovery, convergence and infeasibility criteria, reduced tolerances,
-  regularization (including ×100 escalation, at most 3 levels) and refinement,
-  all following Clarabel.rs. `AlmostSolved` is never promoted. Do not
-  reintroduce an independent certificate stage or status promotion.
-- Do not relax accuracy gates, mix precisions, factor MPFR problems in Float64,
-  use precision-ladder warm starts, or branch on benchmark names.
-- `tol_feas_componentwise` stays optional and off by default.
-- Direct solves default to Ruiz, presolve and chordal. Prepared handles keep
-  Ruiz and disable structural preprocessing for reusable updates.
-- MPFR values own their storage; decimal inputs reach MPFR without a Float64
-  intermediate. Sampled factors define the operator; never replace them with
-  rounded materializations.
-- MPFR accumulation keeps per-term FMA order. The one exception is exact
-  accumulation rounded once at the destination (RNS, `exactdot`), which is
-  more accurate.
-- High-precision NT scaling uses a direct SVD. Do not replace it with an
-  eigendecomposition of `MᵀM`; keep the ill-conditioned SPD regression.
-- Parallel and distributed results equal serial results bitwise, or the
-  difference is documented (MPFR reductions fold in rank order).
-- PSD cones use NT only.
+One fast-profile E2E is enough to advance development; its timing is
+preliminary. Batch related edits before formal timing. For a performance
+claim or choosing between candidates, run one release ABBA on the affected
+case, sequentially on one host:
 
-## Code
+```sh
+python3 benchmark/e2e/e2e.py build --arm NAME --profile release
+python3 benchmark/e2e/e2e.py ab CASE OLD NEW
+```
 
-- Layout: `crates/solver/src/solver/{core,default,cones,kkt,sampled,distributed,chordal}`;
-  unit tests in each module's `tests/`. The public API is the flat
-  `sdpx_solver::solver::*` facade.
-- Target ≤ 30k production lines by removing duplication, not by wrapping or
-  compressing. Prefer small typed interfaces. Keep upstream attribution
-  (`provenance/`).
-- Fix warnings in touched code. Run `rustfmt` on files you edit, not on the
-  whole tree.
-- Write maintained documentation in concise English; keep experiment detail
-  in `docs/JOURNAL.md` and current decisions in `REVIEW_AND_PLAN.md`.
-- Commit only when asked. End commit messages with the attribution line the
-  harness supplies.
+Use identical precision, settings, input and thread/BLAS budgets. Keep a
+speed optimization on a repeatable ≥2% end-to-end gain, or a clear memory or
+correctness benefit. Report the median and native/API/process scope. Repeat
+only if noise leaves the decision unresolved. Record a short kept/rejected
+entry in the journal; do not reopen closed directions without new evidence.
 
-## Working with other agents
+## Cluster work and delegation
 
-Work alone on small or tightly coupled changes. Delegate only independent,
-bounded work, giving each worker a file ownership and an acceptance command
-(one of the `e2e.py` checks above). Preserve other workers' uncommitted edits
-in the shared checkout; commit or stash them first if a change must span them.
-Timed runs stay serial per host. Cluster work uses the `ucas-hpc` skill and
-runs only within the scope the user authorizes.
+- Keep small E2E checks local. Send long builds, solves and substantial
+  benchmarks to the cluster using `ucas-hpc`; use its validated dynamic
+  OpenBLAS configuration until the recorded static-provider issue is fixed.
+- Work yourself by default, including job submission and monitoring. Use a
+  subagent only when genuinely needed for independent, bounded work; a long
+  run alone does not require delegation. No mandatory agent or model.
+- Freeze source and inputs, use bounded resources, and record job state,
+  exit code, status, audit, time, memory and evidence paths.
+- Keep timed runs serial per host. Compare frozen sources, not a moving tree.
+- Submit only work needed for the active task. Do not restart cancelled jobs,
+  launch old campaigns or expand to large sweeps merely because the plan
+  mentions them. No long run is required for a documentation-only edit.

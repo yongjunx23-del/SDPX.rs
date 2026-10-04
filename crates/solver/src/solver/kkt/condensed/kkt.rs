@@ -19,6 +19,9 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             !self.local_only || operator.is_local_only(),
             "local KKT requires local sampled policy"
         );
+        // Fused sampled solves condense and recover through Rinv and apply H
+        // through G; only the MPI path's inverse application reads Ginv.
+        let fused = self.mpi_world().is_none();
         for (bi, sampled_block) in operator.blocks().iter().enumerate() {
             if let Some(block) = self
                 .blocks
@@ -41,6 +44,9 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                     p.dense_row_first = Vec::new();
                     p.coefficient_support = Vec::new();
                     p.mat3c = Matrix::zeros(p.Rinv.size());
+                    if fused {
+                        p.Ginv = Matrix::zeros((0, 0));
+                    }
                     p.sampled = Some(SampledPsd {
                         work: SampledSchurWorkspace::new(sampled_block),
                         pair_lanes: Vec::new(),
@@ -64,12 +70,20 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         });
         if !values_needed {
             self.A.nzval = Vec::new();
+            // Single-process products never read the pattern either; only
+            // the MPI path shards products over it.
+            if self.mpi_world().is_none() {
+                self.A.colptr = vec![0; self.A.n + 1];
+                self.A.rowval = Vec::new();
+            }
         } else {
             assert!(
                 !self.A.nzval.is_empty() || self.A.rowval.is_empty(),
                 "condensed KKT built without A values needs every PSD block sampled"
             );
         }
+        // Sampled A updates are rejected; the reduced KKT owns these values.
+        self.retained_A.nzval = Vec::new();
         self.prepare_shared_pool();
         self.refresh_parallel_plan();
     }
@@ -128,7 +142,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             self.blocks
                 .iter()
                 .map(|b| match &b.scaling {
-                    Scaling::Psd(p) if p.sampled.is_some() => p.mat3c.data().len(),
+                    Scaling::Psd(p) if p.sampled.is_some() => triangular_number(p.mat3c.nrows()),
                     _ => 0,
                 })
                 .sum()
@@ -159,9 +173,14 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 for block in &self.blocks {
                     if let Scaling::Psd(p) = &block.scaling {
                         if p.sampled.is_some() {
-                            let values = p.mat3c.data();
-                            halves[offset..offset + values.len()].copy_from_slice(values);
-                            offset += values.len();
+                            // Congruences mirror their upper triangle exactly;
+                            // keep one copy of each value between RHS columns.
+                            let side = p.mat3c.nrows();
+                            for j in 0..side {
+                                let values = &p.mat3c.data()[j * side..j * side + j + 1];
+                                halves[offset..offset + values.len()].copy_from_slice(values);
+                                offset += values.len();
+                            }
                         }
                     }
                 }
@@ -185,9 +204,16 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 for block in &mut self.blocks {
                     if let Scaling::Psd(p) = &mut block.scaling {
                         if p.sampled.is_some() {
-                            let values = p.mat3c.data_mut();
-                            values.copy_from_slice(&halves[offset..offset + values.len()]);
-                            offset += values.len();
+                            let side = p.mat3c.nrows();
+                            for j in 0..side {
+                                let saved = &halves[offset..offset + j + 1];
+                                p.mat3c.data_mut()[j * side..j * side + j + 1]
+                                    .copy_from_slice(saved);
+                                for (i, &value) in saved[..j].iter().enumerate() {
+                                    p.mat3c[(j, i)] = value;
+                                }
+                                offset += j + 1;
+                            }
                         }
                     }
                 }
@@ -258,20 +284,25 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
 
     fn update_P(&mut self, P: &CscMatrix<T>) {
         self.scaled_valid.fill(false);
-        assert_eq!(P.size(), self.P.size());
-        assert_eq!(P.colptr, self.P.colptr);
-        assert_eq!(P.rowval, self.P.rowval);
+        // The solver built both patterns; only the values change.
+        debug_assert!(
+            P.size() == self.P.size() && P.colptr == self.P.colptr && P.rowval == self.P.rowval
+        );
         self.P.nzval.copy_from_slice(&P.nzval);
     }
 
     fn update_A(&mut self, A: &CscMatrix<T>) {
         self.scaled_valid.fill(false);
-        assert_eq!(A.size(), self.A.size());
-        assert_eq!(A.colptr, self.A.colptr);
-        assert_eq!(A.rowval, self.A.rowval);
+        // The eliminated-row plan may cache constant A rows.
+        self.eliminated = None;
+        debug_assert_eq!(A.size(), self.A.size());
         // An empty copy means only the sampled factors define these rows.
         if !self.A.nzval.is_empty() {
+            debug_assert!(A.colptr == self.A.colptr && A.rowval == self.A.rowval);
             self.A.nzval.copy_from_slice(&A.nzval);
+            if self.a_panel.is_some() {
+                self.a_panel = DenseColumns::new(&self.A);
+            }
         }
         for block in &mut self.blocks {
             if let Scaling::Psd(psd) = &mut block.scaling {
@@ -460,7 +491,9 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let sync = |(block, cone, owned): (&mut Block<T>, &SupportedCone<T>, bool)| {
             match (&mut block.scaling, cone) {
                 (Scaling::Psd(p), SupportedCone::PSDTriangleCone(c)) => {
-                    p.R.copy_from_slice(c.scaling_R().data());
+                    if !p.R.data().is_empty() {
+                        p.R.copy_from_slice(c.scaling_R().data());
+                    }
                     p.Rinv.copy_from_slice(c.scaling_Rinv().data());
                     if let Some(sampled) = &mut p.sampled {
                         // One parallel level only. Fine inner lanes are reserved
@@ -484,13 +517,24 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     }
                     // Cone scaling already formed this exact same product.
                     // Copy its authoritative triangle before mirroring below.
-                    p.G.copy_from_slice(c.scaling_gram().data());
-                    p.Ginv
-                        .syrk(&p.Rinv.t(), T::one(), T::zero(), MatrixTriangle::Triu);
+                    for j in 0..c.n {
+                        let start = j * c.n;
+                        p.G.data_mut()[start..start + j + 1]
+                            .copy_from_slice(&c.scaling_gram().data()[start..start + j + 1]);
+                    }
                     for j in 0..c.n {
                         for i in j + 1..c.n {
                             p.G[(i, j)] = p.G[(j, i)];
-                            p.Ginv[(i, j)] = p.Ginv[(j, i)];
+                        }
+                    }
+                    // A released Ginv (fused sampled block) is never read.
+                    if !p.Ginv.data().is_empty() {
+                        p.Ginv
+                            .syrk(&p.Rinv.t(), T::one(), T::zero(), MatrixTriangle::Triu);
+                        for j in 0..c.n {
+                            for i in j + 1..c.n {
+                                p.Ginv[(i, j)] = p.Ginv[(j, i)];
+                            }
                         }
                     }
                     if !p.R.data().is_finite()
@@ -508,7 +552,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     }
                 }
                 (Scaling::Zero, SupportedCone::ZeroCone(_)) => {}
-                (Scaling::Soc { w, eta }, SupportedCone::SecondOrderCone(c)) => {
+                (Scaling::Soc { w, eta }, SupportedCone::SecondOrderCone(c))
+                | (Scaling::SocElim { w, eta, .. }, SupportedCone::SecondOrderCone(c)) => {
                     w.copy_from_slice(&c.w);
                     *eta = c.η;
                 }
@@ -536,8 +581,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             }
             true
         };
-        let __ts = std::time::Instant::now();
-        let __cs = crate::receipt::cpu_start();
+        let sync_timer = crate::receipt::start();
         // Rank split follows block update cost (Gram entries for sampled
         // blocks, ~n^3 proxy otherwise), not block count — a count split
         // turns size skew into allgatherv wait on every collective.
@@ -650,15 +694,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 }
             }
         }
-        if crate::receipt::profile_requested() {
-            eprintln!(
-                "PHASE sync {:?} (inner_sampled={:?})",
-                __ts.elapsed(),
-                inner_sampled
-            );
-        }
-        crate::receipt::phase_record("sync", __ts.elapsed());
-        crate::receipt::cpu_add("sync", __cs);
+        crate::receipt::finish("sync", sync_timer);
         // `valid` folds this rank's owned blocks only; a failing owner
         // returning early while peers proceed would hang the next
         // collective. Merge the flag before any rank leaves the call.
@@ -670,30 +706,26 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         if !valid {
             return false;
         }
-        let __t0 = std::time::Instant::now();
-        let __c0 = crate::receipt::cpu_start();
+        let timer = crate::receipt::start();
         if !self.assemble() {
             return false;
         }
-        crate::receipt::phase("assemble", __t0.elapsed());
-        crate::receipt::cpu_add("assemble", __c0);
-        self.reduced.update_P(&self.schur);
+        crate::receipt::finish("assemble", timer);
+        self.reduced.publish_P();
         let retained = &self.retained_indices;
-        let __t1 = std::time::Instant::now();
-        let __c1 = crate::receipt::cpu_start();
+        let timer = crate::receipt::start();
         let retained_cones = cones
             .iter()
             .enumerate()
             .filter(|(i, _)| retained.binary_search(i).is_ok())
             .map(|(_, c)| c);
-        let __r = if factor {
+        let result = if factor {
             self.reduced.update_from_cones(retained_cones, settings)
         } else {
             self.reduced.assemble_from_cones(retained_cones);
             true
         };
-        crate::receipt::phase("cones_schur", __t1.elapsed());
-        crate::receipt::cpu_add("cones_schur", __c1);
-        __r
+        crate::receipt::finish("cones_schur", timer);
+        result
     }
 }

@@ -38,6 +38,8 @@ where
 pub(crate) struct SolverCallbacks<I> {
     /// callback for termination
     pub termination_callback: Callback<I>,
+    /// iterate checkpoint / restart requests
+    pub checkpoint: crate::solver::core::checkpoint::CheckpointConfig,
 }
 
 impl<I> Default for SolverCallbacks<I> {
@@ -45,6 +47,7 @@ impl<I> Default for SolverCallbacks<I> {
     fn default() -> Self {
         Self {
             termination_callback: Callback::None,
+            checkpoint: Default::default(),
         }
     }
 }

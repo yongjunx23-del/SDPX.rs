@@ -119,18 +119,10 @@ impl<T: FloatT> ConeCollection<T> for OwnedCones<T> {
         self.collective.all_true(471, local).unwrap_or(false)
     }
     fn reset_scaling(&mut self) {
-        if let Some(pool) = &self.pool {
-            debug_assert!(owner_cone_pools_ok(&self.blocks));
-            pool.install(|| {
-                self.blocks
-                    .par_iter_mut()
-                    .for_each(|c| c.set_identity_scaling())
-            });
-        } else {
-            for c in &mut self.blocks {
-                c.set_identity_scaling();
-            }
-        }
+        debug_assert!(self.pool.is_none() || owner_cone_pools_ok(&self.blocks));
+        for_blocks!(self.pool.as_ref(), (&mut self.blocks,), |(c,)| {
+            c.set_identity_scaling()
+        });
     }
     fn worker_pool(&self) -> Option<Arc<rayon::ThreadPool>> {
         self.pool.clone()
@@ -206,27 +198,12 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         (sz + self.tau() * self.kappa()) / T::from_usize(c.degree + 1).unwrap()
     }
     fn affine_step_rhs(&mut self, r: &Self::R, v: &Self, c: &Self::C) {
-        if let Some(pool) = &c.pool {
-            debug_assert!(owner_cone_pools_ok(&c.blocks));
-            pool.install(|| {
-                self.blocks
-                    .par_iter_mut()
-                    .zip(&r.blocks)
-                    .zip(&v.blocks)
-                    .zip(&c.blocks)
-                    .for_each(|(((out, r), v), c)| out.affine_step_rhs(r, v, c));
-            });
-        } else {
-            for (((out, r), v), c) in self
-                .blocks
-                .iter_mut()
-                .zip(&r.blocks)
-                .zip(&v.blocks)
-                .zip(&c.blocks)
-            {
-                out.affine_step_rhs(r, v, c);
-            }
-        }
+        debug_assert!(c.pool.is_none() || owner_cone_pools_ok(&c.blocks));
+        for_blocks!(
+            c.pool.as_ref(),
+            (&mut self.blocks, &r.blocks, &v.blocks, &c.blocks),
+            |(out, r, v, c)| out.affine_step_rhs(r, v, c)
+        );
         self.tau = r.scalar.rτ;
         self.kappa = v.tau() * v.kappa();
         self.border_z.copy_from_slice(&r.border_residual);
@@ -243,31 +220,18 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         mu: T,
         m: T,
     ) {
-        if let Some(pool) = &c.pool {
-            debug_assert!(owner_cone_pools_ok(&c.blocks));
-            pool.install(|| {
-                self.blocks
-                    .par_iter_mut()
-                    .zip(&r.blocks)
-                    .zip(&v.blocks)
-                    .zip(&mut c.blocks)
-                    .zip(&mut step.blocks)
-                    .for_each(|((((out, r), v), c), step)| {
-                        out.combined_step_rhs(r, v, c, step, sigma, mu, m)
-                    });
-            });
-        } else {
-            for ((((out, r), v), c), step) in self
-                .blocks
-                .iter_mut()
-                .zip(&r.blocks)
-                .zip(&v.blocks)
-                .zip(&mut c.blocks)
-                .zip(&mut step.blocks)
-            {
-                out.combined_step_rhs(r, v, c, step, sigma, mu, m);
-            }
-        }
+        debug_assert!(c.pool.is_none() || owner_cone_pools_ok(&c.blocks));
+        for_blocks!(
+            c.pool.as_ref(),
+            (
+                &mut self.blocks,
+                &r.blocks,
+                &v.blocks,
+                &mut c.blocks,
+                &mut step.blocks
+            ),
+            |(out, r, v, c, step)| out.combined_step_rhs(r, v, c, step, sigma, mu, m)
+        );
         self.tau = (T::one() - sigma) * r.scalar.rτ;
         self.kappa = -sigma * mu + m * step.tau() * step.kappa() + v.tau() * v.kappa();
         self.border_z
@@ -286,31 +250,18 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         sigma: T,
         mu: T,
     ) {
-        if let Some(pool) = &c.pool {
-            debug_assert!(owner_cone_pools_ok(&c.blocks));
-            pool.install(|| {
-                self.blocks
-                    .par_iter_mut()
-                    .zip(&r.blocks)
-                    .zip(&v.blocks)
-                    .zip(&mut c.blocks)
-                    .zip(&mut step.blocks)
-                    .for_each(|((((out, r), v), c), step)| {
-                        out.combined_step_rhs_prepared(r, v, c, step, sigma, mu)
-                    });
-            });
-        } else {
-            for ((((out, r), v), c), step) in self
-                .blocks
-                .iter_mut()
-                .zip(&r.blocks)
-                .zip(&v.blocks)
-                .zip(&mut c.blocks)
-                .zip(&mut step.blocks)
-            {
-                out.combined_step_rhs_prepared(r, v, c, step, sigma, mu);
-            }
-        }
+        debug_assert!(c.pool.is_none() || owner_cone_pools_ok(&c.blocks));
+        for_blocks!(
+            c.pool.as_ref(),
+            (
+                &mut self.blocks,
+                &r.blocks,
+                &v.blocks,
+                &mut c.blocks,
+                &mut step.blocks
+            ),
+            |(out, r, v, c, step)| out.combined_step_rhs_prepared(r, v, c, step, sigma, mu)
+        );
         self.tau = (T::one() - sigma) * r.scalar.rτ;
         self.kappa = -sigma * mu + step.tau() * step.kappa() + v.tau() * v.kappa();
         self.border_z
@@ -394,7 +345,6 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         let alpha = cones.fold_bounds(self.scalar_bound(step), |o, cone, r, cap| {
             let v = &self.blocks[o];
             let d = &mut step.blocks[o];
-            #[cfg(feature = "sdp")]
             if let SupportedCone::PSDTriangleCone(cone) = cone {
                 return cone.prepare_affine_bounds(&mut d.z[r.clone()], &mut d.s[r], cap);
             }
@@ -643,25 +593,6 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
             .unwrap_or(T::infinity());
         barrier += total;
         barrier
-    }
-    fn rescale(&mut self) {
-        let scale = self
-            .collective
-            .reduce_max(512, &[T::max(self.tau, self.kappa)])
-            .ok()
-            .and_then(|values| values.into_iter().next())
-            .unwrap_or(T::infinity());
-        let invscale = scale.recip();
-        for v in &mut self.blocks {
-            v.x.scale(invscale);
-            v.z.scale(invscale);
-            v.s.scale(invscale);
-        }
-        self.tau *= invscale;
-        self.kappa *= invscale;
-        self.border_z.scale(invscale);
-        self.border_s.scale(invscale);
-        self.sync_border();
     }
 }
 #[cfg(test)]

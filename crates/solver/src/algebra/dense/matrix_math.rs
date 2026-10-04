@@ -103,7 +103,7 @@ impl<T> Matrix<T>
 where
     T: FloatT,
 {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn kron<MATA, MATB>(&mut self, A: &MATA, B: &MATB)
     where
         MATA: DenseMatrix<T>,
@@ -131,9 +131,7 @@ where
 
 // additional functions that require floating point operations
 
-// allow dead code here since dense matrix and its supporting
-// functionality could eventually become a public interface.
-#[allow(dead_code)]
+#[cfg(test)]
 impl<S, T> DenseStorageMatrix<S, T>
 where
     T: FloatT,

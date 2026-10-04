@@ -2,7 +2,7 @@
 use crate::algebra::*;
 use crate::qdldl::*;
 use crate::solver::core::CoreSettings;
-use crate::solver::kkt::direct::{DirectLDLSolver, DirectLDLSolverReqs};
+use crate::solver::kkt::direct::DirectLDLSolver;
 use crate::solver::kkt::HasLinearSolverInfo;
 use crate::solver::kkt::LinearSolverInfo;
 
@@ -49,15 +49,6 @@ where
     }
 }
 
-impl<T> DirectLDLSolverReqs for QDLDLDirectLDLSolver<T>
-where
-    T: FloatT,
-{
-    fn required_matrix_shape() -> MatrixTriangle {
-        MatrixTriangle::Triu
-    }
-}
-
 impl<T> HasLinearSolverInfo for QDLDLDirectLDLSolver<T>
 where
     T: FloatT,
@@ -85,10 +76,6 @@ where
 
     fn scale_values(&mut self, index: &[usize], scale: T) {
         self.factors.scale_values(index, scale);
-    }
-
-    fn offset_values(&mut self, index: &[usize], offset: T, signs: &[i8]) {
-        self.factors.offset_values(index, offset, signs);
     }
 
     fn solve(&mut self, _kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T]) {

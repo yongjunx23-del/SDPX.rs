@@ -1,6 +1,6 @@
 [package]
 name = "sdpx-solver"
-version = "0.8.0"
+version = "0.9.0"
 authors = ["Paul Goulart <paul.goulart@eng.ox.ac.uk>"]
 edition = "2021"
 rust-version = "1.85.0"
@@ -14,7 +14,6 @@ categories = ["mathematics"]
 [dependencies]
 rayon          = "=1.12.0"
 amd            = "0.2.2"
-cfg-if         = "1.0"
 itertools      = "0.11"
 derive_builder = "0.11"
 enum_dispatch  = "0.3.8"
@@ -30,49 +29,39 @@ thiserror      = "1.0"
 [features]
 default = ["serde"]
 
+# Opt in to every MPFR frontend precision (128..2048 in steps of 64).
+# Native Rust `MpFloat<N>` types are unaffected.
+all-precisions = ["sdpx-arithmetic/all-precisions"]
+
 # enable reading / writing of problems from json files 
 serde = ["dep:serde", "dep:serde_json", "dep:sha2", "sdpx-arithmetic/serde"]
 
-# enables blas/lapack for SDP support, with blas/lapack src unspecified
-# also enable packages required for chordal decomposition 
-# `blas-src`/`lapack-src` are provider-neutral shims: pick a provider with a
-# `sdp-*` flavour below, or link one directly (e.g. `-l dylib=openblas`).
-sdp = ["blas","lapack", "blas-src", "lapack-src", "indexmap", "dep:gemm"]
-
-# explicit configuration options for different blas flavours
-sdp-accelerate = ["sdp", "blas-src/accelerate", "lapack-src/accelerate"]
-sdp-netlib     = ["sdp", "blas-src/netlib", "lapack-src/netlib", "netlib-src"]
-sdp-openblas   = ["sdp", "blas-src/openblas", "lapack-src/openblas", "openblas-src"]
-sdp-mkl        = ["sdp", "blas-src/intel-mkl", "lapack-src/intel-mkl","intel-mkl-src"]
+# BLAS/LAPACK are always linked. Pick a provider with one of these, or link
+# one directly (e.g. RUSTFLAGS="-l dylib=openblas") through the provider-
+# neutral `blas-src`/`lapack-src` shims.
+sdp-accelerate = ["blas-src/accelerate", "lapack-src/accelerate"]
+sdp-netlib     = ["blas-src/netlib", "lapack-src/netlib", "netlib-src"]
+sdp-openblas   = ["blas-src/openblas", "lapack-src/openblas", "openblas-src"]
+sdp-mkl        = ["blas-src/intel-mkl", "lapack-src/intel-mkl","intel-mkl-src"]
 
 # compile with faer supernodal solver option
 faer-sparse = ["dep:faer", "dep:faer-traits"]
 
-# compile with more exhaustive benchmarking tests 
-bench = []
-
-# opt-in lossless KKT snapshot capture/replay for offline audits (see snapshot.rs)
-snapshot = []
-
 # -------------------------------
-# SDP configuration
+# BLAS / LAPACK
 # -------------------------------
 
 [dependencies.blas]
 version = "0.22.0"
-optional = true
 
 [dependencies.lapack]
 version = "0.19.0"
-optional = true
 
 [dependencies.blas-src]
 version = "0.11.1"
-optional = true 
 
 [dependencies.lapack-src]
 version = "0.11.0"
-optional = true 
 
 [target.'cfg(not(windows))'.dependencies.openblas-src]
 version = "0.10.11"
@@ -99,7 +88,6 @@ optional = true
 
 [dependencies.indexmap]
 version = "2.2"
-optional = true
 
 # -------------------------------
 # 3rd party sparse LDL solvers
@@ -111,12 +99,6 @@ optional = true
 # Worker pinning (Linux sched_setaffinity); already in the lockfile.
 [target.'cfg(target_os = "linux")'.dependencies.libc]
 version = "0.2.189"
-
-[dependencies.gemm]
-version = "0.18.2"
-default-features = false
-features = ["std"]
-optional = true
 
 [dependencies.faer]
 version = "0.21.9"
@@ -162,12 +144,10 @@ path = "examples/rust/example_callback.rs"
 [[example]]
 name = "sdp"
 path = "examples/rust/example_sdp.rs"
-required-features = ["sdp"]
 
 [[example]]
 name = "bootstrap"
 path = "examples/rust/example_bootstrap.rs"
-required-features = ["sdp"]
 
 [[example]]
 name = "box_faer"
@@ -178,11 +158,6 @@ required-features = ["faer-sparse"]
 name = "json"
 path = "examples/rust/example_json.rs"
 required-features = ["serde"]
-
-[[example]]
-name = "kkt_replay"
-path = "examples/rust/kkt_replay.rs"
-required-features = ["snapshot"]
 
 
 
@@ -239,5 +214,6 @@ required-features = ["serde"]
 # ------------------------------
 [dev-dependencies]
 tempfile = "3"
+sdpx-pmp = { path = "../pmp" }
 
 

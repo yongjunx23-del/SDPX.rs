@@ -20,22 +20,13 @@ type BoxedKKTSolver<T> = Box<dyn KKTSolver<T> + Send + Sync>;
 pub struct DefaultKKTSystem<T> {
     kktsolver: BoxedKKTSolver<T>,
 
-    // solution vector for constant part of KKT solves
-    x1: Vec<T>,
-    z1: Vec<T>,
-
-    // solution vector for general KKT solves
-    x2: Vec<T>,
-    z2: Vec<T>,
-
-    // work vectors for assembling/dissambling vectors
+    // work vector for the homogeneous scalar equation
     workx: Vec<T>,
-    workz: Vec<T>,
-    work_conic: Vec<T>,
+    // Two RHS columns; after a batch, their conic slices also hold step scratch.
     batch_rhs: Vec<T>,
+    // Constant (x2,z2), then affine/corrector (x1,z1), in RHS column order.
     batch_out: Vec<T>,
     affine_ready: Option<bool>,
-    hs1: Vec<T>,
     hs2: Vec<T>,
 }
 
@@ -43,7 +34,6 @@ impl<T> DefaultKKTSystem<T>
 where
     T: FloatT,
 {
-    #[cfg(feature = "sdp")]
     pub(crate) fn uses_condensed(
         data: &DefaultProblemData<T>,
         cones: &CompositeCone<T>,
@@ -64,7 +54,6 @@ where
         let (m, n) = (data.m, data.n);
 
         // Both formulations share the embedding and recovery.
-        #[cfg(feature = "sdp")]
         let use_condensed = Self::uses_condensed(data, cones, settings);
         assert!(
             settings.direct_kkt_solver,
@@ -80,7 +69,6 @@ where
                 settings.core(),
             ))
         };
-        #[cfg(feature = "sdp")]
         let mut kktsolver: BoxedKKTSolver<T> = if use_condensed {
             let fully_sampled = data
                 .sampled
@@ -95,42 +83,17 @@ where
         } else {
             augmented()
         };
-        #[cfg(not(feature = "sdp"))]
-        let kktsolver = augmented();
 
-        #[cfg(feature = "sdp")]
         if let Some(operator) = &data.sampled {
             kktsolver.set_sampled_operator(std::sync::Arc::clone(operator));
         }
 
-        //the LHS constant part of the reduced solve
-        let x1 = vec![T::zero(); n];
-        let z1 = vec![T::zero(); m];
-
-        //the LHS for other solves
-        let x2 = vec![T::zero(); n];
-        let z2 = vec![T::zero(); m];
-
-        //workspace compatible with (x,z)
-        let workx = vec![T::zero(); n];
-        let workz = vec![T::zero(); m];
-
-        //additional conic workspace vector compatible with s and z
-        let work_conic = vec![T::zero(); m];
-
         Self {
             kktsolver,
-            x1,
-            z1,
-            x2,
-            z2,
-            workx,
-            workz,
-            work_conic,
-            batch_rhs: Vec::new(),
-            batch_out: Vec::new(),
+            workx: vec![T::zero(); n],
+            batch_rhs: vec![T::zero(); 2 * (n + m)],
+            batch_out: vec![T::zero(); 2 * (n + m)],
             affine_ready: None,
-            hs1: Vec::new(),
             hs2: Vec::new(),
         }
     }
@@ -204,8 +167,6 @@ where
         self.affine_ready = None;
         let (n, m) = (data.n, data.m);
         let width = n + m;
-        self.batch_rhs.resize(2 * width, T::zero());
-        self.batch_out.resize(2 * width, T::zero());
         loop {
             let updated = all_succeeded(self.kktsolver.update(cones, settings.core()));
             let mut constant_ok = false;
@@ -226,12 +187,7 @@ where
                 constant_ok = all_succeeded(ok[0]);
                 let affine_ok = all_succeeded(ok[1]);
                 if constant_ok {
-                    self.x2.copy_from_slice(&self.batch_out[..n]);
-                    self.z2.copy_from_slice(&self.batch_out[n..width]);
-                    self.x1.copy_from_slice(&self.batch_out[width..width + n]);
-                    self.z1.copy_from_slice(&self.batch_out[width + n..]);
                     copy_scaled(&*self.kktsolver, 0, &mut self.hs2);
-                    copy_scaled(&*self.kktsolver, 1, &mut self.hs1);
                     self.affine_ready = Some(affine_ok);
                 }
             }
@@ -256,9 +212,13 @@ where
         step_direction: StepDirection,
         settings: &DefaultSettings<T>,
     ) -> bool {
-        let (x1, z1) = (&mut self.x1, &mut self.z1);
-        let (x2, z2) = (&self.x2, &self.z2); //from constant solve, so not mut
-        let (workx, workz) = (&mut self.workx, &mut self.workz);
+        let (constant, variable) = self.batch_out.split_at_mut(data.n + data.m);
+        let (x2, z2) = constant.split_at(data.n);
+        let (x1, z1) = variable.split_at_mut(data.n);
+        let (constant_rhs, variable_rhs) = self.batch_rhs.split_at_mut(data.n + data.m);
+        let workx = &mut self.workx;
+        let workz = &mut variable_rhs[data.n..];
+        let Δs_const_term = &mut constant_rhs[data.n..];
 
         // solve for (x1,z1)
         // -----------
@@ -266,8 +226,6 @@ where
 
         // compute the vector c in the step equation HₛΔz + Δs = -c,
         // with shortcut in affine case
-        let Δs_const_term = &mut self.work_conic;
-
         match step_direction {
             StepDirection::Affine => {
                 Δs_const_term.copy_from(&variables.s);
@@ -298,9 +256,8 @@ where
         };
         let is_success = prepared.unwrap_or_else(|| {
             self.kktsolver.setrhs(workx, workz);
-            let ok = self.kktsolver.solve(Some(x1), Some(z1), settings.core());
-            copy_scaled(&*self.kktsolver, 0, &mut self.hs1);
-            ok
+            self.kktsolver
+                .solve(Some(&mut *x1), Some(&mut *z1), settings.core())
         });
         if !all_succeeded(is_success) {
             return false;
@@ -316,10 +273,16 @@ where
         // -------------
         //  compute the linear term HₛΔz, where Hs = WᵀW for symmetric
         //  cones and Hs = μH(z) for asymmetric cones
-        if self.hs1.len() == data.m && self.hs2.len() == data.m {
+        // Cached affine output is batch column 1; a fresh solve is column 0.
+        let hs1 = self
+            .kktsolver
+            .scaled_solution(usize::from(prepared.is_some()))
+            .filter(|_| T::precision_bits() > 53)
+            .unwrap_or(&[]);
+        if hs1.len() == data.m && self.hs2.len() == data.m {
             // Linearity: reuse original-operator products from the two accepted
             // KKT solutions. No product from a rejected refinement is reused.
-            lhs.s.waxpby(T::one(), &self.hs1, lhs.τ, &self.hs2);
+            lhs.s.waxpby(T::one(), hs1, lhs.τ, &self.hs2);
         } else {
             cones.mul_Hs(&mut lhs.s, &lhs.z, workz);
         }
@@ -342,14 +305,16 @@ where
         settings: &DefaultSettings<T>,
     ) -> bool {
         let mut is_success;
+        let workx = &mut self.workx;
+        let workz = &mut self.batch_rhs[2 * data.n + data.m..];
 
         if data.P.nnz() == 0 {
             // LP initialization
             // solve with [0;b] as a RHS to get (x,-s) initializers
             // zero out any sparse cone variables at end
-            self.workx.fill(T::zero());
-            self.workz.copy_from(&data.b);
-            self.kktsolver.setrhs(&self.workx, &self.workz);
+            workx.fill(T::zero());
+            workz.copy_from(&data.b);
+            self.kktsolver.setrhs(workx, workz);
             is_success = self.kktsolver.solve(
                 Some(&mut variables.x),
                 Some(&mut variables.s),
@@ -363,18 +328,18 @@ where
 
             // solve with [-q;0] as a RHS to get z initializer
             // zero out any sparse cone variables at end
-            self.workx.axpby(-T::one(), &data.q, T::zero());
-            self.workz.fill(T::zero());
+            workx.axpby(-T::one(), &data.q, T::zero());
+            workz.fill(T::zero());
 
-            self.kktsolver.setrhs(&self.workx, &self.workz);
+            self.kktsolver.setrhs(workx, workz);
             is_success = self
                 .kktsolver
                 .solve(None, Some(&mut variables.z), settings.core());
         } else {
             //QP initialization
-            self.workx.scalarop_from(|q| -q, &data.q);
-            self.workz.copy_from(&data.b);
-            self.kktsolver.setrhs(&self.workx, &self.workz);
+            workx.scalarop_from(|q| -q, &data.q);
+            workz.copy_from(&data.b);
+            self.kktsolver.setrhs(workx, workz);
             is_success = self.kktsolver.solve(
                 Some(&mut variables.x),
                 Some(&mut variables.z),
@@ -487,12 +452,13 @@ where
         data: &DefaultProblemData<T>,
         settings: &DefaultSettings<T>,
     ) -> bool {
-        self.workx.axpby(-T::one(), &data.q, T::zero()); //workx .= -q
-        self.workz.copy_from_slice(&data.b);
-        self.kktsolver.setrhs(&self.workx, &self.workz);
-        let is_success =
-            self.kktsolver
-                .solve(Some(&mut self.x2), Some(&mut self.z2), settings.core());
+        let workx = &mut self.workx;
+        let workz = &mut self.batch_rhs[2 * data.n + data.m..];
+        workx.axpby(-T::one(), &data.q, T::zero()); //workx .= -q
+        workz.copy_from_slice(&data.b);
+        self.kktsolver.setrhs(workx, workz);
+        let (x2, z2) = self.batch_out[..data.n + data.m].split_at_mut(data.n);
+        let is_success = self.kktsolver.solve(Some(x2), Some(z2), settings.core());
 
         copy_scaled(&*self.kktsolver, 0, &mut self.hs2);
         is_success

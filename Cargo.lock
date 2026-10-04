@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "sdpx-arithmetic"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "gmp-mpfr-sys",
  "num-traits",
@@ -1755,16 +1755,15 @@ dependencies = [
 
 [[package]]
 name = "sdpx-ffi"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "sdpx-arithmetic",
  "sdpx-solver",
- "serde_json",
 ]
 
 [[package]]
 name = "sdpx-pmp"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "quick-xml",
  "sdpx-arithmetic",
@@ -1774,17 +1773,15 @@ dependencies = [
 
 [[package]]
 name = "sdpx-solver"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "amd",
  "blas",
  "blas-src",
- "cfg-if",
  "derive_builder 0.11.2",
  "enum_dispatch",
  "faer",
  "faer-traits",
- "gemm",
  "indexmap",
  "intel-mkl-src",
  "itertools",
@@ -1796,6 +1793,7 @@ dependencies = [
  "openblas-src",
  "rayon",
  "sdpx-arithmetic",
+ "sdpx-pmp",
  "serde",
  "serde_json",
  "sha2",

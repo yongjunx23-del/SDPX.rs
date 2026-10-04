@@ -387,21 +387,7 @@ impl<T: FloatT> OwnedKkt<T> {
             }
             valid
         };
-        let valid = if let Some(pool) = &self.pool {
-            pool.install(|| {
-                self.locals
-                    .par_iter_mut()
-                    .zip(cones)
-                    .map(assemble)
-                    .reduce(|| true, |a, b| a & b)
-            })
-        } else {
-            self.locals
-                .iter_mut()
-                .zip(cones)
-                .map(assemble)
-                .fold(true, |a, b| a & b)
-        };
+        let valid = all_blocks!(self.pool.as_ref(), (&mut self.locals, cones), assemble);
         crate::receipt::finish("owned.local_assemble", timer);
         self.finish_update(settings, valid)
     }
@@ -453,7 +439,7 @@ impl<T: FloatT> OwnedKkt<T> {
         let shift = self.shift;
         let timer = crate::receipt::start();
         let record_costs = self.record_costs;
-        let factor = |local: &mut LocalKkt<T>| {
+        let factor = |(local,): (&mut LocalKkt<T>,)| {
             let started = record_costs.then(Instant::now);
             let valid = if !local.kernel.factor_interior(settings, shift) {
                 false
@@ -475,16 +461,7 @@ impl<T: FloatT> OwnedKkt<T> {
             }
             valid
         };
-        let valid = if let Some(pool) = &self.pool {
-            pool.install(|| {
-                self.locals
-                    .par_iter_mut()
-                    .map(factor)
-                    .reduce(|| true, |a, b| a & b)
-            })
-        } else {
-            self.locals.iter_mut().map(factor).fold(true, |a, b| a & b)
-        };
+        let valid = all_blocks!(self.pool.as_ref(), (&mut self.locals,), factor);
         crate::receipt::finish("owned.factor_response", timer);
         let valid = self.collective.all_true(102, valid).unwrap_or(false);
         if !valid {
@@ -589,33 +566,17 @@ impl<T: FloatT> OwnedKkt<T> {
     }
 
     fn prepare_reduced_work(&mut self, source: &Point<T>, work: &mut Work<T>, lane: usize) {
-        let prepare = |((local, b), rhs): ((&mut LocalKkt<T>, &mut Vec<T>), &Vec<T>)| {
+        let prepare = |(local, b, rhs): (&mut LocalKkt<T>, &mut Vec<T>, &Vec<T>)| {
             local.kernel.prepare_interior_rhs(rhs, b);
             local
                 .kernel
                 .copy_sampled_rhs_cache(&mut local.rhs_cache[lane]);
         };
-        if let Some(pool) = &self.pool {
-            pool.install(|| {
-                self.locals
-                    .par_iter_mut()
-                    .zip(&mut work.b.blocks)
-                    .zip(&source.blocks)
-                    .for_each(prepare)
-            });
-        } else {
-            for ((local, b), rhs) in self
-                .locals
-                .iter_mut()
-                .zip(&mut work.b.blocks)
-                .zip(&source.blocks)
-            {
-                local.kernel.prepare_interior_rhs(rhs, b);
-                local
-                    .kernel
-                    .copy_sampled_rhs_cache(&mut local.rhs_cache[lane]);
-            }
-        }
+        for_blocks!(
+            self.pool.as_ref(),
+            (&mut self.locals, &mut work.b.blocks, &source.blocks),
+            prepare
+        );
         work.b.border.copy_from_slice(&source.border);
     }
 
@@ -1022,43 +983,32 @@ impl<T: FloatT> OwnedKkt<T> {
     ) -> bool {
         out.border.copy_from_slice(&inner.border);
         let border = out.border.as_slice();
-        let recover = |(((local, x), rhs), reduced): (
-            ((&mut LocalKkt<T>, &mut Vec<T>), &Vec<T>),
-            &Vec<T>,
-        )| {
-            if let Some(lane) = cache_lane {
-                if !local
-                    .kernel
-                    .restore_sampled_rhs_cache(&local.rhs_cache[lane])
-                {
-                    return false;
+        let recover =
+            |(local, x, rhs, reduced): (&mut LocalKkt<T>, &mut Vec<T>, &Vec<T>, &Vec<T>)| {
+                if let Some(lane) = cache_lane {
+                    if !local
+                        .kernel
+                        .restore_sampled_rhs_cache(&local.rhs_cache[lane])
+                    {
+                        return false;
+                    }
                 }
-            }
-            let success = local.kernel.recover_interior_rhs(x, rhs, reduced);
-            for (j, &r) in local.border_rows.iter().enumerate() {
-                x[local.n + r] = border[j];
-            }
-            success
-        };
-        if let Some(pool) = &self.pool {
-            pool.install(|| {
-                self.locals
-                    .par_iter_mut()
-                    .zip(&mut out.blocks)
-                    .zip(&rhs.blocks)
-                    .zip(&inner.blocks)
-                    .map(recover)
-                    .reduce(|| true, |a, b| a & b)
-            })
-        } else {
-            self.locals
-                .iter_mut()
-                .zip(&mut out.blocks)
-                .zip(&rhs.blocks)
-                .zip(&inner.blocks)
-                .map(recover)
-                .fold(true, |a, b| a & b)
-        }
+                let success = local.kernel.recover_interior_rhs(x, rhs, reduced);
+                for (j, &r) in local.border_rows.iter().enumerate() {
+                    x[local.n + r] = border[j];
+                }
+                success
+            };
+        all_blocks!(
+            self.pool.as_ref(),
+            (
+                &mut self.locals,
+                &mut out.blocks,
+                &rhs.blocks,
+                &inner.blocks
+            ),
+            recover
+        )
     }
 
     pub(crate) fn cost_samples(&self) -> Option<Vec<(f64, f64)>> {
@@ -1071,26 +1021,14 @@ impl<T: FloatT> OwnedKkt<T> {
     }
 
     fn solve_reduced_raw(&mut self, out: &mut Point<T>, rhs: &Point<T>) -> bool {
-        let solve = |((local, b), x): ((&mut LocalKkt<T>, &Vec<T>), &mut Vec<T>)| {
+        let solve = |(local, b, x): (&mut LocalKkt<T>, &Vec<T>, &mut Vec<T>)| {
             local.kernel.solve_interior_panel(b, x, 1)
         };
-        let valid = if let Some(pool) = &self.pool {
-            pool.install(|| {
-                self.locals
-                    .par_iter_mut()
-                    .zip(&rhs.blocks)
-                    .zip(&mut out.blocks)
-                    .map(solve)
-                    .reduce(|| true, |a, b| a & b)
-            })
-        } else {
-            self.locals
-                .iter_mut()
-                .zip(&rhs.blocks)
-                .zip(&mut out.blocks)
-                .map(solve)
-                .fold(true, |a, b| a & b)
-        };
+        let valid = all_blocks!(
+            self.pool.as_ref(),
+            (&mut self.locals, &rhs.blocks, &mut out.blocks),
+            solve
+        );
         let valid = self.collective.all_true(239, valid).unwrap_or(false);
         if !valid {
             return false;
@@ -1136,16 +1074,7 @@ impl<T: FloatT> OwnedKkt<T> {
                 );
             }
         };
-        if let Some(pool) = &self.pool {
-            pool.install(|| {
-                self.locals
-                    .par_iter()
-                    .zip(&mut out.blocks)
-                    .for_each(correct)
-            });
-        } else {
-            self.locals.iter().zip(&mut out.blocks).for_each(correct);
-        }
+        for_blocks!(self.pool.as_ref(), (&self.locals, &mut out.blocks), correct);
         self.collective
             .all_true(242, out.norm().is_finite())
             .unwrap_or(false)
@@ -1158,24 +1087,14 @@ impl<T: FloatT> OwnedKkt<T> {
         settings: &CoreSettings<T>,
     ) -> bool {
         let mut work = self.inner.take().unwrap();
-        let prepare = |((local, b), rhs): ((&mut LocalKkt<T>, &mut Vec<T>), &Vec<T>)| {
+        let prepare = |(local, b, rhs): (&mut LocalKkt<T>, &mut Vec<T>, &Vec<T>)| {
             local.kernel.prepare_interior_rhs(rhs, b);
         };
-        if let Some(pool) = &self.pool {
-            pool.install(|| {
-                self.locals
-                    .par_iter_mut()
-                    .zip(&mut work.b.blocks)
-                    .zip(&rhs.blocks)
-                    .for_each(prepare)
-            });
-        } else {
-            self.locals
-                .iter_mut()
-                .zip(&mut work.b.blocks)
-                .zip(&rhs.blocks)
-                .for_each(prepare);
-        }
+        for_blocks!(
+            self.pool.as_ref(),
+            (&mut self.locals, &mut work.b.blocks, &rhs.blocks),
+            prepare
+        );
         work.b.border.copy_from_slice(&rhs.border);
         let mut success = self.solve_reduced_raw(&mut work.x, &work.b)
             && refine(
@@ -1218,8 +1137,11 @@ impl<T: FloatT> OwnedKkt<T> {
                 .map(|b| vec![T::zero(); b.len()])
                 .collect();
         }
-        let local = |((((local, e), b), x), y): (
-            (((&mut LocalKkt<T>, &mut Vec<T>), &Vec<T>), &Vec<T>),
+        let local = |(local, e, b, x, y): (
+            &mut LocalKkt<T>,
+            &mut Vec<T>,
+            &Vec<T>,
+            &Vec<T>,
             &mut Vec<T>,
         )| {
             local.kernel.interior_residual(e, b, x);
@@ -1230,27 +1152,17 @@ impl<T: FloatT> OwnedKkt<T> {
             y.resize(e.len(), T::zero());
             e.is_finite() && local.kernel.solve_interior_panel(e, y, 1)
         };
-        let solved = if let Some(pool) = &self.pool {
-            pool.install(|| {
-                self.locals
-                    .par_iter_mut()
-                    .zip(&mut out.blocks)
-                    .zip(&rhs.blocks)
-                    .zip(&point.blocks)
-                    .zip(&mut self.fused_interior)
-                    .map(local)
-                    .reduce(|| true, |a, b| a & b)
-            })
-        } else {
-            self.locals
-                .iter_mut()
-                .zip(&mut out.blocks)
-                .zip(&rhs.blocks)
-                .zip(&point.blocks)
-                .zip(&mut self.fused_interior)
-                .map(local)
-                .fold(true, |a, b| a & b)
-        };
+        let solved = all_blocks!(
+            self.pool.as_ref(),
+            (
+                &mut self.locals,
+                &mut out.blocks,
+                &rhs.blocks,
+                &point.blocks,
+                &mut self.fused_interior
+            ),
+            local
+        );
         // [border residual part | border rhs contribution | local norm | solved]
         let mut message = vec![T::zero(); 2 * border + 2];
         let mut local_norm = T::zero();
@@ -1339,7 +1251,7 @@ impl<T: FloatT> OwnedKkt<T> {
             return false;
         }
         let border = &out.border;
-        let correct = |((local, x), y): ((&LocalKkt<T>, &mut Vec<T>), &Vec<T>)| {
+        let correct = |(local, x, y): (&LocalKkt<T>, &mut Vec<T>, &Vec<T>)| {
             let d = x.len();
             for (i, v) in x.iter_mut().enumerate() {
                 *v = y[i]
@@ -1348,21 +1260,11 @@ impl<T: FloatT> OwnedKkt<T> {
                     );
             }
         };
-        if let Some(pool) = &self.pool {
-            pool.install(|| {
-                self.locals
-                    .par_iter()
-                    .zip(&mut out.blocks)
-                    .zip(&self.fused_interior)
-                    .for_each(correct)
-            });
-        } else {
-            self.locals
-                .iter()
-                .zip(&mut out.blocks)
-                .zip(&self.fused_interior)
-                .for_each(correct);
-        }
+        for_blocks!(
+            self.pool.as_ref(),
+            (&self.locals, &mut out.blocks, &self.fused_interior),
+            correct
+        );
         out.norm().is_finite()
     }
 
@@ -1374,37 +1276,29 @@ impl<T: FloatT> OwnedKkt<T> {
         reduced: bool,
     ) -> T {
         out.border.fill(T::zero());
-        let residual =
-            |(((local, e), b), x): (((&mut LocalKkt<T>, &mut Vec<T>), &Vec<T>), &Vec<T>)| {
-                if reduced {
-                    local.kernel.interior_residual(e, b, x);
-                    local
-                        .coupling
-                        .t()
-                        .gemv(&mut e[..local.n], &point.border, -T::one(), T::one());
-                } else {
-                    // Original b contains zero in every local equality row. Add
-                    // the global affine term only after summing their operators.
-                    local.kernel.original_residual(e, b, x);
-                }
-            };
-        if let Some(pool) = &self.pool {
-            pool.install(|| {
-                self.locals
-                    .par_iter_mut()
-                    .zip(&mut out.blocks)
-                    .zip(&rhs.blocks)
-                    .zip(&point.blocks)
-                    .for_each(residual)
-            });
-        } else {
-            self.locals
-                .iter_mut()
-                .zip(&mut out.blocks)
-                .zip(&rhs.blocks)
-                .zip(&point.blocks)
-                .for_each(residual);
-        }
+        let residual = |(local, e, b, x): (&mut LocalKkt<T>, &mut Vec<T>, &Vec<T>, &Vec<T>)| {
+            if reduced {
+                local.kernel.interior_residual(e, b, x);
+                local
+                    .coupling
+                    .t()
+                    .gemv(&mut e[..local.n], &point.border, -T::one(), T::one());
+            } else {
+                // Original b contains zero in every local equality row. Add
+                // the global affine term only after summing their operators.
+                local.kernel.original_residual(e, b, x);
+            }
+        };
+        for_blocks!(
+            self.pool.as_ref(),
+            (
+                &mut self.locals,
+                &mut out.blocks,
+                &rhs.blocks,
+                &point.blocks
+            ),
+            residual
+        );
         for ((local, e), x) in self.locals.iter().zip(&mut out.blocks).zip(&point.blocks) {
             if reduced {
                 local
@@ -1443,13 +1337,6 @@ impl<T: FloatT> OwnedKkt<T> {
             T::infinity()
         }
     }
-}
-
-/// Fused reduced refinement passes (default on; `SDPX_FUSED_REDUCED=0`
-/// restores the two-round pass for comparison).
-fn fused_reduced_refinement() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SDPX_FUSED_REDUCED").map_or(true, |v| v != "0"))
 }
 
 fn select_rows<T: FloatT>(
@@ -1496,7 +1383,7 @@ impl<T: FloatT> Refinement<T> for OwnedRefinement<'_, T> {
             .unwrap_or(T::infinity())
     }
     fn residual(&mut self, candidate: bool, _reuse: bool) -> T {
-        if self.reduced && fused_reduced_refinement() {
+        if self.reduced {
             return self.solver.residual_reduced_fused(
                 &mut self.work.error,
                 &self.work.b,
@@ -1520,11 +1407,8 @@ impl<T: FloatT> Refinement<T> for OwnedRefinement<'_, T> {
     }
     fn solve_correction(&mut self, settings: &CoreSettings<T>) -> bool {
         self.solver.refinements += 1;
-        if self.reduced && fused_reduced_refinement() {
+        if self.reduced {
             self.solver.solve_reduced_fused(&mut self.work.candidate)
-        } else if self.reduced {
-            self.solver
-                .solve_reduced_raw(&mut self.work.candidate, &self.work.error)
         } else {
             self.solver
                 .solve_original(&mut self.work.candidate, &self.work.error, settings)

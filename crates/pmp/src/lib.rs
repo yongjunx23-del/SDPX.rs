@@ -365,11 +365,12 @@ fn convert<T: Scalar + FromStr>(
         m.reduced_prefactor.is_none() || m.prefactor.is_some(),
         "reducedPrefactor requires prefactor",
     )?;
-    let reduced = if let Some(p) = &m.reduced_prefactor {
-        Damped::read(Some(p), degree)?
-    } else {
-        Damped::read(m.prefactor.as_ref(), degree)?
-    };
+    let reduced = m
+        .reduced_prefactor
+        .as_ref()
+        .map(|p| Damped::read(Some(p), degree))
+        .transpose()?;
+    let reduced = reduced.as_ref().unwrap_or(&prefactor);
     let count = (degree + 1)
         .checked_add(reduced.poles.len())
         .and_then(|n| n.checked_sub(prefactor.poles.len()))
@@ -389,13 +390,14 @@ fn convert<T: Scalar + FromStr>(
         Some(v) => numbers(v)?,
         None => prefactor.scalings(&points)?,
     };
-    let rscales = match &m.reduced_sample_scalings {
-        Some(v) => numbers(v)?,
-        None if m.reduced_prefactor.is_some() => reduced.scalings(&points)?,
-        None => scales.clone(),
+    let reduced_scalings = match &m.reduced_sample_scalings {
+        Some(v) => Some(numbers(v)?),
+        None if m.reduced_prefactor.is_some() => Some(reduced.scalings(&points)?),
+        None => None,
     };
+    let rscales = reduced_scalings.as_deref().unwrap_or(&scales);
     require(
-        [&scales, &rscales]
+        [scales.as_slice(), rscales]
             .iter()
             .all(|s| s.len() == count && s.iter().all(|&v| v > T::zero())),
         "sample scalings must be positive and match sample points",
@@ -407,7 +409,7 @@ fn convert<T: Scalar + FromStr>(
     let effective_degree = count - 1;
     let sizes = [effective_degree / 2 + 1, (effective_degree + 1) / 2];
     let basis = if supplied.iter().all(Option::is_none) {
-        sampling::basis(&points, &rscales)?
+        sampling::basis(&points, rscales)?
     } else {
         let mut result = [Vec::new(), Vec::new()];
         for parity in 0..2 {
@@ -479,6 +481,7 @@ fn convert<T: Scalar + FromStr>(
     }
     output.write_all(b"],\"B\":[")?;
     let mut first = true;
+    let mut values = Vec::with_capacity(norm.len() - 1);
     for c in 0..dim {
         for row in m.polynomials.iter().take(c + 1) {
             let v = &row[c];
@@ -498,19 +501,17 @@ fn convert<T: Scalar + FromStr>(
                 }
             }
             for (k, &x) in points.iter().enumerate() {
-                let values: Vec<_> = adjusted
-                    .iter()
-                    .map(|p| -scales[k] * evaluate(p, x))
-                    .collect();
-                require(
-                    values.iter().all(|v| v.is_finite()),
-                    "constraint coefficient overflow",
-                )?;
-                write_element(output, &mut first, &strings(&values))?;
+                values.clear();
+                for p in &adjusted {
+                    let value = -scales[k] * evaluate(p, x);
+                    require(value.is_finite(), "constraint coefficient overflow")?;
+                    values.push(value.decimal_string());
+                }
+                write_element(output, &mut first, &values)?;
             }
         }
     }
-    let metadata = serde_json::json!({"index":index,"path":"","dim":dim,"prefactor":prefactor.metadata(),"reducedPrefactor":reduced.metadata(),"samplePoints":strings(&points),"sampleScalings":strings(&scales),"reducedSampleScalings":strings(&rscales)});
+    let metadata = serde_json::json!({"index":index,"path":"","dim":dim,"prefactor":prefactor.metadata(),"reducedPrefactor":reduced.metadata(),"samplePoints":strings(&points),"sampleScalings":strings(&scales),"reducedSampleScalings":strings(rscales)});
     output.write_all(b"]}\n")?;
     Ok((count, metadata))
 }

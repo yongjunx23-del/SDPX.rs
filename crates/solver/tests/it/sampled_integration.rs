@@ -1,5 +1,3 @@
-#![cfg(feature = "sdp")]
-
 use sdpx_solver::{algebra::*, solver::*};
 
 fn num<T: FloatT>(value: f64) -> T {

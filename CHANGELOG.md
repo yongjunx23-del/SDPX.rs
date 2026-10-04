@@ -4,6 +4,152 @@ All notable changes to SDPX are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Measurements quote audited full
 solves; the experiment log is [docs/JOURNAL.md](docs/JOURNAL.md).
 
+## [Unreleased]
+
+## [0.9.0] - 2026-10-04
+
+### Performance: SOC elimination, dense panels, distributed arrow (2026-10-04)
+
+- The condensed form eliminates second-order cones of dimension ≤ 16 through
+  the explicit NT factor W⁻¹, so orthant and small SOC rows form one Gram
+  BᵀB (dense-column SYRK plus a sparse pair plan; exact per entry at MPFR).
+  The condensed shared-SOC arrow is no longer selected there; the augmented
+  shared-SOC arrow is unchanged. g0 medium: Float64 0.20 → 0.024 s (MOSEK
+  0.029 s), 256-bit 6.65 → 2.55 s, 256-bit audit still accepted.
+- Binary64 products with A use a dense BLAS panel for columns at least a
+  quarter full, in residuals and condensed solves, at every thread count.
+- MPFR CSC products accumulate each long output row/column exactly, rounded
+  once; MPFR panel-only orthant rows use a cached exact residue congruence.
+- The generic arrow computes leaf contributions on the fly instead of storing
+  them, parallelizes leaf columns, sizes its cap by KKT storage, and under
+  MPI distributes leaves across ranks (border summed in rank order; exact
+  refinement residual rows split by work). Λ27 1024-bit: ~670 → ~50 s per
+  iteration on one node.
+- Sampled operators fold unmatched one-dimensional blocks lying in orthant
+  rows into the linear rows instead of dropping the factored operator.
+
+### Simplification (2026-10-04)
+
+- Removed the diagnostic `SDPX_TRACE_IR` and `SDPX_SERIAL_QDLDL` environment
+  switches. Receipt timers use one `receipt::start/finish` form throughout.
+- Sampled forward/adjoint pair kernels are shared between the serial and
+  split paths instead of being written out per path; points are identical.
+- `docs/ARCHITECTURE.md` now describes the design only; measurements live in
+  the plan and journal.
+- Removed the opt-in `snapshot` feature (KKT capture/replay, the `kkt_replay`
+  example and `Scalar::scalar_exact_{encode,decode}`) and the `bench` feature
+  with its test-only micro-benchmarks. Neither was part of any workflow.
+- Removed dead internals: `DirectLDLSolver::offset_values` and the QDLDL
+  method behind it, `Variables::rescale`, the unused `MultiplyGEMV`/`xgemv`
+  chain, the unused `SVDEngineAlgorithm` selector, the default
+  `KKTSolver::solve_many` column loop, the `AutoDirectLDLSolver` and
+  `SpecializedLDL` wrappers, and the `cfg-if` and ffi `serde_json`
+  dependencies. LDL backend selection now lives in `kkt/ldl/config.rs`.
+- Removed leftover `#[allow(unused...)]` attributes and redundant nested
+  blocks in the CLI; the build is warning-free with and without `faer-sparse`.
+- Primitive `Scalar` math (`mul_add`, `sqrt`, ...) is `#[inline]` across the
+  crate boundary. Release (thin LTO) already inlined it; non-LTO builds (the
+  `fast` profile, downstream crates) ran the Float64 Schur kernels through a
+  call per FMA. Results are bitwise identical.
+- Consumed conic and sampled JSON transfer owned inputs into setup; CSC
+  validation is shared, and exports stream through a buffered writer.
+- KKT storage has one authoritative CSC. Dense-block refactors read it,
+  condensed assembly writes its primal prefix, and dense Schur destinations
+  are computed instead of stored. Exact residual rows retain incoming mirrors
+  only. Sampled RHS snapshots and generic arrow contributions store one triangle.
+- MPFR SVD reuses existing input/output storage, including caller Vt for
+  compact tall/square factors. HSD solutions use their batch output directly,
+  with RHS conic slices reused as step scratch.
+- SVD reuses the shifted-QR quotient, and Ruiz skips norm work on an empty
+  quadratic matrix. Both remove redundant computation with identical points.
+- MPFR empty quadratic forms skip zero arithmetic for finite operands;
+  nonfinite behavior and Float64 arithmetic are unchanged.
+- Equality plus one MPFR orthant reuses the existing parallel cone chunks.
+  Matched release gravity256/four-thread solves improve 5.70% small and 4.25%
+  larger, with identical points and original-coordinate audits passing.
+- Float64 local-bound leaf solves use disjoint solution slots for forward
+  intermediates, removing their separate RHS work buffer.
+- Parallel arrow refactors accumulate diagnostic regularization counts
+  without a per-leaf counter vector and use `try_for_each` without collecting
+  unit results.
+- Leaf coupling scratch stores only its coupled suffix. Exact refinement
+  residuals borrow and restore the mutable point instead of copying it.
+- Higher-order sampled inverse adjoints write directly to output, removing
+  their persistent quadratic buffer. Scalar projections and fallback writes
+  are preserved; a768-bit matrix SDP matches its full accepted point/audit.
+- CRT prime workers borrow one immutable output-index slice, removing their
+  cloned index arrays. Ising512 complete points and original audit match.
+- CRT accumulation compacts dead product residues in place, removing its
+  separate residue buffer. Full Lambda19/768 and gravity256 points remain
+  identical, with bound original-coordinate audits passing.
+- Single-product diagonal scratch and balanced residue multiplication improve
+  larger gravity256 by3.41%; small improves0.92%, Ising512 regresses0.66%.
+  All12 matched full points and bound original audits pass.
+- Declined slice-dot accumulations follow the generic dot's filtered FMA
+  fallback, preserving its nonfinite and underflow zero behavior.
+- Exact-dot classification handles regular pairs first. Matched gravity256
+  release solves improve2.87% small and regress0.41% larger; full points and
+  original-coordinate audits are preserved.
+- Input validation stays at construction boundaries; sampled setup trusts its
+  internally built CSC. Exact norms use the slice accumulator without pointer
+  staging. PSD scaling reuses its second input for the lower factor, and leaf
+  single-RHS buffers allocate only when called.
+- Sampled scalar adjoints skip unused matrix panels. PSD scaling reuses dead
+  SVD singular-value scratch for rounded roots shared by R and Rinv.
+- Sampled setup releases numerical A before allocating initial residual and
+  variable work, reducing their overlap without changing persistent storage.
+- Sampled condensed setup also releases duplicate retained coefficient values
+  after installing the factored operator; its CSC pattern remains available.
+- Narrow MPFR scalar FMA uses exact stack arithmetic with one rounding;
+  matched release gravity256 runs improve by 2.24% on the smaller case.
+- Narrow two-product FMMA improves matched release Ising256 by 2.87%, with
+  identical points. PSD synchronization copies only its authoritative triangle.
+- MPFR eigenvalues-only requests omit unused reflector storage. PMP generated
+  bases store only the Cholesky triangle; converted output stays identical.
+- Exact diagonal congruences pack upper partial residues and bound CRT groups,
+  reducing active scratch while retaining exact accumulation and one rounding.
+- Diagonal congruences use the actual scaling spread instead of a duplicate
+  fixed reserve. Matched gravity256 solves improve3.48% small/4.22% larger,
+  with full audited point identity. Row blocks use one exact product and
+  tile-sized scratch, removing the unused second buffer.
+- Owner MPI steps reuse constant-RHS slack scratch for offsets; the frozen
+  two-rank solve preserves complete points and original-coordinate audits.
+- PMP conversion writes checked decimal coefficients directly and reuses one
+  output row buffer per block, reducing allocations with identical output.
+  Unchanged reduced prefactors and sample scalings borrow the original values,
+  removing repeated parsing and duplicate vectors.
+- Bound Schur diagonals reuse solve scratch, removing a duplicate MPFR
+  vector and recurring Float64 temporary allocations.
+- Float64 bound residuals borrow contiguous primal ranges, and one-RHS panel
+  products use GEMV. Matched release gravity solves improve at unchanged
+  convergence rules and accepted original-coordinate audits; see the journal.
+- New [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); README, AGENTS.md and the
+  plan point to it. Performance decisions and pending trials stay in the plan
+  and journal.
+
+### Earlier unreleased changes
+
+- New KKT backends `local_bounds` (LPs with bound rows; packed faer kernels in
+  binary64) and `shared_soc_arrow` (SOC3 leaves around a small shared border).
+- Frontends compile Float64 plus MPFR 128/256/512/768/1024 by default;
+  `all-precisions` restores every 64-bit width up to 2048.
+- Integration tests are one binary (`--test it`).
+- PSD scaling reports a non-converged SVD as `NumericalError` instead of
+  panicking; a failed eigensolve in the step length gives a zero step.
+- Presolve's exact redundant-equality elimination has an operation budget.
+- Removed the `SDPX_DUMP_KKT`, `SDPX_DUMP_CONE`, `SDPX_FUSED_REDUCED` and
+  `SDPX_RNS_OPS` switches (the last was slower where measured); the remaining
+  diagnostics use `SDPX_RECEIPT` and `SDPX_PROFILE`.
+- Checkpoint/restart: `--checkpoint FILE [--checkpoint-every N]`,
+  `--restart FILE`. A file restarts the same problem exactly, or hot-starts a
+  nearby problem of the same structure (e.g. the next point of a scan).
+- Opt-in `tol_dual_qnorm`: audit-aligned dual residual `‖r_d‖∞/(1+‖q‖∞)`.
+- MPI: the MPICH ABI (MPICH, Intel MPI, MVAPICH) is supported alongside
+  OpenMPI.
+- `sdp-openblas` builds OpenBLAS with `USE_LOCKING=1`; the default
+  single-threaded build was not safe for concurrent calls from the solver
+  pool and could give wrong multithreaded results.
+
 ## [0.8.0] — 2026-09-26
 
 A performance release for large high-precision SDPs (conformal bootstrap),

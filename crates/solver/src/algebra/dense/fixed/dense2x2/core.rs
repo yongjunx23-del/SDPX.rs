@@ -19,7 +19,7 @@ where
     T: FloatT,
 {
     // y = H*x
-    #[allow(dead_code)] // used in tests
+    #[cfg(test)]
     pub fn mul(&self, y: &mut [T], x: &[T]) {
         let H = self;
 

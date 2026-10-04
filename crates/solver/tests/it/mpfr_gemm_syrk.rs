@@ -1,16 +1,13 @@
 //! All-precision GEMM/SYRK checks with independent accumulation/indexing at 8192 bits.
 //! The reference shares the production MpFloat wrapper and decimal conversion;
 //! it is not a binding-independent native MPFR oracle.
-#![cfg(feature = "sdp")]
-use sdpx_solver::receipt;
 // This test imports the whole provider but exercises only selected operations.
 #[allow(dead_code)]
-#[path = "../src/algebra/dense/blas/traits.rs"]
+#[path = "../../src/algebra/dense/blas/traits.rs"]
 mod provider;
 use num_traits::{FromPrimitive, One, Zero};
 use provider::{XgemmScalar, XsyrkScalar};
 use sdpx_arithmetic::{MpFloat, Scalar};
-use sdpx_solver::algebra;
 type F<const N: usize> = MpFloat<N>;
 type Oracle = F<128>;
 

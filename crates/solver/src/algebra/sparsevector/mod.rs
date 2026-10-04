@@ -34,28 +34,6 @@ where
         }
         SparseVector { n, nzind, nzval }
     }
-
-    #[allow(dead_code)]
-    pub fn dropzeros(&mut self) {
-        let mut writeidx: usize = 0;
-
-        for readidx in 0..self.nzval.len() {
-            let val = self.nzval[readidx];
-            let idx = self.nzind[readidx];
-
-            // If nonzero and a shift so far, move the value
-            if val != T::zero() {
-                if writeidx != readidx {
-                    self.nzval[writeidx] = val;
-                    self.nzind[writeidx] = idx;
-                }
-                writeidx += 1;
-            }
-        }
-
-        self.nzind.resize(writeidx, 0);
-        self.nzval.resize(writeidx, T::zero());
-    }
 }
 
 impl<T> From<SparseVector<T>> for Vec<T>
@@ -83,18 +61,4 @@ fn test_sparsevector_new() {
 
     let vback: Vec<f64> = vs.into();
     assert_eq!(v, vback);
-}
-
-#[test]
-fn test_sparsevector_dropzeros() {
-    let x = vec![0.1, 0.3, 0.2, 0.0, 0.4, 0.0];
-    let y = vec![0.1, 0.3, 0.0, 0.0, 0.4, 0.0];
-
-    let mut xs = SparseVector::new(&x);
-    xs.nzval[2] = 0.0;
-    xs.dropzeros();
-
-    let ys = SparseVector::new(&y);
-
-    assert_eq!(xs, ys);
 }

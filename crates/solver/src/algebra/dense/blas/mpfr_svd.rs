@@ -97,46 +97,17 @@ impl<const N: usize> RotationLog<N> {
 /// the same order, so the result is bitwise identical. The factor is processed
 /// as row-major rows (adjacent `p, p+1`), split across the ambient pool when
 /// inner parallelism is active.
-/// Per-thread reusable scratch, keyed by type: taken out for one call and put
-/// back, so repeated decompositions of one shape make no Rust allocations
-/// (the caller-owned-workspace contract) and reentrant calls stay safe.
-fn with_scratch<V: Default + 'static, R>(f: impl FnOnce(&mut V) -> R) -> R {
-    use std::any::{Any, TypeId};
-    use std::cell::RefCell;
-    thread_local! {
-        static SCRATCH: RefCell<Vec<Box<dyn Any>>> = const { RefCell::new(Vec::new()) };
-    }
-    let taken = SCRATCH.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        slot.iter()
-            .position(|b| (**b).type_id() == TypeId::of::<V>())
-            .map(|i| slot.swap_remove(i))
-    });
-    let mut boxed: Box<V> = match taken.map(|b| b.downcast::<V>()) {
-        Some(Ok(v)) => v,
-        _ => Box::default(),
-    };
-    let result = f(&mut boxed);
-    SCRATCH.with(|slot| slot.borrow_mut().push(boxed));
-    result
-}
-
-fn replay_rotations<const N: usize>(log: &[Rotation<N>], a: &mut [F<N>], rows: usize, cols: usize) {
-    if a.is_empty() || log.is_empty() {
-        return;
-    }
-    with_scratch(|t: &mut Vec<F<N>>| replay_into(log, a, rows, cols, t));
-}
-
-fn replay_into<const N: usize>(
+fn replay_rotations<const N: usize>(
     log: &[Rotation<N>],
     a: &mut [F<N>],
     rows: usize,
     cols: usize,
-    t: &mut Vec<F<N>>,
+    t: &mut [F<N>],
 ) {
-    t.clear();
-    t.resize(rows * cols, F::<N>::zero());
+    if a.is_empty() || log.is_empty() {
+        return;
+    }
+    debug_assert_eq!(t.len(), rows * cols);
     for j in 0..cols {
         for i in 0..rows {
             t[j + i * cols] = a[i + j * rows];
@@ -324,9 +295,10 @@ fn shifted_qr<const N: usize>(
     lo: usize,
     hi: usize,
     shift: F<N>,
+    shift_ratio: F<N>,
     log: &mut RotationLog<N>,
 ) {
-    let (c, s, _) = givens(d[lo] - shift * (shift / d[lo]), e[lo]);
+    let (c, s, _) = givens(d[lo] - shift * shift_ratio, e[lo]);
     log.push(Rotation {
         v: true,
         p: lo,
@@ -506,10 +478,11 @@ fn bidiagonal_svd<const N: usize>(
             demmel_kahan(d, e, lo, hi, log);
         } else {
             let shift = small_shift(d[hi - 1], d[hi], e[hi - 1]);
-            if (shift / d[lo]).abs() < sqrt_epsilon {
+            let shift_ratio = shift / d[lo];
+            if shift_ratio.abs() < sqrt_epsilon {
                 demmel_kahan(d, e, lo, hi, log);
             } else {
-                shifted_qr(d, e, lo, hi, shift, log);
+                shifted_qr(d, e, lo, hi, shift, shift_ratio, log);
             }
         }
         if d.iter().chain(e.iter()).any(|x| !x.is_finite()) {
@@ -590,7 +563,15 @@ pub(super) fn scale_checked<const N: usize>(a: &mut [F<N>], scale: F<N>) -> Resu
 // Work layout for the tall factorization; wide matrices transpose both the
 // input and requested vector counts. GESVD has no integer work argument, so
 // exact integer indices occupy scalar work cells during output ordering.
-pub(super) fn svd_work_len(m: usize, n: usize, uc: usize, vr: usize) -> Option<usize> {
+pub(super) fn svd_work_len(
+    m: usize,
+    n: usize,
+    lda: usize,
+    uc: usize,
+    vr: usize,
+    direct_vt: bool,
+) -> Option<usize> {
+    let copy = m < n || lda != m;
     let (m, n, uc, vr) = if m < n {
         (n, m, vr, uc)
     } else {
@@ -598,7 +579,7 @@ pub(super) fn svd_work_len(m: usize, n: usize, uc: usize, vr: usize) -> Option<u
     };
     let mut size = 0usize;
     for cells in [
-        m.checked_mul(n)?,
+        if copy { m.checked_mul(n)? } else { 0 },
         n,
         n.saturating_sub(1),
         n,
@@ -608,7 +589,7 @@ pub(super) fn svd_work_len(m: usize, n: usize, uc: usize, vr: usize) -> Option<u
         if vr > 0 { n.checked_mul(n)? } else { 0 },
         n,
         m.checked_mul(uc)?,
-        vr.checked_mul(n)?,
+        if direct_vt { 0 } else { vr.checked_mul(n)? },
         n,
     ] {
         size = size.checked_add(cells)?;
@@ -618,19 +599,33 @@ pub(super) fn svd_work_len(m: usize, n: usize, uc: usize, vr: usize) -> Option<u
 // The returned vectors are in the tall orientation. The caller transposes
 // their indexing for a wide input, without allocating intermediate factors.
 pub(super) fn svd<'a, const N: usize>(
-    a: &[F<N>],
+    a: &mut [F<N>],
     lda: usize,
     m: usize,
     n: usize,
     uc: usize,
     vr: usize,
+    output_vt: Option<&'a mut [F<N>]>,
     work: &'a mut [F<N>],
 ) -> Result<(&'a [F<N>], &'a [F<N>], &'a [F<N>]), i32> {
     let wide = m < n;
+    let copy = wide || lda != m;
     let (m, n, uc, vr) = if wide { (n, m, vr, uc) } else { (m, n, uc, vr) };
     work.fill(F::zero());
     let mut work = work;
-    let b = take_work(&mut work, m * n);
+    // GESVD destroys A: use compact tall inputs directly, retaining the
+    // packed transpose/copy only for wide matrices or padded columns.
+    let b = if copy {
+        let b = take_work(&mut work, m * n);
+        for j in 0..n {
+            for i in 0..m {
+                b[i + j * m] = if wide { a[j + i * lda] } else { a[i + j * lda] };
+            }
+        }
+        b
+    } else {
+        &mut a[..m * n]
+    };
     let d = take_work(&mut work, n);
     let e = take_work(&mut work, n.saturating_sub(1));
     let left = take_work(&mut work, n);
@@ -640,13 +635,12 @@ pub(super) fn svd<'a, const N: usize>(
     let v = take_work(&mut work, if vr > 0 { n * n } else { 0 });
     let order = take_work(&mut work, n);
     let sorted_u = take_work(&mut work, m * uc);
-    let vt = take_work(&mut work, vr * n);
+    // A compact caller Vt is dead until ordering, so it can also hold replay scratch.
+    let vt = match output_vt {
+        Some(vt) => vt,
+        None => take_work(&mut work, vr * n),
+    };
     let ss = take_work(&mut work, n);
-    for j in 0..n {
-        for i in 0..m {
-            b[i + j * m] = if wide { a[j + i * lda] } else { a[i + j * lda] };
-        }
-    }
     let mut scale = F::zero();
     for &x in b.iter() {
         if !x.is_finite() {
@@ -675,7 +669,7 @@ pub(super) fn svd<'a, const N: usize>(
     }
     // The bidiagonal QR never reads U or V: log its rotations, then replay
     // them on U and V (see `replay_rotations`).
-    with_scratch(|log: &mut RotationLog<N>| {
+    crate::algebra::scratch::with_scratch(|log: &mut RotationLog<N>| {
         log.u.clear();
         log.v.clear();
         log.keep_u = uc > 0;
@@ -684,9 +678,11 @@ pub(super) fn svd<'a, const N: usize>(
         bidiagonal_svd(d, e, n, log)?;
         crate::receipt::finish("svd.qr", timer);
         let timer = crate::receipt::start();
-        replay_rotations(&log.u, u, m, uc);
+        // Output ordering runs after reflector reconstruction, so its buffers
+        // can hold the row-major replay without another dense allocation.
+        replay_rotations(&log.u, u, m, uc, sorted_u);
         if vr > 0 {
-            replay_rotations(&log.v, v, n, n);
+            replay_rotations(&log.v, v, n, n, vt);
         }
         crate::receipt::finish("svd.replay", timer);
         Ok::<(), i32>(())
@@ -791,9 +787,20 @@ impl<const N: usize> XgesvdScalar for F<N> {
         }
         let out_uc = if ju == b'O' { r } else { uc } as usize;
         let out_vr = if jv == b'O' { r } else { vr } as usize;
-        let Some(required) = svd_work_len(m as usize, n as usize, out_uc, out_vr)
-            .filter(|&size| size <= i32::MAX as usize)
-        else {
+        let direct_vt = m >= n
+            && vr > 0
+            && ldvt == vr
+            && ju != b'O'
+            && jv != b'O';
+        let Some(required) = svd_work_len(
+            m as usize,
+            n as usize,
+            lda as usize,
+            out_uc,
+            out_vr,
+            direct_vt,
+        )
+        .filter(|&size| size <= i32::MAX as usize) else {
             *info = -13;
             return;
         };
@@ -823,6 +830,12 @@ impl<const N: usize> XgesvdScalar for F<N> {
         }
         let mm = m as usize;
         let nn = n as usize;
+        let mut no_vt = [];
+        let (output_vt, copy_vt) = if direct_vt {
+            (Some(&mut vt[..nn * out_vr]), &mut no_vt[..])
+        } else {
+            (None, vt)
+        };
         match svd(
             a,
             lda as usize,
@@ -830,6 +843,7 @@ impl<const N: usize> XgesvdScalar for F<N> {
             nn,
             out_uc,
             out_vr,
+            output_vt,
             &mut work[..required],
         ) {
             Err(e) => *info = e,
@@ -854,9 +868,11 @@ impl<const N: usize> XgesvdScalar for F<N> {
                         u[i + j * ldu as usize] = get_u(i, j);
                     }
                 }
-                for j in 0..nn {
-                    for i in 0..vr as usize {
-                        vt[i + j * ldvt as usize] = get_vt(i, j);
+                if !direct_vt {
+                    for j in 0..nn {
+                        for i in 0..vr as usize {
+                            copy_vt[i + j * ldvt as usize] = get_vt(i, j);
+                        }
                     }
                 }
                 if ju == b'O' {

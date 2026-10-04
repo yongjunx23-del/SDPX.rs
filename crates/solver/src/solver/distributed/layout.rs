@@ -191,10 +191,7 @@ impl OwnerLayout {
         history: Option<&CostHistory>,
         input_fingerprint: Option<[u8; 32]>,
     ) -> Result<Self, String> {
-        #[cfg(feature = "sdp")]
         let a = data.sampled.as_ref().map_or(&data.A, |s| s.linear());
-        #[cfg(not(feature = "sdp"))]
-        let a = &data.A;
         let (n, m) = (a.n, a.m);
         let mut units = Vec::new();
         let mut borders = Vec::new();
@@ -243,7 +240,6 @@ impl OwnerLayout {
                 }
             }
         }
-        #[cfg(feature = "sdp")]
         if let Some(sampled) = &data.sampled {
             for block in sampled.blocks() {
                 let end = block.column_start + block.column_count();
@@ -302,7 +298,6 @@ impl OwnerLayout {
                 component_hash[root] = structural_mix(component_hash[root], 3, row as u64);
             }
         }
-        #[cfg(feature = "sdp")]
         if let Some(sampled) = &data.sampled {
             for block in sampled.blocks() {
                 let unit = row_unit[block.row_start];

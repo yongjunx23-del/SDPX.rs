@@ -1,6 +1,5 @@
 #![allow(non_snake_case)]
 #![allow(clippy::type_complexity)]
-#![cfg(feature = "sdp")]
 
 use sdpx_solver::algebra::*;
 use sdpx_solver::solver::*;

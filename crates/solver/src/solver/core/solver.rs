@@ -89,16 +89,12 @@ enum StrategyCheckpoint {
 
 impl StrategyCheckpoint {
     fn synchronized(self) -> Self {
-        if let Some(world) = crate::mpi::World::get() {
-            let action = match self {
-                Self::NoUpdate => 0,
-                Self::Fail => 1,
-                Self::Update(scaling) => 2 + scaling as u32,
-            };
-            if !world.agree_u32(action) {
-                world.abort("inconsistent replicated solver strategy decision");
-            }
-        }
+        let action = match self {
+            Self::NoUpdate => 0,
+            Self::Fail => 1,
+            Self::Update(scaling) => 2 + scaling as u32,
+        };
+        crate::mpi::assert_agree(action, "inconsistent replicated solver strategy decision");
         self
     }
 }
@@ -208,6 +204,19 @@ where
         self.callbacks.termination_callback = Callback::None;
     }
 
+    /// Write the accepted iterate to `path` every `every` iterations
+    /// (replicated solvers only). Call [`Self::check_restart`] before
+    /// restarting from such a file.
+    pub fn set_checkpoint(&mut self, path: impl Into<std::path::PathBuf>, every: u32) {
+        self.callbacks.checkpoint.path = Some(path.into());
+        self.callbacks.checkpoint.every = every.max(1);
+    }
+
+    /// Start the next `solve` from a checkpoint instead of the default start.
+    pub fn set_restart(&mut self, path: impl Into<std::path::PathBuf>) {
+        self.callbacks.checkpoint.restart = Some(path.into());
+    }
+
     pub fn settings(&self) -> &SE {
         &self.settings
     }
@@ -216,6 +225,26 @@ where
         settings.validate_as_update(&self.settings)?;
         self.settings = settings;
         Ok(())
+    }
+}
+
+impl<T, D, V, R, K, C, I, SO, SE> Solver<T, D, V, R, K, C, I, SO, SE>
+where
+    D: ProblemData<T>,
+    V: Variables<T, D = D>,
+    SE: Settings<T>,
+    T: FloatT,
+{
+    /// Check that the restart file (if any) matches this problem and precision.
+    pub fn check_restart(&self) -> std::io::Result<()> {
+        match &self.callbacks.checkpoint.restart {
+            None => Ok(()),
+            Some(path) => self
+                .variables
+                .new_like()
+                .read_checkpoint(&self.data, path)
+                .map(|_| ()),
+        }
     }
 }
 
@@ -270,22 +299,28 @@ where
 
         // solver release info, solver config
         // problem dimensions, cone types etc
-        notimeit! {timers; {
-            _print_banner(self.info.print_target(), self.settings.core().verbose).unwrap();
-            self.info.print_configuration(&self.settings, &self.data, &self.cones).unwrap();
-            self.info.print_status_header(&self.settings).unwrap();
-        }}
+        _print_banner(self.info.print_target(), self.settings.core().verbose).unwrap();
+        self.info
+            .print_configuration(&self.settings, &self.data, &self.cones)
+            .unwrap();
+        self.info.print_status_header(&self.settings).unwrap();
 
         self.info.reset(&mut timers);
 
-        timeit! {timers => "solve"; {
+        timeit! {"solve"; {
 
         // initialize variables to some reasonable starting point
-        timeit!{timers => "default start"; {
+        timeit! {"default start"; {
             self.default_start();
+            if let Some(path) = self.callbacks.checkpoint.restart.clone() {
+                // validated by `check_restart`; the same file is read on every rank
+                self.variables
+                    .read_checkpoint(&self.data, &path)
+                    .unwrap_or_else(|e| panic!("restart from {}: {e}", path.display()));
+            }
         }}
 
-        timeit!{timers => "IP iteration"; {
+        timeit! {"IP iteration"; {
 
         // ----------
         // main loop
@@ -300,13 +335,13 @@ where
 
             //update the residuals
             //--------------
-            timeit!{timers => "residual update"; {
+            timeit! {"residual update"; {
             self.residuals.update_with_pool(&self.variables, &self.data, self.cones.worker_pool());
             }}
 
             //calculate duality gap (scaled)
             //--------------
-            timeit!{timers => "mu+info"; {
+            timeit! {"mu+info"; {
             μ = self.variables.calc_mu(&self.residuals, &self.cones);
 
             // record scalar values from most recent iteration.
@@ -323,28 +358,24 @@ where
                 self.cones.worker_pool());
             }}
 
-            notimeit!{timers; {
-                self.info.print_status(&self.settings).unwrap();
-            }}
+            self.info.print_status(&self.settings).unwrap();
 
             // termination checks
             // --------------
 
             // user defined termination checks
             let callback_stop = self.callbacks.check_termination(&self.info);
-            let callback_stop = crate::mpi::World::get()
-                .map_or(callback_stop, |w| !w.all_true(!callback_stop));
+            let callback_stop = crate::mpi::any_true(callback_stop);
             if callback_stop {
                 self.info.set_status(SolverStatus::CallbackTerminated);
                 break;
             }
             // internal termination checks
             let is_done = self.info.check_termination(&self.residuals, &self.settings, iter);
-            if let Some(world) = crate::mpi::World::get() {
-                if !world.agree_u32(self.info.get_status() as u32) {
-                    world.abort("inconsistent replicated solver termination status");
-                }
-            }
+            crate::mpi::assert_agree(
+                self.info.get_status() as u32,
+                "inconsistent replicated solver termination status",
+            );
 
             // check for termination due to slow progress and update strategy
             if is_done{
@@ -354,15 +385,23 @@ where
                     }
             }  // allows continuation if new strategy provided
 
+            // The iterate has passed the progress checks: it is accepted.
+            if let Some(path) = self.callbacks.checkpoint.path.as_deref() {
+                if iter > 0 && iter % self.callbacks.checkpoint.every.max(1) == 0 && crate::mpi::is_root() {
+                    if let Err(e) = self.variables.write_checkpoint(&self.data, path, iter) {
+                        eprintln!("checkpoint {}: {e}", path.display());
+                    }
+                }
+            }
+
 
             // update the scalings
             // --------------
             let is_scaling_success;
-            timeit!{timers => "scale cones"; {
+            timeit! {"scale cones"; {
                 is_scaling_success = self.variables.scale_cones(&mut self.cones,μ,scaling);
             }}
-            let is_scaling_success = crate::mpi::World::get()
-                .map_or(is_scaling_success, |w| w.all_true(is_scaling_success));
+            let is_scaling_success = crate::mpi::all_succeeded(is_scaling_success);
             // check whether variables are interior points
             match self.strategy_checkpoint_is_scaling_success(is_scaling_success,scaling).synchronized(){
                 StrategyCheckpoint::Fail => {break}
@@ -379,7 +418,7 @@ where
 
             // Keep the affine RHS beside the constant RHS so the KKT update
             // can reuse the factorization and multi-RHS solve.
-            timeit!{timers => "affine rhs"; {
+            timeit! {"affine rhs"; {
             self.step_rhs
                 .affine_step_rhs(&self.residuals, &self.variables, &self.cones);
             }}
@@ -390,13 +429,12 @@ where
             //PJG: This should be a Result in Rust, but needs changes down
             //into the KKT solvers to do that.
             let mut is_kkt_solve_success : bool;
-            timeit!{timers => "kkt update"; {
+            timeit! {"kkt update"; {
                 is_kkt_solve_success = self.kktsystem.update_affine(&self.data, &self.cones, &self.step_rhs, &self.variables, &self.settings);
             }} // end "kkt update" timer
-            is_kkt_solve_success = crate::mpi::World::get()
-                .map_or(is_kkt_solve_success, |w| w.all_true(is_kkt_solve_success));
+            is_kkt_solve_success = crate::mpi::all_succeeded(is_kkt_solve_success);
 
-            timeit!{timers => "kkt solve"; {
+            timeit! {"kkt solve"; {
                 is_kkt_solve_success = is_kkt_solve_success &&
                 self.kktsystem.solve(
                     &mut self.step_lhs,
@@ -408,8 +446,7 @@ where
                     &self.settings,
                 );
             }}  //end "kkt solve affine" timer
-            is_kkt_solve_success = crate::mpi::World::get()
-                .map_or(is_kkt_solve_success, |w| w.all_true(is_kkt_solve_success));
+            is_kkt_solve_success = crate::mpi::all_succeeded(is_kkt_solve_success);
 
             // combined step only on affine step success
             if is_kkt_solve_success {
@@ -419,7 +456,7 @@ where
 
                 //calculate step length and centering parameter
                 // --------------
-                timeit!{timers => "affine step len"; {
+                timeit! {"affine step len"; {
                 α = if iter > 1 {
                     self.variables.prepare_affine_step_length(&mut self.step_lhs, &mut self.cones, &self.settings)
                 } else {
@@ -434,7 +471,7 @@ where
 
                 // calculate the combined step and length
                 // --------------
-                timeit!{timers => "combined rhs"; {
+                timeit! {"combined rhs"; {
                 if iter > 1 {
                     self.step_rhs.combined_step_rhs_prepared(&self.residuals, &self.variables,
                         &mut self.cones, &mut self.step_lhs, σ, μ);
@@ -451,7 +488,7 @@ where
                 }
                 }}
 
-                timeit!{timers => "kkt solve" ; {
+                timeit! {"kkt solve" ; {
                     is_kkt_solve_success =
                     self.kktsystem.solve(
                         &mut self.step_lhs,
@@ -466,8 +503,7 @@ where
             }
 
             // check for numerical failure and update strategy
-            is_kkt_solve_success = crate::mpi::World::get()
-                .map_or(is_kkt_solve_success, |w| w.all_true(is_kkt_solve_success));
+            is_kkt_solve_success = crate::mpi::all_succeeded(is_kkt_solve_success);
             match self.strategy_checkpoint_numerical_error(is_kkt_solve_success,scaling).synchronized() {
                 StrategyCheckpoint::NoUpdate => {}
                 StrategyCheckpoint::Update(s) => {α = T::zero(); scaling = s; continue}
@@ -477,7 +513,7 @@ where
 
             // compute final step length and update the current iterate
             // --------------
-            timeit!{timers => "final step len"; {
+            timeit! {"final step len"; {
             α = self.get_step_length(StepDirection::Combined,scaling);
 
             // Inspired by Hypatia curve search, using the two existing NT directions.
@@ -514,7 +550,7 @@ where
             // Copy previous iterate in case the next one is a dud
             self.info.save_prev_iterate(&self.variables,&mut self.prev_vars);
 
-            timeit!{timers => "iterate update"; {
+            timeit! {"iterate update"; {
             self.variables
                 .add_step_with_pool(&self.step_lhs, α, self.cones.worker_pool());
             }}
@@ -531,10 +567,10 @@ where
         // to recapture the scalars and print one last line
         if α.is_zero() {
             self.info.save_scalars(μ, α, σ, iter);
-            notimeit! {timers; {self.info.print_status(&self.settings).unwrap();}}
+            self.info.print_status(&self.settings).unwrap();
         }
 
-        timeit! {timers => "post-process"; {
+        timeit! {"post-process"; {
             self.info.set_linear_solver_info(self.kktsystem.linear_solver_info());
             //check for "almost" convergence case and then extract solution
             self.info.post_process(&self.residuals, &self.settings);
@@ -543,15 +579,10 @@ where
         }}
 
         //halt timers
+        timers.stop_solve();
         self.info.finalize(&mut timers);
         crate::receipt::memory_mark("solved");
         self.solution.finalize(&self.info);
-
-        if crate::receipt::profile_requested()
-            && crate::mpi::World::get().is_none_or(|w| w.rank() == 0)
-        {
-            timers.print();
-        }
 
         self.info.print_footer(&self.settings).unwrap();
 

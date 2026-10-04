@@ -29,6 +29,9 @@ pub struct DefaultInfo<T> {
     /// Optional operator-aware componentwise dual residual. It is `None`
     /// unless `tol_feas_componentwise` is enabled.
     pub res_dual_componentwise: Option<T>,
+    /// Original-coordinate dual Euclidean norm divided by `1 + ‖q‖∞`;
+    /// gated by `tol_dual_qnorm`.
+    pub res_dual_qnorm: T,
     /// primal infeasibility residual
     pub res_primal_inf: T,
     /// dual infeasibility residual
@@ -51,6 +54,8 @@ pub struct DefaultInfo<T> {
     pub(crate) prev_res_dual: T,
     /// componentwise dual residual from previous iteration
     pub(crate) prev_res_dual_componentwise: Option<T>,
+    /// audit-normalized dual residual from previous iteration
+    pub(crate) prev_res_dual_qnorm: T,
     /// absolute duality gap from previous iteration
     pub(crate) prev_gap_abs: T,
     /// relative duality gap from previous iteration
@@ -167,6 +172,7 @@ where
         self.res_primal = rz_ns * τinv / T::max(T::one(), normb + normx + norms);
         self.res_dual = rx_ns * τinv * cinv / T::max(T::one(), normq + normx + normz);
         self.res_dual_componentwise = summary.dual_componentwise;
+        self.res_dual_qnorm = rx_ns * τinv * cinv / (T::one() + normq);
 
         // absolute and relative gaps
         self.gap_abs = T::abs(self.cost_primal - self.cost_dual);
@@ -198,8 +204,10 @@ where
         self.solve_time = 0f64;
         self.res_dual_componentwise = None;
         self.prev_res_dual_componentwise = None;
+        self.res_dual_qnorm = T::zero();
+        self.prev_res_dual_qnorm = T::zero();
 
-        timers.reset_timer("solve");
+        timers.start_solve();
     }
 
     fn post_process(&mut self, residuals: &DefaultResiduals<T>, settings: &DefaultSettings<T>) {
@@ -300,6 +308,7 @@ where
         self.prev_res_primal = self.res_primal;
         self.prev_res_dual = self.res_dual;
         self.prev_res_dual_componentwise = self.res_dual_componentwise;
+        self.prev_res_dual_qnorm = self.res_dual_qnorm;
         self.prev_gap_abs = self.gap_abs;
         self.prev_gap_rel = self.gap_rel;
 
@@ -312,6 +321,7 @@ where
         self.res_primal = self.prev_res_primal;
         self.res_dual = self.prev_res_dual;
         self.res_dual_componentwise = self.prev_res_dual_componentwise;
+        self.res_dual_qnorm = self.prev_res_dual_qnorm;
         self.gap_abs = self.prev_gap_abs;
         self.gap_rel = self.prev_gap_rel;
 
@@ -366,6 +376,7 @@ where
             tol_infeas_rel,
             tol_ktratio,
             settings.tol_feas_componentwise,
+            settings.tol_dual_qnorm,
             solved_status,
             pinf_status,
             dinf_status,
@@ -398,6 +409,7 @@ where
             tol_infeas_rel,
             tol_ktratio,
             None,
+            None,
             solved_status,
             pinf_status,
             dinf_status,
@@ -415,12 +427,19 @@ where
         tol_infeas_rel: T,
         tol_ktratio: T,
         tol_componentwise: Option<T>,
+        tol_qnorm: Option<T>,
         solved_status: SolverStatus,
         pinf_status: SolverStatus,
         dinf_status: SolverStatus,
     ) {
         if self.ktratio <= T::one()
-            && self.is_solved(tol_gap_abs, tol_gap_rel, tol_feas, tol_componentwise)
+            && self.is_solved(
+                tol_gap_abs,
+                tol_gap_rel,
+                tol_feas,
+                tol_componentwise,
+                tol_qnorm,
+            )
         {
             self.status = solved_status;
         //PJG hardcoded factor 1000 here should be fixed
@@ -439,10 +458,12 @@ where
         tol_gap_rel: T,
         tol_feas: T,
         tol_componentwise: Option<T>,
+        tol_qnorm: Option<T>,
     ) -> bool {
         ((self.gap_abs < tol_gap_abs) || (self.gap_rel < tol_gap_rel))
             && (self.res_primal < tol_feas)
             && (self.res_dual < tol_feas)
+            && tol_qnorm.map_or(true, |tol| self.res_dual_qnorm < tol)
             && tol_componentwise.map_or(true, |tol| {
                 self.res_dual_componentwise
                     .is_some_and(|residual| residual < tol)

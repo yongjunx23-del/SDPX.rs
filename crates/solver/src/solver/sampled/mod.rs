@@ -2,10 +2,8 @@
 //! view of these factors, not the definition of their operator.
 use crate::algebra::sparse_parallel::SparseParallel;
 use crate::algebra::*;
-#[allow(unused_imports)]
 use crate::solver::default::*;
 use rayon::prelude::*;
-use sdpx_arithmetic::{EncodeSide, Residues, RnsPlan};
 use std::sync::{Arc, OnceLock};
 
 /// A sampled PSD row block with canonical columns `(s, r, k)`, r <= s.
@@ -38,113 +36,16 @@ fn checked_triangle(n: usize) -> Option<usize> {
         n.checked_mul(next / 2)
     }
 }
-fn tri(n: usize) -> usize {
-    n * (n + 1) / 2
-}
 /// `(s, r)` of the `pair`-th level pair in `s`-major, `r <= s` order.
 fn level_pair(pair: usize) -> (usize, usize) {
     let mut s = 0;
-    while tri(s + 1) <= pair {
+    while triangular_number(s + 1) <= pair {
         s += 1;
     }
-    (s, pair - tri(s))
+    (s, pair - triangular_number(s))
 }
 fn tri_work(n: usize) -> u128 {
     (n as u128) * (n as u128 + 1) / 2
-}
-
-/// `SDPX_RNS_OPS` selects exact residue-domain dots for sampled products.
-/// Reconstruction rounds each output once, so results may differ from the
-/// `dot_fma` chain in the last ulp; every dot remains the correctly rounded
-/// exact sum.
-fn rns_ops_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Fixed at launch like the other opt-in gates; caching keeps getenv out
-    // of per-product sampled calls.
-    *ON.get_or_init(|| std::env::var_os("SDPX_RNS_OPS").is_some())
-}
-
-/// Cached constant-side encoding: residues of an operand that never changes
-/// across calls. Encoded once at the full prime-table width so it stays
-/// valid while the per-call plan's prime count moves with the varying
-/// side's exponent window (see [`RnsPlan::encode_wide`]).
-struct RnsConst {
-    shift: i64,
-    primes: usize,
-    res: Residues,
-}
-
-/// Shared context passed to split leaves: the constant and per-call variable
-/// residues plus the plan they were encoded against. Immutable and `Sync`, so
-/// parallel subtasks evaluate disjoint outputs against the same operands.
-#[derive(Clone, Copy)]
-struct RnsSide<'a> {
-    plan: &'a RnsPlan,
-    cns: &'a Residues,
-    var: &'a Residues,
-}
-
-/// Refresh `cache` to the plan's a-side encoding of `const_vals`.
-fn rns_const<T: FloatT>(
-    cache: &mut Option<RnsConst>,
-    plan: &RnsPlan,
-    const_vals: &[T],
-) -> Option<()> {
-    let hit = matches!(cache, Some(c) if c.shift == plan.shift_a() && c.primes >= plan.primes());
-    if !hit {
-        let res = T::rns_encode_wide(plan, EncodeSide::A, const_vals)?;
-        *cache = Some(RnsConst {
-            shift: plan.shift_a(),
-            primes: res.k,
-            res,
-        });
-    }
-    Some(())
-}
-
-/// Build this call's plan and encode the varying side; the constant side is
-/// scanned once (`range`) and encoded once per `shift_a` (`cache`).
-/// Returns `None` — keeping the MPFR dot path — when the gate is off, the
-/// backend has no residue support, an operand is non-finite, the exponent
-/// window overflows, or the cost model says the swap is not profitable.
-fn rns_call<T: FloatT>(
-    cache: &mut Option<RnsConst>,
-    range: &mut Option<Option<(i64, i64)>>,
-    const_vals: &[T],
-    var: &[T],
-    terms: usize,
-    outputs: usize,
-) -> Option<(RnsPlan, Residues)> {
-    if !rns_ops_enabled() {
-        return None;
-    }
-    // Measured on Λ=15 (jobs 214136/214153): reconstruction is per-output,
-    // so products with more outputs than terms pay more Garner+MPFR work
-    // than the residue dots save — the forward product (76 terms, 741
-    // outputs) regressed ~40% while the adjoint (741 terms, 76 outputs)
-    // improved ~20%. Restrict RNS to term-dominated products.
-    if outputs > terms {
-        return None;
-    }
-    let a_range = match range {
-        Some(r) => *r,
-        slot @ None => {
-            let r = T::rns_exponent_range(const_vals);
-            *slot = Some(r);
-            r
-        }
-    }?;
-    let b_range = T::rns_exponent_range(var)?;
-    let plan = T::rns_plan_ranges(a_range, b_range, terms)?;
-    // The constant side is encoded once; the recurring cost is the varying
-    // side plus a small amortized share of the constant encode.
-    let encode_elems = var.len() + const_vals.len() / 64;
-    if !plan.profitable(terms, outputs, encode_elems, T::precision_bits() / 64) {
-        return None;
-    }
-    rns_const(cache, &plan, const_vals)?;
-    let var = T::rns_encode(&plan, EncodeSide::B, var)?;
-    Some((plan, var))
 }
 
 impl<T: FloatT> SampledBlock<T> {
@@ -170,7 +71,7 @@ impl<T> SampledBlock<T> {
     }
     /// Number of packed upper-triangle conic rows.
     pub fn row_count(&self) -> usize {
-        tri(self.side())
+        triangular_number(self.side())
     }
     /// Number of weighted canonical primitive columns.
     pub fn column_count(&self) -> usize {
@@ -215,25 +116,28 @@ pub(crate) fn block_row_span<T>(blocks: &[SampledBlock<T>]) -> (usize, usize) {
 /// Immutable per-block coefficients derived from the authoritative basis.
 ///
 /// The operator owns one shared shell per block.  `wdiag` is initialized by
-/// the first workspace in the old construction order, while `qq` retains the
-/// old lazy forward-path trigger.  Once initialized, both arrays are read-only
-/// and can be borrowed by every workspace using this operator.
+/// the first workspace in the old construction order.  Once initialized, it is
+/// read-only and can be borrowed by every workspace using this operator.
 #[derive(Debug)]
 struct SampledBlockConstants<T> {
     wdiag: OnceLock<Vec<T>>,
-    qq: OnceLock<Vec<T>>,
-    /// |basis|, for the componentwise dual residual's |A|ᵀ|z|.
-    abs_basis: OnceLock<Vec<T>>,
-    basis_residues: [ResidueCache; 3],
+    basis_residues: [ResidueCache; 2],
 }
 
 impl<T> SampledBlockConstants<T> {
-    fn new() -> Self {
+    fn new(b: &SampledBlock<T>) -> Self {
+        // The forward product reads Q as its B operand with the same view,
+        // alignment and entries as the adjoint quadratic form. When both
+        // inner dimensions use one prime width, they share one encoding.
+        let forward = ResidueCache::default();
+        let adjoint = if ResidueCache::same_prime_width(b.basis_cols, b.basis_rows) {
+            forward.clone()
+        } else {
+            ResidueCache::default()
+        };
         Self {
             wdiag: OnceLock::new(),
-            qq: OnceLock::new(),
-            abs_basis: OnceLock::new(),
-            basis_residues: std::array::from_fn(|_| ResidueCache::default()),
+            basis_residues: [forward, adjoint],
         }
     }
 }
@@ -275,9 +179,6 @@ impl<T: FloatT> SampledOperator<T> {
         linear
             .check_format()
             .map_err(|e| format!("sampled linear CSC: {e:?}"))?;
-        if linear.colptr.first() != Some(&0) {
-            return Err("sampled linear CSC must start at offset zero".into());
-        }
         if !linear.nzval.iter().all(|v| v.is_finite()) {
             return Err("sampled linear CSC contains nonfinite values".into());
         }
@@ -373,7 +274,7 @@ impl<T: FloatT> SampledOperator<T> {
         let ordered_rows = blocks.windows(2).all(|w| w[0].row_start < w[1].row_start);
         let constants = blocks
             .iter()
-            .map(|_| Arc::new(SampledBlockConstants::new()))
+            .map(|b| Arc::new(SampledBlockConstants::new(b)))
             .collect();
         Ok(Self {
             local_only: false,
@@ -416,7 +317,7 @@ impl<T: FloatT> SampledOperator<T> {
     }
 
     /// True when every PSD cone of `cones` (in row order) is one of this
-    /// operator's blocks and every other cone is a zero cone.
+    /// operator's blocks and every other cone is a zero or nonnegative cone.
     pub(crate) fn covers_all_psd(&self, cones: &[crate::solver::SupportedConeT<T>]) -> bool {
         use crate::solver::SupportedConeT;
         let mut row = 0;
@@ -424,7 +325,7 @@ impl<T: FloatT> SampledOperator<T> {
             let start = row;
             row += cone.nvars();
             match cone {
-                SupportedConeT::ZeroConeT(_) => true,
+                SupportedConeT::ZeroConeT(_) | SupportedConeT::NonnegativeConeT(_) => true,
                 SupportedConeT::PSDTriangleConeT(n) => self.blocks.iter().any(|b| {
                     b.row_start == start && b.row_count() == cone.nvars() && b.side() == *n
                 }),
@@ -490,10 +391,10 @@ impl<T: FloatT> SampledOperator<T> {
         }
         for (bi, b) in self.blocks.iter().enumerate() {
             let h = b.basis_rows;
-            for p in 0..tri(b.dim) * b.basis_cols {
+            for p in 0..triangular_number(b.dim) * b.basis_cols {
                 let (s, r) = level_pair(p / b.basis_cols.max(1));
                 owners[b.column_start + p].push((bi, p));
-                bound[b.column_start + p + 1] += if r == s { tri(h) } else { h * h };
+                bound[b.column_start + p + 1] += if r == s { triangular_number(h) } else { h * h };
                 let _ = s;
             }
         }
@@ -570,7 +471,7 @@ impl<T: FloatT> SampledOperator<T> {
             let (s, r) = level_pair(p / b.basis_cols);
             for j in 0..h {
                 for i in 0..if r == s { j + 1 } else { h } {
-                    let row = b.row_start + tri(s * h + j) + r * h + i;
+                    let row = b.row_start + triangular_number(s * h + j) + r * h + i;
                     let scale = if r != s {
                         T::FRAC_1_SQRT_2()
                     } else if i != j {
@@ -749,27 +650,22 @@ impl<T: FloatT> SampledOperator<T> {
                                 data: b.basis.as_slice(),
                                 phantom: std::marker::PhantomData,
                             };
-                            let call = w.prepare_fwd_rns(b, x);
-                            let rns = call.as_ref().map(|(p, v)| RnsSide {
-                                plan: p,
-                                cns: &w.rns_fwd.as_ref().unwrap().res,
-                                var: v,
+                            with_panels(h, kmax, |square, panel| {
+                                forward_split_chunks(
+                                    b,
+                                    &q,
+                                    x,
+                                    alpha,
+                                    0..b.dim,
+                                    &mut terms[..],
+                                    sqrt2,
+                                    inv_sqrt2,
+                                    chunks,
+                                    square,
+                                    panel,
+                                    w.q_fwd_cache.as_mut(),
+                                )
                             });
-                            forward_split_chunks(
-                                b,
-                                &q,
-                                x,
-                                alpha,
-                                0..b.dim,
-                                &mut terms[..],
-                                sqrt2,
-                                inv_sqrt2,
-                                chunks,
-                                &mut w.square,
-                                &mut w.panel,
-                                rns,
-                                w.q_fwd_cache.as_mut(),
-                            );
                         } else {
                             w.forward_terms(b, x, alpha, |i, term| terms[i] = term);
                         }
@@ -932,10 +828,9 @@ impl<T: FloatT> SampledOperator<T> {
             w.adjoint_abs_terms(b, x);
         };
 
-        // Keep the optional diagnostic local and deterministic under MPI. The
-        // ordinary pooled path reuses the caller's workers when no rank
-        // partition is active.
-        if let Some(pool) = pool.filter(|_| self.mpi_world().is_none()) {
+        // Blocks are independent and each is evaluated by one worker, so the
+        // pooled pass is deterministic with or without an MPI world.
+        if let Some(pool) = pool {
             pool.install(|| {
                 self.blocks
                     .par_iter()
@@ -990,27 +885,22 @@ fn adjoint_leaf<T: FloatT>(
             data: b.basis.as_slice(),
             phantom: std::marker::PhantomData,
         };
-        let call = w.prepare_adj_rns(b, x);
-        let rns = call.as_ref().map(|(p, v)| RnsSide {
-            plan: p,
-            cns: &w.rns_adj.as_ref().unwrap().res,
-            var: v,
-        });
         let wdiag = w.constants.wdiag.get_or_init(|| build_wdiag(b));
-        adjoint_split_chunks(
-            b,
-            &q,
-            wdiag,
-            x,
-            alpha,
-            0..b.dim,
-            &mut terms[..],
-            inv_sqrt2,
-            chunks,
-            &mut w.square,
-            &mut w.panel,
-            rns,
-        );
+        with_panels(h, kmax, |square, panel| {
+            adjoint_split_chunks(
+                b,
+                &q,
+                wdiag,
+                x,
+                alpha,
+                0..b.dim,
+                &mut terms[..],
+                inv_sqrt2,
+                chunks,
+                square,
+                panel,
+            )
+        });
     } else {
         w.adjoint_terms(b, x, alpha, |i, term| terms[i] = term);
     }
@@ -1037,84 +927,15 @@ struct SampledBlockWorkspace<T> {
     /// same operator. Mutable panels and all input-dependent residue state stay
     /// in this workspace.
     constants: Arc<SampledBlockConstants<T>>,
-    panel: Matrix<T>,
-    square: Matrix<T>,
-    /// `d[k] = weights[k]·x[column_start+k]` scratch for the residue forward.
+    /// Exact-quadratic outputs or one weighted basis column for absolute terms.
     dvec: Vec<T>,
-    /// Constant-side residue caches: `adj` encodes `wdiag`, `fwd` encodes `qq`.
-    rns_adj: Option<RnsConst>,
-    rns_fwd: Option<RnsConst>,
-    /// Shared `wdiag`/`qq` exponent range (same values, permuted layout);
-    /// `Some(None)` records a permanent non-finite scan failure.
-    rns_range: Option<Option<(i64, i64)>>,
     /// Residues of the basis `Q` for the forward `panel·Qᵀ` and the exact
     /// adjoint; `Q` is fixed per solve. Only the KKT's workspace enables them
     /// (`enable_basis_caches`), so short-lived workspaces stay small.
     q_fwd_cache: Option<ResidueCache>,
     q_adj_cache: Option<ResidueCache>,
-    q_abs_cache: Option<ResidueCache>,
 }
 impl<T: FloatT> SampledBlockWorkspace<T> {
-    /// `dim == 1` adjoint residue context: `wdiagᵀ·x_sub` over the block's
-    /// contiguous svec row range. Constant residues land in `self.rns_adj`.
-    /// Adjoint helpers take `x` as the block's own rows (`block_rows`).
-    fn prepare_adj_rns(&mut self, b: &SampledBlock<T>, x: &[T]) -> Option<(RnsPlan, Residues)> {
-        if b.dim != 1 || b.basis_cols == 0 {
-            return None;
-        }
-        let terms = tri(b.basis_rows);
-        let x_sub = &x[..terms];
-        let wdiag = self.constants.wdiag.get_or_init(|| build_wdiag(b));
-        rns_call(
-            &mut self.rns_adj,
-            &mut self.rns_range,
-            wdiag,
-            x_sub,
-            terms,
-            b.basis_cols,
-        )
-    }
-
-    /// `dim == 1` forward residue context: `qq·d` where `d_k` is the
-    /// weight-scaled primitive slice and `qq` is `wdiag` transposed so the
-    /// svec scale factors ride inside the residues.
-    fn prepare_fwd_rns(&mut self, b: &SampledBlock<T>, x: &[T]) -> Option<(RnsPlan, Residues)> {
-        if b.dim != 1 || b.basis_cols == 0 {
-            return None;
-        }
-        let h = b.basis_rows;
-        let kmax = b.basis_cols;
-        let trih = tri(h);
-        // Skip building `qq` entirely for output-dominated shapes that
-        // `rns_call` rejects anyway.
-        if trih > kmax {
-            return None;
-        }
-        let wdiag = self.constants.wdiag.get_or_init(|| build_wdiag(b));
-        let qq = self.constants.qq.get_or_init(|| {
-            let mut qq = vec![T::zero(); trih * kmax];
-            for k in 0..kmax {
-                for t in 0..trih {
-                    qq[t * kmax + k] = wdiag[k * trih + t];
-                }
-            }
-            qq
-        });
-        self.dvec.clear();
-        self.dvec.resize(kmax, T::zero());
-        for k in 0..kmax {
-            self.dvec[k] = b.weights[k] * x[b.column_start + k];
-        }
-        rns_call(
-            &mut self.rns_fwd,
-            &mut self.rns_range,
-            qq,
-            &self.dvec,
-            kmax,
-            trih,
-        )
-    }
-
     fn forward_terms(
         &mut self,
         b: &SampledBlock<T>,
@@ -1124,21 +945,8 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
     ) {
         let h = b.basis_rows;
         let kmax = b.basis_cols;
-        self.check(b);
         if kmax == 0 {
             return;
-        }
-        if b.dim == 1 {
-            if let Some((plan, var)) = self.prepare_fwd_rns(b, x) {
-                // qq folds the svec √2 scale into the constant residues, so
-                // each output row is a single residue dot against `d`.
-                let cns = &self.rns_fwd.as_ref().unwrap().res;
-                for t in 0..tri(h) {
-                    let v = T::rns_dot(&plan, cns, t * kmax, 1, &var, 0, 1, kmax);
-                    store(t, alpha * v);
-                }
-                return;
-            }
         }
         let sqrt2 = if h > 1 { T::SQRT_2() } else { T::zero() };
         let inv_sqrt2 = if h > 0 && b.dim > 1 {
@@ -1151,44 +959,26 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
             data: b.basis.as_slice(),
             phantom: std::marker::PhantomData,
         };
-        let mut p = 0;
-        for s in 0..b.dim {
-            for r in 0..=s {
-                for k in 0..kmax {
-                    let weight = b.weights[p + k] * x[b.column_start + p + k];
-                    let q_col = &q.data()[k * h..(k + 1) * h];
-                    let p_col = &mut self.panel.data_mut()[k * h..(k + 1) * h];
-                    for i in 0..h {
-                        p_col[i] = q_col[i] * weight;
-                    }
+        with_panels(h, kmax, |square: &mut Matrix<T>, panel: &mut Matrix<T>| {
+            for s in 0..b.dim {
+                for r in 0..=s {
+                    forward_pair(
+                        b,
+                        &q,
+                        x,
+                        alpha,
+                        s,
+                        r,
+                        sqrt2,
+                        inv_sqrt2,
+                        square,
+                        panel,
+                        self.q_fwd_cache.as_mut(),
+                        &mut store,
+                    );
                 }
-                // `panel·Qᵀ` is exactly symmetric; the shared kernel returns the
-                // same correctly rounded upper entries and mirrors them.
-                pooled_gemm_sym_cached(
-                    &mut self.square,
-                    &self.panel,
-                    &q.t(),
-                    None,
-                    self.q_fwd_cache.as_mut(),
-                );
-                for j in 0..h {
-                    for i in 0..if r == s { j + 1 } else { h } {
-                        let scale = if r != s {
-                            inv_sqrt2
-                        } else if i != j {
-                            sqrt2
-                        } else {
-                            T::one()
-                        };
-                        store(
-                            tri(s * h + j) + r * h + i,
-                            alpha * scale * self.square[(i, j)],
-                        );
-                    }
-                }
-                p += kmax;
             }
-        }
+        });
     }
     /// `dim == 1` adjoint `alpha·w_k·(q_kᵀ·X·q_k)` as one exact quadratic
     /// form per block, rounded once (`XgemmScalar::xsvec_quadratic_exact`).
@@ -1198,13 +988,14 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
             return false;
         }
         let (h, kmax) = (b.basis_rows, b.basis_cols);
-        let x_sub = &x[..tri(h)];
+        let x_sub = &x[..triangular_number(h)];
         self.dvec.clear();
         self.dvec.resize(kmax, T::zero());
         if !T::xsvec_quadratic_exact(
             h,
             kmax,
             &b.basis,
+            false,
             x_sub,
             T::SQRT_2(),
             None,
@@ -1228,7 +1019,6 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
     ) {
         let h = b.basis_rows;
         let kmax = b.basis_cols;
-        self.check(b);
         if kmax == 0 {
             return;
         }
@@ -1251,52 +1041,31 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
             data: b.basis.as_slice(),
             phantom: std::marker::PhantomData,
         };
-        let mut p = 0;
-        let trih = tri(h);
-        for s in 0..b.dim {
-            for r in 0..=s {
-                if r == s {
-                    if b.dim == 1 {
-                        if let Some((plan, var)) = self.prepare_adj_rns(b, x) {
-                            let cns = &self.rns_adj.as_ref().unwrap().res;
-                            for k in 0..kmax {
-                                let v = T::rns_dot(&plan, cns, k * trih, 1, &var, 0, 1, trih);
-                                store(p + k, alpha * b.weights[p + k] * v);
-                            }
-                            p += kmax;
-                            continue;
-                        }
-                    }
-                    // Diagonal pair: `v_k = q'·S·q` with symmetric `S` reduces
-                    // to a flat dot over the block's svec triangle against the
-                    // precomputed `wdiag` — half the panel product's work.
-                    let wdiag = self.constants.wdiag.get_or_init(|| build_wdiag(b));
-                    for k in 0..kmax {
-                        let w = &wdiag[k * trih..(k + 1) * trih];
-                        let v = T::dot_fma((0..h).flat_map(|j| {
-                            (0..=j).map(move |i| (&x[tri(r * h + j) + r * h + i], &w[tri(j) + i]))
-                        }));
-                        store(p + k, alpha * b.weights[p + k] * v);
-                    }
-                } else {
-                    for j in 0..h {
-                        for i in 0..h {
-                            let (a, c) = (r * h + i, s * h + j);
-                            let scale = if a == c { T::one() } else { inv_sqrt2 };
-                            self.square[(i, j)] = x[tri(c) + a] * scale;
-                        }
-                    }
-                    self.panel.mul(&self.square, &q, T::one(), T::zero());
-                    for k in 0..kmax {
-                        let q_col = &q.data()[k * h..(k + 1) * h];
-                        let p_col = &self.panel.data()[k * h..(k + 1) * h];
-                        let v = T::dot_fma(q_col.iter().zip(p_col.iter()));
-                        store(p + k, alpha * b.weights[p + k] * v);
-                    }
-                }
-                p += kmax;
+        let wdiag = self.constants.wdiag.get_or_init(|| build_wdiag(b));
+        if b.dim == 1 {
+            // Scalar blocks have only the diagonal pair: no panel scratch.
+            for k in 0..kmax {
+                store(k, alpha * b.weights[k] * diag_pair_dot(x, wdiag, h, 0, k));
             }
+            return;
         }
+        with_panels(h, kmax, |square: &mut Matrix<T>, panel: &mut Matrix<T>| {
+            for s in 0..b.dim {
+                adjoint_pairs(
+                    b,
+                    &q,
+                    wdiag,
+                    x,
+                    alpha,
+                    s,
+                    0..=s,
+                    inv_sqrt2,
+                    square,
+                    panel,
+                    &mut store,
+                );
+            }
+        });
     }
 
     /// Store absolute individual factor contributions for the optional
@@ -1312,26 +1081,23 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
         // exact quadratic kernel on |Q| and |x|. Every term is nonnegative,
         // so the sum is computed exactly and rounded once.
         if exact_adjoint_applies(b) {
-            let terms = tri(h);
+            let terms = triangular_number(h);
             let xs: Vec<T> = x[b.row_start..b.row_start + terms]
                 .iter()
                 .map(|v| v.abs())
                 .collect();
-            let qa = self
-                .constants
-                .abs_basis
-                .get_or_init(|| b.basis.iter().map(|v| v.abs()).collect());
             self.dvec.clear();
             self.dvec.resize(kmax, T::zero());
             if T::xsvec_quadratic_exact(
                 h,
                 kmax,
-                qa,
+                &b.basis,
+                true,
                 &xs,
                 T::SQRT_2(),
                 None,
                 &mut self.dvec,
-                self.q_abs_cache.as_mut(),
+                self.q_adj_cache.as_mut(),
             ) {
                 for k in 0..kmax {
                     self.adjoint_abs[k] += b.weights[k].abs() * self.dvec[k];
@@ -1350,11 +1116,16 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
             T::zero()
         };
         let sqrt2 = if h > 1 { T::SQRT_2() } else { T::zero() };
+        self.dvec.resize(h, T::zero());
         let mut p = 0;
         for s in 0..b.dim {
             for r in 0..=s {
                 for k in 0..kmax {
                     let col = p + k;
+                    // Preserve the first rounded multiply, shared by every j.
+                    for (i, value) in self.dvec.iter_mut().enumerate() {
+                        *value = b.weights[col] * q.data()[i + k * h];
+                    }
                     for j in 0..h {
                         for i in 0..if r == s { j + 1 } else { h } {
                             let scale = if r != s {
@@ -1364,9 +1135,8 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
                             } else {
                                 T::one()
                             };
-                            let value =
-                                b.weights[col] * q.data()[i + k * h] * q.data()[j + k * h] * scale;
-                            let row = b.row_start + tri(s * h + j) + r * h + i;
+                            let value = self.dvec[i] * q.data()[j + k * h] * scale;
+                            let row = b.row_start + triangular_number(s * h + j) + r * h + i;
                             self.adjoint_abs[col] += T::abs(value * x[row]);
                         }
                     }
@@ -1374,11 +1144,6 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
                 p += kmax;
             }
         }
-    }
-
-    fn check(&self, b: &SampledBlock<T>) {
-        assert_eq!(self.panel.size(), (b.basis_rows, b.basis_cols));
-        assert_eq!(self.square.size(), (b.basis_rows, b.basis_rows));
     }
 }
 /// Mutable scratch is owned by one caller, independently of shared metadata.
@@ -1396,9 +1161,7 @@ pub struct SampledWorkspace<T> {
 /// Whether a `dim == 1` block's diagonal adjoint uses the exact residue
 /// quadratic form (no `wdiag` table needed).
 fn exact_adjoint_applies<T: FloatT>(b: &SampledBlock<T>) -> bool {
-    b.dim == 1
-        && T::residue_blas_applies(b.basis_rows, b.basis_cols, b.basis_rows)
-        && !rns_ops_enabled()
+    b.dim == 1 && T::residue_blas_applies(b.basis_rows, b.basis_cols, b.basis_rows)
 }
 
 /// Measured load balancing (SDPB 2.0 §2.2.2): a block whose last measured
@@ -1417,7 +1180,7 @@ fn assign_block_ways<T>(work: &mut [SampledBlockWorkspace<T>], slot: usize, work
 
 fn build_wdiag<T: FloatT>(b: &SampledBlock<T>) -> Vec<T> {
     let h = b.basis_rows;
-    let trih = tri(h);
+    let trih = triangular_number(h);
     let kmax = b.basis_cols;
     let sqrt2 = if h > 1 { T::SQRT_2() } else { T::zero() };
     let mut wdiag = vec![T::zero(); kmax * trih];
@@ -1425,7 +1188,8 @@ fn build_wdiag<T: FloatT>(b: &SampledBlock<T>) -> Vec<T> {
         for j in 0..h {
             for i in 0..=j {
                 let c = if i == j { T::one() } else { sqrt2 };
-                wdiag[k * trih + tri(j) + i] = c * b.basis[i + k * h] * b.basis[j + k * h];
+                wdiag[k * trih + triangular_number(j) + i] =
+                    c * b.basis[i + k * h] * b.basis[j + k * h];
             }
         }
     }
@@ -1509,8 +1273,6 @@ impl<T: FloatT> SampledWorkspace<T> {
                 .get_or_insert_with(|| w.constants.basis_residues[0].clone());
             w.q_adj_cache
                 .get_or_insert_with(|| w.constants.basis_residues[1].clone());
-            w.q_abs_cache
-                .get_or_insert_with(|| w.constants.basis_residues[2].clone());
         }
     }
     /// Allocate reusable product scratch for the supplied operator.
@@ -1521,8 +1283,6 @@ impl<T: FloatT> SampledWorkspace<T> {
                 .iter()
                 .zip(&operator.constants)
                 .map(|(b, constants)| {
-                    let h = b.basis_rows;
-                    let kmax = b.basis_cols;
                     if !exact_adjoint_applies(b) {
                         constants.wdiag.get_or_init(|| build_wdiag(b));
                     }
@@ -1531,15 +1291,9 @@ impl<T: FloatT> SampledWorkspace<T> {
                         adjoint: Vec::new(),
                         adjoint_abs: Vec::new(),
                         constants: Arc::clone(constants),
-                        panel: Matrix::zeros((h, kmax)),
-                        square: Matrix::zeros((h, h)),
                         dvec: Vec::new(),
-                        rns_adj: None,
-                        rns_fwd: None,
-                        rns_range: None,
                         q_fwd_cache: None,
                         q_adj_cache: None,
-                        q_abs_cache: None,
                         cost: [0.0; 2],
                         ways: [1; 2],
                     }
@@ -1566,10 +1320,11 @@ impl<T: FloatT> SampledWorkspace<T> {
 /// may carry the opposite sign, so zero results are recomputed with the
 /// full-side accumulation to preserve bitwise parity.
 pub struct SampledSchurWorkspace<T> {
-    ub: Matrix<T>,
+    /// Column-compacted basis, kept only when exact duplicate columns were
+    /// merged; otherwise the operator's own basis is read (`unique_basis`).
+    ub: Option<Vec<T>>,
     v: Matrix<T>,
     gram: Matrix<T>,
-    product: Matrix<T>,
     pairs: Vec<(usize, usize)>,
     dim: usize,
     side: usize,
@@ -1608,12 +1363,13 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
         }
         let count = unique.len();
         let rank = b.dim * count;
-        let mut ub = Matrix::zeros((b.basis_rows, count));
-        for (k, &original) in unique.iter().enumerate() {
-            for i in 0..b.basis_rows {
-                ub[(i, k)] = b.basis[i + original * b.basis_rows];
-            }
-        }
+        let ub = (count != b.basis_cols).then(|| {
+            let h = b.basis_rows;
+            unique
+                .iter()
+                .flat_map(|&original| b.basis[original * h..(original + 1) * h].iter().copied())
+                .collect()
+        });
         let mut pairs = Vec::with_capacity(b.weights.len());
         for s in 0..b.dim {
             for r in 0..=s {
@@ -1635,7 +1391,6 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
             ub,
             v: Matrix::zeros((b.side(), rank)),
             gram: Matrix::zeros((rank, rank)),
-            product: Matrix::zeros((b.side(), rank)),
             pairs,
             dim: b.dim,
             side: b.side(),
@@ -1702,7 +1457,18 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
         if let Some(pool) = pool {
             self.configure_parallel(pool.current_num_threads());
         }
-        sampled_basis_product(&mut self.v, rinv, &self.ub, self.dim, pool, self.gemm_tile);
+        let ub = self.ub.as_deref().unwrap_or(&b.basis);
+        let (h, count) = (b.basis_rows, self.count);
+        sampled_basis_product(
+            &mut self.v,
+            rinv,
+            ub,
+            h,
+            count,
+            self.dim,
+            pool,
+            self.gemm_tile,
+        );
         sampled_gram(&mut self.gram, &self.v, pool, self.syrk_tile);
     }
     /// A' H^-1 b from U = Rinv * mat(b) * Rinv'. The transformed
@@ -1716,8 +1482,6 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
                 self.packed_rhs
                     .extend_from_slice(&u.data()[j * self.side..j * self.side + j + 1]);
             }
-            self.quadratic
-                .resize(self.pairs.len().max(self.count), T::zero());
             if self.dim > 1
                 && T::xsymmetric_bilinear_exact(
                     self.side,
@@ -1725,73 +1489,75 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
                     self.v.data(),
                     &self.packed_rhs,
                     &self.pairs,
-                    &mut self.quadratic,
+                    out,
                     &mut self.adjoint_cache,
                 )
             {
-                for ((dst, &value), &weight) in out.iter_mut().zip(&self.quadratic).zip(&b.weights)
-                {
-                    *dst = weight * value;
+                for (dst, &weight) in out.iter_mut().zip(&b.weights) {
+                    *dst = weight * *dst;
                 }
                 return;
             }
-            if self.dim == 1
-                && T::xsvec_quadratic_exact(
+            if self.dim == 1 {
+                self.quadratic
+                    .resize(self.pairs.len().max(self.count), T::zero());
+                if T::xsvec_quadratic_exact(
                     self.side,
                     self.count,
                     self.v.data(),
+                    false,
                     &self.packed_rhs,
                     T::from_u8(2).unwrap(),
                     None,
                     &mut self.quadratic,
                     Some(&mut self.adjoint_cache),
-                )
-            {
-                for ((dst, &(a, _)), &weight) in out.iter_mut().zip(&self.pairs).zip(&b.weights) {
-                    *dst = weight * self.quadratic[a];
+                ) {
+                    for ((dst, &(a, _)), &weight) in out.iter_mut().zip(&self.pairs).zip(&b.weights)
+                    {
+                        *dst = weight * self.quadratic[a];
+                    }
+                    return;
                 }
-                return;
             }
         }
         // U is exactly symmetric (the congruence mirrors its triangle).
         // Reading Uᵀ gives contiguous dot operands at the same term order.
-        self.product.mul(&u.t(), &self.v, T::one(), T::zero());
         let n = self.side;
-        for ((value, &(a, c)), &weight) in out.iter_mut().zip(&self.pairs).zip(&b.weights) {
-            *value = weight
-                * T::dot_fma(
-                    (0..n).map(|i| (&self.v.data()[i + a * n], &self.product.data()[i + c * n])),
-                );
-        }
+        with_product(self.v.size(), |product| {
+            product.mul(&u.t(), &self.v, T::one(), T::zero());
+            for ((value, &(a, c)), &weight) in out.iter_mut().zip(&self.pairs).zip(&b.weights) {
+                *value = weight
+                    * T::dot_fma(
+                        (0..n).map(|i| (&self.v.data()[i + a * n], &product.data()[i + c * n])),
+                    );
+            }
+        });
     }
 
     /// Rinv * mat(A*x) * Rinv' = V*C(x)*V'. Assemble C by its exact
     /// canonical pairs; duplicate basis columns and signed weights are retained.
     pub(crate) fn inverse_forward(&mut self, b: &SampledBlock<T>, x: &[T], out: &mut Matrix<T>) {
-        self.product.data_mut().fill(T::zero());
         let n = self.side;
         let half = T::from_f64(0.5).unwrap();
-        for (p, &(a, c)) in self.pairs.iter().enumerate() {
-            let mut w = b.weights[p] * x[b.column_start + p];
-            if a != c {
-                w *= half;
-            }
-            for i in 0..n {
-                let dst = &mut self.product.data_mut()[i + c * n];
-                *dst = w.mul_add(self.v.data()[i + a * n], *dst);
+        let (v, pairs, v_cache) = (&self.v, &self.pairs, &mut self.v_cache);
+        with_product(v.size(), |product| {
+            product.data_mut().fill(T::zero());
+            for (p, &(a, c)) in pairs.iter().enumerate() {
+                let mut w = b.weights[p] * x[b.column_start + p];
                 if a != c {
-                    let dst = &mut self.product.data_mut()[i + a * n];
-                    *dst = w.mul_add(self.v.data()[i + c * n], *dst);
+                    w *= half;
+                }
+                for i in 0..n {
+                    let dst = &mut product.data_mut()[i + c * n];
+                    *dst = w.mul_add(v.data()[i + a * n], *dst);
+                    if a != c {
+                        let dst = &mut product.data_mut()[i + a * n];
+                        *dst = w.mul_add(v.data()[i + c * n], *dst);
+                    }
                 }
             }
-        }
-        pooled_gemm_sym_cached(
-            out,
-            &self.product,
-            &self.v.t(),
-            None,
-            Some(&mut self.v_cache),
-        );
+            pooled_gemm_sym_cached(out, &*product, &v.t(), None, Some(v_cache));
+        });
     }
 
     /// Schur entry for zero-based canonical primitive indices in this block.
@@ -1833,15 +1599,52 @@ fn sampled_gram<T: FloatT>(
 #[cfg(test)]
 mod tests;
 
+/// Per-call `h × kmax` product panel and `h × h` square of one sampled
+/// block. Every use writes them before reading, so they are shared per thread.
+struct Panels<T> {
+    square: Matrix<T>,
+    panel: Matrix<T>,
+}
+
+fn with_panels<T: FloatT, R>(
+    h: usize,
+    kmax: usize,
+    f: impl FnOnce(&mut Matrix<T>, &mut Matrix<T>) -> R,
+) -> R {
+    crate::algebra::scratch::with_scratch(|slot: &mut Option<Panels<T>>| {
+        if slot.as_ref().map_or(true, |p| p.panel.size() != (h, kmax)) {
+            *slot = Some(Panels {
+                square: Matrix::zeros((h, h)),
+                panel: Matrix::zeros((h, kmax)),
+            });
+        }
+        let p = slot.as_mut().unwrap();
+        f(&mut p.square, &mut p.panel)
+    })
+}
+
+/// Per-call `side × rank` panel of one sampled block, shared per thread.
+fn with_product<T: FloatT, R>(size: (usize, usize), f: impl FnOnce(&mut Matrix<T>) -> R) -> R {
+    crate::algebra::scratch::with_scratch(|m: &mut Option<Matrix<T>>| {
+        if m.as_ref().map_or(true, |m| m.size() != size) {
+            *m = Some(Matrix::zeros(size));
+        }
+        f(m.as_mut().unwrap())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn sampled_basis_product<T: FloatT>(
     out: &mut Matrix<T>,
     rinv: &Matrix<T>,
-    ub: &Matrix<T>,
+    ub: &[T],
+    h: usize,
+    count: usize,
     dim: usize,
     pool: Option<&rayon::ThreadPool>,
     tile: usize,
 ) {
-    let (side, h, count) = (rinv.nrows(), ub.nrows(), ub.ncols());
+    let side = rinv.nrows();
     let (side32, h32, count32) = (
         i32::try_from(side).unwrap(),
         i32::try_from(h).unwrap(),
@@ -1862,7 +1665,7 @@ fn sampled_basis_product<T: FloatT>(
                 T::one(),
                 a,
                 side32,
-                ub.data(),
+                ub,
                 h32,
                 T::zero(),
                 ccols,
@@ -1879,7 +1682,7 @@ fn sampled_basis_product<T: FloatT>(
                 T::one(),
                 a,
                 side32,
-                ub.data(),
+                ub,
                 h32,
                 T::zero(),
                 ccols,
@@ -1900,7 +1703,7 @@ fn sampled_basis_product<T: FloatT>(
                     *slot = T::dot_fma((0..side).map(|j| {
                         let rj = &rinv.data()[i + j * side];
                         if j / h == r {
-                            (rj, &ub.data()[j - r * h + k * h])
+                            (rj, &ub[j - r * h + k * h])
                         } else {
                             (rj, &zero)
                         }

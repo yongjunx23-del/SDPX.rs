@@ -38,7 +38,7 @@ fn block<T: FloatT>(row_start: usize, column_start: usize, dim: usize) -> Sample
         basis_rows: 2,
         basis_cols: k,
         basis: vec![c::<T>(1) / c(3), c::<T>(2) / c(7), c(-1), c(1), c(0), c(0)],
-        weights: (0..tri(dim) * k)
+        weights: (0..triangular_number(dim) * k)
             .map(|p| {
                 if p % 4 == 0 {
                     T::zero()
@@ -151,8 +151,8 @@ fn cache_block<T: FloatT>(row_start: usize, column_start: usize, h: usize) -> Sa
 }
 
 fn sampled_constant_cache<T: FloatT>() {
-    let first = cache_block::<T>(0, 0, 3); // tri(3) == 6 <= 21: qq eligible.
-    let second = cache_block::<T>(first.row_count(), 21, 20); // tri(20) == 210 > 21.
+    let first = cache_block::<T>(0, 0, 3);
+    let second = cache_block::<T>(first.row_count(), 21, 20); // triangular_number(20) == 210 > 21.
     let m = first.row_count() + second.row_count();
     let n = 42;
     let operator = SampledOperator::new(CscMatrix::zeros((m, n)), vec![first, second]).unwrap();
@@ -164,13 +164,13 @@ fn sampled_constant_cache<T: FloatT>() {
     assert_eq!(serial.blocks.len(), 2);
     assert_eq!(
         serial.blocks[0].constants.wdiag.get().unwrap().len(),
-        21 * tri(3)
+        21 * triangular_number(3)
     );
     assert_eq!(
         serial.blocks[1].constants.wdiag.get().unwrap().len(),
-        21 * tri(20)
+        21 * triangular_number(20)
     );
-    let constant_elements = 21 * (tri(3) + tri(20));
+    let constant_elements = 21 * (triangular_number(3) + triangular_number(20));
     let shared_payload = constant_elements * std::mem::size_of::<T>();
     let old_three_workspace_payload = 3 * shared_payload;
     assert_eq!(
@@ -188,7 +188,7 @@ fn sampled_constant_cache<T: FloatT>() {
     );
     assert_eq!(
         serial.blocks[0].constants.wdiag.get().unwrap().len() * std::mem::size_of::<T>(),
-        21 * tri(3) * std::mem::size_of::<T>()
+        21 * triangular_number(3) * std::mem::size_of::<T>()
     );
     assert!(Arc::ptr_eq(
         &serial.blocks[0].constants,
@@ -202,8 +202,6 @@ fn sampled_constant_cache<T: FloatT>() {
         &serial.blocks[0].constants,
         &serial.blocks[1].constants
     ));
-    assert!(serial.blocks[0].constants.qq.get().is_none());
-    assert!(serial.blocks[1].constants.qq.get().is_none());
 
     let x: Vec<_> = (0..n).map(|i| c::<T>((i as i32 % 9) - 4) / c(5)).collect();
     let z: Vec<_> = (0..m)
@@ -220,16 +218,6 @@ fn sampled_constant_cache<T: FloatT>() {
     );
     operator.apply_with_pool(&mut yp, &x, T::one(), T::zero(), &mut pooled, Some(&pool));
     exact_with_zero_sign(&ys, &yp);
-    assert!(serial.blocks[0].constants.qq.get().is_some());
-    assert!(serial.blocks[1].constants.qq.get().is_none());
-    assert_eq!(
-        serial.blocks[0].constants.qq.get().unwrap().len(),
-        21 * tri(3)
-    );
-    assert_eq!(
-        serial.blocks[0].constants.qq.get().unwrap().len() * std::mem::size_of::<T>(),
-        21 * tri(3) * std::mem::size_of::<T>()
-    );
 
     let mut ts = vec![T::zero(); n];
     let mut tp = vec![T::zero(); n];
@@ -246,8 +234,6 @@ fn sampled_constant_cache<T: FloatT>() {
 
     let wdiag_before = serial.blocks[0].constants.wdiag.get().unwrap().clone();
     let wdiag_ptr = serial.blocks[0].constants.wdiag.get().unwrap().as_ptr();
-    let qq_before = serial.blocks[0].constants.qq.get().unwrap().clone();
-    let qq_ptr = serial.blocks[0].constants.qq.get().unwrap().as_ptr();
     let d = vec![c::<T>(2); n];
     let e = vec![c::<T>(3); m];
     let mut scaled = operator;
@@ -260,11 +246,6 @@ fn sampled_constant_cache<T: FloatT>() {
         serial.blocks[0].constants.wdiag.get().unwrap(),
         &wdiag_before
     );
-    assert_eq!(
-        serial.blocks[0].constants.qq.get().unwrap().as_ptr(),
-        qq_ptr
-    );
-    assert_eq!(serial.blocks[0].constants.qq.get().unwrap(), &qq_before);
     let mut scaled_y = vec![T::zero(); m];
     scaled.apply(&mut scaled_y, &x, T::one(), T::zero(), &mut serial);
     let scaled_materialized = scaled.materialize();
@@ -634,20 +615,12 @@ fn pooled_gram<T: FloatT>() {
         assert_eq!(pooled.plan_threads, width);
         assert_eq!(pooled.v.data(), serial.v.data());
         assert_eq!(pooled.gram.data(), serial.gram.data());
-        let pointers = (
-            pooled.ub.data().as_ptr(),
-            pooled.v.data().as_ptr(),
-            pooled.gram.data().as_ptr(),
-        );
+        let pointers = (pooled.v.data().as_ptr(), pooled.gram.data().as_ptr());
         let tiles = (pooled.gemm_tile, pooled.syrk_tile);
         pooled.update_with_pool(&b, &rinv, Some(&pool));
         assert_eq!(
             pointers,
-            (
-                pooled.ub.data().as_ptr(),
-                pooled.v.data().as_ptr(),
-                pooled.gram.data().as_ptr()
-            )
+            (pooled.v.data().as_ptr(), pooled.gram.data().as_ptr())
         );
         assert_eq!(tiles, (pooled.gemm_tile, pooled.syrk_tile));
         for p in 0..b.column_count() {
@@ -722,14 +695,7 @@ fn pooled_operators<T: FloatT>() {
     let pointers = |w: &SampledWorkspace<T>| {
         w.blocks
             .iter()
-            .map(|b| {
-                (
-                    b.forward.as_ptr(),
-                    b.adjoint.as_ptr(),
-                    b.panel.data().as_ptr(),
-                    b.square.data().as_ptr(),
-                )
-            })
+            .map(|b| (b.forward.as_ptr(), b.adjoint.as_ptr()))
             .collect::<Vec<_>>()
     };
     let mut saved = None;
@@ -878,231 +844,6 @@ fn pooled_dim1_operators_mpfr256() {
 fn pooled_dim1_operators_mpfr512() {
     pooled_dim1_operators::<Bits512>();
 }
-/// `SDPX_RNS_OPS` leaf bodies driven with a hand-built `RnsSide` (the env gate
-/// only selects the prepare path; these leaves are what it feeds). Residue
-/// dots round the exact sum once, so compare against the serial `dot_fma`
-/// evaluation at working precision rather than bitwise.
-fn rns_dim1_leaves<T: FloatT>() {
-    if T::precision_bits() <= 53 {
-        return;
-    }
-    let b = SampledBlock::<T> {
-        row_start: 1,
-        column_start: 2,
-        dim: 1,
-        basis_rows: 12,
-        basis_cols: 8,
-        basis: (0..96).map(|i| c::<T>((i % 9) as i32 - 4) / c(6)).collect(),
-        weights: (0..8).map(|i| c::<T>((i % 4) as i32 - 1) / c(3)).collect(),
-    };
-    let (h, kmax, trih) = (b.basis_rows, b.basis_cols, tri(b.basis_rows));
-    let (m, n) = (1 + trih, 16);
-    let x: Vec<T> = (0..n).map(|i| c::<T>(i as i32 - 6) / c(7)).collect();
-    let z: Vec<T> = (0..m).map(|i| c::<T>((i % 13) as i32 - 5) / c(4)).collect();
-    let linear = CscMatrix::zeros((m, n));
-    let op = SampledOperator::new(linear, vec![b.clone()]).unwrap();
-    let mut work = SampledWorkspace::new(&op);
-
-    let mut fwd_ref = vec![T::zero(); trih];
-    work.blocks[0].forward_terms(&b, &x, T::one(), |i, t| fwd_ref[i] = t);
-    let mut adj_ref = vec![T::zero(); kmax];
-    work.blocks[0].adjoint_terms(&b, block_rows(&b, &z), T::one(), |i, t| adj_ref[i] = t);
-
-    let w0 = &mut work.blocks[0];
-    let q = BorrowedMatrix {
-        size: (h, kmax),
-        data: b.basis.as_slice(),
-        phantom: std::marker::PhantomData,
-    };
-    let mut sq = Matrix::<T>::zeros((h, h));
-    let mut pa = Matrix::<T>::zeros((h, kmax));
-
-    let z_sub = &z[b.row_start..b.row_start + trih];
-    let wdiag = w0.constants.wdiag.get().unwrap();
-    let plan_a = T::rns_plan_ranges(
-        T::rns_exponent_range(wdiag).unwrap(),
-        T::rns_exponent_range(z_sub).unwrap(),
-        trih,
-    )
-    .unwrap();
-    // Production caches the constant side at full prime width
-    // (`rns_encode_wide`); the dot then reads the plan's prefix.
-    let cns_a = T::rns_encode_wide(&plan_a, EncodeSide::A, wdiag).unwrap();
-    let var_a = T::rns_encode(&plan_a, EncodeSide::B, z_sub).unwrap();
-    let side_a = RnsSide {
-        plan: &plan_a,
-        cns: &cns_a,
-        var: &var_a,
-    };
-    for chunks in [1usize, 2, 4] {
-        let mut out = vec![T::zero(); kmax];
-        adjoint_split_chunks(
-            &b,
-            &q,
-            wdiag,
-            block_rows(&b, &z),
-            T::one(),
-            0..1,
-            &mut out,
-            T::FRAC_1_SQRT_2(),
-            chunks,
-            &mut sq,
-            &mut pa,
-            Some(side_a),
-        );
-        for (v, e) in out.iter().zip(&adj_ref) {
-            close(*v, *e);
-        }
-    }
-
-    let mut qq = vec![T::zero(); trih * kmax];
-    for k in 0..kmax {
-        for t in 0..trih {
-            qq[t * kmax + k] = wdiag[k * trih + t];
-        }
-    }
-    let dvec: Vec<T> = (0..kmax)
-        .map(|k| b.weights[k] * x[b.column_start + k])
-        .collect();
-    let plan_f = T::rns_plan_ranges(
-        T::rns_exponent_range(&qq).unwrap(),
-        T::rns_exponent_range(&dvec).unwrap(),
-        kmax,
-    )
-    .unwrap();
-    let cns_f = T::rns_encode_wide(&plan_f, EncodeSide::A, &qq).unwrap();
-    let var_f = T::rns_encode(&plan_f, EncodeSide::B, &dvec).unwrap();
-    let side_f = RnsSide {
-        plan: &plan_f,
-        cns: &cns_f,
-        var: &var_f,
-    };
-    for chunks in [1usize, 2, 4] {
-        let mut out = vec![T::zero(); trih];
-        forward_split_chunks(
-            &b,
-            &q,
-            &x,
-            T::one(),
-            0..1,
-            &mut out,
-            T::SQRT_2(),
-            T::zero(),
-            chunks,
-            &mut sq,
-            &mut pa,
-            Some(side_f),
-            None,
-        );
-        for (v, e) in out.iter().zip(&fwd_ref) {
-            close(*v, *e);
-        }
-    }
-}
-#[test]
-fn rns_dim1_leaves_mpfr256() {
-    rns_dim1_leaves::<Bits256>();
-}
-#[test]
-fn rns_dim1_leaves_mpfr512() {
-    rns_dim1_leaves::<Bits512>();
-}
-/// Per-block cost of the residue kernels at production shape (h = 38,
-/// kmax = 76): serial `dot_fma` terms vs hand-driven `RnsSide` dots, plus the
-/// per-call plan/encode overhead. Run with `--ignored`.
-fn rns_dim1_perf<T: FloatT>() {
-    if T::precision_bits() <= 53 {
-        return;
-    }
-    let b = SampledBlock::<T> {
-        row_start: 0,
-        column_start: 0,
-        dim: 1,
-        basis_rows: 38,
-        basis_cols: 76,
-        basis: (0..38 * 76)
-            .map(|i| c::<T>(((i * 7) % 11) as i32 - 5) / c(6))
-            .collect(),
-        weights: (0..76).map(|i| c::<T>((i % 5) as i32 - 2) / c(3)).collect(),
-    };
-    let (kmax, trih) = (b.basis_cols, tri(b.basis_rows));
-    let (m, n) = (trih, 2 * kmax);
-    let x: Vec<T> = (0..n).map(|i| c::<T>((i % 13) as i32 - 6) / c(7)).collect();
-    let z: Vec<T> = (0..m).map(|i| c::<T>((i % 17) as i32 - 8) / c(4)).collect();
-    let op = SampledOperator::new(CscMatrix::zeros((m, n)), vec![b.clone()]).unwrap();
-    let mut work = SampledWorkspace::new(&op);
-    let reps = 20;
-    let t0 = std::time::Instant::now();
-    let mut acc = T::zero();
-    for _ in 0..reps {
-        work.blocks[0].adjoint_terms(&b, block_rows(&b, &z), T::one(), |_, t| acc += t);
-        work.blocks[0].forward_terms(&b, &x, T::one(), |_, t| acc += t);
-    }
-    eprintln!("serial adj+fwd: {:?} ({:?})", t0.elapsed() / reps, acc);
-
-    // Adjoint residues.
-    let z_sub = &z[..trih];
-    let wdiag = work.blocks[0].constants.wdiag.get().unwrap();
-    let plan = T::rns_plan_ranges(
-        T::rns_exponent_range(wdiag).unwrap(),
-        T::rns_exponent_range(z_sub).unwrap(),
-        trih,
-    )
-    .unwrap();
-    let cns = T::rns_encode(&plan, EncodeSide::A, wdiag).unwrap();
-    let t1 = std::time::Instant::now();
-    for _ in 0..reps {
-        let var = T::rns_encode(&plan, EncodeSide::B, z_sub).unwrap();
-        for k in 0..kmax {
-            acc += T::rns_dot(&plan, &cns, k * trih, 1, &var, 0, 1, trih);
-        }
-    }
-    eprintln!(
-        "rns adj (encode+{} dots): {:?} primes={}",
-        kmax,
-        t1.elapsed() / reps,
-        plan.primes()
-    );
-
-    // Forward residues.
-    let mut qq = vec![T::zero(); trih * kmax];
-    for k in 0..kmax {
-        for t in 0..trih {
-            qq[t * kmax + k] = wdiag[k * trih + t];
-        }
-    }
-    let dvec: Vec<T> = (0..kmax).map(|k| b.weights[k] * x[k]).collect();
-    let plan_f = T::rns_plan_ranges(
-        T::rns_exponent_range(&qq).unwrap(),
-        T::rns_exponent_range(&dvec).unwrap(),
-        kmax,
-    )
-    .unwrap();
-    let cns_f = T::rns_encode_wide(&plan_f, EncodeSide::A, &qq).unwrap();
-    let t2 = std::time::Instant::now();
-    for _ in 0..reps {
-        let var = T::rns_encode(&plan_f, EncodeSide::B, &dvec).unwrap();
-        for t in 0..trih {
-            acc += T::rns_dot(&plan_f, &cns_f, t * kmax, 1, &var, 0, 1, kmax);
-        }
-    }
-    eprintln!(
-        "rns fwd (encode+{} dots): {:?} primes={}",
-        trih,
-        t2.elapsed() / reps,
-        plan_f.primes()
-    );
-}
-#[test]
-#[ignore]
-fn rns_dim1_perf_512() {
-    rns_dim1_perf::<Bits512>();
-}
-#[test]
-#[ignore]
-fn rns_dim1_perf_768() {
-    rns_dim1_perf::<sdpx_arithmetic::Bits768>();
-}
 #[test]
 fn pooled_operators_f64() {
     pooled_operators::<f64>();
@@ -1140,7 +881,7 @@ fn duplicate_basis<T: FloatT>() {
         weights: (0..18).map(|i| c::<T>(i % 7 - 3) / c(4)).collect(),
     };
     let mut work = SampledSchurWorkspace::new(&b);
-    assert_eq!(work.ub.ncols(), 4); // Four exact vectors, including a near duplicate.
+    assert_eq!(work.count, 4); // Four exact vectors, including a near duplicate.
     assert_eq!(work.gram.size(), (8, 8));
     assert_eq!(work.pairs.len(), b.weights.len());
     let mut pooled = SampledSchurWorkspace::new(&b);
@@ -1177,7 +918,7 @@ fn structured_v_parity<T: FloatT>() {
             basis_rows: h,
             basis_cols: cols,
             basis,
-            weights: (0..tri(dim) * cols)
+            weights: (0..triangular_number(dim) * cols)
                 .map(|i| c::<T>((i % 6) as i32 - 2) / c(5))
                 .collect(),
         };
@@ -1191,13 +932,14 @@ fn structured_v_parity<T: FloatT>() {
         let mut work = SampledSchurWorkspace::new(&b);
         work.update_with_pool(&b, &rinv, None);
         // Reference: the explicit dense block-diagonal u, dense GEMM.
-        let count = work.ub.ncols();
+        let count = work.count;
+        let ub = work.ub.as_deref().unwrap_or(&b.basis);
         let rank = dim * count;
         let mut u = Matrix::zeros((side, rank));
         for r in 0..dim {
             for k in 0..count {
                 for i in 0..h {
-                    u[(r * h + i, r * count + k)] = work.ub[(i, k)];
+                    u[(r * h + i, r * count + k)] = ub[i + k * h];
                 }
             }
         }

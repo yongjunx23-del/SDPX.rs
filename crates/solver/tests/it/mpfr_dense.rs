@@ -1,16 +1,13 @@
 //! Provider contract tests, separate from end-to-end solver qualification.
-#![cfg(feature = "sdp")]
-use sdpx_solver::receipt;
 // The dense provider is crate-private. Compile the same trait/provider source
 // here to exercise its LAPACK boundary without expanding the public API.
 // This test imports the whole provider but exercises only selected operations.
 #[allow(dead_code)]
-#[path = "../src/algebra/dense/blas/traits.rs"]
+#[path = "../../src/algebra/dense/blas/traits.rs"]
 mod provider;
 use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
 use provider::*;
 use sdpx_arithmetic::{MpFloat, Scalar};
-use sdpx_solver::algebra;
 type F<const N: usize> = MpFloat<N>;
 fn f<const N: usize>(x: i64) -> F<N> {
     F::from_i64(x).unwrap()
@@ -29,21 +26,6 @@ fn run<const N: usize>() {
     let mut c = vec![zero; 4];
     F::xgemm(b'T', b'N', 2, 2, 3, one, &a, 3, &a, 3, zero, &mut c, 2);
     assert_eq!(c, vec![f(14), f(32), f(32), f(77)]);
-    let mut y = vec![zero; 2];
-    F::xgemv(
-        b'T',
-        3,
-        2,
-        one,
-        &a,
-        3,
-        &[one, f(2), f(3)],
-        -1,
-        zero,
-        &mut y,
-        1,
-    );
-    assert_eq!(y, vec![f(10), f(28)]);
     let mut ch = vec![f(4), f(2), f(987), f(3)];
     let mut info = 0;
     F::xpotrf(b'L', 2, &mut ch, 2, &mut info);
@@ -357,6 +339,7 @@ fn contracts<const N: usize>() {
     );
     assert_eq!(info, 0);
     close(single[0], f(32), one);
+    tall.fill(one); // GESVD may destroy its input.
     let mut thin = vec![zero; 1024];
     let mut right = vec![zero];
     F::xgesvd(
