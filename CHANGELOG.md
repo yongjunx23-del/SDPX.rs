@@ -25,6 +25,9 @@ solves; the experiment log is [docs/JOURNAL.md](docs/JOURNAL.md).
 - MPI cone partition balances measured per-cone scaling cost (SVD CPU per
   rank 148–202 s → 168–182 s), and sampled Grams are exchanged as packed
   upper triangles (`sync` 7.7 → 4.9 s); together about −3% more.
+- Arrow border solve splits its forward sweep over the pool and leaf
+  back-substitution splits its row couplings (both bitwise identical):
+  Λ27 4 nodes 113–115 → 109 s, 8 nodes 103–104 → 97–98 s.
 
 ## [0.9.0] - 2026-10-04
 

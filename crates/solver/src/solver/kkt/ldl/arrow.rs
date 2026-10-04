@@ -270,6 +270,45 @@ impl<T: FloatT> DenseLeaf<T> {
         }
         self.backward(x);
     }
+
+    /// `solve` with the forward sweep split over `pool`. Rows are processed
+    /// in blocks: once a block is final, every later row applies that
+    /// block's columns in ascending order (rows are independent), then the
+    /// next block finishes serially. Each entry sees the serial FMA order,
+    /// so results are bitwise identical. The backward sweep stays serial.
+    fn solve_pooled(&self, x: &mut [T], pool: Option<&rayon::ThreadPool>) {
+        const BLOCK: usize = 32;
+        let n = self.n;
+        match pool.filter(|p| p.current_num_threads() > 1 && n >= 8 * BLOCK) {
+            Some(pool) => pool.install(|| {
+                let mut r0 = 0;
+                while r0 < n {
+                    let r1 = (r0 + BLOCK).min(n);
+                    for i in r0..r1 {
+                        for k in r0..i {
+                            x[i] = (-self.l[i + k * n]).mul_add(x[k], x[i]);
+                        }
+                    }
+                    let (head, tail) = x.split_at_mut(r1);
+                    let done = &head[r0..r1];
+                    tail.par_chunks_mut(16).enumerate().for_each(|(c, rows)| {
+                        for (j, v) in rows.iter_mut().enumerate() {
+                            let i = r1 + c * 16 + j;
+                            for (k, &xk) in (r0..r1).zip(done) {
+                                *v = (-self.l[i + k * n]).mul_add(xk, *v);
+                            }
+                        }
+                    });
+                    r0 = r1;
+                }
+            }),
+            None => self.forward(x),
+        }
+        for (x, d) in x.iter_mut().zip(&self.dinv) {
+            *x *= *d;
+        }
+        self.backward(x);
+    }
 }
 
 struct Leaf<T> {
@@ -442,18 +481,32 @@ impl<T: FloatT> Leaf<T> {
     }
     fn second_many(&mut self, xt: &[T], cols: usize, chunks: usize) {
         let g = self.ids.len();
-        for i in 0..g {
-            for c in 0..cols {
-                let s = if i < self.coupling_start {
-                    T::zero()
-                } else {
-                    T::dot_fma(self.coupled.iter().map(|&j| {
-                        (
-                            &self.coupling_values()[self.coupling_index(i, j)],
-                            &xt[j * cols + c],
-                        )
-                    }))
-                };
+        // As in `second_solve`: independent row couplings, split over the
+        // ambient pool for long leaves.
+        let row = |i: usize| -> Vec<T> {
+            (0..cols)
+                .map(|c| {
+                    if i < self.coupling_start {
+                        T::zero()
+                    } else {
+                        T::dot_fma(self.coupled.iter().map(|&j| {
+                            (
+                                &self.coupling_values()[self.coupling_index(i, j)],
+                                &xt[j * cols + c],
+                            )
+                        }))
+                    }
+                })
+                .collect()
+        };
+        let pooled = rayon::current_thread_index().is_some();
+        let s: Vec<Vec<T>> = if pooled && g * self.coupled.len() * cols >= 1 << 14 {
+            (0..g).into_par_iter().with_min_len(8).map(row).collect()
+        } else {
+            (0..g).map(row).collect()
+        };
+        for (i, si) in s.into_iter().enumerate() {
+            for (c, s) in si.into_iter().enumerate() {
                 self.batch_w[i * cols + c] = (self.batch_w[i * cols + c] - s) * self.factor.dinv[i];
             }
         }
@@ -482,8 +535,10 @@ impl<T: FloatT> Leaf<T> {
 
     fn second_solve(&mut self, xt: &[T]) {
         let g = self.ids.len();
-        for i in 0..g {
-            let s = if i < self.coupling_start {
+        // Row couplings are independent dots of the final border values;
+        // long leaves split them over the ambient pool (same arithmetic).
+        let row = |i: usize| {
+            if i < self.coupling_start {
                 T::zero()
             } else {
                 T::dot_fma(
@@ -491,7 +546,16 @@ impl<T: FloatT> Leaf<T> {
                         .iter()
                         .map(|&j| (&self.coupling_values()[self.coupling_index(i, j)], &xt[j])),
                 )
-            };
+            }
+        };
+        // Only on a pool worker: a serial caller must not reach the global pool.
+        let pooled = rayon::current_thread_index().is_some();
+        let s: Vec<T> = if pooled && g * self.coupled.len() >= 1 << 14 {
+            (0..g).into_par_iter().with_min_len(8).map(row).collect()
+        } else {
+            (0..g).map(row).collect()
+        };
+        for (i, s) in s.into_iter().enumerate() {
             self.w[i] = (self.w[i] - s) * self.factor.dinv[i];
         }
         self.factor.backward(&mut self.w);
@@ -1169,7 +1233,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         crate::receipt::finish("arrow.couple", timer);
         let timer = crate::receipt::start();
-        self.tf.solve(&mut self.tx);
+        self.tf.solve_pooled(&mut self.tx, self.pool.as_deref());
         crate::receipt::finish("arrow.trunk", timer);
         let timer = crate::receipt::start();
         let tx = &self.tx;
@@ -1477,6 +1541,38 @@ mod tests {
     use super::*;
     use num_traits::{FromPrimitive, ToPrimitive, Zero};
     use sdpx_arithmetic::MpFloat;
+
+    // The pooled forward sweep must reproduce the serial solve bitwise.
+    fn pooled_solve_parity<T: FloatT>() {
+        let n = 300;
+        let mut leaf = DenseLeaf::<T>::new(n);
+        for j in 0..n {
+            for i in j + 1..n {
+                leaf.l[i + j * n] =
+                    T::from_usize((i * 7 + j * 13) % 17 + 1).unwrap() / T::from_usize(97).unwrap();
+            }
+            leaf.dinv[j] = T::from_usize(j % 5 + 2).unwrap().recip();
+        }
+        let rhs: Vec<T> = (0..n)
+            .map(|i| T::from_usize(i % 11 + 1).unwrap() / T::from_usize(3).unwrap())
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let (mut serial, mut pooled) = (rhs.clone(), rhs);
+        leaf.solve(&mut serial);
+        leaf.solve_pooled(&mut pooled, Some(&pool));
+        assert_eq!(serial, pooled);
+    }
+    #[test]
+    fn pooled_solve_parity_f64() {
+        pooled_solve_parity::<f64>();
+    }
+    #[test]
+    fn pooled_solve_parity_mpfr256() {
+        pooled_solve_parity::<sdpx_arithmetic::Bits256>();
+    }
 
     fn batch_parity<T: FloatT>() {
         let (base, signs) = arrow_kkt();

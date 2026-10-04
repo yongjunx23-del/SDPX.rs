@@ -248,6 +248,7 @@ impl SparseParallel {
             })
             .collect();
         let (o0, len) = gather_ranges[world.rank()];
+        let timer = crate::receipt::start();
         // The local segment inherits y's current values so `beta` applies to
         // the same base as the serial product.
         let mut local = y[o0..o0 + len].to_vec();
@@ -272,6 +273,7 @@ impl SparseParallel {
                 compute(o0 + i, value);
             }
         }
+        crate::receipt::finish("sharded.compute", timer);
         y.fill(T::zero());
         world.gather_slice(site, &local, &gather_ranges, y);
     }
@@ -315,6 +317,7 @@ impl SparseParallel {
             })
             .collect();
         let (o0, len) = ranges[world.rank()];
+        let timer = crate::receipt::start();
         let mut local: Vec<T> = active[o0..o0 + len].iter().map(|&r| y[r]).collect();
         let compute =
             |k: usize, value: &mut T| self.output(a, false, active[o0 + k], value, x, alpha, beta);
@@ -334,9 +337,12 @@ impl SparseParallel {
                 .enumerate()
                 .for_each(|(k, v)| compute(k, v)),
         }
+        crate::receipt::finish("sharded.active_compute", timer);
+        let timer = crate::receipt::start();
         for value in y.iter_mut() {
             scale_output(value, beta);
         }
+        crate::receipt::finish("sharded.scale_rest", timer);
         let mut all = vec![T::zero(); count];
         world.gather_slice(site, &local, &ranges, &mut all);
         for (&r, v) in active.iter().zip(all) {

@@ -5914,3 +5914,22 @@ Further scaling of this phase needs parallelism inside one cone's SVD.
 
 1-node full solves (1024 bits, 32 threads): SDPX Solved/42, solve 2170 s,
 process 36:19, load 3.4 s with parallel block parsing (222643).
+
+### Border solve and scaling to 8 nodes
+
+- Pooled forward sweep of the arrow border solve (`DenseLeaf::solve_pooled`,
+  blocks of 32 rows; every later row applies a finished block's columns in
+  ascending order, so each entry keeps the serial FMA order; the backward
+  sweep stays serial). Same allocation, 4 nodes (222675): `arrow.trunk`
+  8.6 → 4.4 s, wall.solve 117.5/113.5 → 107.6/109.2 s (−5.7%). Kept; parity
+  test `pooled_solve_parity_*`.
+- 8 nodes × 32 threads (222669, packed-Gram arm): wall.solve 107.5 s vs
+  120.1 s at 4 nodes. Refactor keeps scaling (26.5 → 18.0 s); KKT solves
+  (~17.5 s), the start iteration (~19 s), cone scaling (single-cone latency)
+  and `arrow.leaf_backward` (~7.5 s: each leaf's row dots ran serially) do not.
+- 1-node full solves: SDPB optimal/125, solver 4014 s, process 1:06:56
+  (222644); SDPX Solved/42, solve 2170 s, process 36:19.
+- Leaf back-substitution row couplings split over the pool (bitwise
+  identical; only on pool workers). Same allocation (222677/222678), with
+  the pooled border solve: 4 nodes 113.5/115.0 → 108.7/109.9 s; 8 nodes
+  103.1/104.1 → 97.2/97.9 s; `arrow.leaf_backward` 7.0 → 3.7 s at 8 nodes.
