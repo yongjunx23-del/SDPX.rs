@@ -86,14 +86,12 @@ fn stages<T: FloatT>(mixed: bool) {
     if mixed {
         kinds.push(SupportedConeT::ExponentialConeT());
     }
-    #[cfg(feature = "sdp")]
     kinds.push(SupportedConeT::PSDTriangleConeT(2));
     let m = kinds.iter().map(|c| c.nvars()).sum();
     let settings = DefaultSettings {
         max_threads: 1,
         presolve_enable: false,
         equilibrate_enable: false,
-        #[cfg(feature = "sdp")]
         chordal_decomposition_enable: false,
         ..DefaultSettings::default()
     };
@@ -151,7 +149,6 @@ fn stages<T: FloatT>(mixed: bool) {
     full.unit_initialization(&original);
     owned.unit_initialization(&cones);
     compare(&owned, &full);
-    #[cfg(feature = "sdp")]
     {
         full.s[m - 3] = n(2);
         full.s[m - 2] = T::one() / n(8);
@@ -237,9 +234,6 @@ fn stages<T: FloatT>(mixed: bool) {
     let mut full_interpolated = full.new_like();
     interpolated.interpolate(&backup, &owned, T::one() / n(4));
     full_interpolated.interpolate(&full_backup, &full, T::one() / n(4));
-    compare(&interpolated, &full_interpolated);
-    interpolated.rescale();
-    full_interpolated.rescale();
     compare(&interpolated, &full_interpolated);
     owned.copy_from(&backup);
     full.copy_from(&full_backup);

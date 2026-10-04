@@ -76,3 +76,29 @@ fn api_dim_check_bad_cones() {
     let settings = DefaultSettings::default();
     assert!(DefaultSolver::new(&P, &q, &A, &b, &cones, settings).is_err());
 }
+
+#[test]
+fn api_noncanonical_A_duplicate_rejected() {
+    let (P, q, _A, b, cones) = api_dim_check_data();
+    // Two entries in column 0 share row 0: a duplicate coordinate.
+    let A = CscMatrix::new(6, 4, vec![0, 2, 2, 2, 2], vec![0, 0], vec![1., 1.]);
+
+    let settings = DefaultSettings::default();
+    assert!(matches!(
+        DefaultSolver::new(&P, &q, &A, &b, &cones, settings),
+        Err(SolverError::BadInputData(_))
+    ));
+}
+
+#[test]
+fn api_noncanonical_A_unsorted_rejected() {
+    let (P, q, _A, b, cones) = api_dim_check_data();
+    // Rows [1, 0] inside column 0 are not strictly increasing.
+    let A = CscMatrix::new(6, 4, vec![0, 2, 2, 2, 2], vec![1, 0], vec![1., 1.]);
+
+    let settings = DefaultSettings::default();
+    assert!(matches!(
+        DefaultSolver::new(&P, &q, &A, &b, &cones, settings),
+        Err(SolverError::BadInputData(_))
+    ));
+}

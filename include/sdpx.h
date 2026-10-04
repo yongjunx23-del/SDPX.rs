@@ -42,7 +42,8 @@ typedef struct {
  sdpx_scalars basis, weights;
 } sdpx_sampled_block;
 typedef struct {
- /* precision_bits: 53 (binary64), or 128..2048 in steps of 64 (MPFR). */
+ /* precision_bits: 53 (binary64), or 128, 256, 512, 768, 1024 (MPFR) by
+  * default; builds with all-precisions accept every 128..2048 step 64. */
  uint32_t abi_version, struct_size, precision_bits, max_iter;
  /* max_threads budgets the cone worker pool and eligible KKT factorization.
   * It is not a total process thread limit. Native BLAS threads are separate.

@@ -33,7 +33,6 @@ fn check_kernels_threads<T: FloatT>(kinds: &[SupportedConeT<T>], threads: usize)
         s[i] *= T::one() + perturbation;
         z[i] *= T::one() + perturbation + perturbation;
     }
-    #[cfg(feature = "sdp")]
     {
         let mut offset = 0;
         for (cone, kind) in serial.iter().zip(kinds) {
@@ -167,12 +166,10 @@ fn mixed_mpfr256_parallel_equivalence() {
     check_kernels(&mixed::<Bits256>());
 }
 
-#[cfg(feature = "sdp")]
 #[test]
 fn psd_f64_parallel_equivalence() {
     check_kernels::<f64>(&vec![SupportedConeT::PSDTriangleConeT(16); 4]);
 }
-#[cfg(feature = "sdp")]
 #[test]
 fn psd_mpfr256_parallel_equivalence() {
     check_kernels::<Bits256>(&vec![SupportedConeT::PSDTriangleConeT(16); 4]);
@@ -334,7 +331,6 @@ fn single_orthant_complete_lp_mpfr512() {
     single_orthant_complete_lp::<sdpx_arithmetic::Bits512>(259);
 }
 
-#[cfg(feature = "sdp")]
 #[test]
 fn single_psd_shares_wider_pool_with_condensed_columns() {
     let mut cones = CompositeCone::<f64>::new(&[SupportedConeT::PSDTriangleConeT(32)]);
@@ -348,7 +344,6 @@ fn single_psd_shares_wider_pool_with_condensed_columns() {
     }
 }
 
-#[cfg(feature = "sdp")]
 fn psd_steps<T: FloatT>() {
     let num = |n: i32| T::from_i32(n).unwrap();
     let half = T::one() / num(2);
@@ -476,18 +471,15 @@ fn psd_steps<T: FloatT>() {
         assert!(pooled.sym_step_bounds.is_empty());
     }
 }
-#[cfg(feature = "sdp")]
 #[test]
 fn psd_step_lengths_f64() {
     psd_steps::<f64>();
 }
-#[cfg(feature = "sdp")]
 #[test]
 #[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn psd_step_lengths_mpfr256() {
     psd_steps::<Bits256>();
 }
-#[cfg(feature = "sdp")]
 #[test]
 #[ignore = "extended: MPFR pool/threading sweep; default f64 covers the equivalence logic"]
 fn psd_step_lengths_mpfr512() {

@@ -57,6 +57,55 @@ impl<T> Variables<T> for DefaultVariables<T>
 where
     T: FloatT,
 {
+    fn write_checkpoint(
+        &self,
+        data: &DefaultProblemData<T>,
+        path: &std::path::Path,
+        iter: u32,
+    ) -> std::io::Result<()> {
+        let eq = &data.equilibration;
+        crate::solver::core::checkpoint::write(
+            path,
+            data.checkpoint_identity(),
+            iter,
+            [self.τ, self.κ, eq.c],
+            [&self.x, &self.s, &self.z, &eq.d, &eq.e],
+        )
+    }
+
+    fn read_checkpoint(
+        &mut self,
+        data: &DefaultProblemData<T>,
+        path: &std::path::Path,
+    ) -> std::io::Result<bool> {
+        let id = data.checkpoint_identity();
+        let (n, m) = (self.x.len(), self.s.len());
+        let ck = crate::solver::core::checkpoint::read::<T>(path, id.structure, n, m)?;
+        let eq = &data.equilibration;
+        let exact = ck.values == id.values && ck.c == eq.c && ck.d == eq.d && ck.e == eq.e;
+        if exact {
+            self.x.copy_from_slice(&ck.x);
+            self.s.copy_from_slice(&ck.s);
+            self.z.copy_from_slice(&ck.z);
+        } else {
+            // Map through original coordinates: x̂ = d∘x, ŝ = s/e, ẑ = e∘z/c, κ̂ = κ/c.
+            for i in 0..n {
+                self.x[i] = (ck.d[i] * ck.x[i]) * eq.dinv[i];
+            }
+            for i in 0..m {
+                self.s[i] = (ck.s[i] / ck.e[i]) * eq.e[i];
+                self.z[i] = ((ck.e[i] * ck.z[i]) / ck.c) * (eq.c * eq.einv[i]);
+            }
+        }
+        self.τ = ck.tau;
+        self.κ = if exact {
+            ck.kappa
+        } else {
+            (ck.kappa / ck.c) * eq.c
+        };
+        Ok(exact)
+    }
+
     type D = DefaultProblemData<T>;
     type R = DefaultResiduals<T>;
     type C = CompositeCone<T>;
@@ -286,17 +335,6 @@ where
 
         barrier
     }
-
-    fn rescale(&mut self) {
-        let scale = T::max(self.τ, self.κ);
-        let invscale = scale.recip();
-
-        self.x.scale(invscale);
-        self.z.scale(invscale);
-        self.s.scale(invscale);
-        self.τ *= invscale;
-        self.κ *= invscale;
-    }
 }
 
 fn _shift_to_cone_interior<T>(z: &mut [T], cones: &mut CompositeCone<T>, pd: PrimalOrDualCone)
@@ -357,7 +395,6 @@ where
         self.κ *= scaleinv;
     }
 
-    #[cfg_attr(not(feature = "sdp"), allow(dead_code))]
     pub(crate) fn dims(&self) -> (usize, usize) {
         (self.x.len(), self.s.len())
     }
@@ -403,6 +440,6 @@ impl<T: FloatT> DefaultVariables<T> {
     }
 }
 
-#[cfg(all(test, feature = "sdp"))]
+#[cfg(test)]
 #[path = "tests/affine_prepared.rs"]
 mod affine_prepared_tests;

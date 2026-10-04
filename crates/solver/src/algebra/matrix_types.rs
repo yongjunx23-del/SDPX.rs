@@ -14,7 +14,6 @@ pub enum MatrixTriangle {
 /// Matrix triangular form marker
 impl MatrixTriangle {
     /// convert to u8 character for BLAS calls
-    #[cfg(feature = "sdp")]
     pub fn as_blas_char(&self) -> u8 {
         match self {
             MatrixTriangle::Triu => b'U',
@@ -34,19 +33,10 @@ pub enum MatrixShape {
 
 impl MatrixShape {
     /// convert to u8 character for BLAS calls
-    #[cfg(feature = "sdp")]
     pub fn as_blas_char(&self) -> u8 {
         match self {
             MatrixShape::N => b'N',
             MatrixShape::T => b'T',
-        }
-    }
-    /// transpose
-    #[allow(dead_code)]
-    pub fn t(&self) -> Self {
-        match self {
-            MatrixShape::N => MatrixShape::T,
-            MatrixShape::T => MatrixShape::N,
         }
     }
 }
@@ -66,7 +56,6 @@ pub struct Symmetric<'a, M> {
     pub uplo: MatrixTriangle,
 }
 
-#[allow(dead_code)]
 impl<M> Symmetric<'_, M>
 where
     M: TriangularMatrixChecks,
@@ -74,6 +63,7 @@ where
     pub(crate) fn is_triu_src(&self) -> bool {
         self.uplo == MatrixTriangle::Triu
     }
+    #[cfg(test)]
     pub(crate) fn is_tril_src(&self) -> bool {
         self.uplo == MatrixTriangle::Tril
     }

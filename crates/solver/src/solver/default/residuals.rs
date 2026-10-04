@@ -34,10 +34,11 @@ pub struct DefaultResiduals<T> {
     /// Local blocks must bypass the implicit MPI world and use only their
     /// shared owner worker pool when evaluating residual products.
     pub(crate) sparse_parallel_local: bool,
-    #[cfg(feature = "sdp")]
     pub(crate) sampled_workspace: Option<SampledWorkspace<T>>,
-    #[cfg(feature = "sdp")]
     pub(crate) sampled_pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    /// Binary64 dense-column view of A for serial products; built on first
+    /// use and dropped when A's values change.
+    pub(crate) a_panel: Option<Option<DenseColumns<T>>>,
 }
 
 impl<T> DefaultResiduals<T>
@@ -66,10 +67,9 @@ where
             sparse_parallel: None,
             sparse_parallel_local: false,
             products: ResidualProducts::zero(),
-            #[cfg(feature = "sdp")]
             sampled_workspace: None,
-            #[cfg(feature = "sdp")]
             sampled_pool: None,
+            a_panel: None,
         }
     }
     pub(super) fn prepare_sparse(
@@ -99,11 +99,7 @@ where
         local_only: bool,
     ) {
         self.sparse_parallel_local = local_only;
-        #[cfg(feature = "sdp")]
         let is_sampled = data.sampled.is_some();
-        #[cfg(not(feature = "sdp"))]
-        let is_sampled = false;
-        #[cfg(feature = "sdp")]
         if self.sampled_workspace.is_none() {
             if let Some(operator) = &data.sampled {
                 operator.prepare_constants(pool.as_deref());
@@ -112,10 +108,15 @@ where
                 self.sampled_workspace = Some(work);
             }
         }
+        if !is_sampled {
+            self.ensure_panel(data);
+        }
         if !is_sampled
             && self.sparse_parallel.is_none()
+            && !matches!(self.a_panel, Some(Some(_)))
             && (pool.as_ref().is_some_and(|p| p.current_num_threads() > 1)
-                || (!local_only && crate::mpi::World::get().is_some()))
+                || (!local_only && crate::mpi::World::get().is_some())
+                || T::precision_bits() > 64)
             && sparse_parallel::worthwhile(&data.A)
         {
             self.sparse_parallel = Some(sparse_parallel::SparseParallel::new(&data.A));
@@ -125,8 +126,23 @@ where
         }
     }
 
+    /// A binary64 dense-column panel serves every thread count, so results
+    /// do not depend on it; replicated MPI products keep the row plan.
+    /// `update_A` drops the panel.
+    fn ensure_panel(&mut self, data: &DefaultProblemData<T>) {
+        if self.a_panel.is_none()
+            && (self.sparse_parallel_local || crate::mpi::World::get().is_none())
+        {
+            self.a_panel = Some(DenseColumns::new(&data.A));
+        }
+    }
+
     fn ordinary_products(&mut self, variables: &DefaultVariables<T>, data: &DefaultProblemData<T>) {
-        if let Some(plan) = &self.sparse_parallel {
+        self.ensure_panel(data);
+        if let Some(Some(panel)) = &self.a_panel {
+            panel.gemv(true, &mut self.rx_inf, &variables.z, -T::one(), T::zero());
+            panel.gemv(false, &mut self.rz_inf, &variables.x, T::one(), T::one());
+        } else if let Some(plan) = &self.sparse_parallel {
             if self.sparse_parallel_local {
                 plan.residual_products_local(
                     &data.A,
@@ -189,10 +205,7 @@ where
         // operator's stripped linear view whenever factors are installed.
         // Each column accumulates only its own entries, so a column-parallel
         // pass keeps every value bitwise equal to the serial loop.
-        #[cfg(feature = "sdp")]
         let pool = self.sampled_pool.clone();
-        #[cfg(not(feature = "sdp"))]
-        let pool: Option<std::sync::Arc<rayon::ThreadPool>> = None;
         let accumulate_linear = |work: &mut [T], a: &CscMatrix<T>| {
             let column = |(col, w): (usize, &mut T)| {
                 for idx in a.colptr[col]..a.colptr[col + 1] {
@@ -213,16 +226,12 @@ where
                 _ => work[..a.n].iter_mut().enumerate().for_each(column),
             }
         };
-        #[cfg(feature = "sdp")]
         if let Some(operator) = &data.sampled {
             accumulate_linear(&mut work, operator.linear());
         } else {
             accumulate_linear(&mut work, &data.A);
         }
-        #[cfg(not(feature = "sdp"))]
-        accumulate_linear(&mut work, &data.A);
 
-        #[cfg(feature = "sdp")]
         if let Some(operator) = &data.sampled {
             let timer = crate::receipt::start();
             let sampled_workspace = self
@@ -277,13 +286,11 @@ where
         data: &DefaultProblemData<T>,
         pool: Option<std::sync::Arc<rayon::ThreadPool>>,
     ) {
-        #[cfg(feature = "sdp")]
         {
             self.sampled_pool = pool.clone();
         }
         self.prepare_sparse(data, pool);
         self.update(variables, data);
-        #[cfg(feature = "sdp")]
         {
             self.sampled_pool = None;
         }
@@ -329,7 +336,6 @@ impl<T: FloatT> DefaultResiduals<T> {
         //rx_inf .= -data.A'* variables.z
         //Same as:  residuals.rz_inf .=  data.A * variables.x + variables.s
         self.rz_inf.copy_from(&variables.s);
-        #[cfg(feature = "sdp")]
         if let Some(operator) = &data.sampled {
             let timer = crate::receipt::start();
             let work = self
@@ -353,10 +359,6 @@ impl<T: FloatT> DefaultResiduals<T> {
             );
             crate::receipt::finish("ipm_residual.products", timer);
         } else {
-            self.ordinary_products(variables, data);
-        }
-        #[cfg(not(feature = "sdp"))]
-        {
             self.ordinary_products(variables, data);
         }
 
@@ -441,6 +443,7 @@ mod tests {
         }
 
         let mut serial = DefaultResiduals::new(n, m);
+        serial.prepare_sparse(&data, None);
         serial.update(&variables, &data);
 
         let pool = Arc::new(
@@ -452,9 +455,15 @@ mod tests {
         let mut local = DefaultResiduals::new(n, m);
         local.prepare_sparse_local(&data, Some(Arc::clone(&pool)));
         assert!(local.sparse_parallel_local);
-        let plan = local.sparse_parallel.as_ref().unwrap();
-        assert!(plan.has_lanes());
-        assert_eq!(plan.test_pool_and_storage().0, 4);
+        if T::precision_bits() <= 53 {
+            // Binary64 dense columns use the panel at every thread count.
+            assert!(matches!(local.a_panel, Some(Some(_))));
+            assert!(local.sparse_parallel.is_none());
+        } else {
+            let plan = local.sparse_parallel.as_ref().unwrap();
+            assert!(plan.has_lanes());
+            assert_eq!(plan.test_pool_and_storage().0, 4);
+        }
         local.update(&variables, &data);
 
         // Every row/column lane scans the original CSC positions in order;

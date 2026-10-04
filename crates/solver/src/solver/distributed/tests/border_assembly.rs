@@ -30,7 +30,6 @@ fn problem<T: FloatT>(border: usize) -> DefaultProblemData<T> {
         &DefaultSettings {
             presolve_enable: false,
             equilibrate_enable: false,
-            #[cfg(feature = "sdp")]
             chordal_decomposition_enable: false,
             ..DefaultSettings::default()
         },

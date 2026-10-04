@@ -22,7 +22,6 @@ fn settings<T: FloatT>() -> DefaultSettings<T> {
         verbose: false,
         presolve_enable: false,
         equilibrate_enable: true,
-        #[cfg(feature = "sdp")]
         chordal_decomposition_enable: false,
         ..DefaultSettings::default()
     }
@@ -92,7 +91,6 @@ fn compare<T: FloatT>(
             );
             assert_eq!(keep.as_ref().unwrap(), &vec![true, false, false, true]);
         }
-        #[cfg(feature = "sdp")]
         {
             assert_eq!(state.data.chordal_info.is_some(), chordal);
             if let Some(c) = &state.data.chordal_info {
@@ -104,12 +102,9 @@ fn compare<T: FloatT>(
                 assert_ne!((reference.n, reference.m), original);
             }
         }
-        #[cfg(not(feature = "sdp"))]
-        assert!(!chordal);
         // Recovery metadata is central; shards must not carry redundant copies.
         for (shard, variables) in state.data.blocks.iter().zip(&state.variables.blocks) {
             assert!(shard.presolver.is_none());
-            #[cfg(feature = "sdp")]
             assert!(shard.chordal_info.is_none());
             assert_eq!(shard.n, variables.x.len());
             assert_eq!(shard.m, variables.s.len());
@@ -219,7 +214,6 @@ fn owned_recovery_mpfr512() {
     ordinary_and_presolve::<MpFloat<8>>();
 }
 
-#[cfg(feature = "sdp")]
 fn chordal<T: FloatT>() {
     let mut s = settings::<T>();
     s.chordal_decomposition_enable = true;
@@ -272,17 +266,14 @@ fn chordal<T: FloatT>() {
         compare(build, &s, (4, 10), false, true);
     }
 }
-#[cfg(feature = "sdp")]
 #[test]
 fn owned_recovery_chordal_f64() {
     chordal::<f64>();
 }
-#[cfg(feature = "sdp")]
 #[test]
 fn owned_recovery_chordal_mpfr256() {
     chordal::<MpFloat<4>>();
 }
-#[cfg(feature = "sdp")]
 #[test]
 fn owned_recovery_chordal_mpfr512() {
     chordal::<MpFloat<8>>();

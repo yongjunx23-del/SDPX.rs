@@ -1,11 +1,18 @@
-//! Shared exact precision dispatch for the CLI and C ABI.
+//! Shared exact precision dispatch for the CLI, C ABI and converter.
 
 /// Precision choices built into the executable frontends. The native Rust API
 /// also accepts `MpFloat<N>` outside this range.
+#[cfg(feature = "all-precisions")]
 pub const FRONTEND_PRECISION_HELP: &str =
     "53 (Float64), or multiples of 64 from 128 through 2048 (MPFR)";
 
+/// Precision choices built into the executable frontends. The native Rust API
+/// also accepts `MpFloat<N>` outside this range.
+#[cfg(not(feature = "all-precisions"))]
+pub const FRONTEND_PRECISION_HELP: &str = "53 (Float64), 128, 256, 512, 768, or 1024 (MPFR); build with the all-precisions feature for every multiple of 64 from 128 through 2048";
+
 /// Invoke an internal callback with `(bits, variant, scalar)` entries.
+#[cfg(feature = "all-precisions")]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! with_frontend_precisions {
@@ -48,14 +55,11 @@ macro_rules! with_frontend_precisions {
     };
 }
 
-/// Common precisions for smaller solver CLI builds. The complete dispatch
-/// remains available through `with_frontend_precisions`.
-pub const DEFAULT_FRONTEND_PRECISION_HELP: &str =
-    "53 (Float64), 128, 256, 512, 768, or 1024 (MPFR); build with all-precisions for the full range";
-
+/// Invoke an internal callback with `(bits, variant, scalar)` entries.
+#[cfg(not(feature = "all-precisions"))]
 #[doc(hidden)]
 #[macro_export]
-macro_rules! with_default_precisions {
+macro_rules! with_frontend_precisions {
     ($callback:ident $(, $arg:tt)*) => {
         $callback! {
             [$($arg),*]

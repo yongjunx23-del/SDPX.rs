@@ -1,7 +1,6 @@
 //! One-time split of prepared data into persistent owner-local storage.
 //! Iteration and recovery are implemented by the shared HSD consumers.
 use super::*;
-#[cfg(feature = "sdp")]
 use std::sync::Arc;
 
 pub(crate) struct OwnerState<T: FloatT> {
@@ -33,7 +32,6 @@ pub(crate) struct OwnedState<T: FloatT> {
     pub internal_cones: Vec<SupportedConeT<T>>,
     pub presolver: Option<Presolver<T>>,
     pub cost: CostRuntimeConfig,
-    #[cfg(feature = "sdp")]
     pub chordal_info: Option<ChordalInfo<T>>,
 }
 
@@ -79,7 +77,6 @@ impl<T: FloatT> OwnedState<T> {
         Self::from_layout(data, layout, CostRuntimeConfig::disabled(), None)
     }
 
-    #[cfg(feature = "sdp")]
     pub(crate) fn new_with_history(
         data: DefaultProblemData<T>,
         count: usize,
@@ -102,7 +99,6 @@ impl<T: FloatT> OwnedState<T> {
         Self::from_layout(data, layout, cost, None)
     }
 
-    #[cfg(feature = "sdp")]
     pub(crate) fn new_auto_with_history(
         data: DefaultProblemData<T>,
         cost: CostRuntimeConfig,
@@ -127,7 +123,6 @@ impl<T: FloatT> OwnedState<T> {
     /// The full structural layout and shared equality metadata remain
     /// available to the caller, but unowned matrix/cone workspaces are never
     /// allocated in `owners`.
-    #[cfg(feature = "sdp")]
     pub(crate) fn new_rank_local_with_history(
         data: DefaultProblemData<T>,
         count: usize,
@@ -211,7 +206,6 @@ impl<T: FloatT> OwnedState<T> {
                 einv: selected(&eq.einv, &ids.rows),
                 c,
             };
-            #[cfg(feature = "sdp")]
             let sampled = data
                 .sampled
                 .as_ref()
@@ -264,11 +258,8 @@ impl<T: FloatT> OwnedState<T> {
                 normb: None,
                 presolver: None,
                 dropped_zeros: 0,
-                #[cfg(feature = "sdp")]
                 sampled,
-                #[cfg(feature = "sdp")]
                 sampled_input: data.sampled_input,
-                #[cfg(feature = "sdp")]
                 chordal_info: None,
             };
             let variables = DefaultVariables::new(local.n, local.m);
@@ -309,21 +300,20 @@ impl<T: FloatT> OwnedState<T> {
             internal_cones: std::mem::take(&mut data.cones),
             presolver: data.presolver.take(),
             cost,
-            #[cfg(feature = "sdp")]
             chordal_info: data.chordal_info.take(),
         })
     }
 }
 
-#[cfg(all(test, feature = "sdp"))]
+#[cfg(test)]
 #[path = "tests/state.rs"]
 pub(super) mod tests;
 
-#[cfg(all(test, feature = "sdp"))]
+#[cfg(test)]
 #[path = "tests/recovery.rs"]
 mod recovery_tests;
 
-#[cfg(all(test, feature = "sdp", feature = "serde"))]
+#[cfg(all(test, feature = "serde"))]
 #[path = "tests/ising.rs"]
 mod ising_tests;
 

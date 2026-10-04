@@ -19,7 +19,6 @@ fn settings<T: FloatT>(workers: usize) -> DefaultSettings<T> {
         max_iter: 100,
         max_threads: workers as u32,
         presolve_enable: false,
-        #[cfg(feature = "sdp")]
         chordal_decomposition_enable: false,
         tol_feas: tolerance,
         tol_gap_abs: tolerance,
@@ -299,7 +298,6 @@ fn owned_pool_presolve_recovery_matches_default() {
     assert_eq!(owned.solution.0.z[1], 0.0);
 }
 
-#[cfg(feature = "sdp")]
 fn chordal_inputs<T: FloatT>(
     workers: usize,
 ) -> (
@@ -337,7 +335,6 @@ fn chordal_inputs<T: FloatT>(
     (p, q, a, b.to_vec(), cones.to_vec(), set)
 }
 
-#[cfg(feature = "sdp")]
 fn chordal_prepared<T: FloatT>(workers: usize) -> PreparedProblem<T> {
     let (p, q, a, b, cones, mut set) = chordal_inputs(workers);
     // Exercise the ordinary default stopping criterion. In the decomposed
@@ -349,12 +346,10 @@ fn chordal_prepared<T: FloatT>(workers: usize) -> PreparedProblem<T> {
     PreparedProblem::new(&p, &q, &a, &b, &cones, set).unwrap()
 }
 
-#[cfg(feature = "sdp")]
 fn chordal_problem<T: FloatT>(workers: usize) -> DefaultSolver<T> {
     DefaultSolver::from_prepared(chordal_prepared(workers)).unwrap()
 }
 
-#[cfg(feature = "sdp")]
 #[test]
 fn owned_pool_chordal_psd4_recovery_matches_default() {
     let mut reference = chordal_problem::<f64>(1);

@@ -14,8 +14,6 @@ pub(crate) mod mpi;
 pub use mpi::MpiContext;
 pub mod qdldl;
 pub mod receipt;
-#[cfg(feature = "snapshot")]
-pub mod snapshot;
 pub mod solver;
 pub mod timers;
 

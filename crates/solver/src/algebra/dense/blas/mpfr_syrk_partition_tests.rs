@@ -1,12 +1,6 @@
 use super::*;
 
-fn leaves(
-    n: usize,
-    begin: usize,
-    end: usize,
-    lanes: usize,
-    upper: bool,
-) -> Vec<(usize, usize)> {
+fn leaves(n: usize, begin: usize, end: usize, lanes: usize, upper: bool) -> Vec<(usize, usize)> {
     if lanes == 1 {
         return vec![(begin, end)];
     }

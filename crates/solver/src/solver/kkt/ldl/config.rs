@@ -1,4 +1,4 @@
-use super::{auto::AutoDirectLDLSolver, qdldl::QDLDLDirectLDLSolver};
+use super::qdldl::QDLDLDirectLDLSolver;
 use crate::{
     algebra::{CscMatrix, FloatT, MatrixTriangle},
     solver::{kkt::direct::BoxedDirectLDLSolver, CoreSettings},
@@ -28,13 +28,15 @@ pub trait LDLConfiguration: Sized {
 }
 
 macro_rules! primitive_configuration {
-    ($t:ty) => {
+    ($t:ty, $dense:expr) => {
         impl LDLConfiguration for $t {
             fn get_ldlsolver_config(
                 settings: &CoreSettings<Self>,
             ) -> (MatrixTriangle, LDLConstructor<Self>) {
                 match settings.direct_solve_method.as_str() {
-                    "auto" => (MatrixTriangle::Triu, AutoDirectLDLSolver::new),
+                    "auto" => (MatrixTriangle::Triu, |m, d, s, _p| {
+                        Self::auto_ldlsolver(m, d, s)
+                    }),
                     "qdldl" => (MatrixTriangle::Triu, |m, d, s, p| {
                         Box::new(QDLDLDirectLDLSolver::new(m, d, s, p))
                     }),
@@ -42,7 +44,10 @@ macro_rules! primitive_configuration {
                     "faer" => (MatrixTriangle::Triu, |m, d, s, p| {
                         Box::new(super::faer_ldl::FaerDirectLDLSolver::new(m, d, s, p))
                     }),
-                    method => Self::specialized_ldl(method),
+                    method => panic!(
+                        "LDL backend {method:?} is unavailable for {}",
+                        stringify!($t)
+                    ),
                 }
             }
 
@@ -51,7 +56,12 @@ macro_rules! primitive_configuration {
                 signs: &[i8],
                 settings: &CoreSettings<Self>,
             ) -> BoxedDirectLDLSolver<Self> {
-                if let Some(solver) = Self::dense_ldl(matrix, signs, settings) {
+                let dense: fn(
+                    &CscMatrix<Self>,
+                    &[i8],
+                    &CoreSettings<Self>,
+                ) -> Option<BoxedDirectLDLSolver<Self>> = $dense;
+                if let Some(solver) = dense(matrix, signs, settings) {
                     return solver;
                 }
                 #[cfg(feature = "faer-sparse")]
@@ -67,51 +77,17 @@ macro_rules! primitive_configuration {
     };
 }
 
-trait SpecializedLDL: FloatT {
-    fn specialized_ldl(method: &str) -> (MatrixTriangle, LDLConstructor<Self>);
-    fn dense_ldl(
-        _matrix: &CscMatrix<Self>,
-        _signs: &[i8],
-        _settings: &CoreSettings<Self>,
-    ) -> Option<BoxedDirectLDLSolver<Self>> {
-        None
-    }
-}
-/// Single-precision stays configured because the dense BLAS suites exercise
-/// both `s`- and `d`-prefixed kernels; the solver itself is instantiated only
-/// at f64 and the fixed-precision MPFR types.
-impl SpecializedLDL for f32 {
-    fn specialized_ldl(method: &str) -> (MatrixTriangle, LDLConstructor<Self>) {
-        panic!("LDL backend {method:?} is unavailable for Float32")
-    }
-}
-impl SpecializedLDL for f64 {
-    fn dense_ldl(
-        matrix: &CscMatrix<Self>,
-        signs: &[i8],
-        settings: &CoreSettings<Self>,
-    ) -> Option<BoxedDirectLDLSolver<Self>> {
-        #[cfg(feature = "sdp")]
-        {
-            super::dense_block::DenseBlockSolver::try_new(matrix, signs, settings)
-                .map(|solver| Box::new(solver) as BoxedDirectLDLSolver<Self>)
-                .or_else(|| {
-                    super::arrow::ArrowLDLSolver::try_new(matrix, signs, settings)
-                        .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
-                })
-        }
-        #[cfg(not(feature = "sdp"))]
-        {
-            let _ = (matrix, signs, settings);
-            None
-        }
-    }
-    fn specialized_ldl(method: &str) -> (MatrixTriangle, LDLConstructor<Self>) {
-        panic!("LDL backend {method:?} is unavailable for Float64")
-    }
-}
-primitive_configuration!(f32);
-primitive_configuration!(f64);
+// Single precision is configured only so the dense BLAS suites can exercise
+// the `s`-prefixed kernels; the solver itself runs at f64 and MPFR.
+primitive_configuration!(f32, |_, _, _| None);
+primitive_configuration!(f64, |matrix, signs, settings| {
+    super::dense_block::DenseBlockSolver::try_new(matrix, signs, settings)
+        .map(|s| Box::new(s) as BoxedDirectLDLSolver<f64>)
+        .or_else(|| {
+            super::arrow::ArrowLDLSolver::try_new(matrix, signs, settings)
+                .map(|a| Box::new(a) as BoxedDirectLDLSolver<f64>)
+        })
+});
 
 impl<const N: usize> LDLConfiguration for MpFloat<N> {
     fn get_ldlsolver_config(

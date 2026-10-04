@@ -11,7 +11,6 @@ fn data<T: FloatT>(
 ) -> DefaultProblemData<T> {
     let settings = DefaultSettings {
         presolve_enable: false,
-        #[cfg(feature = "sdp")]
         chordal_decomposition_enable: false,
         equilibrate_enable: false,
         input_sparse_dropzeros: false,
@@ -153,7 +152,6 @@ fn owner_layout_generic_mpfr512() {
     generic::<MpFloat<8>>();
 }
 
-#[cfg(feature = "sdp")]
 #[test]
 fn owner_layout_shared_sampled_ranges() {
     use crate::solver::{SampledBlock, SampledOperator};
@@ -325,7 +323,6 @@ fn owner_inner_admission_is_dominant_and_deterministic() {
     assert!(!equal.owner_inner_admission(1));
 }
 
-#[cfg(feature = "sdp")]
 #[test]
 fn owner_layout_auto_canonical_sampled_coupling() {
     use crate::solver::{SampledBlock, SampledOperator};
@@ -354,7 +351,7 @@ fn owner_layout_auto_canonical_sampled_coupling() {
     invariant(&auto);
 }
 
-#[cfg(all(feature = "sdp", feature = "serde"))]
+#[cfg(feature = "serde")]
 #[test]
 fn historical_costs_validate_identity_and_change_only_lpt_order() {
     let p = CscMatrix::identity(4);

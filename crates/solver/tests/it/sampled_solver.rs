@@ -1,4 +1,3 @@
-#![cfg(feature = "sdp")]
 use sdpx_solver::algebra::{CscMatrix, FloatT};
 use sdpx_solver::solver::*;
 

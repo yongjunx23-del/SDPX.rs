@@ -199,6 +199,7 @@ fn live_residual_updates<T: FloatT>(soc: bool) {
             *value += num::<T>(i % 3 + 1) / num::<T>(128);
         }
         solver.update_A(&a).unwrap();
+        serial.a_panel = None;
         serial.update(&solver.variables, &solver.data);
         solver.residuals.update_with_pool(
             &solver.variables,
@@ -236,7 +237,8 @@ fn live_residual_updates<T: FloatT>(soc: bool) {
                 ));
             }
         } else {
-            assert_eq!(threads, 1);
+            // Binary64 dense columns use the panel at every thread count.
+            assert!(threads == 1 || matches!(solver.residuals.a_panel, Some(Some(_))));
         }
     }
 }
@@ -259,7 +261,6 @@ fn sparse_live_lp_soc_mpfr512() {
     live_residual_updates::<sdpx_arithmetic::Bits512>(true);
 }
 
-#[cfg(feature = "sdp")]
 #[test]
 fn sampled_factor_residuals_do_not_build_sparse_row_plan() {
     let block = SampledBlock {

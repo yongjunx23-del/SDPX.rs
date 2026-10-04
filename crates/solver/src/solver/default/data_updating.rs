@@ -14,14 +14,12 @@ pub enum DataUpdateError {
     #[error("Data updates are not allowed if structural zeros have been dropped")]
     /// Data updates are not allowed if structural zeros have been dropped
     DroppedStructuralZeros,
-    #[cfg(feature = "sdp")]
     #[error("Data updates are not allowed when chordal decomposition is active")]
     /// Data updates are not allowed when chordal decomposition is active
     ChordalDecompositionIsActive,
     #[error("Data formatting error")]
     /// Data formatting error.   See [`SparseFormatError`]
     BadFormat(#[from] SparseFormatError),
-    #[cfg(feature = "sdp")]
     #[error("Update sampled factors by preparing a new sampled problem")]
     /// A factor-defined constraint matrix requires preparing new sampled input.
     SampledMatrixUpdate,
@@ -85,7 +83,6 @@ where
         A: &DataA,
         b: &Datab,
     ) -> Result<(), DataUpdateError> {
-        #[cfg(feature = "sdp")]
         if self.data.sampled_input && !A.is_empty_update() {
             return Err(DataUpdateError::SampledMatrixUpdate);
         }
@@ -134,7 +131,6 @@ where
         &mut self,
         data: &Data,
     ) -> Result<(), DataUpdateError> {
-        #[cfg(feature = "sdp")]
         if self.data.sampled_input {
             return if data.is_empty_update() {
                 Ok(())
@@ -146,6 +142,7 @@ where
         let d = &self.data.equilibration.d;
         let e = &self.data.equilibration.e;
         data.update_matrix(&mut self.data.A, e, d, None)?;
+        self.residuals.a_panel = None;
         // overwrite KKT data
         self.kktsystem.update_A(&self.data.A);
         Ok(())
@@ -189,7 +186,6 @@ where
         if self.data.is_dropped_zeros() {
             return Err(DataUpdateError::DroppedStructuralZeros);
         }
-        #[cfg(feature = "sdp")]
         if self.data.is_chordal_decomposed() {
             return Err(DataUpdateError::ChordalDecompositionIsActive);
         }

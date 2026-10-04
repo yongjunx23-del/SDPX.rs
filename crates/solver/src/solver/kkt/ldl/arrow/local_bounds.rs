@@ -6,6 +6,7 @@
 //! multipliers and unbounded variables form the border. The parent KKT solver
 //! still regularizes and refines against the complete original operator.
 use super::*;
+use crate::algebra::ResidueCache;
 use crate::solver::cones::{CompositeCone, SupportedCone};
 
 impl<T: FloatT> ArrowLDLSolver<T> {
@@ -66,16 +67,18 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             .any(|(&bound, &used)| bound && !used)
             || groups.len() < 64
             || trunk.is_empty()
-            || trunk.len() > 128
         {
             return None;
         }
         let t = trunk.len() as u128;
+        let packed = T::precision_bits() > 64
+            || (cfg!(feature = "faer-sparse")
+                && std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>());
         let cells = groups
             .iter()
             .map(|g| {
                 let g = g.len() as u128;
-                2 * g * g + 3 * t + 4 * g
+                2 * g * g + 4 * g + if packed { 0 } else { 3 * t }
             })
             .sum::<u128>()
             + 6 * t * t
@@ -89,7 +92,11 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         } else {
             0
         };
-        if cells * std::mem::size_of::<T>() as u128 + packed_bytes > ARROW_MAX_BYTES {
+        // Tall couplings already occupy the input CSC. Bound the additional
+        // dense storage, rather than rejecting a large, already dense LP.
+        if cells * std::mem::size_of::<T>() as u128 + packed_bytes
+            > ARROW_MAX_BYTES + k.nzval.len() as u128 * std::mem::size_of::<T>() as u128
+        {
             return None;
         }
         let mut owner = vec![usize::MAX; k.n];
@@ -105,14 +112,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         {
             return None;
         }
-        // Diagonal P only. Reject cross-leaf edges and malformed CSC before
-        // installing the persistent block map; stored zeros remain edges.
+        // Diagonal P only. Reject cross-leaf edges before installing the
+        // persistent block map; stored zeros remain edges.
         for j in 0..k.n {
             for p in k.colptr[j]..k.colptr[j + 1] {
                 let i = k.rowval[p];
-                if i > j
-                    || (p > k.colptr[j] && k.rowval[p - 1] >= i)
-                    || (j < n && i != j)
+                if (j < n && i != j)
                     || (owner[i] != usize::MAX && owner[j] != usize::MAX && owner[i] != owner[j])
                 {
                     return None;
@@ -135,28 +140,235 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     }
 }
 
+#[cfg(feature = "faer-sparse")]
+const BOUND_BLAS_COLS: usize = 16;
+
 // Persistent column-major panels avoid gathering individual leaves for every
 // Schur entry. Only actual binary64 problems enter this path; MPFR never casts.
 #[cfg(feature = "faer-sparse")]
+/// `out = op(Y)·x` for the column-major `n × t` panel `Y` and `cols`
+/// right-hand sides (`op` = `N`: n × cols out, `T`: t × cols out), through
+/// the linked BLAS like the bound Gram.
+fn panel_product(
+    op: u8,
+    y: &[f64],
+    n: usize,
+    t: usize,
+    x: &[f64],
+    cols: usize,
+    out: &mut [f64],
+    pool: Option<&rayon::ThreadPool>,
+) {
+    let (rows, inner, tile) = if op == b'N' {
+        (n, t, 128 * BOUND_BLAS_COLS)
+    } else {
+        (t, n, BOUND_BLAS_COLS)
+    };
+    if pool.is_none() || n * t * cols < 262144 {
+        // SAFETY: y is n×t, x is inner×cols and out is rows×cols.
+        unsafe {
+            if cols == 1 {
+                blas::dgemv(op, n as i32, t as i32, 1.0, y, n as i32, x, 1, 0.0, out, 1);
+                return;
+            }
+            blas::dgemm(
+                op,
+                b'N',
+                rows as i32,
+                cols as i32,
+                inner as i32,
+                1.0,
+                y,
+                n as i32,
+                x,
+                inner as i32,
+                0.0,
+                out,
+                rows as i32,
+            );
+        }
+        return;
+    }
+    let product = |(j, dst): (usize, &mut [f64]), rhs: &[f64]| {
+        let first = j * tile;
+        let offset = if op == b'N' { first } else { first * n };
+        // SAFETY: each tile owns its output rows. The panel retains its
+        // original leading dimension; RHS columns are processed separately.
+        unsafe {
+            if cols == 1 {
+                let (m, columns) = if op == b'N' {
+                    (dst.len(), t)
+                } else {
+                    (n, dst.len())
+                };
+                blas::dgemv(
+                    op,
+                    m as i32,
+                    columns as i32,
+                    1.0,
+                    &y[offset..],
+                    n as i32,
+                    rhs,
+                    1,
+                    0.0,
+                    dst,
+                    1,
+                );
+                return;
+            }
+            blas::dgemm(
+                op,
+                b'N',
+                dst.len() as i32,
+                1,
+                inner as i32,
+                1.0,
+                &y[offset..],
+                n as i32,
+                rhs,
+                inner as i32,
+                0.0,
+                dst,
+                dst.len() as i32,
+            );
+        }
+    };
+    // Fixed tiles retain the same accumulation across parallel thread counts.
+    pool.unwrap().install(|| {
+        out.par_chunks_mut(rows)
+            .zip(x.par_chunks(inner))
+            .for_each(|(dst, rhs)| {
+                dst.par_chunks_mut(tile)
+                    .enumerate()
+                    .for_each(|tile| product(tile, rhs));
+            });
+    });
+}
+
+#[cfg(feature = "faer-sparse")]
+fn bound_gram(y: &[f64], z: &[f64], n: usize, t: usize, out: &mut [f64], parallel: bool) {
+    let tile = BOUND_BLAS_COLS;
+    let gram = |(j, dst): (usize, &mut [f64])| {
+        let first = j * tile;
+        let columns = dst.len() / t;
+        let end = first + columns;
+        // SAFETY: each task owns complete output columns. The off-diagonal
+        // rectangle starts below its diagonal tile, with leading dimension t.
+        unsafe {
+            if end < t {
+                blas::dgemm(
+                    b'T',
+                    b'N',
+                    (t - end) as i32,
+                    columns as i32,
+                    n as i32,
+                    1.0,
+                    &y[end * n..],
+                    n as i32,
+                    &z[first * n..],
+                    n as i32,
+                    0.0,
+                    &mut dst[end..],
+                    t as i32,
+                );
+            }
+            // Z contains individually rounded Y*d products. A symmetric
+            // rank-k update would change that operator, so keep YᵀZ dots.
+            for col in 0..columns {
+                let start = first + col;
+                blas::dgemm(
+                    b'T',
+                    b'N',
+                    (end - start) as i32,
+                    1,
+                    n as i32,
+                    1.0,
+                    &y[start * n..],
+                    n as i32,
+                    &z[start * n..],
+                    n as i32,
+                    0.0,
+                    &mut dst[col * t + start..],
+                    t as i32,
+                );
+            }
+        }
+    };
+    if parallel {
+        out.par_chunks_mut(t * tile).enumerate().for_each(gram);
+    } else {
+        out.chunks_mut(t * tile).enumerate().for_each(gram);
+    }
+}
+
+#[cfg(feature = "faer-sparse")]
 pub(super) struct BoundPanels {
-    y: Vec<f64>,
+    pub(super) y: Vec<f64>,
     z: Vec<f64>,
     gram: Vec<f64>,
     rhs: Vec<f64>,
     border: Vec<f64>,
     pub(super) residual_entries: Vec<(usize, usize, usize)>,
+    pub(super) primal_start: Option<usize>,
+    // Leaf factors copied into flat arrays after each refactor, so the batched
+    // bound solve streams them instead of chasing per-leaf allocations.
+    flat: FlatLeaves,
+}
+
+/// Per-leaf ids, strict-lower L entries and dinv, concatenated. The bound
+/// coupling is the last row; leaf i spans off[i]..off[i+1] (loff for L).
+#[cfg(feature = "faer-sparse")]
+#[derive(Default)]
+struct FlatLeaves {
+    stale: bool,
+    off: Vec<usize>,
+    loff: Vec<usize>,
+    ids: Vec<usize>,
+    l: Vec<f64>,
+    dinv: Vec<f64>,
+}
+
+#[cfg(feature = "faer-sparse")]
+impl FlatLeaves {
+    fn rebuild<T: FloatT>(&mut self, leaves: &[Leaf<T>]) {
+        if self.off.is_empty() {
+            self.off.push(0);
+            self.loff.push(0);
+            for leaf in leaves {
+                let g = leaf.ids.len();
+                self.ids.extend_from_slice(&leaf.ids);
+                self.off.push(self.ids.len());
+                self.loff.push(self.loff.last().unwrap() + g * (g - 1) / 2);
+            }
+        }
+        self.l.clear();
+        self.dinv.clear();
+        for leaf in leaves {
+            let g = leaf.ids.len();
+            self.l.push(leaf.factor.l[1].to_f64().unwrap());
+            if g == 3 {
+                self.l.push(leaf.factor.l[2].to_f64().unwrap());
+                self.l.push(leaf.factor.l[5].to_f64().unwrap());
+            }
+            self.dinv
+                .extend(leaf.factor.dinv.iter().map(|v| v.to_f64().unwrap()));
+        }
+        self.stale = false;
+    }
 }
 
 #[cfg(feature = "faer-sparse")]
 impl BoundPanels {
     pub(super) fn new(capacity: usize, border: usize) -> Self {
         Self {
-            y: Vec::with_capacity(capacity * border),
+            y: vec![0.0; capacity * border],
             z: Vec::with_capacity(capacity * border),
             gram: vec![0.0; border * border],
+            flat: FlatLeaves::default(),
             rhs: Vec::new(),
             border: Vec::new(),
             residual_entries: Vec::new(),
+            primal_start: None,
         }
     }
 }
@@ -169,27 +381,44 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         };
         let n = self.leaves.len();
         let t = self.trunk.len();
+        panels.flat.stale = true;
         panels.y.resize(n * t, 0.0);
         panels.z.resize(n * t, 0.0);
-        for j in 0..t {
-            for (i, leaf) in self.leaves.iter().enumerate() {
-                panels.y[i + j * n] = leaf.coupling_values()[j].to_f64().unwrap();
-                panels.z[i + j * n] = (leaf.coupling_values()[j]
-                    * leaf.factor.dinv[leaf.coupling_start])
-                    .to_f64()
-                    .unwrap();
+        // Z = Y D^-1: the multiplies are bitwise the same products the old
+        // per-leaf reads formed, just computed column-contiguously.
+        // Solve scratch is refilled before its next read.
+        panels.rhs.clear();
+        panels.rhs.extend(
+            self.leaves
+                .iter()
+                .map(|leaf| leaf.factor.dinv[leaf.coupling_start].to_f64().unwrap()),
+        );
+        let d = &panels.rhs;
+        let scale = |(z, y): (&mut [f64], &[f64])| {
+            for ((z, y), d) in z.iter_mut().zip(y).zip(d) {
+                *z = y * d;
+            }
+        };
+        // Scale first, then form fixed column tiles on the existing pool.
+        // Every lower-triangle entry is formed once; tile shapes are fixed.
+        match &self.pool {
+            Some(pool) if n * t * t >= 262144 => pool.install(|| {
+                panels
+                    .z
+                    .par_chunks_mut(n)
+                    .zip(panels.y.par_chunks(n))
+                    .for_each(scale);
+                bound_gram(&panels.y, &panels.z, n, t, &mut panels.gram, true);
+            }),
+            _ => {
+                panels
+                    .z
+                    .chunks_mut(n)
+                    .zip(panels.y.chunks(n))
+                    .for_each(scale);
+                bound_gram(&panels.y, &panels.z, n, t, &mut panels.gram, false);
             }
         }
-        // Serial SIMD reduction keeps the same result at every requested
-        // thread count. Leaf work can still use the caller's thread pool.
-        faer::linalg::matmul::matmul(
-            faer::MatMut::from_column_major_slice_mut(&mut panels.gram, t, t),
-            faer::Accum::Replace,
-            faer::MatRef::from_column_major_slice(&panels.y, n, t).transpose(),
-            faer::MatRef::from_column_major_slice(&panels.z, n, t),
-            1.0,
-            faer::Par::Seq,
-        );
         for j in 0..t {
             for i in j..t {
                 let value = self.c[i + j * t] - T::from_f64(panels.gram[i + j * t]).unwrap();
@@ -208,25 +437,46 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let Some(panels) = self.bound_panels.as_mut() else {
             return false;
         };
-        let n = self.leaves.len();
-        let t = self.trunk.len();
+        let (n, t, dim) = (self.leaves.len(), self.trunk.len(), self.n);
+        if panels.flat.stale || panels.flat.off.len() != n + 1 {
+            panels.flat.rebuild(&self.leaves);
+        }
+        let f = &panels.flat;
         panels.rhs.resize(n * cols, 0.0);
         panels.border.resize(t * cols, 0.0);
-        for (i, leaf) in self.leaves.iter_mut().enumerate() {
-            leaf.first_many(b, self.n, cols, 1);
+        // Leaf output slots hold forward intermediates until the backward
+        // solve; the intervening border solve writes only disjoint trunk ids.
+        // Forward leaf solves, as `Leaf::first_many` and
+        // `DenseLeaf::forward_many`: same fused updates in the same order.
+        for i in 0..n {
+            let (o, g) = (f.off[i], f.off[i + 1] - f.off[i]);
+            let l = &f.l[f.loff[i]..f.loff[i + 1]];
+            debug_assert!(g == 2 || g == 3);
             for c in 0..cols {
-                panels.rhs[i + c * n] = leaf.batch_v[leaf.coupling_start * cols + c]
-                    .to_f64()
-                    .unwrap();
+                let w0 = b[c * dim + f.ids[o]].to_f64().unwrap();
+                let w1 = (-l[0]).mul_add(w0, b[c * dim + f.ids[o + 1]].to_f64().unwrap());
+                x[f.ids[o] + c * dim] = T::from_f64(w0).unwrap();
+                x[f.ids[o + 1] + c * dim] = T::from_f64(w1).unwrap();
+                let last = if g == 3 {
+                    let w2 = (-l[1]).mul_add(w0, b[c * dim + f.ids[o + 2]].to_f64().unwrap());
+                    let w2 = (-l[2]).mul_add(w1, w2);
+                    x[f.ids[o + 2] + c * dim] = T::from_f64(w2).unwrap();
+                    w2
+                } else {
+                    w1
+                };
+                panels.rhs[i + c * n] = last * f.dinv[o + g - 1];
             }
         }
-        faer::linalg::matmul::matmul(
-            faer::MatMut::from_column_major_slice_mut(&mut panels.border, t, cols),
-            faer::Accum::Replace,
-            faer::MatRef::from_column_major_slice(&panels.y, n, t).transpose(),
-            faer::MatRef::from_column_major_slice(&panels.rhs, n, cols),
-            1.0,
-            faer::Par::Seq,
+        panel_product(
+            b'T',
+            &panels.y,
+            n,
+            t,
+            &panels.rhs,
+            cols,
+            &mut panels.border,
+            self.pool.as_deref(),
         );
         for c in 0..cols {
             for (j, &id) in self.trunk.iter().enumerate() {
@@ -238,31 +488,38 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 panels.border[j + c * t] = self.tx[j].to_f64().unwrap();
             }
         }
-        faer::linalg::matmul::matmul(
-            faer::MatMut::from_column_major_slice_mut(&mut panels.rhs, n, cols),
-            faer::Accum::Replace,
-            faer::MatRef::from_column_major_slice(&panels.y, n, t),
-            faer::MatRef::from_column_major_slice(&panels.border, t, cols),
-            1.0,
-            faer::Par::Seq,
+        panel_product(
+            b'N',
+            &panels.y,
+            n,
+            t,
+            &panels.border,
+            cols,
+            &mut panels.rhs,
+            self.pool.as_deref(),
         );
-        for (i, leaf) in self.leaves.iter_mut().enumerate() {
-            for r in 0..leaf.ids.len() {
-                for c in 0..cols {
-                    let value = if r == leaf.coupling_start {
-                        T::from_f64(panels.rhs[i + c * n]).unwrap()
-                    } else {
-                        T::zero()
-                    };
-                    leaf.batch_w[r * cols + c] =
-                        (leaf.batch_w[r * cols + c] - value) * leaf.factor.dinv[r];
-                }
-            }
-            leaf.factor.backward_many(&mut leaf.batch_w, cols);
-            for (r, &id) in leaf.ids.iter().enumerate() {
-                for c in 0..cols {
-                    x[id + c * self.n] = leaf.batch_w[r * cols + c];
-                }
+        // Backward leaf solves, as `DenseLeaf::backward_many`; rows other than
+        // the coupling row subtract zero, which leaves them unchanged.
+        for i in 0..n {
+            let (o, g) = (f.off[i], f.off[i + 1] - f.off[i]);
+            let l = &f.l[f.loff[i]..f.loff[i + 1]];
+            for c in 0..cols {
+                let w0 = (x[f.ids[o] + c * dim].to_f64().unwrap() - 0.0) * f.dinv[o];
+                let value = panels.rhs[i + c * n];
+                let w1 = (x[f.ids[o + 1] + c * dim].to_f64().unwrap()
+                    - if g == 2 { value } else { 0.0 })
+                    * f.dinv[o + 1];
+                let (w0, w1) = if g == 3 {
+                    let w2 = (x[f.ids[o + 2] + c * dim].to_f64().unwrap() - value) * f.dinv[o + 2];
+                    let w1 = (-l[2]).mul_add(w2, w1);
+                    let w0 = (-l[0]).mul_add(w1, w0);
+                    x[f.ids[o + 2] + c * dim] = T::from_f64(w2).unwrap();
+                    ((-l[1]).mul_add(w2, w0), w1)
+                } else {
+                    ((-l[0]).mul_add(w1, w0), w1)
+                };
+                x[f.ids[o] + c * dim] = T::from_f64(w0).unwrap();
+                x[f.ids[o + 1] + c * dim] = T::from_f64(w1).unwrap();
             }
         }
         true
@@ -280,40 +537,73 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     ) -> Option<T> {
         let panels = self.bound_panels.as_ref()?;
         let (n, t) = (self.leaves.len(), self.trunk.len());
-        let primal: Vec<f64> = self
-            .leaves
-            .iter()
-            .map(|l| point[l.ids[l.coupling_start]].to_f64().unwrap())
-            .collect();
-        let border: Vec<f64> = self
-            .trunk
-            .iter()
-            .map(|&i| point[i].to_f64().unwrap())
-            .collect();
-        let mut product = vec![0.0; n + t];
-        let (leaf_product, border_product) = product.split_at_mut(n);
-        faer::linalg::matmul::matmul(
-            faer::MatMut::from_column_major_slice_mut(leaf_product, n, 1),
-            faer::Accum::Replace,
-            faer::MatRef::from_column_major_slice(&panels.y, n, t),
-            faer::MatRef::from_column_major_slice(&border, t, 1),
-            1.0,
-            faer::Par::Seq,
-        );
-        faer::linalg::matmul::matmul(
-            faer::MatMut::from_column_major_slice_mut(border_product, t, 1),
-            faer::Accum::Replace,
-            faer::MatRef::from_column_major_slice(&panels.y, n, t).transpose(),
-            faer::MatRef::from_column_major_slice(&primal, n, 1),
-            1.0,
-            faer::Par::Seq,
-        );
-        out.copy_from_slice(rhs);
-        for (i, l) in self.leaves.iter().enumerate() {
-            out[l.ids[l.coupling_start]] -= T::from_f64(product[i]).unwrap();
+        // BoundPanels exists only for T=f64. A contiguous leaf range can read
+        // the point directly and use its residual output as the forward product.
+        let point64 =
+            unsafe { std::slice::from_raw_parts(point.as_ptr().cast::<f64>(), point.len()) };
+        let mut gathered = Vec::new();
+        let primal = if let Some(start) = panels.primal_start {
+            &point64[start..start + n]
+        } else {
+            gathered.extend(self.leaves.iter().map(|l| point64[l.ids[l.coupling_start]]));
+            &gathered
+        };
+        let border: Vec<f64> = self.trunk.iter().map(|&i| point64[i]).collect();
+        let mut product = vec![
+            0.0;
+            if panels.primal_start.is_some() {
+                t
+            } else {
+                n + t
+            }
+        ];
+        {
+            let (leaf_product, border_product) = if let Some(start) = panels.primal_start {
+                // BLAS beta=0 overwrites every entry without reading old out.
+                let out64 = unsafe {
+                    std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<f64>(), out.len())
+                };
+                (&mut out64[start..start + n], &mut product[..])
+            } else {
+                product.split_at_mut(n)
+            };
+            panel_product(
+                b'N',
+                &panels.y,
+                n,
+                t,
+                &border,
+                1,
+                leaf_product,
+                self.pool.as_deref(),
+            );
+            panel_product(
+                b'T',
+                &panels.y,
+                n,
+                t,
+                primal,
+                1,
+                border_product,
+                self.pool.as_deref(),
+            );
         }
+        let border_product = if let Some(start) = panels.primal_start {
+            out[..start].copy_from_slice(&rhs[..start]);
+            for i in start..start + n {
+                out[i] = rhs[i] - out[i];
+            }
+            out[start + n..].copy_from_slice(&rhs[start + n..]);
+            &product[..]
+        } else {
+            out.copy_from_slice(rhs);
+            for (i, l) in self.leaves.iter().enumerate() {
+                out[l.ids[l.coupling_start]] -= T::from_f64(product[i]).unwrap();
+            }
+            &product[n..]
+        };
         for (i, &id) in self.trunk.iter().enumerate() {
-            out[id] -= T::from_f64(product[n + i]).unwrap();
+            out[id] -= T::from_f64(border_product[i]).unwrap();
         }
         // Read current unshifted values from the parent's KKT. Factor storage
         // contains regularized diagonals and must never define this residual.
@@ -323,8 +613,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 out[j] = (-k.nzval[q]).mul_add(point[i], out[j]);
             }
         }
-        Some(if out.is_finite() {
-            out.norm_inf()
+        let norm = out.norm_inf();
+        Some(if norm.is_finite() {
+            norm
         } else {
             T::infinity()
         })
@@ -332,16 +623,23 @@ impl<T: FloatT> ArrowLDLSolver<T> {
 }
 
 pub(super) struct ExactBoundPanels<T> {
-    y: Vec<T>,
+    pub(super) y: Vec<T>,
     z: Vec<T>,
     gram: Vec<T>,
+    // Packed leaf `v`/`batch_v` rows at `coupling_start`, so the couple dot
+    // reads one contiguous column of `y` against one contiguous `vs` column.
+    pub(super) vs: Vec<T>,
+    // Residues of the constant `y` for the exact `Yᵀ·diag(d)·Y` kernel.
+    pub(super) y_residues: ResidueCache,
 }
 impl<T: FloatT> ExactBoundPanels<T> {
     pub(super) fn new(n: usize, t: usize) -> Self {
         Self {
             y: vec![T::zero(); n * t],
-            z: vec![T::zero(); n * t],
+            z: Vec::new(),
             gram: vec![T::zero(); t * t],
+            y_residues: ResidueCache::default(),
+            vs: vec![T::zero(); n],
         }
     }
 }
@@ -351,27 +649,91 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return false;
         };
         let (n, t) = (self.leaves.len(), self.trunk.len());
-        for j in 0..t {
-            for (i, leaf) in self.leaves.iter().enumerate() {
-                panels.y[i + j * n] = leaf.coupling_values()[j];
-                panels.z[i + j * n] =
-                    leaf.coupling_values()[j] * leaf.factor.dinv[leaf.coupling_start];
+        // Exact Yᵀ·diag(d)·Y, rounded once per entry, with Y's residues cached
+        // across iterations. It declines (nothing written) for types without
+        // the residue kernel; the rounded-Z path below is the fallback.
+        // Solve scratch is refilled before its next read.
+        for (d, leaf) in panels.vs[..n].iter_mut().zip(&self.leaves) {
+            *d = leaf.factor.dinv[leaf.coupling_start];
+        }
+        if T::diag_congruence_upper_exact(
+            t,
+            n,
+            &panels.y,
+            &panels.vs[..n],
+            &mut panels.gram,
+            self.pool.as_deref(),
+            &mut panels.y_residues,
+        ) {
+            for j in 0..t {
+                for i in 0..=j {
+                    let v = self.c[j + i * t] - panels.gram[i + j * t];
+                    self.s[j + i * t] = v;
+                    self.s[i + j * t] = v;
+                }
             }
+            return true;
+        }
+        // Z = Y diag(d): independent products, split by trunk column.
+        panels.z.resize(n * t, T::zero());
+        let leaves = &self.leaves;
+        let fill = |(j, column): (usize, &mut [T])| {
+            for (i, (z, leaf)) in column.iter_mut().zip(leaves).enumerate() {
+                *z = panels.y[i + j * n] * leaf.factor.dinv[leaf.coupling_start];
+            }
+        };
+        match &self.pool {
+            Some(pool) => pool.install(|| {
+                panels.z[..n * t]
+                    .par_chunks_mut(n)
+                    .enumerate()
+                    .for_each(fill)
+            }),
+            None => panels.z[..n * t].chunks_mut(n).enumerate().for_each(fill),
         }
         // Upper Z^T Y is the transpose of the old lower Y^T Z. This keeps
         // exactly the same chosen entries even though rounding Z can make
         // the unmirrored product differ in the last bit across the diagonal.
+        // The exact residue kernel was measured here and reverted: it
+        // assembled faster but raised peak RSS several-fold (see journal).
         {
             let (y, z) = (&panels.y, &panels.z);
-            let column = |(j, col): (usize, &mut [T])| {
-                for (i, v) in col.iter_mut().enumerate().take(j + 1) {
-                    *v = T::dot_fma(z[i * n..(i + 1) * n].iter().zip(&y[j * n..(j + 1) * n]));
+            let entry =
+                |i: usize, j: usize| T::dot_slices(&z[i * n..(i + 1) * n], &y[j * n..(j + 1) * n]);
+            // Pair column j with column t-1-j so every task owns about t+1
+            // upper entries; per-column parallelism is triangular-imbalanced.
+            // Each entry's dot terms and order are unchanged.
+            let pairs = t.div_ceil(2);
+            let pair = move |k: usize| {
+                let (a, b) = (k, t - 1 - k);
+                let mut cols = Vec::with_capacity(2);
+                cols.push((a, (0..=a).map(|i| entry(i, a)).collect::<Vec<T>>()));
+                if b != a {
+                    cols.push((b, (0..=b).map(|i| entry(i, b)).collect()));
+                }
+                cols
+            };
+            let mut store = |cols: Vec<(usize, Vec<T>)>| {
+                for (j, col) in cols {
+                    for (i, v) in col.into_iter().enumerate() {
+                        panels.gram[i + j * t] = v;
+                    }
                 }
             };
             if let Some(pool) = &self.pool {
-                pool.install(|| panels.gram.par_chunks_mut(t).enumerate().for_each(column));
+                let all = pool.install(|| {
+                    (0..pairs)
+                        .into_par_iter()
+                        .map(pair)
+                        .collect::<Vec<Vec<(usize, Vec<T>)>>>()
+                });
+                for cols in all {
+                    store(cols);
+                }
             } else {
-                panels.gram.chunks_mut(t).enumerate().for_each(column);
+                for k in 0..pairs {
+                    store(pair(k));
+                }
             }
         }
         for j in 0..t {

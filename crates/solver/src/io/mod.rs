@@ -4,8 +4,7 @@
 use std::fs::File;
 use std::io::{Error, ErrorKind, Result, Sink, Write};
 
-#[allow(unused_imports)]
-pub(crate) use std::io::{stderr, stdout, Stdout};
+pub(crate) use std::io::{stdout, Stdout};
 
 /// Container for managing multiple print targets
 pub(crate) enum PrintTarget {

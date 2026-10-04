@@ -2,6 +2,13 @@
 members = ["crates/solver", "crates/ffi", "crates/arithmetic", "crates/pmp"]
 resolver = "2"
 
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

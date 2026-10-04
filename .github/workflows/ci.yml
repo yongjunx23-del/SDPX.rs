@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -22,24 +22,53 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      # SDP builds link the system OpenBLAS (it also provides LAPACK).
+      # Every build links BLAS/LAPACK; CI uses the system OpenBLAS.
       RUSTFLAGS: -l dylib=openblas
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
       - name: Native dependencies
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev m4
       - uses: Swatinem/rust-cache@v2
-      - name: Workspace tests (default features)
+      - name: Workspace tests (system OpenBLAS)
         run: cargo test --locked --release --workspace
-      - name: Solver tests (SDP, faer)
+      - name: Solver tests (faer)
         run: >
           cargo test --locked --release -p sdpx-solver
-          --features sdp,blas-src,lapack-src,faer-sparse
+          --features faer-sparse
       - name: CLI build
         run: >
           cargo build --locked --release -p sdpx-solver --bin sdpx
-          --features sdp,blas-src,lapack-src,faer-sparse
+          --features faer-sparse
+
+  macos:
+    # The development platform: Apple Accelerate BLAS/LAPACK.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Native dependencies
+        run: brew install gmp mpfr m4
+      - uses: Swatinem/rust-cache@v2
+      - name: Solver tests (faer, Accelerate)
+        run: >
+          cargo test --locked --release -p sdpx-solver
+          --features sdp-accelerate,faer-sparse
+
+  build-variants:
+    # Compile-only coverage of the opt-in feature sets.
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -l dylib=openblas
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev m4
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo check --locked -p sdpx-solver --bin sdpx
+          --features faer-sparse,all-precisions
 
   clippy:
     runs-on: ubuntu-latest
@@ -49,7 +78,7 @@ jobs:
       RUSTFLAGS: -l dylib=openblas
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy
       - name: Native dependencies
@@ -57,4 +86,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: >
           cargo clippy --locked -p sdpx-solver
-          --features sdp,blas-src,lapack-src,faer-sparse --lib --bins
+          --features faer-sparse --lib --bins

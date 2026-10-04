@@ -1,4 +1,13 @@
 // Included in arrow.rs::tests: uses the existing Arrow fixture and kernels.
+/// Values of `indices` after adding `offset * sign` in order (repeats accumulate).
+fn shifted<T: FloatT>(m: &CscMatrix<T>, indices: &[usize], offset: T, signs: &[i8]) -> Vec<T> {
+    let mut v = m.nzval.clone();
+    for (&p, &s) in indices.iter().zip(signs) {
+        v[p] += offset * T::from_i8(s).unwrap();
+    }
+    indices.iter().map(|&p| v[p]).collect()
+}
+
 fn storage_number<T: FloatT>(x: f64) -> T {
     T::from_f64(x).unwrap()
 }
@@ -150,7 +159,7 @@ fn storage_update_parity<T: FloatT>() {
     }
     let offset_signs = [-1, 1, 1, -1];
     let offset = storage_number::<T>(0.03125);
-    solver.offset_values(&indices, offset, &offset_signs);
+    solver.update_values(&indices, &shifted(&expected, &indices, offset, &offset_signs));
     for (&p, &sign) in indices.iter().zip(&offset_signs) {
         expected.nzval[p] += offset * T::from_i8(sign).unwrap();
     }
@@ -173,7 +182,7 @@ fn storage_update_parity<T: FloatT>() {
     let unshifted = expected.clone();
     let old_diag: Vec<_> = diagonal.iter().map(|&p| expected.nzval[p]).collect();
     let shift = storage_number::<T>(0.0625);
-    solver.offset_values(&diagonal, shift, &signs);
+    solver.update_values(&diagonal, &shifted(&expected, &diagonal, shift, &signs));
     for (i, &p) in diagonal.iter().enumerate() {
         expected.nzval[p] += shift * T::from_i8(signs[i]).unwrap();
     }
@@ -189,7 +198,7 @@ fn storage_update_parity<T: FloatT>() {
     // and restoring the pivot must recover a valid solve.
     let before_fallback_shift = expected.clone();
     let restore_diag: Vec<_> = diagonal.iter().map(|&p| expected.nzval[p]).collect();
-    solver.offset_values(&diagonal, shift, &signs);
+    solver.update_values(&diagonal, &shifted(&expected, &diagonal, shift, &signs));
     for (i, &p) in diagonal.iter().enumerate() {
         expected.nzval[p] += shift * T::from_i8(signs[i]).unwrap();
     }
@@ -258,17 +267,4 @@ fn arrow_storage_updates_mpfr512() {
 #[test]
 fn arrow_storage_updates_mpfr768() {
     storage_update_parity::<sdpx_arithmetic::Bits768>();
-}
-
-#[test]
-fn arrow_storage_duplicate_coordinates_decline() {
-    let (mut k, signs) = storage_fixture::<f64>();
-    // Independent positions at one coordinate cannot round-trip through one
-    // dense block slot. Leave such input to the existing general backend.
-    k.rowval.insert(1, 0);
-    k.nzval.insert(1, k.nzval[0]);
-    for p in &mut k.colptr[1..] {
-        *p += 1;
-    }
-    assert!(ArrowLDLSolver::try_new(&k, &signs, &CoreSettings::default()).is_none());
 }

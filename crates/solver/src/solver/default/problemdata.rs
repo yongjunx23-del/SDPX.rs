@@ -9,8 +9,8 @@ use crate::solver::{
     core::traits::ProblemData,
 };
 
-#[cfg(feature = "sdp")]
 use crate::solver::chordal::ChordalInfo;
+use crate::solver::sampled::{SampledBlock, SampledOperator};
 
 // ---------------
 // Data type for default problem format
@@ -27,9 +27,7 @@ pub struct DefaultProblemData<T> {
     /// [`Self::materialize_A`] to obtain all coefficients.
     pub A: CscMatrix<T>,
     pub(crate) sampled_matrix_stats: Option<(T, usize)>,
-    #[cfg(feature = "sdp")]
     pub(crate) sampled: Option<std::sync::Arc<SampledOperator<T>>>,
-    #[cfg(feature = "sdp")]
     pub(crate) sampled_input: bool,
     /// The vector b in the constraints
     pub b: Vec<T>,
@@ -55,7 +53,6 @@ pub struct DefaultProblemData<T> {
     pub(crate) presolver: Option<Presolver<T>>,
     pub(crate) dropped_zeros: usize, // number of eliminated structural zeros
 
-    #[cfg(feature = "sdp")]
     pub(crate) chordal_info: Option<ChordalInfo<T>>,
 }
 
@@ -63,6 +60,56 @@ impl<T> DefaultProblemData<T>
 where
     T: FloatT,
 {
+    /// Checkpoint identity of the internal (presolved, equilibrated) problem.
+    pub(crate) fn checkpoint_identity(&self) -> crate::solver::core::checkpoint::Identity {
+        use crate::solver::core::checkpoint::{Fnv, Identity};
+        let (mut shape, mut values) = (Fnv::new(), Fnv::new());
+        shape.words(&[self.n, self.m]);
+        for m in [&self.A, &self.P] {
+            shape.words(&m.colptr);
+            shape.words(&m.rowval);
+            values.scalars(&m.nzval);
+        }
+        values.scalars(&self.q);
+        values.scalars(&self.b);
+        for cone in &self.cones {
+            let tag = match cone {
+                SupportedConeT::ZeroConeT(_) => 0,
+                SupportedConeT::NonnegativeConeT(_) => 1,
+                SupportedConeT::SecondOrderConeT(_) => 2,
+                SupportedConeT::ExponentialConeT() => 3,
+                SupportedConeT::PowerConeT(a) => {
+                    shape.scalars(&[*a]);
+                    4
+                }
+                SupportedConeT::GenPowerConeT(a, dim2) => {
+                    shape.scalars(a);
+                    shape.word(*dim2 as u64);
+                    5
+                }
+                SupportedConeT::PSDTriangleConeT(_) => 6,
+            };
+            shape.words(&[tag, cone.nvars()]);
+        }
+        if let Some(op) = &self.sampled {
+            for b in op.blocks() {
+                shape.words(&[
+                    b.row_start,
+                    b.column_start,
+                    b.dim,
+                    b.basis_rows,
+                    b.basis_cols,
+                ]);
+                values.scalars(&b.basis);
+                values.scalars(&b.weights);
+            }
+        }
+        Identity {
+            structure: shape.finish(),
+            values: values.finish(),
+        }
+    }
+
     /// Create a new `DefaultProblemData` object
     pub fn new(
         P: &CscMatrix<T>,
@@ -72,21 +119,26 @@ where
         cones: &[SupportedConeT<T>],
         settings: &DefaultSettings<T>,
     ) -> Self {
-        Self::new_cow(P, q, std::borrow::Cow::Borrowed(A), b, cones, settings)
+        Self::new_cow(
+            std::borrow::Cow::Borrowed(P),
+            std::borrow::Cow::Borrowed(q),
+            std::borrow::Cow::Borrowed(A),
+            std::borrow::Cow::Borrowed(b),
+            cones,
+            settings,
+        )
     }
 
-    /// [`Self::new`] that takes ownership of an already-private `A`, so the
-    /// unreduced case moves it instead of cloning (a sampled problem's
-    /// materialized matrix is otherwise held twice during setup).
+    /// Move already-owned inputs when preprocessing leaves them unchanged.
     pub(crate) fn new_cow(
-        P: &CscMatrix<T>,
-        q: &[T],
+        P_in: std::borrow::Cow<'_, CscMatrix<T>>,
+        q_in: std::borrow::Cow<'_, [T]>,
         A_in: std::borrow::Cow<'_, CscMatrix<T>>,
-        b: &[T],
+        b_in: std::borrow::Cow<'_, [T]>,
         cones: &[SupportedConeT<T>],
         settings: &DefaultSettings<T>,
     ) -> Self {
-        let A: &CscMatrix<T> = &A_in;
+        let (P, q, A, b) = (&*P_in, &*q_in, &*A_in, &*b_in);
         // clean up the cones by consolidating repeated NNs,
         // eliminate empty cones, transform singletons etc
         // this makes a locally owned copy of the cones
@@ -96,7 +148,6 @@ where
         // but nonzero, number of data copies during presolve steps
 
         let mut P_new: Option<CscMatrix<T>> = None;
-        #[allow(unused_mut)] // mut q_new only needed with chordal
         let mut q_new: Option<Vec<T>> = None;
         let mut A_new: Option<CscMatrix<T>> = None;
         let mut b_new: Option<Vec<T>> = None;
@@ -120,14 +171,12 @@ where
         // ChordalInfo must be built on the *reduced* problem: its init_cones
         // and per-cone row ranges index the presolved A/b, and the cone_maps
         // it records map decomposed cones back to the presolved cone list.
-        #[cfg(feature = "sdp")]
         let mut chordal_info = try_chordal_info(
             A_new.as_ref().unwrap_or(A),
             unwrap_and_slice_or_else(&b_new, || b),
             cones_new.as_deref().unwrap_or(&cones),
             settings,
         );
-        #[cfg(feature = "sdp")]
         if let Some(ref mut chordal_info) = chordal_info {
             let (_P_new, _q_new, _A_new, _b_new, _cones_new) = chordal_info.decomp_augment(
                 P_new.as_ref().unwrap_or(P),
@@ -145,14 +194,11 @@ where
             );
         }
 
-        // now make sure we have a clean copy of everything if we
-        // haven't made one already.   Necessary since we will scale
-        // the internal copy and don't want to step on the user
-
-        let mut P_new = P_new.unwrap_or_else(|| P.clone());
-        let q_new = q_new.unwrap_or_else(|| q.to_vec());
+        // Scaling owns its inputs; borrowed API data is copied only here.
+        let mut P_new = P_new.unwrap_or_else(|| P_in.into_owned());
+        let q_new = q_new.unwrap_or_else(|| q_in.into_owned());
         let mut A_new = A_new.unwrap_or_else(|| A_in.into_owned());
-        let mut b_new = b_new.unwrap_or_else(|| b.to_vec());
+        let mut b_new = b_new.unwrap_or_else(|| b_in.into_owned());
 
         // cones was already copied, so can just pass through without cloning
         let cones_new = cones_new.unwrap_or(cones);
@@ -186,9 +232,7 @@ where
             q: q_new,
             A: A_new,
             sampled_matrix_stats: None,
-            #[cfg(feature = "sdp")]
             sampled: None,
-            #[cfg(feature = "sdp")]
             sampled_input: false,
             b: b_new,
             cones: cones_new,
@@ -200,7 +244,6 @@ where
             normb,
             dropped_zeros,
             presolver,
-            #[cfg(feature = "sdp")]
             chordal_info,
         }
     }
@@ -209,7 +252,6 @@ where
     /// This may allocate a large matrix; solver products use the factors directly.
     #[allow(non_snake_case)]
     pub fn materialize_A(&self) -> Result<CscMatrix<T>, String> {
-        #[cfg(feature = "sdp")]
         if let Some(operator) = &self.sampled {
             return operator.materialize_checked();
         }
@@ -226,7 +268,6 @@ where
             .map_or_else(|| self.A.nnz(), |s| s.1)
     }
 
-    #[cfg(feature = "sdp")]
     pub(crate) fn compact_sampled_matrix(&mut self) {
         if let Some(operator) = &self.sampled {
             self.sampled_matrix_stats = Some((self.A.nzval.norm_inf(), self.A.nnz()));
@@ -265,7 +306,6 @@ where
         self.normb = None;
     }
 
-    #[cfg(feature = "sdp")]
     pub(crate) fn install_sampled(
         &mut self,
         mut operator: SampledOperator<T>,
@@ -307,15 +347,36 @@ where
                 (start, row, cone)
             })
             .collect();
-        if operator.blocks().iter().any(|b| {
-            !ranges.iter().any(|(start, end, cone)| {
+        let matched = |b: &SampledBlock<T>| {
+            ranges.iter().any(|(start, end, cone)| {
                 *start == b.row_start
                     && *end == b.row_start + b.row_count()
                     && matches!(cone, SupportedConeT::PSDTriangleConeT(n) if *n == b.side())
             })
-        }) {
-            // In particular, upstream turns a singleton PSD cone into an NN.
-            return;
+        };
+        if !operator.blocks().iter().all(matched) {
+            // Cone collapsing turns a singleton PSD cone into nonnegative rows.
+            // Fold such 1x1 blocks into the explicit linear rows; any other
+            // mismatch keeps the generic (materialized) route.
+            let in_orthant = |b: &SampledBlock<T>| {
+                ranges.iter().any(|(start, end, cone)| {
+                    matches!(cone, SupportedConeT::NonnegativeConeT(_))
+                        && *start <= b.row_start
+                        && b.row_start + b.row_count() <= *end
+                })
+            };
+            let (kept, folded): (Vec<_>, Vec<_>) =
+                operator.blocks().iter().cloned().partition(|b| matched(b));
+            if !folded.iter().all(|b| b.side() == 1 && in_orthant(b)) {
+                return;
+            }
+            let (m, n) = operator.dims();
+            let rows = SampledOperator::new(CscMatrix::zeros((m, n)), folded)
+                .expect("subset of a valid sampled operator")
+                .materialize();
+            let linear = operator.linear().disjoint_sum(&rows);
+            operator = SampledOperator::new(linear, kept)
+                .expect("folding singleton blocks keeps a valid operator");
         }
         for block in operator.blocks() {
             let sigma = self.equilibration.e[block.row_start];
@@ -346,9 +407,7 @@ where
         self.dropped_zeros != 0
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_chordal_decomposed(&self) -> bool {
-        #[cfg(feature = "sdp")]
         if self.chordal_info.is_some() {
             return true;
         }
@@ -415,11 +474,13 @@ where
             d.hadamard(dwork);
             e.hadamard(ework);
 
-            // now use the Dwork array to hold the
-            // column norms of the newly scaled P
-            // so that we can compute the mean
-            P.col_norms(dwork);
-            let mean_col_norm_P = dwork.mean();
+            // Reuse Dwork for the newly scaled P column norms when present.
+            let mean_col_norm_P = if P.nnz() == 0 {
+                T::zero()
+            } else {
+                P.col_norms(dwork);
+                dwork.mean()
+            };
             let inf_norm_q = q.norm_inf();
 
             if mean_col_norm_P != T::zero() && inf_norm_q != T::zero() {
@@ -547,7 +608,6 @@ fn lrscale_pooled<T: FloatT>(
     });
 }
 
-#[cfg(feature = "sdp")]
 fn try_chordal_info<T>(
     A: &CscMatrix<T>,
     b: &[T],
@@ -604,7 +664,6 @@ where
 // -- utility function that tries to unwrap and slice a vector, or return
 // an alternative.   Necessary since the Options for q and b are &Vec, but
 // the user supplied data is a slice &[T]
-#[cfg(feature = "sdp")]
 pub(crate) fn unwrap_and_slice_or_else<'a, T, F>(opt: &'a Option<Vec<T>>, f: F) -> &'a [T]
 where
     F: FnOnce() -> &'a [T],

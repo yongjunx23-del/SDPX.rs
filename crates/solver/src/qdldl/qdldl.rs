@@ -187,31 +187,8 @@ where
         }
     }
 
-    /// Shifts a subset of the values of the matrix to be (re)factored.   The
-    /// values are offset by `offset`, with `signs` a vector of +/- 1 values
-    /// indicating the direction of shifts. See [`refactor`](crate::qdldl::QDLDLFactorisation::refactor)
-    ///
-    pub fn offset_values(&mut self, indices: &[usize], offset: T, signs: &[i8]) {
-        assert_eq!(indices.len(), signs.len());
-
-        let nzval = &mut self.workspace.triuA.nzval; // post perm internal data
-        let AtoPAPt = &self.workspace.AtoPAPt; //mapping from input matrix entries to triuA
-
-        for (&idx, &sign) in zip(indices, signs) {
-            match sign.signum() {
-                1 => {
-                    nzval[AtoPAPt[idx]] += offset;
-                }
-                -1 => {
-                    nzval[AtoPAPt[idx]] -= offset;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Refactor a matrix after its data has been modified.   See [`update_values`](crate::qdldl::QDLDLFactorisation::update_values),
-    /// [`scale_values`](crate::qdldl::QDLDLFactorisation::scale_values) and [`offset_values`](crate::qdldl::QDLDLFactorisation::offset_values)
+    /// Refactor a matrix after its data has been modified.   See [`update_values`](crate::qdldl::QDLDLFactorisation::update_values)
+    /// and [`scale_values`](crate::qdldl::QDLDLFactorisation::scale_values)
     ///
     pub fn refactor(&mut self) -> Result<(), QDLDLError> {
         // It never makes sense to call refactor for a logical
@@ -857,25 +834,6 @@ fn _invperm(p: &[usize]) -> Result<Vec<usize>, QDLDLError> {
         }
     }
     Ok(b)
-}
-
-// permutation and inverse permutation
-// functions that require no allocation
-// p must be a valid permutation vector
-// in both cases for safety
-
-pub(crate) fn permute<T: Copy>(x: &mut [T], b: &[T], p: &[usize]) {
-    debug_assert!(p.is_empty() || *p.iter().max().unwrap() < x.len());
-    unsafe {
-        zip(p, x).for_each(|(p, x)| *x = *b.get_unchecked(*p));
-    }
-}
-
-pub(crate) fn ipermute<T: Copy>(x: &mut [T], b: &[T], p: &[usize]) {
-    debug_assert!(p.is_empty() || *p.iter().max().unwrap() < x.len());
-    unsafe {
-        zip(p, b).for_each(|(p, b)| *x.get_unchecked_mut(*p) = *b);
-    }
 }
 
 // Given a sparse symmetric matrix `A` (with only upper triangular entries), return

@@ -233,18 +233,18 @@ pub(crate) fn basis<T: Scalar>(points: &[T], scales: &[T]) -> Result<[Vec<Vec<T>
             (degree + 1) / 2
         };
         // Upper Cholesky of the Hankel moment matrix, then U^{-1}.
-        let mut u = vec![vec![T::zero(); n]; n];
+        let mut u: Vec<_> = (0..n).map(|i| vec![T::zero(); n - i]).collect();
         for j in 0..n {
             for i in 0..=j {
                 let mut value = moments[i + j + parity];
-                for row in u.iter().take(i) {
-                    value -= row[i] * row[j];
+                for (r, row) in u.iter().take(i).enumerate() {
+                    value -= row[i - r] * row[j - r];
                 }
                 if i == j {
                     require(value > T::zero() && value.is_finite(), "bilinear moment matrix is not positive definite; increase precision or provide a basis")?;
-                    u[i][j] = value.sqrt();
+                    u[i][j - i] = value.sqrt();
                 } else {
-                    u[i][j] = value / u[i][i];
+                    u[i][j - i] = value / u[i][0];
                 }
             }
         }
@@ -253,9 +253,9 @@ pub(crate) fn basis<T: Scalar>(points: &[T], scales: &[T]) -> Result<[Vec<Vec<T>
             for i in (0..=j).rev() {
                 let mut v = if i == j { T::one() } else { T::zero() };
                 for k in i + 1..=j {
-                    v -= u[i][k] * poly[k];
+                    v -= u[i][k - i] * poly[k];
                 }
-                poly[i] = v / u[i][i];
+                poly[i] = v / u[i][0];
             }
             result[parity].push(poly);
         }

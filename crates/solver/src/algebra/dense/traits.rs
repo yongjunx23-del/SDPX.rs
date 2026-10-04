@@ -74,12 +74,6 @@ pub(crate) trait MultiplyGEMM<T> {
         MATA: DenseMatrix<T>;
 }
 
-#[allow(dead_code)] //PJG: not currently used anywhere
-pub(crate) trait MultiplyGEMV<T> {
-    fn gemv(&self, x: &[T], y: &mut [T], α: T, β: T);
-}
-
-#[allow(dead_code)] //PJG: not currently used anywhere
 pub(crate) trait MultiplySYMV {
     type T;
     fn symv(&self, x: &[Self::T], y: &mut [Self::T], α: Self::T, β: Self::T);

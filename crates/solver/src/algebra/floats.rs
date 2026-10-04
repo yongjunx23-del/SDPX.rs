@@ -3,30 +3,12 @@ use crate::solver::kkt::ldl::config::LDLConfiguration;
 use num_traits::FromPrimitive;
 use sdpx_arithmetic::Scalar;
 
-#[cfg(feature = "sdp")]
 use crate::algebra::dense::BlasFloatT;
-
-/// Arithmetic required by the single solver engine, including owned MPFR scalars.
-pub trait CoreFloatT: Scalar {}
-impl<T: Scalar> CoreFloatT for T {}
-
-cfg_if::cfg_if! {
-    if #[cfg(feature="sdp")] {
-        /// Scalar types with a complete dense SDP numerical provider.
-        #[doc(hidden)]
-        pub trait MaybeBlasFloatT: BlasFloatT {}
-        impl<T: BlasFloatT> MaybeBlasFloatT for T {}
-    } else {
-        #[doc(hidden)]
-        pub trait MaybeBlasFloatT {}
-        impl<T> MaybeBlasFloatT for T {}
-    }
-}
 
 /// Arithmetic, dense operations and sparse factorization supported by SDPX.
 /// Faer's RealField requirement is local to its provider, not the solver engine.
-pub trait FloatT: CoreFloatT + MaybeBlasFloatT + LDLConfiguration {}
-impl<T: CoreFloatT + MaybeBlasFloatT + LDLConfiguration> FloatT for T {}
+pub trait FloatT: Scalar + BlasFloatT + LDLConfiguration {}
+impl<T: Scalar + BlasFloatT + LDLConfiguration> FloatT for T {}
 
 /// Trait for converting Rust primitives to [`FloatT`](crate::algebra::FloatT)
 ///

@@ -4,14 +4,6 @@ use crate::algebra::*;
 use core::cmp::min;
 use std::iter::zip;
 
-#[allow(dead_code)]
-#[derive(PartialEq, Eq, Copy, Clone, Default)]
-pub(crate) enum SVDEngineAlgorithm {
-    #[default]
-    DivideAndConquer,
-    QRDecomposition,
-}
-
 pub(crate) struct SVDBlasWorkVectors<T> {
     pub work: Vec<T>,
     pub iwork: Vec<i32>,
@@ -40,9 +32,6 @@ pub(crate) struct SVDEngine<T> {
 
     // BLAS workspace (allocated vecs only)
     pub blas: Option<SVDBlasWorkVectors<T>>,
-
-    // BLAS factorization method
-    pub algorithm: SVDEngineAlgorithm,
 }
 
 impl<T> SVDEngine<T>
@@ -65,14 +54,7 @@ where
         let U = Matrix::<T>::zeros((m, if left { min(m, n) } else { 0 }));
         let Vt = Matrix::<T>::zeros((min(m, n), n));
         let blas = None;
-        let algorithm = SVDEngineAlgorithm::default();
-        Self {
-            s,
-            U,
-            Vt,
-            blas,
-            algorithm,
-        }
+        Self { s, U, Vt, blas }
     }
 
     pub fn resize(&mut self, size: (usize, usize)) {
@@ -331,22 +313,11 @@ where
         let info = &mut 0_i32; // output info
 
         for i in 0..2 {
-            // iwork is only used for the DivideAndConquer BLAS call
-            // and should always be 8*min(m,n) elements in that case.
-            // This will *not* shrink iwork in the case that the engine's
-            // algorithm is switched back and forth
-            if self.algorithm == SVDEngineAlgorithm::DivideAndConquer {
-                iwork.resize(8 * min(m, n) as usize, 0);
-            }
-
-            match self.algorithm {
-                SVDEngineAlgorithm::DivideAndConquer => T::xgesdd(
-                    job, m, n, a, lda, s, u, ldu, vt, ldvt, work, lwork, iwork, info,
-                ),
-                SVDEngineAlgorithm::QRDecomposition => T::xgesvd(
-                    job, job, m, n, a, lda, s, u, ldu, vt, ldvt, work, lwork, info,
-                ),
-            }
+            // iwork must hold 8*min(m,n) elements for the gesdd call.
+            iwork.resize(8 * min(m, n) as usize, 0);
+            T::xgesdd(
+                job, m, n, a, lda, s, u, ldu, vt, ldvt, work, lwork, iwork, info,
+            );
             if *info != 0 {
                 return Err(DenseFactorizationError::SVD(*info));
             }
@@ -486,24 +457,16 @@ mod test {
     {
         use crate::algebra::VectorMath;
 
-        let methods = [
-            SVDEngineAlgorithm::DivideAndConquer,
-            SVDEngineAlgorithm::QRDecomposition,
-        ];
+        // A and B are modified inplace during factor/solve
+        let mut thisA = A.clone();
+        let mut thisB = B.clone();
 
-        for method in methods.iter() {
-            // A and B are modified inplace during factor/solve
-            let mut thisA = A.clone();
-            let mut thisB = B.clone();
+        let mut eng = SVDEngine::<T>::new(thisA.size());
 
-            let mut eng = SVDEngine::<T>::new(thisA.size());
-            eng.algorithm = *method;
+        assert!(eng.factor(&mut thisA).is_ok());
+        eng.solve(&mut thisB);
 
-            assert!(eng.factor(&mut thisA).is_ok());
-            eng.solve(&mut thisB);
-
-            assert!(thisB.data().norm_inf_diff(X.data()) < tolfn(1e-10.as_T()));
-        }
+        assert!(thisB.data().norm_inf_diff(X.data()) < tolfn(1e-10.as_T()));
     }
 
     macro_rules! generate_test_svd_solve {
@@ -567,38 +530,30 @@ mod test {
     {
         use crate::algebra::{DenseMatrix, MultiplyGEMM, VectorMath};
 
-        let methods = [
-            SVDEngineAlgorithm::DivideAndConquer,
-            SVDEngineAlgorithm::QRDecomposition,
-        ];
+        let Acopy = A.clone(); //A is corrupted after factorization
 
-        for method in methods.iter() {
-            let Acopy = A.clone(); //A is corrupted after factorization
+        let mut eng = SVDEngine::<T>::new(A.size());
 
-            let mut eng = SVDEngine::<T>::new(A.size());
-            eng.algorithm = *method;
+        assert!(eng.factor(A).is_ok());
 
-            assert!(eng.factor(A).is_ok());
+        let mut M = Matrix::<T>::zeros((1, 1));
+        M.resize(A.size()); //manual resize for test coverage
 
-            let mut M = Matrix::<T>::zeros((1, 1));
-            M.resize(A.size()); //manual resize for test coverage
+        let U = &eng.U;
+        let s = &eng.s;
+        let Vt = &eng.Vt;
 
-            let U = &eng.U;
-            let s = &eng.s;
-            let Vt = &eng.Vt;
+        assert!(is_descending_order(s));
 
-            assert!(is_descending_order(s));
-
-            //reconstruct matrix from SVD
-            let mut Us = U.clone();
-            for c in 0..s.len() {
-                for r in 0..Us.nrows() {
-                    Us[(r, c)] *= s[c];
-                }
+        //reconstruct matrix from SVD
+        let mut Us = U.clone();
+        for c in 0..s.len() {
+            for r in 0..Us.nrows() {
+                Us[(r, c)] *= s[c];
             }
-            M.mul(&Us, Vt, T::one(), T::zero());
-            assert!(M.data().norm_inf_diff(Acopy.data()) < tolfn((1e-10).as_T()));
         }
+        M.mul(&Us, Vt, T::one(), T::zero());
+        assert!(M.data().norm_inf_diff(Acopy.data()) < tolfn((1e-10).as_T()));
     }
 
     macro_rules! generate_test_svd_factor {
@@ -625,34 +580,4 @@ mod test {
 
     generate_test_svd_factor!(f32, test_svd_factor_f32, sqrt);
     generate_test_svd_factor!(f64, test_svd_factor_f64, abs);
-}
-
-#[cfg(all(test, feature = "bench"))]
-mod bench {
-
-    use super::*;
-
-    fn svd3_bench_iter() -> impl Iterator<Item = Matrix<f64>> {
-        use itertools::iproduct;
-
-        let v = [-4., -2., 0., 1., 5.];
-
-        iproduct!(v, v, v, v, v, v, v, v, v).map(move |(a, b, c, d, e, f, g, h, i)| {
-            let data = [a, b, c, d, e, f, g, h, i];
-            Matrix::new_from_slice((3, 3), &data)
-        })
-    }
-
-    #[test]
-    fn bench_svd3_vs_blas() {
-        let mut eng = SVDEngine::<f64>::new((3, 3));
-
-        for mut A in svd3_bench_iter() {
-            eng.factor3(&mut A).unwrap();
-        }
-
-        for mut A in svd3_bench_iter() {
-            eng.factorblas(&mut A).unwrap();
-        }
-    }
 }

@@ -37,7 +37,6 @@ pub enum SolverError {
     BadInputData(&'static str),
 
     /// Invalid dimensions or coefficients in a factor-defined sampled input.
-    #[cfg(feature = "sdp")]
     #[error("Bad sampled input: {0}")]
     SampledInput(String),
 
@@ -77,51 +76,45 @@ impl<T: FloatT> PreparedProblem<T> {
         cones: &[SupportedConeT<T>],
         settings: DefaultSettings<T>,
     ) -> Result<Self, SolverError> {
-        Self::new_with_cost_identity_impl(P, q, A, b, cones, settings, false)
+        Self::new_with_cost_identity_impl(
+            std::borrow::Cow::Borrowed(P),
+            std::borrow::Cow::Borrowed(q),
+            std::borrow::Cow::Borrowed(A),
+            std::borrow::Cow::Borrowed(b),
+            cones,
+            settings,
+            false,
+        )
     }
 
-    #[cfg(feature = "serde")]
-    pub(crate) fn new_with_cost_identity(
-        P: &CscMatrix<T>,
-        q: &[T],
-        A: &CscMatrix<T>,
-        b: &[T],
-        cones: &[SupportedConeT<T>],
-        settings: DefaultSettings<T>,
-    ) -> Result<Self, SolverError> {
-        Self::new_with_cost_identity_impl(P, q, A, b, cones, settings, true)
-    }
-
-    fn new_with_cost_identity_impl(
-        P: &CscMatrix<T>,
-        q: &[T],
-        A: &CscMatrix<T>,
-        b: &[T],
+    pub(super) fn new_with_cost_identity_impl(
+        P: std::borrow::Cow<'_, CscMatrix<T>>,
+        q: std::borrow::Cow<'_, [T]>,
+        A: std::borrow::Cow<'_, CscMatrix<T>>,
+        b: std::borrow::Cow<'_, [T]>,
         cones: &[SupportedConeT<T>],
         settings: DefaultSettings<T>,
         with_identity: bool,
     ) -> Result<Self, SolverError> {
-        #[cfg(all(feature = "sdp", feature = "serde"))]
+        #[cfg(feature = "serde")]
         let input_fingerprint = with_identity
-            .then(|| crate::solver::distributed::input_fingerprint(P, q, A, b, cones, None));
-        #[cfg(not(all(feature = "sdp", feature = "serde")))]
+            .then(|| crate::solver::distributed::input_fingerprint(&P, &q, &A, &b, cones, None));
+        #[cfg(not(feature = "serde"))]
         let input_fingerprint = {
             let _ = with_identity;
             None
         };
-        Self::new_with_setup(
-            P,
-            q,
-            std::borrow::Cow::Borrowed(A),
-            b,
-            cones,
-            settings,
-            input_fingerprint,
-            |_, _| {},
-        )
+        check_dimensions(&P, &q, &A, &b, cones)?;
+        P.check_format().map_err(|_| {
+            SolverError::BadInputData("P must be canonical CSC (sorted, unique, in-range rows)")
+        })?;
+        A.check_format().map_err(|_| {
+            SolverError::BadInputData("A must be canonical CSC (sorted, unique, in-range rows)")
+        })?;
+        settings.validate()?;
+        Self::new_with_setup(P, q, A, b, cones, settings, input_fingerprint, |_, _| {})
     }
 
-    #[cfg(feature = "sdp")]
     pub(crate) fn new_sampled(
         P: &CscMatrix<T>,
         q: &[T],
@@ -131,38 +124,23 @@ impl<T: FloatT> PreparedProblem<T> {
         blocks: Vec<SampledBlock<T>>,
         settings: DefaultSettings<T>,
     ) -> Result<Self, SolverError> {
-        Self::new_sampled_with_cost_identity_impl(P, q, A_linear, b, cones, blocks, settings, false)
-    }
-
-    #[cfg(all(feature = "serde", feature = "sdp"))]
-    pub(crate) fn new_sampled_with_cost_identity(
-        P: &CscMatrix<T>,
-        q: &[T],
-        A_linear: &CscMatrix<T>,
-        b: &[T],
-        cones: &[SupportedConeT<T>],
-        blocks: Vec<SampledBlock<T>>,
-        settings: DefaultSettings<T>,
-        with_identity: bool,
-    ) -> Result<Self, SolverError> {
-        Self::new_sampled_with_cost_identity_impl(
-            P,
-            q,
-            A_linear,
-            b,
+        Self::new_sampled_cow_with_identity(
+            std::borrow::Cow::Borrowed(P),
+            std::borrow::Cow::Borrowed(q),
+            std::borrow::Cow::Borrowed(A_linear),
+            std::borrow::Cow::Borrowed(b),
             cones,
             blocks,
             settings,
-            with_identity,
+            false,
         )
     }
 
-    #[cfg(feature = "sdp")]
-    fn new_sampled_with_cost_identity_impl(
-        P: &CscMatrix<T>,
-        q: &[T],
-        A_linear: &CscMatrix<T>,
-        b: &[T],
+    pub(super) fn new_sampled_cow_with_identity(
+        P: std::borrow::Cow<'_, CscMatrix<T>>,
+        q: std::borrow::Cow<'_, [T]>,
+        A_linear: std::borrow::Cow<'_, CscMatrix<T>>,
+        b: std::borrow::Cow<'_, [T]>,
         cones: &[SupportedConeT<T>],
         blocks: Vec<SampledBlock<T>>,
         settings: DefaultSettings<T>,
@@ -170,7 +148,14 @@ impl<T: FloatT> PreparedProblem<T> {
     ) -> Result<Self, SolverError> {
         #[cfg(feature = "serde")]
         let input_fingerprint = with_identity.then(|| {
-            crate::solver::distributed::input_fingerprint(P, q, A_linear, b, cones, Some(&blocks))
+            crate::solver::distributed::input_fingerprint(
+                &P,
+                &q,
+                &A_linear,
+                &b,
+                cones,
+                Some(&blocks),
+            )
         });
         #[cfg(not(feature = "serde"))]
         let input_fingerprint = {
@@ -178,9 +163,14 @@ impl<T: FloatT> PreparedProblem<T> {
             None
         };
         let mut sampled_timers = Timers::default();
-        sampled_timers.start_as_current("setup");
-        let operator =
-            SampledOperator::new(A_linear.clone(), blocks).map_err(SolverError::SampledInput)?;
+        sampled_timers.start_setup();
+        check_dimensions(&P, &q, &A_linear, &b, cones)?;
+        P.check_format().map_err(|_| {
+            SolverError::BadInputData("P must be canonical CSC (sorted, unique, in-range rows)")
+        })?;
+        settings.validate()?;
+        let operator = SampledOperator::new(A_linear.into_owned(), blocks)
+            .map_err(SolverError::SampledInput)?;
         let mut row = 0;
         let ranges: Vec<_> = cones
             .iter()
@@ -229,28 +219,26 @@ impl<T: FloatT> PreparedProblem<T> {
         )?;
         // Include factor-input assembly in native setup time as well as the
         // ordinary preparation performed by the shared constructor.
-        sampled_timers.stop_current();
+        sampled_timers.stop_setup();
         prepared.timers = sampled_timers;
         Ok(prepared)
     }
 
     fn new_with_setup(
-        P: &CscMatrix<T>,
-        q: &[T],
+        P: std::borrow::Cow<'_, CscMatrix<T>>,
+        q: std::borrow::Cow<'_, [T]>,
         A: std::borrow::Cow<'_, CscMatrix<T>>,
-        b: &[T],
+        b: std::borrow::Cow<'_, [T]>,
         cones: &[SupportedConeT<T>],
         settings: DefaultSettings<T>,
         input_fingerprint: Option<[u8; 32]>,
         prepare_data: impl FnOnce(&mut DefaultProblemData<T>, Option<&rayon::ThreadPool>),
     ) -> Result<Self, SolverError> {
-        check_dimensions(P, q, &A, b, cones)?;
-        settings.validate()?;
         let mut timers = Timers::default();
-        timers.start_as_current("setup");
+        timers.start_setup();
         let solution = DefaultSolution::<T>::new(A.n, A.m);
         let mut data;
-        timeit! {timers => "presolve"; {
+        timeit! {"presolve"; {
             data = DefaultProblemData::<T>::new_cow(P,q,A,b,cones,&settings);
         }}
         crate::receipt::memory_mark("problem data");
@@ -266,12 +254,12 @@ impl<T: FloatT> PreparedProblem<T> {
                 "cone dimensions do not match the reduced problem",
             ));
         }
-        timeit! {timers => "equilibration"; {
+        timeit! {"equilibration"; {
             data.equilibrate(&cones,&settings);
             prepare_data(&mut data, cones.thread_pool().as_deref());
         }}
         crate::receipt::memory_mark("equilibrated");
-        timers.stop_current();
+        timers.stop_setup();
         Ok(Self {
             data,
             cones,
@@ -297,7 +285,6 @@ impl<T: FloatT> DefaultSolver<T> {
 
     /// Construct a problem whose sampled PSD coefficients are defined by the
     /// supplied factors. `A_linear` is zero on every described PSD row range.
-    #[cfg(feature = "sdp")]
     pub fn new_sampled(
         P: &CscMatrix<T>,
         q: &[T],
@@ -321,20 +308,18 @@ impl<T: FloatT> DefaultSolver<T> {
             mut timers,
             cost_input_fingerprint: _,
         } = prepared;
-        #[cfg(feature = "sdp")]
         let mut data = data;
-        timers.start_as_current("setup");
+        timers.start_setup();
+        let kktsystem;
+        timeit! {"kktinit"; {
+            kktsystem = DefaultKKTSystem::<T>::new(&data,&cones,&settings);
+        }}
+        data.compact_sampled_matrix();
+        crate::receipt::memory_mark("kkt system");
         let variables = DefaultVariables::<T>::new(data.n, data.m);
         let mut residuals = DefaultResiduals::<T>::new(data.n, data.m);
         residuals.prepare_sparse(&data, cones.thread_pool());
         crate::receipt::memory_mark("residual workspace");
-        let kktsystem;
-        timeit! {timers => "kktinit"; {
-            kktsystem = DefaultKKTSystem::<T>::new(&data,&cones,&settings);
-        }}
-        #[cfg(feature = "sdp")]
-        data.compact_sampled_matrix();
-        crate::receipt::memory_mark("kkt system");
         let mut info = DefaultInfo::<T>::new();
         info.linsolver = kktsystem.linear_solver_info();
         let step_rhs = DefaultVariables::<T>::new(data.n, data.m);
@@ -356,7 +341,7 @@ impl<T: FloatT> DefaultSolver<T> {
             callbacks: SolverCallbacks::default(),
             phantom: std::marker::PhantomData,
         };
-        timers.stop_current();
+        timers.stop_setup();
         output.timers.replace(timers);
         Ok(output)
     }

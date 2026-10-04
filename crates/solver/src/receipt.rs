@@ -88,14 +88,6 @@ pub fn finish(name: &'static str, timer: Option<Mark>) {
     }
 }
 
-/// Add process CPU time since `start` (from `cpu_start`) to phase `name`.
-pub fn cpu_add(name: &'static str, start: Option<CpuMark>) {
-    if let (Some(mark), Some(now)) = (start, process_cpu()) {
-        *CPU.lock().unwrap().entry(name).or_default() += now.saturating_sub(mark.cpu);
-        serial_add(name, mark.serial);
-    }
-}
-
 /// Record one phase observation: echo the legacy `PHASE` line under
 /// `SDPX_PROFILE` and aggregate when a receipt was requested.
 pub fn phase(name: &'static str, dur: Duration) {
@@ -107,7 +99,7 @@ pub fn phase(name: &'static str, dur: Duration) {
 
 /// Record without printing — for sites whose stderr line carries extra
 /// fields beyond `PHASE <name> <dur>` and keeps its own eprintln.
-pub fn phase_record(name: &'static str, dur: Duration) {
+pub(crate) fn phase_record(name: &'static str, dur: Duration) {
     if receipts_requested() {
         let mut g = PHASES.lock().unwrap();
         let s = g.entry(name).or_default();
@@ -131,7 +123,7 @@ fn process_cpu() -> Option<Duration> {
     clock_cpu(if cfg!(target_os = "macos") { 12 } else { 2 })
 }
 
-/// CPU time of the calling thread. Timers run on the solver's main thread,
+/// CPU time of the calling thread. Timed phases run on the solver's main thread,
 /// which sleeps inside `pool.install`, so this is the phase's serial time.
 fn thread_cpu() -> Option<Duration> {
     // CLOCK_THREAD_CPUTIME_ID: 3 on Linux, 16 on macOS.
@@ -173,7 +165,7 @@ pub struct CpuMark {
 }
 
 /// Add calling-thread CPU time since `start` to phase `name`'s serial time.
-pub fn serial_add(name: &'static str, start: Option<Duration>) {
+fn serial_add(name: &'static str, start: Option<Duration>) {
     if let (Some(start), Some(now)) = (start, thread_cpu()) {
         *SERIAL.lock().unwrap().entry(name).or_default() += now.saturating_sub(start);
     }
@@ -295,12 +287,15 @@ pub fn try_write<T: crate::algebra::FloatT>(
         solver.cones.cone_threads(),
         1,
         peak_rss,
-        solver.timers.as_ref().map(|t| t.setup_times()),
+        solver
+            .timers
+            .as_ref()
+            .map(|t| BTreeMap::from([("setup".to_string(), t.setup_time().as_secs_f64())])),
     )
 }
 
 /// Write a receipt for the owner-partitioned backend.
-#[cfg(all(feature = "serde", feature = "sdp"))]
+#[cfg(feature = "serde")]
 pub fn try_write_partitioned<T: crate::algebra::FloatT>(
     solver: &crate::solver::PartitionedSolver<T>,
     peak_rss: Option<u64>,
@@ -399,7 +394,6 @@ fn try_write_parts<T: crate::algebra::FloatT>(
         "memory": {"peak_rss_bytes": peak_rss},
         "env": {
             "SDPX_DIRECT_SOLVE": env("SDPX_DIRECT_SOLVE"),
-            "SDPX_RNS_OPS": env("SDPX_RNS_OPS"),
             "SDPX_INPUT_ID": env("SDPX_INPUT_ID"),
         },
     });

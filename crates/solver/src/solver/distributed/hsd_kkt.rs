@@ -7,7 +7,6 @@ use crate::solver::{
     core::{traits::KKTSystem, StepDirection},
     kkt::{HasLinearSolverInfo, LinearSolverInfo, SolveCounters},
 };
-use rayon::prelude::*;
 
 pub(crate) struct OwnedKktSystem<T: FloatT> {
     pub(crate) kernel: OwnedKkt<T>,
@@ -15,7 +14,6 @@ pub(crate) struct OwnedKktSystem<T: FloatT> {
     constant_work: OwnedVariables<T>,
     varying: OwnedVariables<T>,
     work: OwnedVariables<T>,
-    offset: Vec<Vec<T>>,
     hs_constant: Vec<Vec<T>>,
     hs_varying: Vec<Vec<T>>,
     affine_ready: Option<bool>,
@@ -43,7 +41,6 @@ impl<T: FloatT> OwnedKktSystem<T> {
             constant_work: OwnedVariables::new(data),
             varying: OwnedVariables::new(data),
             work: OwnedVariables::new(data),
-            offset: data.blocks.iter().map(|d| vec![T::zero(); d.m]).collect(),
             hs_constant: data.blocks.iter().map(|_| Vec::new()).collect(),
             hs_varying: data.blocks.iter().map(|_| Vec::new()).collect(),
             affine_ready: None,
@@ -72,17 +69,11 @@ impl<T: FloatT> OwnedKktSystem<T> {
             out.x.scalarop_from(|q| -q, &d.q);
             out.z.copy_from_slice(&d.b);
         };
-        if let Some(pool) = &self.pool {
-            pool.install(|| {
-                self.work
-                    .blocks
-                    .par_iter_mut()
-                    .zip(&data.blocks)
-                    .for_each(fill)
-            });
-        } else {
-            self.work.blocks.iter_mut().zip(&data.blocks).for_each(fill);
-        }
+        for_blocks!(
+            self.pool.as_ref(),
+            (&mut self.work.blocks, &data.blocks),
+            fill
+        );
         self.work.border_z.copy_from_slice(&data.border_b);
         self.work.sync_border();
         let ok = self.kernel.solve_blocks_with_border(
@@ -153,8 +144,9 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
             w.x.scalarop_from(|q| -q, &d.q);
             w.z.copy_from_slice(&d.b);
         };
-        let fill_affine = |((w, r), v): (
-            (&mut DefaultVariables<T>, &DefaultVariables<T>),
+        let fill_affine = |(w, r, v): (
+            &mut DefaultVariables<T>,
+            &DefaultVariables<T>,
             &DefaultVariables<T>,
         )| {
             w.x.copy_from_slice(&r.x);
@@ -169,33 +161,16 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
                 .unwrap_or(false);
             let constant_ok;
             if updated {
-                if let Some(pool) = &cones.pool {
-                    pool.install(|| {
-                        self.constant_work
-                            .blocks
-                            .par_iter_mut()
-                            .zip(&data.blocks)
-                            .for_each(fill_constant);
-                        self.work
-                            .blocks
-                            .par_iter_mut()
-                            .zip(&rhs.blocks)
-                            .zip(&variables.blocks)
-                            .for_each(fill_affine)
-                    });
-                } else {
-                    self.constant_work
-                        .blocks
-                        .iter_mut()
-                        .zip(&data.blocks)
-                        .for_each(fill_constant);
-                    self.work
-                        .blocks
-                        .iter_mut()
-                        .zip(&rhs.blocks)
-                        .zip(&variables.blocks)
-                        .for_each(fill_affine);
-                }
+                for_blocks!(
+                    cones.pool.as_ref(),
+                    (&mut self.constant_work.blocks, &data.blocks),
+                    fill_constant
+                );
+                for_blocks!(
+                    cones.pool.as_ref(),
+                    (&mut self.work.blocks, &rhs.blocks, &variables.blocks),
+                    fill_affine
+                );
                 self.constant_work.border_z.copy_from_slice(&data.border_b);
                 for ((out, &s), &z) in self
                     .work
@@ -270,9 +245,10 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
         let prepare_rhs = direction != StepDirection::Affine || cached.is_none();
         let prepare = |i: usize,
                        w: &mut DefaultVariables<T>,
-                       offset: &mut Vec<T>,
+                       constant_work: &mut DefaultVariables<T>,
                        cone: &mut CompositeCone<T>,
                        lhs: &mut DefaultVariables<T>| {
+            let offset = &mut constant_work.s;
             let r = &rhs.blocks[i];
             let v = &variables.blocks[i];
             if prepare_rhs {
@@ -291,31 +267,19 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
                 }
             }
         };
-        if let Some(pool) = &cones.pool {
-            debug_assert!(owner_cone_pools_ok(&cones.blocks));
-            pool.install(|| {
-                self.work
-                    .blocks
-                    .par_iter_mut()
-                    .zip(&mut self.offset)
-                    .zip(&mut cones.blocks)
-                    .zip(&mut lhs.blocks)
-                    .enumerate()
-                    .for_each(|(i, (((w, offset), cone), lhs))| prepare(i, w, offset, cone, lhs))
-            });
-        } else {
-            for (i, (((w, offset), cone), lhs)) in self
-                .work
-                .blocks
-                .iter_mut()
-                .zip(&mut self.offset)
-                .zip(&mut cones.blocks)
-                .zip(&mut lhs.blocks)
-                .enumerate()
-            {
-                prepare(i, w, offset, cone, lhs);
-            }
-        }
+        debug_assert!(cones.pool.is_none() || owner_cone_pools_ok(&cones.blocks));
+        let owners = self.work.blocks.len();
+        for_blocks!(
+            cones.pool.as_ref(),
+            (
+                0..owners,
+                &mut self.work.blocks,
+                &mut self.constant_work.blocks,
+                &mut cones.blocks,
+                &mut lhs.blocks
+            ),
+            |(i, w, offset, cone, lhs)| prepare(i, w, offset, cone, lhs)
+        );
         if prepare_rhs {
             if direction == StepDirection::Affine {
                 for ((out, &s), &z) in self
@@ -335,26 +299,16 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
             self.work.sync_border();
         }
         if direction == StepDirection::Combined {
-            let subtract = |(w, c): (&mut DefaultVariables<T>, &Vec<T>)| {
-                for (v, &c) in w.z.iter_mut().zip(c) {
+            let subtract = |(w, c): (&mut DefaultVariables<T>, &DefaultVariables<T>)| {
+                for (v, &c) in w.z.iter_mut().zip(&c.s) {
                     *v = c - *v;
                 }
             };
-            if let Some(pool) = &cones.pool {
-                pool.install(|| {
-                    self.work
-                        .blocks
-                        .par_iter_mut()
-                        .zip(&self.offset)
-                        .for_each(subtract)
-                });
-            } else {
-                self.work
-                    .blocks
-                    .iter_mut()
-                    .zip(&self.offset)
-                    .for_each(subtract);
-            }
+            for_blocks!(
+                cones.pool.as_ref(),
+                (&mut self.work.blocks, &self.constant_work.blocks),
+                subtract
+            );
         }
         let prepared = if direction == StepDirection::Affine {
             cached
@@ -463,7 +417,7 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
             &self.constant,
             &self.hs_constant,
             &self.hs_varying,
-            &self.offset,
+            &self.constant_work.blocks,
         );
         let recover = |i: usize,
                        l: &mut DefaultVariables<T>,
@@ -481,28 +435,19 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
             } else {
                 cone.mul_Hs(&mut l.s, &l.z, &mut work.z);
             }
-            l.s.axpby(-T::one(), &offset[i], -T::one());
+            l.s.axpby(-T::one(), &offset[i].s, -T::one());
         };
-        if let Some(pool) = &cones.pool {
-            pool.install(|| {
-                lhs.blocks
-                    .par_iter_mut()
-                    .zip(&mut self.work.blocks)
-                    .zip(&mut cones.blocks)
-                    .enumerate()
-                    .for_each(|(i, ((l, work), cone))| recover(i, l, work, cone))
-            });
-        } else {
-            for (i, ((l, work), cone)) in lhs
-                .blocks
-                .iter_mut()
-                .zip(&mut self.work.blocks)
-                .zip(&mut cones.blocks)
-                .enumerate()
-            {
-                recover(i, l, work, cone);
-            }
-        }
+        let owners = lhs.blocks.len();
+        for_blocks!(
+            cones.pool.as_ref(),
+            (
+                0..owners,
+                &mut lhs.blocks,
+                &mut self.work.blocks,
+                &mut cones.blocks
+            ),
+            |(i, l, work, cone)| recover(i, l, work, cone)
+        );
         for ((out, &varying), &constant) in lhs
             .border_z
             .iter_mut()

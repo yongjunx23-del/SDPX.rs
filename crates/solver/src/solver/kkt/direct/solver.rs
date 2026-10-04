@@ -23,12 +23,6 @@ pub(crate) type BoxedDirectLDLSolver<T> = Box<dyn DirectLDLSolver<T> + Send + Sy
 /// dummy variable that would leak into the Schur complement.
 struct EmptyDirectLDLSolver;
 
-impl DirectLDLSolverReqs for EmptyDirectLDLSolver {
-    fn required_matrix_shape() -> MatrixTriangle {
-        MatrixTriangle::Triu
-    }
-}
-
 impl HasLinearSolverInfo for EmptyDirectLDLSolver {
     fn linear_solver_info(&self) -> LinearSolverInfo {
         LinearSolverInfo {
@@ -48,10 +42,6 @@ impl<T: FloatT> DirectLDLSolver<T> for EmptyDirectLDLSolver {
 
     fn scale_values(&mut self, index: &[usize], _scale: T) {
         debug_assert!(index.is_empty());
-    }
-
-    fn offset_values(&mut self, index: &[usize], _offset: T, signs: &[i8]) {
-        debug_assert!(index.is_empty() && signs.is_empty());
     }
 
     fn solve(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T]) {
@@ -107,11 +97,15 @@ pub struct DirectLDLKKTSolver<T> {
     reg_boost: usize,
     counters: crate::solver::kkt::SolveCounters,
     residual_plan: Option<SparseParallel>,
-    #[cfg(feature = "sdp")]
     residual_dense: Option<Matrix<T>>,
-    /// Full symmetric row lists of the KKT for exact residuals (MPFR only).
+    packed_residual: bool,
+    /// Incoming symmetric mirrors of the fixed KKT pattern (MPFR exact residuals).
     exact_rows: Option<ExactRows>,
     residual_pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    /// Ranks sharing the replicated system: exact residual rows are split
+    /// between them and gathered (each row is rounded once, so the result
+    /// does not depend on the split).
+    residual_world: Option<crate::mpi::World>,
 }
 
 impl<T> DirectLDLKKTSolver<T>
@@ -132,6 +126,11 @@ where
 
         //construct a KKT matrix of the right shape
         let (KKT, map) = assemble_kkt_matrix(P, A, cones, kktshape);
+        debug_assert!(
+            kktshape != MatrixTriangle::Triu
+                || P.count_diagonal_entries(MatrixTriangle::Triu) != n
+                || map.P.iter().enumerate().all(|(i, &position)| i == position)
+        );
 
         //Need this many extra variables for sparse cones
         let p = map.sparse_maps.pdim();
@@ -165,6 +164,11 @@ where
                 &KKT, &dsigns, A, cones, settings,
             )
             .or_else(|| {
+                crate::solver::kkt::ldl::arrow::ArrowLDLSolver::try_shared_soc(
+                    &KKT, &dsigns, A, cones, settings,
+                )
+            })
+            .or_else(|| {
                 crate::solver::kkt::ldl::arrow::ArrowLDLSolver::try_local_bounds(
                     &KKT, &dsigns, A, cones, settings,
                 )
@@ -174,6 +178,9 @@ where
         } else {
             ldl_ctor(&KKT, &dsigns, settings, None)
         };
+
+        let packed_residual = ldlsolver.linear_solver_info().name == "dense_block"
+            && KKT.colptr[n] == triangular_number(n);
 
         Self {
             m,
@@ -195,9 +202,10 @@ where
             reg_boost: 0,
             counters: Default::default(),
             residual_plan: None,
-            #[cfg(feature = "sdp")]
             residual_dense: None,
+            packed_residual,
             exact_rows: None,
+            residual_world: None,
             residual_pool: None,
         }
     }
@@ -246,60 +254,18 @@ where
         lhsz: Option<&mut [T]>,
         settings: &CoreSettings<T>,
     ) -> bool {
-        let __t0 = std::time::Instant::now();
-        // Lossless snapshot capture (PR-02): the RHS is cloned before the
-        // solve because a backend may overwrite it.
-        #[cfg(feature = "snapshot")]
-        let snap = if crate::snapshot::enabled() {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static SNAP_IDX: AtomicU64 = AtomicU64::new(0);
-            Some((SNAP_IDX.fetch_add(1, Ordering::Relaxed), self.b.clone()))
-        } else {
-            None
-        };
         self.counters.rhs_applied += 1;
         self.counters.linear_solves += 1;
-        let __c0 = crate::receipt::cpu_start();
+        let timer = crate::receipt::start();
         self.ldlsolver.solve(&self.KKT, &mut self.x, &mut self.b);
-        let __t_trsv = __t0.elapsed();
-        crate::receipt::cpu_add("trsv", __c0);
-        #[cfg(feature = "snapshot")]
-        if let Some((idx, rhs)) = snap {
-            let ok = self.x.is_finite();
-            if crate::snapshot::wanted(idx, !ok) {
-                if let Some(dir) = std::env::var_os("SDPX_SNAPSHOT") {
-                    let backend = self.ldlsolver.linear_solver_info().name.clone();
-                    let _ = crate::snapshot::write(
-                        std::path::Path::new(&dir),
-                        idx,
-                        &self.KKT,
-                        &self.dsigns,
-                        &rhs,
-                        &self.x,
-                        ok,
-                        &backend,
-                        self.reg_boost,
-                    );
-                }
-            }
-        }
-        let is_success = {
-            if settings.iterative_refinement_enable {
-                let __c_ir = crate::receipt::cpu_start();
-                let r = self.iterative_refinement(settings);
-                crate::receipt::cpu_add("ir", __c_ir);
-                if crate::receipt::profile_requested() {
-                    eprintln!("PHASE trsv {:?} ir {:?}", __t_trsv, __t0.elapsed());
-                }
-                crate::receipt::phase_record("trsv", __t_trsv);
-                // The printed "ir" field is cumulative since __t0; record the
-                // refinement-only share for per-phase accounting.
-                crate::receipt::phase_record("ir", __t0.elapsed() - __t_trsv);
-                r
-            } else {
-                crate::receipt::phase("trsv", __t_trsv);
-                self.x.is_finite()
-            }
+        crate::receipt::finish("trsv", timer);
+        let is_success = if settings.iterative_refinement_enable {
+            let timer = crate::receipt::start();
+            let r = self.iterative_refinement(settings);
+            crate::receipt::finish("ir", timer);
+            r
+        } else {
+            self.x.is_finite()
         };
 
         if is_success {
@@ -323,10 +289,6 @@ where
         assert_eq!(out.len(), rhs.len());
         if cols == 0 {
             return Vec::new();
-        }
-        #[cfg(feature = "snapshot")]
-        if crate::snapshot::enabled() {
-            return crate::solver::kkt::solve_many_by_columns(self, n, rhs, out, cols, settings);
         }
         self.counters.batches += 1;
         let full = width + self.p;
@@ -388,6 +350,23 @@ where
 }
 
 impl<T: FloatT> DirectLDLKKTSolver<T> {
+    /// The complete-diagonal upper primal block is the KKT's leading prefix.
+    /// Condensed assembly writes that prefix before notifying the backend.
+    pub(crate) fn kkt_matrix_mut(&mut self) -> &mut CscMatrix<T> {
+        debug_assert_eq!(self.KKTuplo, MatrixTriangle::Triu);
+        &mut self.KKT
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kkt_matrix(&self) -> &CscMatrix<T> {
+        &self.KKT
+    }
+
+    pub(crate) fn publish_P(&mut self) {
+        self.ldlsolver
+            .update_values(&self.map.P, &self.KKT.nzval[..self.map.P.len()]);
+    }
+
     // A condensed system retains some original cones. Read their current
     // scaling directly; a second set of cone states would become stale.
     pub(crate) fn update_from_cones<'a, I>(&mut self, cones: I, settings: &CoreSettings<T>) -> bool
@@ -520,13 +499,11 @@ where
         };
 
         // Refactor with the (possibly) shifted values.
-        let __t0 = std::time::Instant::now();
-        let __c0 = crate::receipt::cpu_start();
+        let timer = crate::receipt::start();
         self.counters.factor_attempts += 1;
         let is_success = self.ldlsolver.refactor(KKT);
         self.counters.factorizations += u64::from(is_success);
-        crate::receipt::phase("refactor", __t0.elapsed());
-        crate::receipt::cpu_add("refactor", __c0);
+        crate::receipt::finish("refactor", timer);
 
         if applied_shift {
             // The factor backend intentionally retains the shifted values,
@@ -537,11 +514,11 @@ where
         // Dense binary64 systems spend more time traversing CSC during IR
         // than multiplying. Cache the authoritative, unshifted triangle once
         // per factor update; never use the regularized factor as an operator.
-        #[cfg(feature = "sdp")]
         {
             let dim = KKT.n;
             let dense_entries = (dim as u128) * (dim as u128);
-            if T::precision_bits() <= 53
+            if !self.packed_residual
+                && T::precision_bits() <= 53
                 && dim >= 512
                 && dense_entries * std::mem::size_of::<T>() as u128 <= (512u128 << 20)
                 && (KKT.nzval.len() as u128) * 5 >= dense_entries
@@ -555,10 +532,6 @@ where
                     }
                 }
             }
-        }
-
-        if let Some(dir) = kkt_dump_dir() {
-            dump_kkt_f64(dir, KKT);
         }
 
         is_success
@@ -604,22 +577,18 @@ where
         assert_eq!(rhs.len(), self.factor_dimension());
         assert_eq!(point.len(), rhs.len());
         assert_eq!(out.len(), rhs.len());
+        // Same precedence as refinement: exact rows, then a backend residual.
+        if let Some(rows) = &self.exact_rows {
+            return rows.residual(out, rhs, &self.KKT, point, self.residual_pool.as_deref());
+        }
         if let Some(norm) = self.ldlsolver.residual(&self.KKT, out, rhs, point) {
             return norm;
         }
         let KKTsym = self.KKT.sym(self.KKTuplo);
         let plan = self.residual_plan.as_ref();
-        if let Some(rows) = &self.exact_rows {
-            return rows.residual(out, rhs, &self.KKT, point, self.residual_pool.as_deref());
-        }
-        #[cfg(feature = "sdp")]
         {
             let dense = self.residual_dense.as_ref();
             _get_refine_error_dense(out, rhs, &KKTsym, point, plan, dense)
-        }
-        #[cfg(not(feature = "sdp"))]
-        {
-            _get_refine_error(out, rhs, &KKTsym, point, plan)
         }
     }
 
@@ -646,6 +615,12 @@ where
         self.ldlsolver.set_pool(pool);
     }
 
+    pub(crate) fn set_world(&mut self, world: Option<crate::mpi::World>) {
+        self.residual_world = world.filter(|w| w.size() > 1);
+        self.ldlsolver
+            .set_world(crate::MpiContext::from_world(world));
+    }
+
     pub(crate) fn set_residual_pool(&mut self, pool: Option<std::sync::Arc<rayon::ThreadPool>>) {
         let words = T::precision_bits().div_ceil(64) as u128;
         let work = self.KKT.nzval.len() as u128 * words * words;
@@ -653,9 +628,6 @@ where
             p.current_num_threads() > 1 && work >= 4096 * p.current_num_threads() as u128
         });
         self.residual_pool = pool.clone();
-        if pool.is_some() && self.residual_plan.is_none() {
-            self.residual_plan = Some(SparseParallel::new_symmetric(&self.KKT));
-        }
         if let Some(plan) = &mut self.residual_plan {
             plan.configure(&self.KKT, pool);
         }
@@ -674,36 +646,33 @@ where
         let KKT = &self.KKT;
         let KKTsym = KKT.sym(self.KKTuplo);
 
-        let plan = self.residual_plan.as_ref();
         let normb = b.norm_inf();
 
-        if T::precision_bits() > 64
-            && self
-                .exact_rows
-                .as_ref()
-                .map_or(true, |r| r.entries.len() != r.expected(&self.KKT))
-        {
+        if T::precision_bits() > 64 && self.exact_rows.is_none() {
             self.exact_rows = Some(ExactRows::new(KKT));
         }
         let exact = self.exact_rows.as_ref();
-        let pool = self.residual_pool.as_deref();
-        #[cfg(feature = "sdp")]
+        let world = self.residual_world;
+        let pool = &self.residual_pool;
         let dense = self.residual_dense.as_ref();
-        let error = |e: &mut [T], x: &mut [T], backend: &dyn DirectLDLSolver<T>| -> T {
+        let plan = &mut self.residual_plan;
+        let mut error = |e: &mut [T], x: &mut [T], backend: &dyn DirectLDLSolver<T>| -> T {
             if let Some(rows) = exact {
-                return rows.residual(e, b, KKT, x, pool);
+                x.negate();
+                let norm = rows.residual_negated(e, b, KKT, x, pool.as_deref(), world);
+                x.negate();
+                return norm;
             }
             if let Some(norm) = backend.residual(KKT, e, b, x) {
                 return norm;
             }
-            #[cfg(feature = "sdp")]
-            {
-                _get_refine_error_dense(e, b, &KKTsym, x, plan, dense)
+            // Exact rows and backend residuals do not use the generic CSR.
+            if dense.is_none() && plan.is_none() && pool.is_some() {
+                let mut rows = SparseParallel::new_symmetric(KKT);
+                rows.configure(KKT, pool.clone());
+                *plan = Some(rows);
             }
-            #[cfg(not(feature = "sdp"))]
-            {
-                _get_refine_error(e, b, &KKTsym, x, plan)
-            }
+            _get_refine_error_dense(e, b, &KKTsym, x, plan.as_ref(), dense)
         };
         //compute the initial error
         let mut norme = error(e, x, self.ldlsolver.as_ref());
@@ -712,12 +681,9 @@ where
             return false;
         }
 
-        for pass in 0..maxiter {
+        for _ in 0..maxiter {
             if norme <= (abstol + reltol * normb) {
                 //within tolerance.  Exit
-                if trace_ir() {
-                    eprintln!("IRI converged pass={pass}");
-                }
                 break;
             }
 
@@ -743,16 +709,6 @@ where
             }
 
             let improved_ratio = lastnorme / norme;
-            if trace_ir() {
-                eprintln!(
-                    "IRI pass={} before={:.3e} after={:.3e} ratio={:.3e} normb={:.3e}",
-                    self.counters.refinements,
-                    lastnorme.to_f64().unwrap_or(f64::NAN),
-                    norme.to_f64().unwrap_or(f64::NAN),
-                    improved_ratio.to_f64().unwrap_or(f64::NAN),
-                    normb.to_f64().unwrap_or(f64::NAN),
-                );
-            }
             if improved_ratio < stopratio {
                 //insufficient improvement.  Exit
                 if improved_ratio > T::one() {
@@ -765,12 +721,6 @@ where
         //NB: "success" means only that we had a finite valued result
         true
     }
-}
-
-/// Diagnostic trace of inner refinement passes (`SDPX_TRACE_IR`).
-fn trace_ir() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SDPX_TRACE_IR").is_some())
 }
 
 fn _compute_regularizer<T: FloatT>(diag_kkt: &[T], settings: &CoreSettings<T>) -> T {
@@ -791,8 +741,10 @@ fn _compute_regularizer<T: FloatT>(diag_kkt: &[T], settings: &CoreSettings<T>) -
 /// exact residual keeps the error at eps·|e_i|.
 struct ExactRows {
     ptr: Vec<usize>,
-    /// (nz position, column) for every entry of each full symmetric row.
+    /// (nz position, column) for off-diagonal entries incoming from CSC columns.
     entries: Vec<(usize, usize)>,
+    /// Full row work: own CSC column plus incoming mirrors.
+    work_offsets: Vec<usize>,
 }
 
 impl ExactRows {
@@ -802,9 +754,8 @@ impl ExactRows {
         for j in 0..n {
             for p in k.colptr[j]..k.colptr[j + 1] {
                 let r = k.rowval[p];
-                count[r + 1] += 1;
                 if r != j {
-                    count[j + 1] += 1;
+                    count[r + 1] += 1;
                 }
             }
         }
@@ -812,28 +763,23 @@ impl ExactRows {
             count[i + 1] += count[i];
         }
         let ptr = count.clone();
+        let work_offsets = ptr.iter().zip(&k.colptr).map(|(a, b)| a + b).collect();
         let mut fill = count;
         let mut entries = vec![(0usize, 0usize); ptr[n]];
         for j in 0..n {
             for p in k.colptr[j]..k.colptr[j + 1] {
                 let r = k.rowval[p];
-                entries[fill[r]] = (p, j);
-                fill[r] += 1;
                 if r != j {
-                    entries[fill[j]] = (p, r);
-                    fill[j] += 1;
+                    entries[fill[r]] = (p, j);
+                    fill[r] += 1;
                 }
             }
         }
-        Self { ptr, entries }
-    }
-
-    /// Entry count the current pattern implies (rebuild on mismatch).
-    fn expected<T>(&self, k: &CscMatrix<T>) -> usize {
-        let diag = (0..k.n)
-            .filter(|&j| k.rowval[k.colptr[j]..k.colptr[j + 1]].contains(&j))
-            .count();
-        2 * k.nzval.len() - diag
+        Self {
+            ptr,
+            entries,
+            work_offsets,
+        }
     }
 
     fn residual<T: FloatT>(
@@ -844,31 +790,70 @@ impl ExactRows {
         x: &[T],
         pool: Option<&rayon::ThreadPool>,
     ) -> T {
-        use rayon::prelude::*;
         let neg: Vec<T> = x.iter().map(|&v| -v).collect();
+        self.residual_negated(e, b, k, &neg, pool, None)
+    }
+
+    fn residual_negated<T: FloatT>(
+        &self,
+        e: &mut [T],
+        b: &[T],
+        k: &CscMatrix<T>,
+        neg: &[T],
+        pool: Option<&rayon::ThreadPool>,
+        world: Option<crate::mpi::World>,
+    ) -> T {
+        use rayon::prelude::*;
         let one = T::one();
         let row = |i: usize| {
-            let terms = &self.entries[self.ptr[i]..self.ptr[i + 1]];
+            let incoming = &self.entries[self.ptr[i]..self.ptr[i + 1]];
             T::dot_fma(
                 std::iter::once((&b[i], &one))
-                    .chain(terms.iter().map(|&(p, j)| (&k.nzval[p], &neg[j]))),
+                    .chain((k.colptr[i]..k.colptr[i + 1]).map(|p| (&k.nzval[p], &neg[k.rowval[p]])))
+                    .chain(incoming.iter().map(|&(p, j)| (&k.nzval[p], &neg[j]))),
             )
+        };
+        // Under MPI each rank evaluates one work-balanced row range.
+        let n = e.len();
+        let boundary = |part: usize, parts: usize| {
+            let total = self.work_offsets[n];
+            self.work_offsets
+                .partition_point(|&v| v < total * part / parts)
+                .min(n)
+        };
+        let (lo, hi) = match world {
+            Some(w) => (
+                boundary(w.rank(), w.size()),
+                boundary(w.rank() + 1, w.size()),
+            ),
+            None => (0, n),
+        };
+        let lo = if world.is_some_and(|w| w.rank() == 0) {
+            0
+        } else {
+            lo
+        };
+        let hi = if world.is_none_or(|w| w.rank() + 1 == w.size()) {
+            n
+        } else {
+            hi
         };
         match pool {
             Some(pool) => {
                 // Border rows hold ~10x the entries of leaf rows; split by
                 // entry count (about four tasks per worker) so no task
                 // collects a run of long rows. Every row is unchanged.
-                let n = e.len();
-                let parts = (4 * pool.current_num_threads()).clamp(1, n.max(1));
-                let total = self.ptr[n];
+                let parts = (4 * pool.current_num_threads()).clamp(1, (hi - lo).max(1));
+                let (base, top) = (self.work_offsets[lo], self.work_offsets[hi]);
                 let mut chunks: Vec<(usize, &mut [T])> = Vec::with_capacity(parts);
-                let (mut start, mut rest) = (0usize, &mut *e);
+                let (mut start, mut rest) = (lo, &mut e[lo..hi]);
                 for p in 1..=parts {
                     let end = if p == parts {
-                        n
+                        hi
                     } else {
-                        self.ptr.partition_point(|&v| v < total * p / parts).min(n)
+                        self.work_offsets
+                            .partition_point(|&v| v < base + (top - base) * p / parts)
+                            .clamp(lo, hi)
                     };
                     if end > start {
                         let (chunk, tail) = std::mem::take(&mut rest).split_at_mut(end - start);
@@ -885,10 +870,29 @@ impl ExactRows {
                     })
                 })
             }
-            None => e.iter_mut().enumerate().for_each(|(i, v)| *v = row(i)),
+            None => e[lo..hi]
+                .iter_mut()
+                .enumerate()
+                .for_each(|(i, v)| *v = row(lo + i)),
         }
-        if e.is_finite() {
-            e.norm_inf()
+        if let Some(w) = world {
+            let ranges: Vec<(usize, usize)> = (0..w.size())
+                .map(|r| {
+                    let a = if r == 0 { 0 } else { boundary(r, w.size()) };
+                    let z = if r + 1 == w.size() {
+                        n
+                    } else {
+                        boundary(r + 1, w.size())
+                    };
+                    (a, z - a)
+                })
+                .collect();
+            let local = e[lo..hi].to_vec();
+            w.gather_slice(crate::mpi::SITE_ARROW, &local, &ranges, e);
+        }
+        let norm = e.norm_inf();
+        if norm.is_finite() {
+            norm
         } else {
             T::infinity()
         }
@@ -915,7 +919,6 @@ fn _get_refine_error<T: FloatT>(
     e.norm_inf()
 }
 
-#[cfg(feature = "sdp")]
 fn _get_refine_error_dense<T: FloatT>(
     e: &mut [T],
     b: &[T],
@@ -988,41 +991,6 @@ fn _fill_signs(signs: &mut [i8], m: usize, n: usize, map: &LDLDataMap) {
         signs[p..(p + thisp)].copy_from_slice(thismap.Dsigns());
         p += thisp;
     }
-}
-
-/// Debug probe: dump the true (unregularized) KKT matrix as f64 CSC text.
-/// Gated by SDPX_DUMP_KKT=<dir>; writes <dir>/kkt-NNNN.txt with the matrix
-/// dimension, colptr, rowval and nzval converted elementwise to f64. Values
-/// overflowing f64 clamp to ±f64::MAX, which already answers the conditioning
-/// question the probe exists for.
-/// `SDPX_DUMP_KKT` capture gate, read once per process. The gate is fixed at
-/// launch; caching keeps getenv out of the per-factorization path.
-fn kkt_dump_dir() -> Option<&'static std::ffi::OsStr> {
-    static DIR: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| std::env::var_os("SDPX_DUMP_KKT"))
-        .as_deref()
-}
-
-fn dump_kkt_f64<T: FloatT>(dir: &std::ffi::OsStr, KKT: &CscMatrix<T>) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static DUMP_IDX: AtomicUsize = AtomicUsize::new(0);
-    let idx = DUMP_IDX.fetch_add(1, Ordering::Relaxed);
-    let path = std::path::Path::new(dir).join(format!("kkt-{idx:04}.txt"));
-    let mut out = String::with_capacity(KKT.nzval.len() * 24);
-    out.push_str(&format!("{} {}\n", KKT.n, KKT.nzval.len()));
-    for &p in KKT.colptr.iter() {
-        out.push_str(&format!("{p}\n"));
-    }
-    for &r in KKT.rowval.iter() {
-        out.push_str(&format!("{r}\n"));
-    }
-    for v in KKT.nzval.iter() {
-        let f = v
-            .to_f64()
-            .unwrap_or_else(|| if *v < T::zero() { -f64::MAX } else { f64::MAX });
-        out.push_str(&format!("{f:.17e}\n"));
-    }
-    let _ = std::fs::write(&path, out);
 }
 
 #[cfg(test)]
@@ -1165,7 +1133,6 @@ mod parallel_residual_tests {
     }
 
     #[test]
-    #[cfg(feature = "sdp")]
     fn dense_refinement_uses_original_updated_triangle() {
         let n = 512;
         let mut p = CscMatrix::zeros((n, n));
@@ -1189,12 +1156,9 @@ mod parallel_residual_tests {
                 solver.update_P(&p);
             }
             assert!(solver.update(&cones, &settings));
-            let dense = solver.residual_dense.as_ref().unwrap();
-            for col in 0..n {
-                for pos in p.colptr[col]..p.colptr[col + 1] {
-                    assert_eq!(dense[(p.rowval[pos], col)], p.nzval[pos]);
-                }
-            }
+            assert!(solver.packed_residual);
+            assert!(solver.residual_dense.is_none());
+            assert_eq!(solver.KKT.nzval, p.nzval);
             let mut rhs = vec![0.; n];
             p.sym(MatrixTriangle::Triu)
                 .symv(&mut rhs, &expected, 1., 0.);
@@ -1274,6 +1238,7 @@ mod parallel_residual_tests {
             .map(|i| T::from_f64((i % 7) as f64 - 3.).unwrap())
             .collect();
         let mut storage = None;
+        settings.iterative_refinement_max_iter = 0;
         for workers in [4, 1, 2, 4] {
             let pool = (workers > 1).then(|| {
                 std::sync::Arc::new(
@@ -1284,22 +1249,27 @@ mod parallel_residual_tests {
                 )
             });
             solver.set_residual_pool(pool);
-            let plan = solver.residual_plan.as_ref().unwrap();
-            let (actual_workers, address) = plan.test_pool_and_storage();
-            assert_eq!(actual_workers, workers);
-            if let Some(previous) = storage {
-                assert_eq!(previous, address);
-            } else {
-                storage = Some(address);
-            }
             p.nzval[0] += T::from_f64(0.125).unwrap();
             solver.update_P(&p);
             let mut expected = vec![T::zero(); n];
             let mut actual = expected.clone();
             let k = solver.KKT.sym(solver.KKTuplo);
             let en = _get_refine_error(&mut expected, &rhs, &k, &mut x, None);
-            let an =
-                _get_refine_error(&mut actual, &rhs, &k, &mut x, solver.residual_plan.as_ref());
+            solver.b.copy_from_slice(&rhs);
+            solver.x.copy_from_slice(&x);
+            assert!(solver.iterative_refinement(&settings));
+            let an = solver.residual_full(&mut actual, &rhs, &x);
+            if let Some(plan) = &solver.residual_plan {
+                let (actual_workers, address) = plan.test_pool_and_storage();
+                assert_eq!(actual_workers, workers);
+                if let Some(previous) = storage {
+                    assert_eq!(previous, address);
+                } else {
+                    storage = Some(address);
+                }
+            } else {
+                assert!(T::precision_bits() > 64 || workers == 1);
+            }
             assert_eq!(actual, expected);
             assert_eq!(an, en);
         }

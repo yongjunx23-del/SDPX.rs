@@ -18,11 +18,6 @@ mod statistics;
 mod variables;
 
 // shared by the modules below through `use super::*`
-#[cfg(feature = "sdp")]
-#[allow(unused_imports)]
-use crate::solver::distributed::*;
-#[cfg(feature = "sdp")]
-#[allow(unused_imports)]
 use crate::solver::sampled::*;
 
 // export flattened

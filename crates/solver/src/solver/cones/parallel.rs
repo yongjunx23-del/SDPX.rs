@@ -6,8 +6,8 @@ pub(super) struct ConeThreading {
     pub(super) pool: std::sync::Arc<rayon::ThreadPool>,
     pub(super) lanes: Vec<Lane>,
     pub(super) sym_step_lanes: Vec<Lane>,
-    // A single large orthant uses disjoint elementwise chunks instead of
-    // outer cone tasks. Never combine the two scheduling levels.
+    // A single large orthant, optionally with equality rows, uses disjoint
+    // elementwise chunks on the same worker pool.
     pub(super) orthant_chunk: Option<usize>,
     // Inner (within-cone) work re-offered to the ambient pool only pays
     // when spare workers exist beyond the cone lanes; when lanes already
@@ -35,7 +35,6 @@ const MIN_LANE_WORK: u128 = 4096;
 
 fn cone_cost<T: FloatT>(cone: &SupportedCone<T>) -> u128 {
     let dimension_cost = match cone {
-        #[cfg(feature = "sdp")]
         SupportedCone::PSDTriangleCone(k) => (k.n as u128).saturating_pow(3),
         _ => cone.numel() as u128,
     };
@@ -75,7 +74,6 @@ impl ConeThreading {
         if T::precision_bits() <= 64
             || cones.len() <= workers
             || !cones.iter().any(|c| {
-                #[cfg(feature = "sdp")]
                 if matches!(c, SupportedCone::PSDTriangleCone(_)) {
                     return true;
                 }
@@ -128,8 +126,25 @@ impl ConeThreading {
     ) -> Result<Option<Self>, rayon::ThreadPoolBuildError> {
         let budget = crate::solver::core::worker_budget(requested);
         let single_orthant = matches!(cones, [SupportedCone::NonnegativeCone(_)]);
+        let orthant_size = cones
+            .iter()
+            .find(|c| matches!(c, SupportedCone::NonnegativeCone(_)))
+            .filter(|_| {
+                cones.iter().all(|c| {
+                    matches!(
+                        c,
+                        SupportedCone::ZeroCone(_) | SupportedCone::NonnegativeCone(_)
+                    )
+                }) && cones
+                    .iter()
+                    .filter(|c| matches!(c, SupportedCone::NonnegativeCone(_)))
+                    .count()
+                    == 1
+            })
+            .filter(|c| c.numel() > 0)
+            .filter(|_| single_orthant || T::precision_bits() > 53)
+            .map(|c| c.numel());
         let has_psd = cones.iter().any(|cone| {
-            #[cfg(feature = "sdp")]
             if matches!(cone, SupportedCone::PSDTriangleCone(_)) {
                 return true;
             }
@@ -152,12 +167,12 @@ impl ConeThreading {
         let workers = budget
             .min(if single_orthant {
                 cones[0].numel()
-            } else if has_psd {
-                // Condensed Schur columns can use workers beyond the number
-                // of cones. Outer cone lanes still own whole cones.
-                budget
             } else {
-                cones.len()
+                // Outer cone lanes stay bounded by the cone count (see
+                // balanced_lanes below), but this pool is also the KKT
+                // backend's worker budget: condensed Schur columns and
+                // arrow leaves can use workers beyond the number of cones.
+                budget
             })
             .min((total / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
         if workers <= 1 {
@@ -165,7 +180,7 @@ impl ConeThreading {
         }
         // Contiguous lanes preserve original cone/data ordering and permit
         // safe slice splitting, without raw pointers or per-call job vectors.
-        let orthant_chunk = single_orthant.then(|| cones[0].numel().div_ceil(workers));
+        let orthant_chunk = orthant_size.map(|n| n.div_ceil(workers));
         // Deliberate over-splitting: balanced lanes follow a structural cost
         // model, so spare tasks are what lets work stealing absorb model error.
         // Measured worse when reduced to one lane per worker (w8 13.35 -> 14.37,
@@ -272,36 +287,21 @@ fn balanced_lanes<T: FloatT>(
     prefix: &[u128],
     workers: usize,
 ) -> Vec<Lane> {
-    let mut lanes = Vec::with_capacity(workers);
-    let (mut begin, mut row) = (0, 0);
-    for lane in 0..workers {
-        lanes.push(Lane {
-            cone_start: begin,
-            row_start: row,
-        });
-        let remaining = workers - lane;
-        if remaining == 1 {
-            break;
-        }
-        let target = (prefix[cones.len()] - prefix[begin]) / (remaining as u128);
-        let last = cones.len() - (remaining - 1);
-        let mut end = begin + 1;
-        while end < last && prefix[end] - prefix[begin] < target {
-            end += 1;
-        }
-        if end > begin + 1 {
-            let before = prefix[end - 1] - prefix[begin];
-            let after = prefix[end] - prefix[begin];
-            if target.abs_diff(before) <= target.abs_diff(after) {
-                end -= 1;
+    let (mut next, mut row) = (0, 0);
+    crate::utils::partition::contiguous_lanes(prefix, workers)
+        .into_iter()
+        .map(|cone_start| {
+            row += cones[next..cone_start]
+                .iter()
+                .map(|c| c.numel())
+                .sum::<usize>();
+            next = cone_start;
+            Lane {
+                cone_start,
+                row_start: row,
             }
-        }
-        for cone in &cones[begin..end] {
-            row += cone.numel();
-        }
-        begin = end;
-    }
-    lanes
+        })
+        .collect()
 }
 
 // Splitting consumes the borrowed bundle and returns nonoverlapping bundles.
@@ -544,22 +544,10 @@ pub(super) fn prepare_affine_bounds<T: FloatT>(
             let mut row = 0;
             for (cone, bound) in cones.iter_mut().zip(bounds) {
                 let end = row + cone.numel();
-                #[cfg(feature = "sdp")]
                 if let SupportedCone::PSDTriangleCone(cone) = cone {
                     *bound =
                         cone.prepare_affine_bounds(&mut dz[row..end], &mut ds[row..end], alpha);
                 } else if cone.is_symmetric() {
-                    *bound = cone.step_length(
-                        &dz[row..end],
-                        &ds[row..end],
-                        &z[row..end],
-                        &s[row..end],
-                        settings,
-                        alpha,
-                    );
-                }
-                #[cfg(not(feature = "sdp"))]
-                if cone.is_symmetric() {
                     *bound = cone.step_length(
                         &dz[row..end],
                         &ds[row..end],

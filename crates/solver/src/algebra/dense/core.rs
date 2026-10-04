@@ -1,6 +1,3 @@
-// allow dead code here since dense matrix and its supporting
-// functionality could eventually become a public interface.
-#![allow(dead_code)]
 #![allow(non_snake_case)]
 
 use crate::algebra::*;
@@ -80,6 +77,7 @@ where
         Self::new(size, data)
     }
 
+    #[cfg(test)]
     pub fn identity(n: usize) -> Self {
         let mut mat = Matrix::zeros((n, n));
         mat.set_identity();
@@ -95,6 +93,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub fn new_from_slice(size: (usize, usize), src: &[T]) -> Self {
         Self::new(size, src.to_vec())
     }

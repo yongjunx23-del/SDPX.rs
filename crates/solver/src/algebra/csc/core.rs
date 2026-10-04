@@ -217,6 +217,35 @@ where
         CscMatrix::new(m, n, colptr, rowval, nzval)
     }
 
+    /// `self + other` for same-size matrices whose stored rows are disjoint
+    /// in every column; each merged column keeps ascending row order.
+    pub(crate) fn disjoint_sum(&self, other: &Self) -> Self {
+        assert_eq!((self.m, self.n), (other.m, other.n));
+        let nnz = self.nnz() + other.nnz();
+        let mut colptr = Vec::with_capacity(self.n + 1);
+        let mut rowval = Vec::with_capacity(nnz);
+        let mut nzval = Vec::with_capacity(nnz);
+        colptr.push(0);
+        for j in 0..self.n {
+            let (mut p, pend) = (self.colptr[j], self.colptr[j + 1]);
+            let (mut q, qend) = (other.colptr[j], other.colptr[j + 1]);
+            while p < pend || q < qend {
+                if q == qend || (p < pend && self.rowval[p] < other.rowval[q]) {
+                    rowval.push(self.rowval[p]);
+                    nzval.push(self.nzval[p]);
+                    p += 1;
+                } else {
+                    debug_assert!(p == pend || self.rowval[p] != other.rowval[q]);
+                    rowval.push(other.rowval[q]);
+                    nzval.push(other.nzval[q]);
+                    q += 1;
+                }
+            }
+            colptr.push(rowval.len());
+        }
+        CscMatrix::new(self.m, self.n, colptr, rowval, nzval)
+    }
+
     /// Sparse matrix of zeros of size `m` x `n`
     pub fn zeros(size: (usize, usize)) -> Self {
         Self::spalloc(size, 0)
@@ -273,7 +302,6 @@ where
 
     /// Return matrix data in triplet format.
     ///
-    #[cfg_attr(not(feature = "sdp"), allow(dead_code))]
     pub(crate) fn findnz(&self) -> (Vec<usize>, Vec<usize>, Vec<T>) {
         let I = self.rowval.clone();
         let mut J = Vec::with_capacity(self.nnz());
@@ -426,7 +454,7 @@ where
         }
 
         //check for colptr monotonicity
-        if self.colptr.windows(2).any(|c| c[0] > c[1]) {
+        if self.colptr[0] != 0 || self.colptr.windows(2).any(|c| c[0] > c[1]) {
             return Err(SparseFormatError::BadColptr);
         }
         Ok(())

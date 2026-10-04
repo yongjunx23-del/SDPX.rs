@@ -1,3 +1,13 @@
-# SDPX solver core
+# SDPX solver
 
-Rust conic solver adapted from [Clarabel.rs](https://github.com/oxfordcontrol/Clarabel.rs), under the upstream Apache-2.0 license retained here. See the workspace README for the native API/CLI, build instructions and supported arithmetic. `provenance/upstream.json` records the source mapping and original hashes.
+One generic Rust HSD interior-point engine for Float64 and MPFR, adapted
+from [Clarabel.rs](https://github.com/oxfordcontrol/Clarabel.rs). This crate
+provides the native Rust API and `sdpx` CLI; `sdpx-ffi` provides the C ABI.
+
+See the [workspace README](../../README.md) for setup and usage,
+[Rust examples](examples/rust/) for API examples, and
+[architecture](../../docs/ARCHITECTURE.md) for arithmetic, KKT backends and
+build features. BLAS/LAPACK are linked in every solver build.
+
+Apache-2.0. Upstream attribution, source mapping and original hashes are
+retained in [provenance](../../provenance/).

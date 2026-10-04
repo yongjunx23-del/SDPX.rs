@@ -74,15 +74,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         if trunk.iter().any(|&id| signs[id] != -1) {
             return None;
         }
-        // Reject nonlocal P coupling and any noncanonical CSC pattern before
-        // constructing the block map. Stored zeros count as structural edges,
-        // so later data updates cannot silently invalidate this decomposition.
+        // Reject nonlocal P coupling before constructing the block map.
+        // Stored zeros count as structural edges, so later data updates
+        // cannot silently invalidate this decomposition.
         for j in 0..k.n {
             for p in k.colptr[j]..k.colptr[j + 1] {
                 let i = k.rowval[p];
-                if i > j || (p > k.colptr[j] && k.rowval[p - 1] >= i) {
-                    return None;
-                }
                 if owner[i] != usize::MAX && owner[j] != usize::MAX && owner[i] != owner[j] {
                     return None;
                 }
@@ -117,7 +114,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         let t = self.trunk.len();
         let leaves = &self.leaves;
-        // A border column couples only to the leaf's primal suffix.
+        // Use the leaf's structurally nonzero coupling suffix.
         // MPFR's dot uses exact accumulation rounded once; each entry has the
         // same leaf/coordinate order at every thread count. No parallel sum.
         let column = |(j, values): (usize, &mut [T])| {

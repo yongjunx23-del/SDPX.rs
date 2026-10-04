@@ -1,4 +1,3 @@
-#[cfg(feature = "sdp")]
 use crate::solver::chordal::ChordalInfo;
 
 use crate::io::{ConfigurablePrintTarget, PrintTarget};
@@ -74,7 +73,6 @@ where
             )?;
         }
 
-        #[cfg(feature = "sdp")]
         if let Some(ref chordal_info) = data.chordal_info {
             print_chordal_decomposition(out, chordal_info, settings)?;
         }
@@ -93,7 +91,6 @@ where
         _print_conedims_by_type(out, cones, SupportedConeTag::ExponentialCone)?;
         _print_conedims_by_type(out, cones, SupportedConeTag::PowerCone)?;
         _print_conedims_by_type(out, cones, SupportedConeTag::GenPowerCone)?;
-        #[cfg(feature = "sdp")]
         _print_conedims_by_type(out, cones, SupportedConeTag::PSDTriangleCone)?;
 
         writeln!(out,)?;
@@ -290,7 +287,6 @@ fn print_nthreads(out: &mut PrintTarget, nthreads: usize) -> std::io::Result<()>
     }
 }
 
-#[cfg(feature = "sdp")]
 fn print_chordal_decomposition<T: FloatT>(
     out: &mut PrintTarget,
     chordal_info: &ChordalInfo<T>,

@@ -48,6 +48,13 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "None")]
     pub tol_feas_componentwise: Option<T>,
 
+    /// Optional dual tolerance normalized by the objective alone. A full
+    /// `Solved` status also requires `‖r_dual‖₂ / (τ (1 + ‖q‖∞)) < tol` in original
+    /// coordinates, without the `‖x‖`, `‖z‖` terms of the standard
+    /// normalization. `None` (default) keeps the standard test.
+    #[builder(default = "None")]
+    pub tol_dual_qnorm: Option<T>,
+
     ///absolute infeasibility tolerance (primal and dual)
     #[builder(default = "accuracy_default::<T>(1e-8)")]
     pub tol_infeas_abs: T,
@@ -133,6 +140,11 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = r#""auto".to_string()"#)]
     pub kkt_form: String,
 
+    /// Dense workspace budget for automatic shared-variable SOC elimination.
+    /// Zero disables this route; the default preserves the 512 MiB limit.
+    #[builder(default = "512 * 1024 * 1024")]
+    pub shared_soc_max_bytes: u64,
+
     ///enable KKT static regularization
     #[builder(default = "true")]
     pub static_regularization_enable: bool,
@@ -190,26 +202,18 @@ pub struct DefaultSettings<T: FloatT> {
     pub input_sparse_dropzeros: bool,
 
     /// enable chordal decomposition.
-    /// [requires "sdp" feature.]
-    #[cfg(feature = "sdp")]
     #[builder(default = "true")]
     pub chordal_decomposition_enable: bool,
 
     ///chordal decomposition merge method ("none", "parent_child" or "clique_graph").
-    /// [requires "sdp" feature.]
-    #[cfg(feature = "sdp")]
     #[builder(default = r#""clique_graph".to_string()"#)]
     pub chordal_decomposition_merge_method: String,
 
     ///assemble decomposed system in "compact" form
-    ///[requires "sdp" feature.]
-    #[cfg(feature = "sdp")]
     #[builder(default = "true")]
     pub chordal_decomposition_compact: bool,
 
     ///complete PSD dual variables after decomposition
-    /// [requires "sdp" feature.]
-    #[cfg(feature = "sdp")]
     #[builder(default = "true")]
     pub chordal_decomposition_complete_dual: bool,
 }
@@ -308,9 +312,6 @@ where
     fn core(&self) -> &DefaultSettings<T> {
         self
     }
-    fn core_mut(&mut self) -> &mut DefaultSettings<T> {
-        self
-    }
 
     /// Check option names and numerical values required for safe control flow.
     fn validate(&self) -> Result<(), SettingsError> {
@@ -330,9 +331,13 @@ where
                 return Err(SettingsError::BadFieldValue("tol_feas_componentwise"));
             }
         }
+        if let Some(tol) = self.tol_dual_qnorm {
+            if !tol.is_finite() || tol <= T::zero() {
+                return Err(SettingsError::BadFieldValue("tol_dual_qnorm"));
+            }
+        }
 
         // check that the chordal decomposition merge method (string) is valid
-        #[cfg(feature = "sdp")]
         validate_chordal_decomposition_merge_method(&self.chordal_decomposition_merge_method)?;
 
         Ok(())
@@ -354,6 +359,7 @@ where
         check_immutable_setting!(self, prev, direct_kkt_solver);
         check_immutable_setting!(self, prev, direct_solve_method);
         check_immutable_setting!(self, prev, kkt_form);
+        check_immutable_setting!(self, prev, shared_soc_max_bytes);
         check_immutable_setting!(self, prev, dynamic_regularization_enable);
         check_immutable_setting!(self, prev, dynamic_regularization_eps);
         check_immutable_setting!(self, prev, dynamic_regularization_delta);
@@ -365,7 +371,6 @@ where
             return Err(SettingsError::ImmutableSetting("tol_feas_componentwise"));
         }
 
-        #[cfg(feature = "sdp")]
         {
             check_immutable_setting!(self, prev, chordal_decomposition_enable);
             check_immutable_setting!(self, prev, chordal_decomposition_merge_method);
@@ -407,9 +412,13 @@ where
                 return Err(SettingsError::BadFieldValue("tol_feas_componentwise"));
             }
         }
+        if let Some(Some(tol)) = self.tol_dual_qnorm.as_ref() {
+            if !tol.is_finite() || *tol <= T::zero() {
+                return Err(SettingsError::BadFieldValue("tol_dual_qnorm"));
+            }
+        }
 
         // check that the chordal decomposition merge method is valid
-        #[cfg(feature = "sdp")]
         if let Some(ref chordal_decomposition_merge_method) =
             self.chordal_decomposition_merge_method
         {
@@ -434,7 +443,7 @@ fn validate_linesearch_backtrack_step<T: FloatT>(step: T) -> Result<(), Settings
 fn validate_kkt_form(form: &str) -> Result<(), SettingsError> {
     match form {
         "auto" | "augmented" => Ok(()),
-        "condensed" if cfg!(feature = "sdp") => Ok(()),
+        "condensed" if true => Ok(()),
         _ => Err(SettingsError::BadFieldValue("kkt_form")),
     }
 }
@@ -449,7 +458,6 @@ fn validate_direct_solve_method(direct_solve_method: &str) -> Result<(), Setting
     }
 }
 
-#[cfg(feature = "sdp")]
 fn validate_chordal_decomposition_merge_method(
     chordal_decomposition_merge_method: &str,
 ) -> Result<(), SettingsError> {
@@ -488,15 +496,10 @@ fn test_settings_validate() {
     let builder = DefaultSettingsBuilder::<f64>::default()
         .direct_solve_method("faer".to_string())
         .build();
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "faer-sparse")] {
-            assert!(builder.is_ok());
-        }
-        else {
-            assert!(builder.is_err());
-        }
-    }
-    #[cfg(feature = "sdp")]
+    #[cfg(feature = "faer-sparse")]
+    assert!(builder.is_ok());
+    #[cfg(not(feature = "faer-sparse"))]
+    assert!(builder.is_err());
     // fail on unknown chordal decomposition merge method
     assert!(DefaultSettingsBuilder::<f64>::default()
         .chordal_decomposition_merge_method("foo".to_string())
@@ -521,6 +524,13 @@ fn test_settings_validate() {
         ..DefaultSettings::default()
     };
     assert!(newsettings.validate_as_update(&oldsettings).is_err());
+
+    let changed_budget = DefaultSettings::<f64> {
+        shared_soc_max_bytes: 2 * 1024 * 1024 * 1024,
+        ..oldsettings.clone()
+    };
+    assert!(changed_budget.validate().is_ok());
+    assert!(changed_budget.validate_as_update(&oldsettings).is_err());
 
     // try to overlay allowed update values
     let oldsettings = DefaultSettings::<f64> {

@@ -1,0 +1,4 @@
+[env]
+# openblas-src builds OpenBLAS single-threaded by default. The solver calls
+# BLAS from its worker pool, which that build only supports with locking.
+OPENBLAS_USE_LOCKING = "1"

@@ -17,8 +17,9 @@ workers when memory is limited. Output is identical across thread counts.
 Single-block inputs use one worker.
 
 Input: SDPB JSON or legacy XML. Output: a new, uncompressed SDP directory.
-Existing paths are refused. The CLI supports MPFR at every 64-bit increment
-from 128 through 2048; the library accepts `MpFloat<N>` with at least 128 bits.
+Existing paths are refused. The CLI supports MPFR at 128, 256, 512, 768 or 1024 bits by default —
+`all-precisions` builds accept every 64-bit increment from 128 through 2048.
+The library accepts `MpFloat<N>` with at least 128 bits.
 Use the same precision when solving the converted problem.
 
 ## Input

@@ -379,3 +379,372 @@ fn ordered_dot_fma_all_precisions() {
     ordered_dot_fma::<16>();
     ordered_dot_fma::<32>();
 }
+
+// The inline product must equal mpfr_mul bit for bit (nearest-even has one
+// answer): random full mantissas, exponent spread, signs, ties and carries.
+fn inline_mul_matches_mpfr<const N: usize>() {
+    let mut s = 0x2545f4914f6cdd1du64 ^ N as u64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let random = |next: &mut dyn FnMut() -> u64, bits: Option<u32>| {
+        let mut limbs = [0u64; N];
+        for l in limbs.iter_mut() {
+            *l = next();
+        }
+        if let Some(bits) = bits {
+            // Few leading bits: products then land on exact ties often.
+            limbs = [0; N];
+            limbs[N - 1] = (next() | 1 << 63) & !(u64::MAX >> bits);
+        }
+        limbs[N - 1] |= 1 << 63;
+        let e = (next() % 400) as i64 - 200;
+        let kind = if next() & 1 == 0 {
+            mpfr::REGULAR_KIND
+        } else {
+            -mpfr::REGULAR_KIND
+        };
+        MpFloat::<N> {
+            limbs,
+            kind,
+            exponent: e as mpfr::exp_t,
+        }
+    };
+    let top = MpFloat::<N> {
+        limbs: [u64::MAX; N],
+        kind: mpfr::REGULAR_KIND,
+        exponent: 0,
+    };
+    let mut cases = vec![(top, top)];
+    for i in 0..20_000 {
+        let bits = match i % 4 {
+            0 => None,
+            1 => Some(2),
+            2 => Some(5),
+            _ => Some(17),
+        };
+        let a = random(&mut next, None);
+        let b = random(&mut next, bits);
+        cases.push((a, b));
+        cases.push((b, a));
+    }
+    for (a, b) in cases {
+        let fast = a.mul_regular(&b).expect("regular operands in range");
+        let reference = a.binary(b, mpfr::mul);
+        assert_eq!(
+            (fast.kind, fast.exponent, fast.limbs),
+            (reference.kind, reference.exponent, reference.limbs),
+            "N={N} {a:?} * {b:?}"
+        );
+    }
+    // Specials and wide exponents defer to MPFR.
+    let one = MpFloat::<N>::one();
+    assert!(one.mul_regular(&MpFloat::<N>::zero()).is_none());
+    let huge = MpFloat::<N> {
+        exponent: (1 << 29) as mpfr::exp_t,
+        ..one
+    };
+    assert!(huge.mul_regular(&huge).is_none());
+    assert_eq!((huge * huge).kind, (huge.binary(huge, mpfr::mul)).kind);
+}
+
+#[test]
+fn inline_multiply_matches_mpfr_mul() {
+    inline_mul_matches_mpfr::<1>();
+    inline_mul_matches_mpfr::<2>();
+    inline_mul_matches_mpfr::<3>();
+    inline_mul_matches_mpfr::<4>();
+    inline_mul_matches_mpfr::<8>();
+    inline_mul_matches_mpfr::<12>();
+    inline_mul_matches_mpfr::<16>();
+}
+
+// Inline add/sub must equal mpfr_add/mpfr_sub bit for bit.
+fn inline_add_matches_mpfr<const N: usize>() {
+    let mut s = 0x9e3779b97f4a7c15u64 ^ (N as u64 * 977);
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let p = (N * 64) as i64;
+    let make = |next: &mut dyn FnMut() -> u64, e: i64, style: u64| {
+        let mut limbs = [0u64; N];
+        match style % 5 {
+            0 | 1 => limbs.iter_mut().for_each(|l| *l = next()),
+            2 => limbs[N - 1] = next() & !(u64::MAX >> 3), // few bits: ties
+            3 => {}                                        // power of two
+            _ => limbs = [u64::MAX; N],                    // all ones: carry-out
+        }
+        limbs[N - 1] |= 1 << 63;
+        let kind = if next() & 1 == 0 {
+            mpfr::REGULAR_KIND
+        } else {
+            -mpfr::REGULAR_KIND
+        };
+        MpFloat::<N> {
+            limbs,
+            kind,
+            exponent: e as mpfr::exp_t,
+        }
+    };
+    let gaps = [
+        0,
+        1,
+        2,
+        3,
+        63,
+        64,
+        65,
+        p - 2,
+        p - 1,
+        p,
+        p + 1,
+        p + 2,
+        p + 3,
+        2 * p,
+        1000,
+    ];
+    let mut cases = Vec::new();
+    for _ in 0..3000 {
+        for &g in &gaps {
+            let e = (next() % 200) as i64 - 100;
+            let style = next();
+            let a = make(&mut next, e, style);
+            let style = next();
+            let b = make(&mut next, e - g, style);
+            cases.push((a, b));
+            cases.push((b, a));
+        }
+        // Near-total cancellation: b = -a perturbed in the last limb.
+        let a = make(&mut next, 7, 0);
+        let mut b = MpFloat::<N> { kind: -a.kind, ..a };
+        b.limbs[0] ^= next() & 0xff;
+        b.limbs[N - 1] |= 1 << 63;
+        cases.push((a, b));
+        cases.push((a, MpFloat::<N> { kind: -a.kind, ..a }));
+    }
+    for (a, b) in cases {
+        for negate in [false, true] {
+            let fast = a.add_regular(&b, negate).expect("in range");
+            let reference = a.binary(b, if negate { mpfr::sub } else { mpfr::add });
+            let norm = |v: MpFloat<N>| {
+                if v.kind.abs() == mpfr::ZERO_KIND {
+                    (0, 0, [0; N])
+                } else {
+                    (v.kind, v.exponent as i64, v.limbs)
+                }
+            };
+            assert_eq!(
+                norm(fast),
+                norm(reference),
+                "N={N} {a:?} {} {b:?}",
+                if negate { '-' } else { '+' }
+            );
+            if fast.kind.abs() == mpfr::ZERO_KIND {
+                assert_eq!(fast.kind, reference.kind, "zero sign");
+            }
+        }
+    }
+}
+
+#[test]
+fn inline_add_sub_matches_mpfr() {
+    inline_add_matches_mpfr::<1>();
+    inline_add_matches_mpfr::<2>();
+    inline_add_matches_mpfr::<3>();
+    inline_add_matches_mpfr::<4>();
+    inline_add_matches_mpfr::<8>();
+}
+
+// Timing only (cargo test --release -- --ignored --nocapture): inline vs
+// MPFR per width, to keep each fast path only where it wins.
+fn time_ops<const N: usize>() {
+    let mut s = 0x1234_5678_9abc_def1u64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let vals: Vec<MpFloat<N>> = (0..4096)
+        .map(|_| {
+            let mut limbs = [0u64; N];
+            limbs.iter_mut().for_each(|l| *l = next());
+            limbs[N - 1] |= 1 << 63;
+            let kind = if next() & 1 == 0 {
+                mpfr::REGULAR_KIND
+            } else {
+                -mpfr::REGULAR_KIND
+            };
+            MpFloat::<N> {
+                limbs,
+                kind,
+                exponent: ((next() % 9) as i64 - 4) as mpfr::exp_t,
+            }
+        })
+        .collect();
+    let reps = 200;
+    let time = |f: &dyn Fn(&MpFloat<N>, &MpFloat<N>) -> MpFloat<N>| {
+        let t = std::time::Instant::now();
+        let mut acc = 0i64;
+        for _ in 0..reps {
+            for w in vals.windows(2) {
+                let r = std::hint::black_box(f(
+                    std::hint::black_box(&w[0]),
+                    std::hint::black_box(&w[1]),
+                ));
+                acc = acc.wrapping_add(r.exponent as i64 ^ r.limbs[0] as i64);
+            }
+        }
+        (
+            t.elapsed().as_nanos() as f64 / (reps * (vals.len() - 1)) as f64,
+            acc,
+        )
+    };
+    let (mi, _) = time(&|a, b| a.mul_regular(b).unwrap_or(*a));
+    let (mm, _) = time(&|a, b| a.binary(*b, mpfr::mul));
+    let (ai, _) = time(&|a, b| a.add_regular(b, false).unwrap_or(*a));
+    let (am, _) = time(&|a, b| a.binary(*b, mpfr::add));
+    println!("N={N:2}: mul inline {mi:5.1} mpfr {mm:5.1} | add inline {ai:5.1} mpfr {am:5.1} ns");
+}
+
+#[test]
+#[ignore]
+fn time_inline_vs_mpfr() {
+    time_ops::<2>();
+    time_ops::<4>();
+    time_ops::<8>();
+    time_ops::<12>();
+    time_ops::<16>();
+    time_ops::<19>();
+    time_ops::<32>();
+}
+
+fn time_fmma<const N: usize>() {
+    let mut s = 0xabcdef12345u64 ^ N as u64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let vals: Vec<MpFloat<N>> = (0..4096)
+        .map(|_| {
+            let mut limbs = [0u64; N];
+            limbs.iter_mut().for_each(|l| *l = next());
+            limbs[N - 1] |= 1 << 63;
+            let kind = if next() & 1 == 0 {
+                mpfr::REGULAR_KIND
+            } else {
+                -mpfr::REGULAR_KIND
+            };
+            MpFloat::<N> {
+                limbs,
+                kind,
+                exponent: ((next() % 9) as i64 - 4) as mpfr::exp_t,
+            }
+        })
+        .collect();
+    let reps = 100;
+    let t = std::time::Instant::now();
+    let mut acc = 0i64;
+    for _ in 0..reps {
+        for w in vals.windows(4) {
+            let r = std::hint::black_box(MpFloat::<N>::dot_fma2(&w[0], &w[1], &w[2], &w[3]));
+            acc ^= r.limbs[0] as i64;
+        }
+    }
+    let a = t.elapsed().as_nanos() as f64 / (reps * 4093) as f64;
+    let t = std::time::Instant::now();
+    for _ in 0..reps {
+        for w in vals.windows(4) {
+            let r = std::hint::black_box(MpFloat::<N>::dot_fma([(&w[0], &w[1]), (&w[2], &w[3])]));
+            acc ^= r.limbs[0] as i64;
+        }
+    }
+    let b = t.elapsed().as_nanos() as f64 / (reps * 4093) as f64;
+    for w in vals.windows(4).take(2000) {
+        assert_eq!(
+            MpFloat::<N>::dot_fma2(&w[0], &w[1], &w[2], &w[3]),
+            MpFloat::<N>::dot_fma([(&w[0], &w[1]), (&w[2], &w[3])])
+        );
+    }
+    println!("N={N:2}: fmma {a:6.1} ns, exact dot of 2 {b:6.1} ns ({acc})");
+}
+
+#[test]
+#[ignore]
+fn time_fmma_vs_exact_dot() {
+    time_fmma::<4>();
+    time_fmma::<8>();
+    time_fmma::<12>();
+}
+
+// Narrow dot_fma2 (exact dot) must equal mpfr_fmma bit for bit.
+fn narrow_fmma_matches_mpfr<const N: usize>() {
+    let mut s = 0x51ed2701f3a4b5c7u64 ^ N as u64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let value = |next: &mut dyn FnMut() -> u64| {
+        let mut limbs = [0u64; N];
+        limbs.iter_mut().for_each(|l| *l = next());
+        limbs[N - 1] |= 1 << 63;
+        let kind = if next() & 1 == 0 {
+            mpfr::REGULAR_KIND
+        } else {
+            -mpfr::REGULAR_KIND
+        };
+        let e = (next() % 300) as i64 - 150;
+        MpFloat::<N> {
+            limbs,
+            kind,
+            exponent: e as mpfr::exp_t,
+        }
+    };
+    for i in 0..20_000 {
+        let (a, b, c) = (value(&mut next), value(&mut next), value(&mut next));
+        // Every fourth case cancels the first product exactly.
+        let d = if i % 4 == 0 {
+            -(a * b) / c
+        } else {
+            value(&mut next)
+        };
+        let reference = {
+            let (a, b, c, d) = (
+                a.descriptor(),
+                b.descriptor(),
+                c.descriptor(),
+                d.descriptor(),
+            );
+            MpFloat::<N>::output(|r| unsafe {
+                mpfr::fmma(r, &a, &b, &c, &d, ROUND);
+            })
+        };
+        let fast = MpFloat::<N>::dot_fma2(&a, &b, &c, &d);
+        let norm = |v: MpFloat<N>| {
+            if v.kind.abs() == mpfr::ZERO_KIND {
+                (0, 0, [0; N])
+            } else {
+                (v.kind, v.exponent as i64, v.limbs)
+            }
+        };
+        assert_eq!(norm(fast), norm(reference), "N={N} case {i}");
+    }
+}
+
+#[test]
+fn narrow_fmma_matches_mpfr_fmma() {
+    narrow_fmma_matches_mpfr::<1>();
+    narrow_fmma_matches_mpfr::<2>();
+    narrow_fmma_matches_mpfr::<3>();
+    narrow_fmma_matches_mpfr::<4>();
+}

@@ -6,10 +6,6 @@ use crate::algebra::*;
 // ------------------------------------
 
 pub struct PSDConeData<T> {
-    chol1: CholeskyEngine<T>,
-    chol2: CholeskyEngine<T>,
-    SVD: SVDEngine<T>,
-    Eig: EigEngine<T>,
     λ: Vec<T>,
     Λisqrt: Vec<T>,
     pub(crate) R: Matrix<T>,
@@ -17,14 +13,40 @@ pub struct PSDConeData<T> {
     // G = R R^T, with an authoritative upper triangle. The p-by-p
     // Hessian is generated only into an augmented KKT caller's packed block.
     G: Matrix<T>,
+}
 
-    //workspace for various internal uses
-    workmat1: Matrix<T>,
-    workmat2: Matrix<T>,
-    workmat3: Matrix<T>,
-    workvec: Vec<T>,
+impl<T> PSDConeData<T>
+where
+    T: FloatT,
+{
+    pub fn new(n: usize) -> Self {
+        Self {
+            λ: vec![T::zero(); n],
+            Λisqrt: vec![T::zero(); n],
+            R: Matrix::zeros((n, n)),
+            Rinv: Matrix::zeros((n, n)),
+            G: Matrix::zeros((n, n)),
+        }
+    }
+}
+
+// Scratch of one cone call. Every buffer is written before it is read within
+// a call, and only R, Rinv, G and λ persist between calls, so each worker
+// thread keeps one set for all the cones it serves instead of one per cone.
+struct PsdWork<T> {
+    n: usize,
+    chol1: CholeskyEngine<T>,
+    // Larger second factors use mat2 until L2' * L1 consumes them.
+    chol2: CholeskyEngine<T>,
+    // Scaling consumes Vt before other cone calls reuse it as their third
+    // matrix; the next factorization overwrites every entry.
+    svd: SVDEngine<T>,
+    eig: EigEngine<T>,
+    mat1: Matrix<T>,
+    mat2: Matrix<T>,
+    vector: Vec<T>,
     // Allocated only when dz/ds bounds actually run on two workers.
-    second_step: Option<Box<StepWorkspace<T>>>,
+    second: Option<Box<StepWorkspace<T>>>,
 }
 
 struct StepWorkspace<T> {
@@ -46,31 +68,32 @@ impl<T: FloatT> StepWorkspace<T> {
     }
 }
 
-impl<T> PSDConeData<T>
-where
-    T: FloatT,
-{
-    pub fn new(n: usize) -> Self {
+impl<T: FloatT> PsdWork<T> {
+    fn new(n: usize) -> Self {
         Self {
-            chol1: CholeskyEngine::<T>::new(n),
-            chol2: CholeskyEngine::<T>::new(n),
-            SVD: SVDEngine::<T>::new_right((n, n)),
-            Eig: EigEngine::<T>::new(n),
-
-            λ: vec![T::zero(); n],
-            Λisqrt: vec![T::zero(); n],
-            R: Matrix::zeros((n, n)),
-            Rinv: Matrix::zeros((n, n)),
-            G: Matrix::zeros((n, n)),
-
-            //workspace for various internal uses
-            workmat1: Matrix::zeros((n, n)),
-            workmat2: Matrix::zeros((n, n)),
-            workmat3: Matrix::zeros((n, n)),
-            workvec: vec![T::zero(); triangular_number(n)],
-            second_step: None,
+            n,
+            chol1: CholeskyEngine::new(n),
+            chol2: CholeskyEngine::new(if n <= 3 { n } else { 0 }),
+            svd: SVDEngine::new_right((n, n)),
+            eig: EigEngine::new(n),
+            mat1: Matrix::zeros((n, n)),
+            mat2: Matrix::zeros((n, n)),
+            vector: vec![T::zero(); triangular_number(n)],
+            second: None,
         }
     }
+}
+
+/// Run `f` with this thread's scratch for a cone of order `n`. A set built for
+/// another order is replaced by a fresh one, so the Cholesky factors' upper
+/// triangles start at zero exactly as in a newly constructed cone.
+fn with_work<T: FloatT, R>(n: usize, f: impl FnOnce(&mut PsdWork<T>) -> R) -> R {
+    crate::algebra::scratch::with_scratch(|slot: &mut Option<PsdWork<T>>| {
+        if slot.as_ref().map_or(true, |w| w.n != n) {
+            *slot = Some(PsdWork::new(n));
+        }
+        f(slot.as_mut().unwrap())
+    })
 }
 
 pub struct PSDTriangleCone<T> {
@@ -100,11 +123,6 @@ where
         &self.data.Rinv
     }
 
-    /// Cached R·Rᵀ; only the upper triangle is authoritative.
-    pub(crate) fn scaling_gram(&self) -> &Matrix<T> {
-        &self.data.G
-    }
-
     /// Number of `T` values the scaling state exchange carries per cone:
     /// R and Rinv in full (n² each) plus λ. Λisqrt and G are derived from
     /// them locally on receipt, bitwise identical to the owner's values.
@@ -114,6 +132,11 @@ where
 
     /// Append this cone's scaling state to `out` in `[R, Rinv, λ]` order.
     /// Called on the owning rank only, after `update_scaling`.
+    /// Cached R·Rᵀ; only the upper triangle is authoritative.
+    pub(crate) fn scaling_gram(&self) -> &Matrix<T> {
+        &self.data.G
+    }
+
     pub(crate) fn pack_scaling_state(&self, out: &mut Vec<T>) {
         out.extend_from_slice(self.data.R.data());
         out.extend_from_slice(self.data.Rinv.data());
@@ -169,22 +192,17 @@ where
 
     // functions relating to unit vectors and cone initialization
     fn margins(&mut self, z: &mut [T], _pd: PrimalOrDualCone) -> (T, T) {
-        let α: T;
-        let β: T;
-
         if z.is_empty() {
-            α = T::max_value();
-            β = T::zero();
-        } else {
-            let Z = &mut self.data.workmat1;
-            svec_to_mat(Z, z);
-            self.data.Eig.eigvals(Z).expect("Eigval error");
-            let e = &self.data.Eig.λ;
-            α = e.minimum();
-            β = e.iter().fold(T::zero(), |s, x| s + T::max(*x, T::zero())); //= sum(e[e.>0])
+            return (T::max_value(), T::zero());
         }
-
-        (α, β)
+        with_work(self.n, |w: &mut PsdWork<T>| {
+            svec_to_mat(&mut w.mat1, z);
+            w.eig.eigvals(&mut w.mat1).expect("Eigval error");
+            let e = &w.eig.λ;
+            let α = e.minimum();
+            let β = e.iter().fold(T::zero(), |s, x| s + T::max(*x, T::zero())); //= sum(e[e.>0])
+            (α, β)
+        })
     }
 
     fn scaled_unit_shift(&self, z: &mut [T], α: T, _pd: PrimalOrDualCone) {
@@ -220,86 +238,120 @@ where
             return true;
         }
 
-        let f = &mut self.data;
-        let (S, Z) = (&mut f.workmat1, &mut f.workmat2);
-        svec_to_mat(S, s);
-        svec_to_mat(Z, z);
-
-        //compute Cholesky factors. The S and Z factorizations are
-        //independent, so offer the second to an idle ambient worker.
-        let (ch1, ch2) = (&mut f.chol1, &mut f.chol2);
-        let (c1, c2) = if sdpx_arithmetic::inner_parallel::paired() {
-            rayon::join(|| ch1.factor(S), || ch2.factor(Z))
-        } else {
-            (ch1.factor(S), ch2.factor(Z))
-        };
-
-        // bail if the cholesky factorization fails
-        // PJG: Need proper Result return type here
-        if c1.is_err() || c2.is_err() {
-            return false;
-        }
-
-        let (L1, L2) = (&f.chol1.L, &f.chol2.L);
-
-        // SVD of L2'*L1,
-        let tmp = &mut f.workmat1;
-        tmp.mul(&L2.t(), L1, T::one(), T::zero());
-        if let Some(dir) = cone_dump_dir() {
-            dump_cone_f64(dir, tmp);
-        }
-
-        // Direct SVD avoids squaring the condition number of L2' * L1.
-        // Only V is needed: with L2'L1 = UΛV', R = L1 V Λ^{-1/2} and its
-        // exact inverse Rinv = Λ^{-1/2} U' L2' = Λ^{1/2} V' L1^{-1}. Recovering
-        // Rinv by one triangular solve replaces the accumulation of U.
-        let __ts = std::time::Instant::now();
-        f.SVD.factor_right(tmp).expect("SVD error");
-        crate::receipt::phase("cone_svd", __ts.elapsed());
-
-        // assemble λ (diagonal), R and Rinv.
-        f.λ.copy_from(&f.SVD.s);
-        f.Λisqrt.copy_from(&f.λ).sqrt().recip();
-
-        //f.R = L1*V*Λ^{-1/2} and f.Rinv = Λ^{1/2}*(L1^{-T}*V)' are
-        //independent; pair them when inner workers are idle.
-        {
-            let (R, Rinv, svd, Λi, λ) = (&mut f.R, &mut f.Rinv, &f.SVD, &f.Λisqrt, &f.λ);
-            let X = &mut f.workmat2;
-            let n = λ.len();
-            let mut build_r = || {
-                R.mul(L1, &svd.Vt.t(), T::one(), T::zero());
-                R.rscale(Λi);
-            };
-            let mut build_rinv = || {
-                for j in 0..n {
-                    for i in 0..n {
-                        X[(i, j)] = svd.Vt[(j, i)];
-                    }
-                }
-                T::xtrsm_lower(n, L1.data(), X.data_mut(), true);
-                for i in 0..n {
-                    let root = λ[i].sqrt();
-                    for j in 0..n {
-                        Rinv[(i, j)] = X[(j, i)] * root;
-                    }
-                }
-            };
-            if sdpx_arithmetic::inner_parallel::paired() {
-                rayon::join(build_r, build_rinv);
+        let n = self.n;
+        let f = &mut *self.data;
+        with_work(n, |w: &mut PsdWork<T>| {
+            let (S, Z) = (&mut w.mat1, &mut w.mat2);
+            svec_to_mat(S, s);
+            if n <= 3 {
+                svec_to_mat(Z, z);
             } else {
-                build_r();
-                build_rinv();
+                let scale = T::FRAC_1_SQRT_2();
+                let mut idx = 0;
+                for j in 0..n {
+                    Z.col_slice_mut(j)[..j].fill(T::zero());
+                    for i in 0..=j {
+                        Z[(j, i)] = if i == j { z[idx] } else { z[idx] * scale };
+                        idx += 1;
+                    }
+                }
             }
-        }
 
-        // Cache only the matrix defining the congruence X -> G X G.
-        // Keeping its upper triangle authoritative preserves the original
-        // syrk rounding and skron indexing, without a p-by-p cone allocation.
-        f.G.data_mut().set(T::zero());
-        f.G.syrk(&f.R, T::one(), T::zero(), MatrixTriangle::Triu);
+            //compute Cholesky factors. The S and Z factorizations are
+            //independent, so offer the second to an idle ambient worker.
+            let (ch1, ch2) = (&mut w.chol1, &mut w.chol2);
+            let mut factor_z = || {
+                if n <= 3 {
+                    ch2.factor(Z)
+                } else {
+                    let n = n.try_into().unwrap();
+                    let mut info = 0;
+                    T::xpotrf(b'L', n, Z.data_mut(), n, &mut info);
+                    if info != 0 {
+                        Err(DenseFactorizationError::Cholesky(info))
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            let (c1, c2) = if sdpx_arithmetic::inner_parallel::paired() {
+                rayon::join(|| ch1.factor(S), factor_z)
+            } else {
+                (ch1.factor(S), factor_z())
+            };
 
-        true //PJG: Should return result, with "?" operators above
+            // bail if the cholesky factorization fails
+            // PJG: Need proper Result return type here
+            if c1.is_err() || c2.is_err() {
+                return false;
+            }
+
+            let L1 = &w.chol1.L;
+            let L2 = if n <= 3 { &w.chol2.L } else { &w.mat2 };
+
+            // SVD of L2'*L1,
+            let tmp = &mut w.mat1;
+            tmp.mul(&L2.t(), L1, T::one(), T::zero());
+
+            // Direct SVD avoids squaring the condition number of L2' * L1.
+            // Only V is needed: with L2'L1 = UΛV', R = L1 V Λ^{-1/2} and its
+            // exact inverse Rinv = Λ^{-1/2} U' L2' = Λ^{1/2} V' L1^{-1}. Recovering
+            // Rinv by one triangular solve replaces the accumulation of U.
+            let __ts = std::time::Instant::now();
+            let svd_ok = w.svd.factor_right(tmp).is_ok();
+            crate::receipt::phase("cone_svd", __ts.elapsed());
+            // non-finite or non-converged SVD: report a scaling failure so the
+            // solver ends with NumericalError instead of panicking
+            if !svd_ok {
+                return false;
+            }
+
+            // assemble λ (diagonal), R and Rinv.
+            f.λ.copy_from(&w.svd.s);
+            // Singular values persist in λ; reuse their scratch for both rounded roots.
+            w.svd.s.sqrt();
+            f.Λisqrt.copy_from(&w.svd.s).recip();
+
+            //f.R = L1*V*Λ^{-1/2} and f.Rinv = Λ^{1/2}*(L1^{-T}*V)' are
+            //independent; pair them when inner workers are idle.
+            {
+                let (R, Rinv, svd, Λi, λ) = (&mut f.R, &mut f.Rinv, &w.svd, &f.Λisqrt, &f.λ);
+                let X = &mut w.mat2;
+                let n = λ.len();
+                let mut build_r = || {
+                    R.mul(L1, &svd.Vt.t(), T::one(), T::zero());
+                    R.rscale(Λi);
+                };
+                let mut build_rinv = || {
+                    for j in 0..n {
+                        for i in 0..n {
+                            X[(i, j)] = svd.Vt[(j, i)];
+                        }
+                    }
+                    T::xtrsm_lower(n, L1.data(), X.data_mut(), true);
+                    for i in 0..n {
+                        let root = svd.s[i];
+                        for j in 0..n {
+                            Rinv[(i, j)] = X[(j, i)] * root;
+                        }
+                    }
+                };
+                if sdpx_arithmetic::inner_parallel::paired() {
+                    rayon::join(build_r, build_rinv);
+                } else {
+                    build_r();
+                    build_rinv();
+                }
+            }
+
+            // Cache only the matrix defining the congruence X -> G X G.
+            // Keeping its upper triangle authoritative preserves the original
+            // syrk rounding and skron indexing, without a p-by-p cone allocation.
+            f.G.data_mut().set(T::zero());
+            f.G.syrk(&f.R, T::one(), T::zero(), MatrixTriangle::Triu);
+
+            true //PJG: Should return result, with "?" operators above
+        })
     }
 
     fn Hs_is_diagonal(&self) -> bool {
@@ -341,40 +393,48 @@ where
         αmax: T,
     ) -> (T, T) {
         if sdpx_arithmetic::inner_parallel::paired() {
-            let f = &mut *self.data;
-            let PSDConeData {
-                R,
-                Rinv,
-                Λisqrt,
-                workvec,
-                workmat1,
-                workmat2,
-                workmat3,
-                Eig,
-                second_step,
-                ..
-            } = f;
-            let StepWorkspace {
-                eig: eig2,
-                mat1: workmat4,
-                mat2: workmat5,
-                mat3: workmat6,
-                vector: workvec2,
-            } = second_step
-                .get_or_insert_with(|| Box::new(StepWorkspace::new(self.n)))
-                .as_mut();
-            rayon::join(
-                || {
-                    step_component_inner(
-                        dz, R, Λisqrt, false, αmax, workvec, workmat1, workmat2, workmat3, Eig,
-                    )
-                },
-                || {
-                    step_component_inner(
-                        ds, Rinv, Λisqrt, true, αmax, workvec2, workmat4, workmat5, workmat6, eig2,
-                    )
-                },
-            )
+            let (n, f) = (self.n, &*self.data);
+            with_work(n, |w: &mut PsdWork<T>| {
+                let PsdWork {
+                    vector,
+                    mat1,
+                    mat2,
+                    svd,
+                    eig,
+                    second,
+                    ..
+                } = w;
+                let StepWorkspace {
+                    eig: eig2,
+                    mat1: mat4,
+                    mat2: mat5,
+                    mat3: mat6,
+                    vector: vector2,
+                } = second
+                    .get_or_insert_with(|| Box::new(StepWorkspace::new(n)))
+                    .as_mut();
+                rayon::join(
+                    || {
+                        step_component_inner(
+                            dz,
+                            &f.R,
+                            &f.Λisqrt,
+                            false,
+                            αmax,
+                            vector,
+                            mat1,
+                            mat2,
+                            &mut svd.Vt,
+                            eig,
+                        )
+                    },
+                    || {
+                        step_component_inner(
+                            ds, &f.Rinv, &f.Λisqrt, true, αmax, vector2, mat4, mat5, mat6, eig2,
+                        )
+                    },
+                )
+            })
         } else {
             let αz = self.step_component(dz, false, αmax);
             let αs = self.step_component(ds, true, αmax);
@@ -395,19 +455,21 @@ where
     T: FloatT,
 {
     fn step_component(&mut self, direction: &[T], primal: bool, αmax: T) -> T {
-        let f = &mut self.data;
-        step_component_inner(
-            direction,
-            if primal { &f.Rinv } else { &f.R },
-            &f.Λisqrt,
-            primal,
-            αmax,
-            &mut f.workvec,
-            &mut f.workmat1,
-            &mut f.workmat2,
-            &mut f.workmat3,
-            &mut f.Eig,
-        )
+        let f = &*self.data;
+        with_work(self.n, |w: &mut PsdWork<T>| {
+            step_component_inner(
+                direction,
+                if primal { &f.Rinv } else { &f.R },
+                &f.Λisqrt,
+                primal,
+                αmax,
+                &mut w.vector,
+                &mut w.mat1,
+                &mut w.mat2,
+                &mut w.svd.Vt,
+                &mut w.eig,
+            )
+        })
     }
 
     pub(crate) fn prepare_affine_bounds(&mut self, dz: &mut [T], ds: &mut [T], αmax: T) -> (T, T) {
@@ -415,51 +477,83 @@ where
         // With a second scratch set they can run on two ambient workers;
         // without one they fold serially, bitwise identical either way.
         if sdpx_arithmetic::inner_parallel::paired() {
-            let f = &mut *self.data;
-            let PSDConeData {
-                R,
-                Rinv,
-                Λisqrt,
-                workvec,
-                workmat1,
-                workmat2,
-                workmat3,
-                Eig,
-                second_step,
-                ..
-            } = f;
-            let StepWorkspace {
-                eig: eig2,
-                mat1: workmat4,
-                mat2: workmat5,
-                mat3: workmat6,
-                vector: workvec2,
-            } = second_step
-                .get_or_insert_with(|| Box::new(StepWorkspace::new(self.n)))
-                .as_mut();
-            let (αz, αs) = rayon::join(
-                || {
-                    let α = step_component_inner(
-                        dz, R, Λisqrt, false, αmax, workvec, workmat1, workmat2, workmat3, Eig,
-                    );
-                    dz.copy_from_slice(workvec);
-                    α
-                },
-                || {
-                    let α = step_component_inner(
-                        ds, Rinv, Λisqrt, true, αmax, workvec2, workmat4, workmat5, workmat6, eig2,
-                    );
-                    ds.copy_from_slice(workvec2);
-                    α
-                },
-            );
-            (αz, αs)
+            let (n, f) = (self.n, &*self.data);
+            with_work(n, |w: &mut PsdWork<T>| {
+                let PsdWork {
+                    vector,
+                    mat1,
+                    mat2,
+                    svd,
+                    eig,
+                    second,
+                    ..
+                } = w;
+                let StepWorkspace {
+                    eig: eig2,
+                    mat1: mat4,
+                    mat2: mat5,
+                    mat3: mat6,
+                    vector: vector2,
+                } = second
+                    .get_or_insert_with(|| Box::new(StepWorkspace::new(n)))
+                    .as_mut();
+                rayon::join(
+                    || {
+                        let α = step_component_inner(
+                            dz,
+                            &f.R,
+                            &f.Λisqrt,
+                            false,
+                            αmax,
+                            vector,
+                            mat1,
+                            mat2,
+                            &mut svd.Vt,
+                            eig,
+                        );
+                        dz.copy_from_slice(vector);
+                        α
+                    },
+                    || {
+                        let α = step_component_inner(
+                            ds, &f.Rinv, &f.Λisqrt, true, αmax, vector2, mat4, mat5, mat6, eig2,
+                        );
+                        ds.copy_from_slice(vector2);
+                        α
+                    },
+                )
+            })
         } else {
-            let αz = self.step_component(dz, false, αmax);
-            dz.copy_from_slice(&self.data.workvec);
-            let αs = self.step_component(ds, true, αmax);
-            ds.copy_from_slice(&self.data.workvec);
-            (αz, αs)
+            let f = &*self.data;
+            with_work(self.n, |w: &mut PsdWork<T>| {
+                let αz = step_component_inner(
+                    dz,
+                    &f.R,
+                    &f.Λisqrt,
+                    false,
+                    αmax,
+                    &mut w.vector,
+                    &mut w.mat1,
+                    &mut w.mat2,
+                    &mut w.svd.Vt,
+                    &mut w.eig,
+                );
+                dz.copy_from_slice(&w.vector);
+                let αs = step_component_inner(
+                    ds,
+                    &f.Rinv,
+                    &f.Λisqrt,
+                    true,
+                    αmax,
+                    &mut w.vector,
+                    &mut w.mat1,
+                    &mut w.mat2,
+                    &mut w.svd.Vt,
+                    &mut w.eig,
+                );
+                ds.copy_from_slice(&w.vector);
+                (αz, αs)
+            })
         }
     }
 
@@ -472,14 +566,15 @@ where
     where
         T: FloatT,
     {
-        let (Q, q) = (&mut self.data.workmat1, &mut self.data.workvec);
-        q.waxpby(T::one(), x, α, dx);
-        svec_to_mat(Q, q);
+        with_work(self.n, |w: &mut PsdWork<T>| {
+            w.vector.waxpby(T::one(), x, α, dx);
+            svec_to_mat(&mut w.mat1, &w.vector);
 
-        match self.data.chol1.factor(Q) {
-            Ok(_) => self.data.chol1.logdet(),
-            Err(_) => T::infinity(),
-        }
+            match w.chol1.factor(&mut w.mat1) {
+                Ok(_) => w.chol1.logdet(),
+                Err(_) => T::infinity(),
+            }
+        })
     }
 }
 
@@ -493,60 +588,60 @@ where
 {
     // implements x = λ \ z for the SDP cone
     fn λ_inv_circ_op(&mut self, x: &mut [T], z: &[T]) {
-        let X = &mut self.data.workmat1;
-        let Z = &mut self.data.workmat2;
+        let (n, λ) = (self.n, &self.data.λ);
+        with_work(n, |w: &mut PsdWork<T>| {
+            let X = &mut w.mat1;
+            let Z = &mut w.mat2;
 
-        svec_to_mat(X, x);
-        svec_to_mat(Z, z);
+            svec_to_mat(Z, z);
 
-        let λ = &self.data.λ;
-        let two: T = (2.).as_T();
-        // Z is symmetric and the Jordan inverse uses the same denominator
-        // for (i,j) and (j,i). Evaluate each pair once, then mirror it before
-        // mat_to_svec performs its usual symmetric packing.
-        for j in 0..self.n {
-            for i in 0..=j {
-                let value = (two * Z[(i, j)]) / (λ[i] + λ[j]);
-                X[(i, j)] = value;
-                if i != j {
-                    X[(j, i)] = value;
+            let two: T = (2.).as_T();
+            // Z is symmetric and the Jordan inverse uses the same denominator
+            // for (i,j) and (j,i). Evaluate each pair once, then mirror it before
+            // mat_to_svec performs its usual symmetric packing.
+            for j in 0..n {
+                for i in 0..=j {
+                    let value = (two * Z[(i, j)]) / (λ[i] + λ[j]);
+                    X[(i, j)] = value;
+                    if i != j {
+                        X[(j, i)] = value;
+                    }
                 }
             }
-        }
-        mat_to_svec(x, X);
+            mat_to_svec(x, X);
+        })
     }
 
     fn mul_W(&mut self, is_transpose: MatrixShape, y: &mut [T], x: &[T], α: T, β: T) {
-        mul_Wx_inner(
-            is_transpose,
-            y,
-            x,
-            α,
-            β,
-            &self.data.R,
-            &mut self.data.workmat1,
-            &mut self.data.workmat2,
-            &mut self.data.workmat3,
-        )
+        mul_Wx_inner(is_transpose, y, x, α, β, &self.data.R)
     }
 
     fn mul_Winv(&mut self, is_transpose: MatrixShape, y: &mut [T], x: &[T], α: T, β: T) {
-        mul_Wx_inner(
+        mul_Wx_inner(is_transpose, y, x, α, β, &self.data.Rinv)
+    }
+}
+
+fn mul_Wx_inner<T>(is_transpose: MatrixShape, y: &mut [T], x: &[T], α: T, β: T, Rx: &Matrix<T>)
+where
+    T: FloatT,
+{
+    with_work(Rx.nrows(), |w: &mut PsdWork<T>| {
+        mul_Wx_scratch(
             is_transpose,
             y,
             x,
             α,
             β,
-            &self.data.Rinv,
-            &mut self.data.workmat1,
-            &mut self.data.workmat2,
-            &mut self.data.workmat3,
+            Rx,
+            &mut w.mat1,
+            &mut w.mat2,
+            &mut w.svd.Vt,
         )
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn mul_Wx_inner<T>(
+fn mul_Wx_scratch<T>(
     is_transpose: MatrixShape,
     y: &mut [T],
     x: &[T],
@@ -614,19 +709,17 @@ where
     T: FloatT,
 {
     fn circ_op(&mut self, x: &mut [T], y: &[T], z: &[T]) {
-        let (Y, Z, X) = (
-            &mut self.data.workmat1,
-            &mut self.data.workmat2,
-            &mut self.data.workmat3,
-        );
-        svec_to_mat(Y, y);
-        svec_to_mat(Z, z);
+        with_work(self.n, |w: &mut PsdWork<T>| {
+            let (Y, Z, X) = (&mut w.mat1, &mut w.mat2, &mut w.svd.Vt);
+            svec_to_mat(Y, y);
+            svec_to_mat(Z, z);
 
-        // X .= (Y*Z + Z*Y)/2
-        // NB: works b/c Y and Z are both symmetric
-        X.data_mut().set(T::zero()); //X.sym_up() will assert is_triu
-        X.syr2k(Y, Z, (0.5).as_T(), T::zero());
-        mat_to_svec(x, &X.sym_up());
+            // X .= (Y*Z + Z*Y)/2
+            // NB: works b/c Y and Z are both symmetric
+            X.data_mut().set(T::zero()); //X.sym_up() will assert is_triu
+            X.syr2k(Y, Z, (0.5).as_T(), T::zero());
+            mat_to_svec(x, &X.sym_up());
+        })
     }
 }
 
@@ -649,7 +742,7 @@ fn step_component_inner<T>(
 where
     T: FloatT,
 {
-    mul_Wx_inner(
+    mul_Wx_scratch(
         if primal {
             MatrixShape::T
         } else {
@@ -690,11 +783,15 @@ where
                 None
             };
             let v = match fast {
-                Some(v) => v,
-                None => engine.eigval_min(workΔ).expect("Eigval error"),
+                Some(v) => Some(v),
+                None => engine.eigval_min(workΔ).ok(),
             };
             crate::receipt::phase("cone_eigmin", __ts.elapsed());
-            v
+            // a failed eigensolve means an unusable direction: zero step
+            match v {
+                Some(v) => v,
+                None => return T::zero(),
+            }
         }
     };
 
@@ -947,54 +1044,6 @@ where
             col += 1;
         } //end k
     } //end l
-}
-
-/// Debug probe: dump the SVD input `L2'·L1` as f64 text, keyed by the
-/// workspace's stable data pointer so consecutive files per cone form the
-/// iteration sequence. Gated by SDPX_DUMP_CONE=<dir>; measures how much the
-/// right singular factor drifts between IPM iterations.
-/// `SDPX_DUMP_CONE` capture gate, read once per process. The gate is fixed at
-/// launch; caching keeps getenv out of the per-iteration cone scaling path.
-fn cone_dump_dir() -> Option<&'static std::ffi::OsStr> {
-    static DIR: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| std::env::var_os("SDPX_DUMP_CONE"))
-        .as_deref()
-}
-
-fn dump_cone_f64<T: FloatT>(dir: &std::ffi::OsStr, m: &Matrix<T>) {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static SEQ: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
-    let key = m.data().as_ptr() as usize;
-    let iter = {
-        let mut guard = SEQ.lock().unwrap();
-        *guard
-            .get_or_insert_with(HashMap::new)
-            .entry(key)
-            .or_insert(0)
-    };
-    *SEQ.lock().unwrap().as_mut().unwrap().get_mut(&key).unwrap() += 1;
-    let name = format!("cone-{key:x}-iter{iter:04}");
-    // Lossless companion for replay: exact (kind, exponent, limbs) encoding.
-    #[cfg(feature = "snapshot")]
-    let _ = crate::snapshot::write_dense(
-        std::path::Path::new(dir),
-        &name,
-        m.size().0,
-        m.size().1,
-        m.data(),
-    );
-    let path = std::path::Path::new(dir).join(format!("{name}.txt"));
-    let (rows, cols) = m.size();
-    let mut out = String::with_capacity(m.data().len() * 24);
-    out.push_str(&format!("{rows} {cols}\n"));
-    for v in m.data().iter() {
-        let f = v
-            .to_f64()
-            .unwrap_or_else(|| if *v < T::zero() { -f64::MAX } else { f64::MAX });
-        out.push_str(&format!("{f:.17e}\n"));
-    }
-    let _ = std::fs::write(&path, out);
 }
 
 #[cfg(test)]

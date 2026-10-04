@@ -69,6 +69,33 @@ pub trait Variables<T: FloatT> {
     /// Compute the scaled duality gap.
     fn calc_mu(&mut self, residuals: &Self::R, cones: &Self::C) -> T;
 
+    /// Write the iterate to a checkpoint file. Unsupported by default.
+    fn write_checkpoint(
+        &self,
+        _data: &Self::D,
+        _path: &std::path::Path,
+        _iter: u32,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this solver backend does not support checkpoints",
+        ))
+    }
+
+    /// Replace the iterate from a checkpoint file of a problem with the same
+    /// structure; returns whether the problem data was identical (exact
+    /// continuation) rather than nearby (hot start). Unsupported by default.
+    fn read_checkpoint(
+        &mut self,
+        _data: &Self::D,
+        _path: &std::path::Path,
+    ) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this solver backend does not support checkpoints",
+        ))
+    }
+
     /// Compute the KKT RHS for a pure Newton step.
     fn affine_step_rhs(&mut self, residuals: &Self::R, variables: &Self, cones: &Self::C);
 
@@ -152,10 +179,6 @@ pub trait Variables<T: FloatT> {
 
     /// Compute the barrier function
     fn barrier(&self, step: &Self, α: T, cones: &mut Self::C) -> T;
-
-    /// Rescale variables, e.g. to renormalize iterates
-    /// in a homogeneous embedding
-    fn rescale(&mut self);
 }
 
 /// Residuals for a conic optimization problem.
@@ -277,7 +300,7 @@ where
     /// associated problem residuals type
     type R: Residuals<T>;
 
-    /// Reset internal data, particularly solve timers.
+    /// Reset internal data and start the solve clock.
     fn reset(&mut self, timers: &mut Timers);
 
     /// Refresh metadata after lazy backend selection, pool changes or fallback.
@@ -365,9 +388,6 @@ pub trait Solution<T: FloatT> {
 pub trait Settings<T: FloatT>: Sized + Clone {
     /// Return the core settings.
     fn core(&self) -> &CoreSettings<T>;
-
-    /// Return the core settings (mutably).
-    fn core_mut(&mut self) -> &mut CoreSettings<T>;
 
     /// sanity check the settings
     fn validate(&self) -> Result<(), SettingsError>;

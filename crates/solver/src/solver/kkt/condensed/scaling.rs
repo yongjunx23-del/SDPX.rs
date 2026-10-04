@@ -103,6 +103,27 @@ pub(super) fn apply_block<T: FloatT>(
                 }
             }
             Scaling::Zero => {}
+            Scaling::SocElim { w, eta, .. } => {
+                // H = η²(2wwᵀ - J) and H⁻¹ = η⁻²(2(Jw)(Jw)ᵀ - J), wᵀJw = 1.
+                let two: T = (2.).as_T();
+                let c = if inverse {
+                    two * (w[0] * x[0] - w[1..].dot(&x[1..]))
+                } else {
+                    two * w.dot(x)
+                };
+                y.copy_from_slice(x);
+                y[0] = -x[0];
+                if inverse {
+                    y[0] += c * w[0];
+                    for (y, &w) in y[1..].iter_mut().zip(&w[1..]) {
+                        *y -= c * w;
+                    }
+                    y.scale((*eta * *eta).recip());
+                } else {
+                    y.axpby(c, w, T::one());
+                    y.scale(*eta * *eta);
+                }
+            }
             _ if inverse => {} // Retained rows are never inverted.
             Scaling::Soc { w, eta } => {
                 let two: T = (2.).as_T();
@@ -250,35 +271,12 @@ pub(super) fn weighted_lanes(costs: &[u128], workers: usize) -> Vec<usize> {
     if costs.is_empty() {
         return Vec::new();
     }
-    let workers = workers.max(1).min(costs.len());
     let mut prefix = Vec::with_capacity(costs.len() + 1);
     prefix.push(0u128);
     for &cost in costs {
         prefix.push(prefix.last().unwrap().saturating_add(cost));
     }
-    let mut lanes = Vec::with_capacity(workers);
-    let mut begin = 0;
-    for lane in 0..workers {
-        lanes.push(begin);
-        let remaining = workers - lane;
-        if remaining == 1 {
-            break;
-        }
-        let target = (prefix[costs.len()] - prefix[begin]) / remaining as u128;
-        let last = costs.len() - (remaining - 1);
-        let mut end = begin + 1;
-        while end < last && prefix[end] - prefix[begin] < target {
-            end += 1;
-        }
-        if end > begin + 1
-            && target.abs_diff(prefix[end - 1] - prefix[begin])
-                <= target.abs_diff(prefix[end] - prefix[begin])
-        {
-            end -= 1;
-        }
-        begin = end;
-    }
-    lanes
+    crate::utils::partition::contiguous_lanes(&prefix, workers.max(1).min(costs.len()))
 }
 
 #[cfg(test)]

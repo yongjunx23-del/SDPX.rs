@@ -36,6 +36,53 @@ impl Drop for VectorPoolGuard {
     }
 }
 
+/// The slice as `f64` when `T` is `f64`, for branch-free lane scans.
+fn as_f64<T: FloatT>(v: &[T]) -> Option<&[f64]> {
+    (std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>())
+        // SAFETY: `T` is exactly `f64`, so the layout and length are identical.
+        .then(|| unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<f64>(), v.len()) })
+}
+
+/// All entries finite: `x·0` is ±0 for finite `x` and NaN for ±inf or NaN,
+/// so an 8-lane sum is finite exactly when every entry is.
+fn f64_finite(v: &[f64]) -> bool {
+    let mut lanes = [0.0f64; 8];
+    let chunks = v.chunks_exact(8);
+    let tail = chunks.remainder();
+    for c in chunks {
+        for k in 0..8 {
+            lanes[k] += c[k] * 0.0;
+        }
+    }
+    let tail = tail.iter().fold(0.0, |a, &x| a + x * 0.0);
+    (lanes.iter().sum::<f64>() + tail).is_finite()
+}
+
+/// `max |x|` with NaN propagated as in the scalar scan (any NaN gives NaN);
+/// a max is exact, so the lane split does not change the value.
+fn f64_norm_inf(v: &[f64]) -> f64 {
+    let (mut lanes, mut nan) = ([0.0f64; 8], [false; 8]);
+    let chunks = v.chunks_exact(8);
+    let tail = chunks.remainder();
+    for c in chunks {
+        for k in 0..8 {
+            lanes[k] = lanes[k].max(c[k].abs());
+            nan[k] |= c[k].is_nan();
+        }
+    }
+    let mut out = lanes.iter().fold(0.0f64, |a, &b| a.max(b));
+    let mut any_nan = nan.iter().any(|&b| b);
+    for &x in tail {
+        out = out.max(x.abs());
+        any_nan |= x.is_nan();
+    }
+    if any_nan {
+        f64::NAN
+    } else {
+        out
+    }
+}
+
 fn vector_pool<T: FloatT>(len: usize) -> Option<Arc<rayon::ThreadPool>> {
     let min = if T::precision_bits() > 64 {
         VECTOR_MIN_LEN
@@ -231,6 +278,9 @@ impl<T: FloatT> VectorMath<T> for [T] {
 
     // Returns infinity norm
     fn norm_inf(&self) -> T {
+        if let Some(v) = as_f64(self) {
+            return T::from_f64(f64_norm_inf(v)).unwrap();
+        }
         fn serial<T: FloatT>(v: &[T]) -> T {
             let mut out = T::zero();
             for &v in v {
@@ -266,9 +316,6 @@ impl<T: FloatT> VectorMath<T> for [T] {
     }
 
     //
-    fn norm_one_scaled(&self, v: &Self) -> T {
-        zip(self, v).fold(T::zero(), |acc, (&x, &y)| acc + T::abs(x * y))
-    }
 
     // max absolute difference (used for unit testing)
     fn norm_inf_diff(&self, b: &[T]) -> T {
@@ -295,6 +342,9 @@ impl<T: FloatT> VectorMath<T> for [T] {
     }
 
     fn is_finite(&self) -> bool {
+        if let Some(v) = as_f64(self) {
+            return f64_finite(v);
+        }
         if let Some(pool) = vector_pool::<T>(self.len()) {
             return pool.install(|| {
                 self.par_chunks(VECTOR_CHUNK)
@@ -368,7 +418,7 @@ impl<T: FloatT> ScaledNorm<T> {
     /// unnecessary, and this is at least as accurate.
     pub(crate) fn from_exact_squares(x: impl Iterator<Item = T>) -> Self {
         let values: Vec<T> = x.collect();
-        let sumsq = T::dot_fma(values.iter().map(|v| (v, v)));
+        let sumsq = T::dot_slices(&values, &values);
         if sumsq.is_nan() {
             // Same poison form as the scaled recurrence.
             return Self {

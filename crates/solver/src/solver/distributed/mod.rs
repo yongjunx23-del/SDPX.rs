@@ -2,46 +2,67 @@
 //! owning rank and ranks share one equality Schur complement. It plugs into the
 //! core predictor/corrector loop through the same traits as `default`.
 
-#[allow(unused_imports)]
 use crate::algebra::*;
-#[cfg(feature = "sdp")]
-#[allow(unused_imports)]
 use crate::solver::chordal::ChordalInfo;
-#[allow(unused_imports)]
-use crate::solver::cones::{CompositeCone, Cone};
-#[allow(unused_imports)]
+use crate::solver::cones::CompositeCone;
+#[cfg(test)]
+use crate::solver::cones::Cone;
+#[cfg(test)]
 use crate::solver::core::traits::ProblemData;
-#[allow(unused_imports)]
 use crate::solver::default::*;
-#[cfg(feature = "sdp")]
-#[allow(unused_imports)]
 use crate::solver::sampled::*;
-#[allow(unused_imports)]
 use crate::solver::SupportedConeT;
+
+/// Apply `$f` to every owner block (zipped sources, flat tuple items), on
+/// `$pool` when present. Blocks are independent, so pooled and serial runs
+/// perform identical per-block arithmetic.
+macro_rules! for_blocks {
+    ($pool:expr, ($($src:expr),+ $(,)?), $f:expr) => {
+        match $pool {
+            Some(pool) => pool.install(|| {
+                rayon::iter::ParallelIterator::for_each(
+                    rayon::iter::IntoParallelIterator::into_par_iter(($($src,)+)),
+                    $f,
+                )
+            }),
+            None => itertools::multizip(($($src,)+)).for_each($f),
+        }
+    };
+}
+/// `true` when `$f` succeeds on every owner block; see [`for_blocks`].
+macro_rules! all_blocks {
+    ($pool:expr, ($($src:expr),+ $(,)?), $f:expr) => {
+        match $pool {
+            Some(pool) => pool.install(|| {
+                rayon::iter::ParallelIterator::reduce(
+                    rayon::iter::ParallelIterator::map(
+                        rayon::iter::IntoParallelIterator::into_par_iter(($($src,)+)),
+                        $f,
+                    ),
+                    || true,
+                    |a, b| a & b,
+                )
+            }),
+            None => itertools::multizip(($($src,)+)).map($f).fold(true, |a, b| a & b),
+        }
+    };
+}
 
 pub(crate) mod collective;
 mod costs;
-#[cfg(feature = "sdp")]
 mod hsd;
-#[cfg(feature = "sdp")]
 mod kkt;
 mod layout;
-#[cfg(feature = "sdp")]
 mod partitioned;
 mod state;
 
-#[cfg(all(feature = "serde", feature = "sdp"))]
+#[cfg(feature = "serde")]
 pub(crate) use costs::input_fingerprint;
 pub(crate) use costs::CostRuntimeConfig;
-#[cfg(feature = "sdp")]
 pub use costs::{CostComponent, CostHistory, CostHistoryOptions, CostOwnerSample};
-#[cfg(feature = "sdp")]
-#[allow(unused_imports)]
+#[cfg(test)]
 pub(crate) use hsd::*;
-#[cfg(feature = "sdp")]
 pub(crate) use kkt::*;
 pub(crate) use layout::*;
-#[cfg(feature = "sdp")]
 pub use partitioned::PartitionedSolver;
-#[allow(unused_imports)]
 pub(crate) use state::*;

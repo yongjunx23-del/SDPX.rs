@@ -1,238 +1,128 @@
-<h1 align="center">SDPX</h1>
+# SDPX
 
-<p align="center">
-  <b>High-Precision Conic Solver in Pure Rust for the Numerical Bootstrap</b>
-</p>
+SDPX is a Rust conic solver derived from Clarabel.rs, with one homogeneous
+self-dual interior-point engine for Float64 and fixed-precision MPFR arithmetic.
+It solves
 
-<p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.0-e8590c" alt="version 0.8.0">
-  <img src="https://img.shields.io/badge/rust-2021%20(%E2%89%A51.85)-1c7ed6" alt="Rust 2021">
-  <img src="https://img.shields.io/badge/precision-53%20to%202048%20bits-495057" alt="precision 53 to 2048 bits">
-  <img src="https://img.shields.io/badge/license-Apache--2.0-2f9e44" alt="Apache-2.0">
-</p>
+$$
+\min_x \; \tfrac12 x^\top P x + q^\top x
+\quad\text{subject to}\quad Ax+s=b,\;s\in\mathcal K.
+$$
 
-SDPX is an arbitrary-precision primal-dual interior-point solver for convex conic programs, engineered in pure Rust:
+Supported cones are zero, nonnegative, second-order, exponential, power,
+generalized power and PSD triangle. Sampled bootstrap SDPs retain their PSD
+coefficients as bases and sample weights.
 
-$$\begin{aligned}
-\min_{x} \quad & \tfrac{1}{2} x^\top P x + q^\top x \\
-\text{s.t.} \quad & A x + s = b, \quad s \in \mathcal{K}
-\end{aligned}$$
+Use the native Rust API, the `sdpx` CLI or the C ABI in
+[`include/sdpx.h`](include/sdpx.h). The separate `sdpx-pmp2sdp` converter
+turns polynomial matrix programs into sampled SDP inputs. Julia scripts in
+this repository generate inputs or audit results; they do not drive the solver.
 
-where $\mathcal{K}$ is any Cartesian product of **Zero**, **Nonnegative**, **Second-Order (SOC)**, **Exponential**, **Power**, **Generalized Power**, and **Positive Semidefinite (PSD)** cones.
+## Build
 
----
-
-## Key Features
-
-- **Built for the Numerical Bootstrap:** Designed for general numerical bootstrap problems (conformal bootstrap, S-matrix bootstrap, matrix models, and polynomial optimization). Ingests Polynomial Matrix Programs (PMP) directly via built-in `sdpx-pmp2sdp`. Sampled PSD blocks stay in memory-efficient factored form (bilinear bases $\times$ sample weights), avoiding expanding massive coefficient matrices into RAM.
-- **Precision You Choose:** The solver CLI defaults to Float64 and MPFR 128, 256, 512, 768 and 1024 bits. Build with `all-precisions` to include every 64-bit step from 128 through 2048. Eligible dense high-precision products use an exact Residue Number System (RNS) kernel that accumulates exactly without intermediate rounding.
-- **Fast & Scalable:** Multi-threaded block-level parallelism (SDPB-style load balancing via Rayon), parallel Arrow $\text{LDL}^\top$, Faer sparse solver, certified binary64 step-length screening, and optional multi-node MPI partitioning.
-- **Zero Runtime Dependencies:** Standalone CLI tools and pure Rust libraries. No Julia, Python, or Mathematica required at solve time. Includes a stable C ABI (`include/sdpx.h`) for foreign language integration.
-
----
-
-## Installation & Build
-
-Requires **Rust $\ge$ 1.85** and system **GMP/MPFR** libraries (`brew install gmp mpfr` on macOS, `apt install libgmp-dev libmpfr-dev` on Linux).
+Requires Rust 1.85 or newer, a native build toolchain for the GMP/MPFR dependency,
+and BLAS/LAPACK. Choose one provider; BLAS/LAPACK are linked for every solver
+build. After dependencies are cached, build the required crate:
 
 ```sh
-# macOS (Apple Accelerate + Faer)
-cargo build --release -p sdpx-solver --bin sdpx --features sdp-accelerate,faer-sparse
+# macOS: Accelerate; use sdp-openblas instead on Linux.
+F=sdp-accelerate,faer-sparse
+cargo build --locked --offline --profile fast -p sdpx-solver --bin sdpx --features "$F"
+cargo build --locked --offline --profile fast -p sdpx-pmp
 
-# Linux (OpenBLAS + Faer)
-cargo build --release -p sdpx-solver --bin sdpx --features sdp-openblas,faer-sparse
+# Optional C ABI library.
+cargo build --locked --offline --profile fast -p sdpx-ffi --features "$F"
 ```
 
-These commands build `target/release/sdpx` with six precision choices. Add
-`all-precisions` to the feature list for the complete precision range.
-Build the converter separately with `cargo build --release -p sdpx-pmp`.
-The native Rust API, converter and C ABI retain their complete precision support.
+The executables are in `target/fast/`. Use `release` for measured performance.
+The BLAS provider must support concurrent calls from solver workers;
+`.cargo/config.toml` enables locking for source-built OpenBLAS.
+[Architecture](docs/ARCHITECTURE.md#build-features) describes provider features
+and direct linking.
 
----
+The solver CLI and C ABI support 53-bit Float64 and MPFR at 128, 256, 512,
+768 and 1024 bits. The converter supports those MPFR widths and defaults to
+768 bits. Add `all-precisions` to the relevant crate's feature list to expose
+every MPFR width from 128 through 2048 in steps of 64. Native Rust
+`MpFloat<N>` types do not depend on that dispatch feature. A solve keeps its
+requested precision throughout factorization and refinement.
 
-## Ordinary SDP Usage
+## CLI usage
 
-SDPX solves standard SDPs using symmetric vector format (`svec`, upper-triangular order with off-diagonals scaled by $\sqrt{2}$).
+```sh
+# Conic JSON: Float64 by default, or explicitly selected MPFR precision.
+target/fast/sdpx problem.json --output solution.json
+target/fast/sdpx problem.json --precision 256 --threads 8 --output solution.json
 
-### Rust API Example
+# Convert SDPB JSON/XML PMP input, then solve the sampled SDP directory.
+target/fast/sdpx-pmp2sdp --input problem.xml --output problem-sdp --precision 768 --threads 8
+target/fast/sdpx problem-sdp --precision 768 --threads 8 --output solution.json
+```
+
+`sdpx INPUT` accepts conic JSON, a sampled SDP directory, or `-` for JSON
+stdin. `--settings FILE` replaces input settings; unspecified fields use
+core defaults. Progress goes to stderr and the result goes to stdout unless
+`--output` is supplied. The converter refuses existing output paths.
+
+`--checkpoint FILE [--checkpoint-every N]` saves the accepted iterate
+(default interval: 10 iterations). `--restart FILE` continues the same input
+or starts a nearby input with matching structure and precision. Checkpoints
+require the ordinary solver, without `--partitions`. `SDPX_RECEIPT=FILE`
+records phase timings and peak RSS. Run each executable with `--help` for
+its full argument list, including MPI partitioning.
+
+## Rust API
 
 ```rust
-use sdpx_solver::algebra::*;
+use sdpx_solver::algebra::CscMatrix;
 use sdpx_solver::solver::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 3x3 PSD variable in svec format: dimension = 3 * 4 / 2 = 6
-    // svec: [X11, sqrt(2)*X12, X22, sqrt(2)*X13, sqrt(2)*X23, X33]
-    let n = 3;
-    let nvec = (n * (n + 1)) / 2;
-
-    // Minimize tr(X) = X11 + X22 + X33
-    let p = CscMatrix::zeros((nvec, nvec));
-    let q = vec![1.0, 0.0, 1.0, 0.0, 0.0, 1.0];
-
-    // Constraint: <A_0, X> = 1
-    let s2 = 2.0_f64.sqrt();
-    let a = CscMatrix::from(&[
-        [-1.0,  0.0,  0.0,  0.0,  0.0,  0.0],
-        [ 0.0, -s2,   0.0,  0.0,  0.0,  0.0],
-        [ 0.0,  0.0, -1.0,  0.0,  0.0,  0.0],
-        [ 0.0,  0.0,  0.0, -s2,   0.0,  0.0],
-        [ 0.0,  0.0,  0.0,  0.0, -s2,   0.0],
-        [ 0.0,  0.0,  0.0,  0.0,  0.0, -1.0],
-        [ 1.0,  4.0,  3.0,  8.0, 10.0,  6.0], // <A_0, X> = 1
-    ]);
-    let b = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
-
-    // Cones: 3x3 PSD cone (slack rows 0..5) and 1 equality constraint (row 6)
-    let cones = vec![PSDTriangleConeT(n), ZeroConeT(1)];
-
-    let mut solver = DefaultSolver::new(&p, &q, &a, &b, &cones, DefaultSettings::default())?;
+    // Minimize x subject to 0 <= x <= 1.
+    let p = CscMatrix::<f64>::zeros((1, 1));
+    let q = vec![1.0];
+    let a = CscMatrix::from(&[[-1.0], [1.0]]);
+    let b = vec![0.0, 1.0];
+    let cones = [NonnegativeConeT(2)];
+    let mut solver = DefaultSolver::new(
+        &p, &q, &a, &b, &cones, DefaultSettings::default(),
+    )?;
     solver.solve();
-
-    println!("Status: {:?}", solver.solution.status);
-    println!("Objective: {:.8}", solver.solution.obj_val);
+    println!("{:?}: {:?}", solver.solution.status, solver.solution.x);
     Ok(())
 }
 ```
 
-### CLI Solve
+Use `sdpx_arithmetic::Bits256` or another `MpFloat<N>` type in place of
+`f64` for MPFR. PSD cones use upper-triangular column order with
+off-diagonals scaled by $\sqrt2$ (`svec`). For sampled SDP loading and
+objective recovery, see the
+[bootstrap example](crates/solver/examples/rust/example_bootstrap.rs).
+Other [Rust examples](crates/solver/examples/rust/) cover ordinary SDP,
+SOC, updates and callbacks.
+
+## Documentation and development
+
+- [Architecture](docs/ARCHITECTURE.md): modules, arithmetic, KKT selection and build features.
+- [Development plan](REVIEW_AND_PLAN.md): priorities, measured results and known failures.
+- [Journal](docs/JOURNAL.md): experiment history and evidence.
+- [Working rules](AGENTS.md): numerical contracts and verification workflow.
+- [Changelog](CHANGELOG.md): release notes.
+
+For a solver edit, build the affected crate and run one matching end-to-end
+case with its original-coordinate audit:
 
 ```sh
-# Solve a conic JSON problem in standard Float64:
-sdpx problem.json --output solution.json
-
-# Solve at 256-bit precision with 8 threads:
-sdpx problem.json --precision 256 --threads 8 --output solution.json
+python3 benchmark/e2e/e2e.py build --arm NAME
+python3 benchmark/e2e/e2e.py run ising11 --arm NAME
 ```
 
----
+Pinned cases are `medium` (Float64), `ising11` (MPFR/SDP) and `csdr3` (SOC).
+Documentation edits need only `git diff --check`. Detailed toolchain and
+input instructions are in the
+[development skill](.agents/skills/sdpx-development/SKILL.md).
 
-## LPs with local bounds
-
-Encode `rho >= 0` as `-rho + s = 0`, and an optional upper bound
-`rho <= c` as `rho + s = c`, using nonnegative slack cones. With automatic
-KKT selection, eligible problems eliminate these local directions and factor
-only the equality/free-variable border. Eligibility requires at least 64
-bounded variables, one or two bound rows per variable, a border of at most
-128 coordinates, and diagonal `P`.
-
-Float64 builds with `faer-sparse` use packed faer matrix products and batched
-RHS kernels (`local_bounds_faer`). MPFR uses exact accumulation
-(`local_bounds_arrow`). Both retain full-system regularization and refinement;
-failed factorizations fall back to QDLDL. Explicit `direct_solve_method="qdldl"`
-selects the original backend.
-
----
-
-## PMP to SDP Workflow (Bootstrap)
-
-Polynomial Matrix Programs (PMP) constrain polynomial matrices to be positive semidefinite for all $x \ge 0$:
-
-$$\text{Maximize } y \quad \text{s.t.} \quad M_0(x) + \sum_{i} y_i M_i(x) \succeq 0 \quad \forall x \ge 0$$
-
-### 1. PMP Problem JSON (`problem.json`)
-
-```json
-{
-  "objective": ["0", "1"],
-  "PositiveMatrixWithPrefactorArray": [
-    {
-      "prefactor": { "constant": "1", "base": "0.5", "poles": [] },
-      "polynomials": [[[ ["1", "0", "1"], ["-1"] ]]]
-    }
-  ]
-}
-```
-*Layout: `polynomials[row][col][coordinate][degree_coeff]`, encoding $1 - y + x^2 \ge 0$.*
-
-### 2. End-to-End CLI Pipeline
-
-```sh
-# Step 1: Convert PMP (JSON or SDPB XML) to a sampled SDP directory at 768 bits
-sdpx-pmp2sdp --input problem.json --output problem-sdp --precision 768 --threads 8
-
-# Step 2: Solve the sampled SDP with 32 threads
-sdpx problem-sdp --precision 768 --threads 32 --output solution.json
-```
-
-### 3. Rust API Workflow
-
-```rust
-use sdpx_arithmetic::Bits768;
-use sdpx_pmp::PolynomialMatrixProgram;
-use sdpx_solver::solver::*;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Convert PMP into a sampled SDP directory
-    let pmp = PolynomialMatrixProgram::read("problem.json")?;
-    pmp.write_sdp_with_threads::<Bits768>("problem-sdp", 8)?;
-
-    // 2. Load sampled SDP and configure high-precision tolerances
-    let sdp = read_sdpb_sampled::<Bits768>("problem-sdp")?;
-    let mut problem = sdp.problem;
-    let tol: Bits768 = "1e-45".parse()?;
-    problem.settings.tol_gap_abs = tol;
-    problem.settings.tol_feas = tol;
-    problem.settings.max_threads = 16;
-
-    // 3. Solve
-    let mut solver = problem.into_solver()?;
-    solver.solve();
-
-    // 4. Recover objective & SDPB dual multipliers (y = -z)
-    let objective = solver.solution.obj_val + sdp.objective_constant;
-    println!("Status: {:?}", solver.solution.status);
-    println!("Objective: {}", objective.to_decimal(Some(40)));
-
-    let y: Vec<Bits768> = solver.solution.z[..sdp.num_equalities]
-        .iter()
-        .map(|&v| -v)
-        .collect();
-    println!("Dual multiplier y: {:?}", y);
-
-    Ok(())
-}
-```
-
----
-
-## CLI Reference
-
-### `sdpx`
-```text
-sdpx INPUT [--precision BITS] [--threads N] [--output FILE] [--settings FILE]
-```
-- `INPUT`: Conic JSON file, SDPB sampled directory, or `-` for stdin.
-- `--precision BITS`: `53` (Float64, default), or multiples of 64 from `128` through `2048` (MPFR).
-- `--threads N`: Parallel cone workers and factorization threads (default: CPU cores).
-- `--output FILE`: Output solution JSON path (default: stdout).
-- `SDPX_RECEIPT=receipt.json`: (Env var) Records peak RSS and per-phase microsecond timings.
-
-### `sdpx-pmp2sdp`
-```text
-sdpx-pmp2sdp --input PMP.json|PMP.xml --output NEW_DIR [--precision BITS] [--threads N]
-```
-- `--input FILE`: Input PMP file in SDPB JSON or XML format.
-- `--output DIR`: Uncompressed target SDP directory (refuses to overwrite existing paths).
-- `--precision BITS`: Multiples of 64 from `128` through `2048` (default: `768`).
-- `--threads N`: Number of independent polynomial blocks to convert concurrently.
-
----
-
-## Workspace Structure
-
-| Crate | Purpose |
-|---|---|
-| [`sdpx-solver`](crates/solver/) | Interior-point conic solver core, cones, KKT systems, and `sdpx` CLI |
-| [`sdpx-arithmetic`](crates/arithmetic/) | MPFR scalar types (`Bits128`–`Bits2048`), decimal I/O, exact RNS dot products |
-| [`sdpx-pmp`](crates/pmp/) | PMP-to-SDP transformation library and `sdpx-pmp2sdp` CLI |
-| [`sdpx-ffi`](crates/ffi/) | C ABI (`include/sdpx.h`) for integration with C/C++, Julia, and Python |
-
----
-
-## Citation
-
-If SDPX helps your research, please cite:
+## Citation and attribution
 
 ```bibtex
 @software{sdpx_rs,
@@ -243,13 +133,8 @@ If SDPX helps your research, please cite:
 }
 ```
 
-### Acknowledgements
-
-- **[Clarabel.rs](https://github.com/oxfordcontrol/Clarabel.rs):** The interior-point conic solver core and homogeneous self-dual embedding are adapted from Clarabel.rs.
-- **[SDPB](https://github.com/davidsd/sdpb):** The sampled bootstrap SDP formulation and PMP conversion algorithms are adapted from SDPB.
-
----
-
-## License
-
-Apache-2.0. Upstream code provenance and licenses (Clarabel.rs, SDPB) are documented in [`provenance/`](provenance/).
+The solver core and HSD embedding are adapted from
+[Clarabel.rs](https://github.com/oxfordcontrol/Clarabel.rs); sampled SDP and
+PMP conversion algorithms are adapted from [SDPB](https://github.com/davidsd/sdpb).
+Solver, arithmetic and FFI crates use Apache-2.0; the PMP crate uses MIT.
+Upstream attribution and licenses are retained in [provenance/](provenance/).

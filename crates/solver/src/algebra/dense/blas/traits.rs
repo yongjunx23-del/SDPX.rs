@@ -16,7 +16,6 @@ pub trait BlasFloatT:
     + XgesddScalar
     + XgesvdScalar
     + XgemmScalar
-    + XgemvScalar
     + XsymvScalar
     + XsyrkScalar
     + Xsyr2kScalar
@@ -242,14 +241,24 @@ pub trait XgemmScalar: Sized {
         _b: &[Self], _ldb: usize, _c: &mut [Self], _pool: Option<&rayon::ThreadPool>,
         _cache_b: Option<&mut ResidueCache>
     ) -> bool { false }
+    // Upper triangle of `aᵀ·diag(d)·a` for a constant column-major `k × m`
+    // operand `a` (its residues kept in `cache_a`), each entry the exact sum
+    // rounded once. Reset `cache_a` whenever `a` changes.
+    // Only the exact residue kernel implements it; `false`
+    // means nothing was written.
+    fn diag_congruence_upper_exact(
+        _m: usize, _k: usize, _a: &[Self], _d: &[Self], _c: &mut [Self],
+        _pool: Option<&rayon::ThreadPool>, _cache_a: &mut ResidueCache
+    ) -> bool { false }
     // Whether `xgemm_upper_exact` (and the matching `xgemm` path) uses the
     // exact residue-BLAS kernel for this shape.
     fn residue_blas_applies(_m: usize, _n: usize, _k: usize) -> bool { false }
     // `v[k] = Σ_{i≤j} c_ij·x_t·q_ik·q_jk` (svec `x`, `c_ij = sqrt2` off the
     // diagonal) for `q` of size h × kmax, rounded once from the exact value.
     // Passing scale 2 instead of sqrt2 accepts an unscaled packed symmetric X.
+    // `abs_q` evaluates the form on |q| while reading (and caching) q itself.
     fn xsvec_quadratic_exact(
-        _h: usize, _kmax: usize, _q: &[Self], _x: &[Self], _sqrt2: Self,
+        _h: usize, _kmax: usize, _q: &[Self], _abs_q: bool, _x: &[Self], _sqrt2: Self,
         _pool: Option<&rayon::ThreadPool>, _out: &mut [Self], _cache_q: Option<&mut ResidueCache>
     ) -> bool where Self: Sized { false }
     // Selected q_aᵀ X q_b values for symmetric, unscaled packed X, rounded
@@ -288,39 +297,6 @@ macro_rules! impl_blas_gemm {
 
 impl_blas_gemm!(f32, sgemm);
 impl_blas_gemm!(f64, dgemm);
-
-// --------------------------------------
-// ?gemv : matrix vector multiply (general shape)
-// --------------------------------------
-
-pub trait XgemvScalar: Sized {
-    fn xgemv(
-        trans: u8, m: i32, n: i32, alpha: Self, a: &[Self], lda: i32,
-        x: &[Self], incx: i32, beta: Self, y: &mut [Self], incy: i32
-    );
-}
-
-
-macro_rules! impl_blas_gemv {
-    ($T:ty, $XGEMV:path) => {
-        impl XgemvScalar for $T {
-            fn xgemv(
-                trans: u8, m: i32, n: i32, alpha: Self, a: &[Self], lda: i32,
-                x: &[Self], incx: i32, beta: Self, y: &mut [Self], incy: i32
-            ) {
-                unsafe{
-                    $XGEMV(
-                        trans, m, n, alpha, a, lda, x, incx, beta, y, incy
-                    );
-                }
-            }
-        }
-    };
-}
-
-impl_blas_gemv!(f32, sgemv);
-impl_blas_gemv!(f64, dgemv);
-
 
 // --------------------------------------
 // ?symv : matrix vector multiply (symmetric)

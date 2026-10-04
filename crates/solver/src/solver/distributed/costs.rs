@@ -356,21 +356,21 @@ impl CostHistory {
     }
 }
 
-#[cfg(all(feature = "serde", feature = "sdp"))]
+#[cfg(feature = "serde")]
 use sha2::{Digest, Sha256};
 
-#[cfg(all(feature = "serde", feature = "sdp"))]
+#[cfg(feature = "serde")]
 fn feed_u64(hash: &mut Sha256, value: u64) {
     hash.update(value.to_le_bytes());
 }
 
-#[cfg(all(feature = "serde", feature = "sdp"))]
+#[cfg(feature = "serde")]
 fn feed_bytes(hash: &mut Sha256, bytes: &[u8]) {
     feed_u64(hash, bytes.len() as u64);
     hash.update(bytes);
 }
 
-#[cfg(all(feature = "serde", feature = "sdp"))]
+#[cfg(feature = "serde")]
 fn feed_scalar<T: crate::algebra::FloatT>(hash: &mut Sha256, value: T) {
     feed_u64(hash, T::precision_bits() as u64);
     feed_u64(hash, T::wire_tag());
@@ -384,7 +384,7 @@ fn feed_scalar<T: crate::algebra::FloatT>(hash: &mut Sha256, value: T) {
     feed_bytes(hash, value.to_string().as_bytes());
 }
 
-#[cfg(all(feature = "serde", feature = "sdp"))]
+#[cfg(feature = "serde")]
 fn feed_matrix<T: crate::algebra::FloatT>(
     hash: &mut Sha256,
     matrix: &crate::algebra::CscMatrix<T>,
@@ -402,7 +402,7 @@ fn feed_matrix<T: crate::algebra::FloatT>(
     }
 }
 
-#[cfg(all(feature = "serde", feature = "sdp"))]
+#[cfg(feature = "serde")]
 fn feed_cones<T: crate::algebra::FloatT>(
     hash: &mut Sha256,
     cones: &[crate::solver::SupportedConeT<T>],
@@ -446,7 +446,7 @@ fn feed_cones<T: crate::algebra::FloatT>(
 /// Exact numeric identity used by the cost-history validator.  It hashes raw
 /// input values before preprocessing; MPFR values use their canonical wire
 /// payload rather than a rounded `f64` conversion.
-#[cfg(all(feature = "serde", feature = "sdp"))]
+#[cfg(feature = "serde")]
 pub(crate) fn input_fingerprint<T: crate::algebra::FloatT>(
     p: &crate::algebra::CscMatrix<T>,
     q: &[T],

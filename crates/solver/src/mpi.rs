@@ -63,6 +63,25 @@ pub(crate) fn decision_agrees(value: u32) -> bool {
     })
 }
 
+/// Whether any rank holds `value` (false when not running under MPI ranks).
+pub(crate) fn any_true(value: bool) -> bool {
+    World::get().map_or(value, |world| !world.all_true(!value))
+}
+
+/// All replicated ranks must hold the same `value`; a mismatch aborts.
+pub(crate) fn assert_agree(value: u32, message: &str) {
+    if let Some(world) = World::get() {
+        if !world.agree_u32(value) {
+            world.abort(message);
+        }
+    }
+}
+
+/// True on rank zero and in serial runs.
+pub(crate) fn is_root() -> bool {
+    World::get().is_none_or(|world| world.rank() == 0)
+}
+
 /// Receipt labels for the unnumbered world agreements above.
 const SITE_SUCCESS: usize = 9000;
 const SITE_DECISION: usize = 9001;
@@ -86,6 +105,7 @@ pub(crate) const SITE_GRAM: usize = 3;
 pub(crate) const SITE_RX: usize = 4;
 pub(crate) const SITE_RZ: usize = 5;
 pub(crate) const SITE_CONES: usize = 6;
+pub(crate) const SITE_ARROW: usize = 7;
 const NSITES: usize = 8;
 
 #[derive(Clone, Copy)]
@@ -121,7 +141,6 @@ struct Fns {
         c_int,
         MpiComm,
     ) -> c_int,
-    #[allow(dead_code)]
     allreduce: unsafe extern "C" fn(
         *const c_void,
         *mut c_void,
@@ -132,9 +151,7 @@ struct Fns {
     ) -> c_int,
     comm_world: MpiComm,
     byte: MpiDatatype,
-    #[allow(dead_code)]
     double: MpiDatatype,
-    #[allow(dead_code)]
     max: MpiOp,
 }
 
@@ -145,6 +162,43 @@ unsafe fn resolve_handle(lib: *mut c_void, variable: &str) -> Option<*mut c_void
     let name = CString::new(variable).unwrap();
     let symbol = unsafe { dlsym(lib, name.as_ptr()) };
     (!symbol.is_null()).then_some(symbol)
+}
+
+/// `MPI_COMM_WORLD`, `MPI_BYTE`, `MPI_DOUBLE`, `MPI_MAX` for the library's
+/// handle ABI. OpenMPI exports handles as global objects. The MPICH ABI
+/// (MPICH, Intel MPI, MVAPICH) uses fixed integer handles, carried here in the
+/// pointer-sized slot: x86_64 and AArch64 pass `int` arguments in the low half
+/// of a register, and handle outputs land in zero-initialized slots.
+unsafe fn handle_abi(lib: *mut c_void) -> Option<[*mut c_void; 4]> {
+    let ompi = [
+        "ompi_mpi_comm_world",
+        "ompi_mpi_byte",
+        "ompi_mpi_double",
+        "ompi_mpi_op_max",
+    ]
+    .map(|name| unsafe { resolve_handle(lib, name) });
+    if let [Some(comm), Some(byte), Some(double), Some(max)] = ompi {
+        return Some([comm, byte, double, max]);
+    }
+    // MPI_Get_library_version may be called before MPI_Init.
+    let version = unsafe { dlsym(lib, c"MPI_Get_library_version".as_ptr()) };
+    if version.is_null() {
+        return None;
+    }
+    let version: unsafe extern "C" fn(*mut c_char, *mut c_int) -> c_int =
+        unsafe { std::mem::transmute(version) };
+    let mut text = vec![0 as c_char; 8192];
+    let mut len = 0;
+    if unsafe { version(text.as_mut_ptr(), &mut len) } != MPI_SUCCESS {
+        return None;
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(text.as_ptr()) }.to_string_lossy();
+    ["MPICH", "Intel(R) MPI", "MVAPICH"]
+        .iter()
+        .any(|family| text.contains(family))
+        .then(|| {
+            [0x4400_0000usize, 0x4c00_010d, 0x4c00_080b, 0x5800_0001].map(|h| h as *mut c_void)
+        })
 }
 
 macro_rules! sym {
@@ -159,7 +213,7 @@ macro_rules! sym {
 
 fn load() -> Option<Fns> {
     #[cfg(target_os = "linux")]
-    const NAMES: &[&str] = &["libmpi.so.40", "libmpi.so"];
+    const NAMES: &[&str] = &["libmpi.so.40", "libmpi.so.12", "libmpi.so"];
     #[cfg(target_os = "macos")]
     const NAMES: &[&str] = &["libmpi.dylib", "libmpi.40.dylib"];
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -169,7 +223,13 @@ fn load() -> Option<Fns> {
     // LD_LIBRARY_PATH, so plain sonames can fail to resolve even when the
     // library exists. MPI_LIB (or SDPX_MPI_LIBDIR) gives an absolute dir to
     // fall back to.
-    let mut candidates: Vec<CString> = NAMES.iter().map(|n| CString::new(*n).unwrap()).collect();
+    // Prefer the library family of the launcher when several are installed:
+    // an OpenMPI library under Hydra (Intel MPI, MPICH) or vice versa aborts.
+    let mut names = NAMES.to_vec();
+    if std::env::var_os("OMPI_COMM_WORLD_SIZE").is_none() {
+        names.sort_by_key(|n| !n.contains(".so.12"));
+    }
+    let mut candidates: Vec<CString> = names.iter().map(|n| CString::new(*n).unwrap()).collect();
     for var in ["SDPX_MPI_LIBDIR", "MPI_LIB"] {
         if let Ok(dir) = std::env::var(var) {
             // OpenMPI's installed libmpi carries a dead build-host RPATH and
@@ -183,7 +243,7 @@ fn load() -> Option<Fns> {
                     }
                 }
             }
-            for n in NAMES {
+            for n in &names {
                 if let Ok(p) = CString::new(format!("{dir}/{n}")) {
                     candidates.push(p);
                 }
@@ -213,6 +273,12 @@ fn load() -> Option<Fns> {
                 }
                 continue;
             }
+            let Some(handles) = handle_abi(lib) else {
+                if debug {
+                    eprintln!("mpi: {} has an unknown handle ABI", name.to_string_lossy());
+                }
+                continue;
+            };
             return Some(Fns {
                 init_thread: sym!(lib, "MPI_Init_thread"),
                 initialized: sym!(lib, "MPI_Initialized"),
@@ -227,56 +293,10 @@ fn load() -> Option<Fns> {
                 allgatherv: sym!(lib, "MPI_Allgatherv"),
                 gatherv: sym!(lib, "MPI_Gatherv"),
                 allreduce: sym!(lib, "MPI_Allreduce"),
-                // Only the OpenMPI handle ABI is supported by this dlopen
-                // path. MPICH/Intel constants are intentionally rejected.
-                comm_world: match resolve_handle(lib, "ompi_mpi_comm_world") {
-                    Some(v) => v,
-                    None => {
-                        if debug {
-                            eprintln!(
-                                "mpi: {} has no ompi_mpi_comm_world; refusing unknown handle ABI",
-                                name.to_string_lossy()
-                            );
-                        }
-                        continue;
-                    }
-                },
-                byte: match resolve_handle(lib, "ompi_mpi_byte") {
-                    Some(v) => v,
-                    None => {
-                        if debug {
-                            eprintln!(
-                                "mpi: {} has no ompi_mpi_byte; refusing unknown handle ABI",
-                                name.to_string_lossy()
-                            );
-                        }
-                        continue;
-                    }
-                },
-                double: match resolve_handle(lib, "ompi_mpi_double") {
-                    Some(v) => v,
-                    None => {
-                        if debug {
-                            eprintln!(
-                                "mpi: {} has no ompi_mpi_double; refusing unknown handle ABI",
-                                name.to_string_lossy()
-                            );
-                        }
-                        continue;
-                    }
-                },
-                max: match resolve_handle(lib, "ompi_mpi_op_max") {
-                    Some(v) => v,
-                    None => {
-                        if debug {
-                            eprintln!(
-                                "mpi: {} has no ompi_mpi_op_max; refusing unknown handle ABI",
-                                name.to_string_lossy()
-                            );
-                        }
-                        continue;
-                    }
-                },
+                comm_world: handles[0],
+                byte: handles[1],
+                double: handles[2],
+                max: handles[3],
             });
         }
     }
@@ -339,6 +359,14 @@ static OWNED_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 pub struct MpiContext(Option<World>);
 
 impl MpiContext {
+    pub(crate) fn from_world(world: Option<World>) -> Self {
+        Self(world)
+    }
+
+    pub(crate) fn world(self) -> Option<World> {
+        self.0
+    }
+
     /// Activate optional MPI on the calling thread before reading input.
     /// Without an MPI launch or explicit opt-in, this is a serial context.
     pub fn initialize() -> Self {
@@ -1353,7 +1381,6 @@ pub(crate) fn ranges(count: usize, size: usize) -> Vec<(usize, usize)> {
 /// `rank * total / size` mark, so equal-cost items split exactly like
 /// [`ranges`]. Deterministic for a fixed cost array — every rank computes
 /// the identical partition. Empty ranges are allowed.
-#[cfg_attr(not(feature = "sdp"), allow(dead_code))]
 pub(crate) fn cost_ranges(costs: &[u64], size: usize) -> Vec<(usize, usize)> {
     let n = costs.len();
     let size = size.max(1);
@@ -1537,11 +1564,11 @@ mod tests {
         settings.time_limit = 0.25;
         let mut solver = DefaultSolver::new(&p, &q, &a, &b, &cones, settings).unwrap();
         let timers = solver.timers.as_mut().unwrap();
-        timers.reset_timer("setup");
+        *timers = crate::timers::Timers::default();
         if context.rank() == 0 {
-            timers.start_as_current("rank-local setup delay");
+            timers.start_setup();
             std::thread::sleep(std::time::Duration::from_millis(500));
-            timers.stop_current();
+            timers.stop_setup();
         }
         assert!(context
             .all_succeeded((timers.total_time().as_secs_f64() > 0.25) == (context.rank() == 0)));

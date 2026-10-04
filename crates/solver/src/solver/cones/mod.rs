@@ -27,9 +27,7 @@ pub use {
 };
 
 // only use PSD cones with SDP/Blas enabled
-#[cfg(feature = "sdp")]
 mod psdtrianglecone;
-#[cfg(feature = "sdp")]
 pub use psdtrianglecone::*;
 
 // marker for primal / dual distinctions
@@ -179,7 +177,6 @@ fn numel_degree() {
     assert_eq!(powcone.numel(), 3);
     assert_eq!(powcone.degree(), 3);
 
-    #[cfg(feature = "sdp")]
     {
         let sdpcone = PSDTriangleCone::<f64>::new(5);
         assert_eq!(sdpcone.numel(), 15);

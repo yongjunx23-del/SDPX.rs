@@ -1,10 +1,4 @@
 //! Native entry point; all numerical work stays in the shared solver.
-#[cfg(not(feature = "all-precisions"))]
-use sdpx_arithmetic::{
-    with_default_precisions as with_frontend_precisions,
-    DEFAULT_FRONTEND_PRECISION_HELP as FRONTEND_PRECISION_HELP,
-};
-#[cfg(feature = "all-precisions")]
 use sdpx_arithmetic::{with_frontend_precisions, FRONTEND_PRECISION_HELP};
 use sdpx_solver::{algebra::FloatT, io::ConfigurablePrintTarget, solver::*, MpiContext};
 use serde::{de::DeserializeOwned, Serialize};
@@ -24,6 +18,7 @@ const USAGE: &str = "SDPX — native conic solver\n\
 Usage: sdpx INPUT [--precision BITS] [--settings FILE] [--output FILE]\n\
                      [--threads N] [--partitions N|auto]\n\
                      [--cost-history-in FILE] [--cost-history-out FILE] [--quiet]\n\
+                     [--checkpoint FILE [--checkpoint-every N]] [--restart FILE]\n\
 BITS defaults to 53 (Float64); see the compiled precision list below.\n\
 INPUT is conic JSON, an SDPB sampled JSON directory (requires sdp), or '-'\n\
 for stdin. MPFR coefficients use decimal strings, never fractional\n\
@@ -33,6 +28,10 @@ With MPI, --partitions auto or a count equal to the world size enables one\n\
 owner per rank; the default without --partitions keeps the ordinary MPI path.\n\
 --cost-history-in and --cost-history-out are supported for partitioned MPI\n\
 solves; export gathers owner timings to rank zero.\n\
+--checkpoint writes the accepted iterate every N (default 10) iterations;\n\
+--restart starts from such a file: an exact continuation for the same input,\n\
+or a hot start for a nearby input with the same structure and precision\n\
+(ordinary solver only). The iteration counter restarts from zero.\n\
 Exit: 0 fully solved/infeasible; 2 incomplete/reduced accuracy; 1 input/I/O error.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -51,6 +50,9 @@ struct Options {
     partitions: Option<PartitionMode>,
     cost_history_in: Option<PathBuf>,
     cost_history_out: Option<PathBuf>,
+    checkpoint: Option<PathBuf>,
+    checkpoint_every: Option<u32>,
+    restart: Option<PathBuf>,
     quiet: bool,
 }
 
@@ -92,7 +94,6 @@ type CliResult<T> = Result<T, Box<dyn Error>>;
 
 enum RuntimeSolver<T: FloatT> {
     Default(DefaultSolver<T>),
-    #[cfg(feature = "sdp")]
     Partitioned(PartitionedSolver<T>),
 }
 
@@ -100,7 +101,6 @@ impl<T: FloatT> RuntimeSolver<T> {
     fn solve(&mut self) {
         match self {
             Self::Default(solver) => solver.solve(),
-            #[cfg(feature = "sdp")]
             Self::Partitioned(solver) => solver.solve(),
         }
     }
@@ -108,7 +108,6 @@ impl<T: FloatT> RuntimeSolver<T> {
     fn print_to_stream(&mut self, stream: Box<dyn Write + Send + Sync>) {
         match self {
             Self::Default(solver) => solver.print_to_stream(stream),
-            #[cfg(feature = "sdp")]
             Self::Partitioned(solver) => solver.print_to_stream(stream),
         }
     }
@@ -116,7 +115,6 @@ impl<T: FloatT> RuntimeSolver<T> {
     fn print_to_sink(&mut self) {
         match self {
             Self::Default(solver) => solver.print_to_sink(),
-            #[cfg(feature = "sdp")]
             Self::Partitioned(solver) => solver.print_to_sink(),
         }
     }
@@ -124,7 +122,6 @@ impl<T: FloatT> RuntimeSolver<T> {
     fn solution(&self) -> &DefaultSolution<T> {
         match self {
             Self::Default(solver) => &solver.solution,
-            #[cfg(feature = "sdp")]
             Self::Partitioned(solver) => solver.solution(),
         }
     }
@@ -132,7 +129,6 @@ impl<T: FloatT> RuntimeSolver<T> {
     fn info(&self) -> &DefaultInfo<T> {
         match self {
             Self::Default(solver) => &solver.info,
-            #[cfg(feature = "sdp")]
             Self::Partitioned(solver) => solver.info(),
         }
     }
@@ -140,7 +136,6 @@ impl<T: FloatT> RuntimeSolver<T> {
     fn settings(&self) -> &DefaultSettings<T> {
         match self {
             Self::Default(solver) => solver.settings(),
-            #[cfg(feature = "sdp")]
             Self::Partitioned(solver) => solver.settings(),
         }
     }
@@ -148,7 +143,6 @@ impl<T: FloatT> RuntimeSolver<T> {
     fn cone_threads(&self) -> usize {
         match self {
             Self::Default(solver) => solver.cones.cone_threads(),
-            #[cfg(feature = "sdp")]
             Self::Partitioned(solver) => solver.cone_threads(),
         }
     }
@@ -156,7 +150,6 @@ impl<T: FloatT> RuntimeSolver<T> {
     fn partitions(&self) -> usize {
         match self {
             Self::Default(_) => 1,
-            #[cfg(feature = "sdp")]
             Self::Partitioned(solver) => solver.partitions(),
         }
     }
@@ -164,14 +157,12 @@ impl<T: FloatT> RuntimeSolver<T> {
     fn try_write_receipt(&self, peak_rss: Option<u64>) -> io::Result<()> {
         match self {
             Self::Default(solver) => sdpx_solver::receipt::try_write(solver, peak_rss),
-            #[cfg(feature = "sdp")]
             Self::Partitioned(solver) => {
                 sdpx_solver::receipt::try_write_partitioned(solver, peak_rss)
             }
         }
     }
 
-    #[cfg(feature = "sdp")]
     fn cost_history(&self) -> CliResult<Option<CostHistory>> {
         match self {
             Self::Default(_) => Ok(None),
@@ -240,7 +231,8 @@ where
             }
             "--quiet" | "-q" => out.quiet = true,
             "--precision" | "--threads" | "--settings" | "--output" | "--partitions"
-            | "--cost-history-in" | "--cost-history-out" => {
+            | "--cost-history-in" | "--cost-history-out" | "--checkpoint"
+            | "--checkpoint-every" | "--restart" => {
                 let value = args
                     .next()
                     .ok_or_else(|| format!("missing value for {arg}"))?;
@@ -262,6 +254,9 @@ where
                     }
                     "--cost-history-in" => out.cost_history_in = Some(value.into()),
                     "--cost-history-out" => out.cost_history_out = Some(value.into()),
+                    "--checkpoint" => out.checkpoint = Some(value.into()),
+                    "--checkpoint-every" => out.checkpoint_every = Some(value.parse()?),
+                    "--restart" => out.restart = Some(value.into()),
                     _ => unreachable!(),
                 }
             }
@@ -292,30 +287,11 @@ fn options(mpi: MpiContext) -> CliResult<Option<Options>> {
 }
 
 fn validate_partition_mode(partitions: Option<PartitionMode>, mpi_size: usize) -> CliResult<()> {
-    let Some(partitions) = partitions else {
-        return Ok(());
-    };
-    if partitions == PartitionMode::Count(0) {
-        return Err("--partitions must be greater than zero".into());
-    }
-    #[cfg(not(feature = "sdp"))]
-    {
-        let _ = mpi_size;
-        return Err("--partitions requires a build with an SDP backend".into());
-    }
-    #[cfg(feature = "sdp")]
-    {
-        if mpi_size > 1 {
-            match partitions {
-                PartitionMode::Auto => Ok(()),
-                PartitionMode::Count(count) if count == mpi_size => Ok(()),
-                PartitionMode::Count(_) => {
-                    Err("with MPI, --partitions N must equal the MPI world size".into())
-                }
-            }
-        } else {
-            Ok(())
+    match partitions {
+        Some(PartitionMode::Count(count)) if mpi_size > 1 && count != mpi_size => {
+            Err("with MPI, --partitions N must equal the MPI world size".into())
         }
+        _ => Ok(()),
     }
 }
 
@@ -324,10 +300,6 @@ fn validate_cost_history_options(options: &Options) -> CliResult<()> {
         && options.partitions.is_none()
     {
         return Err("--cost-history requires --partitions N|auto".into());
-    }
-    #[cfg(not(feature = "sdp"))]
-    if options.cost_history_in.is_some() || options.cost_history_out.is_some() {
-        return Err("--cost-history requires a build with an SDP backend".into());
     }
     Ok(())
 }
@@ -341,7 +313,6 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
     let start = Instant::now();
     let path = options.input.as_ref().unwrap();
     let partitions = options.partitions;
-    #[cfg(feature = "sdp")]
     let cost_history = stage(
         mpi,
         (|| -> CliResult<Option<CostHistory>> {
@@ -352,32 +323,23 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
             }
         })(),
     )?;
-    #[cfg(feature = "sdp")]
     agree(mpi, &(&cost_history, options.cost_history_out.is_some()))?;
-    #[allow(unused_mut)]
     let mut objective_constant = T::zero();
-    #[allow(unused_mut)]
     let mut sampled_metadata = None::<serde_json::Value>;
-    #[allow(unused_mut)]
     let mut equalities = 0;
     let problem = stage(
         mpi,
         (|| -> CliResult<JsonProblem<T>> {
             let mut problem = if path.is_dir() {
-                #[cfg(feature = "sdp")]
-                {
-                    let sampled = read_sdpb_sampled::<T>(path)?;
-                    sdpx_solver::receipt::memory_mark("input read");
-                    objective_constant = sampled.objective_constant;
-                    equalities = sampled.num_equalities;
-                    sampled_metadata = Some(serde_json::json!({
-                        "objective_constant": objective_constant,
-                        "num_equalities": equalities, "grams": sampled.grams,
-                    }));
-                    sampled.problem
-                }
-                #[cfg(not(feature = "sdp"))]
-                return Err("SDPB sampled input requires a build with an SDP backend".into());
+                let sampled = read_sdpb_sampled::<T>(path)?;
+                sdpx_solver::receipt::memory_mark("input read");
+                objective_constant = sampled.objective_constant;
+                equalities = sampled.num_equalities;
+                sampled_metadata = Some(serde_json::json!({
+                    "objective_constant": objective_constant,
+                    "num_equalities": equalities, "grams": sampled.grams,
+                }));
+                sampled.problem
             } else if path.as_os_str() == "-" {
                 if mpi.size() > 1 {
                     return Err("MPI stdin is not supported; use a shared input file".into());
@@ -413,35 +375,37 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
     let mut solver = stage(
         mpi,
         (|| -> CliResult<RuntimeSolver<T>> {
-            if let Some(partitions) = partitions {
-                #[cfg(feature = "sdp")]
-                {
-                    let solver = match partitions {
-                        PartitionMode::Auto => problem
-                            .into_auto_partitioned_solver_with_cost_history(CostHistoryOptions {
-                                history: cost_history,
-                                record: options.cost_history_out.is_some(),
-                            })?,
-                        PartitionMode::Count(count) => problem
-                            .into_partitioned_solver_with_cost_history(
-                                count,
-                                CostHistoryOptions {
-                                    history: cost_history,
-                                    record: options.cost_history_out.is_some(),
-                                },
-                            )?,
-                    };
-                    return Ok(RuntimeSolver::Partitioned(solver));
+            let Some(partitions) = partitions else {
+                return Ok(RuntimeSolver::Default(problem.into_solver()?));
+            };
+            let history = CostHistoryOptions {
+                history: cost_history,
+                record: options.cost_history_out.is_some(),
+            };
+            Ok(RuntimeSolver::Partitioned(match partitions {
+                PartitionMode::Auto => {
+                    problem.into_auto_partitioned_solver_with_cost_history(history)?
                 }
-                #[cfg(not(feature = "sdp"))]
-                {
-                    let _ = partitions;
-                    unreachable!("partitioned mode was rejected before setup");
+                PartitionMode::Count(count) => {
+                    problem.into_partitioned_solver_with_cost_history(count, history)?
                 }
-            }
-            Ok(RuntimeSolver::Default(problem.into_solver()?))
+            }))
         })(),
     )?;
+    if options.checkpoint.is_some() || options.restart.is_some() {
+        let RuntimeSolver::Default(inner) = &mut solver else {
+            return Err(
+                "--checkpoint and --restart require the ordinary solver (no --partitions)".into(),
+            );
+        };
+        if let Some(path) = &options.checkpoint {
+            inner.set_checkpoint(path, options.checkpoint_every.unwrap_or(10));
+        }
+        if let Some(path) = &options.restart {
+            inner.set_restart(path);
+            stage(mpi, inner.check_restart().map_err(Into::into))?;
+        }
+    }
     if mpi.rank() == 0 {
         solver.print_to_stream(Box::new(io::stderr()));
     } else {
@@ -449,7 +413,6 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
     }
     solver.solve();
     let api_seconds = solve_start.elapsed().as_secs_f64();
-    #[cfg(feature = "sdp")]
     if let Some(path) = &options.cost_history_out {
         stage(
             mpi,
@@ -612,12 +575,7 @@ fn main() -> ExitCode {
     .collect();
     let result = agree(
         mpi,
-        &(
-            env::args().skip(1).collect::<Vec<_>>(),
-            backend_threads,
-            env::var_os("SDPX_RNS_OPS").is_some(),
-            env::var_os("SDPX_SERIAL_QDLDL").is_some(),
-        ),
+        &(env::args().skip(1).collect::<Vec<_>>(), backend_threads),
     )
     .and_then(|_| stage(mpi, options(mpi)))
     .and_then(|options| match options {
@@ -663,13 +621,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(options.partitions, Some(PartitionMode::Auto));
-        #[cfg(feature = "sdp")]
         assert!(validate_partition_mode(Some(PartitionMode::Auto), 2).is_ok());
-        #[cfg(not(feature = "sdp"))]
-        assert!(validate_partition_mode(Some(PartitionMode::Auto), 2)
-            .unwrap_err()
-            .to_string()
-            .contains("SDP"));
     }
 
     #[test]
@@ -677,18 +629,12 @@ mod tests {
         let error = validate_partition_mode(Some(PartitionMode::Count(3)), 2)
             .unwrap_err()
             .to_string();
-        #[cfg(feature = "sdp")]
         assert!(error.contains("world size"));
-        #[cfg(not(feature = "sdp"))]
-        assert!(error.contains("SDP"));
     }
 
     #[test]
     fn partitions_accept_matching_mpi_world_size() {
-        #[cfg(feature = "sdp")]
         assert!(validate_partition_mode(Some(PartitionMode::Count(2)), 2).is_ok());
-        #[cfg(not(feature = "sdp"))]
-        assert!(validate_partition_mode(Some(PartitionMode::Count(2)), 2).is_err());
     }
 
     #[test]
@@ -733,16 +679,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        #[cfg(feature = "sdp")]
         assert!(validate_cost_history_options(&training).is_ok());
-        #[cfg(not(feature = "sdp"))]
-        assert!(validate_cost_history_options(&training).is_err());
 
         training.cost_history_out = None;
         training.cost_history_in = Some("history.json".into());
-        #[cfg(feature = "sdp")]
         assert!(validate_cost_history_options(&training).is_ok());
-        #[cfg(not(feature = "sdp"))]
-        assert!(validate_cost_history_options(&training).is_err());
     }
 }
