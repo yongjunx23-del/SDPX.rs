@@ -1549,12 +1549,26 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
         }
     }
     /// The Gram contribution buffer for the rank-sharded exchange.
-    pub(crate) fn gram_slice(&self) -> &[T] {
-        self.gram.data()
+    /// Length of the packed upper Gram triangle (the only part ever read).
+    pub(crate) fn gram_len(&self) -> usize {
+        let n = self.gram.ncols();
+        n * (n + 1) / 2
     }
-    /// Republish a gathered Gram into this block's workspace.
+    /// Append the upper Gram triangle, column by column.
+    pub(crate) fn pack_gram(&self, out: &mut Vec<T>) {
+        let n = self.gram.ncols();
+        for j in 0..n {
+            out.extend_from_slice(&self.gram.data()[j * n..j * n + j + 1]);
+        }
+    }
+    /// Republish a gathered upper triangle (`pack_gram` layout).
     pub(crate) fn set_gram(&mut self, data: &[T]) {
-        self.gram.data_mut().copy_from_slice(data);
+        let n = self.gram.ncols();
+        let mut p = 0;
+        for j in 0..n {
+            self.gram.data_mut()[j * n..j * n + j + 1].copy_from_slice(&data[p..p + j + 1]);
+            p += j + 1;
+        }
     }
     // Dimensions are fixed by construction; only the current pool width changes.
     pub(crate) fn configure_parallel(&mut self, workers: usize) -> u128 {

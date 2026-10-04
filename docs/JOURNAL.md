@@ -5899,3 +5899,18 @@ bitwise identical to the non-aligned path at 1–4 local ranks.
 Full solves, 4 nodes × 32 threads, 1024 bits: SDPX Solved/42, solve 1608 s,
 process 28:59 (222615); SDPB "found primal-dual optimal solution"/125,
 solver runtime 2592 s, process 43:17, 689 MB per process (222630, node3/4/5/7).
+
+### Measured cone costs and packed Grams (same allocation A/B, 4 nodes)
+
+| Arm (job) | wall.solve A/B/A/B | Notes |
+|---|---|---|
+| align4 vs measured cone costs (222659) | 121.0 / 117.5 / 119.5 / 115.5 | SVD CPU per rank 173/148/186/202 → 172/168/174/182 s; kept |
+| align4 vs + packed upper Gram exchange (222664) | 123.6 / 122.2 / 127.3 / 120.1 | `sync` 7.4/8.0 → 5.0/4.8 s; kept |
+
+Cone scaling wall stays ~15 s per 4 scalings: each rank's scaling CPU is
+~70 s (2.2 s on 32 threads), but single 88×88 1024-bit cones take 2.4–3.4 s
+(`CONE_COSTS` profile line), so the phase is bounded by one cone's latency.
+Further scaling of this phase needs parallelism inside one cone's SVD.
+
+1-node full solves (1024 bits, 32 threads): SDPX Solved/42, solve 2170 s,
+process 36:19, load 3.4 s with parallel block parsing (222643).

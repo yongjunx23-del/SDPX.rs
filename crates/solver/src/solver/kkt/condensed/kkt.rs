@@ -596,7 +596,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     Scaling::Psd(p) => p
                         .sampled
                         .as_ref()
-                        .map(|s| s.work.gram_slice().len().max(1) as u64)
+                        .map(|s| s.work.gram_len().max(1) as u64)
                         .unwrap_or_else(|| rows.powf(1.5).max(1.0) as u64),
                     _ => rows.max(1.0) as u64,
                 }
@@ -656,7 +656,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 .blocks
                 .iter()
                 .map(|b| match &b.scaling {
-                    Scaling::Psd(p) => p.sampled.as_ref().map_or(0, |s| s.work.gram_slice().len()),
+                    Scaling::Psd(p) => p.sampled.as_ref().map_or(0, |s| s.work.gram_len()),
                     _ => 0,
                 })
                 .collect();
@@ -675,7 +675,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             for i in owned_range.clone() {
                 if let Scaling::Psd(p) = &self.blocks[i].scaling {
                     if let Some(s) = &p.sampled {
-                        local.extend_from_slice(s.work.gram_slice());
+                        s.work.pack_gram(&mut local);
                     }
                 }
             }

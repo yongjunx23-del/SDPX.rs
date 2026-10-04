@@ -22,6 +22,9 @@ solves; the experiment log is [docs/JOURNAL.md](docs/JOURNAL.md).
   partition; prepare/recover/residual keep rank-local rows and exchange once,
   and the sampled linear part is sharded. Mixed Λ27 (1024 bits, 4 nodes ×
   32 threads, same allocation): 3 iterations 124.8 → 117 s (−6%).
+- MPI cone partition balances measured per-cone scaling cost (SVD CPU per
+  rank 148–202 s → 168–182 s), and sampled Grams are exchanged as packed
+  upper triangles (`sync` 7.7 → 4.9 s); together about −3% more.
 
 ## [0.9.0] - 2026-10-04
 
