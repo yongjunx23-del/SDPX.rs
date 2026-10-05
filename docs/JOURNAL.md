@@ -5933,3 +5933,22 @@ process 36:19, load 3.4 s with parallel block parsing (222643).
   identical; only on pool workers). Same allocation (222677/222678), with
   the pooled border solve: 4 nodes 113.5/115.0 → 108.7/109.9 s; 8 nodes
   103.1/104.1 → 97.2/97.9 s; `arrow.leaf_backward` 7.0 → 3.7 s at 8 nodes.
+
+### Arrow leaf phases (same allocation A/B, 3 iterations)
+
+| Change (job) | 1 node | 4 nodes | Verdict |
+|---|---|---|---|
+| In-place parallel contribution update + straggler-leaf factor split (222700/222701) | 192.2/192.2 → 182.3/180.7 s | 111.5/111.2 → 107.2/108.4 s | kept |
+| One parallel region over border columns for all leaves (222730/222731) | −1.2% | noise | kept (simpler code, identical bits) |
+| Deferred flat Y pass after per-leaf factors (222737/222738) | +1% | −3.6% then noise (222742) | dropped |
+| Y in 16-column blocks via `forward_many` (222742/222743) | none | none | dropped: phases are compute-bound, not memory-bound |
+| Contribution tiles of 4/16 columns (local) | slower | — | dropped |
+| Shape-fitted leaf cost model g·(19gk+18k²+8g²) (222748/222749) | — | −1%, 8 nodes none | dropped: exact-dot cost per term also depends on values (small leaves 1.5× per term) |
+| Skip exact accumulation for empty rows (222752) | none | — | dropped |
+| Residue caches for the cones' W products (local) | none | — | dropped |
+
+Fit from the per-leaf profile (`ARROW_LEAVES`, leaf factor/Y timers): the
+contribution pass had a fixed ~18 ms per leaf per factorization (serial
+apply of k² values) and big leaves (g ≈ 264) serialized their dense factor.
+Exact dots cost ~110 ns/term at 1024 bits on an M4 and ~225 ns/term on the
+cluster nodes.

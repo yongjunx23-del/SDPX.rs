@@ -419,40 +419,6 @@ impl<T: FloatT> Leaf<T> {
     /// Each entry is the dot of a Y column with the rounded column
     /// `z_j = y_j ⊙ dinv`, as one exact accumulation; entry (r, c) is owned by
     /// column max(r, c), so columns update disjoint entries in parallel.
-    fn subtract_contribution(&self, s: &mut [T], t: usize, pool: Option<&rayon::ThreadPool>) {
-        let g = self.ids.len();
-        let (y, dinv, coupled) = (&self.y, &self.factor.dinv, &self.coupled);
-        // Only coupled columns are nonzero; uncoupled entries would add 0.
-        let column = |c: usize| -> Vec<T> {
-            let j = coupled[c];
-            let z: Vec<T> = (0..g).map(|k| y[k + j * g] * dinv[k]).collect();
-            coupled[..=c]
-                .iter()
-                .map(|&i| T::dot_fma(y[i * g..(i + 1) * g].iter().zip(&z)))
-                .collect()
-        };
-        let mut apply = |c: usize, values: Vec<T>| {
-            let j = coupled[c];
-            for (&i, a) in coupled.iter().zip(values) {
-                s[i + j * t] -= a;
-                if i != j {
-                    s[j + i * t] -= a;
-                }
-            }
-        };
-        let k = coupled.len();
-        match pool {
-            Some(pool) if k > 1 => {
-                let columns: Vec<Vec<T>> =
-                    pool.install(|| (0..k).into_par_iter().map(column).collect());
-                for (c, values) in columns.into_iter().enumerate() {
-                    apply(c, values);
-                }
-            }
-            _ => (0..k).for_each(|c| apply(c, column(c))),
-        }
-    }
-
     fn first_many(&mut self, rhs: &[T], n: usize, cols: usize, chunks: usize) {
         let g = self.ids.len();
         self.batch_w.resize(g * cols, T::zero());
@@ -603,6 +569,49 @@ impl<T: FloatT> Leaf<T> {
         } else {
             self.factor.backward_many(&mut self.batch_w, cols);
         }
+    }
+}
+
+/// `s -= Σ_leaves YᵀD⁻¹Y` on the upper triangle of the `t × t` border Schur
+/// (the caller mirrors it). One task per border column walks the leaves in
+/// order, so every entry receives the leaf contributions in leaf order (the
+/// serial arithmetic) with no per-leaf barrier. Each term is the dot of a Y
+/// column with the rounded `z_j = y_j ⊙ dinv`, one exact accumulation.
+/// Columns run longest-first: later columns carry more pairs.
+fn subtract_contributions<T: FloatT>(
+    leaves: &[Leaf<T>],
+    s: &mut [T],
+    t: usize,
+    pool: Option<&rayon::ThreadPool>,
+) {
+    if t == 0 {
+        return;
+    }
+    let column = |j: usize, col: &mut [T]| {
+        for leaf in leaves {
+            if !leaf.couples[j] {
+                continue;
+            }
+            let g = leaf.ids.len();
+            let (y, dinv) = (&leaf.y, &leaf.factor.dinv);
+            let c = leaf.coupled.binary_search(&j).unwrap();
+            let z: Vec<T> = (0..g).map(|k| y[k + j * g] * dinv[k]).collect();
+            for &i in &leaf.coupled[..=c] {
+                col[i] -= T::dot_fma(y[i * g..(i + 1) * g].iter().zip(&z));
+            }
+        }
+    };
+    let mut cols: Vec<(usize, &mut [T])> = s.chunks_mut(t).enumerate().collect();
+    match pool {
+        Some(pool) if t > 1 => {
+            cols.reverse();
+            pool.install(|| {
+                cols.par_iter_mut()
+                    .with_max_len(1)
+                    .for_each(|(j, col)| column(*j, col))
+            });
+        }
+        _ => cols.into_iter().for_each(|(j, col)| column(j, col)),
     }
 }
 
@@ -1064,7 +1073,16 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             // even when leaves outnumber threads (per-column arithmetic is
             // unchanged).
             let split = threads > 1;
-            let split_factor = threads >= SPLIT_FACTOR_THREADS_PER_LEAF * owned.len();
+            // Split a leaf's factor when it alone outweighs an even share of
+            // the rank's factor work (it would otherwise be the straggler), or
+            // when threads amply outnumber leaves.
+            let factor_work: u128 = self.leaves[owned.clone()]
+                .iter()
+                .map(|l| (l.ids.len() as u128).pow(3))
+                .sum();
+            let ample = threads >= SPLIT_FACTOR_THREADS_PER_LEAF * owned.len();
+            let split_factor =
+                |g: usize| ample || (g as u128).pow(3) * threads as u128 > factor_work;
             // Counts are diagnostic only; no per-leaf counter buffer is needed.
             let count = AtomicUsize::new(0);
             let ok = pool.install(|| {
@@ -1072,7 +1090,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                     .par_iter_mut()
                     .try_for_each(|leaf| {
                         let mut n = 0;
-                        let result = leaf.refactor(t, reg, &mut n, split, split_factor);
+                        let result =
+                            leaf.refactor(t, reg, &mut n, split, split_factor(leaf.ids.len()));
                         if n != 0 {
                             count.fetch_add(n, Ordering::Relaxed);
                         }
@@ -1105,9 +1124,11 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             self.assemble_local_schur();
         } else {
             let timer = crate::receipt::start();
-            // Deterministic merge order regardless of leaf scheduling.
-            for leaf in &self.leaves[owned] {
-                leaf.subtract_contribution(&mut self.s, t, self.pool.as_deref());
+            subtract_contributions(&self.leaves[owned], &mut self.s, t, self.pool.as_deref());
+            for j in 0..t {
+                for i in 0..j {
+                    self.s[j + i * t] = self.s[i + j * t];
+                }
             }
             crate::receipt::finish("arrow.contribution", timer);
         }
@@ -1511,18 +1532,30 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
             .world()
             .filter(|w| w.size() > 1 && self.local_structure.is_none())
             .map(|world| {
-                let t = self.trunk.len() as u64;
+                let t = self.trunk.len();
                 // Leaf work: contribution g·t²/2, Y = L⁻¹B g²·t/2, factor
                 // g³/3. Measured on Λ27, the full border width balances ranks
-                // better than the coupled width (whose leaves finish early).
+                // better than shape-fitted models (exact-dot cost per term
+                // also varies with the values).
+                let tw = t as u64;
                 let costs: Vec<u64> = self
                     .leaves
                     .iter()
                     .map(|l| {
                         let g = l.ids.len() as u64;
-                        g.saturating_mul(3 * t * t + 3 * g * t + 2 * g * g).max(1)
+                        g.saturating_mul(3 * tw * tw + 3 * g * tw + 2 * g * g)
+                            .max(1)
                     })
                     .collect();
+                if world.rank() == 0 && crate::receipt::profile_requested() {
+                    // Observation only: leaf sizes and coupled border widths.
+                    let shape: Vec<(usize, usize)> = self
+                        .leaves
+                        .iter()
+                        .map(|l| (l.ids.len(), l.coupled.len()))
+                        .collect();
+                    eprintln!("ARROW_LEAVES t={t} shape={shape:?}");
+                }
                 let mut offsets = vec![0];
                 for leaf in &self.leaves {
                     offsets.push(offsets.last().unwrap() + leaf.ids.len());

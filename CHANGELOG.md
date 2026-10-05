@@ -28,6 +28,10 @@ solves; the experiment log is [docs/JOURNAL.md](docs/JOURNAL.md).
 - Arrow border solve splits its forward sweep over the pool and leaf
   back-substitution splits its row couplings (both bitwise identical):
   Λ27 4 nodes 113–115 → 109 s, 8 nodes 103–104 → 97–98 s.
+- Arrow contributions update the border Schur in parallel inside one pass
+  over all owned leaves (no serial per-leaf apply), and a leaf whose factor
+  outweighs an even per-thread share splits it over the pool. Bitwise
+  identical; Λ27 1 node 192 → 181 s, 4 nodes −3%.
 
 ## [0.9.0] - 2026-10-04
 

@@ -278,22 +278,15 @@ impl SparseParallel {
         world.gather_slice(site, &local, &gather_ranges, y);
     }
 
-    /// Rows of `a` holding entries, and their prefix work (entries plus one
-    /// per row) for [`Self::forward_sharded_active`].
-    pub(crate) fn active_rows(&self) -> (Vec<usize>, Vec<usize>) {
-        let rows: Vec<usize> = (0..self.rowptr.len() - 1)
+    /// Rows of `a` holding entries, for [`Self::forward_sharded_active`].
+    pub(crate) fn active_rows(&self) -> Vec<usize> {
+        (0..self.rowptr.len() - 1)
             .filter(|&r| self.rowptr[r + 1] > self.rowptr[r])
-            .collect();
-        let mut ptr = Vec::with_capacity(rows.len() + 1);
-        ptr.push(0);
-        for &r in &rows {
-            ptr.push(ptr.last().unwrap() + self.rowptr[r + 1] - self.rowptr[r] + 1);
-        }
-        (rows, ptr)
+            .collect()
     }
 
     /// Rank-sharded forward product exchanging only the rows that hold
-    /// entries (`active`, with work prefix `ptr` from [`Self::active_rows`]);
+    /// entries (`active`, from [`Self::active_rows`]);
     /// every other output takes the `beta` scaling alone, as gemv does.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_sharded_active<T: FloatT>(
@@ -305,10 +298,23 @@ impl SparseParallel {
         beta: T,
         world: crate::mpi::World,
         site: usize,
-        (active, ptr): (&[usize], &[usize]),
+        active: &[usize],
     ) {
+        // Deal rows round-robin before the contiguous split: exact-dot cost
+        // varies with row magnitudes, which correlate with row order.
+        let size = world.size();
+        let order: Vec<usize> = (0..size)
+            .flat_map(|r| (r..active.len()).step_by(size))
+            .map(|k| active[k])
+            .collect();
+        let active = order.as_slice();
+        let mut ptr = Vec::with_capacity(active.len() + 1);
+        ptr.push(0);
+        for &r in active {
+            ptr.push(ptr.last().unwrap() + self.rowptr[r + 1] - self.rowptr[r] + 1);
+        }
         let count = active.len();
-        let lanes = partitions(ptr, world.size());
+        let lanes = partitions(&ptr, size);
         let ranges: Vec<(usize, usize)> = (0..world.size())
             .map(|r| {
                 let begin = lanes.get(r).copied().unwrap_or(count);

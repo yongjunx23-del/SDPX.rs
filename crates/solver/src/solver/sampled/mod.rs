@@ -1223,8 +1223,8 @@ pub struct SampledWorkspace<T> {
     // the immutable pattern and reconfigured only when the pool width changes.
     linear_plan: SparseParallel,
     linear_plan_workers: usize,
-    // Rows of the linear part holding entries, with their work prefix.
-    linear_active: Option<(Vec<usize>, Vec<usize>)>,
+    // Rows of the linear part holding entries.
+    linear_active: Option<Vec<usize>>,
     // Rank block partition shared with the caller's scaling (MPI).
     parts: Option<Vec<(usize, usize)>>,
 }
@@ -1343,7 +1343,7 @@ impl<T: FloatT> SampledWorkspace<T> {
                 if self.linear_active.is_none() {
                     self.linear_active = Some(self.linear_plan.active_rows());
                 }
-                let (rows, ptr) = self.linear_active.as_ref().unwrap();
+                let rows = self.linear_active.as_ref().unwrap();
                 self.linear_plan.forward_sharded_active(
                     &operator.linear,
                     y,
@@ -1352,7 +1352,7 @@ impl<T: FloatT> SampledWorkspace<T> {
                     beta,
                     world,
                     crate::mpi::SITE_FORWARD,
-                    (rows, ptr),
+                    rows,
                 );
             }
             return;
