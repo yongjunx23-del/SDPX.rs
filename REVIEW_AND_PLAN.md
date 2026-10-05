@@ -56,9 +56,10 @@ The g0 audit's primal residual uses the reported s; SDPX reports its iterate
 (1.6e-4 consistency on tiny rows), MOSEK reports b − Ax. Ruiz bounds
 1e-4/1e4 (a settings option) cut 256-bit to 65 iterations / ~1.95 s.
 
-Mixed Λ27 at 1024 bits, 4 nodes × 32 threads (SDPX one rank per node, SDPB
-32 ranks per node, thresholds 1e-30), full solves: SDPX Solved/42, solve
-1608 s, process 29 min; SDPB optimal/125, solver 2592 s, process 43 min.
+Mixed Λ27 at 1024 bits, 32 threads per node (SDPX one rank per node, SDPB
+32 ranks per node, thresholds 1e-30), full solves: 4 nodes SDPX Solved/42,
+solve 1369 s, process 23 min (head a0a6645; 0.9.0: 1608 s); SDPB
+optimal/125, solver 2592 s, process 43 min. 1 node: SDPX 2106 s, SDPB 4014 s.
 Per iteration (3-iteration runs) SDPX 51/46/37 s on 1/2/4 nodes vs SDPB
 143/70/65 s. Kept since 0.9.0 (same-allocation A/B, 4 nodes): coupled-column
 arrow work and aligned single-exchange sampled/scaling products, −6%.
@@ -147,7 +148,7 @@ regularization and refinement stay unchanged.
 
 | Order | Action | Acceptance / constraint |
 |---|---|---|
-| 0 | Multi-node scaling of the ordinary MPI path | Distributed arrow and aligned sampled/scaling exchanges are in place. Remaining replicated work at 4 nodes: border (trunk) solves ~8 s, Gram republish (`sync`) ~6.5 s, cone-scaling tails, m-vector exchanges ~9 s, per-rank load/setup ~2.5 min. Measure with same-allocation A/B (`aba.pbs`), never across node sets (±5%). Avoid node70. Retire the owner-partitioned path only after it is beaten. |
+| 0 | Multi-node scaling and MPFR kernel cost | Done since 0.9.0: aligned exchanges, measured cone costs, packed Grams, pooled border forward sweep, parallel leaf couplings/contributions, straggler leaf factor split. Λ27 3-iteration wall (32 threads/node): 1 node ~180 s, 4 nodes ~105 s, 8 nodes ~94 s. Remaining: KKT solves and start iteration do not scale (~14 + 17 s); cone scaling is bounded by single-cone SVD latency (~3 s per 88×88 1024-bit cone); arrow phases are bound by the exact-dot limb products (GMP `addmul_1` ~80% of contribution samples). Next real lever: a GEMM-based exact product (residue/Ozaki slicing on BLAS) for leaf contributions and Y = L⁻¹B, or intra-cone SVD parallelism; both are research-sized. Measure with same-allocation A/B (`aba.pbs`); avoid node70. |
 | 1 | Profile remaining exact residual and sampled/PSD work | Diagonal reserve222441 is kept; single-product scratch gate passes. Target measured complete-solve costs with unchanged exact operator/rounding. |
 | 2 | Optimize Lambda sampled RHS/KKT and PSD scaling | Target current dominant costs; ≥2% audited solve gain or clear memory/correctness benefit. Preserve exact operator/rounding contracts. |
 | 3 | Inspect remaining storage/setup lifetimes | Preserve shifted factorization versus unshifted residual operators; structural counts alone do not establish RSS. |

@@ -5952,3 +5952,17 @@ contribution pass had a fixed ~18 ms per leaf per factorization (serial
 apply of k² values) and big leaves (g ≈ 264) serialized their dense factor.
 Exact dots cost ~110 ns/term at 1024 bits on an M4 and ~225 ns/term on the
 cluster nodes.
+
+### Full solves with the committed head (a0a6645), Λ27 1024 bits, 32 threads/node
+
+| Run (job) | Nodes | Status | Solve | Process |
+|---|---|---|---|---|
+| SDPX head (222760, idle nodes node7/10/36/49) | 4 | Solved/42 | 1369 s | 23:25 |
+| SDPX head (222755, node5/9 loadave ~100 from non-PBS processes) | 4 | Solved/42 | 1861 s | 31:34 (discarded) |
+| SDPX head (222756) | 1 | Solved/42 | 2106 s | 35:16 |
+| SDPX 0.9.0 numerics (222615) | 4 | Solved/42 | 1608 s | 28:59 |
+| SDPB (222630) | 4 | optimal/125 | 2592 s | 43:17 |
+| SDPB (222644) | 1 | optimal/125 | 4014 s | 66:56 |
+
+Some free-listed nodes carry heavy load outside PBS; pick nodes with
+loadave < 2 and no jobs (`pbsnodes`) for timing runs.
