@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "sdpx-arithmetic"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "gmp-mpfr-sys",
  "num-traits",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "sdpx-ffi"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "sdpx-arithmetic",
  "sdpx-solver",
@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "sdpx-pmp"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "quick-xml",
  "sdpx-arithmetic",
@@ -1773,7 +1773,7 @@ dependencies = [
 
 [[package]]
 name = "sdpx-solver"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "amd",
  "blas",

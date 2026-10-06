@@ -67,9 +67,10 @@ core defaults. Progress goes to stderr and the result goes to stdout unless
 `--checkpoint FILE [--checkpoint-every N]` saves the accepted iterate
 (default interval: 10 iterations). `--restart FILE` continues the same input
 or starts a nearby input with matching structure and precision. Checkpoints
-require the ordinary solver, without `--partitions`. `SDPX_RECEIPT=FILE`
-records phase timings and peak RSS. Run each executable with `--help` for
-its full argument list, including MPI partitioning.
+require the ordinary solver, without `--partitions`; loading rejects
+nonfinite values and nonpositive homogenization or scaling factors.
+`SDPX_RECEIPT=FILE` records phase timings and peak RSS. Run each executable
+with `--help` for its full argument list, including MPI partitioning.
 
 ## Rust API
 

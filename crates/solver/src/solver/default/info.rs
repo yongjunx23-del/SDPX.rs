@@ -326,6 +326,7 @@ where
         self.gap_rel = self.prev_gap_rel;
 
         variables.copy_from(prev_variables);
+        self.ktratio = variables.κ * T::recip(variables.τ);
     }
 
     fn save_scalars(&mut self, μ: T, α: T, σ: T, iter: u32) {

@@ -257,10 +257,9 @@ unsafe fn matrix<T: Scalar>(a: &Csc, upper: bool) -> Result<CscMatrix<T>> {
         scalars(&a.values)?,
     ))
 }
-unsafe fn cones<T: Scalar>(input: &[Cone], m: usize) -> Result<Vec<SupportedConeT<T>>> {
+unsafe fn cones<T: Scalar>(input: &[Cone]) -> Result<Vec<SupportedConeT<T>>> {
     use SupportedConeT::*;
     let mut out = Vec::new();
-    let mut rows = 0usize;
     for c in input {
         if c.reserved != 0 {
             return Err(invalid("nonzero cone reserved field"));
@@ -270,47 +269,20 @@ unsafe fn cones<T: Scalar>(input: &[Cone], m: usize) -> Result<Vec<SupportedCone
         if d == 0 {
             return Err(invalid("cone dimension must be positive"));
         }
-        let (cone, size) = match c.kind {
-            0 => (ZeroConeT(d), d),
-            1 => (NonnegativeConeT(d), d),
-            2 => (SecondOrderConeT(d), d),
-            3 => (
-                PSDTriangleConeT(d),
-                d.checked_mul(
-                    d.checked_add(1)
-                        .ok_or_else(|| invalid("PSD dimension overflow"))?,
-                )
-                .and_then(|v| v.checked_div(2))
-                .ok_or_else(|| invalid("PSD dimension overflow"))?,
-            ),
-            4 if d == 3 => (ExponentialConeT(), 3),
-            5 if d == 3 && a.len() == 1 && a[0] > T::zero() && a[0] < T::one() => {
-                (PowerConeT(a[0]), 3)
-            }
-            6 if !a.is_empty() && a.iter().all(|x| *x > T::zero() && *x < T::one()) => {
-                let sum = a.iter().fold(T::zero(), |s, x| s + *x);
-                let eps = T::epsilon() * T::from_usize(a.len() * 8).unwrap();
-                if (sum - T::one()).abs() > eps {
-                    return Err(invalid("generalized power alpha must sum to one"));
-                }
-                let len = a
-                    .len()
-                    .checked_add(d)
-                    .ok_or_else(|| invalid("cone size overflow"))?;
-                (GenPowerConeT(a, d), len)
-            }
+        let cone = match c.kind {
+            0 => ZeroConeT(d),
+            1 => NonnegativeConeT(d),
+            2 => SecondOrderConeT(d),
+            3 => PSDTriangleConeT(d),
+            4 if d == 3 => ExponentialConeT(),
+            5 if d == 3 && a.len() == 1 => PowerConeT(a[0]),
+            6 => GenPowerConeT(a, d),
             _ => return Err(invalid("invalid cone kind/dimension/parameters")),
         };
         if c.kind != 5 && c.kind != 6 && c.alpha.count != 0 {
             return Err(invalid("unexpected cone alpha"));
         }
-        rows = rows
-            .checked_add(size)
-            .ok_or_else(|| invalid("cone size overflow"))?;
         out.push(cone);
-    }
-    if rows != m {
-        return Err(invalid("cone dimensions do not sum to rows"));
     }
     Ok(out)
 }
@@ -428,7 +400,7 @@ impl<T: Scalar> Typed<T> {
         let a = matrix(a, false)?;
         let q = scalars(q)?;
         let b = scalars(b)?;
-        let cones = cones(c, a.m)?;
+        let cones = cones(c)?;
         let settings = settings(s)?;
         let solver = match blocks {
             Some(blocks) => DefaultSolver::new_sampled(
@@ -472,13 +444,13 @@ impl<T: Scalar> Typed<T> {
         }
         let q: Vec<T> = scalars(q)?;
         let b: Vec<T> = scalars(b)?;
-        self.solved = false;
         self.solver
             .update_q(&q)
             .map_err(|e| invalid(e.to_string()))?;
         self.solver
             .update_b(&b)
             .map_err(|e| invalid(e.to_string()))?;
+        self.solved = false;
         Ok(())
     }
     fn info(&self) -> Info {

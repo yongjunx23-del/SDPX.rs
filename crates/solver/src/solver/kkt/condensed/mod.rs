@@ -705,6 +705,11 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     workx: Vec<T>,
     workz: Vec<T>,
     workh: Vec<T>,
+    // The last aligned MPI residual left only this rank's rows of workh.
+    workh_partial: bool,
+    // Rows holding sampled linear entries outside zero blocks (cached):
+    // the aligned prepare republishes their scaled values.
+    linear_scaled_rows: Option<Vec<usize>>,
     retained_rhs: Vec<T>,
     local_only: bool,
     pool: Option<Arc<rayon::ThreadPool>>,
@@ -721,13 +726,6 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     sampled: Option<(Arc<SampledOperator<T>>, SampledWorkspace<T>)>,
     sparse_products: Option<crate::algebra::sparse_parallel::SparseParallel>,
     counters: crate::solver::kkt::SolveCounters,
-    /// Improvement ratio of the last outer correction with the current
-    /// factorization; refinement's contraction is a property of the
-    /// factorization, so every right-hand side it serves behaves alike.
-    correction_ratio: Option<T>,
-    /// Relative residual a stalled correction last reached (not reset on
-    /// refactor: the floor tracks the problem's conditioning).
-    stall_floor: Option<T>,
 }
 
 fn local_world(local_only: bool) -> Option<crate::mpi::World> {
@@ -1165,6 +1163,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             workx: vec![T::zero(); n],
             workz: vec![T::zero(); m],
             workh: vec![T::zero(); m],
+            workh_partial: false,
+            linear_scaled_rows: None,
             retained_rhs: vec![T::zero(); nr],
             pool,
             parallel_assembly,
@@ -1179,8 +1179,6 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 && crate::algebra::sparse_parallel::worthwhile(A))
             .then(|| crate::algebra::sparse_parallel::SparseParallel::new(A)),
             counters: Default::default(),
-            correction_ratio: None,
-            stall_floor: None,
         };
         if let Some(plan) = &mut solver.sparse_products {
             plan.configure(A, solver.pool.clone());
@@ -1454,6 +1452,64 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         self.sampled.is_some() && self.mpi_world().is_none()
     }
 
+    /// Under MPI, align the sampled products' rank partition with the
+    /// scaling partition, so each rank's sampled block rows are exactly the
+    /// rows it scales and intermediate vectors need no exchange. Returns the
+    /// world when the partitions align (sampled blocks contiguous per rank).
+    fn align_sampled_parts(&mut self) -> Option<crate::mpi::World> {
+        let world = self.mpi_world()?;
+        let (operator, work) = self.sampled.as_ref()?;
+        // Partial rows require the sharded adjoint. The aligned prepare keeps
+        // scaled rows on their owner, but the column-sharded linear adjoint
+        // reads every row holding a linear entry: rows outside zero blocks
+        // (whose scaled value is nonzero) are republished by their owners.
+        if !work.parallel_eligible(operator, self.pool.as_ref()) {
+            return None;
+        }
+        let scaled_rows = self.linear_scaled_rows.get_or_insert_with(|| {
+            let a = operator.linear();
+            let mut touched = vec![false; a.m];
+            for &r in &a.rowval {
+                touched[r] = true;
+            }
+            for block in &self.blocks {
+                if matches!(block.scaling, Scaling::Zero) {
+                    touched[block.rows.clone()].fill(false);
+                }
+            }
+            (0..a.m).filter(|&r| touched[r]).collect()
+        });
+        if scaled_rows.len() * 8 > operator.linear().m
+            || self
+                .blocks
+                .iter()
+                .any(|b| matches!(&b.scaling, Scaling::Psd(p) if p.sampled.is_none()))
+        {
+            return None;
+        }
+        let nsampled = operator.blocks().len();
+        let mut parts = Vec::with_capacity(world.size());
+        let mut next = 0usize;
+        for (b0, len) in scaling_parts(&self.blocks, world.size()) {
+            let first = next;
+            for block in &self.blocks[b0..b0 + len] {
+                if let Scaling::Psd(p) = &block.scaling {
+                    match &p.sampled {
+                        Some(s) if s.block == next => next += 1,
+                        Some(_) => return None,
+                        None => {}
+                    }
+                }
+            }
+            parts.push((first, next - first));
+        }
+        if next != nsampled {
+            return None;
+        }
+        self.sampled.as_mut().unwrap().1.set_rank_parts(Some(parts));
+        Some(world)
+    }
+
     pub(crate) fn interior_dimension(&self) -> usize {
         self.reduced.factor_dimension()
     }
@@ -1552,6 +1608,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     }
 
     pub(crate) fn restore_scaled_product(&mut self, point: &[T]) {
+        self.workh_partial = false;
         apply_scaling_pool_with_world(
             self.mpi_world(),
             &self.pool,
@@ -1564,6 +1621,45 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         );
     }
 
+    /// After an aligned prepare, give every rank the scaled values of the
+    /// linear-touched rows outside zero blocks (owners hold them).
+    fn republish_linear_rows(&mut self, world: crate::mpi::World) {
+        let rows = self.linear_scaled_rows.as_deref().unwrap_or(&[]);
+        if rows.is_empty() {
+            return;
+        }
+        let (_, spans) = rank_rows(&self.blocks, world);
+        let mut ranges = Vec::with_capacity(spans.len());
+        let mut k = 0;
+        for &(start, len) in &spans {
+            let first = k;
+            while k < rows.len() && rows[k] >= start && rows[k] < start + len {
+                k += 1;
+            }
+            ranges.push((first, k - first));
+        }
+        debug_assert_eq!(k, rows.len());
+        let (k0, kl) = ranges[world.rank()];
+        let local: Vec<T> = rows[k0..k0 + kl].iter().map(|&r| self.workz[r]).collect();
+        let mut all = vec![T::zero(); rows.len()];
+        world.gather_slice(crate::mpi::SITE_SCALING, &local, &ranges, &mut all);
+        for (&r, v) in rows.iter().zip(all) {
+            self.workz[r] = v;
+        }
+    }
+
+    /// `H·z` of the last residual on every rank (gathered once if the
+    /// aligned residual left it rank-partial).
+    pub(crate) fn scaled_product(&mut self) -> &[T] {
+        if std::mem::take(&mut self.workh_partial) {
+            let world = self.mpi_world().unwrap();
+            let ((y0, y1), ranges) = rank_rows(&self.blocks, world);
+            let local = self.workh[y0..y1].to_vec();
+            world.gather_slice(crate::mpi::SITE_SCALING, &local, &ranges, &mut self.workh);
+        }
+        &self.workh
+    }
+
     pub(crate) fn owned_scaled_product(&self) -> Option<&[T]> {
         Some(&self.workh)
     }
@@ -1573,20 +1669,41 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let (bx, bz) = rhs.split_at(self.n);
         let fused = self.fused_sampled();
         let block_timer = crate::receipt::start();
-        apply_block_pool_with_world(
-            self.mpi_world(),
-            &self.pool,
-            &self.scaling_lanes,
-            self.scaling_tiles,
-            &mut self.blocks,
-            &mut self.workz,
-            bz,
-            if fused {
-                ScalingAction::Condense
-            } else {
-                ScalingAction::Apply(true)
-            },
-        );
+        let aligned = if fused {
+            None
+        } else {
+            self.align_sampled_parts()
+        };
+        if let Some(world) = aligned {
+            // The sampled adjoint below reads only this rank's block rows.
+            let ((y0, y1), _) = rank_rows(&self.blocks, world);
+            let local = scale_owned(
+                world,
+                &self.pool,
+                self.scaling_tiles,
+                &mut self.blocks,
+                &bz[y0..y1],
+                ScalingAction::Apply(true),
+            );
+            self.workz.fill(T::zero());
+            self.workz[y0..y1].copy_from_slice(&local);
+            self.republish_linear_rows(world);
+        } else {
+            apply_block_pool_with_world(
+                self.mpi_world(),
+                &self.pool,
+                &self.scaling_lanes,
+                self.scaling_tiles,
+                &mut self.blocks,
+                &mut self.workz,
+                bz,
+                if fused {
+                    ScalingAction::Condense
+                } else {
+                    ScalingAction::Apply(true)
+                },
+            );
+        }
         crate::receipt::finish("prepare_rhs.scaling", block_timer);
         self.workx.copy_from_slice(bx);
         if fused {
@@ -1643,17 +1760,30 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let bz = &rhs[self.n..];
         let (x, z) = out.split_at_mut(self.n);
         let fused = self.fused_sampled();
+        let aligned = !fused && self.align_sampled_parts().is_some();
         if fused {
             self.recover_linear(x, bz);
         } else if let Some((operator, work)) = &mut self.sampled {
-            operator.apply_with_pool(
-                &mut self.workz,
-                x,
-                T::one(),
-                T::zero(),
-                work,
-                self.pool.as_ref(),
-            );
+            // Aligned: only this rank's rows are needed by its scaling.
+            if aligned {
+                operator.apply_owned_with_pool(
+                    &mut self.workz,
+                    x,
+                    T::one(),
+                    T::zero(),
+                    work,
+                    self.pool.as_ref(),
+                );
+            } else {
+                operator.apply_with_pool(
+                    &mut self.workz,
+                    x,
+                    T::one(),
+                    T::zero(),
+                    work,
+                    self.pool.as_ref(),
+                );
+            }
         } else {
             Self::sparse_gemv(
                 self.mpi_world(),
@@ -1729,6 +1859,14 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         reuse_forward: bool,
     ) -> T {
         let reuse_forward = reuse_forward && !self.fused_sampled();
+        // Aligned partitions: forward and scaling fill only this rank's rows
+        // of ez, exchanged once at the end instead of twice.
+        let aligned = if self.fused_sampled() {
+            None
+        } else {
+            self.align_sampled_parts()
+        };
+        let rows = aligned.map(|w| rank_rows(&self.blocks, w));
         let (x, z) = solution.split_at(self.n);
         let (ex, ez) = out.split_at_mut(self.n);
         ex.copy_from_slice(&rhs[..self.n]);
@@ -1759,7 +1897,18 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 crate::receipt::phase("residual.adj", __t.elapsed());
                 if !reuse_forward {
                     let __t = std::time::Instant::now();
-                    operator.apply_with_pool(ez, x, -T::one(), T::one(), work, pool.as_ref());
+                    if aligned.is_some() {
+                        operator.apply_owned_with_pool(
+                            ez,
+                            x,
+                            -T::one(),
+                            T::one(),
+                            work,
+                            pool.as_ref(),
+                        );
+                    } else {
+                        operator.apply_with_pool(ez, x, -T::one(), T::one(), work, pool.as_ref());
+                    }
                     crate::receipt::phase("residual.fwd", __t.elapsed());
                 }
             } else if let (Some(world), Some(plan)) = (world, sparse_products.as_ref()) {
@@ -1808,16 +1957,29 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         };
         let mut scaling = || {
             let __t = std::time::Instant::now();
-            apply_scaling_pool_with_world(
-                world,
-                pool,
-                scaling_lanes,
-                *scaling_tiles,
-                blocks,
-                workh,
-                z,
-                false,
-            );
+            if let (Some(w), Some(((y0, y1), _))) = (aligned, &rows) {
+                let local = scale_owned(
+                    w,
+                    pool,
+                    *scaling_tiles,
+                    blocks,
+                    &z[*y0..*y1],
+                    ScalingAction::Apply(false),
+                );
+                workh.fill(T::zero());
+                workh[*y0..*y1].copy_from_slice(&local);
+            } else {
+                apply_scaling_pool_with_world(
+                    world,
+                    pool,
+                    scaling_lanes,
+                    *scaling_tiles,
+                    blocks,
+                    workh,
+                    z,
+                    false,
+                );
+            }
             crate::receipt::phase("residual.scale", __t.elapsed());
         };
         if let Some(pool) = pool.as_ref().filter(|_| scaling_lanes.len() > 1) {
@@ -1827,6 +1989,11 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             scaling();
         }
         crate::algebra::add_assign(ez, &self.workh);
+        if let (Some(w), Some(((y0, y1), ranges))) = (aligned, rows) {
+            let local = ez[y0..y1].to_vec();
+            w.gather_slice(crate::mpi::SITE_SCALING, &local, &ranges, ez);
+        }
+        self.workh_partial = aligned.is_some();
         if out.is_finite() {
             out.norm_inf()
         } else {

@@ -162,10 +162,6 @@ pub(crate) struct OwnedKkt<T: FloatT> {
     collective: Arc<dyn crate::solver::distributed::collective::Collective<T>>,
     last_border: Vec<T>,
     pair_border: Vec<T>,
-    /// First-correction improvement ratio with the current factorization,
-    /// per refinement level (original, reduced); see `refine`.
-    correction_ratio: [Option<T>; 2],
-    stall_floor: [Option<T>; 2],
     /// Speculative reduced correction prepared with the last fused reduced
     /// residual: local interior solves and the border right-hand side.
     fused_interior: Vec<Vec<T>>,
@@ -311,8 +307,6 @@ impl<T: FloatT> OwnedKkt<T> {
             collective,
             last_border: vec![T::zero(); border],
             pair_border: vec![T::zero(); 2 * border],
-            correction_ratio: [None; 2],
-            stall_floor: [None; 2],
             fused_interior: Vec::new(),
             fused_border_rhs: Vec::new(),
             fused_ready: false,
@@ -392,7 +386,6 @@ impl<T: FloatT> OwnedKkt<T> {
         self.finish_update(settings, valid)
     }
     fn finish_update(&mut self, settings: &CoreSettings<T>, valid: bool) -> bool {
-        self.correction_ratio = [None; 2];
         self.scaled_valid = false;
         let mut diagonal = T::zero();
         for local in &self.locals {
@@ -1416,22 +1409,6 @@ impl<T: FloatT> Refinement<T> for OwnedRefinement<'_, T> {
     }
     fn add_correction(&mut self) {
         self.work.candidate.add(&self.work.x);
-    }
-    fn correction_expected_to_stall(&self, stop_ratio: T) -> bool {
-        // Ratios come from globally reduced norms, so every rank holds the
-        // same value; the agreement keeps the collective sequence aligned.
-        let stall =
-            self.solver.correction_ratio[self.reduced as usize].is_some_and(|r| r < stop_ratio);
-        self.decision_agrees(u32::from(stall)) && stall
-    }
-    fn record_correction_ratio(&mut self, ratio: T) {
-        self.solver.correction_ratio[self.reduced as usize] = Some(ratio);
-    }
-    fn stall_floor(&self) -> Option<T> {
-        self.solver.stall_floor[self.reduced as usize]
-    }
-    fn set_stall_floor(&mut self, floor: T) {
-        self.solver.stall_floor[self.reduced as usize] = Some(floor);
     }
     fn accept_candidate(&mut self) {
         std::mem::swap(&mut self.work.x, &mut self.work.candidate);

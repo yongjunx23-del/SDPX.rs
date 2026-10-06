@@ -34,6 +34,9 @@ pub struct CompositeCone<T: FloatT = f64> {
     _is_symmetric: bool,
     threading: Option<ConeThreading>,
     sym_step_bounds: Vec<(T, T)>,
+    // Measured per-cone scaling cost (ns), identical on every MPI rank; the
+    // rank partition balances it once available.
+    mpi_costs: Option<Vec<u64>>,
 }
 
 impl<T> CompositeCone<T>
@@ -103,6 +106,7 @@ where
             _is_symmetric,
             threading: None,
             sym_step_bounds: Vec::new(),
+            mpi_costs: None,
         }
     }
 }
@@ -483,7 +487,10 @@ where
     /// Cost-balanced contiguous cone partition shared by every sharded
     /// method and its field gather — all ranks derive identical bounds.
     fn mpi_blocks(&self, world: crate::mpi::World) -> Vec<(usize, usize)> {
-        let costs: Vec<u64> = self.cones.iter().map(Self::mpi_work_cost).collect();
+        let costs: Vec<u64> = match &self.mpi_costs {
+            Some(costs) => costs.clone(),
+            None => self.cones.iter().map(Self::mpi_work_cost).collect(),
+        };
         crate::mpi::cost_ranges(&costs, world.size())
     }
 
@@ -624,13 +631,27 @@ where
         };
         let rng = &self.rng_cones;
         let cones = &mut self.cones;
+        let elapsed: Vec<std::sync::atomic::AtomicU64> = (0..cones.len())
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
         let update_one =
             |i: usize, cone: &mut SupportedCone<T>, inner: bool, paired: bool| -> bool {
                 if owned.contains(&i) || Self::scaling_state_len(cone) == 0 {
                     let _inner = (inner || paired).then(|| {
                         sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired)
                     });
-                    cone.update_scaling(&s[rng[i].clone()], &z[rng[i].clone()], μ, scaling_strategy)
+                    let start = std::time::Instant::now();
+                    let ok = cone.update_scaling(
+                        &s[rng[i].clone()],
+                        &z[rng[i].clone()],
+                        μ,
+                        scaling_strategy,
+                    );
+                    elapsed[i].store(
+                        start.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    ok
                 } else {
                     true
                 }
@@ -675,6 +696,45 @@ where
                 Self::unpack_scaling_state(cone, &all[offsets[i]..offsets[i] + lens[i]]);
             }
         }
+        // Share the measured costs of the stateful cones (each owned by one
+        // rank); the next partition balances them on every rank alike.
+        let local: Vec<f64> = owned
+            .clone()
+            .map(|i| elapsed[i].load(std::sync::atomic::Ordering::Relaxed) as f64)
+            .collect();
+        let mut measured = vec![0.0f64; self.cones.len()];
+        world.gather_slice(crate::mpi::SITE_CONES, &local, &blocks, &mut measured);
+        if world.rank() == 0 && crate::receipt::profile_requested() {
+            // Observation only: the slowest cones bound the phase.
+            let mut top: Vec<(f64, usize)> =
+                measured.iter().enumerate().map(|(i, &t)| (t, i)).collect();
+            top.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let sums: Vec<f64> = blocks
+                .iter()
+                .map(|&(b0, len)| measured[b0..b0 + len].iter().sum::<f64>() * 1e-9)
+                .collect();
+            eprintln!(
+                "CONE_COSTS rank_sums_s={:?} top_s={:?}",
+                sums,
+                top.iter()
+                    .take(6)
+                    .map(|&(t, i)| (i, self.cones[i].numel(), t * 1e-9))
+                    .collect::<Vec<_>>()
+            );
+        }
+        self.mpi_costs = Some(
+            self.cones
+                .iter()
+                .zip(&measured)
+                .map(|(c, &t)| {
+                    if Self::scaling_state_len(c) > 0 {
+                        (t as u64).max(1)
+                    } else {
+                        1
+                    }
+                })
+                .collect(),
+        );
         true
     }
 

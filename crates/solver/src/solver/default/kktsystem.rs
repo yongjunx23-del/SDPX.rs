@@ -55,10 +55,6 @@ where
 
         // Both formulations share the embedding and recovery.
         let use_condensed = Self::uses_condensed(data, cones, settings);
-        assert!(
-            settings.direct_kkt_solver,
-            "Indirect solve strategies are not supported."
-        );
         let augmented = || -> BoxedKKTSolver<T> {
             Box::new(DirectLDLKKTSolver::<T>::new(
                 &data.P,

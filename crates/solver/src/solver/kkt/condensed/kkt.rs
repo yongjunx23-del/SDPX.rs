@@ -222,8 +222,9 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 && self.refine_solution(&mut x, rhs, settings);
             if flags[c] {
                 if settings.iterative_refinement_enable {
-                    self.scaled_solutions[c * self.A.m..(c + 1) * self.A.m]
-                        .copy_from_slice(&self.workh);
+                    let m = self.A.m;
+                    let product = self.scaled_product().to_vec();
+                    self.scaled_solutions[c * m..(c + 1) * m].copy_from_slice(&product);
                     self.scaled_valid[c] = true;
                 }
                 out[c * width..(c + 1) * width].copy_from_slice(&x);
@@ -259,7 +260,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             }
             if settings.iterative_refinement_enable {
                 self.scaled_solutions.resize(self.A.m, T::zero());
-                self.scaled_solutions.copy_from_slice(&self.workh);
+                let product = self.scaled_product().to_vec();
+                self.scaled_solutions.copy_from_slice(&product);
                 self.scaled_valid[0] = true;
             }
             // As in upstream DirectLDL, refinement may stop at a finite
@@ -358,21 +360,6 @@ impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
     fn rhs_norm(&self) -> T {
         self.b.norm_inf()
     }
-    fn correction_expected_to_stall(&self, stop_ratio: T) -> bool {
-        self.kernel.mpi_world().is_none()
-            && self.kernel.correction_ratio.is_some_and(|r| r < stop_ratio)
-    }
-    fn record_correction_ratio(&mut self, ratio: T) {
-        self.kernel.correction_ratio = Some(ratio);
-    }
-    fn stall_floor(&self) -> Option<T> {
-        self.kernel
-            .stall_floor
-            .filter(|_| self.kernel.mpi_world().is_none())
-    }
-    fn set_stall_floor(&mut self, floor: T) {
-        self.kernel.stall_floor = Some(floor);
-    }
     fn residual(&mut self, candidate: bool, reuse: bool) -> T {
         self.kernel.residual(
             self.error,
@@ -451,6 +438,82 @@ mod mpi_tests {
         rank_local_rhs_failure::<sdpx_arithmetic::Bits256>(mpi.rank());
         mpi.finish();
     }
+
+    #[test]
+    #[ignore]
+    fn mpi_probe_two_rank_sampled_rhs() {
+        use crate::solver::SampledBlock;
+        use num_traits::{FromPrimitive, One, Zero};
+        type T = sdpx_arithmetic::Bits256;
+        let mpi = crate::MpiContext::initialize();
+        assert_eq!(mpi.size(), 2);
+        // Serial fallback, aligned pooled blocks, mixed ordinary rows with
+        // linear entries (full exchange) and without (aligned). All have an
+        // empty arrow border, which must remain valid under MPI.
+        for (h, threads, orthant, coupled) in [
+            (2, 1, false, false),
+            (16, 2, false, false),
+            (16, 2, true, true),
+            (16, 2, true, false),
+        ] {
+            let offset = usize::from(orthant);
+            let rows = triangular_number(h);
+            let (m, n) = (offset + 2 * rows, 2 * h);
+            let mut kinds = Vec::new();
+            if orthant {
+                kinds.push(SupportedConeT::NonnegativeConeT(1));
+            }
+            kinds.extend(vec![SupportedConeT::PSDTriangleConeT(h); 2]);
+            let linear = if coupled {
+                CscMatrix::new(m, n, (0..=n).collect(), vec![0; n], vec![T::one(); n])
+            } else {
+                CscMatrix::zeros((m, n))
+            };
+            let blocks = (0..2)
+                .map(|b| SampledBlock {
+                    row_start: offset + b * rows,
+                    column_start: b * h,
+                    dim: 1,
+                    basis_rows: h,
+                    basis_cols: h,
+                    basis: Matrix::<T>::identity(h).data().to_vec(),
+                    weights: vec![T::one(); h],
+                })
+                .collect();
+            let operator = Arc::new(SampledOperator::new(linear, blocks).unwrap());
+            let mut cones = CompositeCone::<T>::new(&kinds);
+            cones.configure_threads(threads).unwrap();
+            let (mut slack, mut dual) = (vec![T::zero(); m], vec![T::zero(); m]);
+            cones.unit_initialization(&mut dual, &mut slack);
+            assert!(cones.update_scaling(&slack, &dual, T::one(), ScalingStrategy::PrimalDual));
+            let settings = CoreSettings {
+                max_threads: threads as u32,
+                ..CoreSettings::default()
+            };
+            let mut kkt = CondensedKKTSolver::new(
+                &CscMatrix::identity(n),
+                &operator.materialize(),
+                &kinds,
+                &cones,
+                &settings,
+            );
+            kkt.set_sampled_operator(operator);
+            assert!(kkt.update(&cones, &settings));
+            assert!(kkt.linear_solver_info().name.ends_with("arrow"));
+            let point = vec![T::one(); n + m];
+            let zero = vec![T::zero(); n + m];
+            let mut rhs = zero.clone();
+            kkt.original_residual(&mut rhs, &zero, &point);
+            rhs.negate();
+            kkt.setrhs(&rhs[..n], &rhs[n..]);
+            let mut actual = zero.clone();
+            let (x, z) = actual.split_at_mut(n);
+            assert!(kkt.solve(Some(x), Some(z), &settings));
+            actual.axpby(-T::one(), &point, T::one());
+            assert!(actual.norm_inf() < T::from_f64(1e-30).unwrap());
+        }
+        mpi.finish();
+    }
 }
 
 impl<T: FloatT> CondensedKKTSolver<T> {
@@ -473,7 +536,6 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         pool: Option<Arc<rayon::ThreadPool>>,
     ) -> bool {
         self.scaled_valid.fill(false);
-        self.correction_ratio = None;
         assert_eq!(self.blocks.len(), cones.len());
         // Follow this update's actual pool, including removal/replacement.
         self.pool = pool;
@@ -594,7 +656,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     Scaling::Psd(p) => p
                         .sampled
                         .as_ref()
-                        .map(|s| s.work.gram_slice().len().max(1) as u64)
+                        .map(|s| s.work.gram_len().max(1) as u64)
                         .unwrap_or_else(|| rows.powf(1.5).max(1.0) as u64),
                     _ => rows.max(1.0) as u64,
                 }
@@ -654,7 +716,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 .blocks
                 .iter()
                 .map(|b| match &b.scaling {
-                    Scaling::Psd(p) => p.sampled.as_ref().map_or(0, |s| s.work.gram_slice().len()),
+                    Scaling::Psd(p) => p.sampled.as_ref().map_or(0, |s| s.work.gram_len()),
                     _ => 0,
                 })
                 .collect();
@@ -673,7 +735,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             for i in owned_range.clone() {
                 if let Scaling::Psd(p) = &self.blocks[i].scaling {
                     if let Some(s) = &p.sampled {
-                        local.extend_from_slice(s.work.gram_slice());
+                        s.work.pack_gram(&mut local);
                     }
                 }
             }

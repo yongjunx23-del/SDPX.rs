@@ -144,6 +144,7 @@ fn refine_assignment(roots: &[usize], work: &[u128], owners: usize, assigned: &m
 }
 
 impl OwnerLayout {
+    #[cfg(test)]
     pub(crate) fn new<T: FloatT>(
         data: &DefaultProblemData<T>,
         owners: usize,
@@ -155,6 +156,7 @@ impl OwnerLayout {
     }
 
     /// Budget is the resolved worker budget, not the desired number of tasks.
+    #[cfg(test)]
     pub(crate) fn new_auto<T: FloatT>(
         data: &DefaultProblemData<T>,
         budget: usize,
@@ -162,6 +164,7 @@ impl OwnerLayout {
         Self::build(data, None, budget, None, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_history<T: FloatT>(
         data: &DefaultProblemData<T>,
         owners: usize,
@@ -175,16 +178,7 @@ impl OwnerLayout {
         Self::build(data, Some(owners), budget, Some(history), input_fingerprint)
     }
 
-    pub(crate) fn new_auto_with_history<T: FloatT>(
-        data: &DefaultProblemData<T>,
-        budget: usize,
-        input_fingerprint: Option<[u8; 32]>,
-        history: &CostHistory,
-    ) -> Result<Self, String> {
-        Self::build(data, None, budget, Some(history), input_fingerprint)
-    }
-
-    fn build<T: FloatT>(
+    pub(super) fn build<T: FloatT>(
         data: &DefaultProblemData<T>,
         explicit: Option<usize>,
         budget: usize,

@@ -8,6 +8,159 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-06 — consolidate owner setup and reuse reduction outputs
+
+**Change.** Explicit, automatic and MPI partition setup share one constructor
+route and one layout builder. MPI derives the local owner from its transport.
+Optional input fingerprints are computed once at the JSON boundary; ordinary
+solves avoid unused history strings. Serial owner layouts share immutable
+storage. Scalar/statistic/border reductions use existing buffers, and MPI
+sums fold directly into their destination in the original rank order.
+Public cost-history APIs and settings formats remain supported; the redundant
+internal `direct_kkt_solver` assertion is removed. Net reduction: 150 physical
+Rust lines across eleven files, against the pre-cleanup source snapshot.
+
+**Evidence.** Mac M4, fast arm `architecture-cleanup-20261006-fast`, MPFR256,
+one thread, a two-variable equality/orthant QP: explicit history training,
+automatic history reuse and ordinary explicit partitions are `Solved`/19.
+Actual two-rank OpenMPI training and reuse are also `Solved`/19. Every full
+x/s/z point and reported numerical result matches the corresponding frozen
+baseline; the original-coordinate 1e-30 audit passes (raw primal max
+3.66e-38, dual max 1.10e-37, gap 2.51e-38, cone violations zero). History
+identity/runtime metadata is unchanged; measured costs naturally vary.
+`direct_kkt_solver=false` is rejected at the settings boundary without a
+panic. No suites or formal timings were needed for this refactor.
+
+**Decision/provenance.** Keep for smaller setup code and fewer copies and
+allocations, with no measured speed claim. Evidence and pre-cleanup files:
+`$SDPX_E2E_HOME/work/architecture-cleanup-20261006/`, including `audit.json`,
+input, outputs, histories and logs. Baseline arm
+`exact-arrow-packed-pool-20261006-fast` contains the later-rejected SVD tiles;
+this fixture never calls SVD. Forcing local OpenMPI to `self,tcp` hung both
+baseline ranks in `MPI_Comm_dup` before solver setup; default transport
+passes. Stack traces and bounded timeout logs are preserved with the evidence.
+
+## 2026-10-06 — packed residue outputs; reject smaller SVD replay tiles
+
+**Change.** Upper exact GEMM computes column tiles over only the needed
+rows and retains packed per-prime upper entries through CRT. Substantial
+arrow leaves build scalar-rounded Z and exact YᵀZ concurrently in bounded
+batches; each Schur entry still subtracts leaves in the original order.
+A separate candidate reduces SVD replay tiles on wider pools.
+
+**Evidence.** Sequential release ABBA, node192, dynamic OpenBLAS, BLAS one:
+
+| Cores / comparison | Before native median | Candidate native median | Process RSS median |
+|---|---|---|---|
+| 8 / Ising19 MPFR768, baseline vs packed + adaptive SVD, complete | 332.946 s | 333.185 s (+0.07%) | 731.760 → 697.197 MiB (−4.72%) |
+| 8 / Lambda27 MPFR1024, baseline vs packed, three iterations | 822.329 s | 769.710 s (−6.40%) | 20703.012 → 20702.967 MiB |
+| 32 / Ising19 MPFR768, packed vs adaptive SVD, complete | 233.151 s | 241.238 s (+3.47%) | 1435.098 → 1452.141 MiB |
+| 32 / Lambda27 MPFR1024, packed vs adaptive SVD, three iterations | 350.390 s | 347.140 s (−0.93%) | 26423.021 → 26401.035 MiB |
+
+All complete Ising solves are `Solved`/119 and pass the original-coordinate
+1e-30 audit; full x/s/z points are identical within each ABBA. Lambda27
+windows are `MaxIterations`/3 with identical points, **not complete audited
+solutions**. Ising does not enter the batched arrow residue branch at its
+work gate. Its eight-core RSS saving belongs to the combined frozen binary,
+not an isolated attribution. Square upper products retain m(m+1)/2 residue
+outputs per prime instead of m²; this does not halve total process RSS.
+
+**Decision.** Keep packed upper residue storage for its memory reduction.
+Remove adaptive SVD tiles: the audited solve regressed and the large-window
+gain is below 2%. Four-row parallel replay remains. Batched arrow products
+remain provisional until a complete audited release comparison passes.
+Later local admission rules exclude inline-dot precisions, short/wide
+leaves and underfilled batches; result storage stays proportional to Y.
+They are outside both completed cluster packets.
+
+**Additional repair/check.** Admit equality-only problems to the existing
+shared pool under its work cutoff and attach it to direct backends before
+initial thread reporting. Arm `exact-arrow-packed-pool-20261006-fast`, Mac
+M4: MPFR1024 equality QP at one/four actual backend workers is `Solved`/0,
+enters residue contribution four times, preserves the full reviewed baseline
+point and passes a 1e-50 original-coordinate audit (dual max 3.85e-230).
+Native single-run 0.976/0.345 s is preliminary. Keep the pool repair.
+The earlier one-bound fixture has identical points at actual one/four
+workers, but the baseline also misses its raw dual gate
+(1.127e-50 > 1e-50); preserve that failure, with no gate change.
+
+**Provenance.** PBS223509 (8 cores, 64 GiB, two hours) and approved
+PBS223513 (32 cores, 64 GiB, 45 minutes) both produced `COMPLETE`, summaries
+and exit zero. Remote `~/projects/sdpx-exact-packed-20261006/`, second run
+under `replay32/`; local retrieved manifests, hashes, audits and rows under
+`$SDPX_E2E_HOME/work/exact-arrow-packed-20261006/evidence8/` and `evidence32/`.
+Local equality evidence: `work/exact-arrow-20261005/pool-fixed-audit.json`;
+earlier missed gate: `pooled128-audit-failure.json`. This local arm includes
+the rejected SVD tile change; the equality fixture does not invoke SVD.
+
+## 2026-10-06 — reject serial residue-arrow and disconnected-QR trials
+
+**Hypothesis/change.** Replace wide leaf Schur exact dots with residue BLAS,
+preserving scalar-rounded Z and the original per-leaf subtraction order.
+Split bidiagonal QR only at exact-zero separators, preserving its global
+iteration cap and rotation replay order.
+
+**Evidence.** Frozen release binaries, eight physical cores, BLAS one,
+validated dynamic OpenBLAS, same host and settings, PBS223495:
+
+| Comparison | Baseline native median | Trial native median | Process RSS median |
+|---|---|---|---|
+| Ising Lambda19, MPFR768, complete ABBA | 332.888 s | 349.592 s (+5.02%) | 725.756 → 855.352 MiB |
+| Mixed Lambda27, MPFR1024, three-iteration BLAS ABBA | 824.563 s | 831.410 s (+0.83%) | 20703.867 → 20703.350 MiB |
+
+Ising is `Solved`/119, passes the original-coordinate 1e-30 audit, and all
+four full x/s/z points are identical. All completed Lambda27 windows are
+`MaxIterations`/3 with identical points: **incomplete solves**. The completed
+QR diagnostic pair was 831.930 → 829.027 s (−0.35%); cone-scaling wall was
+101.008 → 100.932 s. It exposed 288 QR splits but no qualifying gain.
+The allocation hit its 7200-second limit during the second QR window;
+there is no completed QR ABBA. PBS output records the kill even though the
+shell EXIT trap wrote zero. No `summary.json` was produced.
+
+**Decision.** Remove both first trials. Residue-arrow CPU work fell on
+Lambda27, but encoding/packing and sequential leaves erased the wall gain;
+Ising contribution wall grew 3.936 → 17.961 s. The later local reservation
+fix was outside these frozen binaries. Next candidate packs residue upper
+triangles and runs a bounded batch of independent substantial leaves;
+small products retain column-parallel dots. A separate small SVD candidate
+adapts replay row tiles to the ambient pool; QR remains serial.
+
+**Provenance.** Remote `~/projects/sdpx-exact-arrow-qr-20261005/` holds
+archives, manifest, binary hashes, failed setup jobs222772/222781 and all
+PBS223495 outputs under `retry2/`. Local source packets and completed rows:
+`$SDPX_E2E_HOME/work/exact-arrow-20261005/`; retrieved evidence is under
+`evidence-retry2/`. Baseline binary SHA256
+`42bab9d527268df686ed43f9d5c53ee40e61c606a1a433184265669e15a6f6c8`.
+
+## 2026-10-05 — repair static-review findings
+
+**Change.** Restrict the aligned MPI sampled exchange to pooled sampled
+PSD/zero blocks; serial and mixed ordinary cones retain the complete scaling
+exchange. Handle an empty arrow border and update arrow rows in place,
+removing temporary per-row vectors. Sampled linear products use the configured
+pool, including when its width decreases. Remove cross-RHS/factorization
+refinement stall prediction. Rollback restores kappa/tau and refreshes
+residuals before reduced convergence. Reject invalid checkpoint scalars
+before assignment, share cone validation in preparation, and preserve the
+last C ABI result when an update is rejected. Numerical tolerances,
+regularization and convergence rules are unchanged.
+
+**Verification.** Mac M4, `fast`, features `sdp-accelerate,faer-sparse`, arm
+`review-fixes-20261005-fast`: Ising11 MPFR512 at one/four threads is
+`Solved`/52, API 12.081/3.633 s, process RSS 52.5/61.2 MiB. Both pass the
+original-coordinate 1e-30 audit and return identical x/s/z; timings are
+preliminary single runs. Evidence under `$SDPX_E2E_HOME/runs/`:
+`20261005-154735-968255-ising11-review-fixes-20261005-fast` and
+`20261005-154755-286834-ising11-review-fixes-20261005-fast`.
+An actual local two-rank OpenMPI check passes three MPFR256 KKT fixtures:
+serial sampled, pooled sampled, and pooled sampled plus ordinary orthant
+rows, all with an empty arrow border. Focused invalid/valid checkpoint,
+rollback, native cone-input, C ABI cone preparation/rejected update and
+public C ABI lifecycle checks pass. No broad suite or cluster campaign.
+
+**Decision.** Keep for correctness and removal of arrow temporary storage.
+No new speed claim; earlier large-case timings precede the refinement repair.
+
 ## 2026-09-27 — binary64 accuracy regression; residue-kernel buffer reuse
 
 **Regression.** `dim2_signed_parities_ruiz_f64` (condensed, generic and
@@ -5815,3 +5968,173 @@ Test-suite repair after the g0 work (all 442 + 201 tests pass):
 Pinned after these changes: medium Solved/19 point `fd1437ee79ac39e0`,
 csdr3 Solved/57 PASS, ising11 Solved/52 PASS; ising11 at 1/2/3 MPI ranks
 Solved/52 (6.4/4.1/4.4 s, 2 threads each).
+
+## 2026-10-05 — Multi-node Λ27 after 0.9.0; SDPB at matched precision/threads
+
+Input: mixed Λ27 (m 544,653, n 18,703, 117 sampled PSD blocks, arrow border
+524), 1024 bits, 32 threads per node (SDPX: one rank per node; SDPB: 32 ranks
+per node), UCAS cluster, OpenMPI over ib0 TCP, node70 excluded (it hangs
+multi-node jobs: 222592, 222616, 222619, 222620 were deleted for that).
+
+SDPX 0.9.0, 3 iterations (`wall.solve` includes the start iteration):
+
+| Nodes | wall.solve | IP (3 it) | refactor | kkt solve | scale cones | process |
+|---|---|---|---|---|---|---|
+| 1 (222600) | 190.7 s | 152.4 s | 81.0 s | 13.6 s | 24.0 s | 5:52 |
+| 2 (222621) | 162.2 s | 137.0 s | 50.5 s | 24.5 s | 19.3 s | 5:33 |
+| 4 (222602) | 132.9 s | 109.5 s | 31.1 s | 20.7 s | 14.8 s | 5:20 |
+
+Per-rank load 65–77 s and setup ~90 s (presolve_rank 24 s) are replicated.
+Scaling stops at the parts every rank repeats: border solves, residual
+scaling and sampled products in the KKT solves (~45 s at 4 nodes, not
+shrinking), m-vector gathers (11.6 s), and cone-scaling tails.
+
+SDPB (same input via `pmp2sdp --precision 1024`, thresholds 1e-30), cumulative
+solver time after iterations 1/2/3: 1 node 112/255/398 s (process 12:20);
+2 nodes 39/105/181 s (4:52); 4 nodes 54/111/195 s (5:22). A 4-node run
+sharing node31 with the 1-node job took 477 s and is discarded.
+
+Full solve, 4 nodes: SDPX (arm with rejected balance changes, numerically
+identical to 0.9.0) Solved in 42 iterations, solve 1608 s, process 28:59
+(job 222615).
+
+Rejected (same-allocation A/B, 4 nodes, 3 iterations, job 222629:
+0.9.0 128.4/124.9 s vs 132.4 s):
+
+- Fused sampled RHS under MPI (owners condense/recover, adjoints gathered):
+  works at 1–4 ranks but disables forward reuse in the residual (26 instead
+  of 12 forward products) and doubles recover scaling; 4 nodes 161.9 s vs
+  132.9 s.
+- Cost-balanced (h²·kmax) block partition for sharded sampled products,
+  largest-first cone scaling under MPI with inner splitting, and rank-local
+  scaling tiles: bitwise identical, no gain (sampled adjoint and solves
+  slightly slower).
+- Leaf cost model by coupled border width: leaves finish unevenly
+  (`arrow.border_sum` wait 2 → 6 s on rank 0).
+
+### MPFR thread-count dependence in sparse products (bug in 0.9.0, fixed)
+
+0.9.0 made MPFR CSC `gemv` exact per output (columns with ≥ 4 entries; rows
+when nnz ≥ 4m) but the pooled `SparseParallel` lanes and the rank-sharded
+`product_sharded` kept the rounded per-term chain. One-thread and pooled runs
+therefore differed: ising11 512-bit point `fecc053686f5` at 1 thread vs
+`2930df70fec0` at 4 threads (both Solved/52, audits pass); mixed Λ11 differed
+likewise; g0 256 was unaffected. Fix: one per-output kernel
+(`csc::wide_output`) used by gemv, the pooled lanes, the sharded product and
+the residual products (the separate all-exact residual kernel is removed).
+After the fix ising11 and Λ11 points agree at 1 and 4 threads
+(`fecc053686f5`); g0 256 changes to `01a08d6b4f` (Solved/117, audit accepted,
+primal 7.5e-44); medium/csdr3/ising11 audits pass. A regression test
+(`wide_exact_parity_*`) covers long columns and dense rows; the old
+`kernel_equivalence` matrix only had short columns.
+
+### Kept after 0.9.0: aligned single-exchange products (same allocation A/B)
+
+Measurement method: `aba.pbs` runs A B A B in one PBS allocation (4 nodes ×
+32 threads, exclusive request, node70 excluded); cross-allocation runs vary
+±5% and are not used for decisions.
+
+| Arm (job) | wall.solve A/B/A/B | Verdict |
+|---|---|---|
+| coupled columns (222634, 2 nodes) | 161.0 / 155.6 / 161.7 / 160.8 | −2.0%, refactor −10%: kept |
+| coupled columns (222635, 4 nodes) | 132.3 / 132.9 / 135.0 / 128.4 | −1.4%: kept |
+| + exact-rule fix, sharded linear part (222640) | 132.2 / 141.7 / 131.7 / 142.8 | +8%: linear forward gathered all m rows |
+| + aligned partition, active-row linear forward (222647) | 132.3 / 128.1 / 131.1 / 132.4 | −1%: forward rows ran 8 tasks only |
+| + one task per active row (222652) | 124.8 / 118.9 / 124.7 / 115.2 | −6.2%: kept |
+
+The sampled linear part of Λ27 is 544,653 × 18,703 with 5.2 M entries in
+525 rows (the equalities). Aligned partition: the sampled products use the
+condensed scaling partition, so prepare skips the scaling exchange, recover
+skips the forward exchange, and the residual exchanges `ez` once; the
+partial `H·z` is gathered once when copied out after refinement. Points are
+bitwise identical to the non-aligned path at 1–4 local ranks.
+
+Full solves, 4 nodes × 32 threads, 1024 bits: SDPX Solved/42, solve 1608 s,
+process 28:59 (222615); SDPB "found primal-dual optimal solution"/125,
+solver runtime 2592 s, process 43:17, 689 MB per process (222630, node3/4/5/7).
+
+### Measured cone costs and packed Grams (same allocation A/B, 4 nodes)
+
+| Arm (job) | wall.solve A/B/A/B | Notes |
+|---|---|---|
+| align4 vs measured cone costs (222659) | 121.0 / 117.5 / 119.5 / 115.5 | SVD CPU per rank 173/148/186/202 → 172/168/174/182 s; kept |
+| align4 vs + packed upper Gram exchange (222664) | 123.6 / 122.2 / 127.3 / 120.1 | `sync` 7.4/8.0 → 5.0/4.8 s; kept |
+
+Cone scaling wall stays ~15 s per 4 scalings: each rank's scaling CPU is
+~70 s (2.2 s on 32 threads), but single 88×88 1024-bit cones take 2.4–3.4 s
+(`CONE_COSTS` profile line), so the phase is bounded by one cone's latency.
+Further scaling of this phase needs parallelism inside one cone's SVD.
+
+1-node full solves (1024 bits, 32 threads): SDPX Solved/42, solve 2170 s,
+process 36:19, load 3.4 s with parallel block parsing (222643).
+
+### Border solve and scaling to 8 nodes
+
+- Pooled forward sweep of the arrow border solve (`DenseLeaf::solve_pooled`,
+  blocks of 32 rows; every later row applies a finished block's columns in
+  ascending order, so each entry keeps the serial FMA order; the backward
+  sweep stays serial). Same allocation, 4 nodes (222675): `arrow.trunk`
+  8.6 → 4.4 s, wall.solve 117.5/113.5 → 107.6/109.2 s (−5.7%). Kept; parity
+  test `pooled_solve_parity_*`.
+- 8 nodes × 32 threads (222669, packed-Gram arm): wall.solve 107.5 s vs
+  120.1 s at 4 nodes. Refactor keeps scaling (26.5 → 18.0 s); KKT solves
+  (~17.5 s), the start iteration (~19 s), cone scaling (single-cone latency)
+  and `arrow.leaf_backward` (~7.5 s: each leaf's row dots ran serially) do not.
+- 1-node full solves: SDPB optimal/125, solver 4014 s, process 1:06:56
+  (222644); SDPX Solved/42, solve 2170 s, process 36:19.
+- Leaf back-substitution row couplings split over the pool (bitwise
+  identical; only on pool workers). Same allocation (222677/222678), with
+  the pooled border solve: 4 nodes 113.5/115.0 → 108.7/109.9 s; 8 nodes
+  103.1/104.1 → 97.2/97.9 s; `arrow.leaf_backward` 7.0 → 3.7 s at 8 nodes.
+
+### Arrow leaf phases (same allocation A/B, 3 iterations)
+
+| Change (job) | 1 node | 4 nodes | Verdict |
+|---|---|---|---|
+| In-place parallel contribution update + straggler-leaf factor split (222700/222701) | 192.2/192.2 → 182.3/180.7 s | 111.5/111.2 → 107.2/108.4 s | kept |
+| One parallel region over border columns for all leaves (222730/222731) | −1.2% | noise | kept (simpler code, identical bits) |
+| Deferred flat Y pass after per-leaf factors (222737/222738) | +1% | −3.6% then noise (222742) | dropped |
+| Y in 16-column blocks via `forward_many` (222742/222743) | none | none | dropped: phases are compute-bound, not memory-bound |
+| Contribution tiles of 4/16 columns (local) | slower | — | dropped |
+| Shape-fitted leaf cost model g·(19gk+18k²+8g²) (222748/222749) | — | −1%, 8 nodes none | dropped: exact-dot cost per term also depends on values (small leaves 1.5× per term) |
+| Skip exact accumulation for empty rows (222752) | none | — | dropped |
+| Residue caches for the cones' W products (local) | none | — | dropped |
+
+Fit from the per-leaf profile (`ARROW_LEAVES`, leaf factor/Y timers): the
+contribution pass had a fixed ~18 ms per leaf per factorization (serial
+apply of k² values) and big leaves (g ≈ 264) serialized their dense factor.
+Exact dots cost ~110 ns/term at 1024 bits on an M4 and ~225 ns/term on the
+cluster nodes.
+
+### Full solves with the committed head (a0a6645), Λ27 1024 bits, 32 threads/node
+
+| Run (job) | Nodes | Status | Solve | Process |
+|---|---|---|---|---|
+| SDPX head (222760, idle nodes node7/10/36/49) | 4 | Solved/42 | 1369 s | 23:25 |
+| SDPX head (222755, node5/9 loadave ~100 from non-PBS processes) | 4 | Solved/42 | 1861 s | 31:34 (discarded) |
+| SDPX head (222756) | 1 | Solved/42 | 2106 s | 35:16 |
+| SDPX 0.9.0 numerics (222615) | 4 | Solved/42 | 1608 s | 28:59 |
+| SDPB (222630) | 4 | optimal/125 | 2592 s | 43:17 |
+| SDPB (222644) | 1 | optimal/125 | 4014 s | 66:56 |
+
+Some free-listed nodes carry heavy load outside PBS; pick nodes with
+loadave < 2 and no jobs (`pbsnodes`) for timing runs.
+
+## 2026-10-06 — A/B of the repair commit (3bbef2b) and release 0.9.1
+
+Same-allocation A/B, mixed Λ27, 1024 bits, 32 threads per node (node7/50/
+54/55 and node91; nodes node71/72/75/84/88 killed jobs at launch, exit −9).
+
+| Comparison (job) | Result |
+|---|---|
+| c824c3f vs 3bbef2b, 4 nodes, 3 it (223540) | 114.5/113.8 vs 122.0/118.9 s (+5%): aligned exchange disabled by the new block-type guard (mixed Λ27 has one ordinary cone) |
+| same, 4 nodes, 20 it (223553) | 632.5/625.3 vs 686.9/683.2 s (+9%) |
+| same, 1 node (223552) | 169.7/171.5 vs 176.0/175.7 s: residue contributions 35 → 22 s; refinement residuals 13 → 25 calls (+10 s) after removing stall prediction |
+| c824c3f vs head aacdc44 (guard on linear-touched rows + republish), 4 nodes (223562) | 114.2/114.4 vs 115.5/112.9 s (on par, correct) |
+| same, 1 node (223563) | 171.1/172.6 vs 176.6/175.3 s (+2.4%) |
+| residue contributions for short batches with pooled residue GEMM (223559/223560) | 4 nodes 115.2/117.9 → 131.6/128.7 s; 1 node +1.5%; rejected |
+
+Mixed Λ27 has one sampled-linear row outside zero blocks; c824c3f's aligned
+prepare read zero there on non-owner ranks (refinement absorbed it). The
+release keeps the aligned exchange and republishes such rows. Refinement
+stall prediction stays removed (Clarabel-style per-RHS refinement).

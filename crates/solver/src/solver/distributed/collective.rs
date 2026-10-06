@@ -235,18 +235,17 @@ impl WorldCollective {
         Ok(all)
     }
 
-    fn fold_sum<T: Scalar>(all: &[T], size: usize, len: usize) -> Vec<T> {
+    fn fold_sum<T: Scalar>(all: &[T], out: &mut [T]) {
+        let len = out.len();
         if len == 0 {
-            return Vec::new();
+            return;
         }
-        let mut out = all[..len].to_vec();
-        for rank in 1..size {
-            let segment = &all[rank * len..(rank + 1) * len];
+        out.copy_from_slice(&all[..len]);
+        for segment in all.chunks_exact(len).skip(1) {
             for (dst, &value) in out.iter_mut().zip(segment) {
                 *dst += value;
             }
         }
-        out
     }
 
     fn fold_max<T: Scalar>(all: &[T], size: usize, len: usize) -> Vec<T> {
@@ -288,9 +287,16 @@ impl<T: Scalar> Collective<T> for WorldCollective {
     }
 
     fn reduce_sum(&self, site: usize, local: &[T]) -> Result<Vec<T>, CollectiveError> {
-        self.handshake(site, Operation::Sum, Some(local.len()), None)?;
-        let all = self.gather(site, local)?;
-        Ok(Self::fold_sum(&all, self.0.size(), local.len()))
+        let mut out = local.to_vec();
+        self.reduce_sum_in_place(site, &mut out)?;
+        Ok(out)
+    }
+
+    fn reduce_sum_in_place(&self, site: usize, values: &mut [T]) -> Result<(), CollectiveError> {
+        self.handshake(site, Operation::Sum, Some(values.len()), None)?;
+        let all = self.gather(site, values)?;
+        Self::fold_sum(&all, values);
+        Ok(())
     }
 
     fn reduce_max(&self, site: usize, local: &[T]) -> Result<Vec<T>, CollectiveError> {

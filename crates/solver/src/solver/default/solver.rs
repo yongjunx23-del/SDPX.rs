@@ -76,34 +76,26 @@ impl<T: FloatT> PreparedProblem<T> {
         cones: &[SupportedConeT<T>],
         settings: DefaultSettings<T>,
     ) -> Result<Self, SolverError> {
-        Self::new_with_cost_identity_impl(
+        Self::new_cow(
             std::borrow::Cow::Borrowed(P),
             std::borrow::Cow::Borrowed(q),
             std::borrow::Cow::Borrowed(A),
             std::borrow::Cow::Borrowed(b),
             cones,
             settings,
-            false,
+            None,
         )
     }
 
-    pub(super) fn new_with_cost_identity_impl(
+    pub(super) fn new_cow(
         P: std::borrow::Cow<'_, CscMatrix<T>>,
         q: std::borrow::Cow<'_, [T]>,
         A: std::borrow::Cow<'_, CscMatrix<T>>,
         b: std::borrow::Cow<'_, [T]>,
         cones: &[SupportedConeT<T>],
         settings: DefaultSettings<T>,
-        with_identity: bool,
+        input_fingerprint: Option<[u8; 32]>,
     ) -> Result<Self, SolverError> {
-        #[cfg(feature = "serde")]
-        let input_fingerprint = with_identity
-            .then(|| crate::solver::distributed::input_fingerprint(&P, &q, &A, &b, cones, None));
-        #[cfg(not(feature = "serde"))]
-        let input_fingerprint = {
-            let _ = with_identity;
-            None
-        };
         check_dimensions(&P, &q, &A, &b, cones)?;
         P.check_format().map_err(|_| {
             SolverError::BadInputData("P must be canonical CSC (sorted, unique, in-range rows)")
@@ -124,7 +116,7 @@ impl<T: FloatT> PreparedProblem<T> {
         blocks: Vec<SampledBlock<T>>,
         settings: DefaultSettings<T>,
     ) -> Result<Self, SolverError> {
-        Self::new_sampled_cow_with_identity(
+        Self::new_sampled_cow(
             std::borrow::Cow::Borrowed(P),
             std::borrow::Cow::Borrowed(q),
             std::borrow::Cow::Borrowed(A_linear),
@@ -132,11 +124,11 @@ impl<T: FloatT> PreparedProblem<T> {
             cones,
             blocks,
             settings,
-            false,
+            None,
         )
     }
 
-    pub(super) fn new_sampled_cow_with_identity(
+    pub(super) fn new_sampled_cow(
         P: std::borrow::Cow<'_, CscMatrix<T>>,
         q: std::borrow::Cow<'_, [T]>,
         A_linear: std::borrow::Cow<'_, CscMatrix<T>>,
@@ -144,24 +136,8 @@ impl<T: FloatT> PreparedProblem<T> {
         cones: &[SupportedConeT<T>],
         blocks: Vec<SampledBlock<T>>,
         settings: DefaultSettings<T>,
-        with_identity: bool,
+        input_fingerprint: Option<[u8; 32]>,
     ) -> Result<Self, SolverError> {
-        #[cfg(feature = "serde")]
-        let input_fingerprint = with_identity.then(|| {
-            crate::solver::distributed::input_fingerprint(
-                &P,
-                &q,
-                &A_linear,
-                &b,
-                cones,
-                Some(&blocks),
-            )
-        });
-        #[cfg(not(feature = "serde"))]
-        let input_fingerprint = {
-            let _ = with_identity;
-            None
-        };
         let mut sampled_timers = Timers::default();
         sampled_timers.start_setup();
         check_dimensions(&P, &q, &A_linear, &b, cones)?;
@@ -356,7 +332,38 @@ fn check_dimensions<T: FloatT>(
 ) -> Result<(), SolverError> {
     let m = b.len();
     let n = q.len();
-    let p = cone_types.iter().fold(0, |acc, cone| acc + cone.nvars());
+    let mut p = 0usize;
+    for cone in cone_types {
+        let invalid = || SolverError::BadInputData("invalid cone dimensions or parameters");
+        let size = match cone {
+            SupportedConeT::ZeroConeT(n)
+            | SupportedConeT::NonnegativeConeT(n)
+            | SupportedConeT::SecondOrderConeT(n) => *n,
+            SupportedConeT::ExponentialConeT() => 3,
+            SupportedConeT::PowerConeT(alpha) => {
+                if !(*alpha > T::zero() && *alpha < T::one()) {
+                    return Err(invalid());
+                }
+                3
+            }
+            SupportedConeT::GenPowerConeT(alpha, dim2) => {
+                // Match the constructor's strict sum tolerance before setup.
+                if !alpha.iter().all(|a| *a > T::zero())
+                    || !((T::one() - alpha.as_slice().sum()).abs()
+                        < T::epsilon() * alpha.len().as_T() * (0.5).as_T())
+                {
+                    return Err(invalid());
+                }
+                alpha.len().checked_add(*dim2).ok_or_else(invalid)?
+            }
+            SupportedConeT::PSDTriangleConeT(n) => n
+                .checked_add(1)
+                .and_then(|next| n.checked_mul(next))
+                .map(|twice| twice / 2)
+                .ok_or_else(invalid)?,
+        };
+        p = p.checked_add(size).ok_or_else(invalid)?;
+    }
 
     if m != A.nrows() {
         return Err(SolverError::BadInputData("A and b incompatible dimensions"));

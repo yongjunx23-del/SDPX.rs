@@ -126,6 +126,7 @@ impl ConeThreading {
     ) -> Result<Option<Self>, rayon::ThreadPoolBuildError> {
         let budget = crate::solver::core::worker_budget(requested);
         let single_orthant = matches!(cones, [SupportedCone::NonnegativeCone(_)]);
+        let single_zero = matches!(cones, [SupportedCone::ZeroCone(_)]);
         let orthant_size = cones
             .iter()
             .find(|c| matches!(c, SupportedCone::NonnegativeCone(_)))
@@ -151,7 +152,10 @@ impl ConeThreading {
             let _ = cone;
             false
         });
-        if budget <= 1 || cones.is_empty() || (cones.len() < 2 && !single_orthant && !has_psd) {
+        if budget <= 1
+            || cones.is_empty()
+            || (cones.len() < 2 && !single_orthant && !single_zero && !has_psd)
+        {
             return Ok(None);
         }
         let mut prefix = Vec::with_capacity(cones.len() + 1);

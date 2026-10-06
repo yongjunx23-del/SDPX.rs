@@ -296,6 +296,8 @@ fn ordinary_recovery_restores_accepted_metrics_and_variables() {
     let mut info = DefaultInfo::<f64>::new();
     let mut variables = DefaultVariables::new(1, 1);
     variables.x[0] = 2.;
+    variables.τ = 2.;
+    variables.κ = 0.5;
     let mut previous = DefaultVariables::new(1, 1);
     info.cost_primal = 3.;
     info.cost_dual = 3.;
@@ -306,6 +308,9 @@ fn ordinary_recovery_restores_accepted_metrics_and_variables() {
     info.gap_rel = 0.;
     info.save_prev_iterate(&variables, &mut previous);
     variables.x[0] = 7.;
+    variables.τ = 0.5;
+    variables.κ = 2.;
+    info.ktratio = 4.;
     info.cost_primal = 5.;
     info.cost_dual = 6.;
     info.res_primal = 1.;
@@ -315,6 +320,7 @@ fn ordinary_recovery_restores_accepted_metrics_and_variables() {
     info.gap_rel = 1.;
     info.reset_to_prev_iterate(&mut variables, &previous);
     assert_eq!(variables.x, vec![2.]);
+    assert_eq!((variables.τ, variables.κ, info.ktratio), (2., 0.5, 0.25));
     assert_eq!((info.cost_primal, info.cost_dual), (3., 3.));
     assert_eq!((info.res_primal, info.res_dual), (1e-12, 2e-12));
     assert_eq!(info.res_dual_componentwise, Some(3e-12));

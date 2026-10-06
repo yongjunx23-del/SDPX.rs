@@ -331,7 +331,15 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
         mpi,
         (|| -> CliResult<JsonProblem<T>> {
             let mut problem = if path.is_dir() {
-                let sampled = read_sdpb_sampled::<T>(path)?;
+                // Block files parse in parallel; keep that within --threads
+                // (the batch also bounds how many parsed blocks are alive).
+                let sampled = match options.threads.filter(|&t| t > 0) {
+                    Some(threads) => rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads as usize)
+                        .build()?
+                        .install(|| read_sdpb_sampled::<T>(path))?,
+                    None => read_sdpb_sampled::<T>(path)?,
+                };
                 sdpx_solver::receipt::memory_mark("input read");
                 objective_constant = sampled.objective_constant;
                 equalities = sampled.num_equalities;

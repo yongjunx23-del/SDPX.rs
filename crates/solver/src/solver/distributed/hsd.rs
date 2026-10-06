@@ -125,36 +125,17 @@ impl<T: FloatT> OwnedSolver<T> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_prepared(
         prepared: PreparedProblem<T>,
         count: usize,
     ) -> Result<Self, String> {
-        Self::from_prepared_tasks(
-            prepared,
-            Some(count),
-            CostHistoryOptions::default(),
-            None,
-            None,
-        )
+        Self::from_prepared_tasks(prepared, Some(count), CostHistoryOptions::default(), None)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_prepared_auto(prepared: PreparedProblem<T>) -> Result<Self, String> {
-        Self::from_prepared_tasks(prepared, None, CostHistoryOptions::default(), None, None)
-    }
-
-    pub(crate) fn from_prepared_with_cost_history(
-        prepared: PreparedProblem<T>,
-        count: usize,
-        options: CostHistoryOptions,
-    ) -> Result<Self, String> {
-        Self::from_prepared_tasks(prepared, Some(count), options, None, None)
-    }
-
-    pub(crate) fn from_prepared_auto_with_cost_history(
-        prepared: PreparedProblem<T>,
-        options: CostHistoryOptions,
-    ) -> Result<Self, String> {
-        Self::from_prepared_tasks(prepared, None, options, None, None)
+        Self::from_prepared_tasks(prepared, None, CostHistoryOptions::default(), None)
     }
 
     /// Build one rank-local owner view over the shared HSD loop.  Prepared
@@ -162,6 +143,7 @@ impl<T: FloatT> OwnedSolver<T> {
     /// non-local numeric blocks are then dropped before the solver is
     /// returned.  The transport is control-thread-only and supplies the
     /// reductions needed by the shared border KKT.
+    #[cfg(test)]
     pub(crate) fn from_prepared_rank_local(
         prepared: PreparedProblem<T>,
         collective: CollectiveHandle<T>,
@@ -173,34 +155,35 @@ impl<T: FloatT> OwnedSolver<T> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_prepared_rank_local_with_cost_history(
         prepared: PreparedProblem<T>,
         collective: CollectiveHandle<T>,
         options: CostHistoryOptions,
     ) -> Result<Self, String> {
-        if !prepared.cones.all_symmetric() {
-            return Err(
-                "rank-local transport currently supports symmetric cones only (LP/SOCP/PSD)".into(),
-            );
-        }
-        let size = collective.size();
-        let rank = collective.rank();
-        if size == 0 || rank >= size {
-            return Err("invalid rank-local collective dimensions".into());
-        }
-        Self::from_prepared_tasks(prepared, Some(size), options, Some(collective), Some(rank))
+        Self::from_prepared_tasks(prepared, None, options, Some(collective))
     }
 
-    fn from_prepared_tasks(
+    pub(super) fn from_prepared_tasks(
         prepared: PreparedProblem<T>,
         count: Option<usize>,
         options: CostHistoryOptions,
         collective: Option<CollectiveHandle<T>>,
-        local_rank: Option<usize>,
     ) -> Result<Self, String> {
-        if local_rank.is_none() && crate::mpi::World::get().is_some() {
-            return Err("partitioned storage does not yet support MPI transport".into());
-        }
+        debug_assert!(collective.is_some() || crate::mpi::World::get().is_none());
+        let local_rank = collective.as_ref().map(|c| c.rank());
+        let count = if let Some(c) = &collective {
+            if !prepared.cones.all_symmetric() {
+                return Err(
+                    "rank-local transport currently supports symmetric cones only (LP/SOCP/PSD)"
+                        .into(),
+                );
+            }
+            debug_assert!(c.size() > 0 && c.rank() < c.size());
+            Some(c.size())
+        } else {
+            count
+        };
         if prepared.settings.kkt_form == "augmented" {
             return Err("partitioned storage requires kkt_form auto or condensed".into());
         }
@@ -217,7 +200,11 @@ impl<T: FloatT> OwnedSolver<T> {
         // before allocating persistent local state and the one shared pool.
         drop(global_cones);
         let budget = crate::solver::core::worker_budget(settings.max_threads as usize);
-        let provider = super::costs::provider_tag();
+        let provider = if options.record || options.history.is_some() {
+            super::costs::provider_tag()
+        } else {
+            String::new()
+        };
         if let Some(history) = options.history.as_ref() {
             history.validate_runtime(
                 &settings.direct_solve_method,
@@ -229,28 +216,25 @@ impl<T: FloatT> OwnedSolver<T> {
             input_fingerprint: cost_input_fingerprint,
             thread_budget: budget,
             record: options.record,
-            direct_solve_method: settings.direct_solve_method.clone(),
-            kkt_form: settings.kkt_form.clone(),
+            direct_solve_method: if options.record {
+                settings.direct_solve_method.clone()
+            } else {
+                String::new()
+            },
+            kkt_form: if options.record {
+                settings.kkt_form.clone()
+            } else {
+                String::new()
+            },
             provider,
         };
         // Rank-local setup only materializes the owner selected by this rank.
         // The layout and shared metadata remain global, while the temporary
         // prepared input is consumed exactly once by the filtered splitter.
-        let state = match (count, local_rank) {
-            (Some(count), Some(rank)) => {
-                OwnedState::new_rank_local_with_history(data, count, rank, cost.clone(), options)?
-            }
-            (Some(count), None) => {
-                OwnedState::new_with_history(data, count, cost.clone(), options)?
-            }
-            (None, None) => OwnedState::new_auto_with_history(data, cost, options)?,
-            (None, Some(_)) => {
-                return Err("rank-local setup requires an explicit global owner count".into())
-            }
-        };
+        let state = OwnedState::new_with_history(data, count, local_rank, cost, options)?;
         let count = state.layout.owners.len();
         let all_owner_ids: Vec<usize> = (0..count).collect();
-        let full_layout = state.layout.clone();
+        let full_layout = Arc::new(state.layout);
         let border_b = state.border_b;
         let border_e = state.border_e;
         let border_einv = state.border_einv;
@@ -275,8 +259,8 @@ impl<T: FloatT> OwnedSolver<T> {
         } else {
             owner_ids.clone()
         };
-        let layout_value = if local_rank.is_some() {
-            OwnerLayout {
+        let layout = if local_rank.is_some() {
+            Arc::new(OwnerLayout {
                 owners: owner_ids
                     .iter()
                     .map(|&owner| full_layout.owners[owner].clone())
@@ -288,12 +272,11 @@ impl<T: FloatT> OwnedSolver<T> {
                 dominant_owner: full_layout
                     .dominant_owner
                     .and_then(|global| owner_ids.iter().position(|&id| id == global)),
-            }
+            })
         } else {
-            full_layout.clone()
+            Arc::clone(&full_layout)
         };
-        let global_layout = Arc::new(full_layout.clone());
-        let layout = Arc::new(layout_value);
+        let global_layout = full_layout;
         let collective: CollectiveHandle<T> =
             collective.unwrap_or_else(|| Arc::new(SerialCollective));
         let local_step_order: Vec<(usize, usize)> = if let Some(rank) = local_rank {
@@ -373,7 +356,10 @@ impl<T: FloatT> OwnedSolver<T> {
                 variables.tau = owner.variables.τ;
                 variables.kappa = owner.variables.κ;
                 for (j, &row) in layout.border_rows.iter().enumerate() {
-                    if let Ok(local) = full_layout.owners[global_owner].rows.binary_search(&row) {
+                    if let Ok(local) = data.global_layout.owners[global_owner]
+                        .rows
+                        .binary_search(&row)
+                    {
                         variables.border_z[j] = owner.variables.z[local];
                         variables.border_s[j] = owner.variables.s[local];
                     }

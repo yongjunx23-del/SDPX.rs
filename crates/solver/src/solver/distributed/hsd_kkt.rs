@@ -368,40 +368,31 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
             terms.b1 += data.border_b.dot(&self.varying.border_z);
             terms.b2 += data.border_b.dot(&self.constant.border_z);
         }
-        let terms = self
+        let mut values = [
+            terms.q1,
+            terms.b1,
+            terms.quad1,
+            terms.q2,
+            terms.b2,
+            terms.delta,
+            terms.quad2,
+        ];
+        if self
             .collective
-            .reduce_sum(
-                350,
-                &[
-                    terms.q1,
-                    terms.b1,
-                    terms.quad1,
-                    terms.q2,
-                    terms.b2,
-                    terms.delta,
-                    terms.quad2,
-                ],
-            )
-            .ok()
-            .filter(|values| values.len() == 7)
-            .map(|values| crate::solver::default::HsdTerms {
-                q1: values[0],
-                b1: values[1],
-                quad1: values[2],
-                q2: values[3],
-                b2: values[4],
-                delta: values[5],
-                quad2: values[6],
-            })
-            .unwrap_or(crate::solver::default::HsdTerms {
-                q1: T::nan(),
-                b1: T::nan(),
-                quad1: T::nan(),
-                q2: T::nan(),
-                b2: T::nan(),
-                delta: T::nan(),
-                quad2: T::nan(),
-            });
+            .reduce_sum_in_place(350, &mut values)
+            .is_err()
+        {
+            values.fill(T::nan());
+        }
+        let terms = crate::solver::default::HsdTerms {
+            q1: values[0],
+            b1: values[1],
+            quad1: values[2],
+            q2: values[3],
+            b2: values[4],
+            delta: values[5],
+            quad2: values[6],
+        };
         let dtau = hsd_tau(
             terms,
             rhs.tau,

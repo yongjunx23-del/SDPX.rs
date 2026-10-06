@@ -203,9 +203,27 @@ where
     let mut sampled = Vec::new();
     let mut grams = Vec::new();
     let mut rows = equalities;
+    // Parsing wide decimals dominates loading; parse a batch of block files
+    // in parallel, then append them in block order (identical result). The
+    // batch bounds how many parsed-but-unappended blocks are alive at once.
+    let batch = rayon::current_num_threads().max(1);
+    let mut parsed = Vec::new();
     for block_index in 0..control.num_blocks {
-        let info: BlockInfo = read(directory, &format!("block_info_{block_index}.json"))?;
-        let data: BlockData<T> = read(directory, &format!("block_data_{block_index}.json"))?;
+        if block_index % batch == 0 {
+            use rayon::prelude::*;
+            let end = (block_index + batch).min(control.num_blocks);
+            parsed = (block_index..end)
+                .into_par_iter()
+                .map(|i| -> Result<(BlockInfo, BlockData<T>), SolverError> {
+                    Ok((
+                        read(directory, &format!("block_info_{i}.json"))?,
+                        read(directory, &format!("block_data_{i}.json"))?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            parsed.reverse();
+        }
+        let (info, data) = parsed.pop().unwrap();
         let count = triangle(info.dim)?
             .checked_mul(info.num_points)
             .ok_or_else(|| bad("sampled column count overflow"))?;

@@ -270,6 +270,32 @@ fn _csc_quad_form<T: FloatT>(M: &CscMatrix<T>, uplo: MatrixTriangle, y: &[T], x:
 
 // sparse matrix-vector multiply, no transpose
 #[allow(non_snake_case)]
+/// Wide-precision output `y + a·Σ terms`: one exact accumulation of y and
+/// the products for a = ±1 (the -1 case negates the exact sum of -y and the
+/// products; round-to-nearest is symmetric), else y + a·dot. The pooled and
+/// rank-sharded sparse products use the same formula.
+pub(crate) fn wide_output<'a, T: FloatT + 'a>(
+    y: T,
+    terms: impl Iterator<Item = (&'a T, &'a T)>,
+    a: T,
+    one: T,
+) -> T {
+    fn with_head<'s, 'a: 's, T: FloatT + 'a>(
+        head: &'s T,
+        one: &'s T,
+        terms: impl Iterator<Item = (&'a T, &'a T)>,
+    ) -> T {
+        T::dot_fma(std::iter::once((head, one)).chain(terms.map(|(p, q)| (p as &'s T, q as &'s T))))
+    }
+    if a == one {
+        with_head(&y, &one, terms)
+    } else if a == -one {
+        -with_head(&-y, &one, terms)
+    } else {
+        y + a * T::dot_fma(terms)
+    }
+}
+
 fn _csc_axpby_N<T: FloatT>(A: &CscMatrix<T>, y: &mut [T], x: &[T], a: T, b: T) {
     //first do the b*y part
     if b.is_zero() {
@@ -308,24 +334,12 @@ fn _csc_axpby_N<T: FloatT>(A: &CscMatrix<T>, y: &mut [T], x: &[T], a: T, b: T) {
                 next[r] += 1;
             }
         }
-        let negated: Vec<T>;
-        let (xs, scale) = if a == T::one() {
-            (x, None)
-        } else if a == -T::one() {
-            negated = x.iter().map(|&v| -v).collect();
-            (negated.as_slice(), None)
-        } else {
-            (x, Some(a))
-        };
         let one = T::one();
         for (i, yi) in y.iter_mut().enumerate() {
             let terms = entries[ptr[i]..ptr[i + 1]]
                 .iter()
-                .map(|&(k, j)| (&A.nzval[k], &xs[j]));
-            *yi = match scale {
-                None => T::dot_fma(std::iter::once((&*yi, &one)).chain(terms)),
-                Some(a) => *yi + a * T::dot_fma(terms),
-            };
+                .map(|&(k, j)| (&A.nzval[k], &x[j]));
+            *yi = wide_output(*yi, terms, a, one);
         }
         return;
     }
@@ -377,32 +391,24 @@ fn _csc_axpby_T<T: FloatT>(A: &CscMatrix<T>, y: &mut [T], x: &[T], a: T, b: T) {
     // column's products, rounded once (a general scale rounds a·dot once
     // more). Short columns keep the FMA chain below.
     if T::precision_bits() > 64 {
-        let negated: Vec<T>;
-        let (xs, scale) = if a == T::one() {
-            (x, None)
-        } else if a == -T::one() {
-            negated = x.iter().map(|&v| -v).collect();
-            (negated.as_slice(), None)
-        } else {
-            (x, Some(a))
-        };
         let one = T::one();
         for (j, yj) in y.iter_mut().enumerate().take(A.n) {
             let (s, e) = (A.colptr[j], A.colptr[j + 1]);
             if e - s < 4 {
                 for k in s..e {
-                    *yj += match scale {
-                        None => A.nzval[k] * xs[A.rowval[k]],
-                        Some(a) => a * A.nzval[k] * x[A.rowval[k]],
-                    };
+                    let (v, xv) = (A.nzval[k], x[A.rowval[k]]);
+                    if a == one {
+                        *yj += v * xv;
+                    } else if a == -one {
+                        *yj -= v * xv;
+                    } else {
+                        *yj += a * v * xv;
+                    }
                 }
                 continue;
             }
-            let terms = (s..e).map(|k| (&A.nzval[k], &xs[A.rowval[k]]));
-            *yj = match scale {
-                None => T::dot_fma(std::iter::once((&*yj, &one)).chain(terms)),
-                Some(a) => *yj + a * T::dot_fma(terms),
-            };
+            let terms = (s..e).map(|k| (&A.nzval[k], &x[A.rowval[k]]));
+            *yj = wide_output(*yj, terms, a, one);
         }
         return;
     }

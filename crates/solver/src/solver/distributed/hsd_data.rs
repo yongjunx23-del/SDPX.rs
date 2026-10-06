@@ -162,14 +162,19 @@ impl<T: FloatT> OwnedResiduals<T> {
         }
 
         let p = summary.products;
+        let mut products = [p.qx, p.bz, p.sz, p.xpx];
         let products_finite = self
             .collective
-            .all_true(453, [p.qx, p.bz, p.sz, p.xpx].is_finite())
+            .all_true(453, products.is_finite())
             .unwrap_or(false);
-        let products = self
+        if self
             .collective
-            .reduce_sum(450, &[p.qx, p.bz, p.sz, p.xpx])
-            .ok();
+            .reduce_sum_in_place(450, &mut products)
+            .is_err()
+            || !products_finite
+        {
+            products.fill(T::nan());
+        }
         let (local_scales, local_sumsq) = summary.norm_parts();
         let norms_finite = self
             .collective
@@ -186,23 +191,20 @@ impl<T: FloatT> OwnedResiduals<T> {
             .ok()
             .and_then(|values| values.try_into().ok())
             .unwrap_or([T::infinity(); 8]);
-        let mut normalized = [T::zero(); 8];
+        let mut sumsq = [T::zero(); 8];
         for i in 0..8 {
-            if scales[i].is_zero() {
-                normalized[i] = T::zero();
-            } else if norms_finite && scales[i].is_finite() {
+            if !scales[i].is_zero() && norms_finite && scales[i].is_finite() {
                 let ratio = local_scales[i] / scales[i];
-                normalized[i] = local_sumsq[i] * ratio * ratio;
-            } else {
-                normalized[i] = T::zero();
+                sumsq[i] = local_sumsq[i] * ratio * ratio;
             }
         }
-        let sumsq = self
+        if self
             .collective
-            .reduce_sum(455, &normalized)
-            .ok()
-            .and_then(|values| values.try_into().ok())
-            .unwrap_or([T::infinity(); 8]);
+            .reduce_sum_in_place(455, &mut sumsq)
+            .is_err()
+        {
+            sumsq.fill(T::infinity());
+        }
         let norms = if norms_finite {
             std::array::from_fn(|i| scales[i] * sumsq[i].sqrt())
         } else {
@@ -223,15 +225,12 @@ impl<T: FloatT> OwnedResiduals<T> {
         } else {
             None
         };
-        let values = products
-            .filter(|values| values.len() == 4)
-            .unwrap_or_else(|| vec![T::nan(); 4]);
         summary.replace_global(
             ResidualProducts {
-                qx: products_finite.then_some(values[0]).unwrap_or(T::nan()),
-                bz: products_finite.then_some(values[1]).unwrap_or(T::nan()),
-                sz: products_finite.then_some(values[2]).unwrap_or(T::nan()),
-                xpx: products_finite.then_some(values[3]).unwrap_or(T::nan()),
+                qx: products[0],
+                bz: products[1],
+                sz: products[2],
+                xpx: products[3],
             },
             norms,
             dual_componentwise,
@@ -426,7 +425,9 @@ impl<T: FloatT> Info<T> for OwnedInfo<T> {
         prev_variables: &OwnedVariables<T>,
     ) {
         let mut empty = DefaultVariables::<T>::new(0, 0);
-        let previous_empty = DefaultVariables::<T>::new(0, 0);
+        let mut previous_empty = DefaultVariables::<T>::new(0, 0);
+        previous_empty.τ = prev_variables.tau;
+        previous_empty.κ = prev_variables.kappa;
         self.0.reset_to_prev_iterate(&mut empty, &previous_empty);
         for (current, previous) in variables.blocks.iter_mut().zip(&prev_variables.blocks) {
             current.copy_from(previous);

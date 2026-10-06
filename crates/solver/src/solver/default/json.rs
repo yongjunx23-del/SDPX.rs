@@ -57,7 +57,11 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
         self,
         partitions: usize,
     ) -> Result<PartitionedSolver<T>, SolverError> {
-        PartitionedSolver::from_prepared(self.into_prepared()?, partitions)
+        PartitionedSolver::from_prepared(
+            self.into_prepared()?,
+            Some(partitions),
+            CostHistoryOptions::default(),
+        )
     }
 
     /// Import optional historical owner costs while constructing an explicit
@@ -73,9 +77,9 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
         // solve; only importing history or recording a training run needs the
         // identity payload.
         let with_identity = options.history.is_some() || options.record;
-        PartitionedSolver::from_prepared_with_cost_history(
+        PartitionedSolver::from_prepared(
             self.into_prepared_with_identity(with_identity)?,
-            partitions,
+            Some(partitions),
             options,
         )
     }
@@ -84,7 +88,7 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
     /// replicated equality storage. In MPI this selects one global owner per
     /// rank and the returned solver reports the global owner count.
     pub fn into_auto_partitioned_solver(self) -> Result<PartitionedSolver<T>, SolverError> {
-        PartitionedSolver::from_prepared_auto(self.into_prepared()?)
+        PartitionedSolver::from_prepared(self.into_prepared()?, None, CostHistoryOptions::default())
     }
 
     /// Choose bounded structural tasks, optionally using validated historical
@@ -95,8 +99,9 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
         options: CostHistoryOptions,
     ) -> Result<PartitionedSolver<T>, SolverError> {
         let with_identity = options.history.is_some() || options.record;
-        PartitionedSolver::from_prepared_auto_with_cost_history(
+        PartitionedSolver::from_prepared(
             self.into_prepared_with_identity(with_identity)?,
+            None,
             options,
         )
     }
@@ -109,44 +114,18 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
         self,
         with_cost_identity: bool,
     ) -> Result<super::PreparedProblem<T>, SolverError> {
-        let mut rows = 0usize;
-        for cone in &self.cones {
-            let invalid = || SolverError::BadInputData("invalid cone dimensions or parameters");
-            let size = match cone {
-                SupportedConeT::ZeroConeT(n)
-                | SupportedConeT::NonnegativeConeT(n)
-                | SupportedConeT::SecondOrderConeT(n) => *n,
-                SupportedConeT::ExponentialConeT() => 3,
-                SupportedConeT::PowerConeT(alpha) => {
-                    if !alpha.is_finite() || *alpha <= T::zero() || *alpha >= T::one() {
-                        return Err(invalid());
-                    }
-                    3
-                }
-                SupportedConeT::GenPowerConeT(alpha, dim2) => {
-                    // Match the constructor's conditions without letting bad
-                    // external data trigger its assertions.
-                    if !alpha.iter().all(|a| a.is_finite() && *a > T::zero())
-                        || (T::one() - alpha.as_slice().sum()).abs()
-                            >= T::epsilon() * alpha.len().as_T() * (0.5).as_T()
-                    {
-                        return Err(invalid());
-                    }
-                    alpha.len().checked_add(*dim2).ok_or_else(invalid)?
-                }
-                SupportedConeT::PSDTriangleConeT(n) => n
-                    .checked_add(1)
-                    .and_then(|next| n.checked_mul(next))
-                    .map(|twice| twice / 2)
-                    .ok_or_else(invalid)?,
-            };
-            rows = rows.checked_add(size).ok_or_else(invalid)?;
-        }
-        if rows != self.b.len() {
-            return Err(SolverError::BadInputData("cone dimensions do not match b"));
-        }
+        let input_fingerprint = with_cost_identity.then(|| {
+            crate::solver::distributed::input_fingerprint(
+                &self.P,
+                &self.q,
+                &self.A,
+                &self.b,
+                &self.cones,
+                (!self.sampled.is_empty()).then_some(self.sampled.as_slice()),
+            )
+        });
         if !self.sampled.is_empty() {
-            return super::PreparedProblem::new_sampled_cow_with_identity(
+            return super::PreparedProblem::new_sampled_cow(
                 std::borrow::Cow::Owned(self.P),
                 std::borrow::Cow::Owned(self.q),
                 std::borrow::Cow::Owned(self.A),
@@ -154,17 +133,17 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
                 &self.cones,
                 self.sampled,
                 self.settings,
-                with_cost_identity,
+                input_fingerprint,
             );
         }
-        super::PreparedProblem::new_with_cost_identity_impl(
+        super::PreparedProblem::new_cow(
             std::borrow::Cow::Owned(self.P),
             std::borrow::Cow::Owned(self.q),
             std::borrow::Cow::Owned(self.A),
             std::borrow::Cow::Owned(self.b),
             &self.cones,
             self.settings,
-            with_cost_identity,
+            input_fingerprint,
         )
     }
 }
