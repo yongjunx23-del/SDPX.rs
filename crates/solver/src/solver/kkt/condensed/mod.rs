@@ -707,6 +707,9 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     workh: Vec<T>,
     // The last aligned MPI residual left only this rank's rows of workh.
     workh_partial: bool,
+    // Whether every row of the sampled linear part lies in a zero block
+    // (cached; required by the aligned exchange).
+    linear_rows_zero_scaled: Option<bool>,
     retained_rhs: Vec<T>,
     local_only: bool,
     pool: Option<Arc<rayon::ThreadPool>>,
@@ -1161,6 +1164,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             workz: vec![T::zero(); m],
             workh: vec![T::zero(); m],
             workh_partial: false,
+            linear_rows_zero_scaled: None,
             retained_rhs: vec![T::zero(); nr],
             pool,
             parallel_assembly,
@@ -1455,14 +1459,28 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     fn align_sampled_parts(&mut self) -> Option<crate::mpi::World> {
         let world = self.mpi_world()?;
         let (operator, work) = self.sampled.as_ref()?;
-        // Partial rows require the sharded adjoint. Ordinary cone rows need
-        // the full scaling exchange before its column-sharded linear product.
-        if !work.parallel_eligible(operator, self.pool.as_ref())
-            || self.blocks.iter().any(|b| match &b.scaling {
-                Scaling::Zero => false,
-                Scaling::Psd(p) => p.sampled.is_none(),
-                _ => true,
-            })
+        // Partial rows require the sharded adjoint. The aligned prepare zeroes
+        // other ranks' rows before the column-sharded linear adjoint, which
+        // reads every row holding a linear entry: such rows must scale to
+        // zero anyway (zero blocks). Ordinary cones without linear entries
+        // (scaled and exchanged by their owner) keep the aligned path.
+        if !work.parallel_eligible(operator, self.pool.as_ref()) {
+            return None;
+        }
+        let zero_scaled = *self.linear_rows_zero_scaled.get_or_insert_with(|| {
+            let mut zero = vec![false; operator.linear().m];
+            for block in &self.blocks {
+                if matches!(block.scaling, Scaling::Zero) {
+                    zero[block.rows.clone()].fill(true);
+                }
+            }
+            operator.linear().rowval.iter().all(|&r| zero[r])
+        });
+        if !zero_scaled
+            || self
+                .blocks
+                .iter()
+                .any(|b| matches!(&b.scaling, Scaling::Psd(p) if p.sampled.is_none()))
         {
             return None;
         }

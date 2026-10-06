@@ -447,9 +447,15 @@ mod mpi_tests {
         type T = sdpx_arithmetic::Bits256;
         let mpi = crate::MpiContext::initialize();
         assert_eq!(mpi.size(), 2);
-        // Serial fallback, aligned pooled blocks, and mixed ordinary rows.
-        // All have an empty arrow border, which must remain valid under MPI.
-        for (h, threads, orthant) in [(2, 1, false), (16, 2, false), (16, 2, true)] {
+        // Serial fallback, aligned pooled blocks, mixed ordinary rows with
+        // linear entries (full exchange) and without (aligned). All have an
+        // empty arrow border, which must remain valid under MPI.
+        for (h, threads, orthant, coupled) in [
+            (2, 1, false, false),
+            (16, 2, false, false),
+            (16, 2, true, true),
+            (16, 2, true, false),
+        ] {
             let offset = usize::from(orthant);
             let rows = triangular_number(h);
             let (m, n) = (offset + 2 * rows, 2 * h);
@@ -458,7 +464,7 @@ mod mpi_tests {
                 kinds.push(SupportedConeT::NonnegativeConeT(1));
             }
             kinds.extend(vec![SupportedConeT::PSDTriangleConeT(h); 2]);
-            let linear = if orthant {
+            let linear = if coupled {
                 CscMatrix::new(m, n, (0..=n).collect(), vec![0; n], vec![T::one(); n])
             } else {
                 CscMatrix::zeros((m, n))
