@@ -707,9 +707,9 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     workh: Vec<T>,
     // The last aligned MPI residual left only this rank's rows of workh.
     workh_partial: bool,
-    // Whether every row of the sampled linear part lies in a zero block
-    // (cached; required by the aligned exchange).
-    linear_rows_zero_scaled: Option<bool>,
+    // Rows holding sampled linear entries outside zero blocks (cached):
+    // the aligned prepare republishes their scaled values.
+    linear_scaled_rows: Option<Vec<usize>>,
     retained_rhs: Vec<T>,
     local_only: bool,
     pool: Option<Arc<rayon::ThreadPool>>,
@@ -1164,7 +1164,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             workz: vec![T::zero(); m],
             workh: vec![T::zero(); m],
             workh_partial: false,
-            linear_rows_zero_scaled: None,
+            linear_scaled_rows: None,
             retained_rhs: vec![T::zero(); nr],
             pool,
             parallel_assembly,
@@ -1459,24 +1459,27 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     fn align_sampled_parts(&mut self) -> Option<crate::mpi::World> {
         let world = self.mpi_world()?;
         let (operator, work) = self.sampled.as_ref()?;
-        // Partial rows require the sharded adjoint. The aligned prepare zeroes
-        // other ranks' rows before the column-sharded linear adjoint, which
-        // reads every row holding a linear entry: such rows must scale to
-        // zero anyway (zero blocks). Ordinary cones without linear entries
-        // (scaled and exchanged by their owner) keep the aligned path.
+        // Partial rows require the sharded adjoint. The aligned prepare keeps
+        // scaled rows on their owner, but the column-sharded linear adjoint
+        // reads every row holding a linear entry: rows outside zero blocks
+        // (whose scaled value is nonzero) are republished by their owners.
         if !work.parallel_eligible(operator, self.pool.as_ref()) {
             return None;
         }
-        let zero_scaled = *self.linear_rows_zero_scaled.get_or_insert_with(|| {
-            let mut zero = vec![false; operator.linear().m];
+        let scaled_rows = self.linear_scaled_rows.get_or_insert_with(|| {
+            let a = operator.linear();
+            let mut touched = vec![false; a.m];
+            for &r in &a.rowval {
+                touched[r] = true;
+            }
             for block in &self.blocks {
                 if matches!(block.scaling, Scaling::Zero) {
-                    zero[block.rows.clone()].fill(true);
+                    touched[block.rows.clone()].fill(false);
                 }
             }
-            operator.linear().rowval.iter().all(|&r| zero[r])
+            (0..a.m).filter(|&r| touched[r]).collect()
         });
-        if !zero_scaled
+        if scaled_rows.len() * 8 > operator.linear().m
             || self
                 .blocks
                 .iter()
@@ -1618,6 +1621,33 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         );
     }
 
+    /// After an aligned prepare, give every rank the scaled values of the
+    /// linear-touched rows outside zero blocks (owners hold them).
+    fn republish_linear_rows(&mut self, world: crate::mpi::World) {
+        let rows = self.linear_scaled_rows.as_deref().unwrap_or(&[]);
+        if rows.is_empty() {
+            return;
+        }
+        let (_, spans) = rank_rows(&self.blocks, world);
+        let mut ranges = Vec::with_capacity(spans.len());
+        let mut k = 0;
+        for &(start, len) in &spans {
+            let first = k;
+            while k < rows.len() && rows[k] >= start && rows[k] < start + len {
+                k += 1;
+            }
+            ranges.push((first, k - first));
+        }
+        debug_assert_eq!(k, rows.len());
+        let (k0, kl) = ranges[world.rank()];
+        let local: Vec<T> = rows[k0..k0 + kl].iter().map(|&r| self.workz[r]).collect();
+        let mut all = vec![T::zero(); rows.len()];
+        world.gather_slice(crate::mpi::SITE_SCALING, &local, &ranges, &mut all);
+        for (&r, v) in rows.iter().zip(all) {
+            self.workz[r] = v;
+        }
+    }
+
     /// `H·z` of the last residual on every rank (gathered once if the
     /// aligned residual left it rank-partial).
     pub(crate) fn scaled_product(&mut self) -> &[T] {
@@ -1657,6 +1687,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             );
             self.workz.fill(T::zero());
             self.workz[y0..y1].copy_from_slice(&local);
+            self.republish_linear_rows(world);
         } else {
             apply_block_pool_with_world(
                 self.mpi_world(),
