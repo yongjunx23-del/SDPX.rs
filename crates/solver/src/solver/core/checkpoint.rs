@@ -144,16 +144,18 @@ pub(crate) fn read<T: FloatT>(
     if bytes.len() != HEADER + count * size {
         return Err(bad("checkpoint has the wrong length"));
     }
-    let mut values = bytes[HEADER..]
-        .chunks_exact(size)
-        .map(|chunk| T::read_wire(chunk).ok_or_else(|| bad("corrupt checkpoint scalar")));
+    let mut values = bytes[HEADER..].chunks_exact(size).map(|chunk| {
+        T::read_wire(chunk)
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| bad("corrupt or nonfinite checkpoint scalar"))
+    });
     let mut take = |len: usize| {
         (0..len)
             .map(|_| values.next().unwrap())
             .collect::<io::Result<Vec<T>>>()
     };
     let head = take(3)?;
-    Ok(Loaded {
+    let loaded = Loaded {
         values: u64_at(24),
         tau: head[0],
         kappa: head[1],
@@ -163,5 +165,16 @@ pub(crate) fn read<T: FloatT>(
         z: take(m)?,
         d: take(n)?,
         e: take(m)?,
-    })
+    };
+    if [loaded.tau, loaded.kappa, loaded.c]
+        .iter()
+        .chain(&loaded.d)
+        .chain(&loaded.e)
+        .any(|v| *v <= T::zero())
+    {
+        return Err(bad(
+            "checkpoint homogenization and scaling must be positive",
+        ));
+    }
+    Ok(loaded)
 }

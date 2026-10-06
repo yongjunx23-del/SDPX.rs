@@ -3,6 +3,30 @@
 use sdpx_solver::{algebra::*, solver::*};
 
 #[test]
+fn malformed_cones_return_input_errors() {
+    for (cones, m) in [
+        (vec![GenPowerConeT(vec![], 1)], 1),
+        (vec![GenPowerConeT(vec![0.5, 0.5 + f64::EPSILON], 1)], 3),
+        (vec![GenPowerConeT(vec![f64::NAN, 0.5], 1)], 3),
+        (vec![PowerConeT(0.0)], 3),
+        (vec![PowerConeT(f64::NAN)], 3),
+        (vec![GenPowerConeT(vec![1.0], usize::MAX)], 0),
+        (vec![PSDTriangleConeT(usize::MAX)], 0),
+        (vec![ZeroConeT(usize::MAX), NonnegativeConeT(1)], 0),
+    ] {
+        let result = DefaultSolver::new(
+            &CscMatrix::identity(1),
+            &[0.0],
+            &CscMatrix::zeros((m, 1)),
+            &vec![0.0; m],
+            &cones,
+            DefaultSettings::default(),
+        );
+        assert!(matches!(result, Err(SolverError::BadInputData(_))));
+    }
+}
+
+#[test]
 fn test_powcone() {
     // solve the following power cone problem
     // max  x1^0.6 y^0.4 + x2^0.1

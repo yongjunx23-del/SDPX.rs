@@ -93,3 +93,41 @@ fn restart_rejects_different_structure() {
     std::fs::write(&file, b"junk").unwrap();
     assert!(solver.check_restart().is_err());
 }
+
+#[test]
+fn restart_rejects_invalid_iterate_and_scaling_before_assignment() {
+    use sdpx_solver::solver::traits::Variables;
+
+    let (p, q, a, b, cones) = lp();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("iterate.ckpt");
+    checkpointed(&q, &file, 1, 4);
+    let original = std::fs::read(&file).unwrap();
+    let mut solver =
+        DefaultSolver::new(&p, &q, &a, &b, &cones, DefaultSettings::default()).unwrap();
+    solver.variables.x.fill(2.);
+    solver.variables.s.fill(3.);
+    solver.variables.z.fill(4.);
+    let (n, m) = (solver.variables.x.len(), solver.variables.s.len());
+    // Float64 checkpoint: 52-byte header, then tau/kappa/c, x/s/z, d/e.
+    for index in 0..3 + 2 * n + 3 * m {
+        for invalid in [f64::NAN, f64::INFINITY, 0., -1.] {
+            if invalid.is_finite() && index >= 3 && index < 3 + n + 2 * m {
+                continue; // Iterate coordinates may have either sign or be zero.
+            }
+            let mut bytes = original.clone();
+            let at = 52 + 8 * index;
+            bytes[at..at + 8].copy_from_slice(&invalid.to_le_bytes());
+            std::fs::write(&file, bytes).unwrap();
+            let error = solver
+                .variables
+                .read_checkpoint(&solver.data, &file)
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(solver.variables.x, vec![2.; n]);
+            assert_eq!(solver.variables.s, vec![3.; m]);
+            assert_eq!(solver.variables.z, vec![4.; m]);
+            assert_eq!((solver.variables.τ, solver.variables.κ), (1., 1.));
+        }
+    }
+}

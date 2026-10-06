@@ -1480,7 +1480,10 @@ pub(super) fn gemm<const N: usize>(
         return false;
     };
     let (len_a, len_b) = (av.len(), bv.len());
-    let outputs = m * n;
+    let selected = selection(m, n, upper_only);
+    let outputs = if upper_only { selected.len() } else { m * n };
+    let packed: Vec<usize> = if upper_only { (0..outputs).collect() } else { Vec::new() };
+    let residue_indices = if upper_only { &packed } else { &selected };
     let shape = GemmShape {
         ta,
         tb,
@@ -1505,11 +1508,10 @@ pub(super) fn gemm<const N: usize>(
     } else {
         STREAM_GROUP
     };
-    let selected = selection(m, n, upper_only);
-    let acc = stream_primes(
+    let mut acc = stream_primes(
         &plan,
         &split,
-        &selected,
+        residue_indices,
         group_cap,
         |acc, q0, q1, s| {
             ca.residues(&plan, q0, q1, &mut s.a);
@@ -1531,11 +1533,15 @@ pub(super) fn gemm<const N: usize>(
                     },
                     &mut s.prod[qi * outputs..(qi + 1) * outputs],
                     &mut s.t,
+                    upper_only,
                 );
             }
             acc.add(&plan, q0, q1, &mut s.prod, outputs);
         },
     );
+    if upper_only {
+        acc.selected = &selected;
+    }
     acc.finish(&plan, lo_a + lo_b, out, &split)
 }
 
@@ -1745,12 +1751,48 @@ impl GemmShape {
         bq: &[f64],
         cq: &mut [f64],
         part: &mut Vec<f64>,
+        upper_only: bool,
     ) {
         let (ta_n, tb_n) = (
             self.ta.to_ascii_uppercase() == b'N',
             self.tb.to_ascii_uppercase() == b'N',
         );
         let (m, n, k, outputs) = (self.m, self.n, self.k, self.m * self.n);
+        if upper_only {
+            // Rectangle tiles cover the requested triangle; only selected
+            // residues survive into CRT, in column-major packed order.
+            const TILE: usize = 32;
+            part.clear();
+            part.resize(m * TILE.min(n), 0.0);
+            for j0 in (0..n).step_by(TILE) {
+                let cols = TILE.min(n - j0);
+                let height = m.min(j0 + cols);
+                for k0 in (0..k).step_by(plan.k_chunk) {
+                    let kc = plan.k_chunk.min(k - k0);
+                    let a_off = if ta_n { k0 * self.lda } else { k0 };
+                    let b_off = if tb_n { k0 + j0 * self.ldb } else { j0 + k0 * self.ldb };
+                    int_gemm(self.ta, self.tb, height, cols, kc,
+                        &aq[a_off..], self.lda, &bq[b_off..], self.ldb,
+                        &mut part[..height * cols], height);
+                    for j in 0..cols {
+                        let column = j0 + j;
+                        let offset = if column < m {
+                            column * (column + 1) / 2
+                        } else {
+                            m * (m + 1) / 2 + (column - m) * m
+                        };
+                        for i in 0..m.min(column + 1) {
+                            let value = reduce(part[i + j * height], plan.p[q], plan.pinv[q]);
+                            let dest = &mut cq[offset + i];
+                            *dest = if k0 == 0 { value } else {
+                                reduce(*dest + value, plan.p[q], plan.pinv[q])
+                            };
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let mut k0 = 0;
         while k0 < k {
             let kc = plan.k_chunk.min(k - k0);

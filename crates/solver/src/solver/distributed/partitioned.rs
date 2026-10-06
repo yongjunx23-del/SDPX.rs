@@ -25,91 +25,31 @@ pub struct PartitionedSolver<T: FloatT> {
 }
 
 impl<T: FloatT> PartitionedSolver<T> {
-    /// Choose bounded structural tasks independently of the worker count.
-    pub(crate) fn from_prepared_auto(prepared: PreparedProblem<T>) -> Result<Self, SolverError> {
-        if let Some(world) = crate::mpi::World::get() {
-            let collective = Arc::new(WorldCollective(world));
-            return OwnedSolver::from_prepared_rank_local(prepared, collective)
-                .map(|inner| Self { inner })
-                .map_err(SolverError::SampledInput);
-        }
-        OwnedSolver::from_prepared_auto(prepared)
-            .map(|inner| Self { inner })
-            .map_err(SolverError::SampledInput)
-    }
-
-    #[cfg(feature = "serde")]
-    pub(crate) fn from_prepared_auto_with_cost_history(
-        prepared: PreparedProblem<T>,
-        options: CostHistoryOptions,
-    ) -> Result<Self, SolverError> {
-        if let Some(world) = crate::mpi::World::get() {
-            let collective = Arc::new(WorldCollective(world));
-            return OwnedSolver::from_prepared_rank_local_with_cost_history(
-                prepared, collective, options,
-            )
-            .map(|inner| Self { inner })
-            .map_err(SolverError::SampledInput);
-        }
-        OwnedSolver::from_prepared_auto_with_cost_history(prepared, options)
-            .map(|inner| Self { inner })
-            .map_err(SolverError::SampledInput)
-    }
-
     /// Build a partitioned solver from shared, prepared problem data.
     ///
     /// Preparation performs validation, preprocessing and equilibration once;
     /// owner conversion then allocates only the local HSD state.
     pub(crate) fn from_prepared(
         prepared: PreparedProblem<T>,
-        partitions: usize,
-    ) -> Result<Self, SolverError> {
-        if partitions == 0 {
-            return Err(SolverError::BadInputData(
-                "partition count must be positive",
-            ));
-        }
-        if let Some(world) = crate::mpi::World::get() {
-            if partitions != world.size() {
-                return Err(SolverError::BadInputData(
-                    "MPI partition count must equal the world size",
-                ));
-            }
-            let collective = Arc::new(WorldCollective(world));
-            return OwnedSolver::from_prepared_rank_local(prepared, collective)
-                .map(|inner| Self { inner })
-                .map_err(SolverError::SampledInput);
-        }
-        OwnedSolver::from_prepared(prepared, partitions)
-            .map(|inner| Self { inner })
-            .map_err(SolverError::SampledInput)
-    }
-
-    #[cfg(feature = "serde")]
-    pub(crate) fn from_prepared_with_cost_history(
-        prepared: PreparedProblem<T>,
-        partitions: usize,
+        partitions: Option<usize>,
         options: CostHistoryOptions,
     ) -> Result<Self, SolverError> {
-        if partitions == 0 {
+        if partitions == Some(0) {
             return Err(SolverError::BadInputData(
                 "partition count must be positive",
             ));
         }
-        if let Some(world) = crate::mpi::World::get() {
-            if partitions != world.size() {
+        let collective = if let Some(world) = crate::mpi::World::get() {
+            if partitions.is_some_and(|count| count != world.size()) {
                 return Err(SolverError::BadInputData(
                     "MPI partition count must equal the world size",
                 ));
             }
-            let collective = Arc::new(WorldCollective(world));
-            return OwnedSolver::from_prepared_rank_local_with_cost_history(
-                prepared, collective, options,
-            )
-            .map(|inner| Self { inner })
-            .map_err(SolverError::SampledInput);
-        }
-        OwnedSolver::from_prepared_with_cost_history(prepared, partitions, options)
+            Some(Arc::new(WorldCollective(world)) as super::hsd::CollectiveHandle<T>)
+        } else {
+            None
+        };
+        OwnedSolver::from_prepared_tasks(prepared, partitions, options, collective)
             .map(|inner| Self { inner })
             .map_err(SolverError::SampledInput)
     }

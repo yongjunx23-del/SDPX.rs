@@ -418,6 +418,89 @@ fn lifecycle_and_update() {
         assert_eq!(sdpx_destroy(h), 0);
     }
 }
+
+#[test]
+fn generalized_power_preparation_uses_constructor_conditions() {
+    unsafe {
+        let p = Csc {
+            rows: 1,
+            cols: 1,
+            nnz: 0,
+            colptr: [0, 0].as_ptr(),
+            rowval: ptr::null(),
+            values: arr(&[]),
+        };
+        let mut a = Csc {
+            rows: 3,
+            cols: 1,
+            nnz: 0,
+            colptr: [0, 0].as_ptr(),
+            rowval: ptr::null(),
+            values: arr(&[]),
+        };
+        let invalid_alpha = [0.5, 0.5 + f64::EPSILON];
+        let mut cone = Cone {
+            kind: 6,
+            reserved: 0,
+            dim: 1,
+            alpha: arr(&invalid_alpha),
+        };
+        let error = Typed::<f64>::prepare(
+            &p,
+            &arr(&[0.0]),
+            &a,
+            &arr(&[0.0; 3]),
+            std::slice::from_ref(&cone),
+            &defaults(),
+            None,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.0, 1);
+        // A single alpha of one is accepted by the generalized constructor.
+        a.rows = 2;
+        cone.alpha = arr(&[1.0]);
+        assert!(Typed::<f64>::prepare(
+            &p,
+            &arr(&[0.0]),
+            &a,
+            &arr(&[0.0; 2]),
+            std::slice::from_ref(&cone),
+            &defaults(),
+            None,
+        )
+        .is_ok());
+    }
+}
+
+#[test]
+fn rejected_structural_update_keeps_result_readable() {
+    let solver = DefaultSolver::new(
+        &CscMatrix::identity(1),
+        &[0.0],
+        &CscMatrix::identity(1),
+        &[1e30],
+        &[SupportedConeT::NonnegativeConeT(1)],
+        DefaultSettings {
+            verbose: false,
+            ..DefaultSettings::default()
+        },
+    )
+    .unwrap();
+    assert!(!solver.is_data_update_allowed());
+    let mut typed = Typed {
+        solver,
+        bits: 53,
+        solved: false,
+    };
+    typed.solve().unwrap();
+    let before = typed.result().unwrap();
+    let status = typed.info().status;
+    assert!(unsafe { typed.update(&arr(&[0.0]), &arr(&[1.0])) }.is_err());
+    assert_eq!(typed.info().status, status);
+    assert_eq!(typed.result().unwrap(), before);
+}
+
 #[test]
 fn panic_poisons_and_busy_rejects() {
     unsafe {

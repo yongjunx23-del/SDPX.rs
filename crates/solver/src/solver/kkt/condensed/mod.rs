@@ -723,13 +723,6 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     sampled: Option<(Arc<SampledOperator<T>>, SampledWorkspace<T>)>,
     sparse_products: Option<crate::algebra::sparse_parallel::SparseParallel>,
     counters: crate::solver::kkt::SolveCounters,
-    /// Improvement ratio of the last outer correction with the current
-    /// factorization; refinement's contraction is a property of the
-    /// factorization, so every right-hand side it serves behaves alike.
-    correction_ratio: Option<T>,
-    /// Relative residual a stalled correction last reached (not reset on
-    /// refactor: the floor tracks the problem's conditioning).
-    stall_floor: Option<T>,
 }
 
 fn local_world(local_only: bool) -> Option<crate::mpi::World> {
@@ -1182,8 +1175,6 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 && crate::algebra::sparse_parallel::worthwhile(A))
             .then(|| crate::algebra::sparse_parallel::SparseParallel::new(A)),
             counters: Default::default(),
-            correction_ratio: None,
-            stall_floor: None,
         };
         if let Some(plan) = &mut solver.sparse_products {
             plan.configure(A, solver.pool.clone());
@@ -1463,7 +1454,18 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     /// world when the partitions align (sampled blocks contiguous per rank).
     fn align_sampled_parts(&mut self) -> Option<crate::mpi::World> {
         let world = self.mpi_world()?;
-        let (operator, _) = self.sampled.as_ref()?;
+        let (operator, work) = self.sampled.as_ref()?;
+        // Partial rows require the sharded adjoint. Ordinary cone rows need
+        // the full scaling exchange before its column-sharded linear product.
+        if !work.parallel_eligible(operator, self.pool.as_ref())
+            || self.blocks.iter().any(|b| match &b.scaling {
+                Scaling::Zero => false,
+                Scaling::Psd(p) => p.sampled.is_none(),
+                _ => true,
+            })
+        {
+            return None;
+        }
         let nsampled = operator.blocks().len();
         let mut parts = Vec::with_capacity(world.size());
         let mut next = 0usize;

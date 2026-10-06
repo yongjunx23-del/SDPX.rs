@@ -572,6 +572,13 @@ where
 
         timeit! {"post-process"; {
             self.info.set_linear_solver_info(self.kktsystem.linear_solver_info());
+            if self.info.get_status() == SolverStatus::InsufficientProgress {
+                // Rollback restored the iterate; recompute its residuals and
+                // infeasibility products before the reduced convergence test.
+                self.residuals.update_with_pool(&self.variables, &self.data, self.cones.worker_pool());
+                self.info.update_with_pool(&mut self.data, &self.variables, &self.residuals,
+                    &timers, self.cones.worker_pool());
+            }
             //check for "almost" convergence case and then extract solution
             self.info.post_process(&self.residuals, &self.settings);
             self.solution

@@ -8,6 +8,159 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-06 — consolidate owner setup and reuse reduction outputs
+
+**Change.** Explicit, automatic and MPI partition setup share one constructor
+route and one layout builder. MPI derives the local owner from its transport.
+Optional input fingerprints are computed once at the JSON boundary; ordinary
+solves avoid unused history strings. Serial owner layouts share immutable
+storage. Scalar/statistic/border reductions use existing buffers, and MPI
+sums fold directly into their destination in the original rank order.
+Public cost-history APIs and settings formats remain supported; the redundant
+internal `direct_kkt_solver` assertion is removed. Net reduction: 150 physical
+Rust lines across eleven files, against the pre-cleanup source snapshot.
+
+**Evidence.** Mac M4, fast arm `architecture-cleanup-20261006-fast`, MPFR256,
+one thread, a two-variable equality/orthant QP: explicit history training,
+automatic history reuse and ordinary explicit partitions are `Solved`/19.
+Actual two-rank OpenMPI training and reuse are also `Solved`/19. Every full
+x/s/z point and reported numerical result matches the corresponding frozen
+baseline; the original-coordinate 1e-30 audit passes (raw primal max
+3.66e-38, dual max 1.10e-37, gap 2.51e-38, cone violations zero). History
+identity/runtime metadata is unchanged; measured costs naturally vary.
+`direct_kkt_solver=false` is rejected at the settings boundary without a
+panic. No suites or formal timings were needed for this refactor.
+
+**Decision/provenance.** Keep for smaller setup code and fewer copies and
+allocations, with no measured speed claim. Evidence and pre-cleanup files:
+`$SDPX_E2E_HOME/work/architecture-cleanup-20261006/`, including `audit.json`,
+input, outputs, histories and logs. Baseline arm
+`exact-arrow-packed-pool-20261006-fast` contains the later-rejected SVD tiles;
+this fixture never calls SVD. Forcing local OpenMPI to `self,tcp` hung both
+baseline ranks in `MPI_Comm_dup` before solver setup; default transport
+passes. Stack traces and bounded timeout logs are preserved with the evidence.
+
+## 2026-10-06 — packed residue outputs; reject smaller SVD replay tiles
+
+**Change.** Upper exact GEMM computes column tiles over only the needed
+rows and retains packed per-prime upper entries through CRT. Substantial
+arrow leaves build scalar-rounded Z and exact YᵀZ concurrently in bounded
+batches; each Schur entry still subtracts leaves in the original order.
+A separate candidate reduces SVD replay tiles on wider pools.
+
+**Evidence.** Sequential release ABBA, node192, dynamic OpenBLAS, BLAS one:
+
+| Cores / comparison | Before native median | Candidate native median | Process RSS median |
+|---|---|---|---|
+| 8 / Ising19 MPFR768, baseline vs packed + adaptive SVD, complete | 332.946 s | 333.185 s (+0.07%) | 731.760 → 697.197 MiB (−4.72%) |
+| 8 / Lambda27 MPFR1024, baseline vs packed, three iterations | 822.329 s | 769.710 s (−6.40%) | 20703.012 → 20702.967 MiB |
+| 32 / Ising19 MPFR768, packed vs adaptive SVD, complete | 233.151 s | 241.238 s (+3.47%) | 1435.098 → 1452.141 MiB |
+| 32 / Lambda27 MPFR1024, packed vs adaptive SVD, three iterations | 350.390 s | 347.140 s (−0.93%) | 26423.021 → 26401.035 MiB |
+
+All complete Ising solves are `Solved`/119 and pass the original-coordinate
+1e-30 audit; full x/s/z points are identical within each ABBA. Lambda27
+windows are `MaxIterations`/3 with identical points, **not complete audited
+solutions**. Ising does not enter the batched arrow residue branch at its
+work gate. Its eight-core RSS saving belongs to the combined frozen binary,
+not an isolated attribution. Square upper products retain m(m+1)/2 residue
+outputs per prime instead of m²; this does not halve total process RSS.
+
+**Decision.** Keep packed upper residue storage for its memory reduction.
+Remove adaptive SVD tiles: the audited solve regressed and the large-window
+gain is below 2%. Four-row parallel replay remains. Batched arrow products
+remain provisional until a complete audited release comparison passes.
+Later local admission rules exclude inline-dot precisions, short/wide
+leaves and underfilled batches; result storage stays proportional to Y.
+They are outside both completed cluster packets.
+
+**Additional repair/check.** Admit equality-only problems to the existing
+shared pool under its work cutoff and attach it to direct backends before
+initial thread reporting. Arm `exact-arrow-packed-pool-20261006-fast`, Mac
+M4: MPFR1024 equality QP at one/four actual backend workers is `Solved`/0,
+enters residue contribution four times, preserves the full reviewed baseline
+point and passes a 1e-50 original-coordinate audit (dual max 3.85e-230).
+Native single-run 0.976/0.345 s is preliminary. Keep the pool repair.
+The earlier one-bound fixture has identical points at actual one/four
+workers, but the baseline also misses its raw dual gate
+(1.127e-50 > 1e-50); preserve that failure, with no gate change.
+
+**Provenance.** PBS223509 (8 cores, 64 GiB, two hours) and approved
+PBS223513 (32 cores, 64 GiB, 45 minutes) both produced `COMPLETE`, summaries
+and exit zero. Remote `~/projects/sdpx-exact-packed-20261006/`, second run
+under `replay32/`; local retrieved manifests, hashes, audits and rows under
+`$SDPX_E2E_HOME/work/exact-arrow-packed-20261006/evidence8/` and `evidence32/`.
+Local equality evidence: `work/exact-arrow-20261005/pool-fixed-audit.json`;
+earlier missed gate: `pooled128-audit-failure.json`. This local arm includes
+the rejected SVD tile change; the equality fixture does not invoke SVD.
+
+## 2026-10-06 — reject serial residue-arrow and disconnected-QR trials
+
+**Hypothesis/change.** Replace wide leaf Schur exact dots with residue BLAS,
+preserving scalar-rounded Z and the original per-leaf subtraction order.
+Split bidiagonal QR only at exact-zero separators, preserving its global
+iteration cap and rotation replay order.
+
+**Evidence.** Frozen release binaries, eight physical cores, BLAS one,
+validated dynamic OpenBLAS, same host and settings, PBS223495:
+
+| Comparison | Baseline native median | Trial native median | Process RSS median |
+|---|---|---|---|
+| Ising Lambda19, MPFR768, complete ABBA | 332.888 s | 349.592 s (+5.02%) | 725.756 → 855.352 MiB |
+| Mixed Lambda27, MPFR1024, three-iteration BLAS ABBA | 824.563 s | 831.410 s (+0.83%) | 20703.867 → 20703.350 MiB |
+
+Ising is `Solved`/119, passes the original-coordinate 1e-30 audit, and all
+four full x/s/z points are identical. All completed Lambda27 windows are
+`MaxIterations`/3 with identical points: **incomplete solves**. The completed
+QR diagnostic pair was 831.930 → 829.027 s (−0.35%); cone-scaling wall was
+101.008 → 100.932 s. It exposed 288 QR splits but no qualifying gain.
+The allocation hit its 7200-second limit during the second QR window;
+there is no completed QR ABBA. PBS output records the kill even though the
+shell EXIT trap wrote zero. No `summary.json` was produced.
+
+**Decision.** Remove both first trials. Residue-arrow CPU work fell on
+Lambda27, but encoding/packing and sequential leaves erased the wall gain;
+Ising contribution wall grew 3.936 → 17.961 s. The later local reservation
+fix was outside these frozen binaries. Next candidate packs residue upper
+triangles and runs a bounded batch of independent substantial leaves;
+small products retain column-parallel dots. A separate small SVD candidate
+adapts replay row tiles to the ambient pool; QR remains serial.
+
+**Provenance.** Remote `~/projects/sdpx-exact-arrow-qr-20261005/` holds
+archives, manifest, binary hashes, failed setup jobs222772/222781 and all
+PBS223495 outputs under `retry2/`. Local source packets and completed rows:
+`$SDPX_E2E_HOME/work/exact-arrow-20261005/`; retrieved evidence is under
+`evidence-retry2/`. Baseline binary SHA256
+`42bab9d527268df686ed43f9d5c53ee40e61c606a1a433184265669e15a6f6c8`.
+
+## 2026-10-05 — repair static-review findings
+
+**Change.** Restrict the aligned MPI sampled exchange to pooled sampled
+PSD/zero blocks; serial and mixed ordinary cones retain the complete scaling
+exchange. Handle an empty arrow border and update arrow rows in place,
+removing temporary per-row vectors. Sampled linear products use the configured
+pool, including when its width decreases. Remove cross-RHS/factorization
+refinement stall prediction. Rollback restores kappa/tau and refreshes
+residuals before reduced convergence. Reject invalid checkpoint scalars
+before assignment, share cone validation in preparation, and preserve the
+last C ABI result when an update is rejected. Numerical tolerances,
+regularization and convergence rules are unchanged.
+
+**Verification.** Mac M4, `fast`, features `sdp-accelerate,faer-sparse`, arm
+`review-fixes-20261005-fast`: Ising11 MPFR512 at one/four threads is
+`Solved`/52, API 12.081/3.633 s, process RSS 52.5/61.2 MiB. Both pass the
+original-coordinate 1e-30 audit and return identical x/s/z; timings are
+preliminary single runs. Evidence under `$SDPX_E2E_HOME/runs/`:
+`20261005-154735-968255-ising11-review-fixes-20261005-fast` and
+`20261005-154755-286834-ising11-review-fixes-20261005-fast`.
+An actual local two-rank OpenMPI check passes three MPFR256 KKT fixtures:
+serial sampled, pooled sampled, and pooled sampled plus ordinary orthant
+rows, all with an empty arrow border. Focused invalid/valid checkpoint,
+rollback, native cone-input, C ABI cone preparation/rejected update and
+public C ABI lifecycle checks pass. No broad suite or cluster campaign.
+
+**Decision.** Keep for correctness and removal of arrow temporary storage.
+No new speed claim; earlier large-case timings precede the refinement repair.
+
 ## 2026-09-27 — binary64 accuracy regression; residue-kernel buffer reuse
 
 **Regression.** `dim2_signed_parities_ruiz_f64` (condensed, generic and

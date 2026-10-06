@@ -140,6 +140,7 @@ fn residue_blas_gemm_matches_exact_dots_bitwise() {
     check::<8>(3, 4, 1, 40, 3);
     check::<4>(9, 6, 300, 60, 4);
     check::<2>(5, 5, 33, 10, 5);
+    check::<16>(35, 37, 45, 90, 7); // packed upper tiles across the 32-column boundary
 }
 
 #[test]

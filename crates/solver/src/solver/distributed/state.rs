@@ -70,7 +70,7 @@ impl<T: FloatT> OwnedState<T> {
     /// separate outstanding part of the distributed backend.
     ///
     /// Test-only convenience: the production entry points take the explicit
-    /// history variant (`new_with_history` / `new_rank_local_with_history`).
+    /// history variant (`new_with_history`).
     #[cfg(test)]
     pub fn new(data: DefaultProblemData<T>, count: usize) -> Result<Self, String> {
         let layout = OwnerLayout::new(&data, count)?;
@@ -79,74 +79,26 @@ impl<T: FloatT> OwnedState<T> {
 
     pub(crate) fn new_with_history(
         data: DefaultProblemData<T>,
-        count: usize,
-        cost: CostRuntimeConfig,
+        count: Option<usize>,
+        local_rank: Option<usize>,
+        mut cost: CostRuntimeConfig,
         options: CostHistoryOptions,
     ) -> Result<Self, String> {
-        let layout = if let Some(history) = options.history.as_ref() {
-            OwnerLayout::new_with_history(
-                &data,
-                count,
-                cost.thread_budget,
-                cost.input_fingerprint,
-                history,
-            )?
-        } else {
-            OwnerLayout::new(&data, count)?
-        };
-        let mut cost = cost;
+        let layout = OwnerLayout::build(
+            &data,
+            count,
+            cost.thread_budget,
+            options.history.as_ref(),
+            cost.input_fingerprint,
+        )?;
+        debug_assert!(local_rank.is_none_or(|rank| rank < layout.owners.len()));
         cost.record = options.record;
-        Self::from_layout(data, layout, cost, None)
-    }
-
-    pub(crate) fn new_auto_with_history(
-        data: DefaultProblemData<T>,
-        cost: CostRuntimeConfig,
-        options: CostHistoryOptions,
-    ) -> Result<Self, String> {
-        let layout = if let Some(history) = options.history.as_ref() {
-            OwnerLayout::new_auto_with_history(
-                &data,
-                cost.thread_budget,
-                cost.input_fingerprint,
-                history,
-            )?
-        } else {
-            OwnerLayout::new_auto(&data, cost.thread_budget)?
-        };
-        let mut cost = cost;
-        cost.record = options.record;
-        Self::from_layout(data, layout, cost, None)
-    }
-
-    /// Build only one global owner's numeric state for a rank-local solver.
-    /// The full structural layout and shared equality metadata remain
-    /// available to the caller, but unowned matrix/cone workspaces are never
-    /// allocated in `owners`.
-    pub(crate) fn new_rank_local_with_history(
-        data: DefaultProblemData<T>,
-        count: usize,
-        owner: usize,
-        cost: CostRuntimeConfig,
-        options: CostHistoryOptions,
-    ) -> Result<Self, String> {
-        if owner >= count {
-            return Err("rank-local owner is outside the global owner count".into());
-        }
-        let layout = if let Some(history) = options.history.as_ref() {
-            OwnerLayout::new_with_history(
-                &data,
-                count,
-                cost.thread_budget,
-                cost.input_fingerprint,
-                history,
-            )?
-        } else {
-            OwnerLayout::new(&data, count)?
-        };
-        let mut cost = cost;
-        cost.record = options.record;
-        Self::from_layout(data, layout, cost, Some(std::slice::from_ref(&owner)))
+        Self::from_layout(
+            data,
+            layout,
+            cost,
+            local_rank.as_ref().map(std::slice::from_ref),
+        )
     }
 
     fn from_layout(
@@ -377,10 +329,10 @@ mod construction_tests {
             ],
             &settings,
         );
-        let state = OwnedState::new_rank_local_with_history(
+        let state = OwnedState::new_with_history(
             data,
-            4,
-            2,
+            Some(4),
+            Some(2),
             CostRuntimeConfig::disabled(),
             CostHistoryOptions::default(),
         )

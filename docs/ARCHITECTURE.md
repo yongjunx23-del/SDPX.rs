@@ -38,16 +38,24 @@ job IDs, rejected trials) is in [JOURNAL.md](JOURNAL.md).
 
 ## Setup
 
-External input is validated once, at the boundary: `PreparedProblem` setup,
-the JSON readers and the C ABI check dimensions, CSC structure, cone
-descriptions and settings. Internal code trusts the structures the solver
-builds and uses `debug_assert!` for its invariants.
+External input is validated at the boundary: `PreparedProblem` checks
+dimensions, CSC structure, cone parameters and settings for every frontend;
+the readers and C ABI validate their transport formats. Internal code trusts
+the structures the solver builds and uses `debug_assert!` for its invariants.
 
 Ordinary direct solves apply presolve, chordal decomposition and Ruiz
 equilibration. Prepared handles keep Ruiz but disable structural
 preprocessing so later data updates keep the prepared structure. Consumed
 JSON problems move their owned P, q, b and A into setup instead of copying.
-Solutions, residuals and checkpoints are reported in original coordinates.
+Explicit, automatic and MPI owner partitions use one setup route; MPI derives
+the local owner from its communicator. Cost-history input fingerprints are
+computed once at the JSON boundary, only for history import or recording.
+Ordinary solves do not collect history metadata. Immutable local/global
+layouts share storage when all owners are local.
+Solutions and residuals are reported in original coordinates. Checkpoints
+store the internal iterate with its equilibration; hot starts map through
+original coordinates. Loading rejects nonfinite values and nonpositive
+homogenization or scaling factors before installing the iterate.
 
 Sampled problems keep the factored operator authoritative: once installed,
 the retained linear-A values are released and the reduced KKT storage owns
@@ -69,6 +77,8 @@ Each HSD iteration:
 Newton solves use iterative refinement against the true, unshifted operator.
 At MPFR precision every refinement residual row is an exact dot product
 rounded once, so refinement keeps working on badly scaled bootstrap systems.
+Every right-hand side uses its own residual and measured correction gain;
+stalls from another right-hand side or factorization do not skip refinement.
 Clarabel stopping rules, reduced tolerances, infeasibility detection,
 regularization with escalation and the distinct `AlmostSolved` status are
 part of the engine. There is no low-precision solver, mixed-precision
@@ -101,11 +111,18 @@ reported as `linear_solver`.
 | Order | Backend | Selection |
 |---|---|---|
 | 1 | `local_soc_arrow` | ≥ 8 SOC3 leaves with a nonempty equality border of ≤ 128 coordinates and no cross-leaf coupling. |
-| 2 | `shared_soc_arrow` | Zero and ≥ 8 SOC3 cones only (augmented form; condensed eliminates SOC3), shared primal border of ≤ 128 coordinates, workspace ≤ `shared_soc_max_bytes` (default 2 GiB; 0 disables). |
+| 2 | `shared_soc_arrow` | Zero and ≥ 8 SOC3 cones only (augmented form; condensed eliminates SOC3), shared primal border of ≤ 128 coordinates, workspace ≤ `shared_soc_max_bytes` (default 512 MiB; 0 disables). |
 | 3 | `local_bounds_faer` / `local_bounds_arrow` | ≥ 64 variables with one or two local bound rows, diagonal `P` and a nonempty equality/free border, admitted by added storage. Float64 needs `faer-sparse`; MPFR uses exact bound Gram products. |
 | 4 | `dense_block` | Float64: an eligible dense leading positive block, pooled tiled Cholesky. |
-| 5 | `arrow` | Disconnected positive dense leaves around a negative border, estimated workspace ≤ max(512 MiB, 8 × KKT storage) (Float64 and MPFR). Leaf contributions are formed on the fly, not stored. |
+| 5 | `arrow` | Disconnected positive dense leaves around a negative border, estimated workspace ≤ max(512 MiB, 8 × KKT storage) (Float64 and MPFR). Leaf contributions are recomputed in bounded batches. |
 | 6 | `faer` / `qdldl` | General sparse LDL. Float64 with `faer-sparse` uses faer when estimated flops ≥ 1e8 and flops per factor nonzero ≥ 40, else QDLDL. MPFR uses QDLDL. |
+
+Above 256 bits, substantial generic MPFR arrow leaves form scalar-rounded
+Z = Y ⊙ dinv, then compute the upper YᵀZ product through exact residues.
+Result storage must stay proportional to Y; batches fill the worker pool,
+hold one result per worker and subtract leaves in their original order.
+Short leaves and underfilled batches retain column-parallel exact dots. The plan records the current
+performance acceptance gate for these candidates.
 
 `qdldl` can be pinned for any scalar and `faer` for Float64. A failed arrow
 factorization falls back to QDLDL and a failed dense block to its sparse
@@ -125,7 +142,9 @@ once (inline limb products through 256 bits, GMP above). The result does not
 depend on term order, partitioning or thread count. Large dense MPFR
 products, congruences (`Aᵀdiag(d)A`) and bound Grams use exact residue (RNS)
 kernels with caches for operands that stay fixed during a solve; CRT
-reconstruction rounds each entry once. MPFR sparse products `Ax`/`Aᵀx`
+reconstruction rounds each entry once. Upper GEMM requests stream packed
+triangle residues through CRT; temporary BLAS tiles cover only the needed
+rows of each column tile. MPFR sparse products `Ax`/`Aᵀx`
 accumulate each output row/column exactly when it has enough entries.
 Ordinary scalar operations and factorizations stay at the requested
 precision. Binary64 products with A route columns that are at least a quarter
@@ -135,13 +154,15 @@ of the thread count.
 `BlasFloatT` maps Float64 to system BLAS/LAPACK and wide scalars to the MPFR
 dense kernels (GEMM/SYRK through `exactdot`/RNS, Cholesky, triangular
 solves, symmetric eigensolver and a bidiagonal-QR SVD whose rotations are
-logged and replayed row-parallel). Float32 is configured only for dense
-kernel tests.
+logged and replayed row-parallel). Four-row replay tiles preserve each row's
+rotation order. Float32 is configured only for dense kernel tests.
 
 ## Parallelism and memory
 
 One worker pool per solve (`max_threads`) runs cone blocks, factorization
 and long vector work; dominant blocks split their tiles over the same pool.
+Equality-only problems also share this pool with KKT kernels when they meet
+the existing work cutoff. Backends receive it before initial thread reporting.
 Splits preserve each output's operation order, so results are independent of
 the thread count. Scratch is per thread (`algebra/scratch.rs`) and reused
 across iterations; dense kernels reuse dead input/output storage instead of
@@ -150,8 +171,10 @@ workers (source-built OpenBLAS needs `USE_LOCKING=1`).
 
 MPI is loaded at runtime. The ordinary MPI path replicates input data and
 shards the expensive work by blocks. Sampled forward/adjoint products and
-condensed scaling share one rank partition, so a condensed solve keeps
-intermediate vectors on their owning rank and exchanges each result once;
+condensed scaling share one rank partition for pooled problems containing
+only sampled PSD and zero cones, so a condensed solve keeps intermediate
+vectors on their owning rank and exchanges each result once. Serial sampled
+products and mixed ordinary cones keep the complete scaling exchange;
 the sampled operator's linear part is sharded by columns (adjoint) or by
 its entry-holding rows (forward). Sharded, pooled and serial sparse products
 use the same per-output arithmetic, so results do not depend on the thread
@@ -162,7 +185,9 @@ and solves gather the leaf solutions. Exact refinement residual rows are
 split across ranks by work. `--partitions N|auto` selects owner partitioning,
 where ranks own whole blocks and share the equality Schur complement, and
 `--cost-history-in/out` feeds measured block costs to the balancer. Both
-paths plug into the same core HSD loop.
+paths plug into the same core HSD loop. Owner sums fold gathered values into
+existing buffers in rank order, retaining the collective sequence and
+failure handling without allocating a separate folded result.
 
 ## Build features
 

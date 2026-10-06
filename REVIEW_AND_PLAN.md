@@ -1,6 +1,6 @@
 # SDPX development plan
 
-Updated 2026-10-04. [AGENTS.md](AGENTS.md) defines working rules and numerical
+Updated 2026-10-06. [AGENTS.md](AGENTS.md) defines working rules and numerical
 contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 [Journal](docs/JOURNAL.md) holds full timings, job histories, source hashes,
 failed attempts and audit evidence. This file keeps priorities, current
@@ -34,6 +34,74 @@ Frontends dispatch Float64 plus MPFR128/256/512/768/1024 by default;
 `all-precisions` adds 128–2048 in steps of 64 (Lambda43 needs 1216).
 
 ## Current state
+
+The 2026-10-05 review fixes are verified: Ising11 MPFR512 at one and four
+threads is `Solved`/52, passes the original-coordinate 1e-30 audit and
+returns identical points. A two-rank MPI KKT check covers serial and pooled
+sampled products, mixed orthant rows and an empty arrow border. Focused
+checkpoint, recovery, cone-input and C ABI checks pass. Validation is shared
+at preparation; every RHS now measures its own refinement progress, and
+rollback refreshes accepted-iterate residuals before reduced convergence.
+The repaired Ising Lambda19 baseline is now retimed below.
+
+Owner setup now has one route for explicit, automatic and MPI partitions.
+Fingerprinting stays opt-in at the JSON boundary; ordinary solves avoid
+unused history metadata. Local/global layouts share immutable storage, and
+owner reductions reuse existing output buffers. The MPFR256 equality/orthant
+QP is `Solved`/19 locally and on two MPI ranks, including history recording
+and reuse, with identical baseline points and a 1e-30 original-coordinate
+audit. This removes 150 physical Rust lines; no speedup is claimed.
+
+The first exact-BLAS arrow trial is rejected: release ABBA on eight cluster
+cores gave Ising19 MPFR768 native medians 332.888 → 349.592 s (+5.02%) and
+RSS 725.756 → 855.352 MiB (+17.86%), with identical audited `Solved`/119
+points. Mixed Lambda27 MPFR1024 three-iteration windows gave 824.563 →
+831.410 s (+0.83%); these are incomplete diagnostics, not audited solutions.
+The disconnected-QR trial is also removed: its completed diagnostic A/B
+showed only −0.35%, and PBS223495 reached its two-hour limit before ABBA
+finished. Preserve its completed rows; the shell exit marker alone does not
+establish campaign completion.
+
+Packed upper-triangle residues reduce retained per-prime output storage.
+PBS223509 completed its eight-core release ABBA: Ising19 MPFR768 native
+332.946 → 333.185 s (+0.07%), process RSS 731.760 → 697.197 MiB (−4.72%),
+all audited `Solved`/119 with identical points. Its combined candidate also
+contained adaptive SVD tiles, so the RSS result is for that frozen binary.
+Lambda27 MPFR1024 baseline/packed three-iteration windows were
+822.329 → 769.710 s (−6.40%), RSS unchanged, identical `MaxIterations`/3
+points. Batched arrow products still need a complete audited release ABBA;
+the windows do not establish full-solve performance.
+
+Approved PBS223513 completed on 32 cores within 45 minutes. Isolating the
+SVD tile change gave complete Ising19 233.151 → 241.238 s (+3.47%), RSS
+1435.098 → 1452.141 MiB; Lambda27 windows improved only 0.93%. All points
+match and complete solves pass the audit. Remove adaptive tiles; keep the
+existing four-row parallel replay. Smaller tiles and disconnected QR are
+closed directions without new evidence.
+
+The later local arrow admission rules preserve column-parallel dots for
+short leaves and underfilled batches, use residues above 256 bits, and
+bound result storage relative to Y. Equality-only problems now admit the
+shared pool under the existing work cutoff; direct backends receive it
+before initial thread reporting. MPFR1024 equality E2Es at one/four **actual**
+workers are `Solved`/0, call the new residue branch, preserve full baseline
+points and pass the original-coordinate 1e-50 audit. The earlier one-bound
+fixture preserves points too, but misses its raw dual gate in the baseline
+as well (1.127e-50 > 1e-50); it is not an audit pass. Ising11 MPFR512 remains
+`Solved`/52 with identical points and 1e-30 audits at one/four threads.
+A focused residue check covers all transposes and the 32-column boundary.
+These admission/pool changes are outside the completed cluster binaries.
+See the journal for source and evidence bindings.
+
+The complete Lambda27 MPFR1024 baseline/latest ABBA is prepared under
+`$SDPX_E2E_HOME/work/exact-arrow-full-20261006/`: frozen source, input hashes,
+32 cores, 64 GiB, at most six hours. Its independent original-coordinate
+1e-30 audit passes the small Ising11 preflight. It is **not submitted**;
+performance work is paused at the user's request. Resuming this longer run
+still needs approval beyond the completed 45-minute allocation.
+
+The performance results below describe their frozen sources before the
+2026-10-05 correctness fixes; they are not timings of the repaired tree.
 
 All three pinned cases pass on the 2026-10-04 working tree (Mac M4, `fast`
 profile, preliminary single-run timings, not performance claims):
@@ -89,12 +157,12 @@ native medians; each row is its own frozen comparison, gains do not add up):
 Float64 versus MOSEK 11.2.2 (PBS222437, explicit qnorm 1e-6, all audits
 pass): larger gravity 1.914/1.380 s (1/4 threads) versus 1.160/0.976 s;
 small 0.143/0.147 s versus 0.130/0.109 s. Larger qnorm runs take 35/36
-iterations versus MOSEK 21. No current matched SDPB comparison exists.
+iterations versus MOSEK 21. The matched SDPB results above cover mixed Λ27.
 
 Pending: PBS222447 (sampled scratch clearing and scalar power-of-two
 multiplication, three cases against kept 222444). Later generic changes have
-no MPI acceptance; MPI offset reuse passed its real two-rank gate (222378)
-only for that exact patch. Full job histories are in the journal.
+no acceptance from that earlier MPI offset-reuse gate (222378); the later
+MPI changes have their own Λ27 evidence above. Full job histories are in the journal.
 
 ## Profile
 
@@ -142,13 +210,13 @@ regularization and refinement stay unchanged.
   refactor requires approval because it changes the regularization contract.
 - **Float64 large:** historical129 s/26 versus MOSEK25.4 s is superseded by
   the scoped222437 audited refresh above; it is not a matched optimization
-  comparison with that history. No new matched SDPB comparison is available.
+  comparison with that history. Mixed Λ27 has the matched SDPB comparison above.
 
 ## Concrete next work
 
 | Order | Action | Acceptance / constraint |
 |---|---|---|
-| 0 | Multi-node scaling and MPFR kernel cost | Done since 0.9.0: aligned exchanges, measured cone costs, packed Grams, pooled border forward sweep, parallel leaf couplings/contributions, straggler leaf factor split. Λ27 3-iteration wall (32 threads/node): 1 node ~180 s, 4 nodes ~105 s, 8 nodes ~94 s. Remaining: KKT solves and start iteration do not scale (~14 + 17 s); cone scaling is bounded by single-cone SVD latency (~3 s per 88×88 1024-bit cone); arrow phases are bound by the exact-dot limb products (GMP `addmul_1` ~80% of contribution samples). Next real lever: a GEMM-based exact product (residue/Ozaki slicing on BLAS) for leaf contributions and Y = L⁻¹B, or intra-cone SVD parallelism; both are research-sized. Measure with same-allocation A/B (`aba.pbs`); avoid node70. |
+| 0 | Multi-node scaling and MPFR kernel cost | Existing aligned exchanges, packed Grams, pooled border work and leaf splitting remain. Batched residue products improved Λ27 eight-core diagnostic windows by 6.40%; next gate is a complete audited release ABBA of the latest admission rules. Smaller SVD tiles regressed complete Ising19 at 32 cores and are removed; disconnected QR is also rejected. Preserve rounded Z and leaf subtraction order; Y = L⁻¹B contains rounded recurrences and cannot be replaced by one exact GEMM. Scaling latency remains bounded by the largest cone; GMP `addmul_1` is ~80% of contribution samples, not 80% of the whole solve. Avoid node70. |
 | 1 | Profile remaining exact residual and sampled/PSD work | Diagonal reserve222441 is kept; single-product scratch gate passes. Target measured complete-solve costs with unchanged exact operator/rounding. |
 | 2 | Optimize Lambda sampled RHS/KKT and PSD scaling | Target current dominant costs; ≥2% audited solve gain or clear memory/correctness benefit. Preserve exact operator/rounding contracts. |
 | 3 | Inspect remaining storage/setup lifetimes | Preserve shifted factorization versus unshifted residual operators; structural counts alone do not establish RSS. |
@@ -175,12 +243,14 @@ Apply these to affected paths; they are not a project-wide gate:
 
 ## Decisions still needed / deferred
 
-- Owner cost histories, fingerprint plumbing and `with_identity` constructor
-  ladder stay until a real scaling campaign establishes their value. Two-node
-  benefit remains unproven; historical Lambda runs showed no advantage.
+- Owner cost histories remain an opt-in public interface until a real scaling
+  campaign establishes their value. Constructor duplication and repeated
+  fingerprint plumbing are removed; distributed-arrow scaling above does
+  not establish a benefit from cost histories.
 - Ordinary per-site and owner MPI paths converge only after real MPI E2Es
-  (local OpenMPI: conda env `sdpx-mpi`). `direct_kkt_solver` removal changes
-  the settings schema and needs a decision.
+  (local OpenMPI: conda env `sdpx-mpi`). Owner setup/reductions now pass a
+  two-rank E2E. Keep `direct_kkt_solver` in the public settings schema,
+  validated at the boundary; its redundant internal assertion is removed.
 - Python/Julia bindings, certificate product, mandatory backend unification,
   communication abstraction, blanket panic removal and line-count rewrites.
   Julia remains input generation/audit only; current API/CLI/C ABI stay supported.

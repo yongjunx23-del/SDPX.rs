@@ -612,7 +612,7 @@ impl<T: FloatT> SampledOperator<T> {
         assert_eq!(y.len(), self.linear.m);
         assert_eq!(x.len(), self.linear.n);
         assert_eq!(work.blocks.len(), self.blocks.len());
-        work.linear_product(self, false, y, x, alpha, beta, pool);
+        work.linear_product_in_pool(self, false, y, x, alpha, beta, pool);
         if self.ordered_rows {
             let chunks = block_chunks(&self.blocks, pool);
             if let Some(world) = self.mpi_world() {
@@ -797,7 +797,7 @@ impl<T: FloatT> SampledOperator<T> {
         assert_eq!(y.len(), self.linear.n);
         assert_eq!(x.len(), self.linear.m);
         assert_eq!(work.blocks.len(), self.blocks.len());
-        work.linear_product(self, true, y, x, alpha, beta, pool);
+        work.linear_product_in_pool(self, true, y, x, alpha, beta, pool);
         let chunks = block_chunks(&self.blocks, pool);
         let world = self.mpi_world();
         let parts = world.map(|w| self.rank_parts(work, w));
@@ -1320,7 +1320,7 @@ impl<T: FloatT> SampledWorkspace<T> {
         pool: Option<&Arc<rayon::ThreadPool>>,
     ) {
         let workers = pool.map_or(1, |p| p.current_num_threads());
-        if workers > self.linear_plan_workers {
+        if workers != self.linear_plan_workers {
             self.linear_plan
                 .configure(&operator.linear, pool.map(Arc::clone));
             self.linear_plan_workers = workers;
@@ -1389,7 +1389,7 @@ impl<T: FloatT> SampledWorkspace<T> {
         }
     }
 
-    fn parallel_eligible(
+    pub(crate) fn parallel_eligible(
         &self,
         operator: &SampledOperator<T>,
         pool: Option<&Arc<rayon::ThreadPool>>,

@@ -447,34 +447,32 @@ impl<T: FloatT> Leaf<T> {
     }
     fn second_many(&mut self, xt: &[T], cols: usize, chunks: usize) {
         let g = self.ids.len();
-        // As in `second_solve`: independent row couplings, split over the
-        // ambient pool for long leaves.
-        let row = |i: usize| -> Vec<T> {
-            (0..cols)
-                .map(|c| {
-                    if i < self.coupling_start {
-                        T::zero()
-                    } else {
-                        T::dot_fma(self.coupled.iter().map(|&j| {
-                            (
-                                &self.coupling_values()[self.coupling_index(i, j)],
-                                &xt[j * cols + c],
-                            )
-                        }))
-                    }
-                })
-                .collect()
-        };
-        let pooled = rayon::current_thread_index().is_some();
-        let s: Vec<Vec<T>> = if pooled && g * self.coupled.len() * cols >= 1 << 14 {
-            (0..g).into_par_iter().with_min_len(8).map(row).collect()
-        } else {
-            (0..g).map(row).collect()
-        };
-        for (i, si) in s.into_iter().enumerate() {
-            for (c, s) in si.into_iter().enumerate() {
-                self.batch_w[i * cols + c] = (self.batch_w[i * cols + c] - s) * self.factor.dinv[i];
+        let start = self.coupling_start;
+        let width = g - start;
+        let values = if self.y.is_empty() { &self.b } else { &self.y };
+        let (coupled, dinv) = (&self.coupled, &self.factor.dinv);
+        let update = |(i, row): (usize, &mut [T])| {
+            for (c, v) in row.iter_mut().enumerate() {
+                let s = if i < start {
+                    T::zero()
+                } else {
+                    T::dot_fma(
+                        coupled
+                            .iter()
+                            .map(|&j| (&values[i - start + j * width], &xt[j * cols + c])),
+                    )
+                };
+                *v = (*v - s) * dinv[i];
             }
+        };
+        if rayon::current_thread_index().is_some() && g * coupled.len() * cols >= 1 << 14 {
+            self.batch_w
+                .par_chunks_mut(cols)
+                .enumerate()
+                .with_min_len(8)
+                .for_each(update);
+        } else {
+            self.batch_w.chunks_mut(cols).enumerate().for_each(update);
         }
         if chunks > 1 {
             self.factor
@@ -501,28 +499,31 @@ impl<T: FloatT> Leaf<T> {
 
     fn second_solve(&mut self, xt: &[T]) {
         let g = self.ids.len();
-        // Row couplings are independent dots of the final border values;
-        // long leaves split them over the ambient pool (same arithmetic).
-        let row = |i: usize| {
-            if i < self.coupling_start {
+        let start = self.coupling_start;
+        let width = g - start;
+        let values = if self.y.is_empty() { &self.b } else { &self.y };
+        let (coupled, dinv) = (&self.coupled, &self.factor.dinv);
+        let update = |(i, v): (usize, &mut T)| {
+            let s = if i < start {
                 T::zero()
             } else {
                 T::dot_fma(
-                    self.coupled
+                    coupled
                         .iter()
-                        .map(|&j| (&self.coupling_values()[self.coupling_index(i, j)], &xt[j])),
+                        .map(|&j| (&values[i - start + j * width], &xt[j])),
                 )
-            }
+            };
+            *v = (*v - s) * dinv[i];
         };
         // Only on a pool worker: a serial caller must not reach the global pool.
-        let pooled = rayon::current_thread_index().is_some();
-        let s: Vec<T> = if pooled && g * self.coupled.len() >= 1 << 14 {
-            (0..g).into_par_iter().with_min_len(8).map(row).collect()
+        if rayon::current_thread_index().is_some() && g * coupled.len() >= 1 << 14 {
+            self.w
+                .par_iter_mut()
+                .enumerate()
+                .with_min_len(8)
+                .for_each(update);
         } else {
-            (0..g).map(row).collect()
-        };
-        for (i, s) in s.into_iter().enumerate() {
-            self.w[i] = (self.w[i] - s) * self.factor.dinv[i];
+            self.w.iter_mut().enumerate().for_each(update);
         }
         self.factor.backward(&mut self.w);
     }
@@ -587,6 +588,77 @@ fn subtract_contributions<T: FloatT>(
     if t == 0 {
         return;
     }
+    // Above the inline-dot precisions, batch substantial products only
+    // when result storage is proportional to Y and outer work fills the pool.
+    let width = pool.map_or(1, |p| p.current_num_threads());
+    let eligible = |leaf: &Leaf<T>| {
+        let (g, q) = (leaf.ids.len(), leaf.coupled.len());
+        T::precision_bits() > 256
+            && T::residue_blas_applies(q, q, g)
+            && g * q * q >= 1 << 21
+            && q * q <= 8 * g * t
+    };
+    if leaves.len() >= width && leaves.iter().any(eligible) {
+        let build = |leaf: &Leaf<T>| {
+            let (g, q) = (leaf.ids.len(), leaf.coupled.len());
+            let mut packed = Vec::new();
+            let y = if q == t {
+                &leaf.y[..]
+            } else {
+                packed.reserve_exact(g * q);
+                for &j in &leaf.coupled {
+                    packed.extend_from_slice(&leaf.y[j * g..(j + 1) * g]);
+                }
+                &packed[..]
+            };
+            let mut z = Vec::with_capacity(g * q);
+            for source in y.chunks(g) {
+                z.extend(source.iter().zip(&leaf.factor.dinv).map(|(&a, &d)| a * d));
+            }
+            let mut product = vec![T::zero(); q * q];
+            let timer = crate::receipt::start();
+            let exact =
+                T::xgemm_upper_exact(b'T', b'N', q, q, g, y, g, &z, g, &mut product, None, None);
+            crate::receipt::finish("arrow.residue_contribution", timer);
+            if !exact {
+                for c in 0..q {
+                    for r in 0..=c {
+                        product[r + c * q] =
+                            T::dot_fma(y[r * g..(r + 1) * g].iter().zip(&z[c * g..(c + 1) * g]));
+                    }
+                }
+            }
+            product
+        };
+        for group in leaves.chunk_by(|a, b| eligible(a) == eligible(b)) {
+            if !eligible(&group[0]) || group.len() < width {
+                // Keep short leaves column-parallel and avoid square result
+                // storage, preserving their position in every entry's sum.
+                subtract_contributions(group, s, t, pool);
+                continue;
+            }
+            for batch in group.chunks(width) {
+                if batch.len() < width {
+                    subtract_contributions(batch, s, t, pool);
+                    continue;
+                }
+                let products: Vec<Vec<T>> = match pool {
+                    Some(p) => p.install(|| batch.par_iter().map(build).collect()),
+                    None => batch.iter().map(build).collect(),
+                };
+                // Each entry subtracts rounded leaves in the original order.
+                for (leaf, product) in batch.iter().zip(products) {
+                    let q = leaf.coupled.len();
+                    for (c, &j) in leaf.coupled.iter().enumerate() {
+                        for (r, &i) in leaf.coupled[..=c].iter().enumerate() {
+                            s[i + j * t] -= product[r + c * q];
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
     let column = |j: usize, col: &mut [T]| {
         for leaf in leaves {
             if !leaf.couples[j] {
@@ -640,6 +712,9 @@ impl LeafRanks {
     /// `out = Σ_ranks local` (equal lengths), added in rank order.
     fn sum<T: FloatT>(&self, local: &[T], out: &mut [T]) {
         let len = local.len();
+        if len == 0 {
+            return;
+        }
         let size = self.world.size();
         let ranges: Vec<(usize, usize)> = (0..size).map(|r| (r * len, len)).collect();
         let mut all = vec![T::zero(); size * len];

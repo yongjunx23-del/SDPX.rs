@@ -78,32 +78,27 @@ impl<T: FloatT> OwnedVariables<T> {
     }
 
     fn refresh_border_from_owner_zero(&mut self) {
-        let border = self.layout.border_rows.len();
-        let mut local_s = vec![T::zero(); border];
-        let mut local_z = vec![T::zero(); border];
         if let Some(local_owner) = self.owner_ids.iter().position(|&owner| owner == 0) {
+            self.border_s.fill(T::zero());
+            self.border_z.fill(T::zero());
             if let Some(block) = self.blocks.get(local_owner) {
                 for (j, &row) in self.layout.border_rows.iter().enumerate() {
                     if let Ok(local) = self.layout.owners[local_owner].rows.binary_search(&row) {
-                        local_s[j] = block.s[local];
-                        local_z[j] = block.z[local];
+                        self.border_s[j] = block.s[local];
+                        self.border_z[j] = block.z[local];
                     }
                 }
             }
-        } else if self.collective.rank() == 0 {
-            local_s.copy_from_slice(&self.border_s);
-            local_z.copy_from_slice(&self.border_z);
+        } else if self.collective.rank() != 0 {
+            self.border_s.fill(T::zero());
+            self.border_z.fill(T::zero());
         }
-        let reduced_s = self.collective.reduce_sum(524, &local_s).ok();
-        let reduced_z = self.collective.reduce_sum(525, &local_z).ok();
-        if let Some(values) = reduced_s.filter(|values| values.len() == border) {
-            self.border_s.copy_from_slice(&values);
-        } else {
+        let reduced_s = self.collective.reduce_sum_in_place(524, &mut self.border_s);
+        let reduced_z = self.collective.reduce_sum_in_place(525, &mut self.border_z);
+        if reduced_s.is_err() {
             self.border_s.fill(T::infinity());
         }
-        if let Some(values) = reduced_z.filter(|values| values.len() == border) {
-            self.border_z.copy_from_slice(&values);
-        } else {
+        if reduced_z.is_err() {
             self.border_z.fill(T::infinity());
         }
         self.sync_border();
@@ -410,17 +405,15 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
                 .ok()
                 .and_then(|values| values.into_iter().next())
                 .map_or(T::zero(), |value| -value);
-            let global_positive = self
+            if self
                 .collective
-                .reduce_sum(522 + pd as usize, std::slice::from_ref(&positive))
-                .ok()
-                .and_then(|values| values.into_iter().next())
-                .unwrap_or(T::infinity());
-            let (first, second) = crate::solver::default::interior_shifts(
-                global_minimum,
-                global_positive,
-                cones.degree,
-            );
+                .reduce_sum_in_place(522 + pd as usize, std::slice::from_mut(&mut positive))
+                .is_err()
+            {
+                positive = T::infinity();
+            }
+            let (first, second) =
+                crate::solver::default::interior_shifts(global_minimum, positive, cones.degree);
             for shift in [Some(first), second].into_iter().flatten() {
                 for (v, c) in self.blocks.iter_mut().zip(&cones.blocks) {
                     let values = match pd {
@@ -549,12 +542,13 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
                 sz = s.mul_add(z, sz);
             }
         }
-        let sz = self
+        if self
             .collective
-            .reduce_sum(510, std::slice::from_ref(&sz))
-            .ok()
-            .and_then(|values| values.into_iter().next())
-            .unwrap_or(T::infinity());
+            .reduce_sum_in_place(510, std::slice::from_mut(&mut sz))
+            .is_err()
+        {
+            sz = T::infinity();
+        }
         let mu = (sz + tau * kappa) / central;
         let mut barrier = central * mu.logsafe() - tau.logsafe() - kappa.logsafe();
         let mut total = T::zero();
@@ -585,12 +579,13 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         if original.is_some() {
             total += subtotal;
         }
-        let total = self
+        if self
             .collective
-            .reduce_sum(511, std::slice::from_ref(&total))
-            .ok()
-            .and_then(|values| values.into_iter().next())
-            .unwrap_or(T::infinity());
+            .reduce_sum_in_place(511, std::slice::from_mut(&mut total))
+            .is_err()
+        {
+            total = T::infinity();
+        }
         barrier += total;
         barrier
     }

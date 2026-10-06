@@ -157,7 +157,7 @@ where
         // AMD ordering vectors to its selected solver
         // If using a solver directly and no ordering is
         // provided, the solver finds one for itself
-        let ldlsolver = if KKT.n == 0 {
+        let mut ldlsolver = if KKT.n == 0 {
             Box::new(EmptyDirectLDLSolver) as BoxedDirectLDLSolver<T>
         } else if settings.direct_solve_method == "auto" {
             crate::solver::kkt::ldl::arrow::ArrowLDLSolver::try_local_soc(
@@ -178,6 +178,7 @@ where
         } else {
             ldl_ctor(&KKT, &dsigns, settings, None)
         };
+        ldlsolver.set_pool(cones.thread_pool());
 
         let packed_residual = ldlsolver.linear_solver_info().name == "dense_block"
             && KKT.colptr[n] == triangular_number(n);
