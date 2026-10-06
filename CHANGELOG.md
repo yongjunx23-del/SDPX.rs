@@ -6,11 +6,36 @@ solves; the experiment log is [docs/JOURNAL.md](docs/JOURNAL.md).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-06
+
+Mixed Λ27 at 1024 bits, 32 threads per node: full solve on 4 nodes 1369 s
+(0.9.0: 1608 s; SDPB 2592 s), 1 node 2106 s (SDPB 4014 s). Same-allocation
+3-iteration A/B of the release head against the pre-repair head: 4 nodes
+on par, 1 node +2.4% (removed refinement prediction, partly offset by
+residue contributions).
+
 ### Fixed
 
 - MPFR sparse products (pooled lanes, MPI-sharded products and residual
   products) now use exactly the CSC gemv arithmetic. In 0.9.0 a solve's
   point depended on the thread count for sampled MPFR problems.
+- The aligned MPI exchange republishes the scaled values of rows that hold
+  sampled linear entries outside zero blocks; before, non-owner ranks read
+  zero there and refinement had to correct the first solve.
+- Rollback to the accepted iterate refreshes residuals before the reduced
+  convergence test; checkpoint readers reject nonfinite or nonpositive
+  homogenization/scaling values; cone dimensions and parameters are
+  validated once for all frontends (the C ABI keeps its last result when an
+  update is rejected); empty arrow borders are handled under MPI.
+- Refinement no longer predicts stalls across right-hand sides or
+  factorizations (each right-hand side refines on its own residuals, as in
+  Clarabel). This costs some MPFR solve time on one node.
+- Sampled block files parse within `--threads` instead of every core.
+
+### Performance
+
+- Exact residue products for generic arrow leaf contributions when a rank
+  holds at least one leaf per worker (Λ27 1 node: contributions 35 → 22 s).
 
 ### Performance
 

@@ -6119,3 +6119,22 @@ cluster nodes.
 
 Some free-listed nodes carry heavy load outside PBS; pick nodes with
 loadave < 2 and no jobs (`pbsnodes`) for timing runs.
+
+## 2026-10-06 — A/B of the repair commit (3bbef2b) and release 0.9.1
+
+Same-allocation A/B, mixed Λ27, 1024 bits, 32 threads per node (node7/50/
+54/55 and node91; nodes node71/72/75/84/88 killed jobs at launch, exit −9).
+
+| Comparison (job) | Result |
+|---|---|
+| c824c3f vs 3bbef2b, 4 nodes, 3 it (223540) | 114.5/113.8 vs 122.0/118.9 s (+5%): aligned exchange disabled by the new block-type guard (mixed Λ27 has one ordinary cone) |
+| same, 4 nodes, 20 it (223553) | 632.5/625.3 vs 686.9/683.2 s (+9%) |
+| same, 1 node (223552) | 169.7/171.5 vs 176.0/175.7 s: residue contributions 35 → 22 s; refinement residuals 13 → 25 calls (+10 s) after removing stall prediction |
+| c824c3f vs head aacdc44 (guard on linear-touched rows + republish), 4 nodes (223562) | 114.2/114.4 vs 115.5/112.9 s (on par, correct) |
+| same, 1 node (223563) | 171.1/172.6 vs 176.6/175.3 s (+2.4%) |
+| residue contributions for short batches with pooled residue GEMM (223559/223560) | 4 nodes 115.2/117.9 → 131.6/128.7 s; 1 node +1.5%; rejected |
+
+Mixed Λ27 has one sampled-linear row outside zero blocks; c824c3f's aligned
+prepare read zero there on non-owner ranks (refinement absorbed it). The
+release keeps the aligned exchange and republishes such rows. Refinement
+stall prediction stays removed (Clarabel-style per-RHS refinement).
