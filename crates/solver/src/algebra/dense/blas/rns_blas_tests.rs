@@ -625,3 +625,83 @@ fn residue_diag_congruence_is_exact_rounded_once() {
     // Longer than one 4096-row block.
     check_diag_congruence::<2, 8>(3, 5000, 20, 23);
 }
+
+#[test]
+fn makespan_ways_feeds_spare_workers_to_heavy_blocks() {
+    // Fewer workers than blocks: everyone keeps one way.
+    assert_eq!(makespan_ways(&[3.0, 1.0, 1.0], 2), vec![1, 1, 1]);
+    // Unmeasured costs keep one way.
+    assert_eq!(makespan_ways(&[0.0, 0.0], 8), vec![1, 1]);
+    // Spare workers go to the heaviest block, within the worker budget.
+    let ways = makespan_ways(&[4.0, 1.0, 1.0, 1.0], 7);
+    assert!(ways.iter().sum::<usize>() <= 7);
+    assert_eq!(ways, vec![4, 1, 1, 1]);
+    // A 2.3x spread over 52 blocks on 96 workers splits the largest blocks.
+    let costs: Vec<f64> = (0..52).map(|i| (40.0 + 13.0 * i as f64 / 51.0).powi(3)).collect();
+    let ways = makespan_ways(&costs, 96);
+    assert!(ways.iter().sum::<usize>() <= 96);
+    assert!(ways[51] > ways[0] && ways[51] >= 2);
+}
+
+#[test]
+fn prime_group_congruence_matches_unsplit() {
+    fn run<const N: usize>(m: usize, seed: u64) {
+        let mut rng = Lcg(seed);
+        let a = random::<N>(&mut rng, m * m, 40);
+        let mut x = random::<N>(&mut rng, m * m, 40);
+        for j in 0..m {
+            for i in j + 1..m {
+                x[i + j * m] = x[j + i * m];
+            }
+        }
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        for upper_only in [false, true] {
+            let mut serial = vec![F::<N>::zero(); m * m];
+            assert!(congruence(b'N', m, m, &a, m, &x, m, upper_only, None, &mut serial, None));
+            let av = View { data: &a[..], rows: m, cols: m, ld: m };
+            let xv = View { data: &x[..], rows: m, cols: m, ld: m };
+            let (lo_a, hi_a) = av.exponent_range().unwrap();
+            let (lo_x, hi_x) = xv.exponent_range().unwrap();
+            let (da, dx) = (hi_a - lo_a, hi_x - lo_x);
+            let needed = 3.0 * F::<N>::PRECISION_BITS as f64
+                + (2 * da + dx) as f64
+                + 2.0 * (m as f64).log2()
+                + 3.0;
+            let plan = Plan::new(m, needed).unwrap();
+            for ways in 1..=5 {
+                let mut got = vec![<F<N> as num_traits::One>::one(); m * m];
+                pool.install(|| {
+                    let split = Split::Ways(ways);
+                    let ca = Operand::Chunks(chunk_matrix(av, lo_a, da, &plan, &split));
+                    let cx = chunk_matrix(xv, lo_x, dx, &plan, &split);
+                    let shape = CongruenceShape {
+                        ta: b'N',
+                        ta_n: true,
+                        m,
+                        k: m,
+                        lda: m,
+                        ldx: m,
+                        len_a: m * m,
+                        len_x: m * m,
+                        upper_only,
+                    };
+                    assert!(congruence_prime_groups(
+                        shape, &plan, &ca, &cx, &split, ways, 2 * lo_a + lo_x, &mut got
+                    ));
+                });
+                for j in 0..m {
+                    for i in 0..m {
+                        let o = i + j * m;
+                        if upper_only && i > j {
+                            assert_eq!(got[o], <F<N> as num_traits::One>::one());
+                        } else {
+                            assert!(got[o] == serial[o] || (got[o].is_zero() && serial[o].is_zero()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    run::<4>(9, 71);
+    run::<12>(53, 72);
+}

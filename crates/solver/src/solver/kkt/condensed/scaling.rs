@@ -93,9 +93,12 @@ pub(super) fn apply_block<T: FloatT>(
                     }
                     _ => p.apply(y, x, inverse, gemm),
                 });
-                // Work, not wall time: a split call finishes sooner, and
-                // using its wall time would oscillate the next allocation.
-                block.cost[a] = start.elapsed().as_secs_f64() * block.ways[a] as f64;
+                // Only unsplit calls measure: a split call's wall time times
+                // its ways overstates the work (split overhead), which fed
+                // back into more ways for the same block.
+                if block.ways[a] == 1 {
+                    block.cost[a] = start.elapsed().as_secs_f64();
+                }
             }
             Scaling::Orthant { w, .. } => {
                 for ((y, &x), &w) in y.iter_mut().zip(x).zip(w.iter()) {
@@ -180,19 +183,16 @@ fn action_index<T>(action: &ScalingAction<'_, T>) -> usize {
     }
 }
 
-/// Measured load balancing (SDPB 2.0 §2.2.2, worst-fit): a block whose last
-/// measured cost for this action exceeds a worker's fair share `total/W`
-/// gets `floor(cost/share)` ways for its residue products; the rest stay
-/// serial. Costs are data dependent (prime counts follow exponent spreads),
-/// so they are measured rather than modelled; the first call keeps 1 way.
+/// Measured load balancing (SDPB-style): spare workers go to the heaviest
+/// blocks ([`makespan_ways`]), so the largest cones stop setting the phase.
+/// Costs are data dependent (prime counts follow exponent spreads), so they
+/// are measured from unsplit calls; the first call keeps 1 way. Split
+/// congruences use prime groups, then output columns
+/// (Λ19 spins 0–50, 64/96 threads: -2/-3%).
 fn assign_ways<T>(blocks: &mut [Block<T>], action: usize, workers: usize) {
-    let total: f64 = blocks.iter().map(|b| b.cost[action]).sum();
-    if workers <= 1 || total <= 0.0 {
-        return;
-    }
-    let share = total / workers as f64;
-    for block in blocks.iter_mut() {
-        block.ways[action] = measured_ways(block.cost[action], share);
+    let costs: Vec<f64> = blocks.iter().map(|b| b.cost[action]).collect();
+    for (block, ways) in blocks.iter_mut().zip(makespan_ways(&costs, workers)) {
+        block.ways[action] = ways;
     }
 }
 
