@@ -294,18 +294,11 @@ fn psd_unit<T: FloatT>() -> u128 {
     64u128.pow(3) * words * words
 }
 
-/// Width per useful unit (`SDPX_DEV_WIDTH` overrides it for calibration).
+/// Width per useful unit.
 const WIDTH_FACTOR: f64 = 1.25;
 
 fn width_factor() -> f64 {
-    static OVERRIDE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *OVERRIDE.get_or_init(|| {
-        std::env::var("SDPX_DEV_WIDTH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &f64| *v > 0.0)
-            .unwrap_or(WIDTH_FACTOR)
-    })
+    WIDTH_FACTOR
 }
 
 /// SDPB-style static placement: when the process is bound to exactly as
@@ -318,7 +311,7 @@ fn width_factor() -> f64 {
 /// budget (`useful_width`), the calling (main) thread is confined to the
 /// workers' CPUs as well, so it neither wanders to another NUMA domain nor
 /// first-touches the solver's memory there. Linux only; elsewhere a no-op.
-fn pin_worker(budget: usize, workers: usize) -> impl Fn(usize) + Send + Sync + 'static {
+pub(crate) fn pin_worker(budget: usize, workers: usize) -> impl Fn(usize) + Send + Sync + 'static {
     #[cfg(target_os = "linux")]
     let cpus: Vec<usize> = unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();

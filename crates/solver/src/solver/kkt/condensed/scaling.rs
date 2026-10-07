@@ -294,6 +294,7 @@ pub(super) fn apply_scaling_pool<T: FloatT>(
         pool,
         lanes,
         tiles,
+        pool.as_ref().map_or(1, |p| p.current_num_threads()),
         blocks,
         y,
         x,
@@ -306,6 +307,7 @@ pub(super) fn apply_scaling_pool_with_world<T: FloatT>(
     pool: &Option<Arc<rayon::ThreadPool>>,
     lanes: &[usize],
     tiles: usize,
+    workers: usize,
     blocks: &mut [Block<T>],
     y: &mut [T],
     x: &[T],
@@ -316,6 +318,7 @@ pub(super) fn apply_scaling_pool_with_world<T: FloatT>(
         pool,
         lanes,
         tiles,
+        workers,
         blocks,
         y,
         x,
@@ -328,6 +331,7 @@ pub(super) fn apply_block_pool_with_world<T: FloatT>(
     pool: &Option<Arc<rayon::ThreadPool>>,
     lanes: &[usize],
     tiles: usize,
+    workers: usize,
     blocks: &mut [Block<T>],
     y: &mut [T],
     x: &[T],
@@ -352,7 +356,11 @@ pub(super) fn apply_block_pool_with_world<T: FloatT>(
     }
     if let Some(pool) = pool {
         if lanes.len() > 1 {
-            assign_ways(blocks, action_index(&action), pool.current_num_threads());
+            assign_ways(
+                blocks,
+                action_index(&action),
+                workers.min(pool.current_num_threads()),
+            );
             pool.install(|| split_scaling(blocks, y, x, action, lanes, gemm));
             return;
         }

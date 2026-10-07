@@ -207,6 +207,12 @@ impl<T: FloatT> OwnedKkt<T> {
         let settings = &local_settings;
         let border = layout.border_rows.len();
         let parts: Vec<_> = parts.collect();
+        // Owners in one process run concurrently on the shared pool: each
+        // plans its block phases for an equal share of it.
+        let share = match &pool {
+            Some(p) if parts.len() > 1 => (p.current_num_threads() / parts.len()).max(1),
+            _ => 0,
+        };
         let locals: Vec<_> = parts
             .into_iter()
             .zip(owner_ids.iter().enumerate())
@@ -226,6 +232,9 @@ impl<T: FloatT> OwnedKkt<T> {
                 // condensed planner still requires >1 workers, 4096-unit
                 // kernel work and a 75% local dominance threshold.
                 kernel.set_owner_inner_admission(heavy_owner);
+                if !heavy_owner {
+                    kernel.set_worker_share(share);
+                }
                 if let Some(sampled) = &data.sampled {
                     kernel.set_sampled_operator(Arc::clone(sampled));
                 }

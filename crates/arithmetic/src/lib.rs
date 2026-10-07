@@ -1648,19 +1648,13 @@ pub mod inner_parallel {
     }
 
     /// Work, in 64-bit limb products, that one extra pool task must carry
-    /// before an inner region is split (`SDPX_DEV_GRAIN` overrides it for
-    /// calibration runs).
+    /// before an inner region is split.
     pub const GRAIN: u128 = 1 << 15;
 
-    /// The effective grain ([`GRAIN`] unless overridden).
+    /// The inner-split grain ([`GRAIN`]).
+    #[inline]
     pub fn grain() -> u128 {
-        static GRAIN_OVERRIDE: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
-        *GRAIN_OVERRIDE.get_or_init(|| {
-            std::env::var("SDPX_DEV_GRAIN")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(GRAIN)
-        })
+        GRAIN
     }
 
     /// Limb-product weight of one multiply-add at `bits` of precision.

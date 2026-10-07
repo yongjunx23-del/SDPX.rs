@@ -296,6 +296,9 @@ impl<T: FloatT> OwnedSolver<T> {
             Some(Arc::new(
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(workers)
+                    // Same static placement as the default cone pool: a
+                    // rank bound to exactly `workers` CPUs pins one each.
+                    .start_handler(crate::solver::cones::pin_worker(workers, workers))
                     .build()
                     .map_err(|e| format!("owner worker pool: {e}"))?,
             ))

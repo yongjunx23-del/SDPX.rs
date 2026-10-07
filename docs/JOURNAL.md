@@ -8,6 +8,54 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-08 — multi-thread and multi-node scaling of sampled Ising solves
+
+Baseline (perf/cc1007 8384986, UCAS EPYC 7742 2x64, ising11/512, 1e-42):
+SDPX 23.2/4.16/3.43/4.04 s at 1/8/16/64 threads; SDPB 127/23/~12/48 s at
+1/8/64/256 ranks; SDPX one-node 22 ranks x 2 threads 2.40 s. Threads peaked
+at 16 and slowed beyond it. 4 nodes x 64 (TCP) were slower than one node.
+
+Diagnosis (`perf stat`): useful instructions stay ~219 G, but at 32/64
+threads idle workers busy-wait between the many short parallel phases; the
+clock falls 3.12 -> 2.05/2.35 GHz and IPC 2.69 -> 1.62/0.83. The unpinned
+main thread also wandered to other NUMA domains. Several earlier "4-node"
+runs were packed on one node, and probe jobs on node29 shared CPUs with
+other tenants (19-28% busy); all kept numbers below come from idle nodes
+named explicitly, with allocated-CPU pinning (`cpus.py` reads exec_host).
+
+Kept (points bitwise identical in every case; lib tests pass):
+1. One inner-parallel grain (2^15 limb products per task) for SVD, eigen,
+   MPFR BLAS, sparse lanes; residue products cap granted ways by work.
+2. A new PSD cone pool is no wider than 1.25 x its PSD units (one per cone
+   of order <= 64); when narrower than the bound CPUs, the main thread is
+   confined to the workers' CPUs.
+3. Split residue congruences share output columns, not primes (no CRT
+   merge; residues formed once). Neutral to -4% (ising11 at 22 threads).
+4. The owner-partitioned pool pins workers like the cone pool (-1 to -6%).
+5. In-process owners plan block phases for their share of the shared pool
+   (each had planned for the whole pool and split every congruence 8-16
+   ways): one process with 26 owners, spins 0-50 30 it 183.5 -> 125.7 s,
+   Lambda19 30 it 98.3 -> 71.1 s.
+
+Clean A/B (median of 3; idle nodes): ising11 64 threads 4.33 -> 3.87 s, 22
+threads 3.69 -> 3.41 s; Lambda19/768 119 it 64 threads 121.3 -> 112.6 s, 32
+threads 115.2 -> 111.2 s; spins 0-50 30 it 64 threads 61.6 -> 57.1 s.
+
+Multi-node (spins 0-50/768, 30 it): 1 node 4x16 66 s, 2 nodes 8x16 52-53 s,
+4 nodes 16x16 45.5 s (TCP). OpenMPI 3.1.6 + UCX (needs OPAL_PREFIX) works on
+one/two nodes but is within 2% of TCP and fails PMIx handshakes with node5/
+node7; TCP over ib0 stays. Four nodes lose to imbalance (per-rank SVD 6-12 s,
+allreduce waits up to 13 s of 41 s, 211 allreduces per iteration) and to
+work every rank replicates (sampled linear products, residual products,
+border solves: a one-owner rank at 2x32 spends 45 s in KKT update for half
+the blocks versus 27 s for all blocks in the threaded path).
+
+Rejected: grain-only sweep (no ising11 gain), pool-width factor sweep (Lambda19
+neutral), disabling residue ways in the threaded path (neutral), in-process
+`--partitions` as a substitute for threads (slower before item 5).
+Evidence: `hpc:~/projects/sdpx-ising11-scaling-20261007/{runs,logs}`; local
+scripts `~/.cache/sdpx-e2e/ising-scale/`.
+
 ## 2026-10-07 — reuse the Float64 bound Schur destination
 
 Delete `BoundPanels.gram`. Its existing BLAS calls write the lower Gram into

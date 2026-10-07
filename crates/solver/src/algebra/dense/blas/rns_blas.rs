@@ -305,19 +305,11 @@ fn split_plan(pool: Option<&rayon::ThreadPool>, work: u128) -> Split<'_> {
     }
 }
 
-/// Residue multiply-adds one extra way must carry (`SDPX_DEV_WAY_WORK`
-/// overrides it for calibration runs).
+/// Residue multiply-adds one extra way must carry.
 const WAY_WORK: u128 = 1 << 18;
 
 fn way_work() -> u128 {
-    static OVERRIDE: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
-    *OVERRIDE.get_or_init(|| {
-        std::env::var("SDPX_DEV_WAY_WORK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(WAY_WORK)
-            .max(1)
-    })
+    WAY_WORK
 }
 
 /// Exact product of integer-valued f64 matrices whose partial sums stay below

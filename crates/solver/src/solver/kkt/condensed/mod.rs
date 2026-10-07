@@ -717,6 +717,10 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     plan_threads: usize,
     scaling_lanes: Vec<usize>,
     scaling_tiles: usize,
+    /// Workers the block phases plan for: the pool width, or this owner's
+    /// share of a pool shared by several in-process owners.
+    scaling_workers: usize,
+    worker_share: usize,
     inner_schur: bool,
     inner_sampled: Option<usize>,
     // Owner-local kernels normally leave inner lanes disabled while every
@@ -1173,6 +1177,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             plan_threads: 0,
             scaling_lanes: Vec::new(),
             scaling_tiles: 1,
+            scaling_workers: 1,
+            worker_share: 0,
             inner_schur: false,
             inner_sampled: None,
             owner_inner_admission: false,
@@ -1259,12 +1265,24 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         self.plan_threads = 0;
     }
 
+    /// Plan this kernel's block phases for `share` workers of the pool it is
+    /// given (0: the whole pool). In-process owners share one pool; each
+    /// planning for its full width floods it with tiles and residue ways.
+    pub(crate) fn set_worker_share(&mut self, share: usize) {
+        self.worker_share = share;
+        self.plan_threads = 0;
+    }
+
     fn refresh_parallel_plan(&mut self) {
-        let workers = self.pool.as_ref().map_or(1, |p| p.current_num_threads());
+        let mut workers = self.pool.as_ref().map_or(1, |p| p.current_num_threads());
+        if self.worker_share > 0 {
+            workers = workers.min(self.worker_share);
+        }
         if workers == self.plan_threads {
             return;
         }
         self.plan_threads = workers;
+        self.scaling_workers = workers;
         let costs: Vec<_> = self
             .blocks
             .iter()
@@ -1616,6 +1634,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             &self.pool,
             &self.scaling_lanes,
             self.scaling_tiles,
+            self.scaling_workers,
             &mut self.blocks,
             &mut self.workh,
             &point[self.n..],
@@ -1696,6 +1715,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 &self.pool,
                 &self.scaling_lanes,
                 self.scaling_tiles,
+                self.scaling_workers,
                 &mut self.blocks,
                 &mut self.workz,
                 bz,
@@ -1810,6 +1830,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             &self.pool,
             &self.scaling_lanes,
             self.scaling_tiles,
+            self.scaling_workers,
             &mut self.blocks,
             z,
             &self.workz,
@@ -1887,6 +1908,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             blocks,
             scaling_lanes,
             scaling_tiles,
+            scaling_workers,
             sparse_products,
             a_panel,
             ..
@@ -1976,6 +1998,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     pool,
                     scaling_lanes,
                     *scaling_tiles,
+                    *scaling_workers,
                     blocks,
                     workh,
                     z,

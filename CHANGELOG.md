@@ -25,6 +25,13 @@ solve 2.02 s/50 it (objective error 4.5e-7) → 9 ms/0 it (6.6e-14), whole CLI
 
 ### Performance
 
+- Wide pools on PSD problems: inner splits need one grain of work per task,
+  the cone pool is no wider than its PSD work (the main thread stays on the
+  workers' CPUs), split congruences share output columns, and in-process
+  owners plan for their share of the pool. Idle-node EPYC 7742, points
+  bitwise identical: ising11/512 64 threads 4.33 → 3.87 s; Λ19/768 64
+  threads 121.3 → 112.6 s; one process with 26 owners on Λ19 spins 0–50
+  (30 it) 183.5 → 125.7 s.
 - MPFR standard-form conic problems: any mix of small orthant/SOC cones whose
   rows touch only their own variables is eliminated leaf by leaf around the
   equality rows (`local_cone_arrow`; oversized cones join the border), with
