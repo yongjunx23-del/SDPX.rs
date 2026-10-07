@@ -618,10 +618,7 @@ fn pooled_gram<T: FloatT>() {
         let pointers = (pooled.v.data().as_ptr(), pooled.gram.as_ptr());
         let tiles = (pooled.gemm_tile, pooled.syrk_tile);
         pooled.update_with_pool(&b, &rinv, Some(&pool));
-        assert_eq!(
-            pointers,
-            (pooled.v.data().as_ptr(), pooled.gram.as_ptr())
-        );
+        assert_eq!(pointers, (pooled.v.data().as_ptr(), pooled.gram.as_ptr()));
         assert_eq!(tiles, (pooled.gemm_tile, pooled.syrk_tile));
         for p in 0..b.column_count() {
             for q in 0..=p {
@@ -882,7 +879,10 @@ fn duplicate_basis<T: FloatT>() {
     };
     let mut work = SampledSchurWorkspace::new(&b);
     assert_eq!(work.count, 4); // Four exact vectors, including a near duplicate.
-    assert_eq!(work.gram.len(), if T::precision_bits() > 64 { 36 } else { 64 });
+    assert_eq!(
+        work.gram.len(),
+        if T::precision_bits() > 64 { 36 } else { 64 }
+    );
     assert_eq!(work.pairs.len(), b.weights.len());
     let mut pooled = SampledSchurWorkspace::new(&b);
     let pool = rayon::ThreadPoolBuilder::new()

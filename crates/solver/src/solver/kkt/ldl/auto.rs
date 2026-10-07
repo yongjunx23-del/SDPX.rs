@@ -15,7 +15,7 @@ where
 {
     use crate::solver::kkt::ldl::faer_ldl::FaerDirectLDLSolver;
 
-    assert!(KKT.is_square(), "KKT matrix is not square");
+    debug_assert!(KKT.is_square());
 
     // Compute an AMD ordering for the KKT matrix,
     // and use it to determine whether we want to

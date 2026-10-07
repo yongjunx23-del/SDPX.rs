@@ -7303,3 +7303,157 @@ Mixed Λ27 has one sampled-linear row outside zero blocks; c824c3f's aligned
 prepare read zero there on non-owner ranks (refinement absorbed it). The
 release keeps the aligned exchange and republishes such rows. Refinement
 stall prediction stays removed (Clarabel-style per-RHS refinement).
+
+## 2026-10-07 — g0-min SOCP versus MOSEK: presolve, shared-SOC shift, Schur kernel
+
+Input: `massive case with real/reproduce with deepseek/code/socp_fine` (106,175
+SOC3 cones, one free scaled majorant per cone, multipliers fixed). Local M4,
+10 threads, other sessions loading the machine (load 2–8).
+
+| Run | Status/it | Solve | Objective error |
+|---|---|---|---|
+| SDPX 0.9.1 Float64 | Solved/50 | 2.02 s | −4.5e-7 |
+| MOSEK 11.1.3, presolve on | optimal | 0.12–0.14 s internal | +4.4e-15 |
+| MOSEK, presolve off | optimal | 2.53 s | +1.4e-4 |
+| SDPX + SOC tail → orthant only (prototype) | Solved/10 | 0.18 s | 1.2e-13 |
+| SDPX + tail and singleton presolve | Solved/0 | 9 ms (CLI 0.06 s) | 6.6e-14 |
+| SDPX 0.9.1 MPFR256 | Solved/33 | 26.7 s | 5.1e-40 |
+| SDPX presolved MPFR256 | Solved/0 | 0.09 s | 3.1e-77 |
+
+MOSEK's advantage was entirely presolve: every cone tail is constant, so each
+cone is a bound on its own variable. Without presolve MOSEK is slower and less
+accurate than SDPX.
+
+Synthetic free-multiplier variant (16 dense random null columns, 5.2M nnz;
+generator `~/.cache/sdpx-e2e/g0min/freelam.py`), shared-SOC arrow:
+
+| Run | it | Solve | Objective |
+|---|---|---|---|
+| SDPX before (static shift 1e-8) | 60 | 15.7 s | 7.743349 (infeasible by 1.5e-6; true value at its λ 7.7434858) |
+| + chunked binary64 Schur | 60 | ≈11 s | — |
+| + leaf primal shift exemption | 15 | 3.15 s | 7.7434858 |
+| MOSEK (presolve eliminates the 106k singleton columns, solves the dual with 16 rows) | 13 | 1.3 s | 7.743501 |
+
+128-bit on a 10% subsample converges in ~15 iterations; Float64 stalled (μ ≈
+3e-4) because the static shift 1e-8 swamps the leaf primal pivots `aᵀH⁻¹a`
+(dual heads span 1e-14…13). Exempting only the x block reproduces the 128-bit
+path (15 it, error 2e-9); exempting the cone block does not. A global smaller
+shift is not acceptable: on the 46-problem Float64 set 1e-12 breaks hinf2,
+nql30 and sched_* (InsufficientProgress).
+
+Regression: the 46-problem Float64 set is unchanged in status, iterations and
+objective (10 digits); csdr3 MPFR256 Solved/57 with identical objective
+(local SOC arrow, no reductions); workspace tests pass after three fixtures
+(one-row LPs now presolved away) disable presolve.
+
+## 2026-10-07 — SDPB's HKM (XZ) direction: measured, not adopted
+
+Opt-in primal HKM PSD cone on the augmented KKT (`H = S ⊗ₛ Z⁻¹`, unscaled
+offset `S + sym(ΔSₐΔZₐZ⁻¹) − σμZ⁻¹`, Cholesky step lengths; patch kept at
+`~/.cache/sdpx-e2e/g0min/hkm-experiment.patch`).
+
+| Measurement | NT | HKM |
+|---|---|---|
+| one 88×88 cone update, 1024 bits, 1 thread (M4) | 1.053 s | 0.161 s |
+| ising11 MPFR512, augmented, 8 threads | Solved/52, 37.1 s | Solved/58, 41.9 s (same objective) |
+| Float64 SDPLIB (augmented) iterations | arch0 21, control1–3 71/25/29, gpp100 25, hinf1–2 32/17, qap5–6 9/25, theta1–2 12/10, truss1/4 11/10, mcp250 12 | 22, 64/27/32, 28, 27/20, 11/26, 10/10, 8/8, 13 |
+
+Cone scaling is 16–33% of a Λ27 solve; a 6.5× cheaper update saves ≈10%
+per iteration before the second Gram and non-congruence transforms that the
+condensed path would need (H⁻¹ = S⁻¹ ⊗ₛ Z factors as `L_S⁻¹ X L_Z`, not a
+congruence). The +5–12% high-precision iteration count (Λ19 Julia era 125 vs
+119; ising11 58 vs 52) removes the rest. Not ported; code removed.
+
+## 2026-10-07 — Behaviour-neutral restructuring (independence, stage 1)
+
+Parity harness `~/.cache/sdpx-e2e/g0min/parity/{run.sh,cmp.py}`: 46 Float64
+benchmark problems (gpp250/500 excluded for time), g0 fixed/LP/subsample,
+ising11 MPFR512 and csdr3 MPFR256 (4 threads). Two runs of one binary are
+49/49 identical. After the staged driver, banner/presolve report, comment and
+metadata changes: 49/49 bitwise identical (x, s, z, objectives, status,
+iterations). Workspace tests pass with the default features (faer, build.rs
+BLAS).
+
+## 2026-10-07 — Larger gravity Float64: where the MOSEK iteration gap comes from
+
+Four threads, qnorm settings, local M4 (preliminary timings). Baseline
+Solved/37, 0.434 s. Probes (code removed):
+
+| Probe | it | native |
+|---|---|---|
+| bound-leaf primal columns without static shift | 37 | 0.445 s |
+| border equality rows without static shift | 32 | 0.384 s (residuals 7× smaller) |
+| + free border variables and leaf primals | 32 | 0.367 s |
+| global `static_regularization_constant` 1e-14 | 32 | 0.358 s |
+
+Static regularization explains 37 → 32 only; MOSEK takes 21. The remaining
+gap is centrality: 6 of 32 iterations take α ≤ 0.105 (0.027, 0.008, 0.031,
+0.092, 0.025, 0.105) after the iterate reaches the boundary, then recover.
+Equality rows lack a structural pivot proof (it needs leaf-coupled full row
+rank), so their exemption is not adopted.
+
+## 2026-10-07 — Gondzio centrality correctors and batched refinement (approved)
+
+Batched refinement: the constant and affine right-hand sides refine
+together (one residual pass over the row plan for both, one two-column
+correction solve); each column keeps its own residual, tolerance and
+stop-ratio decisions. Single right-hand sides use the same routine with one
+column (bitwise as before). Parity: 36/49 identical; the 13 differences are
+`local_bounds_faer` LPs, whose two-column factor solve uses a different BLAS
+kernel (objectives 1e-16–6e-15 relative, same iterations and residuals).
+Medians of three alternating runs (load ~5): free-λ g0 3.26 → 3.14 s,
+larger gravity (4 threads) 0.428 → 0.414 s.
+
+Gondzio correctors (Colombo & Gondzio 2008): after the combined direction,
+aim at α̃ = min(1, 1.5α + 0.3), push trial orthant products and τκ outside
+[0.1σμ, 10σμ] back into the band (large products capped at −10σμ), re-solve
+with the same factorization and keep the direction only if the step grows by
+1%; at most two per iteration, none once α ≥ 0.9; symmetric cones only (SOC
+and PSD rows keep their Mehrotra right-hand side).
+
+| Variant (21 LP/SOCP cases + larger gravity) | iterations | native | gravity | not Solved |
+|---|---|---|---|---|
+| off | 446 | 11.50–11.59 s | 37 / 0.40–0.45 s | sched_100_100, sched_50_50 (Almost) |
+| ≤2 correctors | 365 | 11.41 s | 23 / 0.360 s | sched_100_50 (Almost) |
+| ≤1 corrector | 388 | 11.51 s | 27 / 0.363 s | sched_100_50 |
+| ≤2, skip α ≥ 0.9 (kept) | 366 | 11.40–11.57 s | 22 / 0.355–0.364 s | sched_100_50 |
+| ≤2, orthant/zero-cone problems only | 371 | 11.36 s | 23 / 0.360 s | sched_100_100, sched_50_50 |
+
+LP iterations fall 20–30% (agg 41 → 28, bnl1 55 → 40); larger gravity 37 → 22
+(MOSEK 21), −16% native. Objectives move within tolerance (netlib agg
+2.3e-7 → 2.3e-6 relative to the published optimum, bnl1 2.5e-6 → 6.9e-6).
+ising11 and csdr3 are bitwise unchanged (one rejected attempt, 11 ms, on
+ising11). Small LPs gain little time: a corrector costs one solve.
+
+### Correctors on second-order cones; csdr3 tolerance artifact
+
+SOC rows get spectral corrections: the Jordan product of the NT-scaled trial
+point `W⁻ᵀ(s + αΔs) ∘ W(z + αΔz)` has its two spectral values pushed into the
+band (`λ ∘ (WΔz + W⁻ᵀΔs) = −ds`). Correctors run on symmetric-cone problems
+with orthant or SOC rows (pure SDP/PSD problems keep Mehrotra). Corrector
+subset 366 → 333 iterations, all Solved (sched_100_50 no longer Almost).
+
+Parity set: iterations 993 → 849, native 28.4 → 27.4 s; sched SOCPs all
+Solved (two were AlmostSolved); every SOCP equal or fewer iterations;
+free-λ g0 15 → 11 it (3.39 → 3.05 s); csdr3 MPFR256 57 → 36 it
+(6.78 → 5.61 s).
+
+csdr3 at its pinned 1e-8 tolerances ends at −31.7008 (reference −31.6737;
+historical −31.672156); both pass the original-coordinate audit. pcost and
+dcost drift together while the gap and residuals are already below 1e-8
+(weakly feasible problem; κ/τ still 8.5e-6), so the earlier stop lands
+earlier on that drift. At 1e-12 both runs reach −31.6721556 (agreement
+4e-11, historical 1.3e-8): reference 103 it / 12.21 s, correctors 79 it /
+11.98 s. The pinned tolerance, not the direction, limits csdr3's objective.
+
+Tests asserting a 1e-8 objective on the basic LP now request 1e-9 gaps
+(the 1e-8 default does not guarantee a 1e-8 objective; the previous pass
+relied on overshoot), and the forced MaxIterations test caps at 4 iterations.
+
+### Λ27 1024-bit cone-scaling inner splits (rejected)
+
+Job 223636 (node49, 1 node, 3 it, ABAB with release head): scale cones
+rhead 23.9/24.0 s, without change 24.1/24.2 s, with inner splits always on in
+the cone job path 24.3/24.1 s; solve 175.6–181.2 s across arms, points
+identical. Job 223635 (4 nodes) lost an MPI daemon on node36 in run 2
+(network failure, exit 205) and hung; inconclusive. Reverted.

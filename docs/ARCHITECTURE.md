@@ -48,7 +48,11 @@ the readers and C ABI validate their transport formats. Internal code trusts
 the structures the solver builds and uses `debug_assert!` for its invariants.
 
 Ordinary direct solves apply presolve, chordal decomposition and Ruiz
-equilibration. Prepared handles keep Ruiz but disable structural
+equilibration. Presolve removes infinite orthant bounds and exactly dependent
+equalities, merges SOC tail coordinates with zero rows of `A` (a constant
+tail makes the cone an orthant row), and fixes variables whose only nonzero is
+a single-entry orthant or equality row (objective constant reported in both
+costs); postsolve lifts `x`, `s`, `z` and certificates. Prepared handles keep Ruiz but disable structural
 preprocessing so later data updates keep the prepared structure. Consumed
 JSON problems move their owned P, q, b and A into setup instead of copying.
 Explicit, automatic and MPI owner partitions use one setup route; MPI derives
@@ -94,11 +98,16 @@ Each HSD iteration:
 3. updates and factors the KKT operator;
 4. solves the affine and combined predictor/corrector directions — the
    constant and affine right-hand sides share one batched solve;
-5. chooses the step (Float64 symmetric problems also try a quadratic curve
-   on the two existing directions) and updates the iterate, keeping the
-   previous accepted iterate for recovery.
+5. chooses the step — symmetric-cone problems with orthant or SOC rows first
+   apply up to two Gondzio centrality correctors (orthant products, SOC
+   spectral values of the scaled Jordan product and τκ pushed into
+   [0.1σμ, 10σμ], kept only when the step grows by 1%, skipped once α ≥ 0.9),
+   and Float64 symmetric problems also try a quadratic curve on the affine and
+   combined directions — and updates the iterate, keeping the previous
+   accepted iterate for recovery.
 
-Newton solves use iterative refinement against the true, unshifted operator.
+Newton solves use iterative refinement against the true, unshifted operator;
+batched right-hand sides share each residual pass and correction solve.
 At MPFR precision every refinement residual row is an exact dot product
 rounded once, so refinement keeps working on badly scaled bootstrap systems.
 Every right-hand side uses its own residual and measured correction gain;
@@ -138,7 +147,7 @@ reported as `linear_solver`.
 | Order | Backend | Selection |
 |---|---|---|
 | 1 | `local_soc_arrow` | ≥ 8 SOC3 leaves with a nonempty equality border of ≤ 128 coordinates and no cross-leaf coupling. |
-| 2 | `shared_soc_arrow` | Zero and ≥ 8 SOC3 cones only (augmented form; condensed eliminates SOC3), shared primal border of ≤ 128 coordinates, workspace ≤ `shared_soc_max_bytes` (default 512 MiB; 0 disables). |
+| 2 | `shared_soc_arrow` | Zero and ≥ 8 SOC3 cones only (augmented form; condensed eliminates SOC3), shared primal border of ≤ 128 coordinates, workspace ≤ 512 MiB (the arrow memory cap). A leaf's single primal column follows its SPD cone block and keeps its true diagonal (no static shift) until a factorization fails (approved 2026-10-07). |
 | 3 | `local_bounds_faer` / `local_bounds_arrow` | ≥ 64 variables with one or two local bound rows, diagonal `P` and a nonempty equality/free border, admitted by added storage. Float64 needs `faer-sparse`; MPFR uses exact bound Gram products. |
 | 4 | `dense_block` | Float64: an eligible dense leading positive block, pooled tiled Cholesky. |
 | 5 | `arrow` | Disconnected positive dense leaves around a negative border, estimated workspace ≤ max(512 MiB, 8 × KKT storage) (Float64 and MPFR). Leaf contributions are recomputed in bounded batches. |
@@ -275,13 +284,15 @@ failure handling without allocating a separate folded result.
 
 ## Build features
 
-BLAS/LAPACK are always linked. Choose one provider feature or supply direct
-linkage (for example `RUSTFLAGS="-l dylib=openblas"`).
+BLAS/LAPACK are always linked. Without a provider feature, `build.rs` links
+Accelerate on macOS and the system dynamic OpenBLAS on other Unix targets
+(`OPENBLAS_LIB_DIR` adds a search path; `SDPX_BLAS_LINK=none` defers to
+`RUSTFLAGS`, for example `-l dylib=openblas`).
 
 | Feature | Effect |
 |---|---|
 | `sdp-accelerate`, `sdp-openblas`, `sdp-mkl`, `sdp-netlib` | BLAS/LAPACK provider (solver and FFI crates). |
-| `faer-sparse` | Float64 faer sparse LDL and packed local-bound kernels. |
+| `faer-sparse` (default) | Float64 faer sparse LDL and packed local-bound kernels. |
 | `serde` (solver default) | JSON input, output and settings; required by `sdpx`. |
 | `all-precisions` | Frontend MPFR dispatch for 128–2048 bits in steps of 64 (default: 128, 256, 512, 768, 1024). Native `MpFloat<N>` types are unaffected. |
 

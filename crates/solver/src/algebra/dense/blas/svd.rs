@@ -144,7 +144,7 @@ where
         // and should panic if encountered.
         self.checkdim_solve(B).unwrap();
 
-        // PJG: always use blas to solve, regardless of
+        // always use blas to solve, regardless of
         // dimension.  SVD solve does not happen over cones,
         // and is only I used (I think) during chordal
         // decomposition.   Could come back to this for

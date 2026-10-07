@@ -283,7 +283,6 @@ where
             };
 
             // bail if the cholesky factorization fails
-            // PJG: Need proper Result return type here
             if c1.is_err() || c2.is_err() {
                 return false;
             }
@@ -355,7 +354,7 @@ where
             f.G.data_mut().set(T::zero());
             f.G.syrk(&f.R, T::one(), T::zero(), MatrixTriangle::Triu);
 
-            true //PJG: Should return result, with "?" operators above
+            true
         })
     }
 

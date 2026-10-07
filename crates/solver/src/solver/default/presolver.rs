@@ -7,7 +7,6 @@ use crate::solver::SupportedConeT;
 // Data type for default problem presolver
 // ---------------
 
-// PJG: updates required here
 #[derive(Debug)]
 pub(crate) struct PresolverRowReductionIndex {
     // vector of length = original RHS.   Entries are false
@@ -22,8 +21,17 @@ pub(crate) struct Presolver<T> {
     // original cones of the problem
     pub(crate) _init_cones: Vec<SupportedConeT<T>>,
 
-    // Original-row map for exact equality and infinite NN reductions
+    // Original-row map for exact equality, infinite NN and SOC tail reductions
     pub(crate) reduce_map: Option<PresolverRowReductionIndex>,
+
+    // Second-order cones whose constant tail coordinates were merged
+    pub(crate) soc_tails: Vec<SocTail<T>>,
+
+    // Variables fixed by their only (singleton) row; `keep_columns` is set
+    // when any were removed, and `objective_offset` is their `Σ q_j x_j`.
+    pub(crate) fixed: Vec<FixedColumn<T>>,
+    pub(crate) keep_columns: Option<Vec<bool>>,
+    pub(crate) objective_offset: T,
 
     // size of original and reduced RHS, respectively
     pub(crate) mfull: usize,
@@ -42,6 +50,8 @@ where
 {
     /// create a new presolver object
     pub(crate) fn new(
+        P: &CscMatrix<T>,
+        q: &[T],
         A: &CscMatrix<T>,
         b: &[T],
         cones: &[SupportedConeT<T>],
@@ -53,11 +63,56 @@ where
         let init_cones = cones.to_vec();
         let mfull = b.len();
 
-        let (reduce_map, mreduced) = make_reduction_map(A, cones, b, infbound.as_T());
+        let (mut reduce_map, mut mreduced) = make_reduction_map(A, cones, b, infbound.as_T());
+        let soc_tails = soc_constant_tails(A, b, cones);
+        if !soc_tails.is_empty() {
+            let keep = &mut reduce_map
+                .get_or_insert_with(|| PresolverRowReductionIndex {
+                    keep_logical: vec![true; mfull],
+                })
+                .keep_logical;
+            for tail in &soc_tails {
+                for &row in &tail.rows {
+                    if Some(row) != tail.carrier {
+                        keep[row] = false;
+                        mreduced -= 1;
+                    }
+                }
+            }
+        }
+        let fixed = singleton_columns(
+            P,
+            q,
+            A,
+            &reduced_rhs(b, &soc_tails),
+            cones,
+            &soc_tails,
+            reduce_map.as_ref().map(|map| &map.keep_logical[..]),
+        );
+        let mut keep_columns = None;
+        let mut objective_offset = T::zero();
+        if !fixed.is_empty() {
+            let keep = &mut reduce_map
+                .get_or_insert_with(|| PresolverRowReductionIndex {
+                    keep_logical: vec![true; mfull],
+                })
+                .keep_logical;
+            let columns = keep_columns.get_or_insert_with(|| vec![true; A.n]);
+            for f in &fixed {
+                keep[f.row] = false;
+                columns[f.column] = false;
+                mreduced -= 1;
+            }
+            objective_offset = T::dot_fma(fixed.iter().map(|f| (&q[f.column], &f.x)));
+        }
 
         Self {
             _init_cones: init_cones,
             reduce_map,
+            soc_tails,
+            fixed,
+            keep_columns,
+            objective_offset,
             mfull,
             mreduced,
             infbound,
@@ -73,24 +128,40 @@ where
         self.mfull - self.mreduced
     }
 
+    /// Reduced `A`, `b` and cones, plus `P` and `q` when columns were removed.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn presolve(
         &self,
+        P: &CscMatrix<T>,
+        q: &[T],
         A: &CscMatrix<T>,
         b: &[T],
         cones: &[SupportedConeT<T>],
-    ) -> (CscMatrix<T>, Vec<T>, Vec<SupportedConeT<T>>) {
+    ) -> (
+        CscMatrix<T>,
+        Vec<T>,
+        Vec<SupportedConeT<T>>,
+        Option<(CscMatrix<T>, Vec<T>)>,
+    ) {
         let (A_new, b_new) = self.reduce_A_b(A, b);
         let cones_new = self.reduce_cones(cones);
+        let objective = self
+            .keep_columns
+            .as_ref()
+            .map(|keep| (select_principal(P, keep), q.select(keep)));
 
-        (A_new, b_new, cones_new)
+        (A_new, b_new, cones_new, objective)
     }
 
     fn reduce_A_b(&self, A: &CscMatrix<T>, b: &[T]) -> (CscMatrix<T>, Vec<T>) {
         assert!(self.reduce_map.is_some());
         let map = self.reduce_map.as_ref().unwrap();
 
-        let A = A.select_rows(&map.keep_logical);
-        let b = b.select(&map.keep_logical);
+        let mut A = A.select_rows(&map.keep_logical);
+        if let Some(keep) = &self.keep_columns {
+            A = select_columns(&A, keep);
+        }
+        let b = reduced_rhs(b, &self.soc_tails).select(&map.keep_logical);
 
         (A, b)
     }
@@ -122,6 +193,10 @@ where
                         SupportedConeT::NonnegativeConeT(nkeep)
                     });
                 }
+            } else if matches!(cone, SupportedConeT::SecondOrderConeT(_)) {
+                cones_new.push(SupportedConeT::SecondOrderConeT(
+                    markers.filter(|&b| *b).count(),
+                ));
             } else {
                 //NB: take() is lazy, so must consume this block
                 //to force keep_iter to advance to the next cone
@@ -134,7 +209,8 @@ where
             }
         }
 
-        cones_new
+        // A fully constant SOC tail leaves a one-row cone, i.e. an orthant row.
+        SupportedConeT::new_collapsed(&cones_new)
     }
 
     pub(crate) fn reverse_presolve(
@@ -142,7 +218,25 @@ where
         solution: &mut DefaultSolution<T>,
         variables: &DefaultVariables<T>,
     ) {
-        solution.x.copy_from(&variables.x);
+        // Certificates have no constant part: tail slacks are -A x = 0, and
+        // fixed columns and their rows carry zero certificate entries.
+        let certificate = solution.status.is_infeasible();
+        match &self.keep_columns {
+            None => {
+                solution.x.copy_from(&variables.x);
+            }
+            Some(keep) => {
+                let mut reduced = variables.x.iter();
+                for (x, &kept) in solution.x.iter_mut().zip(keep) {
+                    if kept {
+                        *x = *reduced.next().unwrap();
+                    }
+                }
+                for f in &self.fixed {
+                    solution.x[f.column] = if certificate { T::zero() } else { f.x };
+                }
+            }
+        }
 
         let map = self.reduce_map.as_ref().unwrap();
         let mut ctr = 0;
@@ -164,7 +258,212 @@ where
                 solution.z[idx] = T::zero();
             }
         }
+        for f in &self.fixed {
+            solution.s[f.row] = T::zero();
+            solution.z[f.row] = if certificate { T::zero() } else { f.z };
+        }
+        for tail in &self.soc_tails {
+            let scale = |v: T| {
+                if tail.norm == T::zero() {
+                    T::zero()
+                } else {
+                    v / tail.norm
+                }
+            };
+            match tail.carrier {
+                // (s1, s_V, ν) and (z1, z_V, ζ) lift to s_C = s_ν·b_C/ν and
+                // z_C = ζ·b_C/ν: same cone norms, inner products and bᵀz.
+                Some(row) => {
+                    let (s, z) = (solution.s[row], solution.z[row]);
+                    for (&r, &v) in tail.rows.iter().zip(&tail.values) {
+                        solution.s[r] = s * scale(v);
+                        solution.z[r] = z * scale(v);
+                    }
+                }
+                // Orthant row s1 - ν >= 0 with multiplier z1 lifts to
+                // s = (s1, b_C) and z = z1·(1, -b_C/ν) on the cone boundary.
+                None => {
+                    let z = solution.z[tail.head];
+                    if !certificate {
+                        solution.s[tail.head] += tail.norm;
+                    }
+                    for (&r, &v) in tail.rows.iter().zip(&tail.values) {
+                        solution.s[r] = if certificate { T::zero() } else { v };
+                        solution.z[r] = -z * scale(v);
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Coordinates `C` of a second-order cone tail whose rows of `A` are all zero
+/// have constant slacks `b_C`, so `(s1, s_V, s_C) ∈ K` iff `(s1, s_V, ν) ∈ K`
+/// with `ν = ‖b_C‖`. One carrier row keeps `ν` (none when `ν = 0`); with no
+/// variable tail left the cone is the orthant row `s1 - ν >= 0`.
+#[derive(Debug)]
+pub(crate) struct SocTail<T> {
+    head: usize,
+    rows: Vec<usize>,
+    values: Vec<T>,
+    norm: T,
+    carrier: Option<usize>,
+    orthant: bool,
+}
+
+/// `b` after the SOC tail reductions (carrier `ν`, orthant head `b1 - ν`).
+fn reduced_rhs<T: FloatT>(b: &[T], tails: &[SocTail<T>]) -> Vec<T> {
+    let mut b = b.to_vec();
+    for tail in tails {
+        match tail.carrier {
+            Some(row) => b[row] = tail.norm,
+            None => b[tail.head] -= tail.norm,
+        }
+    }
+    b
+}
+
+/// A variable `x_j` without quadratic terms whose only retained nonzero
+/// `a = A_ij` lies in a single-entry orthant or equality row `i` is fixed at
+/// `x_j = b_i/a`, with multiplier `z_i = -q_j/a` (dual row `q_j + a z_i = 0`)
+/// and `s_i = 0`. An orthant row needs `z_i >= 0`; otherwise the column is
+/// left to the solver. Row and column leave; `q_j x_j` is an objective constant.
+#[derive(Debug)]
+pub(crate) struct FixedColumn<T> {
+    column: usize,
+    row: usize,
+    x: T,
+    z: T,
+}
+
+fn singleton_columns<T: FloatT>(
+    P: &CscMatrix<T>,
+    q: &[T],
+    A: &CscMatrix<T>,
+    b: &[T],
+    cones: &[SupportedConeT<T>],
+    tails: &[SocTail<T>],
+    keep: Option<&[bool]>,
+) -> Vec<FixedColumn<T>> {
+    const ORTHANT: u8 = 1;
+    const EQUALITY: u8 = 2;
+    let mut kind = vec![0u8; b.len()];
+    let mut start = 0;
+    for cone in cones {
+        let dim = cone.nvars();
+        let k = match cone {
+            SupportedConeT::NonnegativeConeT(_) => ORTHANT,
+            SupportedConeT::ZeroConeT(_) => EQUALITY,
+            _ => 0,
+        };
+        kind[start..start + dim].fill(k);
+        start += dim;
+    }
+    for tail in tails.iter().filter(|t| t.orthant) {
+        kind[tail.head] = ORTHANT;
+    }
+    if !kind.iter().any(|&k| k != 0) {
+        return Vec::new();
+    }
+    let kept = |r: usize| keep.is_none_or(|k| k[r]);
+    let mut row_count = vec![0u32; b.len()];
+    for (&r, &v) in A.rowval.iter().zip(&A.nzval) {
+        if v != T::zero() && kept(r) {
+            row_count[r] = row_count[r].saturating_add(1);
+        }
+    }
+    let mut quadratic = vec![false; A.n];
+    for j in 0..P.n {
+        for k in P.colptr[j]..P.colptr[j + 1] {
+            if P.nzval[k] != T::zero() {
+                quadratic[j] = true;
+                quadratic[P.rowval[k]] = true;
+            }
+        }
+    }
+    let mut fixed = Vec::new();
+    for column in 0..A.n {
+        if quadratic[column] {
+            continue;
+        }
+        let mut entries = (A.colptr[column]..A.colptr[column + 1])
+            .filter(|&k| A.nzval[k] != T::zero() && kept(A.rowval[k]));
+        let (Some(k), None) = (entries.next(), entries.next()) else {
+            continue;
+        };
+        let (row, a) = (A.rowval[k], A.nzval[k]);
+        if row_count[row] != 1 || kind[row] == 0 {
+            continue;
+        }
+        let (x, z) = (b[row] / a, -q[column] / a);
+        if !x.is_finite() || !z.is_finite() || (kind[row] == ORTHANT && z < T::zero()) {
+            continue;
+        }
+        fixed.push(FixedColumn { column, row, x, z });
+    }
+    fixed
+}
+
+fn select_columns<T: FloatT>(A: &CscMatrix<T>, keep: &[bool]) -> CscMatrix<T> {
+    let mut colptr = vec![0];
+    let (mut rowval, mut nzval) = (Vec::new(), Vec::new());
+    for (j, _) in keep.iter().enumerate().filter(|(_, &k)| k) {
+        rowval.extend_from_slice(&A.rowval[A.colptr[j]..A.colptr[j + 1]]);
+        nzval.extend_from_slice(&A.nzval[A.colptr[j]..A.colptr[j + 1]]);
+        colptr.push(rowval.len());
+    }
+    CscMatrix::new(A.m, colptr.len() - 1, colptr, rowval, nzval)
+}
+
+/// Principal submatrix of `P` on the retained columns; removed columns have
+/// no nonzero entries.
+fn select_principal<T: FloatT>(P: &CscMatrix<T>, keep: &[bool]) -> CscMatrix<T> {
+    let keep = keep.to_vec();
+    select_columns(P, &keep).select_rows(&keep)
+}
+
+fn soc_constant_tails<T: FloatT>(
+    A: &CscMatrix<T>,
+    b: &[T],
+    cones: &[SupportedConeT<T>],
+) -> Vec<SocTail<T>> {
+    if !cones
+        .iter()
+        .any(|c| matches!(c, SupportedConeT::SecondOrderConeT(d) if *d > 1))
+    {
+        return Vec::new();
+    }
+    let mut used = vec![false; b.len()];
+    for (&row, &value) in A.rowval.iter().zip(&A.nzval) {
+        used[row] |= value != T::zero();
+    }
+    let mut tails = Vec::new();
+    let mut start = 0;
+    for cone in cones {
+        let dim = cone.nvars();
+        if let SupportedConeT::SecondOrderConeT(d) = cone {
+            if *d > 1 {
+                let rows: Vec<usize> = (start + 1..start + dim).filter(|&r| !used[r]).collect();
+                let values: Vec<T> = rows.iter().map(|&r| b[r]).collect();
+                let norm = values.norm();
+                let orthant = rows.len() == dim - 1;
+                // A single constant coordinate is already merged.
+                if !rows.is_empty() && (orthant || rows.len() > 1) {
+                    let carrier = (!orthant && norm != T::zero()).then_some(rows[0]);
+                    tails.push(SocTail {
+                        head: start,
+                        rows,
+                        values,
+                        norm,
+                        carrier,
+                        orthant,
+                    });
+                }
+            }
+        }
+        start += dim;
+    }
+    tails
 }
 
 fn make_reduction_map<T>(
@@ -534,5 +833,145 @@ mod exact_tests {
     #[test]
     fn exact_rows_512() {
         check::<sdpx_arithmetic::Bits512>();
+    }
+}
+
+#[cfg(test)]
+mod reduction_tests {
+    use super::*;
+    use crate::solver::{IPSolver, SolverStatus};
+    use SupportedConeT::*;
+
+    fn t<T: FloatT>(v: f64) -> T {
+        T::from_f64(v).unwrap()
+    }
+
+    fn solve<T: FloatT>(
+        P: &CscMatrix<T>,
+        q: &[T],
+        A: &CscMatrix<T>,
+        b: &[T],
+        cones: &[SupportedConeT<T>],
+        presolve: bool,
+    ) -> DefaultSolver<T> {
+        let settings = DefaultSettings {
+            verbose: false,
+            presolve_enable: presolve,
+            ..DefaultSettings::default()
+        };
+        let mut solver = DefaultSolver::new(P, q, A, b, cones, settings).unwrap();
+        solver.solve();
+        solver
+    }
+
+    fn soc_gap<T: FloatT>(v: &[T]) -> T {
+        v[0] - v[1..].norm()
+    }
+
+    // x0: SOC (2x0 - 1, 3, 4), an orthant row fixing x0 = 3; x1, x2: SOC
+    // (x1 + 10, x2, 1, 2) whose constants merge into √5; x2 >= 1 in a row
+    // singleton of a coupled column; x3: equality singleton 2x3 = 4.
+    fn mixed<T: FloatT>() {
+        let A = CscMatrix::new(
+            9,
+            4,
+            vec![0, 1, 2, 4, 5],
+            vec![0, 3, 4, 7, 8],
+            vec![t(-2.), t(-1.), t(-1.), t(-1.), t(2.)],
+        );
+        let b: Vec<T> = [-1., 3., 4., 10., 0., 1., 2., -1., 4.].map(t).to_vec();
+        let q: Vec<T> = [1., 1., 1., -1.].map(t).to_vec();
+        let P = CscMatrix::new(4, 4, vec![0, 0, 1, 1, 1], vec![1], vec![t(1.)]);
+        let cones = [
+            SecondOrderConeT(3),
+            SecondOrderConeT(4),
+            NonnegativeConeT(1),
+            ZeroConeT(1),
+        ];
+        let reduced = solve(&P, &q, &A, &b, &cones, true);
+        let full = solve(&P, &q, &A, &b, &cones, false);
+        let presolver = reduced.data.presolver.as_ref().unwrap();
+        assert_eq!(presolver.fixed.len(), 2);
+        assert_eq!(presolver.soc_tails.len(), 2);
+        assert_eq!((reduced.data.n, reduced.data.m), (2, 4));
+        for s in [&reduced, &full] {
+            assert_eq!(s.solution.status, SolverStatus::Solved);
+        }
+        let (r, f) = (&reduced.solution, &full.solution);
+        let tol = t::<T>(1e-6);
+        assert!((r.obj_val - f.obj_val).abs() < tol);
+        assert_eq!(r.x[0], t(3.));
+        assert_eq!(r.x[3], t(2.));
+        for (a, b) in r.x.iter().zip(&f.x) {
+            assert!((*a - *b).abs() < tol);
+        }
+        // Original-coordinate KKT conditions of the lifted point.
+        let mut res = b.clone();
+        A.gemv(&mut res, &r.x, -T::one(), T::one());
+        for (v, s) in res.iter().zip(&r.s) {
+            assert!((*v - *s).abs() < tol);
+        }
+        let mut dual = q.clone();
+        P.sym(MatrixTriangle::Triu)
+            .symv(&mut dual, &r.x, T::one(), T::one());
+        A.t().gemv(&mut dual, &r.z, T::one(), T::one());
+        assert!(dual.norm_inf() < tol);
+        for range in [0..3, 3..7] {
+            assert!(soc_gap(&r.s[range.clone()]) > -tol);
+            assert!(soc_gap(&r.z[range.clone()]) > -tol);
+        }
+        assert!(r.s.dot(&r.z).abs() < tol);
+        assert!(r.z[7] >= T::zero() && r.s[7] >= T::zero());
+        assert!((-b.dot(&r.z) - xpx_half(&P, &r.x) - r.obj_val).abs() < tol);
+    }
+
+    fn xpx_half<T: FloatT>(P: &CscMatrix<T>, x: &[T]) -> T {
+        let mut px = vec![T::zero(); x.len()];
+        P.sym(MatrixTriangle::Triu)
+            .symv(&mut px, x, T::one(), T::zero());
+        px.dot(x) / t(2.)
+    }
+
+    #[test]
+    fn mixed_f64() {
+        mixed::<f64>();
+    }
+
+    #[test]
+    fn mixed_256() {
+        mixed::<sdpx_arithmetic::Bits256>();
+    }
+
+    // (x0, 3, 4) in SOC with x0 <= 2: the orthant row x0 >= 5 conflicts,
+    // and the lifted certificate must be one for the original cones.
+    #[test]
+    fn infeasible_certificate_lifts() {
+        let A = CscMatrix::new(4, 1, vec![0, 2], vec![0, 3], vec![-1., 1.]);
+        let b = vec![0., 3., 4., 2.];
+        let cones = [SecondOrderConeT(3), NonnegativeConeT(1)];
+        let s = solve(&CscMatrix::zeros((1, 1)), &[0.], &A, &b, &cones, true);
+        assert_eq!(s.solution.status, SolverStatus::PrimalInfeasible);
+        let z = &s.solution.z;
+        let mut atz = vec![0f64];
+        A.t().gemv(&mut atz, z, 1., 0.);
+        assert!(atz[0].abs() < 1e-8 && b.dot(z) < 0.);
+        assert!(soc_gap(&z[0..3]) > -1e-8 && z[3] >= 0.);
+    }
+
+    // min -x with x >= 0 needs z = -1 < 0: the column stays and the solver
+    // reports the unbounded problem.
+    #[test]
+    fn inadmissible_multiplier_is_not_fixed() {
+        let A = CscMatrix::new(1, 1, vec![0, 1], vec![0], vec![-1.]);
+        let s = solve(
+            &CscMatrix::zeros((1, 1)),
+            &[-1.],
+            &A,
+            &[0.],
+            &[NonnegativeConeT(1)],
+            true,
+        );
+        assert!(s.data.presolver.is_none());
+        assert_eq!(s.solution.status, SolverStatus::DualInfeasible);
     }
 }

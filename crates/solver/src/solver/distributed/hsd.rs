@@ -404,6 +404,10 @@ impl<T: FloatT> OwnedSolver<T> {
         // Reverse presolve/chordal reconstruction is a root-only output
         // phase.  Empty and non-root ranks retain only the local numeric
         // state plus the shared structural metadata needed by the HSD loop.
+        let objective_offset = data
+            .presolver
+            .as_ref()
+            .map_or(T::zero(), |p| p.objective_offset);
         if collective.rank() != 0 {
             data.presolver = None;
             data.chordal_info = None;
@@ -429,6 +433,7 @@ impl<T: FloatT> OwnedSolver<T> {
         let mut info = DefaultInfo::new();
         use crate::solver::kkt::HasLinearSolverInfo;
         info.linsolver = kktsystem.linear_solver_info();
+        info.objective_offset = objective_offset;
         if collective.rank() != 0 {
             solution.x = Vec::new();
             solution.s = Vec::new();

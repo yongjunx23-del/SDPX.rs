@@ -142,7 +142,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         }
         self.scaled_valid.clear();
         self.scaled_valid.resize(cols, false);
-        self.scaled_solutions.resize((cols - 1) * self.A.m, T::zero());
+        self.scaled_solutions
+            .resize((cols - 1) * self.A.m, T::zero());
         self.counters.batches += 1;
         self.counters.rhs_applied += cols as u64;
         let reduced_width = n + self.retained_rows.len();

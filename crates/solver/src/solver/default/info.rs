@@ -70,6 +70,9 @@ pub struct DefaultInfo<T> {
 
     // target stream for printing
     pub(crate) stream: PrintTarget,
+
+    /// Objective constant of presolve-fixed variables (original units).
+    pub(crate) objective_offset: T,
 }
 
 impl<T> DefaultInfo<T>
@@ -147,6 +150,8 @@ where
         let xPx_τinvsq_over2 = summary.products.xpx * τinv * τinv / (2.).as_T();
         self.cost_primal = (summary.products.qx * τinv + xPx_τinvsq_over2) * cinv;
         self.cost_dual = (-summary.products.bz * τinv - xPx_τinvsq_over2) * cinv;
+        self.cost_primal += self.objective_offset;
+        self.cost_dual += self.objective_offset;
 
         let [mut normx, mut normz, mut norms, rx_inf_ns, px_ns, rz_inf_ns, rz_ns, rx_ns] =
             summary.norms();
@@ -443,7 +448,7 @@ where
             )
         {
             self.status = solved_status;
-        //PJG hardcoded factor 1000 here should be fixed
+        // hardcoded factor 1000 here should be fixed
         } else if self.ktratio > tol_ktratio.recip() * (1000.0).as_T() {
             if self.is_primal_infeasible(residuals, tol_infeas_abs, tol_infeas_rel) {
                 self.status = pinf_status;

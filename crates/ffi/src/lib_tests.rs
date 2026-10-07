@@ -332,7 +332,10 @@ fn prepared_solver_receives_preprocessing_flags() {
 #[test]
 fn solver_name_query_and_actual_info() {
     unsafe {
-        let h = lp();
+        // Presolve would fix this one-row LP outright; keep the KKT backend.
+        let mut settings = defaults();
+        settings.preprocessing_flags &= !PREPROCESS_PRESOLVE;
+        let h = lp_settings(settings);
         let mut n = 0;
         assert_eq!(sdpx_get_solver_name(h, ptr::null_mut(), 0, &mut n), 0);
         assert_eq!(n, 6); // qdldl plus NUL
@@ -385,6 +388,7 @@ fn zero_time_limit_returns_max_time() {
     unsafe {
         let mut settings = defaults();
         settings.time_limit = 0.0;
+        settings.preprocessing_flags &= !PREPROCESS_PRESOLVE;
         let h = lp_settings(settings);
         assert_eq!(sdpx_solve(h), 0);
         let mut info = std::mem::MaybeUninit::<Info>::uninit();

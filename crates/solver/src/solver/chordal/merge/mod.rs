@@ -59,7 +59,7 @@ pub(crate) trait MergeStrategy {
     fn post_process_merge(&mut self, t: &mut SuperNodeTree);
 }
 
-// PJG: make a settable option
+// make a settable option
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum EdgeWeightMethod {
     Cubic = 1,
@@ -77,7 +77,7 @@ fn set_union_into_indexed(sets: &mut [VertexSet], c1: usize, c2: usize) {
         return;
     }
 
-    // PJG: this function really needs a unit test
+    // this function really needs a unit test
     let (target, source);
 
     if c1 < c2 {

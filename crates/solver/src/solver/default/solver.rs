@@ -298,6 +298,10 @@ impl<T: FloatT> DefaultSolver<T> {
         crate::receipt::memory_mark("residual workspace");
         let mut info = DefaultInfo::<T>::new();
         info.linsolver = kktsystem.linear_solver_info();
+        info.objective_offset = data
+            .presolver
+            .as_ref()
+            .map_or(T::zero(), |p| p.objective_offset);
         let step_rhs = DefaultVariables::<T>::new(data.n, data.m);
         let step_lhs = DefaultVariables::<T>::new(data.n, data.m);
         let prev_vars = DefaultVariables::<T>::new(data.n, data.m);

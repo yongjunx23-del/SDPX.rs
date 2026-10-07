@@ -56,7 +56,7 @@ where
     let ip = invperm(p);
     let N = A.ncols();
 
-    // PJG: not clear to me if this copy of A is required, or
+    // not clear to me if this copy of A is required, or
     // whether I can operate directly on A by permuting the
     // the indices in the loops below.  Only worth doing that
     // if copying in or out of A is expensive.

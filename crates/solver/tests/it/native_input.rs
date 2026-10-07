@@ -92,7 +92,11 @@ fn native_cli_status_settings_and_precision() {
         }
     }
     let settings = temp.path().join("settings.json");
-    fs::write(&settings, r#"{"max_iter":0,"verbose":false}"#).unwrap();
+    fs::write(
+        &settings,
+        r#"{"max_iter":0,"verbose":false,"presolve_enable":false}"#,
+    )
+    .unwrap();
     let output = run(&["--settings", settings.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(2));
     let point: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

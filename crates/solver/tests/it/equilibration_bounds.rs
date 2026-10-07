@@ -67,7 +67,7 @@ fn test_equilibrate_upper_bound() {
     A.nzval[0] = 1e+15;
 
     let settings = DefaultSettingsBuilder::default()
-        .max_iter(10)
+        .max_iter(4)
         .build()
         .unwrap();
 

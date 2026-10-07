@@ -218,6 +218,9 @@ regularization and refinement stay unchanged.
 | 4 | Improve LP/SOC thread balance and Float64 iteration gap | Compact SOC row supports improve256/512 native time; duplicate raw row 0 is removed. Further storage changes need a live allocation. Use gravity/MOSEK receipts for the iteration gap; preserve convergence, regularization and refinement. |
 | 5 | Scale only for the active workload | Frozen sources and bounded resources. Lambda43/1216 and broad core sweeps remain later work; avoid node70. |
 | 6 | Improve PMP when it limits the workflow | Secondary to the solver; measure whole-command time/memory and output equivalence. |
+| 7 | Free-multiplier g0 SOCP per-iteration cost (3.15 s/15 it vs MOSEK 1.3 s/13 it) | Batch refinement over the constant/affine RHS (one residual pass for both), fewer full-KKT residual passes, then compare a dual (16-row Schur) form as MOSEK's presolve does. Keep the 46-problem Float64 set and csdr3 unchanged. |
+| 8 | Lessons from other solvers (2026-10-07 survey, below) | Each item needs its own audited A/B; none is adopted yet. |
+| 9 | Centrality (Float64 LP/SOC iteration gap) | Done 2026-10-07 (approved): Gondzio correctors on orthant, SOC and τκ; parity iterations −14.5%, gravity 37 → 22, sched all Solved. PSD rows have no correction (eigendecomposition per corrector); measure before adding. |
 
 ## Measurement prerequisites
 
@@ -236,6 +239,45 @@ Apply these to affected paths; they are not a project-wide gate:
   scope, status, iterations and peak memory with evidence.
 
 ## Decisions still needed / deferred
+
+- **Approved 2026-10-07 (regularization contract):** shared-SOC arrow leaf
+  primal columns skip the static shift (pivot `P_jj + aᵀH⁻¹a > 0` by the fixed
+  elimination order; any factor failure restores it). Evidence: JOURNAL
+  2026-10-07. Other structures keep the shift until measured and approved.
+- **Independence from Clarabel.rs (requested 2026-10-07):** ≈36% of non-test
+  lines still match a same-named Clarabel.rs file (verbatim: qdldl, chordal,
+  cone files, info_print, data_updating, datamaps). Apache-2.0 requires keeping
+  the notices of derived files. Staged plan, each stage behaviour-neutral on
+  the pinned cases: (1) SDPX-owned problem/presolve/postsolve pipeline and
+  output (banner, settings schema); (2) replace the trait-object
+  `ProblemData/Variables/Residuals/KKTSystem` scaffolding with SDPX's own
+  state types; (3) own cone and KKT interfaces around the arrow/condensed
+  backends; (4) retire unused Clarabel features. Conflicts with the standing
+  "Clarabel-style convergence/refinement/regularization" rule; needs a
+  decision on which numerical policies may change. Done (bitwise-neutral,
+  2026-10-07): SDPX staged driver, banner/report, NOTICE/metadata, upstream
+  notes. Next neutral candidates: preprocessing pipeline in `problemdata.rs`
+  (keep its copy avoidance), a uniform presolve reduction/postsolve record,
+  and the configuration printer.
+
+### Survey: what other solvers do better (2026-10-07)
+
+- **SDPB (high precision):** HRVW/KSH/M (XZ) direction, so each block needs
+  only Cholesky factors of X and Y; SDPX's NT scaling needs an MPFR SVD per
+  PSD cone (≈3 s per 88×88 cone at 1024 bits, the largest serial latency).
+  Measured 2026-10-07 (JOURNAL): HKM cone update 6.5× cheaper, but +12%
+  iterations on ising11 MPFR512; net ≤ 0 on Λ27 shares. Closed. SDPB 3 forms the
+  Schur complement with blocked RNS (FLINT) BLAS, as SDPX's residue GEMM, and
+  distributes it with Elemental Cholesky.
+- **SDPA-GMP/QD/DD:** double-double and quad-double arithmetic (≈106/212
+  bits) is several times faster than MPFR at 128/256 bits; a `DoubleDouble`
+  scalar would serve medium-precision solves.
+- **MOSEK/HiGHS:** presolve (singleton columns, dualization) decides small and
+  separable SOCPs; Gondzio multiple centrality correctors cut iterations.
+- **Hypatia.jl:** neighborhood-based step with combined directions and
+  interpolant-basis polynomial (WSOS) cones that avoid lifting PMPs to SDP.
+- **COSMO.jl / SCS / CVXOPT:** clique merging (SDPX has it), indirect CG
+  solves with warm starts for very large KKTs, structured KKT exploitation.
 
 - Owner cost histories remain an opt-in public interface until a real scaling
   campaign establishes their value. Constructor duplication and repeated
@@ -264,6 +306,8 @@ are in [the journal](docs/JOURNAL.md).
 
 - Lower/mixed precision, relaxed refinement, NaN clamping and MᵀM eigenanalysis
   violate numerical contracts. Fixed-point SVD replay erased tiny MPFR values.
+- HKM (SDPB XZ) PSD direction: 6.5× cheaper cone update, +12% iterations at
+  MPFR512 (ising11 58 vs 52); net ≤ 0 for the condensed sampled path.
 - SVD/eigen warm starts, terminal/scalar substitutions, zero-pair replay,
   cached small congruences and forced small dense factorization: no solve gain.
 - Float64 step/panel/column-alias/recovery/GEMM variants and Group-FMA loop

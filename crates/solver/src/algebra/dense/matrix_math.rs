@@ -2,7 +2,7 @@
 use crate::algebra::*;
 use rayon::prelude::*;
 
-// PJG : MatrixMath<T> should be implemented for a more
+// MatrixMath<T> should be implemented for a more
 // general type, e.g. the DenseStorageMatrix<S,T> type
 // or similar.   That would provide math functionality
 // for more types, e.g. statically size matrices or
@@ -177,7 +177,7 @@ where
     }
 }
 
-//PJG : Perhaps implementation for Symmetric type would be faster
+// Perhaps implementation for Symmetric type would be faster
 pub(crate) fn mat_to_svec<T, MATM>(x: &mut [T], M: &MATM)
 where
     MATM: DenseMatrix<T>,

@@ -11,9 +11,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         settings: &CoreSettings<T>,
     ) -> Option<Self> {
         let n = a.n;
-        if k.n != n + a.m {
-            return None;
-        }
+        debug_assert_eq!(k.n, n + a.m);
         let mut row_owner = vec![usize::MAX; a.m];
         let mut groups = Vec::new();
         let mut trunk = Vec::new();
@@ -55,7 +53,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             .sum::<u128>()
             + 4 * t * t
             + 4 * k.n as u128;
-        if cells * std::mem::size_of::<T>() as u128 > settings.shared_soc_max_bytes as u128 {
+        if cells * std::mem::size_of::<T>() as u128 > ARROW_MAX_BYTES {
             return None;
         }
         let mut owner = vec![usize::MAX; k.n];
@@ -144,9 +142,6 @@ mod tests {
         kv.push(T::from_f64(0.125).unwrap());
         let k = CscMatrix::new_from_triplets(n + m, n + m, ki.clone(), kj.clone(), kv.clone());
         let settings = CoreSettings::default();
-        let mut disabled = settings.clone();
-        disabled.shared_soc_max_bytes = 0;
-        assert!(ArrowLDLSolver::try_shared_soc(&k, &signs, &a, &cones, &disabled).is_none());
         let mut solver = ArrowLDLSolver::try_shared_soc(&k, &signs, &a, &cones, &settings).unwrap();
         assert_eq!(solver.trunk, vec![30, 0, 1]);
         assert_eq!(

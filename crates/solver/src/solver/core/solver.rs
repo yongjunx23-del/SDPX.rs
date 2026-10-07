@@ -157,35 +157,24 @@ fn _print_banner(out: &mut dyn Write, is_verbose: bool) -> std::io::Result<()> {
     if !is_verbose {
         return std::io::Result::Ok(());
     }
-
+    let rule = "-".repeat(61);
+    writeln!(out, "{rule}")?;
     writeln!(
         out,
-        "-------------------------------------------------------------"
+        "SDPX v{} - homogeneous interior-point conic solver{}",
+        crate::VERSION,
+        if cfg!(debug_assertions) {
+            " (debug build)"
+        } else {
+            ""
+        }
     )?;
     writeln!(
         out,
-        "           SDPX v{}                                         ",
-        crate::VERSION
+        "Float64 and MPFR arithmetic; IPM core derived from Clarabel.rs"
     )?;
-    #[cfg(debug_assertions)]
-    writeln!(
-        out,
-        "                  *** debug build ***                        ",
-    )?;
-    #[cfg(not(debug_assertions))]
-    writeln!(out)?;
-    writeln!(
-        out,
-        "                   (c) Paul Goulart                          "
-    )?;
-    writeln!(
-        out,
-        "                University of Oxford, 2022                   "
-    )?;
-    writeln!(
-        out,
-        "-------------------------------------------------------------"
-    )?;
+    writeln!(out, "(Apache-2.0, see provenance/upstream.json)")?;
+    writeln!(out, "{rule}")?;
     std::io::Result::Ok(())
 }
 
@@ -281,320 +270,141 @@ where
         // Long vector operations on this thread use the cone worker pool.
         let _vector_pool = crate::algebra::VectorPoolGuard::install(self.cones.worker_pool());
         self.kktsystem.reset_solve();
-        // various initializations
-        // The generic curve is validated at all precisions, but its extra PSD
-        // step searches regress the 512-bit Ising workload; retain the measured policy.
-        let use_curve = T::precision_bits() <= 53 && self.cones.all_symmetric();
-        let mut affine_direction = use_curve.then(|| self.variables.new_like());
-        let mut curve_direction = use_curve.then(|| self.variables.new_like());
-        let mut iter: u32 = 0;
-        let mut σ = T::one();
-        let mut α = T::zero();
-        let mut μ;
 
-        //timers is stored as an option so that
-        //we can swap it out here and avoid
-        //borrow conflicts with other fields.
+        // Timers live in an Option so the solver's fields can be borrowed
+        // freely while they run.
         let mut timers = self.timers.take().unwrap();
-
-        // solver release info, solver config
-        // problem dimensions, cone types etc
         _print_banner(self.info.print_target(), self.settings.core().verbose).unwrap();
         self.info
             .print_configuration(&self.settings, &self.data, &self.cones)
             .unwrap();
         self.info.print_status_header(&self.settings).unwrap();
-
         self.info.reset(&mut timers);
 
+        let mut state = IterationState::new(self.cones.supports_primal_dual());
+        let mut curve = CurveSearch::new(&self.variables, &self.cones);
+
         timeit! {"solve"; {
-
-        // initialize variables to some reasonable starting point
         timeit! {"default start"; {
-            self.default_start();
-            if let Some(path) = self.callbacks.checkpoint.restart.clone() {
-                // validated by `check_restart`; the same file is read on every rank
-                self.variables
-                    .read_checkpoint(&self.data, &path)
-                    .unwrap_or_else(|e| panic!("restart from {}: {e}", path.display()));
-            }
+            self.start_point();
         }}
-
         timeit! {"IP iteration"; {
-
-        // ----------
-        // main loop
-        // ----------
-
-        let mut scaling = {
-            if self.cones.supports_primal_dual() {ScalingStrategy::PrimalDual}
-            else {ScalingStrategy::Dual}
-        };
-
         loop {
-
-            //update the residuals
-            //--------------
-            timeit! {"residual update"; {
-            self.residuals.update_with_pool(&self.variables, &self.data, self.cones.worker_pool());
-            }}
-
-            //calculate duality gap (scaled)
-            //--------------
-            timeit! {"mu+info"; {
-            μ = self.variables.calc_mu(&self.residuals, &self.cones);
-
-            // record scalar values from most recent iteration.
-            // This captures μ at iteration zero.
-            self.info.save_scalars(μ, α, σ, iter);
-
-            // convergence check and printing
-            // --------------
-            self.info.update_with_pool(
-                &mut self.data,
-                &self.variables,
-                &self.residuals,
-                &timers,
-                self.cones.worker_pool());
-            }}
-
-            self.info.print_status(&self.settings).unwrap();
-
-            // termination checks
-            // --------------
-
-            // user defined termination checks
-            let callback_stop = self.callbacks.check_termination(&self.info);
-            let callback_stop = crate::mpi::any_true(callback_stop);
-            if callback_stop {
-                self.info.set_status(SolverStatus::CallbackTerminated);
+            self.evaluate(&mut state, &timers);
+            if self.terminate(&mut state).stop() {
                 break;
             }
-            // internal termination checks
-            let is_done = self.info.check_termination(&self.residuals, &self.settings, iter);
-            crate::mpi::assert_agree(
-                self.info.get_status() as u32,
-                "inconsistent replicated solver termination status",
-            );
-
-            // check for termination due to slow progress and update strategy
-            if is_done{
-                    match self.strategy_checkpoint_insufficient_progress(scaling).synchronized(){
-                        StrategyCheckpoint::NoUpdate | StrategyCheckpoint::Fail => {break}
-                        StrategyCheckpoint::Update(s) => {scaling = s; continue}
-                    }
-            }  // allows continuation if new strategy provided
-
-            // The iterate has passed the progress checks: it is accepted.
-            if let Some(path) = self.callbacks.checkpoint.path.as_deref() {
-                if iter > 0 && iter % self.callbacks.checkpoint.every.max(1) == 0 && crate::mpi::is_root() {
-                    if let Err(e) = self.variables.write_checkpoint(&self.data, path, iter) {
-                        eprintln!("checkpoint {}: {e}", path.display());
-                    }
-                }
+            self.write_checkpoint(state.iter);
+            if !self.scale(&state) {
+                break;
             }
-
-
-            // update the scalings
-            // --------------
-            let is_scaling_success;
-            timeit! {"scale cones"; {
-                is_scaling_success = self.variables.scale_cones(&mut self.cones,μ,scaling);
-            }}
-            let is_scaling_success = crate::mpi::all_succeeded(is_scaling_success);
-            // check whether variables are interior points
-            match self.strategy_checkpoint_is_scaling_success(is_scaling_success,scaling).synchronized(){
-                StrategyCheckpoint::Fail => {break}
-                StrategyCheckpoint::NoUpdate => {} // we only expect NoUpdate or Fail here
-                StrategyCheckpoint::Update(_) => {unreachable!()}
+            // Only iterations that update the KKT system are counted.
+            state.iter += 1;
+            if state.iter <= 2 {
+                crate::receipt::memory_mark(if state.iter == 1 { "iteration 1 start" } else { "iteration 2 start" });
             }
-
-            //increment counter here because we only count
-            //iterations that produce a KKT update
-            iter += 1;
-            if iter <= 2 {
-                crate::receipt::memory_mark(if iter == 1 { "iteration 1 start" } else { "iteration 2 start" });
+            match self.direction(&mut state, &mut curve) {
+                Flow::Proceed => {}
+                Flow::Retry => continue,
+                Flow::Stop => break,
             }
-
-            // Keep the affine RHS beside the constant RHS so the KKT update
-            // can reuse the factorization and multi-RHS solve.
-            timeit! {"affine rhs"; {
-            self.step_rhs
-                .affine_step_rhs(&self.residuals, &self.variables, &self.cones);
-            }}
-
-            // Update the KKT system and the constant parts of its solution.
-            // Keep track of the success of each step that calls KKT
-            // --------------
-            //PJG: This should be a Result in Rust, but needs changes down
-            //into the KKT solvers to do that.
-            let mut is_kkt_solve_success : bool;
-            timeit! {"kkt update"; {
-                is_kkt_solve_success = self.kktsystem.update_affine(&self.data, &self.cones, &self.step_rhs, &self.variables, &self.settings);
-            }} // end "kkt update" timer
-            is_kkt_solve_success = crate::mpi::all_succeeded(is_kkt_solve_success);
-
-            timeit! {"kkt solve"; {
-                is_kkt_solve_success = is_kkt_solve_success &&
-                self.kktsystem.solve(
-                    &mut self.step_lhs,
-                    &self.step_rhs,
-                    &self.data,
-                    &self.variables,
-                    &mut self.cones,
-                    StepDirection::Affine,
-                    &self.settings,
-                );
-            }}  //end "kkt solve affine" timer
-            is_kkt_solve_success = crate::mpi::all_succeeded(is_kkt_solve_success);
-
-            // combined step only on affine step success
-            if is_kkt_solve_success {
-
-                // Preserve the raw direction before prepared cone operations consume it.
-                if let Some(affine) = &mut affine_direction { affine.copy_from(&self.step_lhs); }
-
-                //calculate step length and centering parameter
-                // --------------
-                timeit! {"affine step len"; {
-                α = if iter > 1 {
-                    self.variables.prepare_affine_step_length(&mut self.step_lhs, &mut self.cones, &self.settings)
-                } else {
-                    self.get_step_length(StepDirection::Affine, scaling)
-                };
-                }}
-                σ = self.centering_parameter(α);
-
-                // make a reduced Mehrotra correction in the first iteration
-                // to accommodate badly centred starting points
-                let m = if iter > 1 {T::one()} else {α};
-
-                // calculate the combined step and length
-                // --------------
-                timeit! {"combined rhs"; {
-                if iter > 1 {
-                    self.step_rhs.combined_step_rhs_prepared(&self.residuals, &self.variables,
-                        &mut self.cones, &mut self.step_lhs, σ, μ);
-                } else {
-                self.step_rhs.combined_step_rhs(
-                    &self.residuals,
-                    &self.variables,
-                    &mut self.cones,
-                    &mut self.step_lhs,
-                    σ,
-                    μ,
-                    m
-                );
-                }
-                }}
-
-                timeit! {"kkt solve" ; {
-                    is_kkt_solve_success =
-                    self.kktsystem.solve(
-                        &mut self.step_lhs,
-                        &self.step_rhs,
-                        &self.data,
-                        &self.variables,
-                        &mut self.cones,
-                        StepDirection::Combined,
-                        &self.settings,
-                    );
-                }} //end "kkt solve"
+            match self.step_length(&mut state, &mut curve) {
+                Flow::Proceed => {}
+                Flow::Retry => continue,
+                Flow::Stop => break,
             }
-
-            // check for numerical failure and update strategy
-            is_kkt_solve_success = crate::mpi::all_succeeded(is_kkt_solve_success);
-            match self.strategy_checkpoint_numerical_error(is_kkt_solve_success,scaling).synchronized() {
-                StrategyCheckpoint::NoUpdate => {}
-                StrategyCheckpoint::Update(s) => {α = T::zero(); scaling = s; continue}
-                StrategyCheckpoint::Fail => {α = T::zero(); break}
-            }
-
-
-            // compute final step length and update the current iterate
-            // --------------
-            timeit! {"final step len"; {
-            α = self.get_step_length(StepDirection::Combined,scaling);
-
-            // Inspired by Hypatia curve search, using the two existing NT directions.
-            // Quadratic predictor-corrector curve: t*affine + t^2*(combined-affine).
-            // No new KKT solves. Trial bounds use the existing cone-interior margin.
-            if crate::mpi::agreed_branch(use_curve && α > T::zero() && α < (0.9).as_T()) {
-                let original_alpha = α;
-                let affine = affine_direction.as_ref().unwrap();
-                let curve = curve_direction.as_mut().unwrap();
-                for fraction in [0.5, 0.25] {
-                    let t = original_alpha + (T::one()-original_alpha)*T::from_f64(fraction).unwrap();
-                    if crate::mpi::agreed_branch(t*(T::one()-σ*t) <= T::from_f64(1.01).unwrap()*original_alpha*(T::one()-σ)) {
-                        continue;
-                    }
-                    curve.interpolate(affine, &self.step_lhs, t);
-                    let bound = self.variables.calc_step_length(curve, &mut self.cones,
-                        &self.settings, StepDirection::Combined);
-                    if crate::mpi::agreed_branch(t <= bound) {
-                        self.step_lhs.copy_from(curve);
-                        α = t;
-                        break;
-                    }
-                }
-            }
-
-            // check for undersized step and update strategy
-            match self.strategy_checkpoint_small_step(α, scaling).synchronized() {
-                StrategyCheckpoint::NoUpdate => {}
-                StrategyCheckpoint::Update(s) => {α = T::zero(); scaling = s; continue}
-                StrategyCheckpoint::Fail => {α = T::zero(); break}
-            }
-            }} // end "final step len" timer
-
-            // Copy previous iterate in case the next one is a dud
-            self.info.save_prev_iterate(&self.variables,&mut self.prev_vars);
-
+            // Keep the previous iterate in case the next one is a dud.
+            self.info.save_prev_iterate(&self.variables, &mut self.prev_vars);
             timeit! {"iterate update"; {
             self.variables
-                .add_step_with_pool(&self.step_lhs, α, self.cones.worker_pool());
+                .add_step_with_pool(&self.step_lhs, state.α, self.cones.worker_pool());
             }}
-
-        } //end loop
-        // ----------
-        // ----------
-
-        }} //end "IP iteration" timer
-
-        }} // end "solve" timer
-
-        // Check we if actually took a final step.  If not, we need
-        // to recapture the scalars and print one last line
-        if α.is_zero() {
-            self.info.save_scalars(μ, α, σ, iter);
-            self.info.print_status(&self.settings).unwrap();
         }
-
-        timeit! {"post-process"; {
-            self.info.set_linear_solver_info(self.kktsystem.linear_solver_info());
-            if self.info.get_status() == SolverStatus::InsufficientProgress {
-                // Rollback restored the iterate; recompute its residuals and
-                // infeasibility products before the reduced convergence test.
-                self.residuals.update_with_pool(&self.variables, &self.data, self.cones.worker_pool());
-                self.info.update_with_pool(&mut self.data, &self.variables, &self.residuals,
-                    &timers, self.cones.worker_pool());
-            }
-            //check for "almost" convergence case and then extract solution
-            self.info.post_process(&self.residuals, &self.settings);
-            self.solution
-                .post_process(&self.data, &mut self.variables, &self.info, &self.settings);
+        }}
         }}
 
-        //halt timers
+        // Without a final step the last line reports the stopping iterate.
+        if state.α.is_zero() {
+            self.info
+                .save_scalars(state.μ, state.α, state.σ, state.iter);
+            self.info.print_status(&self.settings).unwrap();
+        }
+        timeit! {"post-process"; {
+            self.finish(&timers);
+        }}
         timers.stop_solve();
         self.info.finalize(&mut timers);
         crate::receipt::memory_mark("solved");
         self.solution.finalize(&self.info);
-
         self.info.print_footer(&self.settings).unwrap();
-
-        //stow the timers back into Option in the solver struct
         self.timers.replace(timers);
+    }
+}
+
+/// Scalars carried from one interior-point iteration to the next.
+struct IterationState<T> {
+    iter: u32,
+    μ: T,
+    σ: T,
+    α: T,
+    scaling: ScalingStrategy,
+}
+
+impl<T: FloatT> IterationState<T> {
+    fn new(primal_dual: bool) -> Self {
+        Self {
+            iter: 0,
+            μ: T::zero(),
+            σ: T::one(),
+            α: T::zero(),
+            scaling: if primal_dual {
+                ScalingStrategy::PrimalDual
+            } else {
+                ScalingStrategy::Dual
+            },
+        }
+    }
+}
+
+/// What the driver does after a stage of an iteration.
+enum Flow {
+    /// Continue with the next stage.
+    Proceed,
+    /// Start a new iteration (the scaling strategy changed).
+    Retry,
+    /// Leave the main loop.
+    Stop,
+}
+
+impl Flow {
+    fn stop(&self) -> bool {
+        matches!(self, Flow::Stop)
+    }
+}
+
+/// Quadratic predictor-corrector curve `t·affine + t²·(combined − affine)`,
+/// after Hypatia's curve search, from the two existing directions (no extra
+/// KKT solves). Binary64 with symmetric cones only: its extra PSD step
+/// searches regress the 512-bit Ising workload.
+struct CurveSearch<V> {
+    affine: Option<V>,
+    trial: Option<V>,
+    /// Corrected direction of the Gondzio centrality correctors (symmetric
+    /// cones with orthant or second-order rows, any precision).
+    corrected: Option<V>,
+}
+
+impl<V> CurveSearch<V> {
+    fn new<T: FloatT, C: ConeCollection<T>>(like: &V, cones: &C) -> Self
+    where
+        V: Variables<T>,
+    {
+        let enabled = T::precision_bits() <= 53 && cones.all_symmetric();
+        Self {
+            affine: enabled.then(|| like.new_like()),
+            trial: enabled.then(|| like.new_like()),
+            corrected: (cones.all_symmetric() && cones.has_correctable()).then(|| like.new_like()),
+        }
     }
 }
 
@@ -604,6 +414,37 @@ mod internal {
     use super::*;
 
     pub(super) trait IPSolverInternals<T, D, V, R, K, C, I, SO, SE> {
+        /// Initial point: the default start, or a checkpoint to restart from.
+        fn start_point(&mut self);
+
+        /// Residuals, μ and convergence measures of the current iterate.
+        fn evaluate(&mut self, state: &mut IterationState<T>, timers: &Timers);
+
+        /// Callback and internal termination tests (with strategy fallback).
+        fn terminate(&mut self, state: &mut IterationState<T>) -> Flow;
+
+        /// Write the accepted iterate when a checkpoint is due.
+        fn write_checkpoint(&mut self, iter: u32);
+
+        /// Update the cone scalings; `false` ends the solve.
+        fn scale(&mut self, state: &IterationState<T>) -> bool;
+
+        /// Predictor and corrector directions.
+        fn direction(&mut self, state: &mut IterationState<T>, curve: &mut CurveSearch<V>) -> Flow;
+
+        /// Final step length, optionally along the predictor-corrector curve.
+        fn step_length(
+            &mut self,
+            state: &mut IterationState<T>,
+            curve: &mut CurveSearch<V>,
+        ) -> Flow;
+
+        /// Gondzio multiple centrality correctors on the combined direction.
+        fn centrality_correctors(&mut self, state: &mut IterationState<T>, corrected: &mut V);
+
+        /// Status refinement and solution extraction after the main loop.
+        fn finish(&mut self, timers: &Timers);
+
         /// Find an initial condition
         fn default_start(&mut self);
 
@@ -652,9 +493,310 @@ mod internal {
         K: KKTSystem<T, D = D, V = V, C = C, SE = SE>,
         C: ConeCollection<T>,
         I: Info<T, D = D, V = V, R = R, C = C, SE = SE>,
-        SO: Solution<T, D = D, V = V, I = I>,
+        SO: Solution<T, D = D, V = V, I = I, SE = SE>,
         SE: Settings<T>,
     {
+        fn start_point(&mut self) {
+            self.default_start();
+            if let Some(path) = self.callbacks.checkpoint.restart.clone() {
+                // validated by `check_restart`; the same file is read on every rank
+                self.variables
+                    .read_checkpoint(&self.data, &path)
+                    .unwrap_or_else(|e| panic!("restart from {}: {e}", path.display()));
+            }
+        }
+
+        fn evaluate(&mut self, state: &mut IterationState<T>, timers: &Timers) {
+            timeit! {"residual update"; {
+            self.residuals.update_with_pool(&self.variables, &self.data, self.cones.worker_pool());
+            }}
+            timeit! {"mu+info"; {
+            state.μ = self.variables.calc_mu(&self.residuals, &self.cones);
+            // Record the scalars of the latest iteration (μ at iteration zero).
+            self.info.save_scalars(state.μ, state.α, state.σ, state.iter);
+            self.info.update_with_pool(
+                &mut self.data,
+                &self.variables,
+                &self.residuals,
+                timers,
+                self.cones.worker_pool(),
+            );
+            }}
+            self.info.print_status(&self.settings).unwrap();
+        }
+
+        fn terminate(&mut self, state: &mut IterationState<T>) -> Flow {
+            let callback_stop = self.callbacks.check_termination(&self.info);
+            if crate::mpi::any_true(callback_stop) {
+                self.info.set_status(SolverStatus::CallbackTerminated);
+                return Flow::Stop;
+            }
+            let is_done = self
+                .info
+                .check_termination(&self.residuals, &self.settings, state.iter);
+            crate::mpi::assert_agree(
+                self.info.get_status() as u32,
+                "inconsistent replicated solver termination status",
+            );
+            if !is_done {
+                return Flow::Proceed;
+            }
+            // Slow progress may continue under another scaling strategy.
+            match self
+                .strategy_checkpoint_insufficient_progress(state.scaling)
+                .synchronized()
+            {
+                StrategyCheckpoint::NoUpdate | StrategyCheckpoint::Fail => Flow::Stop,
+                StrategyCheckpoint::Update(s) => {
+                    state.scaling = s;
+                    Flow::Retry
+                }
+            }
+        }
+
+        fn write_checkpoint(&mut self, iter: u32) {
+            // The iterate has passed the progress checks: it is accepted.
+            let Some(path) = self.callbacks.checkpoint.path.as_deref() else {
+                return;
+            };
+            if iter > 0
+                && iter % self.callbacks.checkpoint.every.max(1) == 0
+                && crate::mpi::is_root()
+            {
+                if let Err(e) = self.variables.write_checkpoint(&self.data, path, iter) {
+                    eprintln!("checkpoint {}: {e}", path.display());
+                }
+            }
+        }
+
+        fn scale(&mut self, state: &IterationState<T>) -> bool {
+            let is_scaling_success;
+            timeit! {"scale cones"; {
+                is_scaling_success = self.variables.scale_cones(&mut self.cones, state.μ, state.scaling);
+            }}
+            let is_scaling_success = crate::mpi::all_succeeded(is_scaling_success);
+            match self
+                .strategy_checkpoint_is_scaling_success(is_scaling_success, state.scaling)
+                .synchronized()
+            {
+                StrategyCheckpoint::Fail => false,
+                StrategyCheckpoint::NoUpdate => true,
+                StrategyCheckpoint::Update(_) => unreachable!(),
+            }
+        }
+
+        fn direction(&mut self, state: &mut IterationState<T>, curve: &mut CurveSearch<V>) -> Flow {
+            // The affine RHS sits beside the constant RHS so the KKT update
+            // reuses one factorization and multi-RHS solve.
+            timeit! {"affine rhs"; {
+            self.step_rhs
+                .affine_step_rhs(&self.residuals, &self.variables, &self.cones);
+            }}
+            let mut ok: bool;
+            timeit! {"kkt update"; {
+                ok = self.kktsystem.update_affine(&self.data, &self.cones, &self.step_rhs, &self.variables, &self.settings);
+            }}
+            ok = crate::mpi::all_succeeded(ok);
+            timeit! {"kkt solve"; {
+                ok = ok && self.kktsystem.solve(
+                    &mut self.step_lhs,
+                    &self.step_rhs,
+                    &self.data,
+                    &self.variables,
+                    &mut self.cones,
+                    StepDirection::Affine,
+                    &self.settings,
+                );
+            }}
+            ok = crate::mpi::all_succeeded(ok);
+
+            // The corrector runs only after a successful predictor.
+            if ok {
+                // Keep the raw direction before prepared cone operations consume it.
+                if let Some(affine) = &mut curve.affine {
+                    affine.copy_from(&self.step_lhs);
+                }
+                let iter = state.iter;
+                timeit! {"affine step len"; {
+                state.α = if iter > 1 {
+                    self.variables.prepare_affine_step_length(&mut self.step_lhs, &mut self.cones, &self.settings)
+                } else {
+                    self.get_step_length(StepDirection::Affine, state.scaling)
+                };
+                }}
+                state.σ = self.centering_parameter(state.α);
+                timeit! {"combined rhs"; {
+                if iter > 1 {
+                    self.step_rhs.combined_step_rhs_prepared(&self.residuals, &self.variables,
+                        &mut self.cones, &mut self.step_lhs, state.σ, state.μ);
+                } else {
+                    // A reduced Mehrotra correction in the first iteration
+                    // accommodates badly centred starting points.
+                    self.step_rhs.combined_step_rhs(
+                        &self.residuals,
+                        &self.variables,
+                        &mut self.cones,
+                        &mut self.step_lhs,
+                        state.σ,
+                        state.μ,
+                        state.α,
+                    );
+                }
+                }}
+                timeit! {"kkt solve" ; {
+                    ok = self.kktsystem.solve(
+                        &mut self.step_lhs,
+                        &self.step_rhs,
+                        &self.data,
+                        &self.variables,
+                        &mut self.cones,
+                        StepDirection::Combined,
+                        &self.settings,
+                    );
+                }}
+            }
+            ok = crate::mpi::all_succeeded(ok);
+            match self
+                .strategy_checkpoint_numerical_error(ok, state.scaling)
+                .synchronized()
+            {
+                StrategyCheckpoint::NoUpdate => Flow::Proceed,
+                StrategyCheckpoint::Update(s) => {
+                    state.α = T::zero();
+                    state.scaling = s;
+                    Flow::Retry
+                }
+                StrategyCheckpoint::Fail => {
+                    state.α = T::zero();
+                    Flow::Stop
+                }
+            }
+        }
+
+        fn step_length(
+            &mut self,
+            state: &mut IterationState<T>,
+            curve: &mut CurveSearch<V>,
+        ) -> Flow {
+            let flow;
+            timeit! {"final step len"; {
+            state.α = self.get_step_length(StepDirection::Combined, state.scaling);
+            if let Some(corrected) = &mut curve.corrected {
+                self.centrality_correctors(state, corrected);
+            }
+            let (α, σ) = (state.α, state.σ);
+            if crate::mpi::agreed_branch(curve.affine.is_some() && α > T::zero() && α < (0.9).as_T()) {
+                let affine = curve.affine.as_ref().unwrap();
+                let trial = curve.trial.as_mut().unwrap();
+                for fraction in [0.5, 0.25] {
+                    let t = α + (T::one() - α) * T::from_f64(fraction).unwrap();
+                    // Only a predicted gain of more than 1% is worth a trial.
+                    if crate::mpi::agreed_branch(t * (T::one() - σ * t) <= T::from_f64(1.01).unwrap() * α * (T::one() - σ)) {
+                        continue;
+                    }
+                    trial.interpolate(affine, &self.step_lhs, t);
+                    let bound = self.variables.calc_step_length(trial, &mut self.cones,
+                        &self.settings, StepDirection::Combined);
+                    if crate::mpi::agreed_branch(t <= bound) {
+                        self.step_lhs.copy_from(trial);
+                        state.α = t;
+                        break;
+                    }
+                }
+            }
+            flow = match self.strategy_checkpoint_small_step(state.α, state.scaling).synchronized() {
+                StrategyCheckpoint::NoUpdate => Flow::Proceed,
+                StrategyCheckpoint::Update(s) => {
+                    state.α = T::zero();
+                    state.scaling = s;
+                    Flow::Retry
+                }
+                StrategyCheckpoint::Fail => {
+                    state.α = T::zero();
+                    Flow::Stop
+                }
+            };
+            }}
+            flow
+        }
+
+        fn centrality_correctors(&mut self, state: &mut IterationState<T>, corrected: &mut V) {
+            // Colombo & Gondzio (2008): aim for a longer step α̃, push the
+            // trial complementarity products back into the centrality band
+            // and keep the corrected direction only if the step grows by 1%.
+            // Each corrector reuses the factorization (one more solve).
+            // A step of at least 0.9 already gains little from another solve.
+            const MAX_CORRECTORS: usize = 2;
+            for _ in 0..MAX_CORRECTORS {
+                let α = state.α;
+                if !crate::mpi::agreed_branch(α > T::zero() && α < (0.9).as_T()) {
+                    return;
+                }
+                let target = T::min(T::one(), α * (1.5).as_T() + (0.3).as_T());
+                let changed = self.step_rhs.centrality_correction(
+                    &self.step_lhs,
+                    &self.variables,
+                    &mut self.cones,
+                    target,
+                    state.σ * state.μ,
+                );
+                if !crate::mpi::agreed_branch(changed) {
+                    return;
+                }
+                let ok;
+                timeit! {"corrector solve"; {
+                    ok = self.kktsystem.solve(
+                        corrected,
+                        &self.step_rhs,
+                        &self.data,
+                        &self.variables,
+                        &mut self.cones,
+                        StepDirection::Combined,
+                        &self.settings,
+                    );
+                }}
+                if !crate::mpi::all_succeeded(ok) {
+                    return;
+                }
+                let α_new = self.variables.calc_step_length(
+                    corrected,
+                    &mut self.cones,
+                    &self.settings,
+                    StepDirection::Combined,
+                );
+                if !crate::mpi::agreed_branch(α_new >= α * (1.01).as_T()) {
+                    return;
+                }
+                self.step_lhs.copy_from(corrected);
+                state.α = α_new;
+            }
+        }
+
+        fn finish(&mut self, timers: &Timers) {
+            self.info
+                .set_linear_solver_info(self.kktsystem.linear_solver_info());
+            if self.info.get_status() == SolverStatus::InsufficientProgress {
+                // Rollback restored the iterate; recompute its residuals and
+                // infeasibility products before the reduced convergence test.
+                self.residuals.update_with_pool(
+                    &self.variables,
+                    &self.data,
+                    self.cones.worker_pool(),
+                );
+                self.info.update_with_pool(
+                    &mut self.data,
+                    &self.variables,
+                    &self.residuals,
+                    timers,
+                    self.cones.worker_pool(),
+                );
+            }
+            // "Almost" convergence check, then solution extraction.
+            self.info.post_process(&self.residuals, &self.settings);
+            self.solution
+                .post_process(&self.data, &mut self.variables, &self.info, &self.settings);
+        }
+
         fn default_start(&mut self) {
             if self.cones.all_symmetric() {
                 // set all scalings to identity (or zero for the zero cone)

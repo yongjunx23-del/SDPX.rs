@@ -138,70 +138,50 @@ where
         cones: &[SupportedConeT<T>],
         settings: &DefaultSettings<T>,
     ) -> Self {
-        let (P, q, A, b) = (&*P_in, &*q_in, &*A_in, &*b_in);
-        // clean up the cones by consolidating repeated NNs,
-        // eliminate empty cones, transform singletons etc
-        // this makes a locally owned copy of the cones
-        let cones = SupportedConeT::new_collapsed(cones);
-
-        // some caution is required to ensure we take a minimal,
-        // but nonzero, number of data copies during presolve steps
-
-        let mut P_new: Option<CscMatrix<T>> = None;
-        let mut q_new: Option<Vec<T>> = None;
-        let mut A_new: Option<CscMatrix<T>> = None;
-        let mut b_new: Option<Vec<T>> = None;
-        let mut cones_new: Option<Vec<SupportedConeT<T>>> = None;
-
+        use std::borrow::Cow;
+        let (mut P, mut q, mut A, mut b) = (P_in, q_in, A_in, b_in);
+        // Collapse repeated orthants, drop empty cones and turn singletons
+        // into orthant rows; this is the locally owned copy of the cones.
+        let mut cones = SupportedConeT::new_collapsed(cones);
         if !P.is_triu() {
-            P_new = Some(P.to_triu());
+            P = Cow::Owned(P.to_triu());
         }
 
-        // presolve : return nothing if disabled or no reduction
-        // --------------------------------------
-        let presolver = try_presolver(A, b, &cones, settings);
-
-        if let Some(ref presolver) = presolver {
-            let (_A_new, _b_new, _cones_new) = presolver.presolve(A, b, &cones);
-            (A_new, b_new, cones_new) = (Some(_A_new), Some(_b_new), Some(_cones_new));
+        // Each stage replaces only what it changes, so borrowed API data is
+        // copied at most once.
+        let presolver = try_presolver(&P, &q, &A, &b, &cones, settings);
+        if let Some(presolver) = &presolver {
+            let (A_new, b_new, cones_new, objective) = presolver.presolve(&P, &q, &A, &b, &cones);
+            (A, b, cones) = (Cow::Owned(A_new), Cow::Owned(b_new), cones_new);
+            if let Some((P_new, q_new)) = objective {
+                (P, q) = (Cow::Owned(P_new), Cow::Owned(q_new));
+            }
         }
 
-        // chordal decomposition : return nothing if disabled or no decomp
-        // --------------------------------------
         // ChordalInfo must be built on the *reduced* problem: its init_cones
         // and per-cone row ranges index the presolved A/b, and the cone_maps
         // it records map decomposed cones back to the presolved cone list.
-        let mut chordal_info = try_chordal_info(
-            A_new.as_ref().unwrap_or(A),
-            unwrap_and_slice_or_else(&b_new, || b),
-            cones_new.as_deref().unwrap_or(&cones),
-            settings,
-        );
-        if let Some(ref mut chordal_info) = chordal_info {
-            let (_P_new, _q_new, _A_new, _b_new, _cones_new) = chordal_info.decomp_augment(
-                P_new.as_ref().unwrap_or(P),
-                unwrap_and_slice_or_else(&q_new, || q),
-                A_new.as_ref().unwrap_or(A),
-                unwrap_and_slice_or_else(&b_new, || b),
-                settings,
-            );
-            (P_new, q_new, A_new, b_new, cones_new) = (
-                Some(_P_new),
-                Some(_q_new),
-                Some(_A_new),
-                Some(_b_new),
-                Some(_cones_new),
+        let mut chordal_info = try_chordal_info(&A, &b, &cones, settings);
+        if let Some(chordal_info) = &mut chordal_info {
+            let (P_new, q_new, A_new, b_new, cones_new) =
+                chordal_info.decomp_augment(&P, &q, &A, &b, settings);
+            (P, q, A, b, cones) = (
+                Cow::Owned(P_new),
+                Cow::Owned(q_new),
+                Cow::Owned(A_new),
+                Cow::Owned(b_new),
+                cones_new,
             );
         }
 
         // Scaling owns its inputs; borrowed API data is copied only here.
-        let mut P_new = P_new.unwrap_or_else(|| P_in.into_owned());
-        let q_new = q_new.unwrap_or_else(|| q_in.into_owned());
-        let mut A_new = A_new.unwrap_or_else(|| A_in.into_owned());
-        let mut b_new = b_new.unwrap_or_else(|| b_in.into_owned());
-
-        // cones was already copied, so can just pass through without cloning
-        let cones_new = cones_new.unwrap_or(cones);
+        let (mut P_new, q_new, mut A_new, mut b_new) = (
+            P.into_owned(),
+            q.into_owned(),
+            A.into_owned(),
+            b.into_owned(),
+        );
+        let cones_new = cones;
 
         //cap entries in b at INFINITY.  This is important
         //for inf values that were not in a reduced cone
@@ -214,7 +194,7 @@ where
         let (m, n) = A_new.size();
 
         // explicitly dropzeros on the copied data, since dropzeros
-        // operates in place.  PJG: revisit this order of operations
+        // operates in place. Revisit this order of operations
         // once a proper presolver is implemented, since it might
         // be preferable to dropzeros then presolve
         let mut dropped_zeros = 0;
@@ -318,6 +298,10 @@ where
             return;
         }
         if let Some(presolver) = &self.presolver {
+            // Sampled factors index the original columns.
+            if presolver.keep_columns.is_some() {
+                return;
+            }
             let keep = &presolver.reduce_map.as_ref().unwrap().keep_logical;
             if operator.blocks().iter().any(|b| {
                 keep[b.row_start..b.row_start + b.row_count()]
@@ -640,6 +624,8 @@ where
 }
 
 fn try_presolver<T>(
+    P: &CscMatrix<T>,
+    q: &[T],
     A: &CscMatrix<T>,
     b: &[T],
     cones: &[SupportedConeT<T>],
@@ -652,26 +638,11 @@ where
         return None;
     }
 
-    let presolver = Presolver::new(A, b, cones, settings);
+    let presolver = Presolver::new(P, q, A, b, cones, settings);
 
     if !presolver.is_reduced() {
         return None;
     }
 
     Some(presolver)
-}
-
-// -- utility function that tries to unwrap and slice a vector, or return
-// an alternative.   Necessary since the Options for q and b are &Vec, but
-// the user supplied data is a slice &[T]
-pub(crate) fn unwrap_and_slice_or_else<'a, T, F>(opt: &'a Option<Vec<T>>, f: F) -> &'a [T]
-where
-    F: FnOnce() -> &'a [T],
-    T: FloatT,
-{
-    if opt.is_some() {
-        opt.as_ref().unwrap().as_slice()
-    } else {
-        f()
-    }
 }

@@ -130,6 +130,39 @@ impl SparseParallel {
         a.sym(uplo).symv(y, x, alpha, beta);
     }
 
+    /// Two independent `yᵢ = β·yᵢ + α·K·xᵢ` products sharing one pass over
+    /// the row plan; each output keeps the single-product entry order.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn symv_pair<T: FloatT>(
+        &self,
+        a: &CscMatrix<T>,
+        uplo: MatrixTriangle,
+        y: [&mut [T]; 2],
+        x: [&[T]; 2],
+        alpha: T,
+        beta: T,
+    ) {
+        let [y0, y1] = y;
+        if let Some(pool) = &self.pool {
+            if self.row_lanes.len() > 1 {
+                y0.scale(beta);
+                y1.scale(beta);
+                pool.install(|| {
+                    split_output_pair(y0, y1, &self.row_lanes, &|row, o0, o1| {
+                        for e in &self.entries[self.rowptr[row]..self.rowptr[row + 1]] {
+                            let v = a.nzval[e.position];
+                            *o0 += alpha * v * x[0][e.column];
+                            *o1 += alpha * v * x[1][e.column];
+                        }
+                    })
+                });
+                return;
+            }
+        }
+        a.sym(uplo).symv(y0, x[0], alpha, beta);
+        a.sym(uplo).symv(y1, x[1], alpha, beta);
+    }
+
     pub(crate) fn residual_products<T: FloatT>(
         &self,
         a: &CscMatrix<T>,
@@ -494,6 +527,28 @@ fn split_outputs<T: FloatT, F: Fn(usize, &mut T) + Sync>(y: &mut [T], lanes: &[u
         rayon::join(
             || split_outputs(left, &lanes[..mid], f),
             || split_outputs(right, &lanes[mid..], f),
+        );
+    }
+}
+
+fn split_output_pair<T: FloatT, F: Fn(usize, &mut T, &mut T) + Sync>(
+    y0: &mut [T],
+    y1: &mut [T],
+    lanes: &[usize],
+    f: &F,
+) {
+    if lanes.len() == 1 {
+        for (i, (a, b)) in y0.iter_mut().zip(y1.iter_mut()).enumerate() {
+            f(lanes[0] + i, a, b);
+        }
+    } else {
+        let mid = lanes.len() / 2;
+        let cut = lanes[mid] - lanes[0];
+        let (l0, r0) = y0.split_at_mut(cut);
+        let (l1, r1) = y1.split_at_mut(cut);
+        rayon::join(
+            || split_output_pair(l0, l1, &lanes[..mid], f),
+            || split_output_pair(r0, r1, &lanes[mid..], f),
         );
     }
 }

@@ -62,7 +62,7 @@ pub(crate) trait MultiplySYR2K<T> {
         S2: AsRef<[T]>;
 }
 
-//PJG: problem here since DenseMatrix<T> is implemented by symmetric types,
+// problem here since DenseMatrix<T> is implemented by symmetric types,
 //but this should really only be implemented if MATA and MATB are either
 //DenseStorageMatrix or Adjoint<DenseStorageMatrix>.   Possibly solveable
 //by adding a new trait for DenseMatrix that is not implemented by symmetric,

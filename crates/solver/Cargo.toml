@@ -1,11 +1,11 @@
 [package]
 name = "sdpx-solver"
 version = "0.9.1"
-authors = ["Paul Goulart <paul.goulart@eng.ox.ac.uk>"]
+authors = ["SDPX contributors", "Paul Goulart <paul.goulart@eng.ox.ac.uk> (Clarabel.rs)"]
 edition = "2021"
 rust-version = "1.85.0"
 license = "Apache-2.0"
-description = "SDPX conic solver core adapted from Clarabel.rs"
+description = "SDPX: Float64 and MPFR homogeneous interior-point conic solver (core derived from Clarabel.rs, see NOTICE)"
 readme = "README.md"
 keywords = ["convex", "optimization", "conic", "solver", "linear-programming"]
 categories = ["mathematics"]
@@ -27,7 +27,8 @@ thiserror      = "1.0"
 # -------------------------------
 
 [features]
-default = ["serde"]
+# faer is the default supernodal backend; BLAS defaults come from build.rs.
+default = ["serde", "faer-sparse"]
 
 # Opt in to every MPFR frontend precision (128..2048 in steps of 64).
 # Native Rust `MpFloat<N>` types are unaffected.
@@ -36,9 +37,9 @@ all-precisions = ["sdpx-arithmetic/all-precisions"]
 # enable reading / writing of problems from json files 
 serde = ["dep:serde", "dep:serde_json", "dep:sha2", "sdpx-arithmetic/serde"]
 
-# BLAS/LAPACK are always linked. Pick a provider with one of these, or link
-# one directly (e.g. RUSTFLAGS="-l dylib=openblas") through the provider-
-# neutral `blas-src`/`lapack-src` shims.
+# BLAS/LAPACK are always linked. Without one of these provider features,
+# build.rs links Accelerate on macOS and the system dynamic OpenBLAS on other
+# Unix targets (SDPX_BLAS_LINK=none leaves linkage to RUSTFLAGS).
 sdp-accelerate = ["blas-src/accelerate", "lapack-src/accelerate"]
 sdp-netlib     = ["blas-src/netlib", "lapack-src/netlib", "netlib-src"]
 sdp-openblas   = ["blas-src/openblas", "lapack-src/openblas", "openblas-src"]

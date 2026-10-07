@@ -7,7 +7,7 @@ license = "Apache-2.0"
 name = "sdpx"
 crate-type = ["cdylib", "rlib"]
 [dependencies]
-sdpx-solver = { path = "../solver", default-features = false, features = ["serde"] }
+sdpx-solver = { path = "../solver", default-features = false, features = ["serde", "faer-sparse"] }
 sdpx-arithmetic = { path = "../arithmetic" }
 [features]
 # Opt in to every MPFR frontend precision (128..2048 in steps of 64).

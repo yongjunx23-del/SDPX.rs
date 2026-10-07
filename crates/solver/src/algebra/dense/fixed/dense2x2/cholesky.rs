@@ -77,7 +77,7 @@ mod test {
         // reconstuct M = LL^T
         let mut Lfull: Matrix<f64> = L.clone().into();
 
-        // PJG: L is not actually symmetric, but is rather
+        // L is not actually symmetric, but is rather
         // the cholesky factor packed into a a triangle.
         // Zero out the upper triangle explicitly.   Probably
         // a tril function would be better, or some

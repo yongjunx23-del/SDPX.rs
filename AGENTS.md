@@ -86,7 +86,7 @@ run one matching solve, and continue once it passes.
 export CARGO_HOME=/Users/xuyongjun/.local/share/sdpx-toolchain/cargo
 export RUSTUP_HOME=/Users/xuyongjun/.local/share/sdpx-toolchain/rustup
 export PATH="$CARGO_HOME/bin:$PATH"
-F=sdp-accelerate,faer-sparse   # macOS; cluster uses its validated BLAS provider
+F=sdp-accelerate,faer-sparse   # macOS (also the plain-build default); cluster uses its validated BLAS provider
 ```
 
 - Always `--locked --offline`, and always `-p <crate>` for the crate you

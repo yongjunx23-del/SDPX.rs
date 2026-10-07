@@ -34,7 +34,7 @@ impl<const S: usize, T: FloatT> DenseMatrixN<S, T> {
         Self::N
     }
 
-    // PJG: this probably wants to be defined in some
+    // this probably wants to be defined in some
     // more general matrix trait.   Same for most/all
     // the other functions defined in this trait
     pub(crate) fn set_identity(&mut self) {

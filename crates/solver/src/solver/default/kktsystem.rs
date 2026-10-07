@@ -148,8 +148,6 @@ where
                 return is_success;
             }
         }
-
-        //PJG is_success should be a Result in rust
     }
 
     fn update_affine(

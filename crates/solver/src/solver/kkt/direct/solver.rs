@@ -306,24 +306,24 @@ where
         crate::receipt::finish("trsv", timer);
         self.counters.rhs_applied += cols as u64;
         self.counters.linear_solves += cols as u64;
-        let mut flags = Vec::with_capacity(cols);
+        // The factor solve may consume its right-hand sides: restore them.
         for c in 0..cols {
-            self.setrhs(
-                &rhs[c * width..c * width + n],
-                &rhs[c * width + n..(c + 1) * width],
-            );
-            self.x.copy_from_slice(&x[c * full..(c + 1) * full]);
-            let timer = crate::receipt::start();
-            let ok = if settings.iterative_refinement_enable {
-                self.iterative_refinement(settings)
-            } else {
-                self.x.is_finite()
-            };
-            crate::receipt::finish("ir", timer);
+            b[c * full..c * full + width].copy_from_slice(&rhs[c * width..(c + 1) * width]);
+            b[c * full + width..(c + 1) * full].fill(T::zero());
+        }
+        let timer = crate::receipt::start();
+        let flags = if settings.iterative_refinement_enable {
+            self.refine(&mut x, &b, cols, settings)
+        } else {
+            (0..cols)
+                .map(|c| x[c * full..(c + 1) * full].is_finite())
+                .collect()
+        };
+        crate::receipt::finish("ir", timer);
+        for (c, &ok) in flags.iter().enumerate() {
             if ok {
-                out[c * width..(c + 1) * width].copy_from_slice(&self.x[..width]);
+                out[c * width..(c + 1) * width].copy_from_slice(&x[c * full..c * full + width]);
             }
-            flags.push(ok);
         }
         self.batch_rhs = b;
         self.batch_out = x;
@@ -491,6 +491,15 @@ where
                     *value -= eps;
                 }
             });
+            // Columns whose elimination order already yields a positive
+            // pivot keep their true diagonal; escalation restores the shift.
+            let exempt = self.reg_boost == 0;
+            self.ldlsolver.set_shift_exemption(exempt);
+            if exempt {
+                for &k in self.ldlsolver.unshifted_columns() {
+                    diag_shifted[k] = diag_kkt[k];
+                }
+            }
 
             _update_values(&mut self.ldlsolver, KKT, &map.diag_full, diag_shifted);
             self.diagonal_regularizer = eps;
@@ -635,92 +644,177 @@ where
     }
 
     fn iterative_refinement(&mut self, settings: &CoreSettings<T>) -> bool {
-        let (x, b) = (&mut self.x, &self.b);
-        let (e, dx) = (&mut self.work1, &mut self.work2);
+        let (mut x, b) = (std::mem::take(&mut self.x), std::mem::take(&mut self.b));
+        let ok = self.refine(&mut x, &b, 1, settings)[0];
+        (self.x, self.b) = (x, b);
+        ok
+    }
 
-        // iterative refinement params
+    /// Iterative refinement of `cols` right-hand sides (column-major, KKT
+    /// dimension each). Every column keeps its own residual, tolerance and
+    /// stop-ratio decisions; columns share only the passes over the KKT
+    /// matrix and over the factor. "Success" means a finite result.
+    fn refine(
+        &mut self,
+        x: &mut [T],
+        b: &[T],
+        cols: usize,
+        settings: &CoreSettings<T>,
+    ) -> Vec<bool> {
         let reltol = settings.iterative_refinement_reltol;
         let abstol = settings.iterative_refinement_abstol;
         let maxiter = settings.iterative_refinement_max_iter;
         let stopratio = settings.iterative_refinement_stop_ratio;
+        let full = self.KKT.n;
+        let (mut e, mut dx) = (
+            std::mem::take(&mut self.work1),
+            std::mem::take(&mut self.work2),
+        );
+        e.resize(cols * full, T::zero());
+        dx.resize(cols * full, T::zero());
+        let column = |c: usize| c * full..(c + 1) * full;
 
-        let KKT = &self.KKT;
-        let KKTsym = KKT.sym(self.KKTuplo);
-
-        let normb = b.norm_inf();
-
-        if T::precision_bits() > 64 && self.exact_rows.is_none() {
-            self.exact_rows = Some(ExactRows::new(KKT));
-        }
-        let exact = self.exact_rows.as_ref();
-        let world = self.residual_world;
-        let pool = &self.residual_pool;
-        let dense = self.residual_dense.as_ref();
-        let plan = &mut self.residual_plan;
-        let mut error = |e: &mut [T], x: &mut [T], backend: &dyn DirectLDLSolver<T>| -> T {
-            if let Some(rows) = exact {
-                x.negate();
-                let norm = rows.residual_negated(e, b, KKT, x, pool.as_deref(), world);
-                x.negate();
-                return norm;
-            }
-            if let Some(norm) = backend.residual(KKT, e, b, x) {
-                return norm;
-            }
-            // Exact rows and backend residuals do not use the generic CSR.
-            if dense.is_none() && plan.is_none() && pool.is_some() {
-                let mut rows = SparseParallel::new_symmetric(KKT);
-                rows.configure(KKT, pool.clone());
-                *plan = Some(rows);
-            }
-            _get_refine_error_dense(e, b, &KKTsym, x, plan.as_ref(), dense)
-        };
-        //compute the initial error
-        let mut norme = error(e, x, self.ldlsolver.as_ref());
-
-        if !norme.is_finite() {
-            return false;
-        }
+        let normb: Vec<T> = (0..cols).map(|c| b[column(c)].norm_inf()).collect();
+        let all: Vec<usize> = (0..cols).collect();
+        let mut norme = self.refine_residual(&mut e, b, x, &all, cols);
+        let mut ok: Vec<bool> = norme.iter().map(|n| n.is_finite()).collect();
+        let mut active = ok.clone();
 
         for _ in 0..maxiter {
-            if norme <= (abstol + reltol * normb) {
-                //within tolerance.  Exit
-                break;
-            }
-
-            let lastnorme = norme;
-
-            //make a refinement
-            self.counters.linear_solves += 1;
-            self.counters.refinements += 1;
-            let timer = crate::receipt::start();
-            self.ldlsolver.solve(KKT, dx, e);
-            crate::receipt::finish("ir.solve", timer);
-
-            //prospective solution is x + dx.  Use dx space to
-            // hold it for a check before applying to x
-            dx.axpby(T::one(), x, T::one());
-
-            let timer = crate::receipt::start();
-            norme = error(e, dx, self.ldlsolver.as_ref());
-            crate::receipt::finish("ir.residual", timer);
-
-            if !norme.is_finite() {
-                return false;
-            }
-
-            let improved_ratio = lastnorme / norme;
-            if improved_ratio < stopratio {
-                //insufficient improvement.  Exit
-                if improved_ratio > T::one() {
-                    std::mem::swap(x, dx);
+            for c in 0..cols {
+                if active[c] && norme[c] <= abstol + reltol * normb[c] {
+                    active[c] = false;
                 }
+            }
+            let act: Vec<usize> = (0..cols).filter(|&c| active[c]).collect();
+            if act.is_empty() {
                 break;
             }
-            std::mem::swap(x, dx);
+            let last = norme.clone();
+            self.counters.linear_solves += act.len() as u64;
+            self.counters.refinements += act.len() as u64;
+            let timer = crate::receipt::start();
+            if act.len() == cols && cols > 1 {
+                self.ldlsolver.solve_many(&self.KKT, &mut dx, &mut e, cols);
+            } else {
+                for &c in &act {
+                    let r = column(c);
+                    self.ldlsolver
+                        .solve(&self.KKT, &mut dx[r.clone()], &mut e[r]);
+                }
+            }
+            crate::receipt::finish("ir.solve", timer);
+            // The prospective solution x + dx is checked before acceptance.
+            for &c in &act {
+                let r = column(c);
+                dx[r.clone()].axpby(T::one(), &x[r], T::one());
+            }
+            let timer = crate::receipt::start();
+            let trial = self.refine_residual(&mut e, b, &mut dx, &act, cols);
+            crate::receipt::finish("ir.residual", timer);
+            for &c in &act {
+                norme[c] = trial[c];
+                if !norme[c].is_finite() {
+                    (ok[c], active[c]) = (false, false);
+                    continue;
+                }
+                let improved_ratio = last[c] / norme[c];
+                if improved_ratio < stopratio {
+                    active[c] = false;
+                    if improved_ratio <= T::one() {
+                        continue;
+                    }
+                }
+                let r = column(c);
+                x[r.clone()].copy_from_slice(&dx[r]);
+            }
         }
-        //NB: "success" means only that we had a finite valued result
-        true
+        (self.work1, self.work2) = (e, dx);
+        ok
+    }
+
+    /// `e = b − K·x` and its infinity norm for the listed columns. MPFR uses
+    /// exact rows; a backend may provide its own residual; otherwise the
+    /// symmetric row plan (two columns share one pass) or a dense cache.
+    fn refine_residual(
+        &mut self,
+        e: &mut [T],
+        b: &[T],
+        x: &mut [T],
+        cols: &[usize],
+        count: usize,
+    ) -> Vec<T> {
+        let full = self.KKT.n;
+        let mut norms = vec![T::zero(); count];
+        let column = |c: usize| c * full..(c + 1) * full;
+        if T::precision_bits() > 64 && self.exact_rows.is_none() {
+            self.exact_rows = Some(ExactRows::new(&self.KKT));
+        }
+        let (kkt, pool, world) = (&self.KKT, &self.residual_pool, self.residual_world);
+        if let Some(rows) = &self.exact_rows {
+            for &c in cols {
+                let xc = &mut x[column(c)];
+                xc.negate();
+                norms[c] = rows.residual_negated(
+                    &mut e[column(c)],
+                    &b[column(c)],
+                    kkt,
+                    xc,
+                    pool.as_deref(),
+                    world,
+                );
+                xc.negate();
+            }
+            return norms;
+        }
+        let mut generic = Vec::with_capacity(cols.len());
+        for &c in cols {
+            match self
+                .ldlsolver
+                .residual(kkt, &mut e[column(c)], &b[column(c)], &x[column(c)])
+            {
+                Some(norm) => norms[c] = norm,
+                None => generic.push(c),
+            }
+        }
+        if generic.is_empty() {
+            return norms;
+        }
+        let dense = self.residual_dense.as_ref();
+        if dense.is_none() && self.residual_plan.is_none() && pool.is_some() {
+            let mut rows = SparseParallel::new_symmetric(kkt);
+            rows.configure(kkt, pool.clone());
+            self.residual_plan = Some(rows);
+        }
+        let ksym = kkt.sym(self.KKTuplo);
+        if let ([c0, c1], None, Some(plan)) = (generic.as_slice(), dense, &self.residual_plan) {
+            let (e0, e1) = e.split_at_mut(column(*c1).start);
+            let (e0, e1) = (&mut e0[column(*c0)], &mut e1[..full]);
+            e0.copy_from(&b[column(*c0)]);
+            e1.copy_from(&b[column(*c1)]);
+            plan.symv_pair(
+                kkt,
+                self.KKTuplo,
+                [&mut *e0, &mut *e1],
+                [&x[column(*c0)], &x[column(*c1)]],
+                -T::one(),
+                T::one(),
+            );
+            norms[*c0] = e0.norm_inf();
+            norms[*c1] = e1.norm_inf();
+            return norms;
+        }
+        for &c in &generic {
+            norms[c] = _get_refine_error_dense(
+                &mut e[column(c)],
+                &b[column(c)],
+                &ksym,
+                &x[column(c)],
+                self.residual_plan.as_ref(),
+                dense,
+            );
+        }
+        norms
     }
 }
 

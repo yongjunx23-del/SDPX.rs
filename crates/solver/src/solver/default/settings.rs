@@ -140,11 +140,6 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = r#""auto".to_string()"#)]
     pub kkt_form: String,
 
-    /// Dense workspace budget for automatic shared-variable SOC elimination.
-    /// Zero disables this route; the default preserves the 512 MiB limit.
-    #[builder(default = "512 * 1024 * 1024")]
-    pub shared_soc_max_bytes: u64,
-
     ///enable KKT static regularization
     #[builder(default = "true")]
     pub static_regularization_enable: bool,
@@ -359,7 +354,6 @@ where
         check_immutable_setting!(self, prev, direct_kkt_solver);
         check_immutable_setting!(self, prev, direct_solve_method);
         check_immutable_setting!(self, prev, kkt_form);
-        check_immutable_setting!(self, prev, shared_soc_max_bytes);
         check_immutable_setting!(self, prev, dynamic_regularization_enable);
         check_immutable_setting!(self, prev, dynamic_regularization_eps);
         check_immutable_setting!(self, prev, dynamic_regularization_delta);
@@ -524,13 +518,6 @@ fn test_settings_validate() {
         ..DefaultSettings::default()
     };
     assert!(newsettings.validate_as_update(&oldsettings).is_err());
-
-    let changed_budget = DefaultSettings::<f64> {
-        shared_soc_max_bytes: 2 * 1024 * 1024 * 1024,
-        ..oldsettings.clone()
-    };
-    assert!(changed_budget.validate().is_ok());
-    assert!(changed_budget.validate_as_update(&oldsettings).is_err());
 
     // try to overlay allowed update values
     let oldsettings = DefaultSettings::<f64> {

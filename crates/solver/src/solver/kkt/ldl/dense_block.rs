@@ -34,18 +34,13 @@ impl DenseBlockSolver {
         signs: &[i8],
         settings: &CoreSettings<f64>,
     ) -> Option<Self> {
-        if k.m != k.n || signs.len() != k.n {
-            return None;
-        }
+        debug_assert!(k.m == k.n && signs.len() == k.n);
         let n = signs.iter().take_while(|&&s| s == 1).count();
         let m = k.n - n;
         if n < 128 || signs[n..].iter().any(|&s| s != -1) {
             return None;
         }
-        let elements = n
-            .checked_mul(n)?
-            .checked_add(n.checked_mul(m)?)?
-            .checked_add(m.checked_mul(m)?)?;
+        let elements = (n * n + n * m + m * m) as u128;
         if elements > 256 * 1024 * 1024 || k.n > i32::MAX as usize {
             return None;
         }
