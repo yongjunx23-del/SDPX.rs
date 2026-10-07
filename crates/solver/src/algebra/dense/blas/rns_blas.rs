@@ -1178,6 +1178,37 @@ impl<'a> CrtAccumulator<'a> {
         run_ways(split, ways, range);
         !failed.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Add each packed upper output's exact integer, times `2^shift`, to the
+    /// `width` slots of its position among the global packed outputs; the
+    /// local columns `columns` index the global ones.
+    fn accumulate(
+        self,
+        plan: &Plan,
+        shift: usize,
+        columns: &[usize],
+        slots: &mut [i128],
+        width: usize,
+    ) {
+        let (n, rows, kp) = (self.frac.len(), plan.count() + 1, plan.count());
+        let (crt, y) = (&self.crt, &self.y);
+        let mut i = 0;
+        for (j, &column) in columns.iter().enumerate() {
+            for &row in &columns[..=j] {
+                let o = column * (column + 1) / 2 + row;
+                let dest = &mut slots[o * width..(o + 1) * width];
+                // Digit sums minus round(frac)·M are exact integers below 2^53.
+                let kk = self.frac[i].round();
+                for l in 0..crt.chunks {
+                    let d = y[i + l * n] - kk * crt.table[kp + l * rows];
+                    if d != 0.0 {
+                        add_shifted(dest, d as i64, shift + l * crt.width as usize);
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
 }
 
 impl Drop for CrtAccumulator<'_> {
@@ -1598,7 +1629,13 @@ pub(super) fn gemm<const N: usize>(
 
 /// Upper triangle of `Σ A_bᵀ·B_b`, summed exactly across every row block and
 /// rounded once. Blocks are column-major `rows × m`; output uses `i + j*m`.
-/// Encode bounded row groups instead of retaining two full tall operands.
+///
+/// Rows of one support class may be summed in any order, so they are sorted
+/// by exponent window and cut into groups of at most 256 rows. Each group
+/// encodes against its own window and reconstructs its exact integer with
+/// its own primes: a few rows carrying cancellation residues no longer widen
+/// every group's encoding and prime count. The group integers are added
+/// exactly at their offsets from the lowest group base, then rounded once.
 pub(super) fn gemm_blocks_upper<const N: usize>(
     m: usize,
     rows: usize,
@@ -1606,44 +1643,42 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
     out: &mut [F<N>],
     pool: Option<&rayon::ThreadPool>,
 ) -> bool {
+    // Per-row windows `[lo_a, hi_a, lo_b, hi_b]` (block-major `b·rows + local`).
     let (mut lo_a, mut hi_a, mut lo_b, mut hi_b) =
         (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
     let mut supports = vec![vec![false; m]; rows];
+    let mut windows = Vec::with_capacity(blocks.len() * rows);
     for &(a, b) in blocks {
         debug_assert_eq!(a.len(), rows * m);
         debug_assert_eq!(b.len(), rows * m);
-        for j in 0..m {
-            for local in 0..rows {
+        for local in 0..rows {
+            let (mut la, mut ha, mut lb, mut hb) = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
+            for j in 0..m {
                 let entry = j * rows + local;
                 let (Some(active_a), Some(active_b)) =
-                    (scan_exponent(&a[entry], &mut lo_a, &mut hi_a),
-                     scan_exponent(&b[entry], &mut lo_b, &mut hi_b))
+                    (scan_exponent(&a[entry], &mut la, &mut ha),
+                     scan_exponent(&b[entry], &mut lb, &mut hb))
                 else {
                     return false;
                 };
                 supports[local][j] |= active_a || active_b;
             }
+            (lo_a, hi_a, lo_b, hi_b) = (lo_a.min(la), hi_a.max(ha), lo_b.min(lb), hi_b.max(hb));
+            windows.push([la, ha, lb, hb]);
         }
     }
+    let outputs = m * (m + 1) / 2;
     if lo_a == i64::MAX || lo_b == i64::MAX {
         for j in 0..m {
             out[j * m..j * m + j + 1].fill(F::zero());
         }
         return true;
     }
-    let (da, db) = (hi_a - lo_a, hi_b - lo_b);
-    if da > MAX_SPREAD || db > MAX_SPREAD {
+    if hi_a - lo_a > MAX_SPREAD || hi_b - lo_b > MAX_SPREAD {
         return false;
     }
-    let k = rows * blocks.len();
-    let needed = 2.0 * F::<N>::PRECISION_BITS as f64
-        + (da + db) as f64 + (k.max(1) as f64).log2() + 3.0;
-    let Some(plan) = Plan::new(k, needed) else {
-        return false;
-    };
     let timer = crate::receipt::start();
     let split = split_plan(pool);
-    let outputs = m * (m + 1) / 2;
     // A row's common support includes both operands across all blocks. Equal
     // supports share one product; dense rows retain the original tall layout.
     let mut row_groups: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
@@ -1659,84 +1694,113 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
             row_groups.push((columns, vec![local]));
         }
     }
-    // Start with wider chunks so later compact groups reuse their capacity.
-    row_groups.sort_unstable_by_key(|(columns, _)| std::cmp::Reverse(columns.len()));
-    // Each way streams all primes over at most 256 rows at a time. Row-group
-    // residues add exactly mod p, independent of grouping and worker order.
-    let groups: usize = row_groups.iter()
-        .map(|(_, locals)| blocks.len().div_ceil((256 / locals.len()).max(1))).sum();
-    let ways = split_ways(&split).min(groups).max(1);
-    let build = |w| {
-        let mut part = vec![0.0; plan.count() * outputs];
-        // Keep private buffers in their roles throughout this call. Taking
-        // len-zero pooled scratch can pin large operand chunks as tiny products.
+    struct Group {
+        class: usize,
+        rows: Vec<usize>,
+        lo: (i64, i64),
+        spread: (i64, i64),
+        plan: Plan,
+        cost: f64,
+    }
+    let precision = F::<N>::PRECISION_BITS as f64;
+    let mut groups = Vec::new();
+    for (class, (columns, locals)) in row_groups.iter().enumerate() {
+        // Rows with a zero side contribute nothing.
+        let mut ids: Vec<usize> = (0..blocks.len())
+            .flat_map(|b| locals.iter().map(move |&local| b * rows + local))
+            .filter(|&r| windows[r][0] <= windows[r][1] && windows[r][2] <= windows[r][3])
+            .collect();
+        ids.sort_unstable_by_key(|&r| (windows[r][0] + windows[r][2], r));
+        for chunk in ids.chunks(256) {
+            let (mut la, mut ha, mut lb, mut hb, mut top) =
+                (i64::MAX, i64::MIN, i64::MAX, i64::MIN, i64::MIN);
+            for &r in chunk {
+                let w = windows[r];
+                (la, ha, lb, hb) = (la.min(w[0]), ha.max(w[1]), lb.min(w[2]), hb.max(w[3]));
+                top = top.max(w[1] + w[3]);
+            }
+            // |Σ a·b| < k·2^(2p + top - la - lb) over the group's rows.
+            let k = chunk.len();
+            let needed = 2.0 * precision + (top - la - lb) as f64 + (k as f64).log2() + 3.0;
+            let Some(plan) = Plan::new(k, needed) else {
+                return false;
+            };
+            let cols = columns.len() as f64;
+            let cost = plan.count() as f64
+                * k as f64
+                * cols
+                * ((2.0 * precision + (ha - la + hb - lb) as f64) / 28.0 + cols / 2.0);
+            groups.push(Group {
+                class,
+                rows: chunk.to_vec(),
+                lo: (la, lb),
+                spread: (ha - la, hb - lb),
+                plan,
+                cost,
+            });
+        }
+    }
+    // Heaviest groups first; ways pull the next group, and the exact sums
+    // do not depend on which way adds which group.
+    groups.sort_by(|x, y| y.cost.total_cmp(&x.cost));
+    let base = groups.iter().map(|g| g.lo.0 + g.lo.1).min().unwrap_or(0);
+    // Slots hold signed 64-bit-aligned partial sums of each output's integer.
+    let top = groups
+        .iter()
+        .map(|g| (g.lo.0 + g.lo.1 - base) as usize + g.plan.count() * g.plan.bits as usize + 192)
+        .max()
+        .unwrap_or(0);
+    let width = top.div_ceil(64) + 2;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let ways = split_ways(&split).min(groups.len()).max(1);
+    let build = |_| {
+        let mut slots = vec![0i128; outputs * width];
         let (mut ar, mut br, mut product, mut temp) =
-            (Vec::new(), Vec::new(), vec![0.0; outputs], Vec::new());
-        let mut offset = 0;
-        for (columns, locals) in &row_groups {
-            let cols = columns.len();
-            let local_rows = locals.len();
-            let blocks_per = (256 / local_rows).max(1);
-            let count = blocks.len().div_ceil(blocks_per);
-            let start = (w + ways - offset % ways) % ways;
-            product.resize(cols * (cols + 1) / 2, 0.0);
-            for group in (start..count).step_by(ways) {
-                let first = group * blocks_per;
-                let block = &blocks[first..blocks.len().min(first + blocks_per)];
-                let kr = local_rows * block.len();
-                let len = kr * cols;
-                let mut ca = ChunkMatrix::new::<N>(len, da, &plan);
-                let mut cb = ChunkMatrix::new::<N>(len, db, &plan);
-                // Encode the original block entries in tall column order, avoiding
-                // two gathered MPFR panels without an indexed getter/division.
-                for (j, &column) in columns.iter().enumerate() {
-                    for (r, &(ab, bb)) in block.iter().enumerate() {
-                        for (i, &local) in locals.iter().enumerate() {
-                            let entry = j * kr + r * local_rows + i;
-                            let (a0, b0) = (entry * ca.chunks, entry * cb.chunks);
-                            fill_chunk(&ab[column * rows + local], &mut ca.e[a0..a0 + ca.chunks], lo_a, ca.width);
-                            fill_chunk(&bb[column * rows + local], &mut cb.e[b0..b0 + cb.chunks], lo_b, cb.width);
-                        }
-                    }
-                }
-                let shape = GemmShape {
-                    ta: b'T', tb: b'N', m: cols, n: cols, k: kr, lda: kr, ldb: kr,
-                };
-                for q0 in (0..plan.count()).step_by(STREAM_GROUP) {
-                    let q1 = (q0 + STREAM_GROUP).min(plan.count());
-                    group_residues(ca.view(), &plan, q0, q1, &mut ar);
-                    group_residues(cb.view(), &plan, q0, q1, &mut br);
-                    for q in q0..q1 {
-                        let qi = q - q0;
-                        shape.prime_product(
-                            &plan, q,
-                            &ar[qi * len..(qi + 1) * len],
-                            &br[qi * len..(qi + 1) * len],
-                            &mut product, &mut temp, true,
-                        );
-                        let dest = &mut part[q * outputs..][..outputs];
-                        if cols == m {
-                            for (x, &y) in dest.iter_mut().zip(&product) {
-                                *x = reduce(*x + y, plan.p[q], plan.pinv[q]);
-                            }
-                        } else {
-                            for (j, &column) in columns.iter().enumerate() {
-                                let at = column * (column + 1) / 2;
-                                let packed = j * (j + 1) / 2;
-                                for (i, &row) in columns[..=j].iter().enumerate() {
-                                    let x = &mut dest[at + row];
-                                    *x = reduce(*x + product[packed + i], plan.p[q], plan.pinv[q]);
-                                }
-                            }
-                        }
-                    }
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        loop {
+            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(group) = groups.get(index) else {
+                break;
+            };
+            let (columns, _) = &row_groups[group.class];
+            let (cols, kr, plan) = (columns.len(), group.rows.len(), &group.plan);
+            let len = kr * cols;
+            let mut ca = ChunkMatrix::new::<N>(len, group.spread.0, plan);
+            let mut cb = ChunkMatrix::new::<N>(len, group.spread.1, plan);
+            for (j, &column) in columns.iter().enumerate() {
+                for (i, &r) in group.rows.iter().enumerate() {
+                    let ((ab, bb), at) = (blocks[r / rows], column * rows + r % rows);
+                    let (a0, b0) = ((j * kr + i) * ca.chunks, (j * kr + i) * cb.chunks);
+                    fill_chunk(&ab[at], &mut ca.e[a0..a0 + ca.chunks], group.lo.0, ca.width);
+                    fill_chunk(&bb[at], &mut cb.e[b0..b0 + cb.chunks], group.lo.1, cb.width);
                 }
             }
-            offset += count;
+            let shape = GemmShape {
+                ta: b'T', tb: b'N', m: cols, n: cols, k: kr, lda: kr, ldb: kr,
+            };
+            let n = cols * (cols + 1) / 2;
+            let mut acc = CrtAccumulator::new(plan, n, &[]);
+            for q0 in (0..plan.count()).step_by(STREAM_GROUP) {
+                let q1 = (q0 + STREAM_GROUP).min(plan.count());
+                group_residues(ca.view(), plan, q0, q1, &mut ar);
+                group_residues(cb.view(), plan, q0, q1, &mut br);
+                product.resize((q1 - q0) * n, 0.0);
+                for (qi, q) in (q0..q1).enumerate() {
+                    shape.prime_product(
+                        plan, q,
+                        &ar[qi * len..(qi + 1) * len],
+                        &br[qi * len..(qi + 1) * len],
+                        &mut product[qi * n..(qi + 1) * n], &mut temp, true,
+                    );
+                }
+                acc.add(plan, q0, q1, &mut product, n, &Split::Serial);
+            }
+            let shift = (group.lo.0 + group.lo.1 - base) as usize;
+            acc.accumulate(plan, shift, columns, &mut slots, width);
         }
-        part
+        slots
     };
-    let parts: Vec<Vec<f64>> = match &split {
+    let parts: Vec<Vec<i128>> = match &split {
         Split::Serial => vec![build(0)],
         Split::Pool(p) => p.install(|| (0..ways).into_par_iter().map(build).collect()),
         Split::Ways(_) => (0..ways).into_par_iter().map(build).collect(),
@@ -1744,25 +1808,51 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
     let mut parts = parts.into_iter();
     let mut total = parts.next().unwrap();
     for part in parts {
-        for q in 0..plan.count() {
-            for (x, &y) in total[q * outputs..][..outputs].iter_mut()
-                .zip(&part[q * outputs..][..outputs])
-            {
-                *x = reduce(*x + y, plan.p[q], plan.pinv[q]);
+        for (x, y) in total.iter_mut().zip(&part) {
+            *x += y;
+        }
+    }
+    let mut mag = Vec::with_capacity(width);
+    let mut o = 0;
+    for j in 0..m {
+        for i in 0..=j {
+            out[i + j * m] = round_slots(&total[o * width..(o + 1) * width], base, &mut mag);
+            o += 1;
+        }
+    }
+    crate::receipt::finish("rns.block_gemm", timer);
+    true
+}
+
+/// Adds `value · 2^bit` to 64-bit-aligned signed slots.
+#[inline]
+fn add_shifted(slots: &mut [i128], value: i64, bit: usize) {
+    let v = (value as i128) << (bit % 64);
+    slots[bit / 64] += (v as u64) as i128;
+    slots[bit / 64 + 1] += v >> 64;
+}
+
+/// The integer `Σ slots[s]·2^(64s)` times `2^scale`, rounded once.
+fn round_slots<const N: usize>(slots: &[i128], scale: i64, mag: &mut Vec<u64>) -> F<N> {
+    mag.clear();
+    let mut carry = 0i128;
+    for &s in slots {
+        let t = s + carry;
+        mag.push(t as u64);
+        carry = t >> 64;
+    }
+    // The top slots only carry sign extension: `carry` is 0 or -1.
+    let negative = carry < 0;
+    if negative {
+        let mut one = true;
+        for limb in mag.iter_mut() {
+            *limb = !*limb;
+            if one {
+                (*limb, one) = limb.overflowing_add(1);
             }
         }
     }
-    let selected = selection(m, m, true);
-    let mut acc = CrtAccumulator::new(&plan, outputs, &[]);
-    for q0 in (0..plan.count()).step_by(STREAM_GROUP) {
-        let q1 = (q0 + STREAM_GROUP).min(plan.count());
-        acc.add(&plan, q0, q1, &mut total[q0 * outputs..q1 * outputs], outputs, &split);
-    }
-    // Products/CRT stay packed; only the final scatter uses dense indices.
-    acc.selected = &selected;
-    let result = acc.finish(&plan, lo_a + lo_b, out, &split);
-    crate::receipt::finish("rns.block_gemm", timer);
-    result
+    F::from_scaled_integer(negative, mag, scale)
 }
 
 /// Correctly rounded `Aᵀ·diag(d)·A` (`m × m`) for a column-major `k × m`
