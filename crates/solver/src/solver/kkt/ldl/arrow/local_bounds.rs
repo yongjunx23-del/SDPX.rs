@@ -22,9 +22,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return None;
         }
         let n = a.n;
-        if k.n != n + a.m || k.m != k.n || signs.len() != k.n {
-            return None;
-        }
+        debug_assert!(k.n == n + a.m && k.m == k.n && signs.len() == k.n);
         let mut bound_rows = vec![false; a.m];
         let mut trunk = Vec::new();
         for (cone, rows) in cones.iter().zip(&cones.rng_cones) {
@@ -86,9 +84,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let packed_bytes = if cfg!(feature = "faer-sparse")
             && std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>()
         {
-            (2 * groups.len() as u128 * t + t * t) * 8
+            2 * groups.len() as u128 * t * 8
         } else if T::precision_bits() > 64 {
-            (2 * groups.len() as u128 * t + t * t) * std::mem::size_of::<T>() as u128
+            2 * groups.len() as u128 * t * std::mem::size_of::<T>() as u128
         } else {
             0
         };
@@ -305,7 +303,6 @@ fn bound_gram(y: &[f64], z: &[f64], n: usize, t: usize, out: &mut [f64], paralle
 pub(super) struct BoundPanels {
     pub(super) y: Vec<f64>,
     z: Vec<f64>,
-    gram: Vec<f64>,
     rhs: Vec<f64>,
     border: Vec<f64>,
     pub(super) residual_entries: Vec<(usize, usize, usize)>,
@@ -357,13 +354,32 @@ impl FlatLeaves {
     }
 }
 
+// try_local_bounds gives each leaf distinct ids; rhs slots i+c*n are also
+// distinct across leaves. Only those disjoint slots use this helper;
+// synchronous pool installs join before the borrowed slices are used again.
+#[cfg(feature = "faer-sparse")]
+struct BoundSlots<'a, T>(*mut T, std::marker::PhantomData<&'a mut [T]>);
+#[cfg(feature = "faer-sparse")]
+unsafe impl<T: Send> Sync for BoundSlots<'_, T> {}
+#[cfg(feature = "faer-sparse")]
+impl<'a, T: Copy> BoundSlots<'a, T> {
+    fn new(values: &'a mut [T]) -> Self {
+        Self(values.as_mut_ptr(), std::marker::PhantomData)
+    }
+    unsafe fn read(&self, i: usize) -> T {
+        *self.0.add(i)
+    }
+    unsafe fn write(&self, i: usize, value: T) {
+        *self.0.add(i) = value;
+    }
+}
+
 #[cfg(feature = "faer-sparse")]
 impl BoundPanels {
     pub(super) fn new(capacity: usize, border: usize) -> Self {
         Self {
             y: vec![0.0; capacity * border],
             z: Vec::with_capacity(capacity * border),
-            gram: vec![0.0; border * border],
             flat: FlatLeaves::default(),
             rhs: Vec::new(),
             border: Vec::new(),
@@ -401,27 +417,34 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         };
         // Scale first, then form fixed column tiles on the existing pool.
         // Every lower-triangle entry is formed once; tile shapes are fixed.
-        match &self.pool {
-            Some(pool) if n * t * t >= 262144 => pool.install(|| {
-                panels
-                    .z
-                    .par_chunks_mut(n)
-                    .zip(panels.y.par_chunks(n))
-                    .for_each(scale);
-                bound_gram(&panels.y, &panels.z, n, t, &mut panels.gram, true);
-            }),
-            _ => {
-                panels
-                    .z
-                    .chunks_mut(n)
-                    .zip(panels.y.chunks(n))
-                    .for_each(scale);
-                bound_gram(&panels.y, &panels.z, n, t, &mut panels.gram, false);
+        {
+            // BoundPanels exists only for T=f64. Every lower Gram entry
+            // overwrites S before the shifted C subtraction below.
+            let gram = unsafe {
+                std::slice::from_raw_parts_mut(self.s.as_mut_ptr().cast::<f64>(), self.s.len())
+            };
+            match &self.pool {
+                Some(pool) if n * t * t >= 262144 => pool.install(|| {
+                    panels
+                        .z
+                        .par_chunks_mut(n)
+                        .zip(panels.y.par_chunks(n))
+                        .for_each(scale);
+                    bound_gram(&panels.y, &panels.z, n, t, gram, true);
+                }),
+                _ => {
+                    panels
+                        .z
+                        .chunks_mut(n)
+                        .zip(panels.y.chunks(n))
+                        .for_each(scale);
+                    bound_gram(&panels.y, &panels.z, n, t, gram, false);
+                }
             }
         }
         for j in 0..t {
             for i in j..t {
-                let value = self.c[i + j * t] - T::from_f64(panels.gram[i + j * t]).unwrap();
+                let value = self.c[i + j * t] - self.s[i + j * t];
                 self.s[i + j * t] = value;
                 self.s[j + i * t] = value;
             }
@@ -448,24 +471,40 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         // solve; the intervening border solve writes only disjoint trunk ids.
         // Forward leaf solves, as `Leaf::first_many` and
         // `DenseLeaf::forward_many`: same fused updates in the same order.
-        for i in 0..n {
-            let (o, g) = (f.off[i], f.off[i + 1] - f.off[i]);
-            let l = &f.l[f.loff[i]..f.loff[i + 1]];
-            debug_assert!(g == 2 || g == 3);
-            for c in 0..cols {
-                let w0 = b[c * dim + f.ids[o]].to_f64().unwrap();
-                let w1 = (-l[0]).mul_add(w0, b[c * dim + f.ids[o + 1]].to_f64().unwrap());
-                x[f.ids[o] + c * dim] = T::from_f64(w0).unwrap();
-                x[f.ids[o + 1] + c * dim] = T::from_f64(w1).unwrap();
-                let last = if g == 3 {
-                    let w2 = (-l[1]).mul_add(w0, b[c * dim + f.ids[o + 2]].to_f64().unwrap());
-                    let w2 = (-l[2]).mul_add(w1, w2);
-                    x[f.ids[o + 2] + c * dim] = T::from_f64(w2).unwrap();
-                    w2
-                } else {
-                    w1
-                };
-                panels.rhs[i + c * n] = last * f.dinv[o + g - 1];
+        let grain = 1024;
+        let ranges = n.div_ceil(grain);
+        {
+            let (x, rhs) = (BoundSlots::new(x), BoundSlots::new(&mut panels.rhs));
+            let forward = |range: std::ops::Range<usize>| unsafe {
+                for i in range {
+                    let (o, g) = (f.off[i], f.off[i + 1] - f.off[i]);
+                    let l = &f.l[f.loff[i]..f.loff[i + 1]];
+                    debug_assert!(g == 2 || g == 3);
+                    for c in 0..cols {
+                        let w0 = b[c * dim + f.ids[o]].to_f64().unwrap();
+                        let w1 = (-l[0]).mul_add(w0, b[c * dim + f.ids[o + 1]].to_f64().unwrap());
+                        x.write(f.ids[o] + c * dim, T::from_f64(w0).unwrap());
+                        x.write(f.ids[o + 1] + c * dim, T::from_f64(w1).unwrap());
+                        let last = if g == 3 {
+                            let w2 =
+                                (-l[1]).mul_add(w0, b[c * dim + f.ids[o + 2]].to_f64().unwrap());
+                            let w2 = (-l[2]).mul_add(w1, w2);
+                            x.write(f.ids[o + 2] + c * dim, T::from_f64(w2).unwrap());
+                            w2
+                        } else {
+                            w1
+                        };
+                        rhs.write(i + c * n, last * f.dinv[o + g - 1]);
+                    }
+                }
+            };
+            match &self.pool {
+                Some(pool) if ranges > 1 => pool.install(|| {
+                    (0..ranges).into_par_iter().for_each(|j| {
+                        forward(j * grain..((j + 1) * grain).min(n));
+                    });
+                }),
+                _ => forward(0..n),
             }
         }
         panel_product(
@@ -500,26 +539,40 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         );
         // Backward leaf solves, as `DenseLeaf::backward_many`; rows other than
         // the coupling row subtract zero, which leaves them unchanged.
-        for i in 0..n {
-            let (o, g) = (f.off[i], f.off[i + 1] - f.off[i]);
-            let l = &f.l[f.loff[i]..f.loff[i + 1]];
-            for c in 0..cols {
-                let w0 = (x[f.ids[o] + c * dim].to_f64().unwrap() - 0.0) * f.dinv[o];
-                let value = panels.rhs[i + c * n];
-                let w1 = (x[f.ids[o + 1] + c * dim].to_f64().unwrap()
-                    - if g == 2 { value } else { 0.0 })
-                    * f.dinv[o + 1];
-                let (w0, w1) = if g == 3 {
-                    let w2 = (x[f.ids[o + 2] + c * dim].to_f64().unwrap() - value) * f.dinv[o + 2];
-                    let w1 = (-l[2]).mul_add(w2, w1);
-                    let w0 = (-l[0]).mul_add(w1, w0);
-                    x[f.ids[o + 2] + c * dim] = T::from_f64(w2).unwrap();
-                    ((-l[1]).mul_add(w2, w0), w1)
-                } else {
-                    ((-l[0]).mul_add(w1, w0), w1)
-                };
-                x[f.ids[o] + c * dim] = T::from_f64(w0).unwrap();
-                x[f.ids[o + 1] + c * dim] = T::from_f64(w1).unwrap();
+        {
+            let x = BoundSlots::new(x);
+            let backward = |range: std::ops::Range<usize>| unsafe {
+                for i in range {
+                    let (o, g) = (f.off[i], f.off[i + 1] - f.off[i]);
+                    let l = &f.l[f.loff[i]..f.loff[i + 1]];
+                    for c in 0..cols {
+                        let w0 = (x.read(f.ids[o] + c * dim).to_f64().unwrap() - 0.0) * f.dinv[o];
+                        let value = panels.rhs[i + c * n];
+                        let w1 = (x.read(f.ids[o + 1] + c * dim).to_f64().unwrap()
+                            - if g == 2 { value } else { 0.0 })
+                            * f.dinv[o + 1];
+                        let (w0, w1) = if g == 3 {
+                            let w2 = (x.read(f.ids[o + 2] + c * dim).to_f64().unwrap() - value)
+                                * f.dinv[o + 2];
+                            let w1 = (-l[2]).mul_add(w2, w1);
+                            let w0 = (-l[0]).mul_add(w1, w0);
+                            x.write(f.ids[o + 2] + c * dim, T::from_f64(w2).unwrap());
+                            ((-l[1]).mul_add(w2, w0), w1)
+                        } else {
+                            ((-l[0]).mul_add(w1, w0), w1)
+                        };
+                        x.write(f.ids[o] + c * dim, T::from_f64(w0).unwrap());
+                        x.write(f.ids[o + 1] + c * dim, T::from_f64(w1).unwrap());
+                    }
+                }
+            };
+            match &self.pool {
+                Some(pool) if ranges > 1 => pool.install(|| {
+                    (0..ranges).into_par_iter().for_each(|j| {
+                        backward(j * grain..((j + 1) * grain).min(n));
+                    });
+                }),
+                _ => backward(0..n),
             }
         }
         true
@@ -625,7 +678,6 @@ impl<T: FloatT> ArrowLDLSolver<T> {
 pub(super) struct ExactBoundPanels<T> {
     pub(super) y: Vec<T>,
     z: Vec<T>,
-    gram: Vec<T>,
     // Packed leaf `v`/`batch_v` rows at `coupling_start`, so the couple dot
     // reads one contiguous column of `y` against one contiguous `vs` column.
     pub(super) vs: Vec<T>,
@@ -637,7 +689,6 @@ impl<T: FloatT> ExactBoundPanels<T> {
         Self {
             y: vec![T::zero(); n * t],
             z: Vec::new(),
-            gram: vec![T::zero(); t * t],
             y_residues: ResidueCache::default(),
             vs: vec![T::zero(); n],
         }
@@ -649,9 +700,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return false;
         };
         let (n, t) = (self.leaves.len(), self.trunk.len());
-        // Exact Yᵀ·diag(d)·Y, rounded once per entry, with Y's residues cached
-        // across iterations. It declines (nothing written) for types without
-        // the residue kernel; the rounded-Z path below is the fallback.
+        // S holds the upper Gram until the shifted C subtraction below.
+        // Y's residues remain cached across iterations. A declined kernel
+        // reaches the rounded-Z fallback, which overwrites every upper entry.
         // Solve scratch is refilled before its next read.
         for (d, leaf) in panels.vs[..n].iter_mut().zip(&self.leaves) {
             *d = leaf.factor.dinv[leaf.coupling_start];
@@ -661,13 +712,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             n,
             &panels.y,
             &panels.vs[..n],
-            &mut panels.gram,
+            &mut self.s,
             self.pool.as_deref(),
             &mut panels.y_residues,
         ) {
             for j in 0..t {
                 for i in 0..=j {
-                    let v = self.c[j + i * t] - panels.gram[i + j * t];
+                    let v = self.c[j + i * t] - self.s[i + j * t];
                     self.s[j + i * t] = v;
                     self.s[i + j * t] = v;
                 }
@@ -716,7 +767,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             let mut store = |cols: Vec<(usize, Vec<T>)>| {
                 for (j, col) in cols {
                     for (i, v) in col.into_iter().enumerate() {
-                        panels.gram[i + j * t] = v;
+                        self.s[i + j * t] = v;
                     }
                 }
             };
@@ -738,7 +789,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         for j in 0..t {
             for i in 0..=j {
-                let v = self.c[j + i * t] - panels.gram[i + j * t];
+                let v = self.c[j + i * t] - self.s[i + j * t];
                 self.s[j + i * t] = v;
                 self.s[i + j * t] = v;
             }

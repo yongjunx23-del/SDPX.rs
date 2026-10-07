@@ -942,7 +942,7 @@ pub(crate) fn get_amd_ordering<T: FloatT>(
     A: &CscMatrix<T>,
     amd_dense_scale: f64,
 ) -> (Vec<usize>, Vec<usize>, amd::Info) {
-    // PJG: For interested readers - setting amd_dense_scale to 1.5 seems to work better
+    // For interested readers - setting amd_dense_scale to 1.5 seems to work better
     // for KKT systems in QP problems, but this ad hoc method can surely be improved
 
     // computes a permutation for A using AMD default parameters

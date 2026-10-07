@@ -6,6 +6,73 @@ solves; the experiment log is [docs/JOURNAL.md](docs/JOURNAL.md).
 
 ## [Unreleased]
 
+g0-min reproduction SOCP (106,175 SOC3 cones, fixed multipliers): Float64
+solve 2.02 s/50 it (objective error 4.5e-7) → 9 ms/0 it (6.6e-14), whole CLI
+0.06 s against MOSEK 11.1.3 0.12–0.14 s internal; MPFR256 26.7 s/33 it →
+0.09 s, exact to 3e-77 against a 600-bit reference.
+
+### Added
+
+- Presolve merges second-order-cone tail coordinates whose rows of `A` are
+  zero: `(s1, s_V, s_C) ∈ K` iff `(s1, s_V, ‖b_C‖) ∈ K`; a fully constant tail
+  becomes the orthant row `s1 − ‖b_C‖ ≥ 0`. Postsolve lifts `s`, `z` (and
+  certificates) back to the original cone.
+- Presolve fixes a variable without quadratic terms whose only nonzero lies
+  in a single-entry orthant or equality row when its multiplier `−q_j/a` is
+  admissible; row and column leave, `q_j x_j` is an objective constant
+  reported in both costs. Problems that reduce completely return in 0
+  iterations.
+
+### Performance
+
+- Gondzio multiple centrality correctors (approved 2026-10-07) on orthant
+  rows, second-order cones (spectral) and τκ, for symmetric problems with
+  orthant or SOC rows: parity set iterations 993 → 849; larger gravity
+  37 → 22 (−16% native); csdr3 MPFR256 57 → 36; sched SOCPs now all Solved.
+  Pure PSD problems are unchanged.
+- Iterative refinement of the constant and affine right-hand sides shares
+  one residual pass and one two-column correction solve (−3–4% on the free-λ
+  g0 SOCP and gravity).
+
+- Binary64 local/shared SOC arrow Schur assembly streams each leaf once with
+  fixed 1024-leaf partials summed in chunk order (thread-count invariant):
+  84 → 4.4 ms per factorization on 106k leaves, border 16.
+
+### Changed (regularization contract; approved 2026-10-07)
+
+- The shared-SOC arrow eliminates each leaf's cone block before its single
+  primal column, whose pivot `P_jj + aᵀH⁻¹a` is positive; that column keeps
+  its true diagonal instead of the static shift. Any factorization failure
+  escalates as before and restores the shift. Synthetic free-multiplier g0
+  SOCP: 60 → 15 iterations, wrong objective (6e-5) → optimal.
+
+### Code structure (bitwise-identical solves)
+
+- The IPM driver is SDPX's own staged loop (`evaluate`, `terminate`,
+  `scale`, `direction`, `step_length`, `finish`) with an explicit
+  `IterationState` and control-flow `Flow`; the Hypatia-style curve search is
+  a `CurveSearch` value instead of loose options. All 49 parity cases (46
+  Float64 benchmark problems, ising11 MPFR512, csdr3 MPFR256, g0 cases) give
+  bitwise-identical x, s, z, status and iterations.
+- SDPX banner and presolve report (constraints removed, variables fixed,
+  cones reduced); crate authors are "SDPX contributors"; upstream attribution
+  moves to `NOTICE` and `provenance/`; upstream personal TODO notes removed.
+
+### Removed
+
+- `shared_soc_max_bytes` setting: the shared-SOC arrow uses the common
+  512 MiB arrow workspace cap (the former default). Settings files that set
+  it are rejected as unknown fields.
+- Runtime re-validation of solver-built KKT shapes and pivot signs in the
+  arrow and dense-block backend constructors (now `debug_assert!`).
+
+### Build
+
+- Without an `sdp-*` provider feature, `build.rs` links Accelerate on macOS
+  and the system dynamic OpenBLAS on other Unix targets (`SDPX_BLAS_LINK=none`
+  defers to RUSTFLAGS, `OPENBLAS_LIB_DIR` adds a search path); `faer-sparse`
+  is a default feature, so a plain `cargo build` produces the tuned backend.
+
 ## [0.9.1] - 2026-10-06
 
 Mixed Λ27 at 1024 bits, 32 threads per node: full solve on 4 nodes 1369 s

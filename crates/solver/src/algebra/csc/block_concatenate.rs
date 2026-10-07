@@ -17,7 +17,7 @@ where
         Self::hvcat(&[&[A], &[B]])
     }
 
-    //PJG: This might be modifiable to allow Adjoint and Symmetric
+    // This might be modifiable to allow Adjoint and Symmetric
     //inputs as well.
     fn blockdiag(mats: &[&Self]) -> Result<Self, MatrixConcatenationError> {
         if mats.is_empty() {
@@ -45,7 +45,7 @@ where
 
         M.colcount_to_colptr();
 
-        //PJG: create fake data map showing where the
+        // create fake data map showing where the
         //entries go.   Probably this should be an Option
         //instead, but that requires rewriting some of the
         //KKT assembly code.
@@ -101,7 +101,7 @@ where
 
         M.colcount_to_colptr();
 
-        //PJG: create fake data maps showing where the
+        // create fake data maps showing where the
         //entries go.   Probably this should be an Option
         //instead, but that requires rewriting some of the
         //KKT assembly code

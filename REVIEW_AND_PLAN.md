@@ -1,6 +1,6 @@
 # SDPX development plan
 
-Updated 2026-10-06. [AGENTS.md](AGENTS.md) defines working rules and numerical
+Updated 2026-10-07. [AGENTS.md](AGENTS.md) defines working rules and numerical
 contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 [Journal](docs/JOURNAL.md) holds full timings, job histories, source hashes,
 failed attempts and audit evidence. This file keeps priorities, current
@@ -35,134 +35,124 @@ Frontends dispatch Float64 plus MPFR128/256/512/768/1024 by default;
 
 ## Current state
 
-The 2026-10-05 review fixes are verified: Ising11 MPFR512 at one and four
-threads is `Solved`/52, passes the original-coordinate 1e-30 audit and
-returns identical points. A two-rank MPI KKT check covers serial and pooled
-sampled products, mixed orthant rows and an empty arrow border. Focused
-checkpoint, recovery, cone-input and C ABI checks pass. Validation is shared
-at preparation; every RHS now measures its own refinement progress, and
-rollback refreshes accepted-iterate residuals before reduced convergence.
-The repaired Ising Lambda19 baseline is now retimed below.
+### Verified solver and architecture
 
-Owner setup now has one route for explicit, automatic and MPI partitions.
-Fingerprinting stays opt-in at the JSON boundary; ordinary solves avoid
-unused history metadata. Local/global layouts share immutable storage, and
-owner reductions reuse existing output buffers. The MPFR256 equality/orthant
-QP is `Solved`/19 locally and on two MPI ranks, including history recording
-and reuse, with identical baseline points and a 1e-30 original-coordinate
-audit. This removes 150 physical Rust lines; no speedup is claimed.
+Release 0.9.1 (`4863de1`) keeps the reviewed numerical repairs: per-RHS
+refinement progress, accepted-iterate residual restoration, shared boundary
+validation and the corrected mixed-cone MPI exchanges. Ising11 MPFR512 is
+`Solved`/52 at one/four threads with identical points and an original-
+coordinate 1e-30 audit. Actual two-rank MPI checks cover sampled/ordinary
+products, mixed orthant rows, accepted product reuse and gather decoding.
+Default Float64 failures remain labeled below; qnorm is explicit opt-in.
 
-The first exact-BLAS arrow trial is rejected: release ABBA on eight cluster
-cores gave Ising19 MPFR768 native medians 332.888 → 349.592 s (+5.02%) and
-RSS 725.756 → 855.352 MiB (+17.86%), with identical audited `Solved`/119
-points. Mixed Lambda27 MPFR1024 three-iteration windows gave 824.563 →
-831.410 s (+0.83%); these are incomplete diagnostics, not audited solutions.
-The disconnected-QR trial is also removed: its completed diagnostic A/B
-showed only −0.35%, and PBS223495 reached its two-hour limit before ABBA
-finished. Preserve its completed rows; the shell exit marker alone does not
-establish campaign completion.
+Owner setup has one constructor/layout route; local/global layouts share
+immutable storage, fingerprinting stays opt-in, and reductions use existing
+buffers. History training/reuse passes the MPFR256 equality/orthant E2E
+locally and on two MPI ranks with identical audited points.
 
-Packed upper-triangle residues reduce retained per-prime output storage.
-PBS223509 completed its eight-core release ABBA: Ising19 MPFR768 native
-332.946 → 333.185 s (+0.07%), process RSS 731.760 → 697.197 MiB (−4.72%),
-all audited `Solved`/119 with identical points. Its combined candidate also
-contained adaptive SVD tiles, so the RSS result is for that frozen binary.
-Lambda27 MPFR1024 baseline/packed three-iteration windows were
-822.329 → 769.710 s (−6.40%), RSS unchanged, identical `MaxIterations`/3
-points. Batched arrow products still need a complete audited release ABBA;
-the windows do not establish full-solve performance.
+Latest retained changes (individual measurements and source bindings are in
+[the journal](docs/JOURNAL.md)):
 
-Approved PBS223513 completed on 32 cores within 45 minutes. Isolating the
-SVD tile change gave complete Ising19 233.151 → 241.238 s (+3.47%), RSS
-1435.098 → 1452.141 MiB; Lambda27 windows improved only 0.93%. All points
-match and complete solves pass the audit. Remove adaptive tiles; keep the
-existing four-row parallel replay. Smaller tiles and disconnected QR are
-closed directions without new evidence.
+| Area | Retained benefit and evidence |
+|---|---|
+| Condensed and MPI storage | Reuse accepted H·z, decode gathers in place, and omit owner/fused-only staging. Logical Lambda27/1024 reductions include 149.6 MiB of H·z vectors and 74.8 MiB of gather staging; local and actual two-rank Ising11 points/audits match. No aggregate Lambda27 RSS claim. |
+| PSD and sampled storage | Borrow dead SVD/eigen work, omit unused Gram/coordinate tables, pack MPFR Grams/results and reduce rotation records. Distinct scalar inverse adjoints write quadratics directly; compacted bases retain projection. Matching original-coordinate and threading audits pass; individual timing/memory tradeoffs remain in the journal. |
+| Shared exact-product CRT | GEMM, congruence, quadratic and bilinear kernels share one accumulator and existing prime scheduling; contiguous outputs omit index vectors. Matched small release cases reduce RSS by 1.33–24.83%, with native changes from −1.49% to +4.96%. These are separate measurements; no summed gain or full Ising/Lambda27 claim. |
+| Float64 Schur storage | Defer the unused serial tile buffer during parallel assembly. Medium release RSS 359.75 → 350.90 MiB (−2.46%), native +1.31%; full audited points match. |
+| Bound-leaf elimination | Omit unused dense couplings, masks/indices and pivot signs. Float64/MPFR products reuse the Schur destination, removing `border² × sizeof(T)` retained bytes; matching gravity full fields/audits pass. Float64 reuse release native is flat (−0.08%), no RSS claim. Forward/backward phases use disjoint 1024-leaf ranges on the existing pool. Larger gravity, PBS223608/223609, four threads / BLAS one: native −5.88%, reverse-order repeat −3.41%; single-thread +1.91%/+0.99%, no RSS claim. Full fields and audits match. |
+| Local SOC exact products | Bounded row groups retain rounded Z and round the complete sum once. Initial CSDR3/256 release: serial native −20.97%, RSS +11.44%; four-thread speed below gate, RSS +43.45%. PBS223610/512/four threads: native +0.98%, RSS +22.81%. Direct encoding removes two MPFR staging panels per worker. Subsequent compact row supports: matched256 release native −2.59%/−6.42% at one/four threads; PBS223611/512/four threads native −4.25%. Full fields/audits match; no meaningful row-support RSS gain. |
+| Local SOC storage | Keep raw coupling row 0 in its unchanged Y row; B stores only raw row 1. Remove 176,400 scalars / 8.08 MiB on CSDR3/256, with identical full fields and original audit. Updates, finite checks, retries and fallback preserve original raw values. Logical memory benefit only. |
+| PMP conversion | Release parity bases before constraint coefficient work. At 256 samples/MPFR1024, remove 2.27 MiB of overlapping scalar storage per worker plus row headers. Tiny MPFR128 output is byte-identical; matched current-solver points and the original audit pass. Logical memory benefit only. |
 
-The later local arrow admission rules preserve column-parallel dots for
-short leaves and underfilled batches, use residues above 256 bits, and
-bound result storage relative to Y. Equality-only problems now admit the
-shared pool under the existing work cutoff; direct backends receive it
-before initial thread reporting. MPFR1024 equality E2Es at one/four **actual**
-workers are `Solved`/0, call the new residue branch, preserve full baseline
-points and pass the original-coordinate 1e-50 audit. The earlier one-bound
-fixture preserves points too, but misses its raw dual gate in the baseline
-as well (1.127e-50 > 1e-50); it is not an audit pass. Ising11 MPFR512 remains
-`Solved`/52 with identical points and 1e-30 audits at one/four threads.
-A focused residue check covers all transposes and the 32-column boundary.
-These admission/pool changes are outside the completed cluster binaries.
-See the journal for source and evidence bindings.
+Sparse row-plan setup also reuses offsets as fill cursors, removing
+`rows × sizeof(usize)` temporary bytes per construction at every precision.
+Gravity256 full fields and original audit match; no speed or peak-RSS claim.
+Diagonal congruence releases its unused scaling residues after row products
+join, allowing CRT to reuse or free the storage. Gravity256 full fields and
+audit match; logical overlap removal, with no formal speed or RSS claim.
+CRT table construction keeps one large-integer cofactor at a time instead
+of all prime quotients; Ising11/1024 full fields and original audit match.
+This reduces temporary construction storage; cached table sizes are unchanged.
 
-The complete Lambda27 MPFR1024 baseline/latest ABBA is prepared under
-`$SDPX_E2E_HOME/work/exact-arrow-full-20261006/`: frozen source, input hashes,
-32 cores, 64 GiB, at most six hours. Its independent original-coordinate
-1e-30 audit passes the small Ising11 preflight. It is **not submitted**;
-performance work is paused at the user's request. Resuming this longer run
-still needs approval beyond the completed 45-minute allocation.
+Ordinary square GEMMs of side ≥12 use the existing exact residue kernel at
+≥1024 bits. Matched Mac Ising11/1024 release ABBA, four threads / BLAS one:
+native 9.836518 → 9.555854 s (−2.85%), peak process RSS +4.69%; full fields
+and original audits match. Lower widths and other kernel eligibility stay
+unchanged. This is a small-case speed/memory tradeoff, with no larger-case
+or combined-patch claim. The Ising audit now checks the requested precision
+with the same 1e-30 equations and tolerance, removing its 512/768 allowlist.
 
-The performance results below describe their frozen sources before the
-2026-10-05 correctness fixes; they are not timings of the repaired tree.
+The shared-operand SOC layout reduces RSS relative to private row groups but
+regresses native time 10.96% in release and is reverted. PBS223610 completed
+the private layout's frozen MPFR512 comparison: no verified parallel gain.
+Whole-leaf support grouping offers only 0.0573% fewer products on CSDR3.
+Compact common row supports are kept after matched release gains;
+PBS223611 confirms their higher-precision gain from frozen sources.
 
-All three pinned cases pass on the 2026-10-04 working tree (Mac M4, `fast`
-profile, preliminary single-run timings, not performance claims):
+The earlier combined accepted-product / borrowed-work / gather-decode release
+check on small Ising11/512 was native −1.80%, RSS −0.10%; it establishes no
+≥2% speed gain or aggregate benefit for later patches. Sampled RHS borrowing
+is reverted after a warmed repeat showed no benefit and possible extra
+retained TLS workspaces. Scalar power-of-two multiplication
+is already in release 0.9.1; removing its exact mantissa-copy shortcut regressed
+release Ising11/512 by 0.89%. Leave it in place.
 
-| Case | Status | Native | Backend | Audit |
-|---|---|---|---|---|
-| `medium` Float64, qnorm 1e-6, 1 thread | Solved/19 | 2.12 s | `condensed_dense_block` | PASS, r_d 6.14e-7 |
-| `csdr3` MPFR256 SOC, 4 threads | Solved/57 | 7.0 s | `local_soc_arrow` | PASS |
-| `ising11` MPFR512 sampled, 1 / 4 threads | Solved/52 | 12.2 / 3.7 s | `condensed_sampled_arrow` | PASS, 1e-30 |
+### Full-solve accuracy gate
 
-g0 SOC benchmark, medium (`SDPX_g0_benchmark`, Mac M4, one thread, native
-seconds; condensed SOC elimination + dense panels, 2026-10-04):
+PBS223602 checked frozen 0.9.1 sources differing only in arrow residue batching,
+release ABBA, Lambda27/1024, 32 cores / BLAS one, 64 GiB, six hours. Local
+memory changes are excluded. The branch preserves exact products and leaf
+subtraction order. Earlier three-iteration windows improved 6.40%; they do
+not establish complete-solve performance.
 
-| Precision | Before | Now | Reference | Status / audit |
-|---|---|---|---|---|
-| Float64 | 0.20 s, 39 it | 0.023–0.024 s, 46 it | MOSEK 0.0286 s, 39 it | `AlmostSolved` (dual 3.3e-7 > 1e-9); objective within 2e-11 of the 256-bit answer (MOSEK 1e-7); audit dual 2.1e-6 (MOSEK 8.7e-6) |
-| MPFR256 | 6.65 s, 117 it | 2.55 s, 117 it | — | Solved, audit accepted (dual 2.15e-30) |
+Preserve both prior failures: PBS223591 reused the wrong candidate binary
+and failed the small branch-count preflight; PBS223593 completed baseline
+`Solved`/42 (2441.387 s native, 21163.313 MiB peak RSS) but its Julia audit
+exhausted memory before any candidate ran. PBS223602 is the second scoped
+retry. The blockwise audit completed in 598.277 s / 1157.227 MiB, then failed
+the unchanged 1e-30 gates: primal 3.730e-28, dual 1.475e-23, PSD mapping link
+2.733e-26 and componentwise dual 0.84355. Exit 1; no candidate ran. Diagnose
+the worst original equation and solver/audit normalization before further
+timing. Both automatic retries are spent. The repaired audit matches all
+Ising11 gates (objective/gap summation differs by 2.24e-154). No audited
+large comparison yet. Evidence: `$SDPX_E2E_HOME/work/resumed-091-arrow-full-20261006/`,
+remote `retry2/`.
 
-The g0 audit's primal residual uses the reported s; SDPX reports its iterate
-(1.6e-4 consistency on tiny rows), MOSEK reports b − Ax. Ruiz bounds
-1e-4/1e4 (a settings option) cut 256-bit to 65 iterations / ~1.95 s.
+The user approved a separate saved-point diagnosis after those two retries.
+PBS223605 completed on eight cores / 16 GiB, one actual Julia thread and
+no new solver run: 331.86 s process, 1138.254 MiB peak RSS, exit 0. Layout
+and failed dual metrics match exactly. Primal variables reach 5.832e118;
+standard residual normalization includes that large norm. The worst relative
+row (block77/sample127, zero cost) has absolute residual 1.286e-61, term
+work 1.525e-61 and relative error 0.84355; the worst absolute row is a
+different sample (block78/sample0). Both optional qnorm/componentwise gates
+were off. Next accuracy pilot should enable the existing gates explicitly;
+defaults and convergence rules stay unchanged. The saved point remains FAIL.
+The accuracy pilot is prepared and uploaded (existing frozen baseline binary,
+32 cores / 64 GiB / two hours, at most 100 iterations), awaiting additional
+approval after the exhausted retries. Small Ising11/512 with both gates at
+1e-30 remains `Solved`/52 and passes the unchanged audit.
 
-Mixed Λ27 at 1024 bits, 32 threads per node (SDPX one rank per node, SDPB
-32 ranks per node, thresholds 1e-30), full solves: 4 nodes SDPX Solved/42,
-solve 1369 s, process 23 min (head a0a6645; 0.9.0: 1608 s); SDPB
-optimal/125, solver 2592 s, process 43 min. 1 node: SDPX 2106 s, SDPB 4014 s.
-Per iteration (3-iteration runs) SDPX 51/46/37 s on 1/2/4 nodes vs SDPB
-143/70/65 s. Kept since 0.9.0 (same-allocation A/B, 4 nodes): coupled-column
-arrow work and aligned single-exchange sampled/scaling products, −6%.
+### Historical performance reference
 
-Distributed arrow (mixed Λ27, MPFR1024, 3 iterations, 32 threads per node,
-UCAS cluster): per-iteration time ~670 s → ~50 s on one node (leaf
-contributions on the fly, column-parallel leaves, cap by KKT size). Two
-nodes: refactor 77.4 → 49.8 s, IP 150.5 → 142.7 s; the remaining cost is
-replicated cone scaling and m-vector gathers. The four-node run (job 222592,
-host list including node70) produced no output and was left to its walltime.
+The following measured sources precede the 2026-10-05 repairs; do not treat
+them as current-tree timings or add gains from different comparisons.
 
-Latest matched cluster comparisons (node192, four threads, BLAS one, release
-native medians; each row is its own frozen comparison, gains do not add up):
+- Mixed Lambda27/1024 full solves, 32 threads per node: four-node SDPX
+  `Solved`/42, native 1369 s versus SDPB optimal/125, 2592 s; one-node SDPX
+  2106 s versus SDPB 4014 s. Sources/allocations are recorded in the journal.
+- Matched Float64 gravity, explicit qnorm 1e-6, PBS222437, all audits pass:
+  larger SDPX 1.914/1.380 s (one/four threads) versus MOSEK11.2.2
+  1.160/0.976 s; small 0.143/0.147 s versus 0.130/0.109 s. Larger SDPX
+  takes 35/36 iterations versus MOSEK21: diagnose the gap without changing
+  convergence, regularization or refinement rules.
+- Packed residue outputs: complete Ising19/768 RSS −4.72%, native unchanged
+  (PBS223509 combined binary). Adaptive SVD tiles regressed Ising19/768
+  by 3.47% on 32 cores (PBS223513) and were removed; four-row replay stays.
 
-| Kept change | Native result | Memory / accuracy |
-|---|---|---|
-| Remove duplicate diagonal reserve, gravity256 | small −3.48%, larger −4.22% | RSS −3.42%/−3.10%; points/audits identical |
-| Single-product scratch + balanced residues | small256 −0.92%, larger256 −3.41%, Ising512 +0.66% | dead scratch removed; 12 points/audits identical |
-| Regular-first exact-dot scan, gravity256 | small −2.87%, larger +0.41% | points/audits identical |
-| Zero/orthant pool, gravity256 | small −5.70%, larger −4.25% | RSS +1.05%/+0.31%; points/audits identical |
-| Narrow two-product FMMA, Ising256 | −2.87% | N ≤ 4 only; points/audits identical |
-| Narrow scalar FMA, gravity256 | small −2.24%, larger −0.94% | N ≤ 4 only; points/audits identical |
-| One-RHS GEMV, gravity53 | small −26%/−24% (1/4 threads), larger −11.8% | audits pass; rounding differs across arms |
-| Contiguous residual views, gravity53 | small −2.67%, larger −10.58% (4 threads) | serial small below gate |
-| KKT prefix, medium53 | −3.0% | RSS −5.0% |
-
-Float64 versus MOSEK 11.2.2 (PBS222437, explicit qnorm 1e-6, all audits
-pass): larger gravity 1.914/1.380 s (1/4 threads) versus 1.160/0.976 s;
-small 0.143/0.147 s versus 0.130/0.109 s. Larger qnorm runs take 35/36
-iterations versus MOSEK 21. The matched SDPB results above cover mixed Λ27.
-
-Pending: PBS222447 (sampled scratch clearing and scalar power-of-two
-multiplication, three cases against kept 222444). Later generic changes have
-no acceptance from that earlier MPI offset-reuse gate (222378); the later
-MPI changes have their own Λ27 evidence above. Full job histories are in the journal.
+Full experiment history, source bindings, old timing tables and unretrieved
+receipts (including PBS222447) remain in the journal. They do not authorize
+restarting old campaigns.
 
 ## Profile
 
@@ -176,9 +166,10 @@ Shares of the 2026-10-04 local runs (receipt phases, one thread):
   GMP limb multiplication inside exact dots is ~45% of samples overall.
 - `csdr3` MPFR256, four threads: refactor 43% of wall (arrow local Schur
   38%), iterative refinement 24%. The local Schur is one exact dot per border
-  pair over every leaf (structurally `YᵀZ`); an exact residue product would
-  give identical bits, but the analogous bound-leaf trial was rejected for
-  peak RSS, so measure RSS before trying it.
+  pair over every leaf (structurally `YᵀZ`). The retained bounded residue
+  product now replaces these dots; common row supports improve its 256/512
+  timings above. The original private layout increases RSS; the raw-row and
+  staging removals are logical storage benefits, not a combined RSS claim.
 
 Cluster 222426 cycle samples: gravity exact residual 22.5%, DGEMM 13.8%,
 diagonal congruence 11.0%; Lambda GMP multiplication 26.8%, DGEMM 15.9%,
@@ -194,6 +185,10 @@ regularization and refinement stay unchanged.
 
 ## Known failures (keep visible)
 
+- **Mixed Lambda27 MPFR1024:** frozen 0.9.1 baseline is `Solved`/42 but fails
+  the original-coordinate 1e-30 gate (dual 1.475e-23, primal 3.730e-28,
+  PSD link 2.733e-26, componentwise dual 0.84355). Diagnose before timing;
+  convergence and audit rules remain unchanged.
 - **Gravity Float64 default:** `Solved`/17, original dual residual 4.01e-6
   exceeds 2e-6. MPFR128/256 pass; opt-in qnorm runs are reported separately.
 - **Medium Float64 default:** 1.916e-6 exceeds 1.75e-6. Opt-in
@@ -216,14 +211,16 @@ regularization and refinement stay unchanged.
 
 | Order | Action | Acceptance / constraint |
 |---|---|---|
-| 0 | Multi-node scaling and MPFR kernel cost | Existing aligned exchanges, packed Grams, pooled border work and leaf splitting remain. Batched residue products improved Λ27 eight-core diagnostic windows by 6.40%; next gate is a complete audited release ABBA of the latest admission rules. Smaller SVD tiles regressed complete Ising19 at 32 cores and are removed; disconnected QR is also rejected. Preserve rounded Z and leaf subtraction order; Y = L⁻¹B contains rounded recurrences and cannot be replaced by one exact GEMM. Scaling latency remains bounded by the largest cone; GMP `addmul_1` is ~80% of contribution samples, not 80% of the whole solve. Avoid node70. |
-| 1 | Profile remaining exact residual and sampled/PSD work | Diagonal reserve222441 is kept; single-product scratch gate passes. Target measured complete-solve costs with unchanged exact operator/rounding. |
-| 2 | Optimize Lambda sampled RHS/KKT and PSD scaling | Target current dominant costs; ≥2% audited solve gain or clear memory/correctness benefit. Preserve exact operator/rounding contracts. |
-| 3 | Inspect remaining storage/setup lifetimes | Preserve shifted factorization versus unshifted residual operators; structural counts alone do not establish RSS. |
-| 4 | Improve LP/SOC/general sparse task balance | Keep rounded Z, numerical rules and visible thread regressions. Do not reopen late-correction work without new shift-probe evidence. |
-| 5 | Diagnose the remaining Float64 iteration gap | Use completed222437 small/larger comparison and phase receipts; separate setup/solve costs. Preserve numerical contracts. |
-| 6 | Scale only when the active workload needs it | Bounded frozen sources; Lambda43/1216 and 4/16/64/256-core campaigns remain later work. Recheck inputs/jobs before resuming. |
-| 7 | Improve PMP only when workflow cost warrants it | Whole-command time/memory and output equivalence; secondary to solver. |
+| 0 | Resolve Lambda27's original-coordinate accuracy gate | Saved-point diagnosis is complete; run the prepared explicit-gate pilot after approval. Full primal/dual/PSD/mapping audit still decides acceptance. |
+| 1 | Finish exact arrow batching measurement | After the accuracy gate, complete audited release ABBA. Preserve rounded Z and leaf subtraction order; diagnostic windows are insufficient. |
+| 2 | Optimize dominant sampled/PSD phases | Use the latest receipts to locate remaining serial work after shared congruence CRT. Largest-cone SVD latency and exact factor products remain; rejected SVD tile/QR directions stay closed. |
+| 3 | Remove unused storage/setup work | Packed results/Grams, shared product CRT, implicit indices and sampled owner/fused-only buffers are kept. Further removal needs a live unused allocation; Gram and scaling owners may differ. Preserve shifted factors versus unshifted residual operators. |
+| 4 | Improve LP/SOC thread balance and Float64 iteration gap | Compact SOC row supports improve256/512 native time; duplicate raw row 0 is removed. Further storage changes need a live allocation. Use gravity/MOSEK receipts for the iteration gap; preserve convergence, regularization and refinement. |
+| 5 | Scale only for the active workload | Frozen sources and bounded resources. Lambda43/1216 and broad core sweeps remain later work; avoid node70. |
+| 6 | Improve PMP when it limits the workflow | Secondary to the solver; measure whole-command time/memory and output equivalence. |
+| 7 | Free-multiplier g0 SOCP per-iteration cost (3.15 s/15 it vs MOSEK 1.3 s/13 it) | Batch refinement over the constant/affine RHS (one residual pass for both), fewer full-KKT residual passes, then compare a dual (16-row Schur) form as MOSEK's presolve does. Keep the 46-problem Float64 set and csdr3 unchanged. |
+| 8 | Lessons from other solvers (2026-10-07 survey, below) | Each item needs its own audited A/B; none is adopted yet. |
+| 9 | Centrality (Float64 LP/SOC iteration gap) | Done 2026-10-07 (approved): Gondzio correctors on orthant, SOC and τκ; parity iterations −14.5%, gravity 37 → 22, sched all Solved. PSD rows have no correction (eigendecomposition per corrector); measure before adding. |
 
 ## Measurement prerequisites
 
@@ -243,6 +240,45 @@ Apply these to affected paths; they are not a project-wide gate:
 
 ## Decisions still needed / deferred
 
+- **Approved 2026-10-07 (regularization contract):** shared-SOC arrow leaf
+  primal columns skip the static shift (pivot `P_jj + aᵀH⁻¹a > 0` by the fixed
+  elimination order; any factor failure restores it). Evidence: JOURNAL
+  2026-10-07. Other structures keep the shift until measured and approved.
+- **Independence from Clarabel.rs (requested 2026-10-07):** ≈36% of non-test
+  lines still match a same-named Clarabel.rs file (verbatim: qdldl, chordal,
+  cone files, info_print, data_updating, datamaps). Apache-2.0 requires keeping
+  the notices of derived files. Staged plan, each stage behaviour-neutral on
+  the pinned cases: (1) SDPX-owned problem/presolve/postsolve pipeline and
+  output (banner, settings schema); (2) replace the trait-object
+  `ProblemData/Variables/Residuals/KKTSystem` scaffolding with SDPX's own
+  state types; (3) own cone and KKT interfaces around the arrow/condensed
+  backends; (4) retire unused Clarabel features. Conflicts with the standing
+  "Clarabel-style convergence/refinement/regularization" rule; needs a
+  decision on which numerical policies may change. Done (bitwise-neutral,
+  2026-10-07): SDPX staged driver, banner/report, NOTICE/metadata, upstream
+  notes. Next neutral candidates: preprocessing pipeline in `problemdata.rs`
+  (keep its copy avoidance), a uniform presolve reduction/postsolve record,
+  and the configuration printer.
+
+### Survey: what other solvers do better (2026-10-07)
+
+- **SDPB (high precision):** HRVW/KSH/M (XZ) direction, so each block needs
+  only Cholesky factors of X and Y; SDPX's NT scaling needs an MPFR SVD per
+  PSD cone (≈3 s per 88×88 cone at 1024 bits, the largest serial latency).
+  Measured 2026-10-07 (JOURNAL): HKM cone update 6.5× cheaper, but +12%
+  iterations on ising11 MPFR512; net ≤ 0 on Λ27 shares. Closed. SDPB 3 forms the
+  Schur complement with blocked RNS (FLINT) BLAS, as SDPX's residue GEMM, and
+  distributes it with Elemental Cholesky.
+- **SDPA-GMP/QD/DD:** double-double and quad-double arithmetic (≈106/212
+  bits) is several times faster than MPFR at 128/256 bits; a `DoubleDouble`
+  scalar would serve medium-precision solves.
+- **MOSEK/HiGHS:** presolve (singleton columns, dualization) decides small and
+  separable SOCPs; Gondzio multiple centrality correctors cut iterations.
+- **Hypatia.jl:** neighborhood-based step with combined directions and
+  interpolant-basis polynomial (WSOS) cones that avoid lifting PMPs to SDP.
+- **COSMO.jl / SCS / CVXOPT:** clique merging (SDPX has it), indirect CG
+  solves with warm starts for very large KKTs, structured KKT exploitation.
+
 - Owner cost histories remain an opt-in public interface until a real scaling
   campaign establishes their value. Constructor duplication and repeated
   fingerprint plumbing are removed; distributed-arrow scaling above does
@@ -257,6 +293,9 @@ Apply these to affected paths; they are not a project-wide gate:
 - Sequential Schur writes require column reordering/rounding changes and undo
   suffix compaction. Dense-leaf packing saves only ~5.695 MiB (0.91% RSS)
   against broad index/parallel changes; revisit for a larger workload need.
+- Reusing caller Vt for internal SVD V removes no retained PSD matrix. Borrowed
+  eigen work limits order88 savings to 350 scalars, zero after indexed fallback;
+  no implementation is justified by this storage benefit.
 - Distributed restart, broad sweeps and new physics searches await concrete
   need. Old g0/application campaigns stay stopped unless explicitly resumed.
 
@@ -267,6 +306,8 @@ are in [the journal](docs/JOURNAL.md).
 
 - Lower/mixed precision, relaxed refinement, NaN clamping and MᵀM eigenanalysis
   violate numerical contracts. Fixed-point SVD replay erased tiny MPFR values.
+- HKM (SDPB XZ) PSD direction: 6.5× cheaper cone update, +12% iterations at
+  MPFR512 (ising11 58 vs 52); net ≤ 0 for the condensed sampled path.
 - SVD/eigen warm starts, terminal/scalar substitutions, zero-pair replay,
   cached small congruences and forced small dense factorization: no solve gain.
 - Float64 step/panel/column-alias/recovery/GEMM variants and Group-FMA loop
@@ -284,6 +325,32 @@ are in [the journal](docs/JOURNAL.md).
 - RNS rescan bypass adds mutable/cloned-owner API without copy savings.
   Pair20 is exact but unpack 5.48× slower; potential payload saving is not RSS.
   Rounded-Z residue re-encoding costs memory; cached-Y exact Gram stays.
+- Additional serial residue-encoding scratch pooling: MPFR1024 equality
+  release ABBA gains only 0.53% native time and increases RSS 2.15%; reverted.
+- Scalar power-of-two shortcut removal: release Ising11/512 regresses 0.89%,
+  with identical audited points and no clear memory benefit; existing code stays.
+- Contiguous GEMM scalar fallback: Ising11 release ABBA −4.78% with 20%
+  baseline drift, reverse BAAB +14.14%; no repeatable speed or storage
+  benefit. Reverted; packed SYRK/Gram storage stays.
+- In-place SVD column reflectors: Ising11 release native −0.13%, below
+  the speed gate; copy traffic is not retained storage. Reverted.
+- Packed upper congruence residues: native −0.90%/−0.82% on order24/88,
+  below the speed gate; order88 RSS +6.27%. Reverted; full staging stays.
+- Skinny left SVD projection batches: exact points, but fast-profile native
+  +1.96%/+5.82% at one/four threads. Reverted without a release campaign.
+- Parallel shared-CRT normalization: order88 release native +0.58%, RSS
+  +1.08%. Reverted; fraction conversion and mapped compaction stay serial.
+- Diagonal CRT digit-column splitting: small gravity256/four fast screen
+  native −0.82%, RSS flat, no storage removal; restored without a release
+  campaign. Existing serial diagonal reconstruction stays.
+- Removing overwritten sampled/PSD initialization: Ising11/512/one-thread
+  release native +0.82%, RSS −0.06%, no retained-storage benefit. Reverted.
+- Sampled RHS pool propagation: forward alone native −0.67%; adding scalar
+  adjoint pooling gives −1.86% and RSS +10.37%. Reverted; neither clears the gate.
+- Incremental RNS prime initialization: release 24-row sampled solve gains
+  only 1.23%; tiny table storage does not justify added cache lifecycle. Reverted.
+- Sampled RHS matrix borrowing: warmed release Ising11 shows no speed/RSS
+  benefit, and longer TLS checkouts may retain more worker workspaces; reverted.
 - Leading-diagonal slice and bound-coupling trial: below gate/no clear memory
   benefit; reverted. Shared filtered-FMA fallback fix stays.
 - OR objective-cost guard and G2 coupling increase iterations/work or regress
@@ -294,10 +361,12 @@ are in [the journal](docs/JOURNAL.md).
 - External zero-multiply/zero-addend FMA and diagonal-Gram GEMV: primitive
   regressions, tiny eligibility or sub-gate noisy kernels; no solver claim.
   Power-of-two dot products and capped wide FMMA fail the actual release gate;
-  wider arithmetic stays native. Scalar power-of-two multiplication is a
-  separate deferred external proposal, with no solver gain assumed. Exact
+  wider fused arithmetic stays native. Exact
   binary64 constructors pass native proofs but have no qualifying workload scope.
 - PMP zero-term trimming and Serde `collect_str`: rejected measured variants.
+- Ordinary small-square residue GEMM at512: Ising11/four-thread release
+  native +2.47%, RSS +2.37%, full fields/audits match; reverted. Global
+  24-row/product-area eligibility stays; QR/replay are unaffected.
 - One exact residue Gram for the whole arrow border (all leaves and ranks,
   residues summed by allreduce): Λ27 1024-bit 49.6 s versus 45.2 s for
   per-leaf exact dots on one node, 30.1 s versus 21.5 s on two; removed.

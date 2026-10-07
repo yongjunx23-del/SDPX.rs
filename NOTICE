@@ -1,0 +1,11 @@
+SDPX
+Copyright 2026 SDPX contributors
+
+This product includes software derived from Clarabel.rs
+(https://github.com/oxfordcontrol/Clarabel.rs), Copyright (c) 2022 Paul
+Goulart, University of Oxford, licensed under the Apache License 2.0
+(crates/solver/LICENSE.md). The upstream commit and the files derived from it
+are recorded in provenance/upstream.json.
+
+Further retained ports and their licences are listed in provenance/
+(SDPB pmp2sdp, MIT; SDPX.jl, MIT; GenericLinearAlgebra.jl, MIT).

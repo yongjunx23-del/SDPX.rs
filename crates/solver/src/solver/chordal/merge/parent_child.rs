@@ -10,7 +10,7 @@ pub(crate) struct ParentChildMergeStrategy {
 
 impl ParentChildMergeStrategy {
     pub(crate) fn new() -> Self {
-        let t_fill = 8; // PJG: make settable
+        let t_fill = 8; // make settable
         let t_size = 8;
         Self {
             stop: false,

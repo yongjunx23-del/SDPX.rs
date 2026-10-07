@@ -56,7 +56,7 @@ impl<T> DefaultSolver<T>
 where
     T: FloatT,
 {
-    // PJG: rustdoc fails to resolve links to `update_P`, `update_q`, `update_A`, `update_b` below
+    // rustdoc fails to resolve links to `update_P`, `update_q`, `update_A`, `update_b` below
 
     /// Overwrites internal problem data structures in a solver object with new data, avoiding new memory allocations.
     /// See `update_P`, `update_q`, `update_A`, `update_b` for allowable inputs.

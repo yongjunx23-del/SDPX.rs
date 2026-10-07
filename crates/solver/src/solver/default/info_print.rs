@@ -66,11 +66,22 @@ where
         let out = &mut self.stream;
 
         if let Some(ref presolver) = data.presolver {
-            writeln!(
+            write!(
                 out,
                 "\npresolve: removed {} constraints",
                 presolver.count_reduced()
             )?;
+            if !presolver.fixed.is_empty() {
+                write!(out, ", fixed {} variables", presolver.fixed.len())?;
+            }
+            if !presolver.soc_tails.is_empty() {
+                write!(
+                    out,
+                    ", reduced {} second-order cones",
+                    presolver.soc_tails.len()
+                )?;
+            }
+            writeln!(out)?;
         }
 
         if let Some(ref chordal_info) = data.chordal_info {

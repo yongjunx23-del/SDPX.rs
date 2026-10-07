@@ -24,6 +24,15 @@ fn lp() -> (
     )
 }
 
+// A 1e-8 objective check needs a tighter gap than the 1e-8 default.
+fn tight() -> DefaultSettings<f64> {
+    DefaultSettings {
+        tol_gap_abs: 1e-9,
+        tol_gap_rel: 1e-9,
+        ..DefaultSettings::default()
+    }
+}
+
 fn checkpointed(
     q: &[f64],
     file: &std::path::Path,
@@ -33,7 +42,7 @@ fn checkpointed(
     let (p, _, a, b, cones) = lp();
     let settings = DefaultSettings {
         max_iter,
-        ..DefaultSettings::default()
+        ..tight()
     };
     let mut solver = DefaultSolver::new(&p, q, &a, &b, &cones, settings).unwrap();
     solver.set_checkpoint(file, every);
@@ -50,8 +59,7 @@ fn restart_from_checkpoint_solves() {
     assert_eq!(first.solution.status, SolverStatus::Solved);
     assert!(file.exists());
 
-    let mut second =
-        DefaultSolver::new(&p, &q, &a, &b, &cones, DefaultSettings::default()).unwrap();
+    let mut second = DefaultSolver::new(&p, &q, &a, &b, &cones, tight()).unwrap();
     second.set_restart(&file);
     second.check_restart().unwrap();
     second.solve();

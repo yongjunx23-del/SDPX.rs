@@ -1138,15 +1138,11 @@ impl World {
         }
         self.gather_bytes(site, &local_bytes, &byte_ranges, &mut output_bytes);
 
-        let mut decoded = Vec::new();
         let mut decode_ok = width > 0 && output_bytes.len() % width == 0;
-        if decode_ok && decoded.try_reserve_exact(out.len()).is_err() {
-            decode_ok = false;
-        }
         if decode_ok {
-            for bytes in output_bytes.chunks_exact(width) {
+            for (value, bytes) in out.iter_mut().zip(output_bytes.chunks_exact(width)) {
                 match T::read_wire(bytes) {
-                    Some(value) => decoded.push(value),
+                    Some(decoded) => *value = decoded,
                     None => {
                         decode_ok = false;
                         break;
@@ -1154,8 +1150,7 @@ impl World {
                 }
             }
         }
-        self.exchange_status(site, decode_ok && decoded.len() == out.len());
-        out.copy_from_slice(&decoded);
+        self.exchange_status(site, decode_ok);
     }
 
     /// Gather variable-length Scalar segments only on `root` through the

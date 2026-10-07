@@ -252,7 +252,7 @@ impl SupportedConeTag {
 // ----------------------------------------------
 // Iterator for the range of indices of the cone
 
-//PJG: type names are not satisfactory.   Try to combine
+// type names are not satisfactory.   Try to combine
 //with the internal cone generators.
 
 pub(crate) struct RangeSupportedConesIterator<'a, T> {

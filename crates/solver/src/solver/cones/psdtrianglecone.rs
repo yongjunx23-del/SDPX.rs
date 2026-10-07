@@ -197,7 +197,9 @@ where
         }
         with_work(self.n, |w: &mut PsdWork<T>| {
             svec_to_mat(&mut w.mat1, z);
-            w.eig.eigvals(&mut w.mat1).expect("Eigval error");
+            let result = w.eig.eigvals(&mut w.mat1, &mut w.mat2.data);
+            w.mat2.data.resize(self.n * self.n, T::zero());
+            result.expect("Eigval error");
             let e = &w.eig.λ;
             let α = e.minimum();
             let β = e.iter().fold(T::zero(), |s, x| s + T::max(*x, T::zero())); //= sum(e[e.>0])
@@ -281,7 +283,6 @@ where
             };
 
             // bail if the cholesky factorization fails
-            // PJG: Need proper Result return type here
             if c1.is_err() || c2.is_err() {
                 return false;
             }
@@ -298,7 +299,10 @@ where
             // exact inverse Rinv = Λ^{-1/2} U' L2' = Λ^{1/2} V' L1^{-1}. Recovering
             // Rinv by one triangular solve replaces the accumulation of U.
             let __ts = std::time::Instant::now();
-            let svd_ok = w.svd.factor_right(tmp).is_ok();
+            // L2 is consumed; its storage can serve as SVD workspace until
+            // the inverse construction overwrites it with V.
+            let svd_ok = w.svd.factor_right(tmp, &mut w.mat2.data).is_ok();
+            w.mat2.data.resize(n * n, T::zero());
             crate::receipt::phase("cone_svd", __ts.elapsed());
             // non-finite or non-converged SVD: report a scaling failure so the
             // solver ends with NumericalError instead of panicking
@@ -350,7 +354,7 @@ where
             f.G.data_mut().set(T::zero());
             f.G.syrk(&f.R, T::one(), T::zero(), MatrixTriangle::Triu);
 
-            true //PJG: Should return result, with "?" operators above
+            true
         })
     }
 
@@ -757,7 +761,7 @@ where
         wm2,
         wm3,
     );
-    step_length_psd_component(wm1, eig, wv, Λisqrt, αmax)
+    step_length_psd_component(wm1, eig, wv, Λisqrt, αmax, &mut wm2.data)
 }
 
 fn step_length_psd_component<T>(
@@ -766,6 +770,7 @@ fn step_length_psd_component<T>(
     d: &[T],
     Λisqrt: &[T],
     αmax: T,
+    work: &mut Vec<T>,
 ) -> T
 where
     T: FloatT,
@@ -784,7 +789,11 @@ where
             };
             let v = match fast {
                 Some(v) => Some(v),
-                None => engine.eigval_min(workΔ).ok(),
+                None => {
+                    let result = engine.eigval_min(workΔ, work);
+                    work.resize(workΔ.nrows() * workΔ.ncols(), T::zero());
+                    result.ok()
+                }
             };
             crate::receipt::phase("cone_eigmin", __ts.elapsed());
             // a failed eigensolve means an unusable direction: zero step
@@ -1074,7 +1083,9 @@ mod f64_eigmin_tests {
             }
             let mut work = Matrix::<T>::zeros((n, n));
             work.data_mut().copy_from_slice(m.data());
-            let exact = EigEngine::<T>::new(n).eigval_min(&mut work).unwrap();
+            let exact = EigEngine::<T>::new(n)
+                .eigval_min(&mut work, &mut vec![T::zero()])
+                .unwrap();
             let exact64 = exact.to_f64().unwrap();
             let mut a: Vec<f64> = m.data().iter().map(|v| v.to_f64().unwrap()).collect();
             let fast = min_eigenvalue_f64(&mut a, n).unwrap();

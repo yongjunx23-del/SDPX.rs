@@ -41,7 +41,7 @@ where
         let dim1 = α.len();
         let dim = dim1 + dim2;
 
-        //PJG : these checks belong elsewhere
+        // these checks belong elsewhere
         assert!(α.iter().all(|r| *r > T::zero())); // check all powers are greater than 0
         assert!((T::one() - α.sum()).abs() < (T::epsilon() * α.len().as_T() * (0.5).as_T()));
 

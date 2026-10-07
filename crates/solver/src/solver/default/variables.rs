@@ -154,6 +154,34 @@ where
         self.combined_rhs_impl(residuals, variables, cones, step, σ, μ, T::one(), true);
     }
 
+    fn centrality_correction(
+        &mut self,
+        step: &Self,
+        variables: &Self,
+        cones: &mut CompositeCone<T>,
+        α: T,
+        σμ: T,
+    ) -> bool {
+        let (lo, hi) = (σμ * (0.1).as_T(), σμ * (10.0).as_T());
+        let mut changed = cones.centrality_correction(
+            &mut self.s,
+            &variables.s,
+            &variables.z,
+            &step.s,
+            &step.z,
+            α,
+            lo,
+            hi,
+        );
+        // κΔτ + τΔκ = −rhs.κ, as the orthant rows' zΔs + sΔz = −ds.
+        let v = (variables.τ + α * step.τ) * (variables.κ + α * step.κ);
+        if let Some(t) = band_correction(v, lo, hi) {
+            self.κ -= t;
+            changed = true;
+        }
+        changed
+    }
+
     fn prepare_affine_step_length(
         &self,
         step: &mut Self,
@@ -443,3 +471,16 @@ impl<T: FloatT> DefaultVariables<T> {
 #[cfg(test)]
 #[path = "tests/affine_prepared.rs"]
 mod affine_prepared_tests;
+
+/// Gondzio's target change for a trial complementarity product `v`: back
+/// to the band `[lo, hi]`, large products capped at `−hi` (Colombo &
+/// Gondzio, 2008). `None` inside the band.
+pub(crate) fn band_correction<T: FloatT>(v: T, lo: T, hi: T) -> Option<T> {
+    if v < lo {
+        Some(lo - v)
+    } else if v > hi {
+        Some(T::max(hi - v, -hi))
+    } else {
+        None
+    }
+}

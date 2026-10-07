@@ -316,7 +316,8 @@ struct Leaf<T> {
     signs: Vec<i8>,
     // Structurally zero prefix of the border coupling (zero for shared SOCs).
     coupling_start: usize,
-    // Border columns with a structural B entry (all for local structures).
+    // Border columns with a structural B entry (all for unpacked local leaves).
+    // Packed bounds use their panel maps instead.
     // Other Y columns stay exactly zero, so they are skipped everywhere.
     coupled: Vec<usize>,
     couples: Vec<bool>,
@@ -337,7 +338,7 @@ impl<T: FloatT> Leaf<T> {
         let g = ids.len();
         Self {
             ids,
-            signs: vec![1],
+            signs: Vec::new(),
             coupling_start: 0,
             coupled: (0..t).collect(),
             couples: vec![true; t],
@@ -392,7 +393,15 @@ impl<T: FloatT> Leaf<T> {
         }
         let start = self.coupling_start;
         let width = g - start;
-        self.y.copy_from_slice(&self.b);
+        if self.b.len() < self.y.len() {
+            // Local SOC's first suffix row has L=1 and stays raw in Y.
+            debug_assert_eq!(self.y.len(), 2 * self.b.len());
+            for (column, &value) in self.y.chunks_mut(2).zip(&self.b) {
+                column[1] = value;
+            }
+        } else {
+            self.y.copy_from_slice(&self.b);
+        }
         let (factor, couples) = (&self.factor, &self.couples);
         if split && width > 0 {
             self.y
@@ -615,7 +624,7 @@ fn subtract_contributions<T: FloatT>(
             for source in y.chunks(g) {
                 z.extend(source.iter().zip(&leaf.factor.dinv).map(|(&a, &d)| a * d));
             }
-            let mut product = vec![T::zero(); q * q];
+            let mut product = vec![T::zero(); triangular_number(q)];
             let timer = crate::receipt::start();
             let exact =
                 T::xgemm_upper_exact(b'T', b'N', q, q, g, y, g, &z, g, &mut product, None, None);
@@ -623,7 +632,7 @@ fn subtract_contributions<T: FloatT>(
             if !exact {
                 for c in 0..q {
                     for r in 0..=c {
-                        product[r + c * q] =
+                        product[r + triangular_number(c)] =
                             T::dot_fma(y[r * g..(r + 1) * g].iter().zip(&z[c * g..(c + 1) * g]));
                     }
                 }
@@ -646,14 +655,27 @@ fn subtract_contributions<T: FloatT>(
                     Some(p) => p.install(|| batch.par_iter().map(build).collect()),
                     None => batch.iter().map(build).collect(),
                 };
-                // Each entry subtracts rounded leaves in the original order.
-                for (leaf, product) in batch.iter().zip(products) {
-                    let q = leaf.coupled.len();
-                    for (c, &j) in leaf.coupled.iter().enumerate() {
+                // Columns are independent; each entry still subtracts leaves
+                // in the original order before the next batch begins.
+                let scatter = |(j, col): (usize, &mut [T])| {
+                    for (leaf, product) in batch.iter().zip(&products) {
+                        if !leaf.couples[j] {
+                            continue;
+                        }
+                        let c = leaf.coupled.binary_search(&j).unwrap();
                         for (r, &i) in leaf.coupled[..=c].iter().enumerate() {
-                            s[i + j * t] -= product[r + c * q];
+                            col[i] -= product[r + triangular_number(c)];
                         }
                     }
+                };
+                match pool {
+                    Some(p) if t > 1 => p.install(|| {
+                        s.par_chunks_mut(t)
+                            .enumerate()
+                            .with_max_len(1)
+                            .for_each(scatter)
+                    }),
+                    _ => s.chunks_mut(t).enumerate().for_each(scatter),
                 }
             }
         }
@@ -764,6 +786,10 @@ pub struct ArrowLDLSolver<T: FloatT> {
     regularize_count: usize,
     fallback: Option<BoxedDirectLDLSolver<T>>,
     use_arrow: bool,
+    // Shared-SOC leaf primal columns: eliminated after their SPD cone block,
+    // their pivot P_jj + aᵀH⁻¹a is positive without the static shift.
+    unshifted: Vec<usize>,
+    shift_exempt: bool,
     local_structure: Option<LocalStructure>,
     border_signs: Vec<i8>,
     exact_bound_panels: Option<local_bounds::ExactBoundPanels<T>>,
@@ -779,7 +805,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     /// caller transparently keeps QDLDL.
     pub fn try_new(k: &CscMatrix<T>, signs: &[i8], settings: &CoreSettings<T>) -> Option<Self> {
         let n = k.n;
-        if k.m != n || signs.len() != n || signs.iter().any(|&s| s != 1 && s != -1) || n == 0 {
+        debug_assert!(k.m == n && signs.len() == n && signs.iter().all(|&s| s == 1 || s == -1));
+        if n == 0 {
             return None;
         }
         let mut parent: Vec<usize> = (0..n).collect();
@@ -872,6 +899,31 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         Some(Self::from_groups(k, signs, settings, groups, trunk, None))
     }
 
+    /// Leaves made of an SOC block followed by one primal column with a
+    /// nonzero coupling to it (upper-triangle entries in the cone columns).
+    fn single_primal_leaf_columns(
+        k: &CscMatrix<T>,
+        signs: &[i8],
+        leaves: &[Leaf<T>],
+    ) -> Vec<usize> {
+        leaves
+            .iter()
+            .filter_map(|leaf| {
+                let (&p, cone) = leaf.ids.split_last()?;
+                if signs[p] != 1 || cone.is_empty() || cone.iter().any(|&c| signs[c] != -1 || c < p)
+                {
+                    return None;
+                }
+                cone.iter()
+                    .any(|&c| {
+                        (k.colptr[c]..k.colptr[c + 1])
+                            .any(|q| k.rowval[q] == p && k.nzval[q] != T::zero())
+                    })
+                    .then_some(p)
+            })
+            .collect()
+    }
+
     fn from_groups(
         k: &CscMatrix<T>,
         signs: &[i8],
@@ -893,7 +945,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             local[id] = i;
         }
         let bound_count = groups.len();
-        let leaves = groups
+        let leaves: Vec<Leaf<T>> = groups
             .into_iter()
             .map(|g| {
                 // Local constraints may have a zero prefix in their border coupling.
@@ -904,23 +956,35 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         LocalStructure::SharedSoc => leaf.ids.len(),
                         LocalStructure::Bounds => 1,
                     };
-                    leaf.signs = leaf.ids.iter().map(|&i| signs[i]).collect();
                     leaf.coupling_start = leaf.ids.len() - width;
                     let packed = matches!(kind, LocalStructure::Bounds)
                         && ((T::precision_bits() > 64)
                             || (cfg!(feature = "faer-sparse")
                                 && std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>()));
                     if !packed {
-                        leaf.b.resize(width * t, T::zero());
+                        leaf.signs = leaf.ids.iter().map(|&i| signs[i]).collect();
+                        let b_size = if matches!(kind, LocalStructure::Soc) {
+                            t
+                        } else {
+                            width * t
+                        };
+                        leaf.b.resize(b_size, T::zero());
                         leaf.y.resize(width * t, T::zero());
                         leaf.z.resize(width * t, T::zero());
+                        leaf.coupled = (0..t).collect();
+                        leaf.couples = vec![true; t];
                     }
-                    leaf.coupled = (0..t).collect();
-                    leaf.couples = vec![true; t];
+                } else {
+                    leaf.signs = vec![1];
                 }
                 leaf
             })
             .collect();
+        let unshifted = if matches!(local_structure, Some(LocalStructure::SharedSoc)) {
+            Self::single_primal_leaf_columns(k, signs, &leaves)
+        } else {
+            Vec::new()
+        };
         let mut solver = Self {
             colptr: k.colptr.clone(),
             rowval: k.rowval.clone(),
@@ -941,6 +1005,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             regularize_count: 0,
             fallback: None,
             use_arrow: false,
+            unshifted,
+            shift_exempt: false,
             local_structure,
             exact_bound_panels: if matches!(local_structure, Some(LocalStructure::Bounds))
                 && T::precision_bits() > 64
@@ -1061,8 +1127,17 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         continue;
                     }
                     let leaf = &mut self.leaves[id];
-                    let index = leaf.coupling_index(row, col);
-                    update(q, &mut leaf.b[index]);
+                    let value = if matches!(self.local_structure, Some(LocalStructure::Soc)) {
+                        if row == leaf.coupling_start {
+                            &mut leaf.y[2 * col]
+                        } else {
+                            &mut leaf.b[col]
+                        }
+                    } else {
+                        let index = leaf.coupling_index(row, col);
+                        &mut leaf.b[index]
+                    };
+                    update(q, value);
                 }
             }
         }
@@ -1086,7 +1161,15 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 return T::from_f64(panels.y[id + col * self.leaves.len()]).unwrap();
             }
             let leaf = &self.leaves[id];
-            leaf.b[leaf.coupling_index(row, col)]
+            if matches!(self.local_structure, Some(LocalStructure::Soc)) {
+                if row == leaf.coupling_start {
+                    leaf.y[2 * col]
+                } else {
+                    leaf.b[col]
+                }
+            } else {
+                leaf.b[leaf.coupling_index(row, col)]
+            }
         };
         let mut values = Vec::with_capacity(self.rowval.len());
         for j in 0..self.n {
@@ -1128,10 +1211,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
 
     fn factor_arrow(&mut self) -> bool {
         if !self.c.is_finite()
-            || self
-                .leaves
-                .iter()
-                .any(|leaf| !leaf.h.is_finite() || !leaf.b.is_finite())
+            || self.leaves.iter().any(|leaf| {
+                !leaf.h.is_finite()
+                    || !leaf.b.is_finite()
+                    || (matches!(self.local_structure, Some(LocalStructure::Soc))
+                        && leaf.y.iter().step_by(2).any(|v| !v.is_finite()))
+            })
         {
             return false;
         }
@@ -1430,7 +1515,20 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
 
     fn refactor(&mut self, _kkt: &CscMatrix<T>) -> bool {
         self.use_arrow = self.factor_arrow();
+        // A general fallback ordering needs every static shift: report the
+        // failure so the caller escalates, which also ends the exemption.
+        if !self.use_arrow && self.shift_exempt && !self.unshifted.is_empty() {
+            return false;
+        }
         self.use_arrow || self.factor_fallback()
+    }
+
+    fn unshifted_columns(&self) -> &[usize] {
+        &self.unshifted
+    }
+
+    fn set_shift_exemption(&mut self, active: bool) {
+        self.shift_exempt = active;
     }
 
     fn solve_many(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T], cols: usize) {

@@ -281,6 +281,77 @@ where
         cone.combined_ds_shift(shift, dz, ds, σμ);
     }
 
+    /// Gondzio corrections. Orthant rows: a trial product
+    /// `(s + αΔs)(z + αΔz)` outside `[lo, hi]` adds `−t` to the scaled
+    /// complementarity right-hand side (`zΔs + sΔz = −ds`). Second-order
+    /// cones: the spectral values `v₀ ± ‖v̄‖` of the Jordan product of the
+    /// NT-scaled trial point `W⁻ᵀ(s + αΔs) ∘ W(z + αΔz)` are pushed into the
+    /// band (`λ ∘ (WΔz + W⁻ᵀΔs) = −ds`). Other cones keep their right-hand side.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn centrality_correction(
+        &mut self,
+        ds: &mut [T],
+        s: &[T],
+        z: &[T],
+        step_s: &[T],
+        step_z: &[T],
+        α: T,
+        lo: T,
+        hi: T,
+    ) -> bool {
+        use crate::algebra::{MatrixShape, VectorMath};
+        use crate::solver::default::band_correction;
+        let mut changed = false;
+        let (mut trial, mut ss, mut zz) = (Vec::new(), Vec::new(), Vec::new());
+        for (cone, rows) in self.cones.iter_mut().zip(&self.rng_cones) {
+            match cone {
+                SupportedCone::NonnegativeCone(_) => {
+                    for i in rows.clone() {
+                        let v = (s[i] + α * step_s[i]) * (z[i] + α * step_z[i]);
+                        if let Some(t) = band_correction(v, lo, hi) {
+                            ds[i] -= t;
+                            changed = true;
+                        }
+                    }
+                }
+                SupportedCone::SecondOrderCone(soc) => {
+                    let n = rows.len();
+                    (ss.resize(n, T::zero()), zz.resize(n, T::zero()));
+                    trial.clear();
+                    trial.extend(rows.clone().map(|i| s[i] + α * step_s[i]));
+                    soc.mul_Winv(MatrixShape::T, &mut ss, &trial, T::one(), T::zero());
+                    trial.clear();
+                    trial.extend(rows.clone().map(|i| z[i] + α * step_z[i]));
+                    soc.mul_W(MatrixShape::N, &mut zz, &trial, T::one(), T::zero());
+                    // v = ss ∘ zz = (ss·zz, ss₀ z̄ + zz₀ s̄)
+                    let v0 = ss.dot(&zz);
+                    trial.clear();
+                    trial.extend((1..n).map(|k| ss[0] * zz[k] + zz[0] * ss[k]));
+                    let norm = trial.norm();
+                    let (tp, tm) = (
+                        band_correction(v0 + norm, lo, hi),
+                        band_correction(v0 - norm, lo, hi),
+                    );
+                    if tp.is_none() && tm.is_none() {
+                        continue;
+                    }
+                    let (tp, tm) = (tp.unwrap_or(T::zero()), tm.unwrap_or(T::zero()));
+                    let half = T::from_f64(0.5).unwrap();
+                    ds[rows.start] -= half * (tp + tm);
+                    if norm > T::zero() {
+                        let scale = half * (tp - tm) / norm;
+                        for (k, &w) in trial.iter().enumerate() {
+                            ds[rows.start + 1 + k] -= scale * w;
+                        }
+                    }
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
     pub(crate) fn combined_shift_impl(
         &mut self,
         shift: &mut [T],

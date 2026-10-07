@@ -907,17 +907,17 @@ impl<T: FloatT> PsdBlock<T> {
         } else {
             Vec::new()
         };
-        // Only binary64 applies H through R; wide arithmetic uses G.
-        let r_size = if T::precision_bits() <= 53 {
-            (n, n)
+        // Binary64 applies H through R; wide arithmetic uses G.
+        let (r_size, g_size) = if T::precision_bits() <= 53 {
+            ((n, n), (0, 0))
         } else {
-            (0, 0)
+            ((0, 0), (n, n))
         };
         Self {
             sqrt2: if n > 1 { T::SQRT_2() } else { T::zero() },
             R: Matrix::zeros(r_size),
             Rinv: Matrix::zeros((n, n)),
-            G: Matrix::zeros((n, n)),
+            G: Matrix::zeros(g_size),
             Ginv: Matrix::zeros((n, n)),
             rinv_cache: ResidueCache::default(),
             g_cache: ResidueCache::default(),
@@ -1265,10 +1265,6 @@ impl<T: FloatT> PsdBlock<T> {
         // exact aliases. Bound the accumulator to 4 MiB at Float64 (or one
         // row for very wide blocks) rather than growing it with both axes.
         let tile = 256.min((524288 / width).max(1));
-        // No clearing: `accumulate_column` initializes the live suffix of every
-        // row it touches, and a row it skips (dense axis exhausted) has no
-        // dense right column left to publish, so stale values are never read.
-        self.dense_acc.resize(tile * width, T::zero());
         let per_lane = chunk_count.div_ceil(lanes);
         {
             let ginv = &self.Ginv;
@@ -1389,6 +1385,9 @@ impl<T: FloatT> PsdBlock<T> {
                 return;
             }
         }
+        // No clearing: `accumulate_column` initializes every live suffix.
+        // Parallel packed tiles use worker scratch instead of this buffer.
+        self.dense_acc.resize(tile * width, T::zero());
         let mut a0 = 0;
         while a0 < column_count {
             let a1 = (a0 + tile).min(column_count);
@@ -1485,11 +1484,11 @@ impl<T: FloatT> PsdBlock<T> {
             );
         });
         let sampled = self.sampled.as_mut().unwrap();
-        sampled.work.inverse_adjoint(
-            &sampled.operator.blocks()[sampled.block],
-            &self.mat3c,
-            &mut sampled.adjoint,
-        );
+        let block = &sampled.operator.blocks()[sampled.block];
+        sampled.adjoint.resize(block.column_count(), T::zero());
+        sampled
+            .work
+            .inverse_adjoint(block, &self.mat3c, &mut sampled.adjoint);
     }
 
     pub(super) fn recover_rhs(

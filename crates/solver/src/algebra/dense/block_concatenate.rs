@@ -5,7 +5,7 @@ use crate::algebra::{
     ShapedMatrix,
 };
 
-// PJG: Should allow for borrowed data in the
+// Should allow for borrowed data in the
 // inputs here.   Return types not consistent.
 // tests are redundant with Csc implementation.
 

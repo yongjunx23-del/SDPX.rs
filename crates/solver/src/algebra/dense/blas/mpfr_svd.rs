@@ -63,10 +63,9 @@ pub(super) fn givens<const N: usize>(x: F<N>, y: F<N>) -> (F<N>, F<N>, F<N>) {
         (x / r, y / r, r)
     }
 }
-/// A Givens rotation of columns `p, p+1` of U (`v == false`) or V.
+/// A Givens rotation of columns `p, p+1`; the owning log identifies U or V.
 #[derive(Clone, Copy)]
 pub(super) struct Rotation<const N: usize> {
-    v: bool,
     p: usize,
     c: F<N>,
     s: F<N>,
@@ -82,10 +81,11 @@ pub(super) struct RotationLog<const N: usize> {
     keep_v: bool,
 }
 impl<const N: usize> RotationLog<N> {
-    fn push(&mut self, r: Rotation<N>) {
-        if r.v && self.keep_v {
+    fn push(&mut self, v: bool, p: usize, c: F<N>, s: F<N>) {
+        let r = Rotation { p, c, s };
+        if v && self.keep_v {
             self.v.push(r);
-        } else if !r.v && self.keep_u {
+        } else if !v && self.keep_u {
             self.u.push(r);
         }
     }
@@ -265,12 +265,7 @@ fn demmel_kahan<const N: usize>(
     for i in lo..hi {
         let (nc, s, r) = givens(d[i] * c, e[i]);
         c = nc;
-        log.push(Rotation {
-            v: true,
-            p: i,
-            c,
-            s,
-        });
+        log.push(true, i, c, s);
         if i > lo {
             e[i - 1] = olds * r;
         }
@@ -278,12 +273,7 @@ fn demmel_kahan<const N: usize>(
         oldc = nc;
         olds = ns;
         d[i] = r;
-        log.push(Rotation {
-            v: false,
-            p: i,
-            c: oldc,
-            s: olds,
-        });
+        log.push(false, i, oldc, olds);
     }
     let h = d[hi] * c;
     e[hi - 1] = h * olds;
@@ -299,36 +289,21 @@ fn shifted_qr<const N: usize>(
     log: &mut RotationLog<N>,
 ) {
     let (c, s, _) = givens(d[lo] - shift * shift_ratio, e[lo]);
-    log.push(Rotation {
-        v: true,
-        p: lo,
-        c,
-        s,
-    });
+    log.push(true, lo, c, s);
     let mut di = d[lo] * c + e[lo] * s;
     let mut ei1 = -d[lo] * s + e[lo] * c;
     let mut di1 = d[lo + 1] * c;
     let mut bulge = d[lo + 1] * s;
     for i in lo..hi - 1 {
         let (c, s, _) = givens(di, bulge);
-        log.push(Rotation {
-            v: false,
-            p: i,
-            c,
-            s,
-        });
+        log.push(false, i, c, s);
         d[i] = c * di + s * bulge;
         let ei = c * ei1 + s * di1;
         di1 = -s * ei1 + c * di1;
         ei1 = e[i + 1] * c;
         bulge = s * e[i + 1];
         let (c, s, _) = givens(ei, bulge);
-        log.push(Rotation {
-            v: true,
-            p: i + 1,
-            c,
-            s,
-        });
+        log.push(true, i + 1, c, s);
         e[i] = ei * c + bulge * s;
         di = di1 * c + ei1 * s;
         ei1 = -di1 * s + ei1 * c;
@@ -336,12 +311,7 @@ fn shifted_qr<const N: usize>(
         di1 = d[i + 2] * c;
     }
     let (c, s, _) = givens(di, bulge);
-    log.push(Rotation {
-        v: false,
-        p: hi - 1,
-        c,
-        s,
-    });
+    log.push(false, hi - 1, c, s);
     d[hi - 1] = c * di + s * bulge;
     e[hi - 1] = c * ei1 + s * di1;
     d[hi] = -s * ei1 + c * di1;

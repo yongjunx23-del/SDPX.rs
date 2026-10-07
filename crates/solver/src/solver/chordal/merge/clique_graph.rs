@@ -42,7 +42,7 @@ impl CliqueGraphMergeStrategy {
             edges: CscMatrix::zeros((0, 0)),
             p: Vec::new(),
             adjacency_table: HashMap::new(),
-            edge_weight: EdgeWeightMethod::Cubic, //PJG: make settable
+            edge_weight: EdgeWeightMethod::Cubic, // make settable
         }
     }
 }
@@ -94,7 +94,7 @@ impl MergeStrategy for CliqueGraphMergeStrategy {
         sortperm_rev(slicep, &self.edges.nzval);
 
         // try edges with decreasing weight and check if the edge is permissible
-        // PJG: potentially returns nothing in Julia version?
+        // The Julia version may return nothing here.
         for k in 1..self.edges.nzval.len() {
             let edge = edge_from_index(&self.edges, p[k]);
 
@@ -212,7 +212,7 @@ impl MergeStrategy for CliqueGraphMergeStrategy {
             self.clique_tree_from_graph(t);
         }
 
-        // PJG: This seems unnecessary because the next operation on this
+        // This seems unnecessary because the next operation on this
         // object is the call to reorder_snode_consecutively, which overwrites
         // the snode anyway.  Treatment of separators possibly ends up different.
         // Seems to work without, but keep for now for consistency with COSMO.

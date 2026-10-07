@@ -223,7 +223,7 @@ where
     }
 
     fn combined_ds_shift(&mut self, dz: &mut [T], step_z: &mut [T], step_s: &mut [T], σμ: T) {
-        //PJG: could be done faster for nonnegatives?
+        // could be done faster for nonnegatives?
         self._combined_ds_shift_symmetric(dz, step_z, step_s, σμ);
     }
 

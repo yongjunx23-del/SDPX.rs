@@ -204,7 +204,7 @@ where
     T: FloatT + faer_traits::RealField,
 {
     fn update_values(&mut self, index: &[usize], values: &[T]) {
-        // PJG: this is replicating the update_values function in qdldl
+        // this is replicating the update_values function in qdldl
         let nzval = &mut self.perm_kkt.nzval; // post perm internal data
         let AtoPAPt = &self.perm_map; //mapping from input matrix entries
 
@@ -214,7 +214,7 @@ where
     }
 
     fn scale_values(&mut self, index: &[usize], scale: T) {
-        // PJG: this is replicating the scale_values function in qdldl
+        // this is replicating the scale_values function in qdldl
         let nzval = &mut self.perm_kkt.nzval; // post perm internal data
         let AtoPAPt = &self.perm_map; //mapping from input matrix entries
 
@@ -265,7 +265,7 @@ where
                 MemStack::new(&mut self.work),
                 self.ldlt_params,
             )
-            .is_ok() // PJG: convert to bool for consistency with qdldl.   Should really return Result here and elsewhere
+            .is_ok() // bool, as the other LDL backends report
     }
 }
 

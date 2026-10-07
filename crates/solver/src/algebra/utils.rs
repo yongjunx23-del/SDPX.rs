@@ -78,7 +78,7 @@ where
     p.sort_by(|&i, &j| f(&v[i], &v[j]));
 }
 
-// PJG: maybe should be a vector trait, but T needs to admit
+// maybe should be a vector trait, but T needs to admit
 // non-float types (e.g. usize).  Would require partition of the
 // vector math traits into those that require FloatT and those
 // that only require Num + Ord.

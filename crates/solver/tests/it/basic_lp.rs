@@ -30,7 +30,12 @@ fn basic_lp_data() -> (
 fn test_lp_feasible() {
     let (P, c, A, b, cones) = basic_lp_data();
 
-    let settings = DefaultSettings::default();
+    // A 1e-8 objective check needs a tighter gap than the 1e-8 default.
+    let settings = DefaultSettings {
+        tol_gap_abs: 1e-9,
+        tol_gap_rel: 1e-9,
+        ..DefaultSettings::default()
+    };
 
     let mut solver = DefaultSolver::new(&P, &c, &A, &b, &cones, settings).unwrap();
 

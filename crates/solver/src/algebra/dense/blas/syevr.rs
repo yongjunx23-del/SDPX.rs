@@ -1,28 +1,16 @@
 #![allow(non_snake_case)]
 use crate::algebra::*;
 
-pub(crate) struct EigBlasWorkVectors<T> {
+pub(crate) struct EigBlasWorkVectors {
     isuppz: Vec<i32>,
-    work: Vec<T>,
     iwork: Vec<i32>,
 }
 
-impl<T> EigBlasWorkVectors<T>
-where
-    T: FloatT,
-{
+impl EigBlasWorkVectors {
     fn new(n: usize) -> Self {
         let isuppz = vec![0; 2 * n];
-        // must be at least 1 element because the
-        // requiring work size is written into the
-        // first element
-        let work = vec![T::one()];
         let iwork = vec![1];
-        Self {
-            isuppz,
-            work,
-            iwork,
-        }
+        Self { isuppz, iwork }
     }
 }
 
@@ -31,7 +19,7 @@ pub(crate) struct EigEngine<T> {
     pub λ: Vec<T>,
 
     // BLAS workspace (allocated vecs only)
-    pub blas: Option<EigBlasWorkVectors<T>>,
+    pub blas: Option<EigBlasWorkVectors>,
 }
 
 impl<T> EigEngine<T>
@@ -76,6 +64,7 @@ where
     pub(crate) fn eigvals<S>(
         &mut self,
         A: &mut DenseStorageMatrix<S, T>,
+        work: &mut Vec<T>,
     ) -> Result<(), DenseFactorizationError>
     where
         S: AsMut<[T]> + AsRef<[T]>,
@@ -85,7 +74,7 @@ where
             1 => self.eigvals1(A),
             2 => self.eigvals2(A),
             3 => self.eigvals3(A),
-            _ => self.syevr(A),
+            _ => self.syevr(A, work),
         }
     }
 }
@@ -101,6 +90,7 @@ where
     pub(crate) fn eigval_min<S>(
         &mut self,
         A: &mut DenseStorageMatrix<S, T>,
+        work: &mut Vec<T>,
     ) -> Result<T, DenseFactorizationError>
     where
         S: AsMut<[T]> + AsRef<[T]>,
@@ -117,13 +107,13 @@ where
                 self.eigvals3(A)?;
             }
             _ if T::precision_bits() > 53 => {
-                self.syevr_range(A, b'I', 1, 1)?;
+                self.syevr_range(A, b'I', 1, 1, work)?;
                 return Ok(self.λ[0]);
             }
             _ => {
                 // Float64 keeps the proven full-spectrum path; an ulp-level
                 // change in λmin can flip a borderline step length.
-                self.syevr(A)?;
+                self.syevr(A, work)?;
             }
         }
         Ok(self.λ.minimum())
@@ -196,11 +186,15 @@ impl<T> EigEngine<T>
 where
     T: FloatT,
 {
-    fn syevr<S>(&mut self, A: &mut DenseStorageMatrix<S, T>) -> Result<(), DenseFactorizationError>
+    fn syevr<S>(
+        &mut self,
+        A: &mut DenseStorageMatrix<S, T>,
+        work: &mut Vec<T>,
+    ) -> Result<(), DenseFactorizationError>
     where
         S: AsMut<[T]> + AsRef<[T]>,
     {
-        self.syevr_range(A, b'A', 0, 0)
+        self.syevr_range(A, b'A', 0, 0, work)
     }
 
     fn syevr_range<S>(
@@ -209,6 +203,7 @@ where
         range: u8,
         il: i32,
         iu: i32,
+        work: &mut Vec<T>,
     ) -> Result<(), DenseFactorizationError>
     where
         S: AsMut<[T]> + AsRef<[T]>,
@@ -231,7 +226,6 @@ where
         let w = &mut self.λ; // eigenvalues go here
         let ldz = n; // leading dim of eigenvector matrix
         let isuppz = &mut blaswork.isuppz;
-        let work = &mut blaswork.work;
         let mut lwork = -1_i32; // -1 => config to request required work size
         let iwork = &mut blaswork.iwork;
         let mut liwork = -1_i32; // -1 => config to request required work size
@@ -252,6 +246,9 @@ where
             if i == 0 {
                 lwork = work[0].to_i32().unwrap();
                 liwork = iwork[0];
+                if lwork as usize > work.len() {
+                    work.reserve_exact(lwork as usize - work.len());
+                }
                 work.resize(lwork as usize, T::zero());
                 iwork.resize(liwork as usize, 0);
             }
@@ -275,7 +272,7 @@ macro_rules! generate_test_eigen {
             ]);
 
             let mut eng = EigEngine::<$fxx>::new(4);
-            assert!(eng.eigvals(&mut S).is_ok());
+            assert!(eng.eigvals(&mut S, &mut vec![1.0]).is_ok());
             let sol = [-1.0, -1.0, 8., 9.];
             assert!(eng.λ.norm_inf_diff(&sol) < 1e-6);
         }

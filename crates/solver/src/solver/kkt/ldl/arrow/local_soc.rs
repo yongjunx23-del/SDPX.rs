@@ -17,9 +17,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         settings: &CoreSettings<T>,
     ) -> Option<Self> {
         let n = a.n;
-        if k.n != n + a.m || k.m != k.n || signs.len() != k.n {
-            return None;
-        }
+        debug_assert!(k.n == n + a.m && k.m == k.n && signs.len() == k.n);
         let mut row_owner = vec![usize::MAX; a.m];
         let mut groups = Vec::new();
         let mut trunk = Vec::new();
@@ -56,24 +54,19 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return None;
         }
         let t = trunk.len() as u128;
-        // H/L, B/Y/Z, RHS work and the dense border; no per-leaf t² buffers.
-        let cells =
-            groups.len() as u128 * (2 * 25 + 3 * 2 * t + 4 * 5) + 4 * t * t + 4 * k.n as u128;
+        // H/L, raw B row1 plus Y/Z, RHS work and the dense border.
+        let cells = groups.len() as u128 * (2 * 25 + 5 * t + 4 * 5) + 4 * t * t + 4 * k.n as u128;
         if cells * std::mem::size_of::<T>() as u128 > ARROW_MAX_BYTES {
             return None;
         }
         let mut owner = vec![usize::MAX; k.n];
         for (group, ids) in groups.iter().enumerate() {
             for (position, &id) in ids.iter().enumerate() {
-                if signs[id] != if position < 3 { -1 } else { 1 } {
-                    return None;
-                }
+                debug_assert_eq!(signs[id], if position < 3 { -1 } else { 1 });
                 owner[id] = group;
             }
         }
-        if trunk.iter().any(|&id| signs[id] != -1) {
-            return None;
-        }
+        debug_assert!(trunk.iter().all(|&id| signs[id] == -1));
         // Reject nonlocal P coupling before constructing the block map.
         // Stored zeros count as structural edges, so later data updates
         // cannot silently invalidate this decomposition.
@@ -114,6 +107,38 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         let t = self.trunk.len();
         let leaves = &self.leaves;
+        if matches!(self.local_structure, Some(LocalStructure::Soc))
+            && T::residue_blas_applies(t, t, 2 * leaves.len())
+        {
+            debug_assert!(self.ranks.is_none());
+            debug_assert!(leaves.iter().all(|leaf| {
+                leaf.ids.len() - leaf.coupling_start == 2
+                    && leaf.z.len() == 2 * t
+                    && leaf.y.len() == 2 * t
+            }));
+            let blocks: Vec<_> = leaves
+                .iter()
+                .map(|leaf| (&leaf.z[..], &leaf.y[..]))
+                .collect();
+            // Upper ZᵀY selects the same products as lower YᵀZ below.
+            if T::xgemm_blocks_upper_exact(t, 2, &blocks, &mut self.s, self.pool.as_deref()) {
+                for j in 0..t {
+                    for i in 0..=j {
+                        let value = self.c[i + j * t] - self.s[i + j * t];
+                        self.s[i + j * t] = value;
+                        self.s[j + i * t] = value;
+                    }
+                }
+                crate::receipt::finish("arrow.local_schur", timer);
+                return;
+            }
+            self.s.copy_from_slice(&self.c);
+        }
+        if T::precision_bits() <= 53 {
+            self.assemble_local_schur_f64();
+            crate::receipt::finish("arrow.local_schur", timer);
+            return;
+        }
         // Use the leaf's structurally nonzero coupling suffix.
         // MPFR's dot uses exact accumulation rounded once; each entry has the
         // same leaf/coordinate order at every thread count. No parallel sum.
@@ -136,5 +161,48 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             }
         }
         crate::receipt::finish("arrow.local_schur", timer);
+    }
+
+    /// Binary64 `S -= Σ YᵀZ` over the leaves' coupling suffixes, streaming
+    /// each leaf once. Fixed chunks of leaves accumulate lower-triangle
+    /// partials in leaf order; partials are summed in chunk order, so the
+    /// result does not depend on the thread count.
+    fn assemble_local_schur_f64(&mut self) {
+        const CHUNK: usize = 1024;
+        let t = self.trunk.len();
+        let tri = triangular_number(t);
+        let partial = |leaves: &[Leaf<T>]| {
+            let mut acc = vec![T::zero(); tri];
+            for leaf in leaves {
+                let width = leaf.ids.len() - leaf.coupling_start;
+                let mut at = 0;
+                for j in 0..t {
+                    let z = &leaf.z[j * width..(j + 1) * width];
+                    for i in j..t {
+                        let y = &leaf.y[i * width..(i + 1) * width];
+                        acc[at] = y.iter().zip(z).fold(acc[at], |v, (&a, &b)| a.mul_add(b, v));
+                        at += 1;
+                    }
+                }
+            }
+            acc
+        };
+        let leaves = &self.leaves;
+        let parts: Vec<Vec<T>> = match &self.pool {
+            Some(pool) if leaves.len() > CHUNK => {
+                pool.install(|| leaves.par_chunks(CHUNK).map(partial).collect())
+            }
+            _ => leaves.chunks(CHUNK).map(partial).collect(),
+        };
+        let mut at = 0;
+        for j in 0..t {
+            for i in j..t {
+                let total = parts.iter().fold(T::zero(), |v, p| v + p[at]);
+                let value = self.s[i + j * t] - total;
+                self.s[i + j * t] = value;
+                self.s[j + i * t] = value;
+                at += 1;
+            }
+        }
     }
 }

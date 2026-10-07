@@ -28,6 +28,13 @@ pub trait DirectLDLSolver<T: FloatT>: HasLinearSolverInfo {
         None
     }
     fn refactor(&mut self, kkt: &CscMatrix<T>) -> bool;
+    /// KKT columns whose static diagonal shift this factorization does not
+    /// need: its fixed elimination order gives them a positive pivot.
+    fn unshifted_columns(&self) -> &[usize] {
+        &[]
+    }
+    /// Whether the next refactor sees `unshifted_columns` without the shift.
+    fn set_shift_exemption(&mut self, _active: bool) {}
     /// Share the solver thread pool with factorisation/solve kernels that
     /// support it.  Solvers without a parallel path ignore the pool.
     fn set_pool(&mut self, _pool: Option<std::sync::Arc<rayon::ThreadPool>>) {}

@@ -20,6 +20,11 @@ use crate::timers::*;
 pub trait ConeCollection<T: FloatT> {
     /// Whether every member cone is symmetric.
     fn all_symmetric(&self) -> bool;
+    /// Whether any member has rows the centrality correctors act on
+    /// (nonnegative orthant or second-order cone).
+    fn has_correctable(&self) -> bool {
+        false
+    }
     /// Whether primal-dual scaling is supported by all members.
     fn supports_primal_dual(&self) -> bool;
     /// Set identity scaling before the symmetric initializer.
@@ -28,6 +33,15 @@ pub trait ConeCollection<T: FloatT> {
     fn worker_pool(&self) -> Option<std::sync::Arc<rayon::ThreadPool>>;
 }
 impl<T: FloatT> ConeCollection<T> for crate::solver::cones::CompositeCone<T> {
+    fn has_correctable(&self) -> bool {
+        use crate::solver::cones::SupportedCone;
+        self.iter().any(|c| {
+            matches!(
+                c,
+                SupportedCone::NonnegativeCone(_) | SupportedCone::SecondOrderCone(_)
+            )
+        })
+    }
     fn all_symmetric(&self) -> bool {
         self.is_symmetric()
     }
@@ -130,6 +144,20 @@ pub trait Variables<T: FloatT> {
         settings: &Self::SE,
     ) -> T {
         self.calc_step_length(step, cones, settings, StepDirection::Affine)
+    }
+
+    /// Add Gondzio centrality corrections to this combined right-hand side for
+    /// a trial step `α` along `step`: complementarity products outside
+    /// `[0.1σμ, 10σμ]` are pushed back into the band. `false` when none is.
+    fn centrality_correction(
+        &mut self,
+        _step: &Self,
+        _variables: &Self,
+        _cones: &mut Self::C,
+        _α: T,
+        _σμ: T,
+    ) -> bool {
+        false
     }
 
     /// Consume the direction from `prepare_affine_step_length`, with correction m=1.

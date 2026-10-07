@@ -18,8 +18,10 @@ fn check<T: FloatT>() {
         p.Ginv
             .syrk(&p.Rinv.t(), T::one(), T::zero(), MatrixTriangle::Triu);
         p.Ginv[(1, 0)] = p.Ginv[(0, 1)];
-        p.G.syrk(&p.R, T::one(), T::zero(), MatrixTriangle::Triu);
-        p.G[(1, 0)] = p.G[(0, 1)];
+        if !p.G.data().is_empty() {
+            p.G.syrk(&p.R, T::one(), T::zero(), MatrixTriangle::Triu);
+            p.G[(1, 0)] = p.G[(0, 1)];
+        }
         let mut actual = vec![T::zero(); 3];
         p.apply(&mut actual, &x, inverse, None);
         let relative = (actual[2] - expected).abs() / expected;

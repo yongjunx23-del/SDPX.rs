@@ -2,7 +2,7 @@
 
 use std::iter::zip;
 
-// PJG import here for ConeRanges is weird.   Why is it
+// import here for ConeRanges is weird.   Why is it
 // not coming with SupportedConeT?
 use crate::{
     algebra::*,
