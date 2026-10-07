@@ -299,55 +299,56 @@ where
         lo: T,
         hi: T,
     ) -> bool {
-        use crate::algebra::{MatrixShape, VectorMath};
-        use crate::solver::default::band_correction;
-        let mut changed = false;
-        let (mut trial, mut ss, mut zz) = (Vec::new(), Vec::new(), Vec::new());
-        for (cone, rows) in self.cones.iter_mut().zip(&self.rng_cones) {
-            match cone {
-                SupportedCone::NonnegativeCone(_) => {
-                    for i in rows.clone() {
-                        let v = (s[i] + α * step_s[i]) * (z[i] + α * step_z[i]);
-                        if let Some(t) = band_correction(v, lo, hi) {
-                            ds[i] -= t;
-                            changed = true;
-                        }
-                    }
-                }
-                SupportedCone::SecondOrderCone(soc) => {
-                    let n = rows.len();
-                    (ss.resize(n, T::zero()), zz.resize(n, T::zero()));
-                    trial.clear();
-                    trial.extend(rows.clone().map(|i| s[i] + α * step_s[i]));
-                    soc.mul_Winv(MatrixShape::T, &mut ss, &trial, T::one(), T::zero());
-                    trial.clear();
-                    trial.extend(rows.clone().map(|i| z[i] + α * step_z[i]));
-                    soc.mul_W(MatrixShape::N, &mut zz, &trial, T::one(), T::zero());
-                    // v = ss ∘ zz = (ss·zz, ss₀ z̄ + zz₀ s̄)
-                    let v0 = ss.dot(&zz);
-                    trial.clear();
-                    trial.extend((1..n).map(|k| ss[0] * zz[k] + zz[0] * ss[k]));
-                    let norm = trial.norm();
-                    let (tp, tm) = (
-                        band_correction(v0 + norm, lo, hi),
-                        band_correction(v0 - norm, lo, hi),
-                    );
-                    if tp.is_none() && tm.is_none() {
-                        continue;
-                    }
-                    let (tp, tm) = (tp.unwrap_or(T::zero()), tm.unwrap_or(T::zero()));
-                    let half = T::from_f64(0.5).unwrap();
-                    ds[rows.start] -= half * (tp + tm);
-                    if norm > T::zero() {
-                        let scale = half * (tp - tm) / norm;
-                        for (k, &w) in trial.iter().enumerate() {
-                            ds[rows.start + 1 + k] -= scale * w;
-                        }
-                    }
-                    changed = true;
-                }
-                _ => {}
+        let serial = self.mpi_world().is_some() || self.cones.len() < 2;
+        if !serial {
+            if let Some(threading) = &self.threading {
+                let changed = std::sync::atomic::AtomicBool::new(false);
+                threading.pool.install(|| {
+                    cone_parallel::apply(
+                        &mut self.cones,
+                        &threading.lanes,
+                        threading.inner_parallel,
+                        threading.paired,
+                        threading.inner_ways,
+                        ds,
+                        &|cone, rows, ds| {
+                            let mut work: [Vec<T>; 3] = Default::default();
+                            if correct_cone(
+                                cone,
+                                ds,
+                                &s[rows.clone()],
+                                &z[rows.clone()],
+                                &step_s[rows.clone()],
+                                &step_z[rows],
+                                α,
+                                lo,
+                                hi,
+                                &mut work,
+                            ) {
+                                changed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            true
+                        },
+                    )
+                });
+                return changed.into_inner();
             }
+        }
+        let mut changed = false;
+        let mut work: [Vec<T>; 3] = Default::default();
+        for (cone, rows) in self.cones.iter_mut().zip(&self.rng_cones) {
+            changed |= correct_cone(
+                cone,
+                &mut ds[rows.clone()],
+                &s[rows.clone()],
+                &z[rows.clone()],
+                &step_s[rows.clone()],
+                &step_z[rows.clone()],
+                α,
+                lo,
+                hi,
+                &mut work,
+            );
         }
         changed
     }
@@ -1545,6 +1546,72 @@ where
             barrier += cone.compute_barrier(zi, si, dzi, dsi, α);
         }
         barrier
+    }
+}
+
+/// One cone's Gondzio correction on its own row slices (see
+/// `CompositeCone::centrality_correction`).
+#[allow(clippy::too_many_arguments)]
+fn correct_cone<T: FloatT>(
+    cone: &mut SupportedCone<T>,
+    ds: &mut [T],
+    s: &[T],
+    z: &[T],
+    step_s: &[T],
+    step_z: &[T],
+    α: T,
+    lo: T,
+    hi: T,
+    work: &mut [Vec<T>; 3],
+) -> bool {
+    use crate::algebra::{MatrixShape, VectorMath};
+    use crate::solver::default::band_correction;
+    let [trial, ss, zz] = work;
+    match cone {
+        SupportedCone::NonnegativeCone(_) => {
+            let mut changed = false;
+            for i in 0..ds.len() {
+                let v = (s[i] + α * step_s[i]) * (z[i] + α * step_z[i]);
+                if let Some(t) = band_correction(v, lo, hi) {
+                    ds[i] -= t;
+                    changed = true;
+                }
+            }
+            changed
+        }
+        SupportedCone::SecondOrderCone(soc) => {
+            let n = ds.len();
+            (ss.resize(n, T::zero()), zz.resize(n, T::zero()));
+            trial.clear();
+            trial.extend((0..n).map(|i| s[i] + α * step_s[i]));
+            soc.mul_Winv(MatrixShape::T, ss, trial, T::one(), T::zero());
+            trial.clear();
+            trial.extend((0..n).map(|i| z[i] + α * step_z[i]));
+            soc.mul_W(MatrixShape::N, zz, trial, T::one(), T::zero());
+            // v = ss ∘ zz = (ss·zz, ss₀ z̄ + zz₀ s̄)
+            let v0 = ss.dot(zz);
+            trial.clear();
+            trial.extend((1..n).map(|k| ss[0] * zz[k] + zz[0] * ss[k]));
+            let norm = trial.norm();
+            let (tp, tm) = (
+                band_correction(v0 + norm, lo, hi),
+                band_correction(v0 - norm, lo, hi),
+            );
+            if tp.is_none() && tm.is_none() {
+                return false;
+            }
+            let (tp, tm) = (tp.unwrap_or(T::zero()), tm.unwrap_or(T::zero()));
+            let half = T::from_f64(0.5).unwrap();
+            ds[0] -= half * (tp + tm);
+            if norm > T::zero() {
+                let scale = half * (tp - tm) / norm;
+                for (k, &w) in trial.iter().enumerate() {
+                    ds[1 + k] -= scale * w;
+                }
+            }
+            true
+        }
+        _ => false,
     }
 }
 

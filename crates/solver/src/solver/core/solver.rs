@@ -733,13 +733,16 @@ mod internal {
                     return;
                 }
                 let target = T::min(T::one(), α * (1.5).as_T() + (0.3).as_T());
-                let changed = self.step_rhs.centrality_correction(
-                    &self.step_lhs,
-                    &self.variables,
-                    &mut self.cones,
-                    target,
-                    state.σ * state.μ,
-                );
+                let changed;
+                timeit! {"corrector rhs"; {
+                    changed = self.step_rhs.centrality_correction(
+                        &self.step_lhs,
+                        &self.variables,
+                        &mut self.cones,
+                        target,
+                        state.σ * state.μ,
+                    );
+                }}
                 if !crate::mpi::agreed_branch(changed) {
                     return;
                 }
@@ -758,17 +761,21 @@ mod internal {
                 if !crate::mpi::all_succeeded(ok) {
                     return;
                 }
-                let α_new = self.variables.calc_step_length(
-                    corrected,
-                    &mut self.cones,
-                    &self.settings,
-                    StepDirection::Combined,
-                );
+                let α_new;
+                timeit! {"corrector step len"; {
+                    α_new = self.variables.calc_step_length(
+                        corrected,
+                        &mut self.cones,
+                        &self.settings,
+                        StepDirection::Combined,
+                    );
+                }}
                 if !crate::mpi::agreed_branch(α_new >= α * (1.01).as_T()) {
                     return;
                 }
                 self.step_lhs.copy_from(corrected);
                 state.α = α_new;
+                crate::receipt::phase_record("corrector accepted", std::time::Duration::ZERO);
             }
         }
 

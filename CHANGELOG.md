@@ -32,6 +32,9 @@ solve 2.02 s/50 it (objective error 4.5e-7) → 9 ms/0 it (6.6e-14), whole CLI
   Pure PSD problems are unchanged. At its pinned 1e-8 tolerance csdr3 stops
   earlier with a larger objective error (2.9e-2 versus 1.6e-3); at a matched
   1e-12 tolerance it needs 79 instead of 103 iterations at equal time.
+- Centrality corrections run on the cone pool (bitwise identical): csdr3
+  MPFR256 −2.7% at 1e-8 and at 1e-12, four threads. Receipts count accepted
+  correctors and time their right-hand sides and step lengths.
 - Iterative refinement of the constant and affine right-hand sides shares
   one two-column correction solve, and on the parallel Float64 row plan one
   residual pass (−3–4% on the free-λ g0 SOCP and gravity in three alternating

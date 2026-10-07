@@ -318,6 +318,11 @@ impl RowBuffers for () {
         ((), ())
     }
 }
+impl<'a, T: Send> RowBuffers for &'a mut [T] {
+    fn split(self, at: usize) -> (Self, Self) {
+        self.split_at_mut(at)
+    }
+}
 impl<T: Send> RowBuffers for (&mut [T], &mut [T]) {
     fn split(self, at: usize) -> (Self, Self) {
         let (a, b) = self.0.split_at_mut(at);

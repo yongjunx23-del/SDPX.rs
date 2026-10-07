@@ -7538,3 +7538,26 @@ differ between owner-MPI and single-process runs; ARCHITECTURE claimed shared
 residual passes for every batched refinement; CHANGELOG lacked ce09de1 and
 quoted the 1e-8 corrector gains and the unaudited Λ27/SDPB comparison without
 caveats (both documents updated with this entry).
+
+## 2026-10-07 — Parallel centrality corrections kept (bitwise identical)
+
+`CompositeCone::centrality_correction` runs the per-cone corrections on the
+cone pool (`cone_parallel::apply` over the existing lanes) unless an MPI world
+is present or there is only one cone; one helper, `correct_cone`, keeps the
+serial arithmetic for both paths. Receipts gain `corrector rhs`,
+`corrector step len` and a `corrector accepted` count. Source: review clone
+branch `perf-correctors` (`84f2361`), arm `perf1007-corr-rel`.
+
+Parity harness (46 Float64 problems, g0 cases, ising11/512, csdr3/256): 49/49
+bitwise identical to e2470e6. Release A/B/B/A against
+`review1007-head-e2470e6-rel`, four threads, identical points, all audits pass:
+
+| Case | Median API | CPU | Final step length A → B |
+|---|---|---|---|
+| csdr3 (1e-8, 36 it) | 5.806 → 5.652 s (−2.7%) | +3.7% | 1.75/1.74 → 1.45/1.47 s |
+| csdr3-tight (1e-12, 79 it) | 11.898 → 11.575 s (−2.7%) | +3.0% | 3.44/3.36 → 2.84/2.80 s |
+
+Both B runs beat both A runs in each case. The correction pass costs 2.3 ms
+per call at four threads (0.133 s for 57 calls; about 8 ms serially), the
+extra step-length pass per attempt 3.4 ms. csdr3 accepts 38 of 57 corrector
+solves at 1e-8 and 70 of 112 at 1e-12. One thread: 14.474 s, 36 it.
