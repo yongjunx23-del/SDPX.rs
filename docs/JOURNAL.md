@@ -24,7 +24,16 @@ Splitting GEMM and svec-quadratic products as well was neutral (a split
 quadratic was slower than serial in the probe), so only congruences take
 granted ways. Paired 30 it runs on node63 (bitwise identical): 64 threads
 47.6/48.7 → 46.3/47.9 s, 96 threads 48.4/49.7 → 46.6/48.3 s (-2 to -3%);
-`sampled.adj.local` 3.5 → 2.8 s. Kept.
+`sampled.adj.local` 3.5 → 2.8 s. Kept at first (4b35282), then reverted:
+ABBA on 4 nodes x 13 ranks x 16 threads and 2 x 4 x 32 was 5% and 2.5%
+slower (36.9/36.6 → 39.0/38.4 s; 40.0/40.1 → 41.0/41.0 s). A rank with four
+blocks and 16 workers needs every block's GEMM and quadratic split too, which
+the old share-based rule (`floor(cost/share)` ways) grants; restricting
+splits to congruences or to above-mean blocks (mean-floor variant: 39.3/39.4
+s) lost that. Final: share-based rule plus the prime-group congruence split.
+ABBA vs the previous commit: 4 nodes 36.7/37.5 → 37.0/37.2 s, 2 nodes
+40.3/40.2 → 39.2/39.4 s, one node 96 threads 49.3/50.3 → 48.7/48.6 s, 64
+threads 47.4/49.6 → 47.1/47.2 s; bitwise identical.
 
 ## 2026-10-08 — MPI owner path: parallel border products and reduced residual
 

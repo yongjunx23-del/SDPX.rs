@@ -627,23 +627,6 @@ fn residue_diag_congruence_is_exact_rounded_once() {
 }
 
 #[test]
-fn makespan_ways_feeds_spare_workers_to_heavy_blocks() {
-    // Fewer workers than blocks: everyone keeps one way.
-    assert_eq!(makespan_ways(&[3.0, 1.0, 1.0], 2), vec![1, 1, 1]);
-    // Unmeasured costs keep one way.
-    assert_eq!(makespan_ways(&[0.0, 0.0], 8), vec![1, 1]);
-    // Spare workers go to the heaviest block, within the worker budget.
-    let ways = makespan_ways(&[4.0, 1.0, 1.0, 1.0], 7);
-    assert!(ways.iter().sum::<usize>() <= 7);
-    assert_eq!(ways, vec![4, 1, 1, 1]);
-    // A 2.3x spread over 52 blocks on 96 workers splits the largest blocks.
-    let costs: Vec<f64> = (0..52).map(|i| (40.0 + 13.0 * i as f64 / 51.0).powi(3)).collect();
-    let ways = makespan_ways(&costs, 96);
-    assert!(ways.iter().sum::<usize>() <= 96);
-    assert!(ways[51] > ways[0] && ways[51] >= 2);
-}
-
-#[test]
 fn prime_group_congruence_matches_unsplit() {
     fn run<const N: usize>(m: usize, seed: u64) {
         let mut rng = Lcg(seed);

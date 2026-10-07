@@ -730,10 +730,8 @@ impl<T: FloatT> SampledOperator<T> {
                         }
                         w.forward = terms;
                     });
-                    // Only unsplit calls measure (see `assign_block_ways`).
-                    if ways == 1 {
-                        w.cost[0] = start.elapsed().as_secs_f64();
-                    }
+                    // Work, not wall time, so a split block keeps its ways.
+                    w.cost[0] = start.elapsed().as_secs_f64() * ways as f64;
                 })
         });
         crate::receipt::finish("sampled.fwd.local", local_timer);
@@ -832,10 +830,8 @@ impl<T: FloatT> SampledOperator<T> {
                     with_split_hint(ways, || {
                         adjoint_leaf(b, w, block_rows(b, x), alpha, chunks);
                     });
-                    // Only unsplit calls measure (see `assign_block_ways`).
-                    if ways == 1 {
-                        w.cost[1] = start.elapsed().as_secs_f64();
-                    }
+                    // Work, not wall time, so a split block keeps its ways.
+                    w.cost[1] = start.elapsed().as_secs_f64() * ways as f64;
                 })
         });
         crate::receipt::finish("sampled.adj.local", local_timer);
@@ -1249,12 +1245,17 @@ fn exact_adjoint_applies<T: FloatT>(b: &SampledBlock<T>) -> bool {
     b.dim == 1 && T::residue_blas_applies(b.basis_rows, b.basis_cols, b.basis_rows)
 }
 
-/// Measured load balancing (SDPB-style): spare workers go to the heaviest
-/// blocks of product `slot` (see `makespan_ways`).
+/// Measured load balancing (SDPB 2.0 §2.2.2): a block whose last measured
+/// work for product `slot` exceeds a worker's share gets `floor(work/share)`
+/// ways (at most 8) for its residue products; the others stay serial.
 fn assign_block_ways<T>(work: &mut [SampledBlockWorkspace<T>], slot: usize, workers: usize) {
-    let costs: Vec<f64> = work.iter().map(|w| w.cost[slot]).collect();
-    for (w, ways) in work.iter_mut().zip(makespan_ways(&costs, workers)) {
-        w.ways[slot] = ways;
+    let total: f64 = work.iter().map(|w| w.cost[slot]).sum();
+    if workers <= 1 || total <= 0.0 {
+        return;
+    }
+    let share = total / workers as f64;
+    for w in work.iter_mut() {
+        w.ways[slot] = measured_ways(w.cost[slot], share);
     }
 }
 

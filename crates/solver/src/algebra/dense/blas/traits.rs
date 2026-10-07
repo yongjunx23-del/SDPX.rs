@@ -458,4 +458,4 @@ mod mpfr;
 mod rns_blas;
 // Integration tests include this file by `#[path]` and use only part of it.
 #[allow(unused_imports)]
-pub(crate) use rns_blas::{makespan_ways, with_split_hint, ResidueCache};
+pub(crate) use rns_blas::{measured_ways, with_split_hint, ResidueCache};

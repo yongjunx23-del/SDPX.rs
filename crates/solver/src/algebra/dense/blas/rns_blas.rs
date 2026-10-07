@@ -259,41 +259,16 @@ fn release_buffer(v: Vec<f64>) {
     });
 }
 
-/// SDPB-style worker assignment for blocks of measured `costs` on `workers`:
-/// with at least as many workers as active blocks, the smallest makespan `M`
-/// with `Σ ceil(cost/M) ≤ workers` gives each block `ceil(cost/M)` ways (at
-/// most `MAX_WAYS`), so spare workers go to the heaviest blocks; otherwise
-/// every block keeps one way. Zero (unmeasured) costs keep one way.
-pub(crate) fn makespan_ways(costs: &[f64], workers: usize) -> Vec<usize> {
-    const MAX_WAYS: usize = 8;
-    let active = costs.iter().filter(|&&c| c > 0.0).count();
-    let total: f64 = costs.iter().filter(|&&c| c > 0.0).sum();
-    let largest = costs.iter().copied().fold(0.0f64, f64::max);
-    if workers <= 1 || total <= 0.0 || active > workers {
-        return vec![1; costs.len()];
-    }
-    let ways = |m: f64, c: f64| ((c / m).ceil() as usize).clamp(1, MAX_WAYS);
-    let need = |m: f64| -> usize { costs.iter().filter(|&&c| c > 0.0).map(|&c| ways(m, c)).sum() };
-    // need(M) is non-increasing in M and need(largest) = active <= workers.
-    let (mut lo, mut hi) = ((total / workers as f64).max(largest / MAX_WAYS as f64), largest);
-    if need(lo) <= workers {
-        hi = lo;
-    } else {
-        for _ in 0..50 {
-            let mid = 0.5 * (lo + hi);
-            if need(mid) <= workers {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-    }
-    costs.iter().map(|&c| if c > 0.0 { ways(hi, c) } else { 1 }).collect()
+/// Ways granted to a block of measured `cost` when the pool's fair share is
+/// `share` (SDPB-style measured load balancing).
+pub(crate) fn measured_ways(cost: f64, share: f64) -> usize {
+    ((cost / share).floor() as usize).clamp(1, 8)
 }
 
-/// Run `f` with this thread's residue products split into `ways` on the
-/// ambient pool. Callers grant extra ways only to their heaviest blocks
-/// ([`makespan_ways`]), so light blocks stay serial.
+/// Run `f` with this thread's residue products split into `ways`
+/// on the ambient pool. Callers give extra ways only to blocks whose
+/// measured cost exceeds a worker's fair share (SDPB-style worst-fit), so
+/// light blocks stay serial and cache use stays bounded.
 pub(crate) fn with_split_hint<R>(ways: usize, f: impl FnOnce() -> R) -> R {
     let previous = SPLIT_HINT.with(|c| c.replace(ways.max(1)));
     let result = f();
@@ -316,17 +291,6 @@ enum Split<'a> {
 /// Granted ways are capped so that each prime group carries at least
 /// `WAY_WORK` residue multiply-adds (`work` counts them over all primes):
 /// splitting a small product only adds CRT accumulators to merge.
-/// [`split_plan`] without granted ways: products whose split shares one CRT
-/// state over prime groups (GEMM, svec quadratic) ran slower split than
-/// serial inside a busy pool (EPYC: a 53-row quadratic 3.5 ms serial, 4.6-5.6
-/// ms at 2-4 ways), so only a top-level pool splits them.
-fn unhinted_plan(pool: Option<&rayon::ThreadPool>) -> Split<'_> {
-    match pool.filter(|p| p.current_num_threads() > 1 && rayon::current_thread_index().is_none()) {
-        Some(p) => Split::Pool(p),
-        None => Split::Serial,
-    }
-}
-
 fn split_plan(pool: Option<&rayon::ThreadPool>, work: u128) -> Split<'_> {
     if let Some(p) =
         pool.filter(|p| p.current_num_threads() > 1 && rayon::current_thread_index().is_none())
@@ -1659,7 +1623,7 @@ pub(super) fn gemm<const N: usize>(
         lda,
         ldb,
     };
-    let split = unhinted_plan(pool);
+    let split = split_plan(pool, (m * n * k) as u128 * plan.count() as u128);
     let ca = packed_operand(av, lo_a, da, &plan, &split);
     let cb = (!same_operand).then(|| match cache_b {
         Some(cache) => cache.operand(bv, lo_b, db, &plan, &split),
@@ -2830,7 +2794,7 @@ pub(super) fn svec_quadratic<const N: usize>(
         }
     };
     let scale = sigma + lo_x + 2 * lo_q;
-    let split = unhinted_plan(pool);
+    let split = split_plan(pool, (h * h * kmax) as u128 * plan.count() as u128);
     let cq = match cache_q {
         Some(cache) => cache.operand(qv, lo_q, dq, &plan, &split),
         None => Operand::Chunks(chunk_matrix(qv, lo_q, dq, &plan, &split)),
