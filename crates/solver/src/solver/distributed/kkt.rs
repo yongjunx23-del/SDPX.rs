@@ -1,6 +1,7 @@
 //! Owner-local condensed KKT with one shared equality Schur complement.
 //! Both refinement levels use the existing original-operator acceptance policy.
 use super::*;
+use crate::algebra::sparse_parallel::SparseParallel;
 use crate::solver::kkt::SolveCounters;
 use crate::solver::{
     core::CoreSettings,
@@ -20,6 +21,9 @@ struct LocalKkt<T: FloatT> {
     width: usize,
     border_rows: Vec<usize>,
     coupling: CscMatrix<T>,
+    /// Lanes for the border coupling products (54 x ~1200 dense on Λ19
+    /// spins 0-50; 18 of 77 s serial on a 32-thread rank without them).
+    coupling_plan: SparseParallel,
     coupling_rhs: Vec<T>,
     response: Vec<T>,
     // Two-column panel scratch for the constant/affine predictor pair.  The
@@ -37,6 +41,27 @@ struct LocalKkt<T: FloatT> {
 }
 
 impl<T: FloatT> LocalKkt<T> {
+    /// `y = alpha·op(coupling)·x + beta·y` over the owner pool's lanes; each
+    /// output keeps the serial CSC gemv arithmetic, so the bits never change.
+    fn coupling_product(
+        &self,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+        transpose: bool,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+    ) {
+        match pool.filter(|_| self.coupling_plan.has_lanes()) {
+            Some(pool) => pool.install(|| {
+                self.coupling_plan
+                    .product(&self.coupling, transpose, y, x, alpha, beta)
+            }),
+            None if transpose => self.coupling.t().gemv(y, x, alpha, beta),
+            None => self.coupling.gemv(y, x, alpha, beta),
+        }
+    }
+
     fn panel_buffer(slot: &mut Option<Vec<T>>, len: usize) -> &mut [T] {
         let panel = slot.get_or_insert_with(|| Vec::with_capacity(len));
         if panel.len() < len {
@@ -123,6 +148,30 @@ struct Work<T> {
     x: Point<T>,
     error: Point<T>,
     candidate: Point<T>,
+}
+
+/// Apply `row(i, &mut x[i])` to every interior row, split over `pool` by
+/// rows when each task carries a grain of `border`-long dots. Rows are
+/// independent, so the split never changes an entry.
+fn border_rows<T: FloatT>(
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    x: &mut [T],
+    border: usize,
+    row: impl Fn(usize, &mut T) + Sync + Send,
+) {
+    let d = x.len();
+    let work = (d as u128 * border as u128)
+        * sdpx_arithmetic::inner_parallel::weight(T::precision_bits() as usize);
+    let tasks = sdpx_arithmetic::inner_parallel::tasks_if(pool.is_some(), work, d);
+    match pool.filter(|_| tasks > 1) {
+        Some(pool) => pool.install(|| {
+            x.par_iter_mut()
+                .enumerate()
+                .with_min_len(d.div_ceil(tasks))
+                .for_each(|(i, v)| row(i, v))
+        }),
+        None => x.iter_mut().enumerate().for_each(|(i, v)| row(i, v)),
+    }
 }
 
 fn elapsed_ns(started: Instant) -> f64 {
@@ -249,6 +298,8 @@ impl<T: FloatT> OwnedKkt<T> {
                 // Only coupling entries are selected, not all data columns/rows.
                 let columns: Vec<_> = (0..data.n).collect();
                 let coupling = select_rows(&data.A, &rows, &columns);
+                let mut coupling_plan = SparseParallel::new(&coupling);
+                coupling_plan.configure(&coupling, pool.clone());
                 let cells = kernel.interior_dimension() * border;
                 LocalKkt {
                     kernel,
@@ -256,6 +307,7 @@ impl<T: FloatT> OwnedKkt<T> {
                     width: data.n + data.m,
                     border_rows: rows,
                     coupling,
+                    coupling_plan,
                     coupling_rhs: vec![T::zero(); cells],
                     response: vec![T::zero(); cells],
                     panel_rhs: None,
@@ -890,9 +942,14 @@ impl<T: FloatT> OwnedKkt<T> {
                 } else {
                     &second.x.blocks
                 }) {
-                    local
-                        .coupling
-                        .gemv(target, &x[..local.n], T::one(), T::one());
+                    local.coupling_product(
+                        self.pool.as_ref(),
+                        false,
+                        target,
+                        &x[..local.n],
+                        T::one(),
+                        T::one(),
+                    );
                 }
             } else {
                 // All ranks still enter the same reduction.  A NaN payload
@@ -1044,9 +1101,14 @@ impl<T: FloatT> OwnedKkt<T> {
             };
         }
         for (local, x) in self.locals.iter().zip(&out.blocks) {
-            local
-                .coupling
-                .gemv(&mut self.border_rhs, &x[..local.n], T::one(), T::one());
+            local.coupling_product(
+                self.pool.as_ref(),
+                false,
+                &mut self.border_rhs,
+                &x[..local.n],
+                T::one(),
+                T::one(),
+            );
         }
         if self
             .collective
@@ -1068,13 +1130,14 @@ impl<T: FloatT> OwnedKkt<T> {
         {
             return false;
         }
+        let pool = self.pool.as_ref();
         let correct = |(local, x): (&LocalKkt<T>, &mut Vec<T>)| {
             let d = x.len();
-            for (i, v) in x.iter_mut().enumerate() {
+            border_rows(pool, x, out.border.len(), |i, v| {
                 *v -= T::dot_fma(
                     (0..out.border.len()).map(|j| (&local.response[j * d + i], &out.border[j])),
                 );
-            }
+            });
         };
         for_blocks!(self.pool.as_ref(), (&self.locals, &mut out.blocks), correct);
         self.collective
@@ -1139,6 +1202,7 @@ impl<T: FloatT> OwnedKkt<T> {
                 .map(|b| vec![T::zero(); b.len()])
                 .collect();
         }
+        let pool = self.pool.as_ref();
         let local = |(local, e, b, x, y): (
             &mut LocalKkt<T>,
             &mut Vec<T>,
@@ -1147,10 +1211,14 @@ impl<T: FloatT> OwnedKkt<T> {
             &mut Vec<T>,
         )| {
             local.kernel.interior_residual(e, b, x);
-            local
-                .coupling
-                .t()
-                .gemv(&mut e[..local.n], &point.border, -T::one(), T::one());
+            local.coupling_product(
+                pool,
+                true,
+                &mut e[..local.n],
+                &point.border,
+                -T::one(),
+                T::one(),
+            );
             y.resize(e.len(), T::zero());
             e.is_finite() && local.kernel.solve_interior_panel(e, y, 1)
         };
@@ -1174,10 +1242,17 @@ impl<T: FloatT> OwnedKkt<T> {
             .zip(&out.blocks)
             .zip(point.blocks.iter().zip(&self.fused_interior))
         {
-            local
-                .coupling
-                .gemv(&mut message[..border], &x[..local.n], -T::one(), T::one());
-            local.coupling.gemv(
+            local.coupling_product(
+                self.pool.as_ref(),
+                false,
+                &mut message[..border],
+                &x[..local.n],
+                -T::one(),
+                T::one(),
+            );
+            local.coupling_product(
+                self.pool.as_ref(),
+                false,
                 &mut message[border..2 * border],
                 &y[..local.n],
                 T::one(),
@@ -1253,14 +1328,15 @@ impl<T: FloatT> OwnedKkt<T> {
             return false;
         }
         let border = &out.border;
+        let pool = self.pool.as_ref();
         let correct = |(local, x, y): (&LocalKkt<T>, &mut Vec<T>, &Vec<T>)| {
             let d = x.len();
-            for (i, v) in x.iter_mut().enumerate() {
+            border_rows(pool, x, border.len(), |i, v| {
                 *v = y[i]
                     - T::dot_fma(
                         (0..border.len()).map(|j| (&local.response[j * d + i], &border[j])),
                     );
-            }
+            });
         };
         for_blocks!(
             self.pool.as_ref(),
@@ -1278,13 +1354,18 @@ impl<T: FloatT> OwnedKkt<T> {
         reduced: bool,
     ) -> T {
         out.border.fill(T::zero());
+        let pool = self.pool.as_ref();
         let residual = |(local, e, b, x): (&mut LocalKkt<T>, &mut Vec<T>, &Vec<T>, &Vec<T>)| {
             if reduced {
                 local.kernel.interior_residual(e, b, x);
-                local
-                    .coupling
-                    .t()
-                    .gemv(&mut e[..local.n], &point.border, -T::one(), T::one());
+                local.coupling_product(
+                    pool,
+                    true,
+                    &mut e[..local.n],
+                    &point.border,
+                    -T::one(),
+                    T::one(),
+                );
             } else {
                 // Original b contains zero in every local equality row. Add
                 // the global affine term only after summing their operators.
@@ -1303,9 +1384,14 @@ impl<T: FloatT> OwnedKkt<T> {
         );
         for ((local, e), x) in self.locals.iter().zip(&mut out.blocks).zip(&point.blocks) {
             if reduced {
-                local
-                    .coupling
-                    .gemv(&mut out.border, &x[..local.n], -T::one(), T::one());
+                local.coupling_product(
+                    self.pool.as_ref(),
+                    false,
+                    &mut out.border,
+                    &x[..local.n],
+                    -T::one(),
+                    T::one(),
+                );
             } else {
                 for (j, &r) in local.border_rows.iter().enumerate() {
                     out.border[j] += e[local.n + r];

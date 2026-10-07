@@ -643,6 +643,13 @@ where
             p.current_num_threads() > 1 && work >= 4096 * p.current_num_threads() as u128
         });
         self.residual_pool = pool.clone();
+        // `residual_full` borrows immutably and cannot build the plan on first
+        // use as `refine_residual` does; without it an owner's reduced
+        // residual ran a serial symv (MPI ranks: 27 of 85 s at 32 threads).
+        // The row plan keeps every row's addition order, so bits are unchanged.
+        if self.residual_plan.is_none() && self.residual_dense.is_none() && pool.is_some() {
+            self.residual_plan = Some(SparseParallel::new_symmetric(&self.KKT));
+        }
         if let Some(plan) = &mut self.residual_plan {
             plan.configure(&self.KKT, pool);
         }
