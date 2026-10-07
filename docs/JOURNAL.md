@@ -8,6 +8,24 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-08 — split congruences: prime groups, then output columns
+
+Probe (EPYC, 64-thread pool, one m = 53/768-bit upper congruence): serial
+8.2 ms; the column split reached only 7.0/6.7 ms at 3/8 ways. Per-way
+breakdown: summed GEMM time 2.7 → 7.8 ms from 2 to 4 ways (narrow column
+panels), and the shared residue fill grew with ways. New split for products
+whose per-prime outputs fit the ways' scratch: full-size per-prime GEMMs
+over prime groups, then CRT by output column ranges (same residues, digits
+and rounding; bitwise test against the unsplit product). 3.6 ms at 6 ways.
+
+In the solver, the old `floor(cost/share)` rule split almost nothing. The
+makespan rule was restored with costs measured only from unsplit calls.
+Splitting GEMM and svec-quadratic products as well was neutral (a split
+quadratic was slower than serial in the probe), so only congruences take
+granted ways. Paired 30 it runs on node63 (bitwise identical): 64 threads
+47.6/48.7 → 46.3/47.9 s, 96 threads 48.4/49.7 → 46.6/48.3 s (-2 to -3%);
+`sampled.adj.local` 3.5 → 2.8 s. Kept.
+
 ## 2026-10-08 — MPI owner path: parallel border products and reduced residual
 
 Observation (faer binary, spins 0–50/768 30 it): a rank holding 13
@@ -40,6 +58,18 @@ Multi-node with both fixes (b11be90), idle node48/49/78/79, TCP over ib0:
 | 1 | 13 x 4 (plain 64 threads 44.8 s) | 43.8 s | 49.3 s |
 | 2 | 4 x 32 (26 x 4 41.1 s) | 40.3 s | 43.3 s |
 | 4 | 13 x 16 (26 x 9 39.3 s) | 37.0 s | 40.5 s |
+
+Full solves (177 iterations, same objective; SDPB 768 bits, 1e-42, one
+rank per core, TCP over ib0):
+
+| Resources | SDPX | SDPB |
+|---|---|---|
+| 1 node, 32 / 64 / 96 cores | 300 / 247 / 263 s | 536 / 285 / 370 s |
+| 2 nodes x 64 | 211 s (4 x 32) | 221 s (128 ranks) |
+| 4 nodes x 64 | 200 s (13 x 16) | 341 s (256 ranks) |
+
+The SDPX 64-thread point passed the original-coordinate audit (optimal,
+objective agreement with the reference 1.9e-42).
 
 At 4 nodes each rank holds two components: solve 33.3 s, of which
 `mpi.allreduce` 5.8-8.2 s over 6113 collectives (2120 are refinement
