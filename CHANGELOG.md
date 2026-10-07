@@ -27,18 +27,26 @@ solve 2.02 s/50 it (objective error 4.5e-7) → 9 ms/0 it (6.6e-14), whole CLI
 
 - MPFR standard-form conic problems: any mix of small orthant/SOC cones whose
   rows touch only their own variables is eliminated leaf by leaf around the
-  equality rows (`local_cone_arrow`), with an exact residue border Schur
+  equality rows (`local_cone_arrow`; oversized cones join the border), with
+  the border ordered by coupling degree and an exact residue border Schur
   complement from 128 bits. Crossing SOCP (20,022 variables, 271 dense
   equality rows, 14,021 orthant and 2,000 SOC3 identity rows), MPFR128 at
-  1e-18: Solved/63 as before, objective within 8e-24, native 698.8 → 31.9 s
-  on four threads; refinements 1,357 → 85. Its last factorization falls back
-  to QDLDL, and peak RSS rises 0.95 → 1.61 GB. Binary64 keeps the
-  augmented factorization (the binary64 border loses accuracy there).
+  1e-18: Solved/63 as before, objective within 8e-24, native 698.8 → 19.3 s
+  on four threads, refinements 1,357 → 88, peak RSS 953 → 728 MiB. Binary64
+  keeps the augmented factorization (the binary64 border loses accuracy).
+- Local and shared SOC arrows drop their 128-coordinate border limit (memory
+  and density rules instead): 2,000 SOC3 cones with 300 equality rows solve
+  in 7.6 s instead of 280 s on QDLDL at MPFR256 and 1.13 s instead of 1.32 s
+  in Float64.
+- Presolve proves full row rank from direct F_(2^31−1) images of the input
+  values (no rational conversion, no exponent limit) over columns in stride
+  order, for up to 1024 equality rows: crossing SOCP setup 4.3 → 0.4 s.
 - Local SOC residue Schur: rows are sorted by exponent window and each group
   of 256 rows encodes against its own window with its own primes; the exact
   group integers are added before one rounding, so results are unchanged.
-  csdr3 MPFR256 release A/B/B/A: −17.1% at four threads (peak RSS 238 → 214
-  MiB) and −6.7% at one thread (184 → 179 MiB), identical points.
+  csdr3 MPFR256 release A/B/B/A: −17.1% at four threads and −6.7% at one
+  thread, identical points; with Z = D⁻¹Y formed while encoding instead of
+  stored, peak RSS at four threads falls 234–237 → 186–197 MiB.
 - Gondzio multiple centrality correctors (approved 2026-10-07) on orthant
   rows, second-order cones (spectral) and τκ, for symmetric problems with
   orthant or SOC rows: parity set iterations 993 → 849; larger gravity

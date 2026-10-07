@@ -7706,3 +7706,62 @@ ising11 point `c7491bd8594d4320`; two synthetic mixed problems (SOC3/SOC5,
 orthant, boxed variables merging two units, variables shared by six cones,
 a free variable, an uncoupled cone, a cross-leaf P entry) match QDLDL to
 ~1e-32 at MPFR128. Evidence: `$SDPX_E2E_HOME/work/cc1007/`.
+
+## 2026-10-07 — Local cone arrow follow-ups, relaxed size gates, presolve images
+
+**Border order (kept, `c7efcf2`).** The last crossing factorization failed
+because the dense border eliminated its most coupled rows first: the border
+Schur pattern is a block arrow (rows 0–105 couple to every equality row,
+four ~41-row blocks only to those rows), and QDLDL's AMD order, which
+survived, eliminates the blocks first. Ordering each sign group of the
+border by coupling degree (leaf column cliques plus direct border entries)
+removes the overflow and the QDLDL fallback: Solved/63, same objective,
+peak RSS 1533 → 801 MiB.
+
+**SOC expansions (fix, `1290370`).** SOCs with more than four rows add two
+KKT coordinates after all rows; the first cone-arrow detector left them in
+neither a leaf nor the border (couplings misrouted, rows dropped; refinement
+hid it). They now follow their cone rows in the leaf; each leaf's suffix
+starts at its first border-coupled coordinate. Synthetic SOC5 problem:
+agreement with QDLDL 6e-33 → 5e-39, refinements 103 → 27.
+
+**Size gates (kept, `9b8563d`).** Requested by the user: relax fixed cutoffs
+that send problems to slower paths.
+
+| Gate | Change | Evidence |
+|---|---|---|
+| local/shared SOC border ≤ 128 | memory cap plus density guard (t² ≤ 8 × coupling entries) | 2,000 SOC3 / 300 rows: Float64 1.13 s vs QDLDL 1.32 s / faer 1.45 s; MPFR256 7.6 s vs QDLDL 280 s, same iterations/objective; parity 49/49 unchanged |
+| local cones: ≥ 1 SOC, leaf ≤ 32, border ≤ 2048, oversized cone rejects all | pure orthant admitted after local bounds; leaf ≤ 64; oversized cones join the border; no border cap | crossing unchanged |
+| local cones: shared variable ≤ 4 units | kept | merging a variable shared by six SOCs: 99/90 refinements vs 27/26 |
+| block Schur exponent spread ≤ 4096 | slot-memory budget (256 MiB of i128 slots) | group windows make any spread encodable |
+| QDLDL parallel `groups·n ≤ 500k` | tried coalescing subtrees into ≤ 500k/n groups: bitwise identical but refactor 18.97 → 23.49 s on the trunk-dominated crossing KKT (ordered replay of every leaf→trunk contribution); reverted | the arrow serves such problems |
+| presolve dense proof m ≤ 256, budget 16M | m ≤ 1024 (8 MiB basis), budget 2m³, columns in stride order | crossing presolve_rank 3.9 s → 10 ms |
+
+Residue products below 256 bits, condensation thresholds, dense_block and
+the faer flop rule are measured backend choices and were left alone.
+
+**Presolve images (kept, `9b8563d`).** `Scalar::mersenne31` maps a dyadic
+`±M·2^e` to F_(2^31−1) by folding limbs (2^64 ≡ 4) and `2^(e mod 31)`, with
+no GMP rational and no exponent limit; checked against
+`exact().modulo_mersenne31()` on 2,000 random f64/MPFR256 values. The
+sparse modular test now runs on these images before any rational row is
+built (a forced general path on the crossing system: 3.5 s, dominated by
+the BTreeMap elimination, not the images).
+
+**Z formed while encoding (kept, `acd3a91`).** The exact block Schur takes
+(Y, D⁻¹ suffix, columns) and rounds z = y·d during encoding; windows follow
+from Y and the exponent of d. MPFR leaves drop stored Z (binary64 keeps it).
+Identical points on csdr3 and a shared-SOC g0 subsample at 128 bits; peak
+RSS csdr3 214 → 202 MiB, crossing 801 → 738 MiB, 300-row synthetic 722 →
+651 MiB. Capping the block kernel's prime groups at the 8 MiB stream
+scratch saved another 66 MiB on the synthetic but cost 8% time; reverted.
+
+| Final release `cc1007-final-rel` (Mac M4, load 2.6–4.2) | before | after |
+|---|---|---|
+| crossing MPFR128 1e-18, 4 threads: native | 698.8 s (run_001, QDLDL) | 19.3 s, Solved/63 |
+| setup / refinements / peak RSS | 4.31 s / 1,357 / 953 MiB | 0.40 s / 88 / 728 MiB |
+| crossing Float64 (faer pinned): setup | 3.64 s | 0.08 s (same iterates) |
+| csdr3/256 4 threads, A/B/B/A vs `cc1007-base-rel` | 5.408 s, RSS 234–237 MiB | 4.481 s (−17.1%), RSS 186–197 MiB |
+
+ising11 (`c7491bd8594d4320`) and medium (`fd1437ee79ac39e0`) points are
+unchanged; all audits pass.
