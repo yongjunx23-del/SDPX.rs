@@ -1014,10 +1014,11 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             local[id] = i;
         }
         let bound_count = groups.len();
-        // Local cone leaves: their sorted border columns, and whether a cone
-        // row couples to the border (then the whole leaf is the suffix).
+        // Local cone leaves: their sorted border columns, and the first leaf
+        // position with a border coupling (the suffix starts there).
         let mut links = if matches!(local_structure, Some(LocalStructure::Cones)) {
-            let mut links = vec![(Vec::new(), false); groups.len()];
+            let mut links: Vec<(Vec<usize>, usize)> =
+                groups.iter().map(|g| (Vec::new(), g.len())).collect();
             for j in 0..n {
                 for q in k.colptr[j]..k.colptr[j + 1] {
                     let i = k.rowval[q];
@@ -1028,7 +1029,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                     };
                     let link = &mut links[owner[inner]];
                     link.0.push(local[outer]);
-                    link.1 |= signs[inner] < 0;
+                    link.1 = link.1.min(local[inner]);
                 }
             }
             for link in &mut links {
@@ -1050,10 +1051,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         LocalStructure::Soc => 2,
                         LocalStructure::SharedSoc => leaf.ids.len(),
                         LocalStructure::Bounds => 1,
-                        LocalStructure::Cones if links[gi].1 => leaf.ids.len(),
-                        LocalStructure::Cones => {
-                            leaf.ids.iter().filter(|&&i| signs[i] > 0).count()
-                        }
+                        LocalStructure::Cones => leaf.ids.len() - links[gi].1,
                     };
                     leaf.coupling_start = leaf.ids.len() - width;
                     let panels = matches!(kind, LocalStructure::Bounds)

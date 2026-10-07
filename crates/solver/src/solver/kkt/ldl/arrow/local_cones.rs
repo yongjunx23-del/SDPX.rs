@@ -37,27 +37,36 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         let n = a.n;
         debug_assert!(k.n == n + a.m && k.m == k.n && signs.len() == k.n);
+        // Unit coordinates: cone rows, then a large SOC's two sparse-expansion
+        // coordinates (numbered after all rows, in cone order).
         let mut unit_of_row = vec![usize::MAX; a.m];
-        let mut units: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut units: Vec<Vec<usize>> = Vec::new();
         let mut trunk = Vec::new();
         let mut soc = false;
+        let mut expansion = n + a.m;
         for (cone, rows) in cones.iter().zip(&cones.rng_cones) {
             match cone {
                 SupportedCone::ZeroCone(_) => trunk.extend(rows.clone().map(|r| n + r)),
                 SupportedCone::NonnegativeCone(_) => {
                     for r in rows.clone() {
                         unit_of_row[r] = units.len();
-                        units.push(r..r + 1);
+                        units.push(vec![n + r]);
                     }
                 }
                 SupportedCone::SecondOrderCone(c) if c.numel() <= LEAF_MAX => {
                     soc = true;
                     unit_of_row[rows.clone()].fill(units.len());
-                    units.push(rows.clone());
+                    let mut ids: Vec<usize> = rows.clone().map(|r| n + r).collect();
+                    if cone.is_sparse_expandable() {
+                        ids.extend([expansion, expansion + 1]);
+                        expansion += 2;
+                    }
+                    units.push(ids);
                 }
                 _ => return None,
             }
         }
+        debug_assert_eq!(expansion, k.n);
         // Pure orthant problems keep the bound elimination or QDLDL.
         if !soc {
             return None;
@@ -103,7 +112,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 leaf_of[root] = groups.len();
                 groups.push(Vec::new());
             }
-            groups[leaf_of[root]].extend(rows.clone().map(|r| n + r));
+            groups[leaf_of[root]].extend(rows.iter().copied());
         }
         for col in 0..n {
             if home[col] != usize::MAX {
@@ -116,11 +125,10 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             || t == 0
             || t > BORDER_MAX
             || groups.iter().any(|g| g.len() > LEAF_MAX)
-            || trunk.iter().any(|&id| signs[id] != if id < n { 1 } else { -1 })
-            || groups
+            || trunk
                 .iter()
-                .flatten()
-                .any(|&id| signs[id] != if id < n { 1 } else { -1 })
+                .chain(groups.iter().flatten())
+                .any(|&id| id < n + a.m && signs[id] != if id < n { 1 } else { -1 })
         {
             return None;
         }
@@ -149,6 +157,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 link.0.push(border[outer]);
                 link.1 += 1;
                 link.2 |= inner >= n;
+                debug_assert!(inner < n + a.m);
             }
         }
         let mut cells = 4 * (t as u128).pow(2) + 4 * k.n as u128;
