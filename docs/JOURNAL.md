@@ -8,6 +8,49 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-08 — MPI owner path: parallel border products and reduced residual
+
+Observation (faer binary, spins 0–50/768 30 it): a rank holding 13
+components with 32 threads took 82.6 s, and 2 nodes x 1 rank x 64 threads
+79.0 s, while one plain 64-thread process took 44.2 s. The rank's KKT update
+ran at 9x CPU/wall on 32 workers (plain path 23x).
+
+Owner-phase timers: the reduced refinement's fused residual took 27 s
+(518 calls, 1.7x CPU/wall). Inside it, the border coupling products
+(54 x ~1200 dense, MPFR) were 18 s serial, and the border correction (one
+54-long dot per interior row) 4.6 s serial. `residual_full` also never built the
+pooled row plan (only `refine_residual` builds it lazily) and ran a serial
+symv. Hypothesis tried first and rejected: running a single owner on the
+calling thread instead of as a pool task (2x32 85.3 s, neutral; reverted).
+
+Change: coupling products use a `SparseParallel` row/column plan per owner,
+correction rows split over the pool, and `set_residual_pool` builds the
+residual plan. Each output keeps its serial accumulation order.
+
+| One node, 30 it | Before | After |
+|---|---|---|
+| MPI 2 x 32 | 80.7 s | 47.6 s |
+| MPI 1 x 64 | 98.6 s | 74.8 s |
+| MPI 13 x 4 | 48.2 s | 43.4 s |
+
+Multi-node with both fixes (b11be90), idle node48/49/78/79, TCP over ib0:
+
+| Nodes | Best layout | 30 it | Before (w5) |
+|---|---|---|---|
+| 1 | 13 x 4 (plain 64 threads 44.8 s) | 43.8 s | 49.3 s |
+| 2 | 4 x 32 (26 x 4 41.1 s) | 40.3 s | 43.3 s |
+| 4 | 13 x 16 (26 x 9 39.3 s) | 37.0 s | 40.5 s |
+
+At 4 nodes each rank holds two components: solve 33.3 s, of which
+`mpi.allreduce` 5.8-8.2 s over 6113 collectives (2120 are refinement
+agreement flags); the rest is the per-component chain, which more cores do
+not shorten.
+
+Points bitwise identical to the same rank counts. The owner path still runs
+two refinement levels (reduced inside original), so one rank remains slower
+than the plain path (74.8 vs 44.2 s); not changed (refinement contract).
+Evidence: `hpc:~/projects/sdpx-ising11-scaling-20261007/runs/op{1..5}-*`.
+
 ## 2026-10-08 — residue GEMMs off OpenBLAS: threads scale past 32
 
 Hypothesis: spins 0–50 at 32/64/96 threads was flat (30 it 62/57/60 s;

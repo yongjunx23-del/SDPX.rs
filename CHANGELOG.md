@@ -30,6 +30,10 @@ solve 2.02 s/50 it (objective error 4.5e-7) → 9 ms/0 it (6.6e-14), whole CLI
   Concurrent single-thread OpenBLAS calls lost 8x per-thread throughput at
   64 callers. Λ19 spins 0–50/768, 30 it, EPYC 7742, points bitwise
   identical: 32/64/96 threads 62.2/59.0/59.8 → 53.5/44.2/45.5 s.
+- MPI owner path: border coupling products, border correction rows and the
+  reduced residual run on the rank's pool (they were serial). Spins 0–50,
+  one node, points bitwise identical: 2 ranks x 32 threads 80.7 → 47.6 s,
+  13 x 4 48.2 → 43.4 s.
 - Wide pools on PSD problems: inner splits need one grain of work per task,
   the cone pool is no wider than its PSD work (the main thread stays on the
   workers' CPUs), split congruences share output columns, and in-process
