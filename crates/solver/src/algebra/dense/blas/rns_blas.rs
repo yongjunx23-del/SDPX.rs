@@ -1629,10 +1629,11 @@ pub(super) fn gemm<const N: usize>(
     acc.finish(&plan, lo_a + lo_b, out, &split)
 }
 
-/// Upper triangle of `Σ A_bᵀ·B_b`, summed exactly across every block and
-/// rounded once into `out[i + j*m]`. Block `b` is `(a, b, columns)`: `a`
-/// and `b` are column-major `w × q` over its sorted global columns
-/// (`q = columns.len()`, any width `w`).
+/// Upper triangle of `Σ_b Z_bᵀ·Y_b` with `Z_b = diag(d_b)·Y_b` rounded
+/// entrywise, summed exactly across every block and rounded once into
+/// `out[i + j*m]`. Block `b` is `(y, d, columns)`: `y` is column-major `w × q`
+/// over its sorted global columns (`q = columns.len()`, any width `w`) and
+/// `d` holds the `w` row scales; `Z` is formed while encoding, never stored.
 ///
 /// Blocks sharing a column list form a class; within a class, local rows
 /// with equal supports share one product. Rows of one support may be summed
@@ -1648,11 +1649,10 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
     out: &mut [F<N>],
     pool: Option<&rayon::ThreadPool>,
 ) -> bool {
-    let width = |block: &(&[F<N>], &[F<N>], &[usize])| block.0.len() / block.2.len().max(1);
+    let width = |block: &(&[F<N>], &[F<N>], &[usize])| block.1.len();
     let mut first_row = Vec::with_capacity(blocks.len() + 1);
     first_row.push(0);
     for block in blocks {
-        debug_assert_eq!(block.0.len(), block.1.len());
         debug_assert_eq!(block.0.len(), width(block) * block.2.len());
         first_row.push(first_row.last().unwrap() + width(block));
     }
@@ -1677,23 +1677,29 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
         let q = columns.len();
         let mut class_supports: Vec<Vec<bool>> = Vec::new();
         for &bi in members {
-            let (a, b, _) = blocks[bi];
+            let (y, d, _) = blocks[bi];
             let w = width(&blocks[bi]);
             if class_supports.len() < w {
                 class_supports.resize(w, vec![false; q]);
             }
             for local in 0..w {
-                let (mut la, mut ha, mut lb, mut hb) = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
+                let (mut lb, mut hb) = (i64::MAX, i64::MIN);
                 for c in 0..q {
-                    let entry = local + c * w;
-                    let (Some(active_a), Some(active_b)) =
-                        (scan_exponent(&a[entry], &mut la, &mut ha),
-                         scan_exponent(&b[entry], &mut lb, &mut hb))
-                    else {
+                    let Some(active) = scan_exponent(&y[local + c * w], &mut lb, &mut hb) else {
                         return false;
                     };
-                    class_supports[local][c] |= active_a || active_b;
+                    class_supports[local][c] |= active;
                 }
+                // A rounded product's exponent is e_y + e_d or e_y + e_d - 1.
+                let view = d[local].dyadic_view();
+                let (la, ha) = match view.kind {
+                    DyadicKind::Finite { .. } if lb <= hb => {
+                        let e = view.exponent as i64;
+                        (lb + e - 1, hb + e)
+                    }
+                    DyadicKind::Finite { .. } | DyadicKind::Zero => (i64::MAX, i64::MIN),
+                    _ => return false,
+                };
                 (lo_a, lo_b) = (lo_a.min(la), lo_b.min(lb));
                 windows[first_row[bi] + local] = [la, ha, lb, hb];
             }
@@ -1821,11 +1827,12 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
             let mut cb = ChunkMatrix::new::<N>(len, group.spread.1, plan);
             for (j, &position) in group.positions.iter().enumerate() {
                 for (i, &(b, local)) in group.rows.iter().enumerate() {
-                    let (ab, bb, _) = blocks[b];
+                    let (y, d, _) = blocks[b];
                     let at = local + position * width(&blocks[b]);
                     let (a0, b0) = ((j * kr + i) * ca.chunks, (j * kr + i) * cb.chunks);
-                    fill_chunk(&ab[at], &mut ca.e[a0..a0 + ca.chunks], group.lo.0, ca.width);
-                    fill_chunk(&bb[at], &mut cb.e[b0..b0 + cb.chunks], group.lo.1, cb.width);
+                    let z = y[at] * d[local];
+                    fill_chunk(&z, &mut ca.e[a0..a0 + ca.chunks], group.lo.0, ca.width);
+                    fill_chunk(&y[at], &mut cb.e[b0..b0 + cb.chunks], group.lo.1, cb.width);
                 }
             }
             let shape = GemmShape {

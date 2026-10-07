@@ -1067,7 +1067,10 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                             let q = if width == 0 { 0 } else { columns.len() };
                             leaf.b.resize(width.saturating_sub(1) * q, T::zero());
                             leaf.y.resize(width * q, T::zero());
-                            leaf.z.resize(width * q, T::zero());
+                            // MPFR forms Z = D⁻¹Y inside the exact Schur product.
+                            if T::precision_bits() <= 64 {
+                                leaf.z.resize(width * q, T::zero());
+                            }
                             leaf.couples = vec![false; t];
                             for &c in &columns[..q] {
                                 leaf.couples[c] = true;
@@ -1082,7 +1085,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                             };
                             leaf.b.resize(b_size, T::zero());
                             leaf.y.resize(width * t, T::zero());
-                            leaf.z.resize(width * t, T::zero());
+                            if T::precision_bits() <= 64 {
+                                leaf.z.resize(width * t, T::zero());
+                            }
                             leaf.coupled = (0..t).collect();
                             leaf.couples = vec![true; t];
                         }

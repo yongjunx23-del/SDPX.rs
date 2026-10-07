@@ -438,7 +438,7 @@ impl<const N: usize> XgemmScalar for F<N> {
         c: &mut [Self],
         pool: Option<&rayon::ThreadPool>,
     ) -> bool {
-        let rows: usize = blocks.iter().map(|b| b.0.len() / b.2.len().max(1)).sum();
+        let rows: usize = blocks.iter().map(|b| b.1.len()).sum();
         // Every block row is one rank-one term of many outputs, so exact dots
         // cost far more per term than residue products already at 128 bits.
         N >= 2 && rows >= 24 && m * m >= 576

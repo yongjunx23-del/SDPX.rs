@@ -122,7 +122,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             let blocks: Vec<_> = leaves
                 .iter()
                 .filter(|leaf| !leaf.y.is_empty())
-                .map(|leaf| (&leaf.z[..], &leaf.y[..], &leaf.coupled[..]))
+                .map(|leaf| {
+                    (&leaf.y[..], &leaf.factor.dinv[leaf.coupling_start..], &leaf.coupled[..])
+                })
                 .collect();
             // Upper ZᵀY selects the same products as lower YᵀZ below.
             if T::xgemm_blocks_upper_exact(t, &blocks, &mut self.s, self.pool.as_deref()) {
@@ -146,6 +148,18 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         // Use the leaf's structurally nonzero coupling suffix.
         // MPFR's dot uses exact accumulation rounded once; each entry has the
         // same leaf/coordinate order at every thread count. No parallel sum.
+        // Z = D⁻¹Y is not stored at MPFR; form it for this fallback only.
+        let z: Vec<Vec<T>> = leaves
+            .iter()
+            .map(|leaf| {
+                let (start, width) = (leaf.coupling_start, leaf.ids.len() - leaf.coupling_start);
+                leaf.y
+                    .iter()
+                    .enumerate()
+                    .map(|(e, &y)| y * leaf.factor.dinv[start + e % width])
+                    .collect()
+            })
+            .collect();
         let classes = &self.classes;
         let column = |(j, values): (usize, &mut [T])| {
             for (i, value) in values.iter_mut().enumerate().skip(j) {
@@ -155,11 +169,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         .filter(|c| c.position[i] != usize::MAX && c.position[j] != usize::MAX)
                         .flat_map(|class| {
                             let (pi, pj) = (class.position[i], class.position[j]);
+                            let z = &z;
                             class.leaves.iter().flat_map(move |&l| {
                                 let leaf = &leaves[l];
                                 let width = leaf.ids.len() - leaf.coupling_start;
                                 (0..width).map(move |r| {
-                                    (&leaf.y[r + pi * width], &leaf.z[r + pj * width])
+                                    (&leaf.y[r + pi * width], &z[l][r + pj * width])
                                 })
                             })
                         }),
