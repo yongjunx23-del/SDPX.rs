@@ -29,10 +29,19 @@ solve 2.02 s/50 it (objective error 4.5e-7) → 9 ms/0 it (6.6e-14), whole CLI
   rows, second-order cones (spectral) and τκ, for symmetric problems with
   orthant or SOC rows: parity set iterations 993 → 849; larger gravity
   37 → 22 (−16% native); csdr3 MPFR256 57 → 36; sched SOCPs now all Solved.
-  Pure PSD problems are unchanged.
+  Pure PSD problems are unchanged. At its pinned 1e-8 tolerance csdr3 stops
+  earlier with a larger objective error (2.9e-2 versus 1.6e-3); at a matched
+  1e-12 tolerance it needs 79 instead of 103 iterations at equal time.
 - Iterative refinement of the constant and affine right-hand sides shares
-  one residual pass and one two-column correction solve (−3–4% on the free-λ
-  g0 SOCP and gravity).
+  one two-column correction solve, and on the parallel Float64 row plan one
+  residual pass (−3–4% on the free-λ g0 SOCP and gravity in three alternating
+  runs on a loaded host).
+- Exact products: GEMM, congruence, quadratic and bilinear residue kernels
+  share one CRT accumulator; the local SOC arrow Schur is one exact residue
+  product over compact row supports; ordinary square GEMMs of side ≥ 12 use
+  the residue kernel at ≥ 1024 bits; solver workspaces are reused. csdr3
+  MPFR256: −13.1% at four threads and −26% at one thread with identical
+  points, at +36–40% peak RSS at four threads (+6% at one).
 
 - Binary64 local/shared SOC arrow Schur assembly streams each leaf once with
   fixed 1024-leaf partials summed in chunk order (thread-count invariant):
@@ -79,7 +88,10 @@ Mixed Λ27 at 1024 bits, 32 threads per node: full solve on 4 nodes 1369 s
 (0.9.0: 1608 s; SDPB 2592 s), 1 node 2106 s (SDPB 4014 s). Same-allocation
 3-iteration A/B of the release head against the pre-repair head: 4 nodes
 on par, 1 node +2.4% (removed refinement prediction, partly offset by
-residue contributions).
+residue contributions). These SDPX runs were not audited, and the frozen
+0.9.1 baseline's Λ27 point fails the original-coordinate 1e-30 audit (dual
+residual 1.475e-23), so the SDPB comparison is not yet at matched accuracy
+(see the plan's known failures).
 
 ### Fixed
 

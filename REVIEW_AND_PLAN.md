@@ -97,6 +97,18 @@ retained TLS workspaces. Scalar power-of-two multiplication
 is already in release 0.9.1; removing its exact mantissa-copy shortcut regressed
 release Ising11/512 by 0.89%. Leave it in place.
 
+### Matched release check (2026-10-07)
+
+Release A/B/B/A against 0.9.1 on the Mac (journal): ce09de1 and e2470e6 leave
+medium and ising11 bitwise unchanged (±1%); since 10-03 medium is −6.6% time
+and −34% RSS, ising11 −2.8% and −7%. csdr3/256: ce09de1's residue local Schur
+gives −13.1% at four threads and −26% at one with identical points, at +36–40%
+peak RSS at four threads (+6% at one). The correctors then shorten csdr3 at
+the pinned 1e-8 by 12% only by stopping earlier (objective error 2.9e-2 versus
+1.6e-3). At a matched 1e-12 they save 23% of the iterations (103 → 79) but no
+time (wall +3.1%, CPU −2.3%): corrector solves and the serial SOC corrections
+take 26% of the solve. Owner-MPI runs never apply correctors.
+
 ### Full-solve accuracy gate
 
 PBS223602 checked frozen 0.9.1 sources differing only in arrow residue batching,
@@ -156,20 +168,19 @@ restarting old campaigns.
 
 ## Profile
 
-Shares of the 2026-10-04 local runs (receipt phases, one thread):
+Shares of the 2026-10-07 release runs of e2470e6 (receipt phases):
 
-- `medium` Float64: KKT update 82% of the solve, of which condensed PSD Schur
-  assembly 67% (coefficient transform 37%, dot/scatter 26%) and dense
-  refactor 12%.
-- `ising11` MPFR512: PSD scaling 31% (SVD 27%: bidiagonal QR 12%, rotation
-  replay 11%), KKT solve 16%, RHS scaling 17%, refinement residuals 15%.
-  GMP limb multiplication inside exact dots is ~45% of samples overall.
-- `csdr3` MPFR256, four threads: refactor 43% of wall (arrow local Schur
-  38%), iterative refinement 24%. The local Schur is one exact dot per border
-  pair over every leaf (structurally `YᵀZ`). The retained bounded residue
-  product now replaces these dots; common row supports improve its 256/512
-  timings above. The original private layout increases RSS; the raw-row and
-  staging removals are logical storage benefits, not a combined RSS claim.
+- `medium` Float64, one thread: KKT update 83% of the solve, of which Schur
+  assembly 66% (coefficient transform 37%, dot/scatter 24%) and dense
+  refactor 12%. Four threads give only 1.43×: the refactor stays 0.25 s and
+  the slowest transform call does not shrink (next work 12).
+- `ising11` MPFR512, one thread: cone scaling 32% (SVD 28%: bidiagonal QR
+  12%, rotation replay 11%), KKT update 33%, KKT solve 16%, refinement
+  residuals 14%, RHS recover/prepare scaling 10%/7%. GMP limb multiplication
+  inside exact dots was ~45% of samples on 10-04.
+- `csdr3` MPFR256, four threads, 1e-8: KKT update 45% (refactor 26%, residue
+  local Schur 22.5%), step length with correctors 31% (corrector solves 18%),
+  iterative refinement 27%. At 1e-12 corrector work is 26% of the solve.
 
 Cluster 222426 cycle samples: gravity exact residual 22.5%, DGEMM 13.8%,
 diagonal congruence 11.0%; Lambda GMP multiplication 26.8%, DGEMM 15.9%,
@@ -220,7 +231,11 @@ regularization and refinement stay unchanged.
 | 6 | Improve PMP when it limits the workflow | Secondary to the solver; measure whole-command time/memory and output equivalence. |
 | 7 | Free-multiplier g0 SOCP per-iteration cost (3.15 s/15 it vs MOSEK 1.3 s/13 it) | Batch refinement over the constant/affine RHS (one residual pass for both), fewer full-KKT residual passes, then compare a dual (16-row Schur) form as MOSEK's presolve does. Keep the 46-problem Float64 set and csdr3 unchanged. |
 | 8 | Lessons from other solvers (2026-10-07 survey, below) | Each item needs its own audited A/B; none is adopted yet. |
-| 9 | Centrality (Float64 LP/SOC iteration gap) | Done 2026-10-07 (approved): Gondzio correctors on orthant, SOC and τκ; parity iterations −14.5%, gravity 37 → 22, sched all Solved. PSD rows have no correction (eigendecomposition per corrector); measure before adding. |
+| 9 | Centrality (Float64 LP/SOC iteration gap) | Done 2026-10-07 (approved): Gondzio correctors on orthant, SOC and τκ; parity iterations −14.5%, gravity 37 → 22, sched all Solved. csdr3 at matched 1e-12: 103 → 79 iterations at equal time; the 1e-8 gain is an earlier stop. PSD rows have no correction (eigendecomposition per corrector); measure before adding. |
+| 10 | Corrector overhead | Corrector solves plus serial SOC corrections take 26% of csdr3 at 1e-12. Run the SOC corrections on the cone pool (bitwise identical), count accepted correctors in the receipt, then judge correctors at matched accuracy (csdr3 1e-12; LP objectives against references). |
+| 11 | csdr3 residue memory | ce09de1: +36–40% peak RSS at four threads (about 18 MiB per extra worker) for −13% time. Shrink the per-way operand and prime groups of `gemm_blocks_upper`, or keep it with the trade-off stated; release ABBA with RSS. |
+| 12 | Medium four-thread scaling | 1.43× from one to four threads; refactor flat at 0.25 s; slowest transform call 24 → 28 ms and dot/scatter 7 → 21 ms despite lane splitting. Profile per lane before changing the schedule. |
+| 13 | Owner-MPI correctors | `OwnedCones`/`OwnedVariables` keep the no-op defaults, so SOC/LP iterates differ from single-process runs. Port only after item 10 shows a matched-accuracy gain; needs a real MPI E2E. |
 
 ## Measurement prerequisites
 
@@ -237,6 +252,13 @@ Apply these to affected paths; they are not a project-wide gate:
 - Preserve original input/settings/precision/hash binding before reusing an
   accepted audit after actual full-point equality. Record native/API/process
   scope, status, iterations and peak memory with evidence.
+- Changes that move the stopping point (directions, correctors,
+  regularization) compare time to a matched final accuracy, e.g. csdr3 at
+  1e-12 (optimum −31.6721556) beside the pinned 1e-8 case. Fewer iterations or
+  a faster 1e-8 stop alone are not a speedup.
+- On the shared Mac, compare only inside one A/B/B/A session and report CPU
+  seconds: identical binaries varied 28% and session medians drifted 15% on
+  2026-10-07. Decide sub-5% changes on a quiet host or the cluster.
 
 ## Decisions still needed / deferred
 

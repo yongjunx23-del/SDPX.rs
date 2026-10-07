@@ -7457,3 +7457,84 @@ rhead 23.9/24.0 s, without change 24.1/24.2 s, with inner splits always on in
 the cone job path 24.3/24.1 s; solve 175.6–181.2 s across arms, points
 identical. Job 223635 (4 nodes) lost an MPI daemon on node36 in run 2
 (network failure, exit 205) and hung; inconclusive. Reverted.
+
+## 2026-10-07 — Review: matched release A/B of 0.9.1, ce09de1 and e2470e6
+
+Mac M4 (4P+6E), release arms built in a private clone:
+`review1007-091-4863de1-rel`, `review1007-ce09de1-rel`,
+`review1007-head-e2470e6-rel`, plus `simp-final-rel` (the 2026-10-03
+simplified 0.8.0). A user scan held load 2–5 for most runs, so only ratios
+within one A/B/B/A session count: identical csdr3 binaries ranged 7.45–9.58 s,
+and HEAD's csdr3 median moved 6.80 → 5.78 s between two sessions 15 minutes
+apart. Every run is Solved and passes its original-coordinate audit. Evidence:
+`$SDPX_E2E_HOME/review-20261007/` (`step3.log`, `step-decomp.log`, `tight.log`,
+`tight/`) and `journal.jsonl` rows from 2026-10-07T16:05:43.
+
+| A → B (median API, same session) | Time | Peak RSS | Iterations / point |
+|---|---|---|---|
+| medium, 1 thread: 0.9.1 → e2470e6 | 2.239 → 2.213 s (−1.2%) | 210 → 209 MiB | 19, identical `fd1437ee79ac39e0` |
+| medium: 10-03 → e2470e6 | 2.352 → 2.198 s (−6.6%) | 318 → 210 MiB (−34%) | 19 / 19 |
+| ising11/512, 1 thread: 0.9.1 → e2470e6 | 12.393 → 12.371 s (−0.2%) | 51.6 → 51.0 MiB | 52, identical `c7491bd8594d4320` |
+| ising11: 10-03 → e2470e6 | 12.799 → 12.443 s (−2.8%) | 54.9 → 51.0 MiB (−7%) | 52 / 52 |
+| csdr3/256, 4 threads: 0.9.1 → ce09de1 | 7.600 → 6.607 s (−13.1%) | 171 → 231–238 MiB (+36–40%) | 57, identical `82d7c013a0072d02` |
+| csdr3, 1 thread: 0.9.1 → ce09de1 (one run each) | 22.535 → 16.591 s (−26%) | 168.6 → 179.3 MiB (+6%) | 57, identical |
+| csdr3, 4 threads: ce09de1 → e2470e6 | 6.580 → 5.776 s (−12.2%) | 231–233 → 240–241 MiB | 57 → 36 |
+| csdr3 at 1e-12, 4 threads: ce09de1 → e2470e6 | 11.93 → 12.30 s (+3.1%); CPU 41.6 → 40.7 s (−2.3%) | 239 → 239 MiB | 103 → 79 |
+
+The 1e-12 runs used order 0.9.1/ce09de1/e2470e6/e2470e6/ce09de1/0.9.1 with
+`tight.py` (same input and audit, all tolerances 1e-12): 0.9.1 took
+13.77/16.86 s (the second during a load spike to 5.3). 0.9.1 and ce09de1 reach
+the same point `1b7eb20320df455a` (objective −31.672155639181), e2470e6
+`ecf7f64ddbd35912` (−31.672155652669); all six audits accepted.
+
+**Correctors at matched accuracy.** At the pinned 1e-8 tolerance e2470e6 stops
+at −31.700781 against the 1e-12 optimum −31.6721556: error 2.86e-2 versus
+1.55e-3 for 0.9.1/ce09de1 (18×), primal residual 9.77e-13 → 3.84e-10, gap
+3.37e-9 → 1.91e-9. The csdr3 audit has no objective gate, so both pass. At
+1e-12 the correctors save 23% of the iterations and no time: the step-length
+phase takes 3.50 s of the 12.11 s solve (ce09de1: 0.36 s), 1.91 s of it in
+112 corrector solves and the rest in the serial SOC corrections
+(`CompositeCone::centrality_correction` forms W⁻ᵀ/W and Jordan products for
+all 4,200 cones on one thread) plus one extra step-length pass per attempt;
+factorization falls 7.71 → 5.73 s. At 1e-8, 57 corrector solves (1.21 s) and
+0.88 s of other corrector work take 31% of the 6.77 s solve (0.9.1's whole
+step-length phase: 2.5%). The corrector entry's netlib results show the same
+earlier stop (agg objective error 2.3e-7 → 2.3e-6). Changes that move the
+stopping point must be compared at a matched final accuracy.
+
+**Memory.** ce09de1's residue local Schur adds about 11 MiB at one thread and
+18 MiB per additional worker, consistent with the per-way buffers of
+`gemm_blocks_upper`: K·outputs residues plus two chunk-encoded operand groups
+of at most 256 rows and their residues for 16 primes.
+
+**Threads.** ising11 e2470e6 at four threads: 3.795 s (3.3×), point identical
+to one thread. csdr3 e2470e6 at one thread: 14.617 s, point identical to four
+threads. Binary64 csdr3 (decimal strings converted to binary64 JSON;
+AlmostSolved at 1e-8 in both arms): 41 it (0.9.1) and 35 it (e2470e6), with
+identical points at one and four threads in each arm, so the chunked binary64
+local Schur is thread invariant. Medium's four-thread point `1cfdf1e7829ef559`
+differs from one thread, as in the 10-03 builds (`ab99efe42d097858` vs
+`1a16dc99f3373c3b`); both pass the audit.
+
+**Medium four-thread scaling** (after the scan ended, load about 2): 2.06/2.07
+→ 1.45/1.44 s (1.43×). The dense refactor stays 0.25 s at either thread
+count. The slowest `schur.transform` call grows 24.4 → 28 ms and the slowest
+`schur.dot_scatter` 7 → 21 ms, although `compute_schur_dense_sink` splits the
+transform chunks over pool lanes; the cause is open.
+
+**Code review** of the hot-path changes found no defect. Corrector right-hand
+sides follow `λ∘(W⁻ᵀΔs + WΔz) = −ds` (orthant products, SOC spectral values,
+τκ); a rejected corrector keeps the previous direction; each corrector solve
+forms its own H·z (the condensed solver serves only its latest product from
+`workh`, consumed right after the solve). Batched refinement reproduces the
+single-RHS tolerance and stop-ratio decisions per column, and `symv_pair` keeps
+each product's entry order. The SOC tail merge and singleton-column fixing are
+exact reductions; postsolve keeps cone norms, `bᵀz` and certificate structure,
+and data updates are refused while presolve is active. The shared CRT
+accumulator keeps integer digit sums below 2^53 and the serial `frac` order.
+Gaps: the owner-MPI path never runs correctors (`OwnedCones` keeps the
+`has_correctable` default and `OwnedVariables` the no-op), so SOC/LP iterates
+differ between owner-MPI and single-process runs; ARCHITECTURE claimed shared
+residual passes for every batched refinement; CHANGELOG lacked ce09de1 and
+quoted the 1e-8 corrector gains and the unaudited Λ27/SDPB comparison without
+caveats (both documents updated with this entry).

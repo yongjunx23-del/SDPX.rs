@@ -107,7 +107,9 @@ Each HSD iteration:
    accepted iterate for recovery.
 
 Newton solves use iterative refinement against the true, unshifted operator;
-batched right-hand sides share each residual pass and correction solve.
+batched right-hand sides share each correction solve, and on the parallel
+Float64 row plan each residual pass (MPFR exact residual rows and serial
+Float64 residuals run per right-hand side).
 At MPFR precision every refinement residual row is an exact dot product
 rounded once, so refinement keeps working on badly scaled bootstrap systems.
 Every right-hand side uses its own residual and measured correction gain;
