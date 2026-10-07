@@ -7518,9 +7518,11 @@ differs from one thread, as in the 10-03 builds (`ab99efe42d097858` vs
 
 **Medium four-thread scaling** (after the scan ended, load about 2): 2.06/2.07
 → 1.45/1.44 s (1.43×). The dense refactor stays 0.25 s at either thread
-count. The slowest `schur.transform` call grows 24.4 → 28 ms and the slowest
-`schur.dot_scatter` 7 → 21 ms, although `compute_schur_dense_sink` splits the
-transform chunks over pool lanes; the cause is open.
+count; Schur assembly takes 66 → 39.5 ms per factorization (1.67×). The
+slowest `schur.transform` call grows 24.4 → 28 ms and the slowest
+`schur.dot_scatter` 7 → 21 ms although `compute_schur_dense_sink` splits the
+transform chunks over pool lanes, but a call's wall time also includes tasks
+its thread steals while it waits in a join; the cause is open.
 
 **Code review** of the hot-path changes found no defect. Corrector right-hand
 sides follow `λ∘(W⁻ᵀΔs + WΔz) = −ds` (orthant products, SOC spectral values,
@@ -7561,3 +7563,62 @@ Both B runs beat both A runs in each case. The correction pass costs 2.3 ms
 per call at four threads (0.133 s for 57 calls; about 8 ms serially), the
 extra step-length pass per attempt 3.4 ms. csdr3 accepts 38 of 57 corrector
 solves at 1e-8 and 70 of 112 at 1e-12. One thread: 14.474 s, 36 it.
+
+## 2026-10-07 — Correctors at matched accuracy; block-Schur residue profile
+
+Same-session release A/B/B/A, csdr3-tight (1e-12), four threads, all audits
+pass: ce09de1 (no correctors) 13.593/13.648 s at 103 it versus
+`perf1007-corr-rel` (correctors with parallel corrections) 13.488/13.172 s at
+79 it, median −2.1% wall and −1.8% CPU, both B runs below both A runs, and the
+same objective error (2.15e-10 versus 2.11e-10 against −31.672155646). This
+session ran 12–14% slower than the previous one, so only the ratio counts.
+With the parallel corrections the correctors are a small net gain at matched
+accuracy on this MPFR SOC case; without them (e2470e6) they were +3.1%.
+
+Diagnostic build (`diag-block-gemm`, fast profile, csdr3/256 four threads,
+point unchanged): `gemm_blocks_upper` runs 37 times with border m = 42, 4200
+blocks of 2 rows (k = 8400), 20-bit primes (70–71 of them), two row supports
+in 34 groups of at most 256 rows, four ways. Operand exponent spreads are
+421–441 bits (a) and 437–451 bits (b), so `ChunkMatrix` stores 25–26 chunks of
+28 bits per entry although a 256-bit mantissa covers at most 11. Within
+`rns.block_gemm` (1.43 s of the 5.57 s solve), per-way time splits into residue
+conversion 55%, prime products 23% and chunk encoding 21%.
+
+## 2026-10-07 — Entry-compact residue encoding: −17% RSS, serial block Schur +38% (not kept)
+
+Branch `perf-compact` (`23e24ad`), arm `perf1007-compact-rel`:
+`gemm_blocks_upper` stores only the chunks each entry's mantissa covers (10 of
+30 bits at 256 bits instead of 25–26 of 28) plus its first global chunk, and
+multiplies the residues by 2^(width·offset) mod p. The encoded integers are
+unchanged, so points match `perf1007-corr-rel` at 256 bits (one and four
+threads, 1e-8 and 1e-12) and at 512 bits.
+
+| Same session | perf1007-corr-rel | perf1007-compact-rel |
+|---|---|---|
+| peak RSS, csdr3 four threads (two runs) | 238.2/234.7 MiB | 196.6/194.9 MiB (−17%) |
+| peak RSS, one thread | 184.2/184.2 MiB | 171.7/171.7 MiB (−7%) |
+| `rns.block_gemm`, four threads | 1.33–1.36 s | 1.07–1.26 s (−8…−21%) |
+| `rns.block_gemm`, one thread | 2.19/2.31 s | 3.11/3.10 s (+38%) |
+| csdr3 median API, four threads | 5.616 s | 5.455 s (−2.9%) |
+| csdr3-tight median API, four threads | 13.023 s | 13.366 s (+2.6%) |
+| csdr3 at 512 bits, four threads, one run | 12.40 s | 12.55 s |
+
+Unchanged phases moved up to 20% between runs, so the end-to-end medians are
+inconclusive; the phase totals are not. Serially, the added reduce, multiply
+and table lookup per residue cost more than the shallower chunk GEMM saves.
+Why four threads still gain was not isolated (Accelerate's matrix unit is
+shared per core cluster, so GEMM depth may matter more under contention). Not
+kept: the one-thread regression fails the gate and the four-thread gain may not
+carry to x86 nodes. Shifting per (row group, column) instead would touch only
+the 903 outputs per prime, not every residue, if column spreads are narrow.
+
+Column spread check on the same csdr3 profile (branch `diag-block-gemm`
+`438c2fb`, arm `diag-block-spread-fast`, point `e658ecd790a7d3d1` unchanged):
+within a row group, per-column operand spreads are typically 80–190 bits
+(median over calls ≈ 121/141 bits for a/b, p90 ≈ 163–188), but every call
+contains at least one column at ≈ 400 bits. A uniform per-group window is
+therefore useless — one outlier column restores C ≈ 23 of the global 25 — but
+a split at ≈ 220 bits (tight columns C ≈ 17, outliers C ≈ 25, per-column-pair
+shifts applied to the 903 outputs per prime instead of per residue) would cut
+the common-case GEMM depth and buffers without the serial post-pass that sank
+`perf-compact`. That is the next candidate for item 11 if it is reopened.

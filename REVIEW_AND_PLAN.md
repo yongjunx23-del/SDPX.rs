@@ -173,7 +173,7 @@ Shares of the 2026-10-07 release runs of e2470e6 (receipt phases):
 - `medium` Float64, one thread: KKT update 83% of the solve, of which Schur
   assembly 66% (coefficient transform 37%, dot/scatter 24%) and dense
   refactor 12%. Four threads give only 1.43×: the refactor stays 0.25 s and
-  the slowest transform call does not shrink (next work 12).
+  the Schur assembly speeds up 1.67× (next work 12).
 - `ising11` MPFR512, one thread: cone scaling 32% (SVD 28%: bidiagonal QR
   12%, rotation replay 11%), KKT update 33%, KKT solve 16%, refinement
   residuals 14%, RHS recover/prepare scaling 10%/7%. GMP limb multiplication
@@ -232,10 +232,10 @@ regularization and refinement stay unchanged.
 | 7 | Free-multiplier g0 SOCP per-iteration cost (3.15 s/15 it vs MOSEK 1.3 s/13 it) | Batch refinement over the constant/affine RHS (one residual pass for both), fewer full-KKT residual passes, then compare a dual (16-row Schur) form as MOSEK's presolve does. Keep the 46-problem Float64 set and csdr3 unchanged. |
 | 8 | Lessons from other solvers (2026-10-07 survey, below) | Each item needs its own audited A/B; none is adopted yet. |
 | 9 | Centrality (Float64 LP/SOC iteration gap) | Done 2026-10-07 (approved): Gondzio correctors on orthant, SOC and τκ; parity iterations −14.5%, gravity 37 → 22, sched all Solved. csdr3 at matched 1e-12: 103 → 79 iterations at equal time; the 1e-8 gain is an earlier stop. PSD rows have no correction (eigendecomposition per corrector); measure before adding. |
-| 10 | Corrector overhead | Parallel corrections kept 2026-10-07 (bitwise identical; csdr3 and csdr3-tight −2.7%); csdr3 accepts 38/57 and 70/112 corrector solves. Remaining at 1e-12: 1.9 s of corrector solves and 0.38 s of extra step lengths. Next: one same-session csdr3-tight ABBA against ce09de1 (no correctors) decides whether correctors gain at matched accuracy on MPFR SOC. |
-| 11 | csdr3 residue memory | ce09de1: +36–40% peak RSS at four threads (about 18 MiB per extra worker) for −13% time. Shrink the per-way operand and prime groups of `gemm_blocks_upper`, or keep it with the trade-off stated; release ABBA with RSS. |
-| 12 | Medium four-thread scaling | 1.43× from one to four threads; refactor flat at 0.25 s; slowest transform call 24 → 28 ms and dot/scatter 7 → 21 ms despite lane splitting. Profile per lane before changing the schedule. |
-| 13 | Owner-MPI correctors | `OwnedCones`/`OwnedVariables` keep the no-op defaults, so SOC/LP iterates differ from single-process runs. Port only after item 10 shows a matched-accuracy gain; needs a real MPI E2E. |
+| 10 | Corrector overhead | Parallel corrections kept 2026-10-07 (bitwise identical; csdr3 and csdr3-tight −2.7%); csdr3 accepts 38/57 and 70/112 corrector solves. Remaining at 1e-12: 1.9 s of corrector solves and 0.38 s of extra step lengths. Same-session csdr3-tight against ce09de1 (no correctors): −2.1% wall, −1.8% CPU at equal objective error, so correctors now gain slightly at matched accuracy. |
+| 11 | csdr3 residue memory | ce09de1: +36–40% peak RSS at four threads (about 18 MiB per extra worker) for −13% time. Tried: entry-compact chunks (`perf-compact`) gave −17% RSS but +38% serial `rns.block_gemm` (per-residue shift pass) — rejected, see journal 2026-10-07. Measured spreads: per-column ≈80–190 bits with one ≈400-bit outlier column per call, so only a two-tier column split (tight C≈17, outlier C≈25, shifts on the 903 outputs/prime) can shrink buffers without a per-residue post-pass. Reopen only with release ABBA incl. 1-thread and RSS. |
+| 12 | Medium four-thread scaling | 1.43× from one to four threads: refactor flat at 0.25 s, Schur assembly 66 → 39.5 ms per factorization (1.67×). Per-call phase maxima (transform 24 → 28 ms, dot/scatter 7 → 21 ms) include tasks stolen inside joins, so measure per-lane busy time before changing the schedule. |
+| 13 | Owner-MPI correctors | `OwnedCones`/`OwnedVariables` keep the no-op defaults, so SOC/LP iterates differ from single-process runs. The matched-accuracy gain is small (item 10) and no MPI SOC/LP workload is active; port when one is, with a real MPI E2E. |
 
 ## Measurement prerequisites
 
