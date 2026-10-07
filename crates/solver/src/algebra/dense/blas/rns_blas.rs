@@ -356,6 +356,23 @@ fn int_gemm_acc(
     local_gemm(ta, tb, m, n, k, a, lda, b, ldb, c, ldc, true);
 }
 
+/// Residue products go through faer's kernel except with Accelerate (macOS).
+/// Every block task issues its own small GEMMs, and concurrent single-thread
+/// OpenBLAS 0.3.29 calls collapse: a 53³ `dgemm` ran at 27 GF alone but 3.5 GF
+/// per thread with 64 concurrent callers (EPYC 7742), so wide pools and
+/// in-process owners stalled where separate MPI processes did not. Products
+/// are exact integers, so the kernel never changes the bits.
+/// `SDPX_INT_GEMM=blas|faer` overrides the choice.
+#[cfg(feature = "faer-sparse")]
+fn faer_int_gemm() -> bool {
+    static CHOICE: OnceLock<bool> = OnceLock::new();
+    *CHOICE.get_or_init(|| match std::env::var("SDPX_INT_GEMM").as_deref() {
+        Ok("faer") => true,
+        Ok("blas") => false,
+        _ => !cfg!(target_os = "macos"),
+    })
+}
+
 /// Column-major `c = op(a)·op(b)` (or `c +=` when `accumulate`) on the
 /// calling thread with thread-local packing. Every product and partial sum
 /// is an exact integer below 2^53, so the result does not depend on the
@@ -392,6 +409,24 @@ fn local_gemm(
             for col in c.chunks_mut(ldc.max(1)).take(n) {
                 col[..m].fill(0.0);
             }
+        }
+        return;
+    }
+    #[cfg(feature = "faer-sparse")]
+    if faer_int_gemm() {
+        // SAFETY: the asserts above bound every strided access.
+        unsafe {
+            let (ars, acs) = if ta == b'N' { (1, lda) } else { (lda, 1) };
+            let (brs, bcs) = if tb == b'N' { (1, ldb) } else { (ldb, 1) };
+            let a = faer::MatRef::from_raw_parts(a.as_ptr(), m, k, ars as isize, acs as isize);
+            let b = faer::MatRef::from_raw_parts(b.as_ptr(), k, n, brs as isize, bcs as isize);
+            let c = faer::MatMut::from_raw_parts_mut(c.as_mut_ptr(), m, n, 1, ldc as isize);
+            let accum = if accumulate {
+                faer::Accum::Add
+            } else {
+                faer::Accum::Replace
+            };
+            faer::linalg::matmul::matmul(c, accum, a, b, 1.0, faer::Par::Seq);
         }
         return;
     }

@@ -8,6 +8,45 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-08 — residue GEMMs off OpenBLAS: threads scale past 32
+
+Hypothesis: spins 0–50 at 32/64/96 threads was flat (30 it 62/57/60 s;
+SDPB full solve 536/285/370 s scales 32 → 64) because each block phase waits
+for the largest cone. Tried first, SDPB-style makespan ways (spare workers to
+the heaviest blocks, `Σ ceil(cost/M) ≤ W`): 64 threads 57.0 → 59.0 s, 96
+threads 59.8 → 65.1 s, split congruence calls 24 → 5752. Reverted.
+
+Probe of one m = 53/768-bit congruence on an idle EPYC 7742 with a 64-thread
+pool: 7.3 ms at 1 way, 8.7 ms at 2 (Apple M: 1.9 ms). One process with 13
+owners x 4-5 threads took 124-125 s versus 49.3 s for the same layout as 13
+MPI ranks. Both point at shared state in one process. A C benchmark of
+concurrent single-thread `dgemm` calls (OpenBLAS 0.3.29 pthreads, Zen,
+`OPENBLAS_NUM_THREADS=1`): 53³ per-thread 27 GF alone, 8.8 GF at 32 callers,
+3.5 GF at 64 and 1.7 GF at 96; total throughput falls past 32 callers.
+
+Change: per-prime residue products (`local_gemm`) use faer's kernel
+(`Par::Seq`) except with Accelerate on macOS; `SDPX_INT_GEMM=blas|faer`
+overrides. The products are exact integers below 2^53, so the kernel cannot
+change the bits.
+
+Spins 0–50/768 30 it, idle node63, points bitwise identical to OpenBLAS:
+
+| Threads | OpenBLAS | faer |
+|---|---|---|
+| 16 | 97.2 s | 85.8 s |
+| 32 | 62.2 s | 53.5 s |
+| 64 | 59.0 s | 44.2 s |
+| 96 | 59.8 s | 45.5 s |
+
+MPI 13 x 4 (separate processes, no shared BLAS state): 49.5 → 48.4 s, so one
+64-thread process now beats the best one-node MPI layout. ising11/512 is
+unchanged (64 threads 3.67 → 3.63 s). Makespan ways on top of faer: 64
+threads 44.2 → 44.2 s, 96 threads 45.5 → 46.6 s; still not kept. At 64 and
+96 threads the block phases again sit at the largest cone's time; refactor
+(2.8 s), arrow (1.9 s), refinement solves (~3 s) and sync (1.5 s) are next.
+Evidence: `hpc:~/projects/sdpx-ising11-scaling-20261007/runs/ab{7,8}-*`,
+`logs/blas1-*`, `logs/probe5-*`.
+
 ## 2026-10-08 — multi-node layout: match ranks to independent components
 
 Λ19 spins 0–50 has 26 independent owner components (each block's two PSD
