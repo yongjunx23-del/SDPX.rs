@@ -623,24 +623,22 @@ impl<T: FloatT> SampledOperator<T> {
                 let (b0, len) = parts[world.rank()];
                 let block_range = b0..b0 + len;
                 let (row_begin, row_end) = block_row_span(&self.blocks[block_range.clone()]);
-                let gather_ranges: Vec<(usize, usize)> = parts
-                    .iter()
-                    .map(|&(b0, len)| {
-                        if len == 0 {
-                            (0, 0)
-                        } else {
-                            let (begin, end) = block_row_span(&self.blocks[b0..b0 + len]);
-                            (begin, end - begin)
-                        }
-                    })
-                    .collect();
-                let mut local = y[row_begin..row_end].to_vec();
+                let mut local = if gather {
+                    y[row_begin..row_end].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let output = if gather {
+                    &mut local[..]
+                } else {
+                    &mut y[row_begin..row_end]
+                };
                 let timer = crate::receipt::start();
                 pool.unwrap().install(|| {
                     forward_disjoint(
                         &self.blocks[block_range.clone()],
                         &mut work.blocks[block_range],
-                        &mut local,
+                        output,
                         row_begin,
                         x,
                         alpha,
@@ -649,9 +647,18 @@ impl<T: FloatT> SampledOperator<T> {
                 });
                 crate::receipt::finish("sampled.fwd.local", timer);
                 if gather {
+                    let gather_ranges: Vec<(usize, usize)> = parts
+                        .iter()
+                        .map(|&(b0, len)| {
+                            if len == 0 {
+                                (0, 0)
+                            } else {
+                                let (begin, end) = block_row_span(&self.blocks[b0..b0 + len]);
+                                (begin, end - begin)
+                            }
+                        })
+                        .collect();
                     world.gather_slice(crate::mpi::SITE_FORWARD, &local, &gather_ranges, y);
-                } else {
-                    y[row_begin..row_end].copy_from_slice(&local);
                 }
                 return;
             }
@@ -935,7 +942,7 @@ fn adjoint_leaf<T: FloatT>(
     }
     let mut terms = std::mem::take(&mut w.adjoint);
     terms.resize(b.column_count(), T::zero());
-    if w.adjoint_exact(b, x, alpha, &mut terms) {
+    if w.adjoint_exact(b, x, alpha, |i, term| terms[i] = term) {
         w.adjoint = terms;
         return;
     }
@@ -1052,8 +1059,14 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
     }
     /// `dim == 1` adjoint `alpha·w_k·(q_kᵀ·X·q_k)` as one exact quadratic
     /// form per block, rounded once (`XgemmScalar::xsvec_quadratic_exact`).
-    /// Returns `false` when the kernel does not apply; `terms` is untouched.
-    fn adjoint_exact(&mut self, b: &SampledBlock<T>, x: &[T], alpha: T, terms: &mut [T]) -> bool {
+    /// Returns `false` without storing outputs when the kernel does not apply.
+    fn adjoint_exact(
+        &mut self,
+        b: &SampledBlock<T>,
+        x: &[T],
+        alpha: T,
+        mut store: impl FnMut(usize, T),
+    ) -> bool {
         if !exact_adjoint_applies(b) {
             return false;
         }
@@ -1075,7 +1088,7 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
             return false;
         }
         for k in 0..kmax {
-            terms[k] = alpha * b.weights[k] * self.dvec[k];
+            store(k, alpha * b.weights[k] * self.dvec[k]);
         }
         true
     }
@@ -1092,14 +1105,8 @@ impl<T: FloatT> SampledBlockWorkspace<T> {
         if kmax == 0 {
             return;
         }
-        if exact_adjoint_applies(b) {
-            let mut terms = vec![T::zero(); kmax];
-            if self.adjoint_exact(b, x, alpha, &mut terms) {
-                for (k, v) in terms.into_iter().enumerate() {
-                    store(k, v);
-                }
-                return;
-            }
+        if self.adjoint_exact(b, x, alpha, &mut store) {
+            return;
         }
         let inv_sqrt2 = if h > 0 && (h > 1 || b.dim > 1) {
             T::FRAC_1_SQRT_2()
@@ -1467,8 +1474,9 @@ pub struct SampledSchurWorkspace<T> {
     /// Column-compacted basis, kept only when exact duplicate columns were
     /// merged; otherwise the operator's own basis is read (`unique_basis`).
     ub: Option<Vec<T>>,
+    /// Allocated on the first owner update; other MPI ranks only use the Gram.
     v: Matrix<T>,
-    gram: Matrix<T>,
+    gram: Vec<T>,
     pairs: Vec<(usize, usize)>,
     dim: usize,
     side: usize,
@@ -1533,8 +1541,15 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
         };
         Self {
             ub,
-            v: Matrix::zeros((b.side(), rank)),
-            gram: Matrix::zeros((rank, rank)),
+            v: Matrix::zeros((b.side(), 0)),
+            gram: vec![
+                T::zero();
+                if T::precision_bits() > 64 {
+                    triangular_number(rank)
+                } else {
+                    rank * rank
+                }
+            ],
             pairs,
             dim: b.dim,
             side: b.side(),
@@ -1551,22 +1566,29 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
     /// The Gram contribution buffer for the rank-sharded exchange.
     /// Length of the packed upper Gram triangle (the only part ever read).
     pub(crate) fn gram_len(&self) -> usize {
-        let n = self.gram.ncols();
-        n * (n + 1) / 2
+        triangular_number(self.dim * self.count)
     }
     /// Append the upper Gram triangle, column by column.
     pub(crate) fn pack_gram(&self, out: &mut Vec<T>) {
-        let n = self.gram.ncols();
+        if T::precision_bits() > 64 {
+            out.extend_from_slice(&self.gram);
+            return;
+        }
+        let n = self.dim * self.count;
         for j in 0..n {
-            out.extend_from_slice(&self.gram.data()[j * n..j * n + j + 1]);
+            out.extend_from_slice(&self.gram[j * n..j * n + j + 1]);
         }
     }
     /// Republish a gathered upper triangle (`pack_gram` layout).
     pub(crate) fn set_gram(&mut self, data: &[T]) {
-        let n = self.gram.ncols();
+        if T::precision_bits() > 64 {
+            self.gram.copy_from_slice(data);
+            return;
+        }
+        let n = self.dim * self.count;
         let mut p = 0;
         for j in 0..n {
-            self.gram.data_mut()[j * n..j * n + j + 1].copy_from_slice(&data[p..p + j + 1]);
+            self.gram[j * n..j * n + j + 1].copy_from_slice(&data[p..p + j + 1]);
             p += j + 1;
         }
     }
@@ -1615,6 +1637,9 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
         if let Some(pool) = pool {
             self.configure_parallel(pool.current_num_threads());
         }
+        if self.v.ncols() == 0 {
+            self.v.resize((self.side, self.dim * self.count));
+        }
         let ub = self.ub.as_deref().unwrap_or(&b.basis);
         let (h, count) = (b.basis_rows, self.count);
         sampled_basis_product(
@@ -1657,8 +1682,16 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
                 return;
             }
             if self.dim == 1 {
-                self.quadratic
-                    .resize(self.pairs.len().max(self.count), T::zero());
+                // All-distinct columns retain canonical order; only compacted
+                // bases need an intermediate vector and indexed projection.
+                let direct = self.count == self.pairs.len();
+                let values = if direct {
+                    &mut *out
+                } else {
+                    self.quadratic
+                        .resize(self.pairs.len().max(self.count), T::zero());
+                    &mut self.quadratic
+                };
                 if T::xsvec_quadratic_exact(
                     self.side,
                     self.count,
@@ -1667,12 +1700,19 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
                     &self.packed_rhs,
                     T::from_u8(2).unwrap(),
                     None,
-                    &mut self.quadratic,
+                    values,
                     Some(&mut self.adjoint_cache),
                 ) {
-                    for ((dst, &(a, _)), &weight) in out.iter_mut().zip(&self.pairs).zip(&b.weights)
-                    {
-                        *dst = weight * self.quadratic[a];
+                    if direct {
+                        for (dst, &weight) in out.iter_mut().zip(&b.weights) {
+                            *dst = weight * *dst;
+                        }
+                    } else {
+                        for ((dst, &(a, _)), &weight) in
+                            out.iter_mut().zip(&self.pairs).zip(&b.weights)
+                        {
+                            *dst = weight * self.quadratic[a];
+                        }
                     }
                     return;
                 }
@@ -1722,14 +1762,22 @@ impl<T: FloatT> SampledSchurWorkspace<T> {
     pub fn entry(&self, b: &SampledBlock<T>, p: usize, q: usize) -> T {
         let (a, c) = self.pairs[p];
         let (d, e) = self.pairs[q];
-        let k = |i: usize, j: usize| self.gram[(i.min(j), i.max(j))];
+        let k = |i: usize, j: usize| {
+            let col = j.max(i);
+            let offset = if T::precision_bits() > 64 {
+                triangular_number(col)
+            } else {
+                col * self.dim * self.count
+            };
+            self.gram[offset + i.min(j)]
+        };
         let half: T = (0.5).as_T();
         b.weights[p] * b.weights[q] * half * (k(a, d) * k(c, e) + k(a, e) * k(c, d))
     }
 }
 
 fn sampled_gram<T: FloatT>(
-    gram: &mut Matrix<T>,
+    gram: &mut [T],
     v: &Matrix<T>,
     pool: Option<&rayon::ThreadPool>,
     tile: usize,
@@ -1744,13 +1792,24 @@ fn sampled_gram<T: FloatT>(
             v.data(),
             v.nrows().try_into().unwrap(),
             T::zero(),
-            gram.data_mut(),
+            gram,
             v.ncols().try_into().unwrap(),
             pool,
             tile,
         );
     } else {
-        gram.syrk(&v.t(), T::one(), T::zero(), MatrixTriangle::Triu);
+        T::xsyrk(
+            b'U',
+            b'T',
+            v.ncols().try_into().unwrap(),
+            v.nrows().try_into().unwrap(),
+            T::one(),
+            v.data(),
+            v.nrows().try_into().unwrap(),
+            T::zero(),
+            gram,
+            v.ncols().try_into().unwrap(),
+        );
     }
 }
 

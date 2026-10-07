@@ -463,6 +463,7 @@ fn convert<T: Scalar + FromStr>(
             write_element(output, &mut first, &row)?;
         }
     }
+    drop(basis);
     output.write_all(b"],\"c\":[")?;
     let inverse = T::one() / norm[pivot];
     let mut first = true;

@@ -614,13 +614,13 @@ fn pooled_gram<T: FloatT>() {
         pooled.update_with_pool(&b, &rinv, Some(&pool));
         assert_eq!(pooled.plan_threads, width);
         assert_eq!(pooled.v.data(), serial.v.data());
-        assert_eq!(pooled.gram.data(), serial.gram.data());
-        let pointers = (pooled.v.data().as_ptr(), pooled.gram.data().as_ptr());
+        assert_eq!(pooled.gram, serial.gram);
+        let pointers = (pooled.v.data().as_ptr(), pooled.gram.as_ptr());
         let tiles = (pooled.gemm_tile, pooled.syrk_tile);
         pooled.update_with_pool(&b, &rinv, Some(&pool));
         assert_eq!(
             pointers,
-            (pooled.v.data().as_ptr(), pooled.gram.data().as_ptr())
+            (pooled.v.data().as_ptr(), pooled.gram.as_ptr())
         );
         assert_eq!(tiles, (pooled.gemm_tile, pooled.syrk_tile));
         for p in 0..b.column_count() {
@@ -882,7 +882,7 @@ fn duplicate_basis<T: FloatT>() {
     };
     let mut work = SampledSchurWorkspace::new(&b);
     assert_eq!(work.count, 4); // Four exact vectors, including a near duplicate.
-    assert_eq!(work.gram.size(), (8, 8));
+    assert_eq!(work.gram.len(), if T::precision_bits() > 64 { 36 } else { 64 });
     assert_eq!(work.pairs.len(), b.weights.len());
     let mut pooled = SampledSchurWorkspace::new(&b);
     let pool = rayon::ThreadPoolBuilder::new()
@@ -958,9 +958,12 @@ fn structured_v_parity<T: FloatT>() {
         let mut gref = Matrix::zeros((rank, rank));
         gref.syrk(&vref.t(), T::one(), T::zero(), MatrixTriangle::Triu);
         if T::precision_bits() > 64 {
-            assert_eq!(work.gram.data(), gref.data(), "dim={dim}");
+            let packed: Vec<T> = (0..rank)
+                .flat_map(|j| gref.data()[j * rank..j * rank + j + 1].iter().copied())
+                .collect();
+            assert_eq!(work.gram, packed, "dim={dim}");
         } else {
-            for (&a, &b) in work.gram.data().iter().zip(gref.data()) {
+            for (&a, &b) in work.gram.iter().zip(gref.data()) {
                 close(a, b);
             }
         }

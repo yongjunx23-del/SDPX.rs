@@ -245,10 +245,11 @@ where
     /// Singular values and right singular vectors (`Vt`) only; `U` is left
     /// unspecified. Skipping the left vectors removes their rotation
     /// accumulation and reflector reconstruction for callers that can
-    /// recover the left factor algebraically.
+    /// recover the left factor algebraically. The caller lends its workspace.
     pub(crate) fn factor_right<S>(
         &mut self,
         A: &mut DenseStorageMatrix<S, T>,
+        work: &mut Vec<T>,
     ) -> Result<(), DenseFactorizationError>
     where
         S: AsMut<[T]> + AsRef<[T]>,
@@ -260,14 +261,13 @@ where
         let m: i32 = self.U.nrows().try_into().unwrap();
         let n: i32 = self.Vt.ncols().try_into().unwrap();
         let ldvt = min(m, n);
-        let blaswork = self.blas.get_or_insert_with(SVDBlasWorkVectors::default);
         let (a, s, u, vt) = (
             A.data_mut(),
             &mut self.s,
             self.U.data_mut(),
             self.Vt.data_mut(),
         );
-        let (work, info) = (&mut blaswork.work, &mut 0_i32);
+        let info = &mut 0_i32;
         let mut lwork = -1_i32;
         for i in 0..2 {
             T::xgesvd(b'N', b'S', m, n, a, m, s, u, 1, vt, ldvt, work, lwork, info);
@@ -276,6 +276,11 @@ where
             }
             if i == 0 {
                 lwork = work[0].to_i32().unwrap();
+                // The caller lends a dead matrix; avoid geometric growth
+                // retaining another matrix-sized allocation.
+                if lwork as usize > work.len() {
+                    work.reserve_exact(lwork as usize - work.len());
+                }
                 work.resize(lwork as usize, T::zero());
             }
         }

@@ -840,13 +840,15 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     row_psd[rows.clone()].fill(psd as u32);
                     psd_starts.push(rows.start);
                     psd_numels.push(rows.len());
-                    let mut coordinates = Vec::with_capacity(rows.len());
-                    for j in 0..c.n {
-                        for i in 0..=j {
-                            coordinates.push((i, j));
+                    if keep_values {
+                        let mut coordinates = Vec::with_capacity(rows.len());
+                        for j in 0..c.n {
+                            for i in 0..=j {
+                                coordinates.push((i, j));
+                            }
                         }
+                        psd_coordinates.push(coordinates);
                     }
-                    psd_coordinates.push(coordinates);
                     psd_columns.push(Vec::new());
                 }
                 SupportedCone::NonnegativeCone(_) => {

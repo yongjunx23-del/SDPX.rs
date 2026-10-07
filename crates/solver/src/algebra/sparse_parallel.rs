@@ -59,7 +59,6 @@ impl SparseParallel {
         for i in 0..a.m {
             rowptr[i + 1] += rowptr[i];
         }
-        let mut cursor = rowptr[..a.m].to_vec();
         let mut entries = vec![
             Entry {
                 column: 0,
@@ -72,17 +71,20 @@ impl SparseParallel {
         for column in 0..a.n {
             for position in a.colptr[column]..a.colptr[column + 1] {
                 let row = a.rowval[position];
-                entries[cursor[row]] = Entry { column, position };
-                cursor[row] += 1;
+                entries[rowptr[row]] = Entry { column, position };
+                rowptr[row] += 1;
                 if symmetric && row != column {
-                    entries[cursor[column]] = Entry {
+                    entries[rowptr[column]] = Entry {
                         column: row,
                         position,
                     };
-                    cursor[column] += 1;
+                    rowptr[column] += 1;
                 }
             }
         }
+        // Filled cursors are row ends; shift them back into row starts.
+        rowptr.copy_within(..a.m, 1);
+        rowptr[0] = 0;
         Self {
             rowptr,
             entries,

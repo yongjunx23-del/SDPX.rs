@@ -34,6 +34,7 @@ build-input manifest and copies of untracked source files.
 
 - Pinned cases: `medium`, `ising11` and `csdr3`; commands are in AGENTS.md.
 - Ising audit: `benchmark/e2e/audit-env`; set `SDPX_E2E_JULIA` to select Julia.
+  Audit at the point's requested precision with the unchanged 1e-30 gate.
 - Other Float64 inputs: CLI solve, then `benchmark/research/native.py` audit.
 - `csdr3` pins the reconstructed CSDR input and audit. It is not the missing
   historical Julia input. Check one/four-thread parity for SOC changes.

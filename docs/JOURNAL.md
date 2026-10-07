@@ -8,6 +8,1171 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-07 — reuse the Float64 bound Schur destination
+
+Delete `BoundPanels.gram`. Its existing BLAS calls write the lower Gram into
+S, then perform the same shifted-C subtraction and mirror. A scoped slice
+cast follows the existing invariant: BoundPanels is constructed only for
+exact T=f64. Every lower entry is overwritten; mirrored upper writes cannot
+overwrite pending lower reads. Retries reset S, fallback reads C/H/Y, and
+local bounds have no LeafRanks exchange. Remove only the extra Float64 Gram
+term from the storage estimate; common factor accounting stays unchanged.
+
+Small gravity/Float64/one thread, BLAS one, explicit existing qnorm 1e-6:
+fast Solved/19, every non-timing field identical, original 1e-6 audit passes.
+The 35 ms fast baseline/candidate fluctuates +17.97%, requiring one frozen
+selected53 release ABBA. Native medians 0.038038 → 0.038006 s (−0.08%),
+API 0.038301 → 0.038265 s, peak RSS 31.414 → 31.430 MiB (+0.05%).
+Both first runs are slower than repeats; native time is effectively flat.
+Full fields and first-arm audits match; repeats reuse only after binding and
+full-field proof. Process startup spikes do not establish a speed gain.
+
+Keep for `border² × 8` retained bytes: 20,808 bytes at border51, 81,608 at
+border101. No speed, RSS or larger-case claim. The initial wrapper requested
+unsupported precision64 and never solved; preserve its log, then use53.
+Six-width frontend sources and the normal release binary are unchanged.
+Evidence: `work/resumed-091-f64-bound-gram-destination-20261007/`,
+manifest/summary/trial.patch and `release-pair/{manifest,summary,rows,host}.json`.
+
+## 2026-10-07 — stream CRT cofactor construction
+
+Build the same inverse/digit tables from one large-integer cofactor at a
+time, removing the complete quotient vector-of-vectors. Modulus, width,
+chunk count, prime order, table layout and cache keys are unchanged; only
+independent table stores change order. Each quotient drops before the next.
+
+Ising11/MPFR1024/four threads, BLAS one, fast E2E: Solved/52, every
+non-timing field identical, fresh original 1e-30 audit passes. Native
+9.231469 → 9.255533 s (+0.26%), process RSS 94.1 → 93.2 MiB (−0.96%),
+preliminary only. Keep for construction storage: remove
+`8 × (prime_count − 1) × modulus_limbs` live payload bytes plus the outer
+Vec headers. Cached tables and reconstruction storage are unchanged; no
+formal speed or RSS claim. No additional solve after the matching gate.
+Evidence: `work/resumed-091-crt-cofactor-lifetime-20261007/`, manifest/summary,
+trial.patch and baseline/candidate points, receipts and audits.
+
+## 2026-10-07 — release diagonal scaling residues before CRT
+
+Diagonal congruence uses dres only inside its joined row-product workers.
+Move its existing release immediately after that join, before partial sums
+are merged and CRT storage is allocated. All later stages use only the
+product residues; prime order, grants, rounding, failure paths and outputs
+are unchanged. No extra buffers or interfaces.
+
+Gravity/MPFR256/four threads, BLAS one, fast E2E: Solved/25, every
+non-timing field identical, fresh original-coordinate 1e-18 audit passes.
+Native 0.755651 → 0.756863 s (+0.16%), process peak RSS 151.047 → 146.234
+MiB (−3.19%), preliminary only. Keep for removing live overlap of
+`8 × prime_count × rows` bytes with CRT. Eligible buffers remain pooled
+and may be reused; oversized/cap-rejected buffers are freed. Pool capacity
+and admission can change retention, so the formula is not an RSS claim.
+No further solve or suite after the matching gate. Evidence:
+`work/resumed-091-diagonal-residue-lifetime-20261007/`, manifest/summary,
+baseline/candidate receipts, points and audits.
+
+## 2026-10-07 — retain ordinary small-square residue GEMM at 1024 bits
+
+The rejected 512-bit crossover does not establish 1024-bit costs. A fresh
+Ising11/1024 baseline shows 5,764 W products with worker-summed time 3.155 s
+(512: 1.005 s); QR/replay remain unchanged. Extend only private ordinary
+GEMM eligibility to square products of side ≥12 at ≥1024 bits. Keep the
+global structural gate, SYRK, cached congruences and skinny SVD unchanged.
+Use the existing exact residue kernel, preserving each separately rounded
+GEMM and its intermediate values; no new settings or model-name branches.
+
+Fast Ising11/1024/four, BLAS one: Solved/52, all non-timing fields identical,
+fresh original 1e-30 audit passes; native −1.98%, RSS +5.24%, preliminary.
+One frozen selected1024 auxiliary release ABBA on this Mac settles the choice:
+native median 9.836518 → 9.555854 s (−2.85%), API 9.836559 → 9.555895 s;
+process peak RSS 86.375 → 90.422 MiB (+4.69%). Both candidate runs beat both
+baselines; baseline drift is 0.17%. All full fields match. First runs of
+each arm have fresh audits; repeats reuse them only after full-field and
+input/settings/precision/binary/provider/audit identity proof.
+
+Keep for the measured native gain with its memory tradeoff. Ordinary
+six-width frontends and the normal release binary remain unchanged. This
+does not establish a cluster, larger-cone or combined-patch gain; the 512-bit
+trial stays rejected. Evidence:
+`work/resumed-091-ising-small-square-1024-20261007/`, parent manifest/summary,
+`release-pair/{manifest,summary,rows,host}.json` and bound points/audits.
+Baseline release SHA256 87ff96cfc5f71358bfb99ec23e716fde41368d738fd4308d1c42fdb05d27855f;
+candidate 78c6fcafc0cd54fa8d4d55617f35e38e29e8109a63b341019e7e9bb996b592fc.
+
+## 2026-10-07 — audit Ising points at their requested precision
+
+The small Ising11/MPFR1024 baseline is Solved/52, but the audit wrapper
+rejected its precision before checking the point: it allowed only 512/768.
+Remove that allowlist. Julia validates the requested BigFloat precision;
+the declared point precision, input/reference hashes, equations and 1e-30
+tolerance remain unchanged. No solver source or settings change.
+
+A fresh audit of the saved point passes: primal 2.335e-45, dual 4.289e-44,
+gap 1.699e-43, PSD violations zero, reference-objective agreement 4.623e-35.
+Keep this verification repair. Preserve the initial wrapper failure; it was
+not a numerical solver failure. No solver rerun was needed. Evidence:
+`work/resumed-091-ising-small-square-1024-20261007/`,
+`baseline-row-unsupported-audit.json`, `audit-unsupported-precision.log`,
+`baseline-audit-1024/` and the audit hash binding in manifest.json.
+
+## 2026-10-07 — reuse sparse row offsets as fill cursors
+
+Sparse row-plan construction fills through its existing row offsets, then
+shifts completed row ends back to starts. Remove the temporary cursor copy.
+Every ordinary and symmetric insertion uses exactly its old destination;
+CSC scan order, entry maps, final offsets and sentinel are identical,
+including empty rows and m=0. Products, scheduling and MPI exchanges are
+unchanged. The retained row table remains necessary for pooled products.
+
+Gravity/MPFR256/four threads, BLAS one, fast E2E: Solved/25, every
+non-timing field identical to the frozen bound-Gram baseline, fresh
+original-coordinate 1e-18 audit passes. Keep for removing one temporary
+`rows × sizeof(usize)` allocation per constructor: 41,192 bytes here,
+20,464 at Ising11's 2,558 rows, 4,357,224 bytes (4.16 MiB) at 544,653 rows.
+This is setup storage, independent of scalar precision; no formal speed or
+peak-RSS claim. No additional solve or suite after the matching gate.
+Evidence: `work/resumed-091-sparse-row-cursor-20261007/`, manifest.json,
+summary.json and baseline/candidate receipts and audits.
+
+## 2026-10-07 — reject diagonal CRT digit-column splitting
+
+After diagonal-Gram row products join, pass the existing granted split to
+the shared CRT digit GEMMs instead of forcing serial updates. Prime groups,
+serial fractions, integer bounds, storage and final rounding stay unchanged.
+Independent review proves disjoint output columns and unchanged values;
+this differs from the closed prime-streaming and fractional-normalization
+trials. SVD controller review found no separate safe deletion worth testing.
+
+Gravity/MPFR256/four threads, BLAS one, fast E2E: Solved/25, every
+non-timing field identical, fresh original-coordinate 1e-18 audit passes.
+Native 0.756089 → 0.749910 s (−0.82%), process RSS 150.656 → 150.641 MiB,
+preliminary only. No storage is removed, and historical CRT accounts for
+only about 1% of diagonal-Gram time. Reject the weak screen without a release
+campaign; restore only the pinned RNS source and verified baseline fast binary.
+Evidence: `work/resumed-091-bound-crt-columns-20261007/`, manifest.json,
+summary.json and baseline/candidate receipts and audits.
+
+## 2026-10-07 — reuse the MPFR bound Schur destination
+
+Delete `ExactBoundPanels.gram`. Both exact diagonal congruence and its
+rounded-Z dot fallback write every upper Gram entry into the existing S,
+then perform the same shifted-C subtraction and mirror. Lower writes cannot
+overwrite a later upper result. Leaf failures precede assembly; border
+fallback reads C/H/Y, and retries reset S from C. Local bounds have no
+LeafRanks exchange. Update only the MPFR storage estimate.
+
+Correct the hook comment: a failed CRT finish can leave partial writes.
+The existing fallback overwrites every upper entry before subtraction;
+no extra clearing or recovery path is needed.
+
+Gravity/MPFR256/four threads, BLAS one, fast E2E: Solved/25, every
+non-timing field identical to the frozen scan-refactor baseline, fresh
+original-coordinate 1e-18 audit passes. Keep for eliminating
+`border² × sizeof(T)` retained bytes: 124,848 bytes at border51, 489,648
+bytes at border101/256, 816,080 bytes at border101/512. No formal speed
+or peak-RSS claim. Evidence: `work/resumed-091-bound-gram-destination-20261007/`,
+manifest.json, summary.json and baseline/candidate receipts and audits.
+
+## 2026-10-07 — share residue exponent scanning
+
+Dense views and bounded SOC products use one private finite/zero/exponent
+scanner. Keep the full stored-entry scan and row-support classification;
+exponent bounds, Plan construction and arithmetic are unchanged. This removes
+the duplicated classification logic without new settings or interfaces.
+
+Ising11/MPFR512/four threads, BLAS one, fast E2E: Solved/52, every non-timing
+field identical to the frozen raw-row-lifetime baseline, fresh original audit
+passes. Keep as a pure refactor; no speed or RSS claim. Evidence:
+`work/resumed-091-rns-range-scan-20261007/`, manifest.json and summary.json.
+
+## 2026-10-07 — reject ordinary small-square residue GEMM
+
+Ising11 has 22 PSD sides of 12–16. Its four-thread receipt records 5,764
+cone W products / 11,528 scalar small-square GEMMs. Screen ordinary square
+GEMM alone at MPFR≥512 / side≥12; keep the global structural gate, SYRK,
+cached congruence and skinny SVD replay unchanged. This tests the existing
+exact-dot products, preserving each intermediate rounding.
+
+Ising11/MPFR512/four, BLAS one, fast: every non-timing field and original
+audit matches, Solved/52; native +3.65%, RSS +3.05%, preliminary. One frozen
+selected512 auxiliary release ABBA settles the decision: native median
+3.791495 → 3.885028 s (+2.47%), API 3.791540 → 3.885067 s, peak process
+RSS 54.80 → 56.10 MiB (+2.37%). All full fields and fresh audits pass.
+Process-wall spikes are outside native time and do not establish a win.
+
+Reject and restore only the trial dispatch condition plus its verified
+baseline fast binary; no extra solve after restoration. The existing
+24-row/product-area gate stays. Dominant SVD QR/replay remain unaffected by
+ordinary GEMM eligibility. Default six-width dispatch and ordinary release
+are unchanged. Evidence: `work/resumed-091-ising-small-square-20261007/`,
+manifest.json, summary.json, fast-phase-summary.json and release-summary.json.
+
+## 2026-10-07 — retain raw SOC row 0 in Y
+
+Local SOC forward solves never modify their first coupling row. Keep that
+raw row in the existing even Y slots and store only raw row 1 in B. Updates,
+scales, finite checks and fallback materialization read those same values;
+each refactor reloads only Y row 1 before unchanged forward/scaling arithmetic.
+Failures and retries preserve both raw rows. Other leaf layouts are unchanged;
+the local SOC workspace estimate now counts B₁ + Y + Z rather than B + Y + Z.
+
+CSDR3/MPFR256/four threads, BLAS one, fast E2E: Solved/57, every non-timing
+field identical to the frozen row-support baseline, fresh original audit
+passes. Independent source review covers raw updates, failed factors/retries,
+materialization and the exclusion of local structures from LeafRanks/MPI
+ownership. Keep for `leaves × border_columns × sizeof(T)` retained bytes:
+176,400 scalars / 8.08 MiB here (13.46 MiB at MPFR512). No formal speed or
+peak-RSS claim; no additional solve after the matching gate. Evidence:
+`work/resumed-091-soc-raw-row-lifetime-20261007/`, manifest.json, summary.json
+and the frozen `resumed-091-soc-raw-row-lifetime-20261007-fast` arm.
+
+## 2026-10-07 — compact common row supports in exact SOC products
+
+During the existing full finite/exponent scan, collect each local row's union
+of nonzero columns across both operands and every block. Equal supports share
+one compact product; all-full supports retain the original tall geometry.
+Scatter compact residues into the existing full packed total before the sole
+CRT finish. Global exponent bounds, total k, Plan, rounded Z, shifted-border
+subtraction and convergence rules are unchanged. Metadata is call-local;
+there are no model-name branches, retained masks or new settings.
+
+CSDR3/MPFR256 one/four-thread fast gates preserve every non-timing field and
+pass fresh unchanged audits, Solved/57. Frozen selected256 auxiliary release
+ABBA on one Mac, BLAS one, against the direct-chunk baseline:
+
+| Solver threads | Native median, old → new | Change | Process peak RSS, old → new |
+|---|---|---|---|
+| 1 | 17.756265 → 17.296635 s | −2.59% | 185.55 → 186.20 MiB (+0.35%) |
+| 4 | 7.238451 → 6.773600 s | −6.42% | 238.25 → 238.90 MiB (+0.27%) |
+
+API medians are 17.756461 → 17.296831 s and 7.238684 → 6.773843 s.
+Local-Schur wall time changes 3.843589 → 3.619179 s and 2.589257 →
+2.179068 s. Every full field/settings/point matches; all original audits
+pass. Keep for measured native gains at both thread budgets; no memory
+improvement or full Ising/Lambda claim. Ordinary release and default
+six-width dispatch stay unchanged. Evidence:
+`work/resumed-091-soc-row-support-20261007/`, manifest.json, gate-summary.json,
+release-summary.json and the frozen `resumed-091-soc-row-support-20261007-fast`
+arm. PBS223611 completed the matched MPFR512/four-thread comparison on eight
+allocated cores / 16 GiB / 30 minutes, exit 0. Retrieved source/packet/input/
+settings/provider/point/receipt hashes match; every full field and original
+audit passes. Native median 34.842713 → 33.362542 s (−4.25%), API
+34.843335 → 33.363223 s, peak process RSS 305.19 → 303.40 MiB (−0.59%,
+no meaningful memory gain). Local Schur 11.579417 → 10.138227 s. This
+frozen pair predates the raw-row lifetime change. Evidence:
+`cluster512/retrieved/` and `cluster512/retrieval-verification.json`.
+A binary-name mismatch was repaired before submission; the original
+preparation is preserved under `cluster512/prepared-before-bin-name-repair/`.
+
+## 2026-10-07 — encode SOC chunks directly from leaf operands
+
+Remove the two gathered MPFR panels per row worker. A shared inline encoder
+now fills zeroed chunks directly from the existing leaf slices; dense callers
+retain their stored-entry check. Chunk widths, exponent bounds, residue sums,
+CRT, rounded Z and worker scheduling are unchanged.
+
+CSDR3/MPFR256 at one/four threads and Ising11/MPFR512 at four threads, BLAS
+one, preserve every non-timing field and pass fresh unchanged audits. Statuses
+remain Solved/57 and Solved/52. Keep for the allocation reduction:
+`2 × min(256, k) × m × sizeof(T) × actual_workers` staging bytes, 3.94 MiB
+for the checked 42-column/four-worker SOC shape. This does not remove pooled
+chunk retention. Quick timings are preliminary; no speed or peak-RSS claim.
+Evidence: `work/resumed-091-soc-direct-chunks-20261007/`, manifest.json,
+gate-summary.json and the frozen `resumed-091-soc-direct-chunks-20261007-fast`
+arm.
+
+Input inspection closes whole-leaf support grouping for CSDR3: 4,176/4,200
+leaves use all 42 border columns; removing every absent leaf-column pair
+saves only 0.0573% of selected products. Row-specific support is different:
+the first coupling row shares 29 columns, while the second reaches all 42.
+Investigate compact row groups from actual supports; these counts establish
+scope, not a performance gain.
+
+## 2026-10-07 — bounded exact SOC Schur products
+
+Local SOC assembly previously evaluated each lower YᵀZ entry as one exact
+dot across every leaf. Eligible MPFR shapes now encode groups of at most
+256 coupling rows, sum reduced residues across groups/workers, and reconstruct
+one exact total through shared CRT. Upper ZᵀY selects the original lower
+products; scalar-rounded Z, the single shifted-border subtraction, mirroring
+and numerical decline path are unchanged. No full tall MPFR/residue panels,
+new setting, precision lowering or convergence change.
+
+CSDR3/MPFR256 Mac fast one/four-thread gates preserve every non-timing field
+and pass the unchanged original-coordinate audit, Solved/57. All 58
+factorizations exercise the kernel. Initial pooled Scratch borrowed large
+chunk capacities into tiny/unused roles; keep residue/product/partial buffers
+private instead. Four-thread fast RSS falls from 365.3 to 247.3 MiB, still
+above the 170.9 MiB baseline. This repair changes allocation only.
+
+Frozen selected256 auxiliary CLI, release ABBA on one Mac, BLAS one:
+
+| Solver threads | Native median, old → new | Change | Process peak RSS, old → new |
+|---|---|---|---|
+| 1 | 21.956141 → 17.351146 s | −20.97% | 167.40 → 186.55 MiB (+11.44%) |
+| 4 | 7.299730 → 7.168875 s | −1.79% | 168.35 → 241.50 MiB (+43.45%) |
+
+API medians are 21.956353 → 17.351346 s and 7.299982 → 7.169100 s.
+Single-thread local-Schur wall time falls 52.24%, from 7.829167 to 3.738849 s.
+Every full numerical field/settings/point equals the frozen baseline at its
+thread budget; all original audits pass. Keep for the repeatable serial speed
+gain. Four-thread speed is below the acceptance threshold and parallel RSS
+increases; neither is presented as an improvement. No full Ising/Lambda claim.
+
+A second layout shares one operand group and residue total across workers,
+using the existing prime-product helper. Release four-thread ABBA against
+the private layout: native 7.188557 → 7.976358 s (+10.96%), RSS 244.55 →
+183.95 MiB (−24.78%), local Schur +24.98%. All fields and audits still match.
+Reject this layout for solver speed: serial residue encoding becomes a
+bottleneck. Restore the verified private kernel and its frozen fast binary;
+no extra solve after restoration. Its lower memory use is recorded, not hidden.
+
+Evidence: `work/resumed-091-soc-block-gemm-20261007/`, manifest.json,
+release-summary.json, shared-release-summary.json and per-run audit files.
+Default six-width frontends are unchanged; selected dispatch is confined to
+frozen auxiliary timing copies. The ordinary release binary is untouched.
+The kept fast arm is `resumed-091-soc-block-private-20261007-fast`.
+
+PBS223610 is the bounded higher-precision follow-up: frozen private-layout
+pair, CSDR3/MPFR512/four threads, BLAS one, node192, eight allocated cores,
+16 GiB and 30 minutes. Builds and ABBA run serially on that host; original
+CSDR audit remains unchanged at 256 bits/1e-8. Job completed, exit 0;
+retrieved packet/source/input/settings/provider/point/receipt hashes match,
+all full fields match and original audits pass. Native median 34.079259 →
+34.412946 s (+0.98%), API 34.079886 → 34.413543 s, peak process RSS
+255.06 → 313.24 MiB (+22.81%). Local Schur 10.539518 → 11.123857 s.
+No verified parallel gain at 512 bits; keep this tradeoff explicit. This
+frozen comparison predates direct chunk encoding. It is separate from
+Lambda27's accuracy pilot, which still awaits approval. Evidence:
+`cluster512/retrieved/` and `cluster512/retrieval-verification.json`.
+
+## 2026-10-07 — release PMP basis before constraint coefficients
+
+Drop parsed/generated basis coefficients immediately after both parity arrays
+are written. Their last use precedes normalized cp/adjusted coefficient work
+for c/B; nothing later borrows them. One explicit drop removes this overlap
+without changing arithmetic, sampling, formatting or output order.
+Logical scalar storage released is `sum(n_p*(n_p+1)/2) × sizeof(T)`:
+16,512 MPFR1024 cells (2.27 MiB), plus row headers, at 256 samples per worker.
+Peak RSS still depends on the dominant phase and allocator retention.
+
+Build only sdpx-pmp, fast profile, offline/locked. The existing generated-
+basis fixture at MPFR128/one thread produces five byte-identical files.
+Its historical saved solver point differs by up to 3.41e-18, so compare
+reference and candidate inputs through the same current frozen solver:
+all non-timing fields match, Solved/20, with a fresh unchanged original-
+coordinate/mapping/analytical-optimum 1e-15 audit. Record the historical
+comparison rather than treating it as the current solver baseline.
+
+Keep for the logical memory benefit; no speed or peak-RSS claim, broad
+tests or large run. Evidence: `work/resumed-091-pmp-basis-lifetime-20261007/`,
+manifest.json, summary.json, historical-point-comparison.json and audit.json.
+The solver arm is `resumed-091-sampled-quadratic-direct-20261007-fast`.
+
+## 2026-10-07 — reject removal of overwritten sampled/PSD initialization
+
+Delete two dvec clears before exact quadratic output and update_scaling's
+full G clear before upper SYRK(beta0). The output overwrites every dvec
+entry; G's lower triangle stays +0 from construction/identity setup. MPI
+unpack initialization is unchanged. Fast Ising11/MPFR512/one thread, BLAS
+one, preserves every non-timing field and passes the original-coordinate
+audit at Solved/52. Its slower quick timing warrants one release ABBA.
+
+Frozen release pair differs only in those three clears. Native median
+12.211160 → 12.311106 s (+0.82%), API 12.211200 → 12.311146 s,
+peak RSS 48.461 → 48.430 MiB (−0.06%). All full outputs match and a fresh
+unchanged audit passes. First candidate build reused the baseline artifact;
+binary identity caught this before any timing. Touch and rebuild repaired it;
+both actual binaries/source maps are recorded. Ordinary release is untouched.
+
+Reject: no qualifying speed gain or retained-storage benefit. Restore only
+the two frozen trial files and their already audited fast binary; no extra
+solve. Evidence: `work/resumed-091-overwritten-clears-20261007/`,
+manifest.json, release-manifest.json and release-summary.json.
+
+## 2026-10-07 — omit scalar inverse-adjoint quadratic staging
+
+For eligible dim1 sampled blocks with distinct basis columns, canonical pairs
+are `(k,k)` in output order. Write exact quadratics directly into the existing
+adjoint output, then apply the same weights. Compacted duplicate bases keep
+their existing intermediate vector and indexed projection. Declined kernels
+still reach the existing fallback, which overwrites every output entry.
+
+Mac fast sampled24/MPFR512, one thread / BLAS one: Solved/17, every non-timing
+field equals the frozen retained bilinear baseline, and a fresh original-
+factor 1e-30 audit passes. Candidate native 0.367 s is only a quick gate;
+no speed or RSS claim. Keep for eliminating `count × sizeof(T)` retained
+bytes and the copy: 1,920 bytes here, 7,040 bytes at rank88/MPFR512.
+No threading, settings or numerical contract change; no broad tests.
+
+Evidence: `work/resumed-091-sampled-quadratic-direct-20261007/`, manifest.json,
+summary.json and candidate-audit.json; arm
+`resumed-091-sampled-quadratic-direct-20261007-fast`.
+
+## 2026-10-07 — share sampled bilinear CRT and remove duplicate streaming
+
+Move the final per-way streamed kernel, symmetric_bilinear, onto the retained
+shared streaming/prime-product helpers. Keep symmetric M construction, integer
+GEMM, each pair's summation/reduction order and final rounding. Product tasks
+own one combined M/T buffer and join before CRT updates. Preserve accepted
+empty pairs after the existing decline checks/cache setup. Delete now-unused
+stream_primes, accumulator merge, its prime grain and Scratch.u; net −64 lines.
+No new pool propagation or setting; condensed scaling already grants ways.
+
+Existing small dim2 matrix-PMP, four cones of sides18/16, MPFR768, one/eight
+threads / BLAS one: Solved/58, complete non-timing parity and fresh original-
+coordinate 1e-30 residual/PSD/mapping/reference audits pass. Eight workers
+exercise 146 shared bilinear calls in the fast gate. Baseline fast timing
+overlaps compilation and is excluded from performance evidence.
+
+Frozen Mac release ABBA/eight threads: native 1.646223 → 1.669048 s (+1.39%),
+API 1.646264 → 1.669090 s, peak RSS 42.805 → 38.883 MiB (−9.16%).
+Both candidate runs exercise pooled bilinear work (157/159 calls), preserve
+every non-timing field and match the freshly audited baseline. Startup skews
+process timing; no process-speed claim. Keep the memory benefit and simpler
+implementation with its native time tradeoff. No aggregate Ising/Lambda claim.
+
+Evidence: `work/resumed-091-rns-shared-bilinear-20261007/`,
+manifest.json, summary.json and release-summary.json. Release sources differ
+only in rns_blas; matching MPFR768-only auxiliary CLIs leave ordinary release
+untouched. No broad suite or large solver run.
+
+## 2026-10-07 — share sampled quadratic CRT and operand staging
+
+Move svec_quadratic to the retained shared streaming/prime-product helpers.
+One accumulator and group operand/product staging replace per-prime-way
+copies. Each task combines its existing M/T scratch into one buffer; lower
+M starts zero, upper M and T are overwritten per prime. Product tasks join
+before CRT updates. Eligibility, caches, signs, exact products and final
+rounding stay unchanged; no sampled RHS pool propagation or new setting.
+
+Use two independent exact copies of the dense sampled24 fixture: one block
+cannot exercise the pooled production adjoint. Mac fast MPFR512 at one/four
+threads, BLAS one: Solved/17, complete non-timing parity and fresh original-
+factor 1e-30 audits pass. Four threads record 122 shared quadratic calls.
+Frozen release sources differ only in rns_blas, with matching MPFR512-only
+auxiliary CLIs; ordinary release is untouched. Sequential release ABBA:
+native 0.323870 → 0.319037 s (−1.49%), API 0.323901 → 0.319075 s,
+peak RSS 31.070 → 30.656 MiB (−1.33%). All outputs match the freshly audited
+baseline. Startup skews process timing, so no process-speed claim.
+
+Keep for the measured/logical memory benefit; no qualifying speed gain,
+aggregate RSS estimate, full Ising or Lambda27 claim. Logical CRT saving
+is `8 × (old_ways−1) × outputs × (digits+1)` bytes plus duplicated group
+operand/product staging; task scratch and pooled capacities remain.
+Evidence: `work/resumed-091-rns-shared-quadratic-20261007/`,
+manifest.json, summary.json and release-summary.json. No broad suite or
+new large solve was needed.
+
+## 2026-10-07 — pool Float64 bound-leaf solves
+
+Split independent flat forward/backward leaf sweeps into 1024-leaf ranges
+on the existing pool. No staging, new setting or altered arithmetic sequence;
+joins precede the intervening panel products. Small Mac Float64 gravity:
+Solved/19, complete non-timing parity and fresh original-coordinate audit pass.
+
+Larger gravity runs only on the cluster, frozen release sources differing
+in local_bounds.rs, Float64-only auxiliary CLI, eight allocated cores / 16 GiB,
+actual one/four solver threads and BLAS one. PBS223608 ABBA at four threads:
+native 2.027621 → 1.908415 s (−5.88%). Baseline spread warrants one reverse-order
+repeat; PBS223609 BAAB: native 2.115045 → 2.042846 s (−3.41%),
+API 2.118257 → 2.046348 s, process 2.450422 → 2.374544 s.
+Both runs preserve every non-timing field at each thread budget and pass
+the unchanged original-coordinate audit. One/four threads solve in 35/36
+iterations respectively. Single-thread native +1.91%/+0.99%; RSS changes
+vary in sign, so no memory claim. Keep the repeatable pooled speed gain.
+
+Evidence: `work/resumed-091-bound-leaf-pool-20261007/`, local-summary.json,
+retrieved/summary.json and retrieved-repeat1/summary.json. Both PBS jobs
+exit 0; the ordinary release binary is untouched. This comparison does
+not change the historical MOSEK ratio or establish an MPFR speed gain.
+
+## 2026-10-07 — reject sampled RHS pool propagation
+
+Pass the existing recovery pool into sampled inverse-forward GEMM, then
+also into scalar-block inverse-adjoint quadratics. No new workspace owner
+or setting. Order88/MPFR512 at one/four threads, BLAS one: Solved/18,
+complete non-timing parity and original-coordinate 1e-30 audit pass.
+Pooled GEMM calls rise from 54 to 111 at four threads. Frozen release
+baseline is reused only after every source and binary hash matches.
+
+Mac release ABBA, forward alone: native 4.356570 → 4.327460 s (−0.67%),
+peak RSS +3.16%. Both paths: native 4.353484 → 4.272547 s (−1.86%),
+API 4.353517 → 4.272587 s; peak RSS 185.48 → 204.71 MiB (+10.37%).
+The quadratic path still owns per-prime-way scratch/CRT. Reject both:
+neither reaches the 2% speed gate, and memory increases. Startup skews
+process timings; no process-speed claim or repeat. Restore only these
+three trial files and the kept fast binary exactly. Float64 ignores the
+forward pool and declines the quadratic kernel; its arithmetic is unchanged.
+Evidence: `work/resumed-091-sampled-rhs-pool-20261007/` and
+`work/resumed-091-sampled-rhs-pools-20261007/`, each with
+`{manifest,summary,release-summary}.json`.
+
+## 2026-10-07 — reject parallel shared-CRT normalization
+
+Normalize reduced residues in parallel at disjoint original output positions,
+preserving each fraction's prime order. Join before serial mapped compaction;
+reuse existing buffers and the 256-output grain. Serial code is unchanged.
+Order88/MPFR512 at one/four threads, BLAS one: Solved/18, complete non-timing
+parity and original-coordinate 1e-30 audit pass. Four threads exercise 1,234
+parallel groups. Independent review found no correctness defect.
+
+Mac release ABBA: native 4.349905 → 4.375272 s (+0.58%),
+API 4.349938 → 4.375306 s; peak RSS +1.08%. Startup skews process timings,
+so no process-speed claim. Reject: no 2% speed gain or memory benefit.
+Restore only the trial source and fast binary exactly; shared GEMM/congruence
+CRT remains, with serial fraction conversion. No repeat or broad suite.
+Evidence: `work/resumed-091-rns-parallel-normalize-20261007/`
+`{manifest,summary,release-summary}.json`.
+
+## 2026-10-07 — reject skinny RNS SVD projections
+
+Batch independent left Householder projection dots through exact residue
+GEMM, using the unused half of the existing `2*m` scratch. Keep tau
+multiplication and scalar updates unchanged; unsupported plans use scalar
+dots. Order88/MPFR512 at one/four threads, BLAS one: Solved/18, complete
+non-timing output parity and original-coordinate 1e-30 audit pass. Each
+candidate solve records 1,152 successful batches.
+
+Fast-profile screen: native 9.187746 → 9.368256 s (+1.96%) at one thread,
+4.300859 → 4.550981 s (+5.82%) at four. Bidiagonalization falls
+1.305777 → 1.046426 s serially but rises 0.287750 → 0.545225 s pooled.
+Reject and restore the kept source and fast binary exactly. These are
+preliminary timings, not a release performance claim; no extra timing
+campaign. Review establishes exact-dot equivalence through MPFR2048 only.
+Evidence: `work/resumed-091-svd-rns-left-20261007/{manifest,summary}.json`.
+
+## 2026-10-07 — share pooled congruence CRT and prime partitions
+
+Reuse GEMM's single-accumulator streaming and disjoint prime-product
+partitions for general congruence. Keep full square products, plans, caches,
+group caps and dense destination maps. Prime products join before mapped
+compaction and fractional updates, which remain serial; CRT digit columns
+then update independently. Other residue kernels retain their partitions.
+Logical CRT saving: `8 × (old_ways−1) × outputs × (digits+1)` bytes, with
+`outputs=tri(order)` for upper requests; group scratch is shared too.
+
+Fast sampled24/512 at one/two threads, BLAS one: Solved/17, every non-timing
+field matches its frozen reference and fresh original-coordinate 1e-30
+audits pass; shared-congruence receipt calls are 0/180. Code review passed.
+Mac release ABBA: order24/two threads native 0.288345 → 0.302639 s (+4.96%),
+RSS −10.85%. Order88/four threads native 4.368233 → 4.340212 s (−0.64%),
+API 4.368244 → 4.340224 s, process 4.388415 → 4.359751 s, peak RSS
+249.91 → 187.87 MiB (−24.83%). All Solved/17 or /18 outputs match audited
+baselines; order88 records 190 shared-congruence calls per candidate solve.
+
+Keep for memory with the small-case time penalty visible; no ≥2% speed gain
+or full Lambda27 claim. Frozen sources differ only in rns_blas, with matching
+auxiliary MPFR512 CLIs; ordinary release remains unchanged. GEMM's receipt
+phase now includes returning shared scratch to the pool. Subsequent serial
+cleanup only removes delegation to the same single-accumulator loop; its
+one-thread parity and fresh audit pass, with no separate timing claim.
+No broad suite or large solve. Evidence:
+`work/resumed-091-rns-shared-congruence-20261007/{summary,release-summary}.json`,
+`order88/release-summary.json` and `clean-summary.json` under that packet.
+
+## 2026-10-07 — reject packed upper congruence residue staging
+
+Reuse the existing upper prime-product tiles for congruence's second
+multiply, stage packed residues, and apply the dense destination map only
+at CRT finish. Plans, first products, prime-way scheduling, exact integer
+bounds and final MPFR rounding stay unchanged. Active scratch at a full
+16-prime group saves 30 KiB per way at order24 and 456.5 KiB at order88;
+this does not guarantee lower retained Vec capacities or peak RSS.
+
+Fast sampled24/512/one thread passes Solved/17, exact numerical parity and
+a fresh original-coordinate 1e-30 audit (248 branch calls). The code review
+supports rectangular/padded indexing; this solve uses square compact data.
+Mac release ABBA, BLAS one: order24/one thread native −0.90%, RSS −0.62%;
+order88/four threads native 4.403685 → 4.367399 s (−0.82%), RSS +6.27%.
+All Solved/17 or /18 outputs match their audited baselines; order88 covers
+multiple column tiles and 262 candidate branch calls per solve.
+
+Reject and restore only this trial: neither comparison reaches the 2% speed
+gate, and the larger case has no measured memory benefit. No repeat or extra
+suite. The retained shared-GEMM CRT source is restored exactly; full square
+congruence residue staging stays. Evidence:
+`work/resumed-091-rns-congruence-upper-20261007/{summary,release-summary}.json`
+and `order88/release-summary.json` under that packet.
+
+## 2026-10-07 — share the pooled GEMM CRT accumulator
+
+Parallel prime ways duplicated the full CRT digit/frac vectors. Stream
+ascending prime groups through one accumulator instead: prime products
+write disjoint buffers, then independent digit columns update Y in parallel.
+Fractional residues keep their serial order and the existing reconstruction
+margin. Keep plans, caches, group caps, serial GEMM, other residue kernels,
+arrow admission, requested precision and final rounding unchanged.
+Logical live CRT saving: `8 × (old_ways−1) × outputs × (digits+1)` bytes.
+
+Fast sampled order24/512, one/two threads / BLAS one: Solved/17, identical
+numerical fields and fresh original-coordinate 1e-30 audits; the two-thread
+receipt records 51 shared-CRT calls. An independent code review passed.
+Mac release ABBA at two threads: native +0.86%, RSS +1.07%; no speed/memory
+claim at this size. A single order88 cone from the same deterministic input
+generator tests the larger cone size without running full Lambda27 locally.
+At four threads / BLAS one: native 4.397719 → 4.387814 s (−0.23%), API
+4.397732 → 4.387826 s, process 4.418191 → 4.408771 s, peak RSS
+261.88 → 252.81 MiB (−3.46%). All four Solved/18 outputs match, with the
+unchanged 1e-30 factor audit and 54 candidate branch calls per solve.
+
+Keep for measured memory savings; neither case establishes a ≥2% speed
+gain or full Lambda27 improvement. Frozen sources differ only in rns_blas;
+matching auxiliary MPFR512 release CLIs leave the ordinary release binary
+unchanged. No extra suite or large solve. Evidence:
+`work/resumed-091-rns-shared-crt-20261007/{summary,release-summary}.json`
+and `order88/release-summary.json` under that packet.
+
+## 2026-10-07 — omit owned MPI sampled forward staging
+
+Ordered MPI forward products without a sampled gather write directly into
+the existing owned y rows. Gathered calls retain their separate source
+vector and construct gather metadata only when used. The same disjoint
+kernel receives the same beta-initialized values, row offset and alpha;
+mixed-row gaps, empty owners and contribution order stay unchanged.
+
+One actual two-rank/two-thread fast Ising11/512 solve, BLAS one: Solved/52,
+every non-timing field matches, 2,921 gathers and a fresh original-coordinate
+1e-30 audit pass. Keep the removed transient row-span vector and two copies
+per no-gather forward call: 1,258/1,280 rows, 100,640/102,400 scalar bytes
+per rank on Ising11. No measured RSS or speed claim; no extra suite.
+Evidence: `work/resumed-091-mpi-owned-forward-20261007/summary.json`.
+
+## 2026-10-07 — omit the global MPI fused sampled RHS matrix
+
+`mat3c` starts empty in PSD setup; only fused sampled condensation, recovery
+and RHS snapshots use it. Move its allocation under the existing fused
+guard. Global MPI retains none; serial and owner-local distributed paths
+allocate the same matrix. Other scaling matrices remain: Gram-update and
+scaling ownership use different partitions, so V ownership cannot decide
+their storage. No scaling exchange, factor, residual or recovery changes.
+
+One actual two-rank/two-thread fast Ising11/512 solve, BLAS one: Solved/52,
+every non-timing field matches, 2,921 gathers and a fresh original-coordinate
+1e-30 audit pass. Keep the clear storage reduction: 4,754 scalars, 380,320
+bytes (0.36270 MiB) per MPI rank on Ising11. Logical storage, not measured
+RSS or speed; no large solve or additional suite. Evidence:
+`work/resumed-091-mpi-unused-sampled-half-20261007/summary.json`.
+
+## 2026-10-07 — remove CRT identity index arrays
+
+Use the existing empty selected slice for contiguous CRT source/destination
+indices and derive the output count from the fractional accumulator.
+Remove identity vectors in packed/full GEMM, diagonal/full congruence and
+quadratic/bilinear products. Dense upper triangles retain their required
+maps; packed accumulation installs final dense destinations afterward.
+Result counts use matrix/pair dimensions, so oversized outputs stay intact.
+No new representation field, trait, setting, arithmetic or worker partition.
+
+One fast 24-row sampled MPFR512 solve, one thread / BLAS one: Solved/17,
+every non-timing field matches and the independent original-coordinate
+1e-30 factor audit passes. Keep the unused transient allocation removal:
+eight bytes per result on this 64-bit host (2,400 bytes at packed order24,
+4,608 at full order24, 192 for 24 quadratics, 1.05 MiB at packed order524).
+No retained-capacity, RSS or speed claim; no additional suite or MPI run
+for this indexing change. Evidence:
+`work/resumed-091-rns-identity-indices-20261007/summary.json`.
+
+## 2026-10-07 — reject in-place SVD column reflectors
+
+Construct each left Householder in its packed matrix column, reuse one
+trailing-column update closure, and omit the two copy passes. Reflector
+arithmetic, column scheduling, QR and reconstruction stay unchanged.
+Fast Ising11/512 at one/four threads preserves every point/settings/
+numerical field and passes the original-coordinate 1e-30 audit.
+
+One Mac release ABBA, four threads / BLAS one, auxiliary MPFR512 CLIs:
+native 8.646200 → 8.634682 s (−0.13%), API −0.13%, RSS +0.32%.
+All four Solved/52 points match the audited reference. Reduced copy traffic
+is not retained-memory saving; cold executable startup changes process time.
+Reject and revert only this trial: below the 2% gate, no clear storage
+benefit. No repeat or additional gates. Frozen sources differ in one file;
+normal six-width release remains unchanged. Evidence:
+`work/resumed-091-svd-inplace-column-20261007/release-summary.json`.
+
+## 2026-10-07 — allocate sampled owner buffers on use
+
+Global MPI non-owners never read sampled V, and its RHS path never reads
+fused adjoints. Start V as a conformable `side × 0` matrix, resize on its
+first owner update, and resize adjoints on their first fused RHS use.
+Keep gathered Gram storage on every rank. Serial and owner-local solves
+allocate the same buffers when needed; no arithmetic or scheduling changes.
+
+Fast Ising11/512, one serial thread and actual two ranks/two threads per
+rank: both Solved/52, every non-timing field matches the frozen reference,
+and fresh original-coordinate 1e-30 audits pass. MPI preserves 2,921 gathers.
+Keep the clear unused-storage removal: V saves 0.36659/0.35805 MiB on the
+two ranks, plus 0.04913 MiB of adjoints on each. These are logical scalar
+storage figures, not measured RSS or speed gains; serial full solves still
+need both buffers. No extra suite or large solve. Evidence:
+`work/resumed-091-sampled-owner-storage-20261007/summary.json`.
+
+## 2026-10-07 — correct the SVD rotation-log lifecycle description
+
+The earlier rotation-record entry incorrectly calls the logs transient.
+`with_scratch<RotationLog<N>>` returns its box to the per-thread/type cache;
+`clear()` preserves U/V vector capacities. Success and ordinary errors
+retain them; reentrant calls can retain additional boxes. The kept record
+change therefore saves `8 × (capacity_u + capacity_v)` bytes per cached log
+on the current 64-bit layout. No aggregate capacity or RSS was measured.
+This documentation correction requires no build or solve.
+
+## 2026-10-07 — omit the unused packed RNS destination map
+
+Packed upper GEMM previously built dense destination indices, used only their
+length, then built contiguous residue indices. Use one contiguous table for
+both stages. Dense full/upper/rectangular output retains its original mapping;
+prime products, CRT reconstruction, rounding and scheduling are unchanged.
+
+One fast 24-row sampled MPFR512 solve, one thread / BLAS one: Solved/17,
+all non-timing fields match the frozen packed-Gram result, independent
+original-coordinate 1e-30 factor audit passes. Keep the removed allocation:
+`8 × n × (n+1)/2` bytes per packed product on this 64-bit host (2,400 bytes
+at order24, 66,048 at128, 1.05 MiB at524). No speed or RSS claim, no further
+verification. Evidence: `work/resumed-091-rns-packed-indices-20261007/summary.json`.
+
+## 2026-10-07 — reject contiguous GEMM scalar fallback trial
+
+Use existing exact slice dots only when both scalar GEMM operands are
+contiguous; preserve strided/RNS routes and empty-input behavior. Fast
+Ising11/512 at one thread is Solved/52, every non-timing field matches,
+and the independent original-coordinate 1e-30 audit passes.
+
+Release Ising11/512, four threads / BLAS one, auxiliary MPFR512 CLIs:
+ABBA native 4.815871 → 4.585803 s (−4.78%), but baseline times drift
+4.373 → 5.258 s. One reversed BAAB using identical frozen binaries/settings
+and identity-bound audits gives 5.025434 → 5.736199 s (+14.14%). All eight
+points/settings/numerical fields match. These timings do not establish a
+repeatable benefit; do not combine them into a speed claim. Reject and
+revert the GEMM-only delta, preserving packed SYRK/Gram changes. No further
+timing or gates; no clear storage benefit warrants the extra branch.
+Evidence: `work/resumed-091-gemm-slice-dot-20261007/{release,reverse}-summary.json`.
+
+## 2026-10-07 — retain packed sampled MPFR Grams
+
+Sampled MPFR workspaces retain only the authoritative upper Gram triangle.
+Extend the existing SYRK kernel's output layout, reuse its triangular cuts
+and explicit/ambient pool scheduling, and use existing exact slice dots for
+contiguous operands. Float64 retains its dense storage and BLAS arguments.
+MPI exchanges the same packed wire columns directly from/to retained storage.
+No extra kernel, trait method or setting.
+
+Fast Ising11/512 at one/four threads is Solved/52; the 24-row residue case
+is Solved/17. Full points/settings/numerical fields match and independent
+original-coordinate 1e-30 audits pass. Actual two-rank/two-thread Ising also
+preserves every non-timing field across 2,921 gathers and passes a fresh audit.
+
+One Mac release ABBA, four threads / BLAS one, auxiliary MPFR512 CLIs:
+native 4.563191 → 4.606104 s (+0.94%), API +0.94%, process peak RSS
+56.898 → 56.016 MiB (−1.55%). All four points/settings/numerical fields
+match the audited reference. Keep the 734,080-byte retained storage reduction
+on Ising11; no speed claim. Generally remove `sizeof(T) × rank × (rank−1)/2`
+bytes per workspace. Do not extrapolate measured RSS to Lambda27.
+Evidence: `work/resumed-091-sampled-packed-gram-20261007/release-summary.json`.
+
+## 2026-10-07 — pack arrow products and scatter by columns
+
+Store each substantial MPFR arrow product in its upper triangle; extend the
+existing exact-GEMM output layout, preserving CRT reconstruction and rounding.
+Scatter disjoint border columns over the pool, visiting leaves in their
+original order for every entry. No new settings or factorization changes.
+
+One nonzero, consistent equality-arrow case (four rank-128 leaves), MPFR1024:
+fast one/four-thread complete solves preserve every point and numerical field
+and pass the original-coordinate 1e-50 audit. Release ABBA, one Mac, four
+threads / BLAS one, identical auxiliary MPFR1024 CLIs: native median
+0.514073 → 0.504147 s (−1.93%), API −1.94%, process peak RSS
+219.484 → 210.906 MiB (−3.91%). All four points/settings/numerical fields
+match; audit is reused only after full identity checks. Solved/0 exercises
+nonzero initialization and four exact residue products, not later IPM
+updates. Cold executable startup affects process times; no process speed claim.
+
+Keep for memory: remove 4.47 MiB of result scalars per four-product batch
+on this case, with measured lower process peak RSS. Native gain is below
+2%; no qualifying speed or isolated-scatter claim, no Lambda27 extrapolation.
+Frozen binary hashes differ and the normal six-width release CLI is unchanged.
+Evidence: `work/resumed-091-arrow-packed-output-20261007/release-summary.json`.
+
+## 2026-10-07 — reject incremental RNS prime initialization
+
+Generate only a requested descending-prime prefix, extend under the existing
+mutex with immutable Arc snapshots, preserve the exact log2 range scan and
+1024-prime cap, and preserve eight spare operand-cache primes. One fast
+24-row sampled MPFR512 solve is `Solved`/17 with identical points/settings/
+numerical fields and an independent 1e-30 factor audit.
+
+Release ABBA on one Mac, one thread / BLAS one, temporary MPFR512 CLI:
+native 0.358964 → 0.354544 s (−1.23%), API −1.23%, RSS
+17.586 → 17.461 MiB (−0.71%). All four complete solutions match the accepted
+point exactly; first run has a fresh independent audit, others reuse it
+after strict identity checks. Process medians include cold executable startup
+and do not establish a solver gain. The first frozen candidate build reused
+the baseline through shared-target timestamps; identical binary hashes caught
+this before timing. Touch frozen candidate build inputs, rebuild, and verify
+distinct hashes before ABBA. Normal six-width release binary is unchanged.
+
+Reject and revert: below the 2% native gate; tiny prime-table storage does
+not justify extra cache lifecycle. No repeat or additional tests. Production
+build-input hashes and the restored normal fast CLI match the verified
+`resumed-091-svd-rotation-records-20261007-fast` arm. Evidence:
+`work/resumed-091-rns-primes-20261007/summary.json`.
+
+## 2026-10-07 — reduce SVD rotation records
+
+U/V routing is decided when a rotation is appended; replay never reads the
+stored factor flag. Pass that flag to the existing append helper, retain
+only p/c/s in each record, and compact its six callers. No rotation,
+retention policy, tile, scalar operation or replay order changes. On the
+current 64-bit layout, records shrink 176 → 168 bytes at MPFR512 and
+304 → 296 at MPFR1024: eight bytes per capacity slot in transient per-call
+logs, not retained worker buffers. Keep the clear storage reduction; no
+measured speed or peak-RSS claim.
+
+One fast Ising11/512 solve, one thread: `Solved`/52, every output field
+except timings identical to the frozen accepted result, original-coordinate
+1e-30 audit passes. No additional verification.
+Evidence: `work/resumed-091-svd-rotation-records-20261007/summary.json`;
+arm `resumed-091-svd-rotation-records-20261007-fast`.
+
+## 2026-10-07 — omit the unused Float64 condensed Gram
+
+Float64 condensed PSD application already uses R/Rinv, but setup retained
+G and each update copied/mirrored it. Leave G empty for Float64, as R is
+already empty for MPFR. Wide Gram arithmetic and Ginv remain unchanged.
+The finite gate checks the cone's authoritative upper Gram triangle; this
+observes exactly the values previously copied and mirrored, without testing
+unused lower entries. The existing graded fixture skips populating empty G.
+
+One fast medium Float64 solve, four threads, explicit qnorm 1e-6: `Solved`/19,
+all output fields except timings match the frozen accepted release result,
+original-coordinate audit passes (dual 6.14e-7, gap 2.41e-7). Keep the clear
+storage/copy benefit: 216,280 retained bytes and 27,035 copy/mirror writes per
+scaling update on this input; generally `8 × sum(order²)` bytes (8 MiB for
+one order-1024 block). No measured RSS or speed claim, no additional suite.
+Evidence: `work/resumed-091-f64-unused-gram-20261007/summary.json`;
+arm `resumed-091-f64-unused-gram-20261007-fast`.
+
+## 2026-10-07 — omit unused sampled setup coordinates
+
+Fully sampled condensed setup records only PSD column patterns, yet built
+the generic packed-row coordinate tables first. Construct those tables only
+when generic entries consume them. No arithmetic, order, retained pattern,
+setting or generic/MPI route changes. Keep the removed allocation and writes:
+16 bytes per PSD row (40,608 bytes on Ising11; at most 8.31 MiB using
+Lambda27's total row count). These are logical setup savings, not measured RSS.
+
+One fast Ising11/512 solve, one thread: `Solved`/52, all output fields except
+the three timings identical to the frozen accepted result, original-coordinate
+1e-30 audit passes. No further verification or speed claim. Sparse-support
+materialization bounds are deferred: Ising11 has no zero basis entries, and
+unchecked overflow followed by a zero factor can retain NaN rather than
+zero, so support-only capacity would not preserve that path.
+Evidence: `work/resumed-091-sampled-coordinates-20261007/summary.json`;
+arm `resumed-091-sampled-coordinates-20261007-fast`.
+
+## 2026-10-07 — scalar power-of-two removal rejected; reconcile plan
+
+Live-source inspection found the exact scalar shortcut already introduced
+by 0.9.0 (`24f9e91`); the plan's external/deferred description was stale.
+It copies the other normalized mantissa and uses exponent `e_a + e_b − 1`.
+Existing regular-kind, width, exponent-sum and current MPFR-range guards
+preserve all special/range handling. Independent read-only review found
+no numerical defect. Historical entries remain unchanged.
+
+To measure its common-path checks, compare frozen current sources differing
+only by removal of that shortcut. Both temporary CLIs dispatch MPFR512 under
+a distinct binary name; the normal six-width release CLI hash is unchanged.
+One Mac release ABBA, Ising11/512, four solver threads / BLAS one: all four
+`Solved`/52 points/settings/numerical fields match the accepted reference
+exactly, and the first run passes a fresh original-coordinate 1e-30 audit.
+Native medians 4.312494 → 4.350789 s (+0.89%); API +0.89%. RSS
+56.570 → 56.320 MiB (−0.44%), without a storage change. Cold startup changes
+process medians; it is not a solver benefit. Reject removal, retain existing
+arithmetic, no further tests/builds. No qualifying new speed/RSS claim.
+Evidence: `work/resumed-091-scalar-power-20261007/summary.json`.
+
+## 2026-10-07 — emit serial sampled adjoints without staging
+
+The exact quadratic helper writes its completed workspace results through
+the caller's writer. Serial products no longer allocate a `basis_cols`
+temporary vector per block/call; pooled products fill their existing terms
+buffer through the same helper. The scalar multiply association, ascending
+column order and block accumulation order stay unchanged. A declined exact
+kernel performs no output writes. No new retained buffer or option.
+
+Keep for the removed allocation and transient scalar storage; no measured
+speed or peak-RSS claim. The existing native catalog `mpfr_sampled_24`,
+MPFR512, one thread / BLAS one, fast baseline/candidate: `Solved`/17,
+full points/settings/numerical fields identical. An independent 512-bit
+factor-operator audit passes at 1e-30 (primal 3.882e-35, dual 4.928e-32,
+gap 4.816e-32, both PSD violations zero). Ising11's basis heights are below
+the exact branch's 24-row threshold, so it is not the matching gate.
+The scratch auditor's first attempt failed while writing string metadata
+to a numerically typed dictionary; corrected to `Dict{String,Any}` without
+changing the numerical checks. No broad suite. Evidence:
+`work/resumed-091-sampled-adjoint-direct-20261007/summary.json`.
+
+## 2026-10-07 — prepare the strict Lambda27 accuracy pilot
+
+The saved-point diagnosis confirms 2-norm solver residuals normalized by
+the large recovered variable norms. Existing qnorm uses the original dual
+2-norm divided by `1 + ‖q‖∞`; componentwise checks the operator's individual
+terms. Both are explicit opt-in and defaults stay unchanged. The full
+external audit also checks primal feasibility and PSD mapping, which these
+dual gates alone do not guarantee.
+
+Small Ising11/512 with both optional gates at 1e-30 remains `Solved`/52 and
+passes its unchanged original-coordinate audit. A single large baseline
+pilot is prepared/uploaded/preflighted, not submitted: existing frozen
+release binary, Lambda27/1024, 32 cores / BLAS one, 64 GiB, two-hour PBS
+limit, 100 iterations / 5,400-second solver cap, followed by the unchanged
+full 1e-30 audit. Additional approval is pending because both automatic
+campaign retries are spent; the diagnostic approval does not authorize a
+fresh solver run. No candidate, ABBA or automatic follow-up. Evidence:
+`work/resumed-091-arrow-full-20261006/accuracy-pilot-20261007/`.
+
+## 2026-10-07 — initialize local pivot signs once
+
+Leaf construction starts with empty sign storage. Generic leaves install
+the same `[1]` positive pivot sign; unpacked local leaves collect their
+original signed pivots once; packed bounds leave it empty because their
+factorizer supplies negative bound/positive primal signs directly. Border
+and QDLDL fallback use separately retained global signs. This removes the
+discarded default-sign allocation for all local leaves and the retained sign
+buffer for packed bounds; no factorization, regularization or solve changes.
+
+Fast small gravity Float64, arm `resumed-091-packed-bound-signs-20261007-fast`:
+`Solved`/19, `local_bounds_faer`, identical full baseline points/settings/
+numerical fields and independent original-coordinate audit. Four requested
+threads, one actual worker; no speed/RSS claim or additional suite. Keep.
+Evidence: `work/resumed-091-packed-bound-signs-20261007/summary.json`.
+
+## 2026-10-07 — omit unused packed bound coupling metadata
+
+Packed bound leaves now omit `coupled` and `couples` vectors alongside the
+already omitted dense coupling matrices. Packed refactor, Schur, single/
+batched solves and fallback materialization use their panel/owner maps;
+generic contribution admission and MPI diagnostics exclude these leaves.
+Unpacked bounds and SOC/generic leaves keep both vectors. All numeric work
+and scheduling are unchanged.
+
+Keep for two fewer allocations and `9 × border_width` fewer logical bytes
+per leaf on a 64-bit host; Vec headers remain. Small fixed-a gravity,
+Float64, fast arm `resumed-091-packed-bound-meta-20261007-fast`, explicit
+qnorm 1e-6: baseline/candidate `Solved`/19, `local_bounds_faer`, identical
+full points/settings/numerical fields and independent original-coordinate
+audits. Four threads were requested, but both report one actual worker at
+this small size. No speed or RSS claim; no extra suite. Evidence:
+`work/resumed-091-packed-bound-meta-20261007/summary.json`.
+
+## 2026-10-07 — avoid an unused Float64 Schur accumulator
+
+**Change.** Allocate the serial dense accumulator after the parallel packed
+tile branch returns. That branch already uses worker scratch and never reads
+the per-block accumulator; transform panels do not use it either. Serial
+assembly still initializes the same live suffixes in the same FMA order.
+
+**Evidence/decision.** Keep for one fewer unused retained buffer on fresh
+parallel packed assembly: `tile × dense_width` Float64 scalars (4 MiB cap,
+or one row when wider). Previously initialized serial capacity is retained.
+Mac M4 fast `medium`, four threads, explicit pinned qnorm 1e-6: baseline and
+`resumed-091-serial-acc-20261007-fast` are `Solved`/19, full points/settings/
+numerical fields identical and original-coordinate audits pass (dual 6.14e-7).
+One matched release ABBA, same host/thread budget and only this allocation
+change: process peak RSS median 359.75 → 350.90 MiB (−2.46%), native
+1.415620 → 1.434108 s (+1.31%), API +1.30%. All four `Solved`/19 points,
+numerical fields and settings are identical and independently audited.
+Keep the repeatable memory reduction; no speed gain. Process startup affects
+wall times, which are not a solve improvement. Both frozen CLIs retain all
+six default precisions. Stop verification here. Evidence:
+`work/resumed-091-serial-acc-20261007/summary.json` and
+`work/resumed-091-serial-acc-release-20261007/summary.json`.
+
+## 2026-10-07 — repair the full Lambda27 audit without materializing A
+
+The failed audit below allocated the full sampled conic sparse operator and
+all reconstructed Gram matrices. A frozen replacement computes its forward/
+transpose products and independent original mapping one block/parity at a
+time. It preserves duplicate-coefficient rounding, all six gates, PSD
+eigenvalue checks, input/mapping identities, precision and 1e-30 thresholds.
+On the existing Ising11/512 point, every primal/dual/PSD/mapping gate and hash
+is identical; only the global conic objective/gap differ by 2.24e-154 from
+blockwise summation. Both audits accept. No new solver run or broad suite.
+
+PBS223602 was the second scoped retry on node190 with the same approved
+32 cores, 64 GiB and six-hour limit. It audited the preserved Lambda27
+point before a fresh same-host release ABBA with unchanged binaries.
+The repaired audit completed in 598.277 s at 1157.227 MiB process peak RSS,
+but rejected that point: primal 3.730e-28, dual 1.475e-23, mapping PSD link
+2.733e-26 and componentwise dual 0.84355 exceed 1e-30. Gap/PSD membership
+pass. Exit 1; no candidate solve or new ABBA timing ran. Preserve this as an
+accuracy failure, not a performance result. Diagnose normalization and the
+worst original equation before another comparison; both automatic retries
+are spent. Preserve PBS223591/223593 outputs too. Packet:
+`work/resumed-091-arrow-full-20261006/retry2-packet-20261007/`; equations and
+small audit comparison: `audit-repair-20261007/PROCEDURE.md`; remote `retry2/`.
+
+The prepared diagnostic reproduces Ising11/512's original componentwise
+dual relative/absolute errors exactly and verifies its layout/input/point
+hashes. The user explicitly approved PBS223605 after the retry budget was
+spent: eight cores, 16 GiB, 15 minutes, no fresh solve. It runs one Julia
+thread on node100. It completed with exit 0 in 331.86 s process and
+1138.254 MiB peak RSS; layout, input/point hashes and failed dual errors
+match exactly. Primal x infinity norm is 5.832e118, dual z 4.440e14; reported
+standard primal/dual residuals are 1.847e-143 / 3.386e-142. Normalization
+includes the huge variable norm. Both optional accuracy gates are disabled.
+The worst relative row is block77/sample127 (zero c, nonzero B): residual
+1.286e-61, work 1.525e-61, relative 0.84355; B·y is only −3.807e-151.
+The worst absolute row is block78/sample0: residual 1.475e-23, work
+3.592e15, relative 4.107e-39. These are distinct accuracy issues. No layout
+bug found; keep the point FAIL. The next pilot can use existing optional
+qnorm/componentwise gates explicitly without changing defaults. This is a
+diagnostic, never an accepted audit or performance comparison. Packet:
+`diagnostic-job-20261007/`; result summary: `retrieved-diagnostic-20261007/`.
+
+## 2026-10-07 — measure the memory batch; reject sampled RHS borrowing
+
+**Memory batch.** Release ABBA, Mac M4, Ising11 MPFR512, four solver
+threads / BLAS one, clean 0.9.1 versus accepted H·z/SVD/Eigen/MPI changes:
+native median 3.848620 → 3.779302 s (−1.80%); API −1.80%; process peak RSS
+56.391 → 56.336 MiB (−0.10%). All four are `Solved`/52 with identical full
+points, numerical fields and settings; the bound original-coordinate 1e-30
+audit passes. Keep the verified logical storage reductions. This small case
+establishes neither a ≥2% speed gain nor a peak RSS improvement. The serial
+measurement does not exercise MPI decoding; its two-rank correctness gate
+is recorded below. Evidence: `work/resumed-091-memory-release-20261006/`.
+
+**Rejected trial.** Borrow the consumed PSD RHS matrix for sampled upper-
+triangle packing instead of retaining a separate per-block packed vector.
+Ising11 fast E2E passes with identical audited points. Isolated release ABBA
+first gives native +4.24% with an outlier; one warmed repeat resolves that
+noise: 3.829458 → 3.829716 s (+0.01%), RSS 56.516 → 56.406 MiB (−0.19%).
+Every run is `Solved`/52 with identical points/settings and the bound audit.
+Revert: no measured speed or RSS benefit, and the longer TLS checkout can
+retain extra workspaces under task stealing. Preserve both comparisons;
+no large follow-up. Evidence: `work/resumed-091-sampled-pack-release-20261007/`
+and `repeat/`. Both comparisons instantiate only MPFR512 in frozen CLIs to
+shorten compilation; the repository frontend precision set is unchanged.
+Fresh executable startup affects process times, so they are not solve gains.
+
+**Cluster status.** PBS223593 exited 1 after its first Lambda27/1024 baseline
+was `Solved`/42: native 2441.387 s, API 2441.387 s, process 2448.392 s,
+peak RSS 21163.313 MiB, 32 actual workers, zero residue calls as expected.
+The independent Julia audit exhausted memory before writing its receipt;
+the candidate never ran. This is an unaudited baseline, not a comparison.
+Keep all failed audit output and the completed point; repair audit memory
+within the approved resource limit before the next scoped retry.
+
+## 2026-10-06 — reuse Eigen scratch and decode MPI gathers in place
+
+**Change.** PSD margins and step bounds lend their dead second matrix to
+the eigenvalue routines. Keep integer work arrays, remove the eigensolver's
+separate scalar work vector and its now-unused type parameter. Reserve only
+the queried extension and restore the matrix length before handling success
+or failure. Small closed forms and the certified Float64 step shortcut stay
+unchanged. MPI allgathers decode their canonical wire payload into the
+existing destination rather than another full scalar vector. Format/layout
+validation, gap preservation and collective abort on invalid decode remain.
+
+**Evidence.** Mac M4, fast arm `resumed-091-mpi-eig-work-20261006-fast`,
+actual two-rank OpenMPI, two threads per rank, Ising11 MPFR512: `Solved`/52,
+2,921 gathers, identical full x/s/z/sampled_y, effective settings and numerical
+results to frozen `resumed-091-hz-cache` MPI output. The original-coordinate
+1e-30 audit is reused only after equality and input/settings/precision
+binding. Converted input files match the pinned archive and sampled input
+hash; compressed archive and sampled manifest hashes are recorded separately.
+Independent review found no alias/lifetime/error change. No extra suites.
+
+**Decision.** Keep for fewer scalar allocations and copies. The PSD worker's
+matrix holds the maximum required SVD/Eigen work instead of separate scalar
+work buffers; paired step work owns its own lent matrix. A full Lambda27
+gather (m=544,653 / MPFR1024) avoids a 78,430,032-byte (74.80 MiB) decoded
+vector per rank. Communication byte buffers are unchanged. Logical savings
+do not establish aggregate peak RSS or a speed gain. These changes are outside
+running PBS223593. Evidence:
+`work/resumed-091-mpi-eig-work-20261006/{manifest,summary,audit-reused}.json`.
+
+## 2026-10-06 — reuse consumed PSD matrix for SVD workspace
+
+**Change.** Right-only PSD SVD borrows the second Cholesky matrix after
+`L2ᵀL1` consumes it. Reserve only the queried extension; restore the n²
+matrix length on success and failure before inverse construction overwrites
+it with V. Remove the SVD engine's separate retained BLAS work allocation
+on this path. Other factorizations and all SVD operations stay unchanged.
+
+**Evidence.** Mac M4, fast arm `resumed-091-psd-svd-work-20261006-fast`,
+Ising11 MPFR512: one/four threads are `Solved`/52 and pass the original-
+coordinate 1e-30 audit. At four threads, full x/s/z/sampled_y, effective
+settings and numerical results match frozen `resumed-091-hz-cache` exactly;
+only the two SVD/PSD files differ in their build-input manifests. Independent
+review found no alias, accepted-state or failure-path change. Verification
+stopped after this matching gate; no suites or release timing campaign.
+
+**Decision.** Keep for smaller retained workspace. MPFR right-only SVD at
+order n uses n²+8n−2 scalars; the affected buffers now retain that allocation
+instead of n² plus a separate SVD work vector. Order 88 / MPFR1024 saves
+7,744 scalars = 1,115,136 bytes (1.06 MiB) per initialized worker at that
+order. Resident worker orders and allocator behavior determine aggregate
+RSS; no measured speed or RSS claim. Evidence binding:
+`work/resumed-091-psd-svd-work-20261006/summary.json`; matching four-thread
+run: `runs/20261006-233230-188132-ising11-resumed-091-psd-svd-work-20261006-fast/`.
+This change is outside the running PBS223593 arrow packet.
+
+## 2026-10-06 — reject additional serial residue scratch pooling
+
+**Hypothesis/change.** Reuse the bounded per-thread f64 buffer pool for
+`CachedResidues::from_chunks` prime-group scratch, avoiding allocation for
+each transient operand. Arithmetic, prime grouping and cache contents stay
+unchanged. The frozen sources differ only in this scratch lifetime.
+
+**Evidence.** Mac M4, release ABBA, MPFR1024 equality QP, four actual
+backend/cone workers and BLAS one: native median 0.375117 → 0.373117 s
+(−0.53%); API 0.375258 → 0.373253 s (−0.53%); process peak RSS median
+218.461 → 223.164 MiB (+2.15%). All four complete solves are `Solved`/0,
+make four arrow residue calls, preserve the full baseline point, precision
+and settings, and pass the original-coordinate 1e-50 audit. Fresh-binary
+startup affects the short process times; they do not establish a speed gain.
+Both frozen CLIs instantiate only 1024 bits to shorten this build; the
+repository frontend precision set is unchanged.
+
+**Decision.** Revert: below the 2% native/API gate and no memory benefit.
+No additional tests or retries. Sources, binary/input hashes, full points,
+receipts and ABBA rows: `work/resumed-091-rns-scratch-20261006/`.
+
+## 2026-10-06 — reuse accepted condensed RHS products
+
+**Change.** Remove the full H·z staging clone after successful refinement.
+Keep the final RHS product in `workh`, snapshot only earlier columns and
+retain the existing MPI gather and validity rules. Single solves need no
+snapshot. Every product and accepted-iterate restoration remains unchanged.
+
+**Evidence.** Release 0.9.1 baseline `4863de1`, Mac M4, fast profile,
+Ising11 MPFR512: final arm `resumed-091-hz-cache-20261006-fast` is
+`Solved`/52 at four threads with identical full x/s/z/sampled_y and numerical
+results; the original-coordinate 1e-30 audit passes. Actual two-rank MPI
+with two threads per rank is also `Solved`/52 with identical baseline points,
+precision and settings; its audit passes. Intermediate clone-only arm
+`resumed-091-hz-copy-20261006-fast` passed the same checks.
+
+**Decision.** Keep for one fewer persistent m-vector, one fewer transient
+m-vector and fewer copies. At Lambda27 m=544,653 / MPFR1024 this removes
+74.80 MiB of scalar storage from each vector (149.59 MiB combined). These
+are allocation-size calculations, not process RSS or measured speed claims.
+No broad suites. Local runs:
+`runs/20261006-224400-672311-ising11-resumed-091-baseline-20261006-fast/` and
+`runs/20261006-225817-740260-ising11-resumed-091-hz-cache-20261006-fast/`;
+MPI binding/audit: `work/resumed-091-hz-copy-20261006/cache-summary.json`.
+
+The user resumed performance work and approved a six-hour full Lambda27
+comparison. PBS223593 runs two frozen 0.9.1 release sources
+differing only in arrow batching; this RHS-memory change is excluded.
+Packet: `work/resumed-091-arrow-full-20261006/`. Results remain pending.
+PBS223591 stopped before any large solve: the candidate build took 0.33 s
+and emitted the same binary hash as the counterfactual, despite distinct
+frozen arrow sources. Its preflight correctly rejected zero residue calls.
+Retry1 reuses the validated baseline and touches the changed candidate input
+before compiling; branch counts, point equality and audit gates stay intact.
+The original failed job, binaries, logs and exit 1 are preserved.
+
 ## 2026-10-06 — consolidate owner setup and reuse reduction outputs
 
 **Change.** Explicit, automatic and MPI partition setup share one constructor

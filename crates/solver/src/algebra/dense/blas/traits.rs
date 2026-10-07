@@ -232,8 +232,9 @@ pub trait XgemmScalar: Sized {
         lda: i32, b: &[Self], ldb: i32, beta: Self, c: &mut [Self], ldc: i32,
         _pool: &rayon::ThreadPool, _column_tile: usize
     ) { Self::xgemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc); }
-    // Upper triangle (`i <= j`) of `op(a)·op(b)` into `c` (ldc = m) when the
-    // exact product is known to be symmetric. Only the exact residue-BLAS
+    // Upper triangle (`i <= j`) of `op(a)·op(b)` into `c` when the exact
+    // product is known to be symmetric. Square outputs of length n*(n+1)/2
+    // are packed by column; other outputs use ldc = m. Only exact residue-BLAS
     // kernel implements it; `false` means nothing was written.
     // `cache_b` optionally keeps `b`'s residues when it is a constant operand.
     fn xgemm_upper_exact(
@@ -241,11 +242,18 @@ pub trait XgemmScalar: Sized {
         _b: &[Self], _ldb: usize, _c: &mut [Self], _pool: Option<&rayon::ThreadPool>,
         _cache_b: Option<&mut ResidueCache>
     ) -> bool { false }
+    // Upper triangle of Σ aᵀ·b for column-major `rows × m` blocks, each
+    // entry the exact sum rounded once into `c[i + j*m]` (`i <= j`).
+    // Use the output only on success: `false` may leave partial writes.
+    fn xgemm_blocks_upper_exact(
+        _m: usize, _rows: usize, _blocks: &[(&[Self], &[Self])], _c: &mut [Self],
+        _pool: Option<&rayon::ThreadPool>
+    ) -> bool { false }
     // Upper triangle of `aᵀ·diag(d)·a` for a constant column-major `k × m`
     // operand `a` (its residues kept in `cache_a`), each entry the exact sum
     // rounded once. Reset `cache_a` whenever `a` changes.
-    // Only the exact residue kernel implements it; `false`
-    // means nothing was written.
+    // Only the exact residue kernel implements it. Use the output only on
+    // success: `false` may leave partial writes.
     fn diag_congruence_upper_exact(
         _m: usize, _k: usize, _a: &[Self], _d: &[Self], _c: &mut [Self],
         _pool: Option<&rayon::ThreadPool>, _cache_a: &mut ResidueCache
@@ -335,6 +343,9 @@ impl_blas_gsymv!(f64, dsymv);
 // ?syrk : symmetric rank k update
 // --------------------------------------
 
+/// Primitive BLAS implementations require dense output storage. MPFR also
+/// accepts packed upper columns when `uplo = U`, `ldc = n` and
+/// `c.len() = n * (n + 1) / 2`; `xsyrk_pool` uses the same layout.
 pub trait XsyrkScalar: Sized {
     fn xsyrk(
         uplo: u8, trans: u8, n: i32, k: i32, alpha: Self,

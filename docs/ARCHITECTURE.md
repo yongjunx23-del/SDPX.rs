@@ -21,6 +21,10 @@ job IDs, rejected trials) is in [JOURNAL.md](JOURNAL.md).
 | `crates/pmp` | PMP JSON/XML reader and the `sdpx-pmp2sdp` converter to sampled SDP inputs. |
 | `crates/ffi` | C ABI and prepared handles; header in `include/sdpx.h`. |
 
+PMP conversion streams blocks and writes rows directly. Each worker releases
+the parsed/generated basis after both parity arrays are written, before
+building normalized `c`/`B` coefficients.
+
 ## Solver modules
 
 | Module | Responsibility |
@@ -52,6 +56,9 @@ the local owner from its communicator. Cost-history input fingerprints are
 computed once at the JSON boundary, only for history import or recording.
 Ordinary solves do not collect history metadata. Immutable local/global
 layouts share storage when all owners are local.
+Sparse row-plan construction reuses row offsets as insertion cursors, then
+restores their starts; no temporary cursor copy is allocated. Entry order
+and the retained row layout are unchanged.
 Solutions and residuals are reported in original coordinates. Checkpoints
 store the internal iterate with its equilibration; hot starts map through
 original coordinates. Loading rejects nonfinite values and nonpositive
@@ -60,6 +67,23 @@ homogenization or scaling factors before installing the iterate.
 Sampled problems keep the factored operator authoritative: once installed,
 the retained linear-A values are released and the reduced KKT storage owns
 the coefficients. Rounded materializations never replace the operator.
+Fully sampled KKT setup retains column patterns without generic PSD entry
+coordinates or value plans. Sampled MPFR workspaces retain packed upper Grams;
+SYRK and MPI gather read/write that layout directly. Float64 keeps dense BLAS
+Gram storage. V is allocated on its first owner update; global MPI non-owners
+use only the gathered Gram. Fused adjoints allocate on first use, so global
+MPI keeps none. The fused RHS matrix is allocated only on that path;
+serial and owner-local solves retain it. Gram and scaling ownership can
+differ, so other scaling matrices remain available to their consumers.
+Condensed PSD blocks keep R for Float64 application and G for MPFR application;
+the unused matrix is empty. Ginv remains for Schur assembly when needed.
+MPFR SVD stores rotations in separate U/V logs without redundant factor flags;
+the logs reuse thread-local capacity, and the four-row parallel replay keeps
+each row's scalar rotation order.
+Serial exact sampled adjoints emit workspace results directly in block/column
+order; pooled adjoints use the same writer to fill their contribution buffers.
+Inverse scalar adjoints with distinct basis columns write exact quadratics
+directly into that output; compacted bases retain an indexed projection.
 
 ## Iteration
 
@@ -79,6 +103,9 @@ At MPFR precision every refinement residual row is an exact dot product
 rounded once, so refinement keeps working on badly scaled bootstrap systems.
 Every right-hand side uses its own residual and measured correction gain;
 stalls from another right-hand side or factorization do not skip refinement.
+Condensed solves retain the final accepted H·z product in refinement workspace
+and snapshot only earlier right-hand sides. MPI completes the product gather
+before marking it valid; rejected refinement steps restore the accepted product.
 Clarabel stopping rules, reduced tolerances, infeasibility detection,
 regularization with escalation and the distinct `AlmostSolved` status are
 part of the engine. There is no low-precision solver, mixed-precision
@@ -117,10 +144,38 @@ reported as `linear_solver`.
 | 5 | `arrow` | Disconnected positive dense leaves around a negative border, estimated workspace ≤ max(512 MiB, 8 × KKT storage) (Float64 and MPFR). Leaf contributions are recomputed in bounded batches. |
 | 6 | `faer` / `qdldl` | General sparse LDL. Float64 with `faer-sparse` uses faer when estimated flops ≥ 1e8 and flops per factor nonzero ≥ 40, else QDLDL. MPFR uses QDLDL. |
 
+Packed local bound leaves store their couplings in shared panels; their
+unused dense coupling matrices, per-border coupling index/mask vectors and
+pivot signs are not allocated. The bound factorizer supplies pivot signs;
+generic and unpacked local leaves initialize their sign storage once.
+Float64 flat bound-leaf forward/backward solves share the existing pool in
+1024-leaf ranges. Each leaf owns disjoint output entries and retains its
+arithmetic order; phases join before the intervening panel products.
+Bound products write their Gram into the existing Schur destination
+(Float64 lower triangle, MPFR upper triangle) before the unchanged
+shifted-border subtraction and mirror. The MPFR exact kernel and dot fallback
+share that destination; no separate bound Gram is retained.
+
+Eligible MPFR local SOC Schur products encode at most 256 coupling rows per
+group directly from leaf operands, without gathered MPFR panels. The full
+finite/exponent scan derives common row supports; equal supports share compact
+products, while dense rows retain the original layout. Workers scatter and sum
+reduced residues across groups, then one shared CRT rounds
+each entry once before subtracting it from the shifted border. Upper ZᵀY
+uses the same products as the original lower YᵀZ, retaining scalar-rounded Z.
+Residue/product scratch stays private to each worker; no full tall operand
+cache is retained. Small shapes and declined plans use the original exact dots.
+
+Local SOC leaves keep raw coupling row 0 in the unchanged first row of Y;
+B retains only raw row 1. Updates, scales, finite checks and fallback
+materialization read the original values there. Refactors reload Y row 1
+before applying the same forward solve and diagonal scaling.
+
 Above 256 bits, substantial generic MPFR arrow leaves form scalar-rounded
 Z = Y ⊙ dinv, then compute the upper YᵀZ product through exact residues.
 Result storage must stay proportional to Y; batches fill the worker pool,
-hold one result per worker and subtract leaves in their original order.
+hold one packed upper result per worker and scatter disjoint border columns.
+Each entry subtracts leaves in their original order.
 Short leaves and underfilled batches retain column-parallel exact dots. The plan records the current
 performance acceptance gate for these candidates.
 
@@ -136,14 +191,32 @@ operator stays unshifted.
 bits and addition/subtraction through 512 bits round inline to nearest-even;
 128/256-bit FMA and two-product FMMA use exact stack kernels with one
 rounding. All other cases call MPFR and produce the same bits.
+Inline power-of-two products copy the other mantissa and adjust its exponent;
+results outside MPFR's exponent range retain MPFR handling.
 
 `exactdot` accumulates the exact sum of products in fixed point and rounds
 once (inline limb products through 256 bits, GMP above). The result does not
 depend on term order, partitioning or thread count. Large dense MPFR
 products, congruences (`Aᵀdiag(d)A`) and bound Grams use exact residue (RNS)
 kernels with caches for operands that stay fixed during a solve; CRT
-reconstruction rounds each entry once. Upper GEMM requests stream packed
-triangle residues through CRT; temporary BLAS tiles cover only the needed
+reconstruction rounds each entry once. GEMM, general congruence and sampled
+quadratic/bilinear products use one streaming and prime-partition implementation.
+CRT constants are built from one temporary large-integer cofactor at a time.
+Pooled calls share one CRT accumulator:
+independent prime products run in parallel, then disjoint digit columns update
+the accumulator. Fractional residues and mapped compaction keep their serial
+order. Congruence retains full square residue staging; quadratic/bilinear
+tasks share operand staging and keep private matrix/product scratch. Diagonal
+congruence retains its row partitions and releases scaling residues after
+their joined products, before CRT allocates its buffers.
+Ordinary square GEMMs of side ≥12 use the residue kernel from 1024 bits;
+SYRK, upper products and cached congruences keep their existing eligibility.
+Each ordinary GEMM still rounds separately, including congruence fallback
+intermediates.
+MPFR transposed SYRK uses contiguous exact slice dots when residues are
+unprofitable. Upper GEMM requests stream packed
+triangle residues through CRT. Contiguous results use implicit indices;
+dense upper triangles keep explicit maps. Temporary BLAS tiles cover only the needed
 rows of each column tile. MPFR sparse products `Ax`/`Aᵀx`
 accumulate each output row/column exactly when it has enough entries.
 Ordinary scalar operations and factorizations stay at the requested
@@ -166,14 +239,25 @@ the existing work cutoff. Backends receive it before initial thread reporting.
 Splits preserve each output's operation order, so results are independent of
 the thread count. Scratch is per thread (`algebra/scratch.rs`) and reused
 across iterations; dense kernels reuse dead input/output storage instead of
-allocating temporaries. BLAS providers must support concurrent calls from
-workers (source-built OpenBLAS needs `USE_LOCKING=1`).
+allocating temporaries. Parallel packed Float64 Schur tiles use worker
+scratch; the per-block dense accumulator is allocated only for serial
+assembly. PSD scaling lends its consumed second Cholesky
+matrix to the right-only SVD as workspace, then restores the matrix length
+before constructing the inverse, including on SVD failure. Margins and step
+bounds also lend a dead matrix to the eigensolver, retaining only its integer
+workspace separately. BLAS providers must support concurrent calls from
+workers (source-built OpenBLAS needs
+`USE_LOCKING=1`).
 
 MPI is loaded at runtime. The ordinary MPI path replicates input data and
-shards the expensive work by blocks. Sampled forward/adjoint products and
-condensed scaling share one rank partition for pooled problems containing
+shards the expensive work by blocks. Allgathered scalars decode directly into
+their destination through the canonical wire codec; the collective format
+checks and fatal decode agreement remain. Sampled forward/adjoint products
+and condensed scaling share one rank partition for pooled problems containing
 only sampled PSD and zero cones, so a condensed solve keeps intermediate
-vectors on their owning rank and exchanges each result once. Serial sampled
+vectors on their owning rank and exchanges each result once. Ordered owned
+forward products write directly into those output rows when no gather is
+requested. Serial sampled
 products and mixed ordinary cones keep the complete scaling exchange;
 the sampled operator's linear part is sharded by columns (adjoint) or by
 its entry-holding rows (forward). Sharded, pooled and serial sparse products

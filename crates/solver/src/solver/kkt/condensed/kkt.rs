@@ -43,14 +43,14 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                     p.dense_column_map = Vec::new();
                     p.dense_row_first = Vec::new();
                     p.coefficient_support = Vec::new();
-                    p.mat3c = Matrix::zeros(p.Rinv.size());
                     if fused {
+                        p.mat3c = Matrix::zeros(p.Rinv.size());
                         p.Ginv = Matrix::zeros((0, 0));
                     }
                     p.sampled = Some(SampledPsd {
                         work: SampledSchurWorkspace::new(sampled_block),
                         pair_lanes: Vec::new(),
-                        adjoint: vec![T::zero(); sampled_block.column_count()],
+                        adjoint: Vec::new(),
                         operator: Arc::clone(&operator),
                         block: bi,
                     });
@@ -114,7 +114,15 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             .get(column)
             .copied()
             .unwrap_or(false)
-            .then(|| &self.scaled_solutions[column * self.A.m..(column + 1) * self.A.m])
+            .then(|| {
+                // The final accepted product stays in refinement workspace;
+                // earlier columns must survive the next right-hand side.
+                if column + 1 == self.scaled_valid.len() {
+                    &self.workh
+                } else {
+                    &self.scaled_solutions[column * self.A.m..(column + 1) * self.A.m]
+                }
+            })
     }
 
     fn solve_many(
@@ -134,7 +142,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         }
         self.scaled_valid.clear();
         self.scaled_valid.resize(cols, false);
-        self.scaled_solutions.resize(cols * self.A.m, T::zero());
+        self.scaled_solutions.resize((cols - 1) * self.A.m, T::zero());
         self.counters.batches += 1;
         self.counters.rhs_applied += cols as u64;
         let reduced_width = n + self.retained_rows.len();
@@ -223,8 +231,10 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             if flags[c] {
                 if settings.iterative_refinement_enable {
                     let m = self.A.m;
-                    let product = self.scaled_product().to_vec();
-                    self.scaled_solutions[c * m..(c + 1) * m].copy_from_slice(&product);
+                    self.scaled_product();
+                    if c + 1 != cols {
+                        self.scaled_solutions[c * m..(c + 1) * m].copy_from_slice(&self.workh);
+                    }
                     self.scaled_valid[c] = true;
                 }
                 out[c * width..(c + 1) * width].copy_from_slice(&x);
@@ -259,9 +269,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 return false;
             }
             if settings.iterative_refinement_enable {
-                self.scaled_solutions.resize(self.A.m, T::zero());
-                let product = self.scaled_product().to_vec();
-                self.scaled_solutions.copy_from_slice(&product);
+                self.scaled_product();
                 self.scaled_valid[0] = true;
             }
             // As in upstream DirectLDL, refinement may stop at a finite
@@ -577,16 +585,19 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                             );
                         }
                     }
-                    // Cone scaling already formed this exact same product.
-                    // Copy its authoritative triangle before mirroring below.
-                    for j in 0..c.n {
-                        let start = j * c.n;
-                        p.G.data_mut()[start..start + j + 1]
-                            .copy_from_slice(&c.scaling_gram().data()[start..start + j + 1]);
-                    }
-                    for j in 0..c.n {
-                        for i in j + 1..c.n {
-                            p.G[(i, j)] = p.G[(j, i)];
+                    // Wide arithmetic reads this Gram; binary64 applies H
+                    // through R. Cone scaling already formed the product.
+                    let gram = c.scaling_gram().data();
+                    if !p.G.data().is_empty() {
+                        for j in 0..c.n {
+                            let start = j * c.n;
+                            p.G.data_mut()[start..start + j + 1]
+                                .copy_from_slice(&gram[start..start + j + 1]);
+                        }
+                        for j in 0..c.n {
+                            for i in j + 1..c.n {
+                                p.G[(i, j)] = p.G[(j, i)];
+                            }
                         }
                     }
                     // A released Ginv (fused sampled block) is never read.
@@ -601,7 +612,10 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     }
                     if !p.R.data().is_finite()
                         || !p.Rinv.data().is_finite()
-                        || !p.G.data().is_finite()
+                        || !(0..c.n).all(|j| {
+                            let start = j * c.n;
+                            gram[start..start + j + 1].is_finite()
+                        })
                         || !p.Ginv.data().is_finite()
                     {
                         return false;

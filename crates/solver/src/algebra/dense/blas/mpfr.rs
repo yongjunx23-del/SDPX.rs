@@ -165,18 +165,30 @@ fn split_syrk_columns<const N: usize>(
     end: usize,
     lanes: usize,
     upper: bool,
+    packed: bool,
     column: &(impl Fn(usize, &mut [F<N>]) + Sync),
 ) {
     if lanes == 1 {
-        for (offset, values) in c.chunks_mut(ld).enumerate() {
-            column(begin + offset, &mut values[..n]);
+        for j in begin..end {
+            let start = if packed {
+                j * (j + 1) / 2 - begin * (begin + 1) / 2
+            } else {
+                (j - begin) * ld
+            };
+            let len = if packed { j + 1 } else { n };
+            column(j, &mut c[start..start + len]);
         }
     } else {
         let cut = syrk_cut(n, begin, end, lanes, upper);
-        let (left, right) = c.split_at_mut((cut - begin) * ld);
+        let offset = if packed {
+            cut * (cut + 1) / 2 - begin * (begin + 1) / 2
+        } else {
+            (cut - begin) * ld
+        };
+        let (left, right) = c.split_at_mut(offset);
         rayon::join(
-            || split_syrk_columns(left, n, ld, begin, cut, lanes / 2, upper, column),
-            || split_syrk_columns(right, n, ld, cut, end, lanes - lanes / 2, upper, column),
+            || split_syrk_columns(left, n, ld, begin, cut, lanes / 2, upper, packed, column),
+            || split_syrk_columns(right, n, ld, cut, end, lanes - lanes / 2, upper, packed, column),
         );
     }
 }
@@ -188,19 +200,22 @@ fn syrk_output_columns<const N: usize>(
     parallel: Option<(&rayon::ThreadPool, usize)>,
     column: impl Fn(usize, &mut [F<N>]) + Sync,
 ) {
+    let packed = upper && ld == n && c.len() == n * (n + 1) / 2;
+    let used = if packed { c.len() } else { (n - 1) * ld + n };
     if let Some((pool, tile)) = parallel.filter(|(p, t)| p.current_num_threads() > 1 && *t > 0) {
         // Retain the existing configured number of column tasks, changing
         // only their boundaries. Splits borrow disjoint slices; no scratch.
         let lanes = n.div_ceil(tile.min(n));
         pool.install(|| {
             split_syrk_columns(
-                &mut c[..(n - 1) * ld + n],
+                &mut c[..used],
                 n,
                 ld,
                 0,
                 n,
                 lanes,
                 upper,
+                packed,
                 &column,
             )
         });
@@ -209,17 +224,18 @@ fn syrk_output_columns<const N: usize>(
         // keeps the triangular load balanced across lanes.
         let lanes = (4 * rayon::current_num_threads()).min(n).max(1);
         split_syrk_columns(
-            &mut c[..(n - 1) * ld + n],
+            &mut c[..used],
             n,
             ld,
             0,
             n,
             lanes,
             upper,
+            packed,
             &column,
         );
     } else {
-        output_columns(c, n, n, ld, None, column);
+        split_syrk_columns(&mut c[..used], n, ld, 0, n, 1, upper, packed, &column);
     }
 }
 
@@ -259,7 +275,10 @@ fn gemm<const N: usize>(
     if m == 0 || n == 0 {
         return;
     }
-    if alpha != F::<N>::zero() && residue_blas_profitable::<N>(m as usize, n as usize, k as usize) {
+    if alpha != F::<N>::zero()
+        && (residue_blas_profitable::<N>(m as usize, n as usize, k as usize)
+            || (N >= 16 && m == n && n == k && m >= 12))
+    {
         let (mu, nu) = (m as usize, n as usize);
         let exact_product = |out: &mut [F<N>]| {
             super::rns_blas::gemm(
@@ -413,6 +432,16 @@ impl<const N: usize> XgemmScalar for F<N> {
         residue_blas_profitable::<N>(m, n, k)
             && super::rns_blas::gemm(ta, tb, m, n, k, a, lda, b, ldb, true, pool, c, cache_b)
     }
+    fn xgemm_blocks_upper_exact(
+        m: usize,
+        rows: usize,
+        blocks: &[(&[Self], &[Self])],
+        c: &mut [Self],
+        pool: Option<&rayon::ThreadPool>,
+    ) -> bool {
+        residue_blas_profitable::<N>(m, m, rows * blocks.len())
+            && super::rns_blas::gemm_blocks_upper(m, rows, blocks, c, pool)
+    }
     fn xgemm(
         ta: u8,
         tb: u8,
@@ -505,7 +534,9 @@ fn syrk<const N: usize>(
     ldc: i32,
     parallel: Option<(&rayon::ThreadPool, usize)>,
 ) {
-    assert!(tri(u) && trans(t) && n >= 0 && k >= 0 && valid(c.len(), n, n, ldc));
+    assert!(tri(u) && trans(t) && n >= 0 && k >= 0);
+    let packed = upper(u) == b'U' && ldc == n && c.len() == (n as usize) * (n as usize + 1) / 2;
+    assert!(packed || valid(c.len(), n, n, ldc));
     assert!(valid(
         a.len(),
         if upper(t) == b'N' { n } else { k },
@@ -547,7 +578,7 @@ fn syrk<const N: usize>(
                 continue;
             }
             let mut v = F::<N>::zero();
-            if alpha != F::<N>::zero() {
+            if alpha != F::<N>::zero() && k > 0 {
                 let (a0, da) = if upper(t) == b'N' {
                     (i, lda as usize)
                 } else {
@@ -558,7 +589,11 @@ fn syrk<const N: usize>(
                 } else {
                     (j * lda as usize, 1)
                 };
-                v = F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &a[b0 + p * db])));
+                v = if da == 1 {
+                    F::dot_slices(&a[a0..a0 + k as usize], &a[b0..b0 + k as usize])
+                } else {
+                    F::dot_fma((0..k as usize).map(|p| (&a[a0 + p * da], &a[b0 + p * db])))
+                };
             }
             column[i] = axpby(alpha, v, beta, column[i]);
         }

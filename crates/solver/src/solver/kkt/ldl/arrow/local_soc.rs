@@ -56,9 +56,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return None;
         }
         let t = trunk.len() as u128;
-        // H/L, B/Y/Z, RHS work and the dense border; no per-leaf t² buffers.
+        // H/L, raw B row1 plus Y/Z, RHS work and the dense border.
         let cells =
-            groups.len() as u128 * (2 * 25 + 3 * 2 * t + 4 * 5) + 4 * t * t + 4 * k.n as u128;
+            groups.len() as u128 * (2 * 25 + 5 * t + 4 * 5) + 4 * t * t + 4 * k.n as u128;
         if cells * std::mem::size_of::<T>() as u128 > ARROW_MAX_BYTES {
             return None;
         }
@@ -114,6 +114,30 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         let t = self.trunk.len();
         let leaves = &self.leaves;
+        if matches!(self.local_structure, Some(LocalStructure::Soc))
+            && T::residue_blas_applies(t, t, 2 * leaves.len())
+        {
+            debug_assert!(self.ranks.is_none());
+            debug_assert!(leaves.iter().all(|leaf| {
+                leaf.ids.len() - leaf.coupling_start == 2
+                    && leaf.z.len() == 2 * t
+                    && leaf.y.len() == 2 * t
+            }));
+            let blocks: Vec<_> = leaves.iter().map(|leaf| (&leaf.z[..], &leaf.y[..])).collect();
+            // Upper ZᵀY selects the same products as lower YᵀZ below.
+            if T::xgemm_blocks_upper_exact(t, 2, &blocks, &mut self.s, self.pool.as_deref()) {
+                for j in 0..t {
+                    for i in 0..=j {
+                        let value = self.c[i + j * t] - self.s[i + j * t];
+                        self.s[i + j * t] = value;
+                        self.s[j + i * t] = value;
+                    }
+                }
+                crate::receipt::finish("arrow.local_schur", timer);
+                return;
+            }
+            self.s.copy_from_slice(&self.c);
+        }
         // Use the leaf's structurally nonzero coupling suffix.
         // MPFR's dot uses exact accumulation rounded once; each entry has the
         // same leaf/coordinate order at every thread count. No parallel sum.
