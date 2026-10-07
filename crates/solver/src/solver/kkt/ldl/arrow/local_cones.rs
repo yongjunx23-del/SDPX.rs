@@ -167,6 +167,38 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         {
             return None;
         }
+        // Border Schur couplings: each leaf's border columns form a clique,
+        // plus direct border entries. Within each sign (equality rows before
+        // free and shared variables), eliminate the least coupled border
+        // coordinates first, as a minimum-degree ordering of the sparse
+        // augmented system would; eliminating the densest rows first made
+        // ill-conditioned final factorizations overflow (journal 2026-10-07).
+        let words = t.div_ceil(64);
+        let mut adjacent = vec![0u64; t * words];
+        let mut seen = std::collections::HashSet::new();
+        for (columns, _, _) in &links {
+            if !seen.insert(&columns[..]) {
+                continue;
+            }
+            for &a in columns {
+                for &b in columns {
+                    adjacent[a * words + b / 64] |= 1 << (b % 64);
+                }
+            }
+        }
+        for j in 0..k.n {
+            for &i in &k.rowval[k.colptr[j]..k.colptr[j + 1]] {
+                if border[i] != usize::MAX && border[j] != usize::MAX {
+                    let (a, b) = (border[i], border[j]);
+                    adjacent[a * words + b / 64] |= 1 << (b % 64);
+                    adjacent[b * words + a / 64] |= 1 << (a % 64);
+                }
+            }
+        }
+        let degree: Vec<u32> = adjacent.chunks(words).map(|row| row.iter().map(|w| w.count_ones()).sum()).collect();
+        let mut order: Vec<usize> = (0..t).collect();
+        order.sort_by_key(|&p| (signs[trunk[p]] > 0, degree[p], p));
+        let trunk = order.into_iter().map(|p| trunk[p]).collect();
         Some(Self::from_groups(
             k,
             signs,
