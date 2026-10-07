@@ -636,16 +636,29 @@ fn short_equalities_full_rank<T: FloatT>(
 ) -> bool {
     const P: u64 = (1 << 31) - 1;
     let m = ids.len();
-    if m == 0 || m > 256 || a.n < m {
+    if m == 0 || m > 1024 || a.n < m {
         return false;
     }
     // A proof attempt is only worthwhile if it is cheaper than the exact
-    // fallback; past this many modular updates, defer to it unchanged.
-    let mut budget = 16_000_000usize;
+    // fallback (a full minor takes about m³/2 modular updates); past this
+    // budget, defer to it unchanged.
+    let mut budget = (2 * m * m * m).clamp(16_000_000, MODULAR_BUDGET);
+    // Any nonsingular minor is a proof, so visit the columns in a fixed
+    // stride order: blocks of columns sharing a row pattern are then sampled
+    // early instead of exhausting the budget one block at a time.
+    let mut stride = ((a.n as f64 * 0.618_033_988_7) as usize).max(1);
+    while gcd(stride, a.n) != 1 {
+        stride += 1;
+    }
     let mut basis: Vec<Option<Vec<u64>>> = vec![None; m];
     let mut column = vec![0u64; m];
     let mut rank = 0;
-    for c in 0..=a.n {
+    for step in 0..=a.n {
+        let c = if step == a.n {
+            a.n
+        } else {
+            (step as u128 * stride as u128 % a.n as u128) as usize
+        };
         column.fill(0);
         if c == a.n {
             for (i, &r) in ids.iter().enumerate() {
@@ -693,6 +706,13 @@ fn short_equalities_full_rank<T: FloatT>(
         }
     }
     false
+}
+
+fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }
 
 fn inverse_mersenne31(value: u64) -> u64 {
