@@ -748,3 +748,27 @@ fn narrow_fmma_matches_mpfr_fmma() {
     narrow_fmma_matches_mpfr::<3>();
     narrow_fmma_matches_mpfr::<4>();
 }
+
+#[test]
+fn mersenne31_matches_exact_rationals() {
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for _ in 0..2000 {
+        let bits = next();
+        let v = f64::from_bits(bits);
+        if v.is_finite() {
+            assert_eq!(v.mersenne31(), v.exact().and_then(|e| e.modulo_mersenne31()), "{v:e}");
+            let w = MpFloat::<4>::from_f64(v).unwrap() / MpFloat::<4>::from_f64(3.0).unwrap();
+            if w.exact().is_some() {
+                assert_eq!(w.mersenne31(), w.exact().and_then(|e| e.modulo_mersenne31()), "{w}");
+            }
+        }
+    }
+    assert_eq!(0.0f64.mersenne31(), Some(0));
+    assert_eq!(f64::NAN.mersenne31(), None);
+}

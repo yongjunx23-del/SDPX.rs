@@ -53,6 +53,10 @@ pub trait Scalar:
     fn exact(&self) -> Option<Exact> {
         None
     }
+    /// Image of the exact value in F_(2^31 - 1), for presolve rank proofs.
+    fn mersenne31(&self) -> Option<u32> {
+        self.exact().and_then(|v| v.modulo_mersenne31())
+    }
     /// Decimal text matching Display without formatting flags. Backends may
     /// avoid the extra formatted String allocation when producing JSON strings.
     fn decimal_string(&self) -> String {
@@ -127,6 +131,16 @@ macro_rules! primitive_scalar {
         impl Scalar for $t {
             fn exact(&self) -> Option<Exact> {
                 self.is_finite().then(|| Exact::from_f64(*self as f64))
+            }
+            fn mersenne31(&self) -> Option<u32> {
+                let v = *self as f64;
+                if !v.is_finite() {
+                    return None;
+                }
+                let bits = v.to_bits();
+                let (e, m) = (((bits >> 52) & 0x7ff) as i64, bits & ((1 << 52) - 1));
+                let (mantissa, exponent) = if e == 0 { (m, -1074) } else { (m | 1 << 52, e - 1075) };
+                Some(exact::mersenne31_dyadic(v < 0.0, &[mantissa], exponent))
             }
             fn wire_size() -> Option<usize> {
                 Some(std::mem::size_of::<$t>())
@@ -1228,6 +1242,19 @@ impl<const N: usize> ToPrimitive for MpFloat<N> {
 impl<const N: usize> Scalar for MpFloat<N> {
     fn decimal_string(&self) -> String {
         self.to_decimal(None)
+    }
+
+    fn mersenne31(&self) -> Option<u32> {
+        let view = self.dyadic_view();
+        match view.kind {
+            DyadicKind::Zero => Some(0),
+            DyadicKind::Finite { negative } => Some(exact::mersenne31_dyadic(
+                negative,
+                &self.limbs,
+                view.exponent as i64 - Self::PRECISION_BITS as i64,
+            )),
+            _ => None,
+        }
     }
 
     fn exact(&self) -> Option<Exact> {

@@ -31,6 +31,18 @@ impl Drop for Exact {
         }
     }
 }
+/// `±M·2^e mod (2^31 - 1)` for an integer `M` in little-endian limbs:
+/// `2^31 ≡ 1`, so `2^64 ≡ 4` and `2^e ≡ 2^(e mod 31)`.
+pub(crate) fn mersenne31_dyadic(negative: bool, limbs: &[u64], e: i64) -> u32 {
+    const P: u64 = (1 << 31) - 1;
+    let mut m = 0u64;
+    for &limb in limbs.iter().rev() {
+        m = (m * 4 + limb % P) % P;
+    }
+    let v = (m << e.rem_euclid(31)) % P;
+    (if negative && v != 0 { P - v } else { v }) as u32
+}
+
 impl Exact {
     pub(crate) fn from_f64(value: f64) -> Self {
         let mut out = Self::default();

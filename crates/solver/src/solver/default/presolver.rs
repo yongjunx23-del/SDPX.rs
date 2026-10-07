@@ -567,6 +567,29 @@ fn redundant_equalities_impl<T: FloatT>(
     if short_equalities_full_rank(A, b, &ids, &lookup) {
         return Some(Vec::new());
     }
+    // A full row rank image proves that no exact row can be removed. A
+    // singular image proves nothing: only then build the rational rows.
+    let mut images: Vec<BTreeMap<usize, u64>> = (0..ids.len()).map(|_| BTreeMap::new()).collect();
+    for (i, &r) in ids.iter().enumerate() {
+        let value = b[r].mersenne31()?;
+        if value != 0 {
+            images[i].insert(A.n, u64::from(value));
+        }
+    }
+    for c in 0..A.n {
+        for k in A.colptr[c]..A.colptr[c + 1] {
+            let i = lookup[A.rowval[k]];
+            if i != usize::MAX {
+                let value = A.nzval[k].mersenne31()?;
+                if value != 0 {
+                    images[i].insert(c, u64::from(value));
+                }
+            }
+        }
+    }
+    if modular_full_row_rank(images) {
+        return Some(Vec::new());
+    }
     let mut rows: Vec<BTreeMap<usize, Exact>> = (0..ids.len()).map(|_| BTreeMap::new()).collect();
     for (i, &r) in ids.iter().enumerate() {
         if b[r] != T::zero() {
@@ -580,11 +603,6 @@ fn redundant_equalities_impl<T: FloatT>(
                 rows[i].insert(c, A.nzval[k].exact()?);
             }
         }
-    }
-    // A full row rank image proves that no exact row can be removed. A
-    // singular image proves nothing: preserve the rational fallback below.
-    if modular_full_row_rank(&rows) {
-        return Some(Vec::new());
     }
     let mut basis: BTreeMap<usize, BTreeMap<usize, Exact>> = BTreeMap::new();
     let mut redundant = Vec::new();
@@ -635,14 +653,15 @@ fn short_equalities_full_rank<T: FloatT>(
     lookup: &[usize],
 ) -> bool {
     const P: u64 = (1 << 31) - 1;
+    // The dense basis takes m² words (8 MiB at the limit); larger systems use
+    // the sparse modular elimination below.
     let m = ids.len();
     if m == 0 || m > 1024 || a.n < m {
         return false;
     }
-    // A proof attempt is only worthwhile if it is cheaper than the exact
-    // fallback (a full minor takes about m³/2 modular updates); past this
-    // budget, defer to it unchanged.
-    let mut budget = (2 * m * m * m).clamp(16_000_000, MODULAR_BUDGET);
+    // A full minor takes about m³/2 modular updates; past twice that (a
+    // dependent system), defer to the sparse modular/rational path unchanged.
+    let mut budget = (2 * m * m * m).max(16_000_000);
     // Any nonsingular minor is a proof, so visit the columns in a fixed
     // stride order: blocks of columns sharing a row pattern are then sampled
     // early instead of exhausting the budget one block at a time.
@@ -662,7 +681,7 @@ fn short_equalities_full_rank<T: FloatT>(
         column.fill(0);
         if c == a.n {
             for (i, &r) in ids.iter().enumerate() {
-                let Some(value) = b[r].exact().and_then(|v| v.modulo_mersenne31()) else {
+                let Some(value) = b[r].mersenne31() else {
                     return false;
                 };
                 column[i] = u64::from(value);
@@ -671,7 +690,7 @@ fn short_equalities_full_rank<T: FloatT>(
             for k in a.colptr[c]..a.colptr[c + 1] {
                 let i = lookup[a.rowval[k]];
                 if i != usize::MAX {
-                    let Some(value) = a.nzval[k].exact().and_then(|v| v.modulo_mersenne31()) else {
+                    let Some(value) = a.nzval[k].mersenne31() else {
                         return false;
                     };
                     column[i] = u64::from(value);
@@ -728,23 +747,12 @@ fn inverse_mersenne31(value: u64) -> u64 {
     inverse
 }
 
-fn modular_full_row_rank(
-    rows: &[std::collections::BTreeMap<usize, sdpx_arithmetic::Exact>],
-) -> bool {
+fn modular_full_row_rank(rows: Vec<std::collections::BTreeMap<usize, u64>>) -> bool {
     use std::collections::BTreeMap;
     const P: u64 = (1 << 31) - 1;
     let mut basis: BTreeMap<usize, BTreeMap<usize, u64>> = BTreeMap::new();
     let mut budget = MODULAR_BUDGET;
-    for source in rows {
-        let mut row = BTreeMap::new();
-        for (&column, value) in source {
-            let Some(value) = value.modulo_mersenne31() else {
-                return false;
-            };
-            if value != 0 {
-                row.insert(column, u64::from(value));
-            }
-        }
+    for mut row in rows {
         loop {
             let Some((&pivot, &factor)) = row.first_key_value() else {
                 return false;

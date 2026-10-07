@@ -31,8 +31,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 _ => return None,
             }
         }
-        // Small borders amortize dense assembly; tiny problems stay on QDLDL.
-        if groups.len() < 8 || trunk.is_empty() || trunk.len() > 128 {
+        // Tiny problems stay on QDLDL.
+        if groups.len() < 8 || trunk.is_empty() {
             return None;
         }
         for col in 0..n {
@@ -54,9 +54,17 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return None;
         }
         let t = trunk.len() as u128;
-        // H/L, raw B row1 plus Y/Z, RHS work and the dense border.
+        // H/L, raw B row1 plus Y/Z, RHS work and the dense border. The dense
+        // border must not be much larger than the couplings that fill it.
         let cells = groups.len() as u128 * (2 * 25 + 5 * t + 4 * 5) + 4 * t * t + 4 * k.n as u128;
-        if cells * std::mem::size_of::<T>() as u128 > ARROW_MAX_BYTES {
+        let coupling: usize = groups
+            .iter()
+            .flat_map(|g| &g[3..])
+            .map(|&col| a.colptr[col + 1] - a.colptr[col])
+            .sum();
+        if cells * std::mem::size_of::<T>() as u128 > ARROW_MAX_BYTES
+            || t * t > 8 * coupling as u128
+        {
             return None;
         }
         let mut owner = vec![usize::MAX; k.n];

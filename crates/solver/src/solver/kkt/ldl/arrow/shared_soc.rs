@@ -40,7 +40,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 _ => trunk.push(col),
             }
         }
-        if trunk.is_empty() || trunk.len() > 128 || !trunk.iter().any(|&id| id < n) {
+        if trunk.is_empty() || !trunk.iter().any(|&id| id < n) {
             return None;
         }
         let t = trunk.len() as u128;
@@ -53,7 +53,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             .sum::<u128>()
             + 4 * t * t
             + 4 * k.n as u128;
-        if cells * std::mem::size_of::<T>() as u128 > ARROW_MAX_BYTES {
+        // The dense border must not be much larger than the couplings (the
+        // variables' A entries) that fill it.
+        let coupling = a.colptr[n];
+        if cells * std::mem::size_of::<T>() as u128 > ARROW_MAX_BYTES
+            || t * t > 8 * coupling as u128
+        {
             return None;
         }
         let mut owner = vec![usize::MAX; k.n];

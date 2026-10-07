@@ -1,10 +1,12 @@
 //! Eliminate any mix of small local cones around an equality border.
 //!
-//! Each orthant row and each second-order cone is a unit. A variable touching
-//! at most `SHARED_UNITS` units joins them, so units sharing such a variable
-//! (or a P entry) merge into one leaf: its cone rows (negative) followed by
-//! its variables (positive). Equality rows, free variables and variables
-//! touching more units form the border. Leaves couple to the border through
+//! Each orthant row and each second-order cone is a unit. Variables join the
+//! units they touch (fewest units first) while the merged leaf stays within
+//! `LEAF_MAX` coordinates, so units sharing such a variable (or a P entry)
+//! merge into one leaf: its cone rows (negative) followed by its variables
+//! (positive). Equality rows, free variables, variables shared by more than
+//! `SHARED_UNITS` units and variables that would grow a leaf past the limit
+//! form the border, as do cones too large for a leaf. Leaves couple to the border through
 //! their variables; a leaf whose cone rows also touch a border variable
 //! couples through all of its rows. This covers standard-form problems
 //! (`Ax = b`, `x ∈ K` with identity cone rows) as well as the specialized
@@ -17,12 +19,12 @@
 use super::*;
 use crate::solver::cones::{CompositeCone, Cone, SupportedCone};
 
-/// Largest leaf (cone rows plus variables) factored densely.
-const LEAF_MAX: usize = 32;
-/// A variable touching more units than this is shared and stays in the border.
+/// Largest leaf (cone rows, expansion coordinates and variables) factored
+/// densely.
+const LEAF_MAX: usize = 64;
+/// Variables shared by more units stay in the border: merging them into one
+/// leaf took about four times as many refinement solves (journal 2026-10-07).
 const SHARED_UNITS: usize = 4;
-/// Largest border; its dense factor costs t³/3.
-const BORDER_MAX: usize = 2048;
 
 impl<T: FloatT> ArrowLDLSolver<T> {
     pub(crate) fn try_local_cones(
@@ -36,13 +38,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return None;
         }
         let n = a.n;
-        debug_assert!(k.n == n + a.m && k.m == k.n && signs.len() == k.n);
+        debug_assert!(k.n >= n + a.m && k.m == k.n && signs.len() == k.n);
         // Unit coordinates: cone rows, then a large SOC's two sparse-expansion
         // coordinates (numbered after all rows, in cone order).
         let mut unit_of_row = vec![usize::MAX; a.m];
         let mut units: Vec<Vec<usize>> = Vec::new();
         let mut trunk = Vec::new();
-        let mut soc = false;
         let mut expansion = n + a.m;
         for (cone, rows) in cones.iter().zip(&cones.rng_cones) {
             match cone {
@@ -53,54 +54,70 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         units.push(vec![n + r]);
                     }
                 }
-                SupportedCone::SecondOrderCone(c) if c.numel() <= LEAF_MAX => {
-                    soc = true;
-                    unit_of_row[rows.clone()].fill(units.len());
+                SupportedCone::SecondOrderCone(_) => {
                     let mut ids: Vec<usize> = rows.clone().map(|r| n + r).collect();
                     if cone.is_sparse_expandable() {
                         ids.extend([expansion, expansion + 1]);
                         expansion += 2;
                     }
-                    units.push(ids);
+                    // A cone too large for a leaf joins the border.
+                    if ids.len() > LEAF_MAX {
+                        trunk.extend(ids);
+                    } else {
+                        unit_of_row[rows.clone()].fill(units.len());
+                        units.push(ids);
+                    }
                 }
                 _ => return None,
             }
         }
         debug_assert_eq!(expansion, k.n);
-        // Pure orthant problems keep the bound elimination or QDLDL.
-        if !soc {
-            return None;
-        }
-        let mut parent: Vec<usize> = (0..units.len()).collect();
-        let mut home = vec![usize::MAX; n];
-        let mut touched = Vec::with_capacity(SHARED_UNITS + 1);
-        for col in 0..n {
-            touched.clear();
+        let mut touches: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (col, touched) in touches.iter_mut().enumerate() {
             for &r in &a.rowval[a.colptr[col]..a.colptr[col + 1]] {
                 let u = unit_of_row[r];
                 if u != usize::MAX && !touched.contains(&u) {
                     touched.push(u);
-                    if touched.len() > SHARED_UNITS {
+                    if touched.len() > LEAF_MAX {
                         break;
                     }
                 }
             }
-            if touched.is_empty() || touched.len() > SHARED_UNITS {
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&col| (touches[col].len(), col));
+        let mut parent: Vec<usize> = (0..units.len()).collect();
+        let mut size: Vec<usize> = units.iter().map(Vec::len).collect();
+        let mut home = vec![usize::MAX; n];
+        let mut roots = Vec::new();
+        for col in order {
+            roots.clear();
+            roots.extend(touches[col].iter().map(|&u| find(&mut parent, u)));
+            roots.sort_unstable();
+            roots.dedup();
+            let total = roots.iter().map(|&r| size[r]).sum::<usize>() + 1;
+            if roots.is_empty() || total > LEAF_MAX || touches[col].len() > SHARED_UNITS {
                 trunk.push(col);
                 continue;
             }
-            home[col] = touched[0];
-            for &u in &touched[1..] {
-                let (x, y) = (find(&mut parent, touched[0]), find(&mut parent, u));
-                parent[x] = y;
+            for &r in &roots[1..] {
+                parent[r] = roots[0];
             }
+            size[roots[0]] = total;
+            home[col] = roots[0];
         }
         // P entries between leaf variables merge their leaves.
         for j in 0..n {
             for &i in &k.rowval[k.colptr[j]..k.colptr[j + 1]] {
                 if i < n && i != j && home[i] != usize::MAX && home[j] != usize::MAX {
                     let (x, y) = (find(&mut parent, home[i]), find(&mut parent, home[j]));
-                    parent[x] = y;
+                    if x != y {
+                        if size[x] + size[y] > LEAF_MAX {
+                            return None;
+                        }
+                        parent[x] = y;
+                        size[y] += size[x];
+                    }
                 }
             }
         }
@@ -123,7 +140,6 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let t = trunk.len();
         if groups.len() < 8
             || t == 0
-            || t > BORDER_MAX
             || groups.iter().any(|g| g.len() > LEAF_MAX)
             || trunk
                 .iter()

@@ -36,6 +36,8 @@ const MAX_PRIME_BITS: u32 = 26;
 const MAX_PRIMES: usize = 1024;
 /// Largest admitted per-operand exponent spread (bits).
 const MAX_SPREAD: i64 = 4096;
+/// i128 slots of all ways of one exact block product (256 MiB).
+const SLOT_BUDGET: usize = 16 << 20;
 
 /// Retained plan tables are capped at 64 MiB per table family. Eviction
 /// releases only the cache's references; active kernels keep their Arc.
@@ -1668,8 +1670,7 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
     }
     // Per-row windows `[lo_a, hi_a, lo_b, hi_b]` and per-class supports of
     // each local row (positions within the class columns).
-    let (mut lo_a, mut hi_a, mut lo_b, mut hi_b) =
-        (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
+    let (mut lo_a, mut lo_b) = (i64::MAX, i64::MAX);
     let mut windows = vec![[0i64; 4]; *first_row.last().unwrap()];
     let mut supports: Vec<Vec<Vec<bool>>> = Vec::with_capacity(classes.len());
     for (columns, members) in &classes {
@@ -1693,7 +1694,7 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
                     };
                     class_supports[local][c] |= active_a || active_b;
                 }
-                (lo_a, hi_a, lo_b, hi_b) = (lo_a.min(la), hi_a.max(ha), lo_b.min(lb), hi_b.max(hb));
+                (lo_a, lo_b) = (lo_a.min(la), lo_b.min(lb));
                 windows[first_row[bi] + local] = [la, ha, lb, hb];
             }
         }
@@ -1705,9 +1706,6 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
             out[j * m..j * m + j + 1].fill(F::zero());
         }
         return true;
-    }
-    if hi_a - lo_a > MAX_SPREAD || hi_b - lo_b > MAX_SPREAD {
-        return false;
     }
     let timer = crate::receipt::start();
     let split = split_plan(pool);
@@ -1800,8 +1798,14 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
         .max()
         .unwrap_or(0);
     let slots_per = top.div_ceil(64) + 2;
-    let next = std::sync::atomic::AtomicUsize::new(0);
     let ways = split_ways(&split).min(groups.len()).max(1);
+    // Group windows make any exponent spread encodable; only the exact
+    // accumulator grows with it. Past this, exact dots are cheaper.
+    if outputs * slots_per * ways > SLOT_BUDGET {
+        crate::receipt::finish("rns.block_gemm", timer);
+        return false;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
     let build = |_| {
         let mut slots = vec![0i128; outputs * slots_per];
         let (mut ar, mut br, mut product, mut temp) =
