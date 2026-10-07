@@ -32,7 +32,7 @@ Float64 and every MPFR width. BLAS/LAPACK are always linked (no SDP-less build).
 - `solver/kkt` — `direct`: the augmented system factored by QDLDL (serial or
   elimination-tree parallel), faer, `dense_block` (pooled tiled Cholesky) or an
   arrow LDL that eliminates local structure (`local_bounds`, `local_soc`,
-  `shared_soc`), chosen by `auto`; `condensed`: PSD/orthant blocks eliminated
+  `shared_soc`, `local_cones`), chosen by `auto`; `condensed`: PSD/orthant blocks eliminated
   into a Schur complement, factored by the direct layer. Iterative refinement.
 - `solver/sampled` — SDPB-style factored PSD blocks (bases × sample weights).
 - `solver/chordal`; `solver/distributed`: owner-partitioned data, variables,

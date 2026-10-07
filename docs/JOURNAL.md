@@ -7622,3 +7622,87 @@ a split at ≈ 220 bits (tight columns C ≈ 17, outliers C ≈ 25, per-column-p
 shifts applied to the 903 outputs per prime instead of per residue) would cut
 the common-case GEMM depth and buffers without the serial post-pass that sank
 `perf-compact`. That is the next candidate for item 11 if it is reopened.
+
+## 2026-10-07 — Review of 8a3c87f; grouped residue block Schur (kept)
+
+Review of `8a3c87f` (parallel centrality corrections): correct and bitwise
+neutral by construction (each cone keeps its own slices and arithmetic; `apply`
+hands every kernel its cone's `ds` slice). The parallel kernel allocates three
+work vectors per SOC per call; on the free-λ g0 SOCP (106,175 SOC3, Float64,
+four threads) `corrector rhs` is 17 ms of a 3.52 s solve against 3.42 s for
+e2470e6, so no regression worth a change.
+
+csdr3 operand dump (four calls; branch `perf-cc1007` diagnostic, not kept):
+row-0 entries (raw `B₀`) span 98 bits, each leaf row only 4 bits median (22
+max); row 1 (`B₁ − L₁₀B₀`) is just as tight for 99% of leaves (p90 27 bits)
+but ~1% carry cancellation residues down to 2⁻⁴³⁶, which set the global
+439-bit spread, 25 chunks per entry and 71 primes for every row. Per-row
+pairing does not shrink the global range (the same rows hold the tiny `a`
+and `b` entries), but sorted 256-row groups with their own window and primes
+model to 0.18× residue conversion and 0.42× prime products.
+
+Kept (`c7e74a5` in the work clone): rows of each support class are sorted by
+`lo_a + lo_b` and cut into groups of at most 256; each group encodes against
+its own window, takes its own plan (23-bit primes at k ≤ 256), reconstructs
+its exact integer, and adds it into i128 slots at its offset from the lowest
+group base; each output is rounded once. Results are bitwise unchanged.
+`rns.block_gemm` 1.345 → 0.52 s (four threads), 2.25 → 1.28 s (one thread).
+
+| csdr3 MPFR256, release A/B/B/A, Mac M4 (load 3.4–3.9) | base `cc1007-base-rel` | `cc1007-cones-rel` |
+|---|---|---|
+| four threads, median API | 5.641 s | 4.679 s (−17.1%, CPU −18.0%) |
+| four threads, peak RSS | 237–239 MiB | 212–216 MiB |
+| one thread, median API | 14.782 s | 13.792 s (−6.7%) |
+| one thread, peak RSS | 184 MiB | 178–180 MiB |
+
+Points `e658ecd790a7d3d1` in all runs; audits pass.
+
+## 2026-10-07 — Local cone arrow for standard-form MPFR problems (kept)
+
+Workload: the crossing SOCP of `massive case with real/massive dual
+reproduce/mosek_sdpx_benchmark` (20,022 variables; 271 equality rows holding
+2,028,268 of 2,048,289 entries; 14,021 orthant and 2,000 SOC3 rows, each a ±1
+identity row on one variable; one free variable; 9 distinct equality-row
+patterns). Its run_001 MPFR128 solve (tol 1e-18) took 698.8 s on serial
+QDLDL (`QDLDLSTRUCT n=40314 serial`): 4.7 s per refactor (the 272×272 border
+Schur by scalar MPFR updates), 0.2 s per triangular solve, 1,357 refinements
+for 292 right-hand sides. No arrow layout applied: local SOC needs pure SOC3
+with two variables per cone and a border ≤ 128, local bounds pure orthant,
+generic arrow puts all 20,292 rows in the border.
+
+Kept (`d46f718`): `LocalStructure::Cones`, tried after the local SOC, shared
+SOC and bound layouts. Units are orthant rows and second-order cones (≤ 32
+rows); variables touching ≤ 4 units merge them into one leaf (cone rows then
+variables), other variables and equality rows form the border (≤ 2048).
+Leaves store B/Y/Z over their own border columns; leaves with equal column
+lists form coupling classes used by the border coupling and the Schur
+assembly. `gemm_blocks_upper` takes blocks of any width with their own
+column lists and now runs from 128 bits (exact dots cost ~20 ns per term
+there; residue products ~17× less on this shape). MPFR only.
+
+| crossing SOCP, MPFR128, 4 threads, 1e-18 | QDLDL (run_001) | local_cone_arrow |
+|---|---|---|
+| status / iterations | Solved / 63 | Solved / 63 |
+| objective | −8.075179368810715447830037 | −8.075179368810715447830029 |
+| native (incl. 4.06 s setup) | 698.8 s | 31.9 s (release, loaded host) |
+| refactor | 4.7 s | 0.14 s (local Schur 71 ms) |
+| refinements / linear solves | 1,357 / 1,649 | 85 / 377 |
+| peak RSS | 0.95 GB | 1.61 GB |
+
+Residuals match to four digits (5.117e-22 / 8.6275e-20). The last
+factorization (μ ≈ 1e-21) fails in the border: S reaches 3.4e80 while its
+near-null directions lie below 128-bit resolution, 23 pivots are clamped to
+δ = 1e-30, and each clamp roughly doubles the trailing exponents until MPFR
+overflows; that factorization falls back to QDLDL (5.3 s, +480 MiB). The
+arrow itself adds ~145 MiB during iterations (1051 vs 907 MiB at iteration 2).
+
+Binary64 with the same structure: 8.4 s but AlmostSolved/47 with dual
+residual 1.4e-6, against pinned faer 79.9 s AlmostSolved/300 at 7.9e-9; the
+binary64 border loses accuracy, so the structure stays MPFR-only.
+
+Checks: parity set 49/49 bitwise identical to the base; csdr3 at 128 bits
+identical with `arrow.local_schur` 0.83 → 0.34 s (exact dots → residues);
+ising11 point `c7491bd8594d4320`; two synthetic mixed problems (SOC3/SOC5,
+orthant, boxed variables merging two units, variables shared by six cones,
+a free variable, an uncoupled cone, a cross-leaf P entry) match QDLDL to
+~1e-32 at MPFR128. Evidence: `$SDPX_E2E_HOME/work/cc1007/`.

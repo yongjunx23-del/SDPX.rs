@@ -25,6 +25,20 @@ solve 2.02 s/50 it (objective error 4.5e-7) → 9 ms/0 it (6.6e-14), whole CLI
 
 ### Performance
 
+- MPFR standard-form conic problems: any mix of small orthant/SOC cones whose
+  rows touch only their own variables is eliminated leaf by leaf around the
+  equality rows (`local_cone_arrow`), with an exact residue border Schur
+  complement from 128 bits. Crossing SOCP (20,022 variables, 271 dense
+  equality rows, 14,021 orthant and 2,000 SOC3 identity rows), MPFR128 at
+  1e-18: Solved/63 as before, objective within 8e-24, native 698.8 → 31.9 s
+  on four threads; refinements 1,357 → 85. Its last factorization falls back
+  to QDLDL, and peak RSS rises 0.95 → 1.61 GB. Binary64 keeps the
+  augmented factorization (the binary64 border loses accuracy there).
+- Local SOC residue Schur: rows are sorted by exponent window and each group
+  of 256 rows encodes against its own window with its own primes; the exact
+  group integers are added before one rounding, so results are unchanged.
+  csdr3 MPFR256 release A/B/B/A: −17.1% at four threads (peak RSS 238 → 214
+  MiB) and −6.7% at one thread (184 → 179 MiB), identical points.
 - Gondzio multiple centrality correctors (approved 2026-10-07) on orthant
   rows, second-order cones (spectral) and τκ, for symmetric problems with
   orthant or SOC rows: parity set iterations 993 → 849; larger gravity
