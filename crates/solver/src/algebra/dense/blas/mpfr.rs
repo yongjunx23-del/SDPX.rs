@@ -13,16 +13,13 @@ use rayon::prelude::*;
 use sdpx_arithmetic::{MpFloat, Scalar};
 type F<const N: usize> = MpFloat<N>;
 
-// Minimum trailing column/element count before a kernel offers independent
-// column work to the ambient solver pool while `inner_parallel` is active;
-// smaller tails stay serial to avoid dispatch overhead.
-const PAR_COLS: usize = 4;
-
-// True when this kernel may re-offer independent column work to the ambient
-// Rayon pool. Only solver-pool lanes set the TLS gate, so par iterators here
-// join the solver pool rather than the global pool.
-fn inner_par() -> bool {
-    sdpx_arithmetic::inner_parallel::active()
+// Tasks worth offering to the ambient Rayon pool for `mul_adds` exact
+// multiply-adds over `items` independent pieces: only solver-pool lanes set
+// the inner-parallel gate, so par iterators here join the solver pool, and
+// every task carries at least one grain of work (small blocks stay serial).
+fn inner_tasks<const N: usize>(mul_adds: usize, items: usize) -> usize {
+    let weight = sdpx_arithmetic::inner_parallel::weight(<F<N> as Scalar>::precision_bits());
+    sdpx_arithmetic::inner_parallel::tasks(mul_adds as u128 * weight, items)
 }
 
 fn upper(c: u8) -> u8 {
@@ -88,10 +85,12 @@ fn output_columns<const N: usize>(
     rows: usize,
     columns: usize,
     ld: usize,
+    inner: usize,
     parallel: Option<(&rayon::ThreadPool, usize)>,
     column: impl Fn(usize, &mut [F<N>]) + Sync,
 ) {
     let used = (columns - 1) * ld + rows;
+    let tasks = inner_tasks::<N>(rows * columns * inner.max(1), columns);
     if let Some((pool, tile)) =
         parallel.filter(|(pool, tile)| pool.current_num_threads() > 1 && *tile > 0)
     {
@@ -106,10 +105,10 @@ fn output_columns<const N: usize>(
                     }
                 })
         });
-    } else if inner_par() && columns >= PAR_COLS {
-        // Called on a solver-pool lane without an explicit pool: offer the
-        // same complete-column tiles to the ambient pool.
-        let tile = columns.div_ceil(4 * rayon::current_num_threads()).max(1);
+    } else if tasks > 1 {
+        // Called on a solver-pool lane without an explicit pool: offer
+        // complete-column tiles to the ambient pool.
+        let tile = columns.div_ceil(tasks);
         c[..used]
             .par_chunks_mut(tile * ld)
             .enumerate()
@@ -197,9 +196,11 @@ fn syrk_output_columns<const N: usize>(
     n: usize,
     ld: usize,
     upper: bool,
+    inner: usize,
     parallel: Option<(&rayon::ThreadPool, usize)>,
     column: impl Fn(usize, &mut [F<N>]) + Sync,
 ) {
+    let tasks = inner_tasks::<N>(n * (n + 1) / 2 * inner.max(1), n);
     let packed = upper && ld == n && c.len() == n * (n + 1) / 2;
     let used = if packed { c.len() } else { (n - 1) * ld + n };
     if let Some((pool, tile)) = parallel.filter(|(p, t)| p.current_num_threads() > 1 && *t > 0) {
@@ -219,10 +220,10 @@ fn syrk_output_columns<const N: usize>(
                 &column,
             )
         });
-    } else if inner_par() && n >= PAR_COLS {
+    } else if tasks > 1 {
         // Ambient-pool fallback on a solver-pool lane; split_syrk_columns
         // keeps the triangular load balanced across lanes.
-        let lanes = (4 * rayon::current_num_threads()).min(n).max(1);
+        let lanes = tasks;
         split_syrk_columns(
             &mut c[..used],
             n,
@@ -338,7 +339,7 @@ fn gemm<const N: usize>(
             column[i] = axpby(alpha, v, beta, column[i]);
         }
     };
-    output_columns(c, m as usize, n as usize, ldc as usize, parallel, column);
+    output_columns(c, m as usize, n as usize, ldc as usize, k as usize, parallel, column);
 }
 /// Structural gate for the exact residue-BLAS product: enough multiply work
 /// per output to amortize encode and CRT reconstruction. Both paths return the
@@ -605,6 +606,7 @@ fn syrk<const N: usize>(
         n as usize,
         ldc as usize,
         upper(u) == b'U',
+        k as usize,
         parallel,
         column,
     );
@@ -690,8 +692,9 @@ impl<const N: usize> Xsyr2kScalar for F<N> {
                 cj[i] = axpby(alpha, v, beta, cj[i]);
             }
         };
-        if inner_par() && n >= PAR_COLS && ldc == n {
-            let tile = n.div_ceil(4 * rayon::current_num_threads()).max(1);
+        let tasks = inner_tasks::<N>(n * (n + 1) * k, n);
+        if tasks > 1 && ldc == n {
+            let tile = n.div_ceil(tasks);
             c[..n * ldc]
                 .par_chunks_mut(tile * ldc)
                 .enumerate()
@@ -744,10 +747,12 @@ impl<const N: usize> XpotrfScalar for F<N> {
             // Each trailing update reads only completed columns and writes a
             // disjoint element, so it can join the ambient pool under the
             // solver's inner-parallel gate.
-            if inner_par() && tail >= PAR_COLS && upper(u) == b'L' {
+            let tasks = inner_tasks::<N>(tail * j.max(1), tail);
+            if tasks > 1 && upper(u) == b'L' {
                 let (done, rest) = a.split_at_mut(j * ld);
                 rest[j + 1..n]
                     .par_iter_mut()
+                    .with_min_len(tail.div_ceil(tasks))
                     .enumerate()
                     .for_each(|(t, q)| {
                         let i = j + 1 + t;
@@ -757,9 +762,9 @@ impl<const N: usize> XpotrfScalar for F<N> {
                         }
                         *q = v / d;
                     });
-            } else if inner_par() && tail >= PAR_COLS {
+            } else if tasks > 1 {
                 let (head, right) = a.split_at_mut((j + 1) * ld);
-                right.par_chunks_mut(ld).for_each(|col| {
+                right.par_chunks_mut(ld).with_min_len(tail.div_ceil(tasks)).for_each(|col| {
                     let mut v = col[j];
                     for k in 0..j {
                         v = (-col[k]).mul_add(head[k + j * ld], v);
@@ -852,14 +857,11 @@ impl<const N: usize> XpotrsScalar for F<N> {
         };
         // One task owns each complete RHS; the dependent triangular sweeps
         // inside a column retain exactly the serial arithmetic order.
-        let parallel = inner_par()
-            && rayon::current_num_threads() > 1
-            && nrhs >= PAR_COLS
-            && (n as u128) * (n as u128) * (nrhs as u128) >= 4096;
-        if parallel {
+        let tasks = inner_tasks::<N>(n * n * nrhs, nrhs);
+        if tasks > 1 && rayon::current_num_threads() > 1 {
             #[cfg(test)]
             POOLED_POTRS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let tile = nrhs.div_ceil(4 * rayon::current_num_threads()).max(1);
+            let tile = nrhs.div_ceil(tasks);
             b[..(nrhs - 1) * lb + n]
                 .par_chunks_mut(tile * lb)
                 .for_each(|tile| {

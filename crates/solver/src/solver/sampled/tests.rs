@@ -1001,7 +1001,7 @@ fn sampled_duplicate_basis_512() {
 fn pooled_linear_products<T: FloatT>() {
     // The two sampled blocks own the rows above the ordinary CSC part, which is
     // the operator's only unbounded serial section.
-    let (ordinary_rows, cols_per_block) = (600usize, 80usize);
+    let (ordinary_rows, cols_per_block) = (2000usize, 80usize);
     let block = SampledBlock {
         row_start: 0,
         column_start: 0,
@@ -1031,14 +1031,15 @@ fn pooled_linear_products<T: FloatT>() {
     };
     let (mut r, mut cidx, mut v) = (Vec::new(), Vec::new(), Vec::new());
     for column in 0..n {
-        for _ in 0..400 {
+        // Enough entries for several lanes of one inner-parallel grain each.
+        for _ in 0..1000 {
             r.push((next() % ordinary_rows as u64) as usize);
             cidx.push(column);
             v.push(c::<T>((next() % 19) as i32 - 9) / c(7));
         }
     }
     let linear = CscMatrix::new_from_triplets(m, n, r, cidx, v);
-    assert!(linear.nnz() >= 32768);
+    assert!(linear.nnz() >= 3 * 32768);
     let operator = SampledOperator::new(linear, vec![first, second]).unwrap();
     let mut serial = SampledWorkspace::new(&operator);
     let mut pooled = SampledWorkspace::new(&operator);

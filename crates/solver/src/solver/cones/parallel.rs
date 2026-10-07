@@ -164,11 +164,15 @@ impl ConeThreading {
             prefix.push(prefix.last().unwrap().saturating_add(cone_cost(cone)));
         }
         let total = *prefix.last().unwrap();
-        // The requested budget is a contract: the cone worker count reported to
-        // callers must equal it. Sizing the pool below the request measured
-        // faster on a PSD problem with fewer cones than threads, but that needs
-        // a metadata and benchmark-gate change, so it is not applied here.
+        // A new pool is no wider than the PSD work can keep busy (see
+        // `useful_width`); receipts report the width actually used.
+        let cap = if existing.is_none() {
+            useful_width(cones)
+        } else {
+            usize::MAX
+        };
         let workers = budget
+            .min(cap)
             .min(if single_orthant {
                 cones[0].numel()
             } else {
@@ -233,7 +237,7 @@ impl ConeThreading {
             None => std::sync::Arc::new(
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(workers)
-                    .start_handler(pin_worker(workers))
+                    .start_handler(pin_worker(budget, workers))
                     .build()?,
             ),
         };
@@ -250,14 +254,71 @@ impl ConeThreading {
     }
 }
 
+/// Workers an MPFR problem with PSD cones can keep busy: one per PSD cone
+/// up to `psd_unit` of cost, one more per further unit, and the other cones'
+/// cost in the same units, times `WIDTH_FACTOR`. Idle workers beyond
+/// this only spin between the many short parallel phases, and the busy-wait
+/// lowers the clock of the cores doing the work: ising11 (22 PSD cones of
+/// order 12–16) ran at 3.12 GHz / IPC 2.69 on 8 threads but 2.35 GHz / IPC
+/// 0.83 on 64, with useful instructions unchanged (journal 2026-10-07).
+/// Problems without PSD cones and binary64 keep the requested width.
+fn useful_width<T: FloatT>(cones: &[SupportedCone<T>]) -> usize {
+    if T::precision_bits() <= 64 {
+        return usize::MAX;
+    }
+    let unit = psd_unit::<T>();
+    let (mut units, mut other, mut psd) = (0u128, 0u128, false);
+    for cone in cones {
+        if matches!(cone, SupportedCone::PSDTriangleCone(_)) {
+            psd = true;
+            units += cone_cost(cone).div_ceil(unit).max(1);
+        } else {
+            other += cone_cost(cone);
+        }
+    }
+    if !psd {
+        return usize::MAX;
+    }
+    units += other.div_ceil(unit);
+    let width = (units as f64 * width_factor()).ceil();
+    if width >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        (width as usize).max(2)
+    }
+}
+
+/// Cost (`cone_cost`) one worker absorbs per PSD cone: a cone of order 64.
+fn psd_unit<T: FloatT>() -> u128 {
+    let words = T::precision_bits().div_ceil(64) as u128;
+    64u128.pow(3) * words * words
+}
+
+/// Width per useful unit (`SDPX_DEV_WIDTH` overrides it for calibration).
+const WIDTH_FACTOR: f64 = 1.25;
+
+fn width_factor() -> f64 {
+    static OVERRIDE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("SDPX_DEV_WIDTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f64| *v > 0.0)
+            .unwrap_or(WIDTH_FACTOR)
+    })
+}
+
 /// SDPB-style static placement: when the process is bound to exactly as
-/// many CPUs as there are workers (numactl/taskset/MPI binding gave it its
-/// own cores), worker `i` is bound to the i-th of them for its lifetime. A
-/// wider mask is left alone, so unbound processes sharing a node never
-/// collide on the same cores. Measured −4% at 52 threads (Λ19 spins 0–50). Unpinned workers migrate between cores and lose
+/// many CPUs as the requested thread budget (numactl/taskset/MPI binding
+/// gave it its own cores), worker `i` is bound to the i-th of them for its
+/// lifetime. A wider mask is left alone, so unbound processes sharing a node
+/// never collide on the same cores. Measured −4% at 52 threads (Λ19 spins 0–50). Unpinned workers migrate between cores and lose
 /// their caches, and at high thread counts every phase (serial ones too)
-/// measured 20–40% slower per call. Linux only; elsewhere a no-op.
-fn pin_worker(workers: usize) -> impl Fn(usize) + Send + Sync + 'static {
+/// measured 20–40% slower per call. When the pool is narrower than the
+/// budget (`useful_width`), the calling (main) thread is confined to the
+/// workers' CPUs as well, so it neither wanders to another NUMA domain nor
+/// first-touches the solver's memory there. Linux only; elsewhere a no-op.
+fn pin_worker(budget: usize, workers: usize) -> impl Fn(usize) + Send + Sync + 'static {
     #[cfg(target_os = "linux")]
     let cpus: Vec<usize> = unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
@@ -271,7 +332,19 @@ fn pin_worker(workers: usize) -> impl Fn(usize) + Send + Sync + 'static {
     };
     #[cfg(not(target_os = "linux"))]
     let cpus: Vec<usize> = Vec::new();
-    let pin = cpus.len() == workers;
+    let pin = cpus.len() == budget;
+    #[cfg(target_os = "linux")]
+    if pin && workers < budget {
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for &c in &cpus[..workers] {
+                libc::CPU_SET(c, &mut set);
+            }
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = workers;
     move |i: usize| {
         #[cfg(target_os = "linux")]
         if pin {

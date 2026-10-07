@@ -288,18 +288,36 @@ enum Split<'a> {
     Serial,
 }
 
-fn split_plan(pool: Option<&rayon::ThreadPool>) -> Split<'_> {
+/// Granted ways are capped so that each prime group carries at least
+/// `WAY_WORK` residue multiply-adds (`work` counts them over all primes):
+/// splitting a small product only adds CRT accumulators to merge.
+fn split_plan(pool: Option<&rayon::ThreadPool>, work: u128) -> Split<'_> {
     if let Some(p) =
         pool.filter(|p| p.current_num_threads() > 1 && rayon::current_thread_index().is_none())
     {
         return Split::Pool(p);
     }
-    let ways = SPLIT_HINT.with(|c| c.get());
+    let ways = SPLIT_HINT.with(|c| c.get()).min((work / way_work()).min(usize::MAX as u128) as usize);
     if ways > 1 && rayon::current_thread_index().is_some() {
         Split::Ways(ways)
     } else {
         Split::Serial
     }
+}
+
+/// Residue multiply-adds one extra way must carry (`SDPX_DEV_WAY_WORK`
+/// overrides it for calibration runs).
+const WAY_WORK: u128 = 1 << 18;
+
+fn way_work() -> u128 {
+    static OVERRIDE: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("SDPX_DEV_WAY_WORK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(WAY_WORK)
+            .max(1)
+    })
 }
 
 /// Exact product of integer-valued f64 matrices whose partial sums stay below
@@ -1578,7 +1596,7 @@ pub(super) fn gemm<const N: usize>(
         lda,
         ldb,
     };
-    let split = split_plan(pool);
+    let split = split_plan(pool, (m * n * k) as u128 * plan.count() as u128);
     let ca = packed_operand(av, lo_a, da, &plan, &split);
     let cb = (!same_operand).then(|| match cache_b {
         Some(cache) => cache.operand(bv, lo_b, db, &plan, &split),
@@ -1714,7 +1732,7 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
         return true;
     }
     let timer = crate::receipt::start();
-    let split = split_plan(pool);
+    let split = split_plan(pool, u128::MAX);
     struct Group {
         /// Global output columns and their positions in the blocks' columns.
         columns: Vec<usize>,
@@ -1970,7 +1988,7 @@ pub(super) fn diag_congruence<const N: usize>(
     let Some(plan) = Plan::new(k, needed) else {
         return false;
     };
-    let split = split_plan(pool);
+    let split = split_plan(pool, (m * m * k) as u128 * plan.count() as u128);
     let entry = match cached.filter(|e| e.bits == plan.bits && e.count >= plan.count()) {
         Some(entry) => entry,
         None => {
@@ -2315,12 +2333,40 @@ pub(super) fn congruence<const N: usize>(
             *v = reduce(*v, p, pinv);
         }
     };
-    let split = split_plan(pool);
+    let split = split_plan(pool, (m * k * (m + k)) as u128 * plan.count() as u128);
     let ca = match cache_a {
         Some(cache) => cache.operand(av, lo_a, da, &plan, &split),
         None => Operand::Chunks(chunk_matrix(av, lo_a, da, &plan, &split)),
     };
     let cx = chunk_matrix(xv, lo_x, dx, &plan, &split);
+    // A granted split shares output columns rather than primes: no CRT
+    // accumulator is merged, and one fork covers the whole product.
+    let ways = split_ways(&split).min(m / CONGRUENCE_MIN_COLS).max(1);
+    if ways > 1 {
+        let timer = crate::receipt::start();
+        let ok = congruence_columns(
+            CongruenceShape {
+                ta,
+                ta_n,
+                m,
+                k,
+                lda,
+                ldx,
+                len_a,
+                len_x,
+                upper_only,
+            },
+            &plan,
+            &ca,
+            &cx,
+            &split,
+            ways,
+            2 * lo_a + lo_x,
+            out,
+        );
+        crate::receipt::finish("rns.congruence.columns", timer);
+        return ok;
+    }
     let selected = selection(m, m, upper_only);
     let timer = (split_ways(&split) > 1)
         .then(crate::receipt::start)
@@ -2350,6 +2396,145 @@ pub(super) fn congruence<const N: usize>(
     );
     crate::receipt::finish("rns.congruence.shared_crt", timer);
     acc.finish(&plan, 2 * lo_a + lo_x, out, &split)
+}
+
+/// Fewest output columns one way of a split congruence computes.
+const CONGRUENCE_MIN_COLS: usize = 4;
+
+#[derive(Clone, Copy)]
+struct CongruenceShape {
+    ta: u8,
+    ta_n: bool,
+    m: usize,
+    k: usize,
+    lda: usize,
+    ldx: usize,
+    len_a: usize,
+    len_x: usize,
+    upper_only: bool,
+}
+
+/// `C = op(A)·X·op(A)ᵀ` with its output columns shared over `ways`. Both
+/// operands' residues are formed once for every prime (prime groups split
+/// over the ways); each way then forms `T = X·op(A)[cols,:]ᵀ` and
+/// `C[:, cols] = op(A)·T` per prime and reconstructs its own outputs. Every
+/// output's exact integer, CRT digits and rounding are those of the
+/// unsplit product, so the result is bitwise identical.
+#[allow(clippy::too_many_arguments)]
+fn congruence_columns<const N: usize>(
+    shape: CongruenceShape,
+    plan: &Plan,
+    ca: &Operand,
+    cx: &ChunkMatrix,
+    split: &Split<'_>,
+    ways: usize,
+    scale: i64,
+    out: &mut [F<N>],
+) -> bool {
+    let CongruenceShape {
+        ta,
+        ta_n,
+        m,
+        k,
+        lda,
+        ldx,
+        len_a,
+        len_x,
+        upper_only,
+    } = shape;
+    let count = plan.count();
+    let mut ares = take_buffer(count * len_a);
+    let mut xres = take_buffer(count * len_x);
+    let per = count.div_ceil(ways);
+    let mut fill = || {
+        ares.par_chunks_mut(per * len_a)
+            .zip(xres.par_chunks_mut(per * len_x))
+            .enumerate()
+            .for_each(|(w, (a, x))| {
+                let (q0, q1) = (w * per, (w * per + per).min(count));
+                let mut buf = Vec::new();
+                ca.residues(plan, q0, q1, &mut buf);
+                a.copy_from_slice(&buf[..(q1 - q0) * len_a]);
+                group_residues(cx.view(), plan, q0, q1, &mut buf);
+                x.copy_from_slice(&buf[..(q1 - q0) * len_x]);
+            })
+    };
+    match split {
+        Split::Pool(p) => p.install(fill),
+        _ => fill(),
+    }
+    // Contiguous column ranges; an upper triangle weights later columns more.
+    let weight = |j: usize| if upper_only { j as u128 + 1 } else { m as u128 };
+    let total: u128 = (0..m).map(weight).sum();
+    let mut bounds = vec![0];
+    let mut acc_w = 0u128;
+    for j in 0..m {
+        acc_w += weight(j);
+        if acc_w * ways as u128 >= total * bounds.len() as u128 && bounds.len() < ways {
+            bounds.push(j + 1);
+        }
+    }
+    bounds.push(m);
+    bounds.dedup();
+    let parts = bounds.len() - 1;
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    let optr = SendValues(out.as_mut_ptr());
+    let (ar, xr) = (&ares, &xres);
+    let tb = if ta_n { b'T' } else { b'N' };
+    let part = |w: usize| {
+        let (j0, j1) = (bounds[w], bounds[w + 1]);
+        let width = j1 - j0;
+        let outputs = m * width;
+        let selected: Vec<usize> = if upper_only {
+            (j0..j1)
+                .flat_map(|j| (0..=j).map(move |i| i + (j - j0) * m))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut acc =
+            CrtAccumulator::new(plan, if upper_only { selected.len() } else { outputs }, &selected);
+        // Rows j0.. of op(A) (A itself when ta = 'N', else its columns).
+        let a_cols = if ta_n { j0 } else { j0 * lda };
+        let group = stream_group_cap(outputs);
+        let mut prod = take_buffer(group * outputs);
+        let mut t = take_buffer(k * width);
+        for q0 in (0..count).step_by(group) {
+            let q1 = (q0 + group).min(count);
+            for q in q0..q1 {
+                let (p, pinv) = (plan.p[q], plan.pinv[q]);
+                let aq = &ar[q * len_a..(q + 1) * len_a];
+                let xq = &xr[q * len_x..(q + 1) * len_x];
+                int_gemm(b'N', tb, k, width, k, xq, ldx, &aq[a_cols..], lda, &mut t, k);
+                for v in t.iter_mut() {
+                    *v = reduce(*v, p, pinv);
+                }
+                let cq = &mut prod[(q - q0) * outputs..(q - q0 + 1) * outputs];
+                int_gemm(ta, b'N', m, width, k, aq, lda, &t, k, cq, m);
+                for v in cq.iter_mut() {
+                    *v = reduce(*v, p, pinv);
+                }
+            }
+            acc.add(plan, q0, q1, &mut prod, outputs, &Split::Serial);
+        }
+        release_buffer(prod);
+        release_buffer(t);
+        let mut local = vec![F::<N>::zero(); outputs];
+        if !acc.finish(plan, scale, &mut local, &Split::Serial) {
+            failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        for j in j0..j1 {
+            for i in 0..if upper_only { j + 1 } else { m } {
+                // SAFETY: column ranges are disjoint across ways.
+                unsafe { *optr.get().add(i + j * m) = local[i + (j - j0) * m] };
+            }
+        }
+    };
+    run_ways(split, parts, part);
+    release_buffer(ares);
+    release_buffer(xres);
+    !failed.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Correctly rounded `v[k] = Σ_{i≤j} c_ij·x_t·q_ik·q_jk` for `k < kmax`, where
@@ -2451,7 +2636,7 @@ pub(super) fn svec_quadratic<const N: usize>(
         }
     };
     let scale = sigma + lo_x + 2 * lo_q;
-    let split = split_plan(pool);
+    let split = split_plan(pool, (h * h * kmax) as u128 * plan.count() as u128);
     let cq = match cache_q {
         Some(cache) => cache.operand(qv, lo_q, dq, &plan, &split),
         None => Operand::Chunks(chunk_matrix(qv, lo_q, dq, &plan, &split)),
@@ -2562,7 +2747,7 @@ pub(super) fn symmetric_bilinear<const N: usize>(
     if plan.k_chunk < h {
         return false;
     }
-    let split = split_plan(None);
+    let split = split_plan(None, (h * h * columns) as u128 * plan.count() as u128);
     let cq = cache_q.operand(qv, lo_q, dq, &plan, &split);
     let cx = chunk_matrix(xv, lo_x, dx, &plan, &split);
     let (len_q, len_x, count) = (qv.len(), xv.len(), pairs.len());

@@ -95,13 +95,23 @@ impl SparseParallel {
         }
     }
 
-    pub(crate) fn configure<T>(&mut self, a: &CscMatrix<T>, pool: Option<Arc<rayon::ThreadPool>>) {
+    pub(crate) fn configure<T: FloatT>(
+        &mut self,
+        a: &CscMatrix<T>,
+        pool: Option<Arc<rayon::ThreadPool>>,
+    ) {
         let workers = pool.as_ref().map_or(1, |p| p.current_num_threads());
         self.pool = pool;
         if self.workers != workers {
             self.workers = workers;
-            self.row_lanes = partitions(&self.rowptr, workers);
-            self.column_lanes = partitions(&a.colptr, workers);
+            // Every lane carries at least one grain of multiply-adds; extra
+            // lanes on a small operator only add fork-join latency.
+            let grain = sdpx_arithmetic::inner_parallel::grain().max(1);
+            let work = self.entries.len() as u128
+                * sdpx_arithmetic::inner_parallel::weight(T::precision_bits());
+            let lanes = workers.min((work / grain).max(1).min(usize::MAX as u128) as usize);
+            self.row_lanes = partitions(&self.rowptr, lanes);
+            self.column_lanes = partitions(&a.colptr, lanes);
         }
     }
 

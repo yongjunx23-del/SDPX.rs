@@ -139,7 +139,11 @@ macro_rules! primitive_scalar {
                 }
                 let bits = v.to_bits();
                 let (e, m) = (((bits >> 52) & 0x7ff) as i64, bits & ((1 << 52) - 1));
-                let (mantissa, exponent) = if e == 0 { (m, -1074) } else { (m | 1 << 52, e - 1075) };
+                let (mantissa, exponent) = if e == 0 {
+                    (m, -1074)
+                } else {
+                    (m | 1 << 52, e - 1075)
+                };
                 Some(exact::mersenne31_dyadic(v < 0.0, &[mantissa], exponent))
             }
             fn wire_size() -> Option<usize> {
@@ -1641,6 +1645,46 @@ pub mod inner_parallel {
     #[inline]
     pub fn paired() -> bool {
         PAIRED.with(Cell::get)
+    }
+
+    /// Work, in 64-bit limb products, that one extra pool task must carry
+    /// before an inner region is split (`SDPX_DEV_GRAIN` overrides it for
+    /// calibration runs).
+    pub const GRAIN: u128 = 1 << 15;
+
+    /// The effective grain ([`GRAIN`] unless overridden).
+    pub fn grain() -> u128 {
+        static GRAIN_OVERRIDE: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+        *GRAIN_OVERRIDE.get_or_init(|| {
+            std::env::var("SDPX_DEV_GRAIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(GRAIN)
+        })
+    }
+
+    /// Limb-product weight of one multiply-add at `bits` of precision.
+    #[inline]
+    pub fn weight(bits: usize) -> u128 {
+        let limbs = bits.div_ceil(64).max(1) as u128;
+        limbs * limbs
+    }
+
+    /// Tasks worth creating for `work` limb products spread over `items`
+    /// independent pieces when `enabled`: at least one grain per task, at
+    /// most one task per piece. One means stay serial.
+    #[inline]
+    pub fn tasks_if(enabled: bool, work: u128, items: usize) -> usize {
+        if !enabled || items < 2 {
+            return 1;
+        }
+        (work / grain().max(1)).min(items as u128).max(1) as usize
+    }
+
+    /// [`tasks_if`] under the inner-parallel gate ([`active`]).
+    #[inline]
+    pub fn tasks(work: u128, items: usize) -> usize {
+        tasks_if(active(), work, items)
     }
 
     /// RAII guard enabling [`active`]/[`paired`] until dropped.

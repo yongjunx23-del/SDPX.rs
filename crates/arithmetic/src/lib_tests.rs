@@ -762,10 +762,18 @@ fn mersenne31_matches_exact_rationals() {
         let bits = next();
         let v = f64::from_bits(bits);
         if v.is_finite() {
-            assert_eq!(v.mersenne31(), v.exact().and_then(|e| e.modulo_mersenne31()), "{v:e}");
+            assert_eq!(
+                v.mersenne31(),
+                v.exact().and_then(|e| e.modulo_mersenne31()),
+                "{v:e}"
+            );
             let w = MpFloat::<4>::from_f64(v).unwrap() / MpFloat::<4>::from_f64(3.0).unwrap();
             if w.exact().is_some() {
-                assert_eq!(w.mersenne31(), w.exact().and_then(|e| e.modulo_mersenne31()), "{w}");
+                assert_eq!(
+                    w.mersenne31(),
+                    w.exact().and_then(|e| e.modulo_mersenne31()),
+                    "{w}"
+                );
             }
         }
     }

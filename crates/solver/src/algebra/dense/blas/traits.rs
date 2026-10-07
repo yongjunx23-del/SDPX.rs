@@ -100,8 +100,13 @@ pub trait XpotrsScalar: Sized {
                 column[i] = v / a[i+i*n];
             }
         };
-        if sdpx_arithmetic::inner_parallel::active() && n*b.len() >= 16384 {
-            b.par_chunks_mut(n).for_each(solve);
+        let rhs = b.len() / n.max(1);
+        let tasks = sdpx_arithmetic::inner_parallel::tasks(
+            (n * n * rhs) as u128 / 2 * sdpx_arithmetic::inner_parallel::weight(Self::precision_bits()),
+            rhs,
+        );
+        if tasks > 1 {
+            b.par_chunks_mut(n).with_min_len(rhs.div_ceil(tasks)).for_each(solve);
         } else {
             b.chunks_mut(n).for_each(solve);
         }

@@ -288,6 +288,36 @@ fn check_congruence<const N: usize, const M: usize>(m: usize, k: usize, spread: 
             .iter()
             .zip(&got)
             .all(|(p, q)| p == q || (p.is_zero() && q.is_zero())));
+        // Upper-triangle outputs split by columns: identical upper entries,
+        // and the strict lower triangle is left untouched.
+        let mut upper = vec![F::zero(); m * m];
+        assert!(congruence(
+            ta, m, k, &a, ar, &x, k, true, None, &mut upper, None
+        ));
+        let mut upper_split = vec![<F<N> as num_traits::One>::one(); m * m];
+        assert!(congruence(
+            ta,
+            m,
+            k,
+            &a,
+            ar,
+            &x,
+            k,
+            true,
+            Some(&pool),
+            &mut upper_split,
+            None
+        ));
+        for j in 0..m {
+            for i in 0..m {
+                let (p, q) = (upper_split[i + j * m], upper[i + j * m]);
+                if i <= j {
+                    assert!(p == q || (p.is_zero() && q.is_zero()));
+                } else {
+                    assert!(p == <F<N> as num_traits::One>::one());
+                }
+            }
+        }
         for (o, (g, e)) in got.iter().zip(&c).enumerate() {
             let e = narrow::<N, M>(e);
             assert!(

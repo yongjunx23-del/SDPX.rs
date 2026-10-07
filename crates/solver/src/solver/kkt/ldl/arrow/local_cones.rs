@@ -220,7 +220,10 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 }
             }
         }
-        let degree: Vec<u32> = adjacent.chunks(words).map(|row| row.iter().map(|w| w.count_ones()).sum()).collect();
+        let degree: Vec<u32> = adjacent
+            .chunks(words)
+            .map(|row| row.iter().map(|w| w.count_ones()).sum())
+            .collect();
         let mut order: Vec<usize> = (0..t).collect();
         order.sort_by_key(|&p| (signs[trunk[p]] > 0, degree[p], p));
         let trunk = order.into_iter().map(|p| trunk[p]).collect();

@@ -1,8 +1,11 @@
 use super::*;
 
-// Minimum column count before a reflector update is offered to the ambient
-// solver pool; smaller tails stay serial to avoid dispatch overhead.
-const PAR_COLS: usize = 4;
+use sdpx_arithmetic::inner_parallel::{tasks, tasks_if, weight};
+
+// Limb-product weight of one multiply-add at this precision.
+fn w<const N: usize>() -> u128 {
+    weight(<F<N> as Scalar>::precision_bits())
+}
 
 pub(super) fn num<const N: usize>(v: usize) -> F<N> {
     <F<N> as num_traits::FromPrimitive>::from_usize(v).unwrap()
@@ -114,23 +117,29 @@ fn replay_rotations<const N: usize>(
         }
     }
     // Small row tiles reuse coefficients without changing any row's rotation
-    // order. Keep enough tiles for the ambient pool to steal trailing cones.
+    // order.
     let tile = 4 * cols;
     let apply = |rows: &mut [F<N>]| {
-        for r in log {
-            F::rotate_adjacent_rows(rows, cols, r.p, &r.c, &r.s);
+        for rows in rows.chunks_mut(tile) {
+            for r in log {
+                F::rotate_adjacent_rows(rows, cols, r.p, &r.c, &r.s);
+            }
         }
     };
     // Rows are independent (each sees the whole rotation sequence in order),
     // so splitting them is bitwise neutral. On a pool worker, offer the rows
     // even without granted ways: rayon splits only when idle threads steal,
     // letting them finish the last, largest cones of a scaling phase.
+    // Tasks carry at least one grain of work (a rotation is four
+    // multiply-adds per row), so small blocks stay serial.
     let offer =
         sdpx_arithmetic::inner_parallel::active() || rayon::current_thread_index().is_some();
-    if offer && rows >= PAR_COLS {
-        t.par_chunks_mut(tile).for_each(apply);
+    let work = (rows * log.len() * 4) as u128 * w::<N>();
+    let parts = tasks_if(offer, work, rows);
+    if parts > 1 {
+        t.par_chunks_mut(rows.div_ceil(parts) * cols).for_each(apply);
     } else {
-        t.chunks_mut(tile).for_each(apply);
+        apply(t);
     }
     for j in 0..cols {
         for i in 0..rows {
@@ -168,7 +177,6 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
     right: &mut [F<N>],
     scratch: &mut [F<N>],
 ) {
-    let par = sdpx_arithmetic::inner_parallel::active();
     for k in 0..n {
         let x = &mut scratch[..m - k];
         x.copy_from_slice(&a[k + k * m..(k + 1) * m]);
@@ -177,9 +185,12 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
         left[k] = tau;
         // Column updates are independent; under a solver pool they fill the
         // block-level tail. Order within each column is unchanged.
-        if par && n - k - 1 >= PAR_COLS {
+        let cols = n - k - 1;
+        let parts = tasks((2 * cols * (m - k)) as u128 * w::<N>(), cols);
+        if parts > 1 {
             let x: &[F<N>] = x;
-            a[(k + 1) * m..n * m].par_chunks_mut(m).for_each(|col| {
+            let min = cols.div_ceil(parts);
+            a[(k + 1) * m..n * m].par_chunks_mut(m).with_min_len(min).for_each(|col| {
                 let mut dot = F::dot_fma(x.iter().zip(&col[k..m]));
                 dot *= tau;
                 let ndot = -dot;
@@ -213,12 +224,14 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
             e[k] = beta;
             right[k] = tau;
             let rows = m - k - 1;
-            if par && rows >= PAR_COLS {
+            let parts = tasks((2 * rows * (n - k - 1)) as u128 * w::<N>(), rows.min(n - k - 1));
+            if parts > 1 {
                 let x: &[F<N>] = x;
                 // Phase 1: per-row dots (shared reads) into ndots.
                 let a_ro: &[F<N>] = a;
                 ndots[..rows]
                     .par_iter_mut()
+                    .with_min_len(rows.div_ceil(parts))
                     .enumerate()
                     .for_each(|(t, nd)| {
                         let i = k + 1 + t;
@@ -230,6 +243,7 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
                 // Phase 2: independent column updates.
                 a[(k + 1) * m..n * m]
                     .par_chunks_mut(m)
+                    .with_min_len((n - k - 1).div_ceil(parts))
                     .enumerate()
                     .for_each(|(t, col)| {
                         let xj = x[t];
@@ -473,7 +487,6 @@ pub(super) fn apply_reflectors<const N: usize>(
     uc: usize,
     v: &mut [F<N>],
 ) {
-    let par = sdpx_arithmetic::inner_parallel::active();
     for k in (0..n).rev() {
         let update = |col: &mut [F<N>]| {
             let mut dot = F::dot_fma((k + 1..m).map(|i| (&a[i + k * m], &col[i]))) + col[k];
@@ -484,8 +497,9 @@ pub(super) fn apply_reflectors<const N: usize>(
                 col[i] = a[i + k * m].mul_add(ndot, col[i]);
             }
         };
-        if par && uc >= PAR_COLS {
-            u[..uc * m].par_chunks_mut(m).for_each(update);
+        let parts = tasks((2 * uc * (m - k)) as u128 * w::<N>(), uc);
+        if parts > 1 {
+            u[..uc * m].par_chunks_mut(m).with_min_len(uc.div_ceil(parts)).for_each(update);
         } else {
             for j in 0..uc {
                 update(&mut u[j * m..(j + 1) * m]);
@@ -503,8 +517,9 @@ pub(super) fn apply_reflectors<const N: usize>(
                     col[i] = a[k + i * m].mul_add(ndot, col[i]);
                 }
             };
-            if par && n >= PAR_COLS {
-                v[..n * n].par_chunks_mut(n).for_each(update);
+            let parts = tasks((2 * n * (n - k)) as u128 * w::<N>(), n);
+            if parts > 1 {
+                v[..n * n].par_chunks_mut(n).with_min_len(n.div_ceil(parts)).for_each(update);
             } else {
                 for j in 0..n {
                     update(&mut v[j * n..(j + 1) * n]);

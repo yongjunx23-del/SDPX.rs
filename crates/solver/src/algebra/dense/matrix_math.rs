@@ -340,14 +340,16 @@ pub(crate) fn pooled_gemm_sym_cached<T: FloatT, MATA, MATB>(
                 column(j, &mut c.data_mut()[j * m..(j + 1) * m]);
             }
         }
-    } else if sdpx_arithmetic::inner_parallel::active()
-        && n >= 4
-        && rayon::current_num_threads() > 1
-    {
+    } else if let tasks @ 2.. = sdpx_arithmetic::inner_parallel::tasks(
+        (n * (n + 1) / 2 * k.max(1)) as u128
+            * sdpx_arithmetic::inner_parallel::weight(T::precision_bits()),
+        n,
+    ) {
         // No explicit pool, but a caller marked this as inner work: offer the
-        // triangular columns to the ambient pool's idle workers. Per-element
-        // accumulation order is unchanged, so results stay bitwise identical.
-        let tile = n.div_ceil(4 * rayon::current_num_threads()).max(1);
+        // triangular columns to the ambient pool's idle workers when each task
+        // carries a grain of work. Per-element accumulation order is
+        // unchanged, so results stay bitwise identical.
+        let tile = n.div_ceil(tasks);
         c.data_mut()
             .par_chunks_mut(tile * m)
             .enumerate()

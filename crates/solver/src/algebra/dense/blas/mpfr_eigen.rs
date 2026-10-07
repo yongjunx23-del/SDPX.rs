@@ -29,11 +29,11 @@ pub(super) fn tridiagonalize<const N: usize>(
             // p = tau * B v; w = p - (tau/2)(p·v) v; B -= v wᵀ + w vᵀ.
             // The symv rows and the rank-2 column updates are independent,
             // so they join the ambient pool under the inner-parallel gate.
-            let par = inner_par() && len >= PAR_COLS;
+            let parts = inner_tasks::<N>(2 * len * len, len);
             let p = &mut p[..len];
-            if par {
+            if parts > 1 {
                 let tail: &[F<N>] = &b[(k + 1) * n..n * n];
-                p.par_iter_mut().enumerate().for_each(|(i, pi)| {
+                p.par_iter_mut().with_min_len(len.div_ceil(parts)).enumerate().for_each(|(i, pi)| {
                     let acc = F::dot_fma((0..len).map(|j| (&tail[k + 1 + i + j * n], &v[j])));
                     *pi = tau * acc;
                 });
@@ -52,9 +52,10 @@ pub(super) fn tridiagonalize<const N: usize>(
             for i in 0..len {
                 p[i] -= alpha * v[i];
             }
-            if par {
+            if parts > 1 {
                 b[(k + 1) * n..n * n]
                     .par_chunks_mut(n)
+                    .with_min_len(len.div_ceil(parts))
                     .enumerate()
                     .for_each(|(j, col)| {
                         for i in 0..=j {
@@ -96,10 +97,10 @@ pub(super) fn form_q<const N: usize>(b: &[F<N>], n: usize, taus: &[F<N>], q: &mu
     identity(q, n);
     // Reflector applications to independent columns join the ambient pool
     // under the inner-parallel gate; the reflector sequence stays serial.
-    let par = inner_par() && n >= PAR_COLS;
     for k in (0..n.saturating_sub(2)).rev() {
-        if par {
-            q[..n * n].par_chunks_mut(n).for_each(|qj| {
+        let parts = inner_tasks::<N>(2 * n * (n - k), n);
+        if parts > 1 {
+            q[..n * n].par_chunks_mut(n).with_min_len(n.div_ceil(parts)).for_each(|qj| {
                 let mut dot = qj[k + 1];
                 for i in k + 2..n {
                     dot += b[i + k * n] * qj[i];

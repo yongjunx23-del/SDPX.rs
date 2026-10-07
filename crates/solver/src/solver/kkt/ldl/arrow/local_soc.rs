@@ -115,15 +115,21 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         let t = self.trunk.len();
         let leaves = &self.leaves;
-        if matches!(self.local_structure, Some(LocalStructure::Soc | LocalStructure::Cones))
-            && T::precision_bits() > 64
+        if matches!(
+            self.local_structure,
+            Some(LocalStructure::Soc | LocalStructure::Cones)
+        ) && T::precision_bits() > 64
         {
             debug_assert!(self.ranks.is_none());
             let blocks: Vec<_> = leaves
                 .iter()
                 .filter(|leaf| !leaf.y.is_empty())
                 .map(|leaf| {
-                    (&leaf.y[..], &leaf.factor.dinv[leaf.coupling_start..], &leaf.coupled[..])
+                    (
+                        &leaf.y[..],
+                        &leaf.factor.dinv[leaf.coupling_start..],
+                        &leaf.coupled[..],
+                    )
                 })
                 .collect();
             // Upper ZᵀY selects the same products as lower YᵀZ below.
@@ -173,9 +179,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                             class.leaves.iter().flat_map(move |&l| {
                                 let leaf = &leaves[l];
                                 let width = leaf.ids.len() - leaf.coupling_start;
-                                (0..width).map(move |r| {
-                                    (&leaf.y[r + pi * width], &z[l][r + pj * width])
-                                })
+                                (0..width)
+                                    .map(move |r| (&leaf.y[r + pi * width], &z[l][r + pj * width]))
                             })
                         }),
                 );
