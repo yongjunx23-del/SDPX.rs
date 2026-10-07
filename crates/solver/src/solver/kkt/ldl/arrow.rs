@@ -23,6 +23,7 @@ use std::sync::{
 };
 
 mod local_bounds;
+mod local_cones;
 mod local_soc;
 mod shared_soc;
 
@@ -31,6 +32,9 @@ enum LocalStructure {
     Soc,
     SharedSoc,
     Bounds,
+    // Any mix of small orthant/SOC leaves; couplings stored per leaf over
+    // its own border columns (see `local_cones`).
+    Cones,
 }
 
 /// Dense working-set cap of the local arrow structures, and the size up to
@@ -321,6 +325,9 @@ struct Leaf<T> {
     // Other Y columns stay exactly zero, so they are skipped everywhere.
     coupled: Vec<usize>,
     couples: Vec<bool>,
+    // Local leaves store B/Y/Z over `coupled` only (column c of the suffix
+    // at `c * width`); generic leaves keep all t border columns.
+    packed: bool,
     h: Vec<T>,
     b: Vec<T>,
     factor: DenseLeaf<T>,
@@ -342,6 +349,7 @@ impl<T: FloatT> Leaf<T> {
             coupling_start: 0,
             coupled: (0..t).collect(),
             couples: vec![true; t],
+            packed: false,
             h: vec![T::zero(); g * g],
             b: vec![T::zero(); g * t],
             factor: DenseLeaf::new(g),
@@ -357,7 +365,33 @@ impl<T: FloatT> Leaf<T> {
     }
 
     fn coupling_index(&self, row: usize, col: usize) -> usize {
-        row - self.coupling_start + col * (self.ids.len() - self.coupling_start)
+        row - self.coupling_start + self.column(col) * (self.ids.len() - self.coupling_start)
+    }
+
+    /// Storage column of border column `col`.
+    fn column(&self, col: usize) -> usize {
+        if self.packed {
+            self.coupled.binary_search(&col).unwrap()
+        } else {
+            col
+        }
+    }
+
+    /// Raw coupling entry: with `b` shorter than `y`, the suffix's first row
+    /// (L = 1) stays raw in Y and `b` holds the remaining rows.
+    fn raw_coupling(&mut self, row: usize, col: usize) -> &mut T {
+        if self.b.len() < self.y.len() {
+            let width = self.ids.len() - self.coupling_start;
+            let (r, c) = (row - self.coupling_start, self.column(col));
+            if r == 0 {
+                &mut self.y[c * width]
+            } else {
+                &mut self.b[r - 1 + c * (width - 1)]
+            }
+        } else {
+            let index = self.coupling_index(row, col);
+            &mut self.b[index]
+        }
     }
 
     fn coupling_values(&self) -> &[T] {
@@ -382,8 +416,9 @@ impl<T: FloatT> Leaf<T> {
     ) -> Result<(), &'static str> {
         let g = self.ids.len();
         // A scalar primal suffix has L=1: Y=B. Packed bound panels own Z,
-        // so these leaves need neither a duplicate Y nor a duplicate Z.
-        if self.y.is_empty() && self.coupling_start > 0 {
+        // so these leaves need neither a duplicate Y nor a duplicate Z (nor
+        // stored signs).
+        if self.signs.is_empty() {
             return self.factor.factor_bounds(&self.h, reg, regularize_count);
         }
         self.factor
@@ -394,28 +429,34 @@ impl<T: FloatT> Leaf<T> {
         let start = self.coupling_start;
         let width = g - start;
         if self.b.len() < self.y.len() {
-            // Local SOC's first suffix row has L=1 and stays raw in Y.
-            debug_assert_eq!(self.y.len(), 2 * self.b.len());
-            for (column, &value) in self.y.chunks_mut(2).zip(&self.b) {
-                column[1] = value;
+            // The suffix's first row has L=1 and stays raw in Y.
+            if width > 1 {
+                for (column, raw) in self.y.chunks_mut(width).zip(self.b.chunks(width - 1)) {
+                    column[1..].copy_from_slice(raw);
+                }
             }
         } else {
             self.y.copy_from_slice(&self.b);
         }
-        let (factor, couples) = (&self.factor, &self.couples);
+        let (factor, couples, packed) = (&self.factor, &self.couples, self.packed);
         if split && width > 0 {
             self.y
                 .par_chunks_mut(width)
                 .enumerate()
-                .filter(|(j, _)| couples[*j])
+                .filter(|(j, _)| packed || couples[*j])
                 .for_each(|(_, column)| factor.forward_suffix(column, start));
+        } else if packed {
+            for column in self.y.chunks_mut(width) {
+                factor.forward_suffix(column, start);
+            }
         } else {
             for &j in &self.coupled {
                 factor.forward_suffix(&mut self.y[j * width..(j + 1) * width], start);
             }
         }
         if !self.z.is_empty() {
-            for j in 0..t {
+            let columns = if packed { self.coupled.len() } else { t };
+            for j in 0..columns {
                 for i in 0..width {
                     self.z[i + j * width] = self.y[i + j * width] * self.factor.dinv[i + start];
                 }
@@ -459,17 +500,16 @@ impl<T: FloatT> Leaf<T> {
         let start = self.coupling_start;
         let width = g - start;
         let values = if self.y.is_empty() { &self.b } else { &self.y };
-        let (coupled, dinv) = (&self.coupled, &self.factor.dinv);
+        let (coupled, dinv, packed) = (&self.coupled, &self.factor.dinv, self.packed);
         let update = |(i, row): (usize, &mut [T])| {
             for (c, v) in row.iter_mut().enumerate() {
                 let s = if i < start {
                     T::zero()
                 } else {
-                    T::dot_fma(
-                        coupled
-                            .iter()
-                            .map(|&j| (&values[i - start + j * width], &xt[j * cols + c])),
-                    )
+                    T::dot_fma(coupled.iter().enumerate().map(|(p, &j)| {
+                        let column = if packed { p } else { j };
+                        (&values[i - start + column * width], &xt[j * cols + c])
+                    }))
                 };
                 *v = (*v - s) * dinv[i];
             }
@@ -511,16 +551,15 @@ impl<T: FloatT> Leaf<T> {
         let start = self.coupling_start;
         let width = g - start;
         let values = if self.y.is_empty() { &self.b } else { &self.y };
-        let (coupled, dinv) = (&self.coupled, &self.factor.dinv);
+        let (coupled, dinv, packed) = (&self.coupled, &self.factor.dinv, self.packed);
         let update = |(i, v): (usize, &mut T)| {
             let s = if i < start {
                 T::zero()
             } else {
-                T::dot_fma(
-                    coupled
-                        .iter()
-                        .map(|&j| (&values[i - start + j * width], &xt[j])),
-                )
+                T::dot_fma(coupled.iter().enumerate().map(|(p, &j)| {
+                    let column = if packed { p } else { j };
+                    (&values[i - start + column * width], &xt[j])
+                }))
             };
             *v = (*v - s) * dinv[i];
         };
@@ -765,6 +804,34 @@ impl LeafRanks {
     }
 }
 
+/// Coupling terms of border column `j` over local leaves: each leaf's
+/// suffix rows against `value(leaf, row)`, class by class in leaf order.
+fn class_terms<'a, T: FloatT>(
+    classes: &'a [CouplingClass],
+    leaves: &'a [Leaf<T>],
+    j: usize,
+    value: impl Fn(&'a Leaf<T>, usize) -> &'a T + Copy + 'a,
+) -> impl Iterator<Item = (&'a T, &'a T)> + 'a {
+    classes
+        .iter()
+        .filter(move |class| class.position[j] != usize::MAX)
+        .flat_map(move |class| {
+            let p = class.position[j];
+            class.leaves.iter().flat_map(move |&l| {
+                let leaf = &leaves[l];
+                let width = leaf.ids.len() - leaf.coupling_start;
+                (0..width).map(move |i| (&leaf.coupling_values()[i + p * width], value(leaf, i)))
+            })
+        })
+}
+
+/// Local leaves sharing one list of border columns.
+struct CouplingClass {
+    /// Storage column of each border column (`usize::MAX` when absent).
+    position: Vec<usize>,
+    leaves: Vec<usize>,
+}
+
 pub struct ArrowLDLSolver<T: FloatT> {
     // Only the fixed sparse pattern is global. Numerical entries live in
     // their leaf H/B or border C; the parent retains the original KKT for IR.
@@ -791,6 +858,8 @@ pub struct ArrowLDLSolver<T: FloatT> {
     unshifted: Vec<usize>,
     shift_exempt: bool,
     local_structure: Option<LocalStructure>,
+    // Local leaves grouped by equal border columns, in leaf order.
+    classes: Vec<CouplingClass>,
     border_signs: Vec<i8>,
     exact_bound_panels: Option<local_bounds::ExactBoundPanels<T>>,
     #[cfg(feature = "faer-sparse")]
@@ -945,9 +1014,35 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             local[id] = i;
         }
         let bound_count = groups.len();
+        // Local cone leaves: their sorted border columns, and whether a cone
+        // row couples to the border (then the whole leaf is the suffix).
+        let mut links = if matches!(local_structure, Some(LocalStructure::Cones)) {
+            let mut links = vec![(Vec::new(), false); groups.len()];
+            for j in 0..n {
+                for q in k.colptr[j]..k.colptr[j + 1] {
+                    let i = k.rowval[q];
+                    let (inner, outer) = match (owner[i], owner[j]) {
+                        (x, usize::MAX) if x != usize::MAX => (i, j),
+                        (usize::MAX, y) if y != usize::MAX => (j, i),
+                        _ => continue,
+                    };
+                    let link = &mut links[owner[inner]];
+                    link.0.push(local[outer]);
+                    link.1 |= signs[inner] < 0;
+                }
+            }
+            for link in &mut links {
+                link.0.sort_unstable();
+                link.0.dedup();
+            }
+            links
+        } else {
+            Vec::new()
+        };
         let leaves: Vec<Leaf<T>> = groups
             .into_iter()
-            .map(|g| {
+            .enumerate()
+            .map(|(gi, g)| {
                 // Local constraints may have a zero prefix in their border coupling.
                 let mut leaf = Leaf::new(g, if local_structure.is_some() { 0 } else { t });
                 if let Some(kind) = local_structure {
@@ -955,24 +1050,44 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         LocalStructure::Soc => 2,
                         LocalStructure::SharedSoc => leaf.ids.len(),
                         LocalStructure::Bounds => 1,
+                        LocalStructure::Cones if links[gi].1 => leaf.ids.len(),
+                        LocalStructure::Cones => {
+                            leaf.ids.iter().filter(|&&i| signs[i] > 0).count()
+                        }
                     };
                     leaf.coupling_start = leaf.ids.len() - width;
-                    let packed = matches!(kind, LocalStructure::Bounds)
+                    let panels = matches!(kind, LocalStructure::Bounds)
                         && ((T::precision_bits() > 64)
                             || (cfg!(feature = "faer-sparse")
                                 && std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>()));
-                    if !packed {
+                    if !panels {
                         leaf.signs = leaf.ids.iter().map(|&i| signs[i]).collect();
-                        let b_size = if matches!(kind, LocalStructure::Soc) {
-                            t
+                        leaf.packed = true;
+                        if matches!(kind, LocalStructure::Cones) {
+                            // The suffix's first row stays raw in Y; B keeps the rest.
+                            let columns = std::mem::take(&mut links[gi].0);
+                            let q = if width == 0 { 0 } else { columns.len() };
+                            leaf.b.resize(width.saturating_sub(1) * q, T::zero());
+                            leaf.y.resize(width * q, T::zero());
+                            leaf.z.resize(width * q, T::zero());
+                            leaf.couples = vec![false; t];
+                            for &c in &columns[..q] {
+                                leaf.couples[c] = true;
+                            }
+                            leaf.coupled = columns;
+                            leaf.coupled.truncate(q);
                         } else {
-                            width * t
-                        };
-                        leaf.b.resize(b_size, T::zero());
-                        leaf.y.resize(width * t, T::zero());
-                        leaf.z.resize(width * t, T::zero());
-                        leaf.coupled = (0..t).collect();
-                        leaf.couples = vec![true; t];
+                            let b_size = if matches!(kind, LocalStructure::Soc) {
+                                t
+                            } else {
+                                width * t
+                            };
+                            leaf.b.resize(b_size, T::zero());
+                            leaf.y.resize(width * t, T::zero());
+                            leaf.z.resize(width * t, T::zero());
+                            leaf.coupled = (0..t).collect();
+                            leaf.couples = vec![true; t];
+                        }
                     }
                 } else {
                     leaf.signs = vec![1];
@@ -980,6 +1095,29 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 leaf
             })
             .collect();
+        // Local leaves with equal border columns form one coupling class.
+        let mut classes: Vec<CouplingClass> = Vec::new();
+        if local_structure.is_some() {
+            let mut index: std::collections::HashMap<&[usize], usize> =
+                std::collections::HashMap::new();
+            for (l, leaf) in leaves.iter().enumerate() {
+                if !leaf.packed || leaf.coupled.is_empty() {
+                    continue;
+                }
+                let class = *index.entry(&leaf.coupled[..]).or_insert_with(|| {
+                    let mut position = vec![usize::MAX; t];
+                    for (p, &j) in leaf.coupled.iter().enumerate() {
+                        position[j] = p;
+                    }
+                    classes.push(CouplingClass {
+                        position,
+                        leaves: Vec::new(),
+                    });
+                    classes.len() - 1
+                });
+                classes[class].leaves.push(l);
+            }
+        }
         let unshifted = if matches!(local_structure, Some(LocalStructure::SharedSoc)) {
             Self::single_primal_leaf_columns(k, signs, &leaves)
         } else {
@@ -1008,6 +1146,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             unshifted,
             shift_exempt: false,
             local_structure,
+            classes,
             exact_bound_panels: if matches!(local_structure, Some(LocalStructure::Bounds))
                 && T::precision_bits() > 64
             {
@@ -1126,18 +1265,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         panels.y[index] = value.to_f64().unwrap();
                         continue;
                     }
-                    let leaf = &mut self.leaves[id];
-                    let value = if matches!(self.local_structure, Some(LocalStructure::Soc)) {
-                        if row == leaf.coupling_start {
-                            &mut leaf.y[2 * col]
-                        } else {
-                            &mut leaf.b[col]
-                        }
-                    } else {
-                        let index = leaf.coupling_index(row, col);
-                        &mut leaf.b[index]
-                    };
-                    update(q, value);
+                    update(q, self.leaves[id].raw_coupling(row, col));
                 }
             }
         }
@@ -1161,11 +1289,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 return T::from_f64(panels.y[id + col * self.leaves.len()]).unwrap();
             }
             let leaf = &self.leaves[id];
-            if matches!(self.local_structure, Some(LocalStructure::Soc)) {
-                if row == leaf.coupling_start {
-                    leaf.y[2 * col]
+            if leaf.b.len() < leaf.y.len() {
+                let width = leaf.ids.len() - leaf.coupling_start;
+                let (r, c) = (row - leaf.coupling_start, leaf.column(col));
+                if r == 0 {
+                    leaf.y[c * width]
                 } else {
-                    leaf.b[col]
+                    leaf.b[r - 1 + c * (width - 1)]
                 }
             } else {
                 leaf.b[leaf.coupling_index(row, col)]
@@ -1214,8 +1344,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             || self.leaves.iter().any(|leaf| {
                 !leaf.h.is_finite()
                     || !leaf.b.is_finite()
-                    || (matches!(self.local_structure, Some(LocalStructure::Soc))
-                        && leaf.y.iter().step_by(2).any(|v| !v.is_finite()))
+                    || (leaf.b.len() < leaf.y.len()
+                        && leaf
+                            .y
+                            .iter()
+                            .step_by(leaf.ids.len() - leaf.coupling_start)
+                            .any(|v| !v.is_finite()))
             })
         {
             return false;
@@ -1389,10 +1523,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             if let Some(panels) = panels {
                 *v -= T::dot_fma(panels.y[j * nl..(j + 1) * nl].iter().zip(&panels.vs));
             } else if self.local_structure.is_some() {
-                *v -= T::dot_fma(leaves.iter().flat_map(|leaf| {
-                    let width = leaf.ids.len() - leaf.coupling_start;
-                    (0..width).map(move |i| (&leaf.coupling_values()[i + j * width], &leaf.v[i]))
-                }));
+                *v -= T::dot_fma(class_terms(&self.classes, leaves, j, |leaf, i| &leaf.v[i]));
             } else {
                 for leaf in leaves[owned.clone()].iter().filter(|l| l.couples[j]) {
                     let g = leaf.ids.len();
@@ -1473,6 +1604,7 @@ impl<T: FloatT> HasLinearSolverInfo for ArrowLDLSolver<T> {
         LinearSolverInfo {
             name: match self.local_structure {
                 Some(LocalStructure::Soc) => "local_soc_arrow",
+                Some(LocalStructure::Cones) => "local_cone_arrow",
                 Some(LocalStructure::SharedSoc) => "shared_soc_arrow",
                 #[cfg(feature = "faer-sparse")]
                 Some(LocalStructure::Bounds) if self.bound_panels.is_some() => "local_bounds_faer",
@@ -1598,14 +1730,8 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
                 }
             } else if self.local_structure.is_some() {
                 for (c, v) in row.iter_mut().enumerate() {
-                    *v -= T::dot_fma(leaves.iter().flat_map(|leaf| {
-                        let width = leaf.ids.len() - leaf.coupling_start;
-                        (0..width).map(move |i| {
-                            (
-                                &leaf.coupling_values()[i + j * width],
-                                &leaf.batch_v[i * cols + c],
-                            )
-                        })
+                    *v -= T::dot_fma(class_terms(&self.classes, leaves, j, |leaf, i| {
+                        &leaf.batch_v[i * cols + c]
                     }));
                 }
             } else {

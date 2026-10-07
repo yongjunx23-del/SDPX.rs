@@ -1627,45 +1627,77 @@ pub(super) fn gemm<const N: usize>(
     acc.finish(&plan, lo_a + lo_b, out, &split)
 }
 
-/// Upper triangle of `Σ A_bᵀ·B_b`, summed exactly across every row block and
-/// rounded once. Blocks are column-major `rows × m`; output uses `i + j*m`.
+/// Upper triangle of `Σ A_bᵀ·B_b`, summed exactly across every block and
+/// rounded once into `out[i + j*m]`. Block `b` is `(a, b, columns)`: `a`
+/// and `b` are column-major `w × q` over its sorted global columns
+/// (`q = columns.len()`, any width `w`).
 ///
-/// Rows of one support class may be summed in any order, so they are sorted
-/// by exponent window and cut into groups of at most 256 rows. Each group
-/// encodes against its own window and reconstructs its exact integer with
-/// its own primes: a few rows carrying cancellation residues no longer widen
-/// every group's encoding and prime count. The group integers are added
-/// exactly at their offsets from the lowest group base, then rounded once.
+/// Blocks sharing a column list form a class; within a class, local rows
+/// with equal supports share one product. Rows of one support may be summed
+/// in any order, so they are sorted by exponent window and cut into groups
+/// of at most 256 rows. Each group encodes against its own window and
+/// reconstructs its exact integer with its own primes: a few rows carrying
+/// cancellation residues no longer widen every group's encoding and prime
+/// count. Group integers are added exactly at their offsets from the lowest
+/// group base, then rounded once.
 pub(super) fn gemm_blocks_upper<const N: usize>(
     m: usize,
-    rows: usize,
-    blocks: &[(&[F<N>], &[F<N>])],
+    blocks: &[(&[F<N>], &[F<N>], &[usize])],
     out: &mut [F<N>],
     pool: Option<&rayon::ThreadPool>,
 ) -> bool {
-    // Per-row windows `[lo_a, hi_a, lo_b, hi_b]` (block-major `b·rows + local`).
+    let width = |block: &(&[F<N>], &[F<N>], &[usize])| block.0.len() / block.2.len().max(1);
+    let mut first_row = Vec::with_capacity(blocks.len() + 1);
+    first_row.push(0);
+    for block in blocks {
+        debug_assert_eq!(block.0.len(), block.1.len());
+        debug_assert_eq!(block.0.len(), width(block) * block.2.len());
+        first_row.push(first_row.last().unwrap() + width(block));
+    }
+    // Blocks sharing a column list form one class.
+    let mut classes: Vec<(&[usize], Vec<usize>)> = Vec::new();
+    {
+        let mut index: HashMap<&[usize], usize> = HashMap::new();
+        for (b, block) in blocks.iter().enumerate() {
+            let class = *index.entry(block.2).or_insert_with(|| {
+                classes.push((block.2, Vec::new()));
+                classes.len() - 1
+            });
+            classes[class].1.push(b);
+        }
+    }
+    // Per-row windows `[lo_a, hi_a, lo_b, hi_b]` and per-class supports of
+    // each local row (positions within the class columns).
     let (mut lo_a, mut hi_a, mut lo_b, mut hi_b) =
         (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
-    let mut supports = vec![vec![false; m]; rows];
-    let mut windows = Vec::with_capacity(blocks.len() * rows);
-    for &(a, b) in blocks {
-        debug_assert_eq!(a.len(), rows * m);
-        debug_assert_eq!(b.len(), rows * m);
-        for local in 0..rows {
-            let (mut la, mut ha, mut lb, mut hb) = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
-            for j in 0..m {
-                let entry = j * rows + local;
-                let (Some(active_a), Some(active_b)) =
-                    (scan_exponent(&a[entry], &mut la, &mut ha),
-                     scan_exponent(&b[entry], &mut lb, &mut hb))
-                else {
-                    return false;
-                };
-                supports[local][j] |= active_a || active_b;
+    let mut windows = vec![[0i64; 4]; *first_row.last().unwrap()];
+    let mut supports: Vec<Vec<Vec<bool>>> = Vec::with_capacity(classes.len());
+    for (columns, members) in &classes {
+        let q = columns.len();
+        let mut class_supports: Vec<Vec<bool>> = Vec::new();
+        for &bi in members {
+            let (a, b, _) = blocks[bi];
+            let w = width(&blocks[bi]);
+            if class_supports.len() < w {
+                class_supports.resize(w, vec![false; q]);
             }
-            (lo_a, hi_a, lo_b, hi_b) = (lo_a.min(la), hi_a.max(ha), lo_b.min(lb), hi_b.max(hb));
-            windows.push([la, ha, lb, hb]);
+            for local in 0..w {
+                let (mut la, mut ha, mut lb, mut hb) = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
+                for c in 0..q {
+                    let entry = local + c * w;
+                    let (Some(active_a), Some(active_b)) =
+                        (scan_exponent(&a[entry], &mut la, &mut ha),
+                         scan_exponent(&b[entry], &mut lb, &mut hb))
+                    else {
+                        return false;
+                    };
+                    class_supports[local][c] |= active_a || active_b;
+                }
+                (lo_a, hi_a, lo_b, hi_b) = (lo_a.min(la), hi_a.max(ha), lo_b.min(lb), hi_b.max(hb));
+                windows[first_row[bi] + local] = [la, ha, lb, hb];
+            }
         }
+        supports.push(class_supports);
     }
     let outputs = m * (m + 1) / 2;
     if lo_a == i64::MAX || lo_b == i64::MAX {
@@ -1679,24 +1711,12 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
     }
     let timer = crate::receipt::start();
     let split = split_plan(pool);
-    // A row's common support includes both operands across all blocks. Equal
-    // supports share one product; dense rows retain the original tall layout.
-    let mut row_groups: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
-    for (local, support) in supports.into_iter().enumerate() {
-        let columns: Vec<_> = support.into_iter().enumerate()
-            .filter_map(|(j, active)| active.then_some(j)).collect();
-        if columns.is_empty() {
-            continue;
-        }
-        if let Some(group) = row_groups.iter().position(|(cols, _)| cols == &columns) {
-            row_groups[group].1.push(local);
-        } else {
-            row_groups.push((columns, vec![local]));
-        }
-    }
     struct Group {
-        class: usize,
-        rows: Vec<usize>,
+        /// Global output columns and their positions in the blocks' columns.
+        columns: Vec<usize>,
+        positions: Vec<usize>,
+        /// `(block, local row)` pairs.
+        rows: Vec<(usize, usize)>,
         lo: (i64, i64),
         spread: (i64, i64),
         plan: Plan,
@@ -1704,40 +1724,69 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
     }
     let precision = F::<N>::PRECISION_BITS as f64;
     let mut groups = Vec::new();
-    for (class, (columns, locals)) in row_groups.iter().enumerate() {
-        // Rows with a zero side contribute nothing.
-        let mut ids: Vec<usize> = (0..blocks.len())
-            .flat_map(|b| locals.iter().map(move |&local| b * rows + local))
-            .filter(|&r| windows[r][0] <= windows[r][1] && windows[r][2] <= windows[r][3])
-            .collect();
-        ids.sort_unstable_by_key(|&r| (windows[r][0] + windows[r][2], r));
-        for chunk in ids.chunks(256) {
-            let (mut la, mut ha, mut lb, mut hb, mut top) =
-                (i64::MAX, i64::MIN, i64::MAX, i64::MIN, i64::MIN);
-            for &r in chunk {
-                let w = windows[r];
-                (la, ha, lb, hb) = (la.min(w[0]), ha.max(w[1]), lb.min(w[2]), hb.max(w[3]));
-                top = top.max(w[1] + w[3]);
+    for ((columns, members), class_supports) in classes.iter().zip(supports) {
+        // A row's common support includes both operands across the class.
+        // Equal supports share one product.
+        let mut supports: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+        for (local, support) in class_supports.into_iter().enumerate() {
+            let positions: Vec<_> = support.into_iter().enumerate()
+                .filter_map(|(c, active)| active.then_some(c)).collect();
+            if positions.is_empty() {
+                continue;
             }
-            // |Σ a·b| < k·2^(2p + top - la - lb) over the group's rows.
-            let k = chunk.len();
-            let needed = 2.0 * precision + (top - la - lb) as f64 + (k as f64).log2() + 3.0;
-            let Some(plan) = Plan::new(k, needed) else {
-                return false;
-            };
-            let cols = columns.len() as f64;
-            let cost = plan.count() as f64
-                * k as f64
-                * cols
-                * ((2.0 * precision + (ha - la + hb - lb) as f64) / 28.0 + cols / 2.0);
-            groups.push(Group {
-                class,
-                rows: chunk.to_vec(),
-                lo: (la, lb),
-                spread: (ha - la, hb - lb),
-                plan,
-                cost,
+            if let Some(at) = supports.iter().position(|(p, _)| p == &positions) {
+                supports[at].1.push(local);
+            } else {
+                supports.push((positions, vec![local]));
+            }
+        }
+        for (positions, locals) in supports {
+            let global: Vec<usize> = positions.iter().map(|&c| columns[c]).collect();
+            // Rows with a zero side contribute nothing.
+            let mut ids: Vec<(usize, usize)> = members
+                .iter()
+                .flat_map(|&b| {
+                    let w = width(&blocks[b]);
+                    locals.iter().filter(move |&&local| local < w).map(move |&local| (b, local))
+                })
+                .filter(|&(b, local)| {
+                    let w = windows[first_row[b] + local];
+                    w[0] <= w[1] && w[2] <= w[3]
+                })
+                .collect();
+            ids.sort_unstable_by_key(|&(b, local)| {
+                let w = windows[first_row[b] + local];
+                (w[0] + w[2], b, local)
             });
+            for chunk in ids.chunks(256) {
+                let (mut la, mut ha, mut lb, mut hb, mut top) =
+                    (i64::MAX, i64::MIN, i64::MAX, i64::MIN, i64::MIN);
+                for &(b, local) in chunk {
+                    let w = windows[first_row[b] + local];
+                    (la, ha, lb, hb) = (la.min(w[0]), ha.max(w[1]), lb.min(w[2]), hb.max(w[3]));
+                    top = top.max(w[1] + w[3]);
+                }
+                // |Σ a·b| < k·2^(2p + top - la - lb) over the group's rows.
+                let k = chunk.len();
+                let needed = 2.0 * precision + (top - la - lb) as f64 + (k as f64).log2() + 3.0;
+                let Some(plan) = Plan::new(k, needed) else {
+                    return false;
+                };
+                let cols = global.len() as f64;
+                let cost = plan.count() as f64
+                    * k as f64
+                    * cols
+                    * ((2.0 * precision + (ha - la + hb - lb) as f64) / 28.0 + cols / 2.0);
+                groups.push(Group {
+                    columns: global.clone(),
+                    positions: positions.clone(),
+                    rows: chunk.to_vec(),
+                    lo: (la, lb),
+                    spread: (ha - la, hb - lb),
+                    plan,
+                    cost,
+                });
+            }
         }
     }
     // Heaviest groups first; ways pull the next group, and the exact sums
@@ -1750,11 +1799,11 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
         .map(|g| (g.lo.0 + g.lo.1 - base) as usize + g.plan.count() * g.plan.bits as usize + 192)
         .max()
         .unwrap_or(0);
-    let width = top.div_ceil(64) + 2;
+    let slots_per = top.div_ceil(64) + 2;
     let next = std::sync::atomic::AtomicUsize::new(0);
     let ways = split_ways(&split).min(groups.len()).max(1);
     let build = |_| {
-        let mut slots = vec![0i128; outputs * width];
+        let mut slots = vec![0i128; outputs * slots_per];
         let (mut ar, mut br, mut product, mut temp) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         loop {
@@ -1762,14 +1811,14 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
             let Some(group) = groups.get(index) else {
                 break;
             };
-            let (columns, _) = &row_groups[group.class];
-            let (cols, kr, plan) = (columns.len(), group.rows.len(), &group.plan);
+            let (cols, kr, plan) = (group.columns.len(), group.rows.len(), &group.plan);
             let len = kr * cols;
             let mut ca = ChunkMatrix::new::<N>(len, group.spread.0, plan);
             let mut cb = ChunkMatrix::new::<N>(len, group.spread.1, plan);
-            for (j, &column) in columns.iter().enumerate() {
-                for (i, &r) in group.rows.iter().enumerate() {
-                    let ((ab, bb), at) = (blocks[r / rows], column * rows + r % rows);
+            for (j, &position) in group.positions.iter().enumerate() {
+                for (i, &(b, local)) in group.rows.iter().enumerate() {
+                    let (ab, bb, _) = blocks[b];
+                    let at = local + position * width(&blocks[b]);
                     let (a0, b0) = ((j * kr + i) * ca.chunks, (j * kr + i) * cb.chunks);
                     fill_chunk(&ab[at], &mut ca.e[a0..a0 + ca.chunks], group.lo.0, ca.width);
                     fill_chunk(&bb[at], &mut cb.e[b0..b0 + cb.chunks], group.lo.1, cb.width);
@@ -1796,7 +1845,7 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
                 acc.add(plan, q0, q1, &mut product, n, &Split::Serial);
             }
             let shift = (group.lo.0 + group.lo.1 - base) as usize;
-            acc.accumulate(plan, shift, columns, &mut slots, width);
+            acc.accumulate(plan, shift, &group.columns, &mut slots, slots_per);
         }
         slots
     };
@@ -1812,11 +1861,11 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
             *x += y;
         }
     }
-    let mut mag = Vec::with_capacity(width);
+    let mut mag = Vec::with_capacity(slots_per);
     let mut o = 0;
     for j in 0..m {
         for i in 0..=j {
-            out[i + j * m] = round_slots(&total[o * width..(o + 1) * width], base, &mut mag);
+            out[i + j * m] = round_slots(&total[o * slots_per..(o + 1) * slots_per], base, &mut mag);
             o += 1;
         }
     }

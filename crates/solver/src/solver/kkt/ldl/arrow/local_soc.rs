@@ -107,21 +107,17 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         let t = self.trunk.len();
         let leaves = &self.leaves;
-        if matches!(self.local_structure, Some(LocalStructure::Soc))
-            && T::residue_blas_applies(t, t, 2 * leaves.len())
+        if matches!(self.local_structure, Some(LocalStructure::Soc | LocalStructure::Cones))
+            && T::precision_bits() > 64
         {
             debug_assert!(self.ranks.is_none());
-            debug_assert!(leaves.iter().all(|leaf| {
-                leaf.ids.len() - leaf.coupling_start == 2
-                    && leaf.z.len() == 2 * t
-                    && leaf.y.len() == 2 * t
-            }));
             let blocks: Vec<_> = leaves
                 .iter()
-                .map(|leaf| (&leaf.z[..], &leaf.y[..]))
+                .filter(|leaf| !leaf.y.is_empty())
+                .map(|leaf| (&leaf.z[..], &leaf.y[..], &leaf.coupled[..]))
                 .collect();
             // Upper ZᵀY selects the same products as lower YᵀZ below.
-            if T::xgemm_blocks_upper_exact(t, 2, &blocks, &mut self.s, self.pool.as_deref()) {
+            if T::xgemm_blocks_upper_exact(t, &blocks, &mut self.s, self.pool.as_deref()) {
                 for j in 0..t {
                     for i in 0..=j {
                         let value = self.c[i + j * t] - self.s[i + j * t];
@@ -142,12 +138,24 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         // Use the leaf's structurally nonzero coupling suffix.
         // MPFR's dot uses exact accumulation rounded once; each entry has the
         // same leaf/coordinate order at every thread count. No parallel sum.
+        let classes = &self.classes;
         let column = |(j, values): (usize, &mut [T])| {
             for (i, value) in values.iter_mut().enumerate().skip(j) {
-                *value -= T::dot_fma(leaves.iter().flat_map(|leaf| {
-                    let width = leaf.ids.len() - leaf.coupling_start;
-                    (0..width).map(move |r| (&leaf.y[r + i * width], &leaf.z[r + j * width]))
-                }));
+                *value -= T::dot_fma(
+                    classes
+                        .iter()
+                        .filter(|c| c.position[i] != usize::MAX && c.position[j] != usize::MAX)
+                        .flat_map(|class| {
+                            let (pi, pj) = (class.position[i], class.position[j]);
+                            class.leaves.iter().flat_map(move |&l| {
+                                let leaf = &leaves[l];
+                                let width = leaf.ids.len() - leaf.coupling_start;
+                                (0..width).map(move |r| {
+                                    (&leaf.y[r + pi * width], &leaf.z[r + pj * width])
+                                })
+                            })
+                        }),
+                );
             }
         };
         if let Some(pool) = &self.pool {
@@ -175,13 +183,14 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             let mut acc = vec![T::zero(); tri];
             for leaf in leaves {
                 let width = leaf.ids.len() - leaf.coupling_start;
-                let mut at = 0;
-                for j in 0..t {
-                    let z = &leaf.z[j * width..(j + 1) * width];
-                    for i in j..t {
-                        let y = &leaf.y[i * width..(i + 1) * width];
+                for (cj, &j) in leaf.coupled.iter().enumerate() {
+                    let z = &leaf.z[cj * width..(cj + 1) * width];
+                    // Packed lower column j starts at j·t - j(j-1)/2.
+                    let column = j * t - j * (j + 1) / 2;
+                    for (ci, &i) in leaf.coupled.iter().enumerate().skip(cj) {
+                        let y = &leaf.y[ci * width..(ci + 1) * width];
+                        let at = column + i;
                         acc[at] = y.iter().zip(z).fold(acc[at], |v, (&a, &b)| a.mul_add(b, v));
-                        at += 1;
                     }
                 }
             }

@@ -434,13 +434,15 @@ impl<const N: usize> XgemmScalar for F<N> {
     }
     fn xgemm_blocks_upper_exact(
         m: usize,
-        rows: usize,
-        blocks: &[(&[Self], &[Self])],
+        blocks: &[(&[Self], &[Self], &[usize])],
         c: &mut [Self],
         pool: Option<&rayon::ThreadPool>,
     ) -> bool {
-        residue_blas_profitable::<N>(m, m, rows * blocks.len())
-            && super::rns_blas::gemm_blocks_upper(m, rows, blocks, c, pool)
+        let rows: usize = blocks.iter().map(|b| b.0.len() / b.2.len().max(1)).sum();
+        // Every block row is one rank-one term of many outputs, so exact dots
+        // cost far more per term than residue products already at 128 bits.
+        N >= 2 && rows >= 24 && m * m >= 576
+            && super::rns_blas::gemm_blocks_upper(m, blocks, c, pool)
     }
     fn xgemm(
         ta: u8,

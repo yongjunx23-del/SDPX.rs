@@ -173,6 +173,11 @@ where
                     &KKT, &dsigns, A, cones, settings,
                 )
             })
+            .or_else(|| {
+                crate::solver::kkt::ldl::arrow::ArrowLDLSolver::try_local_cones(
+                    &KKT, &dsigns, A, cones, settings,
+                )
+            })
             .map(|solver| Box::new(solver) as BoxedDirectLDLSolver<T>)
             .unwrap_or_else(|| ldl_ctor(&KKT, &dsigns, settings, None))
         } else {

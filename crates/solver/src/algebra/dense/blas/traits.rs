@@ -242,11 +242,12 @@ pub trait XgemmScalar: Sized {
         _b: &[Self], _ldb: usize, _c: &mut [Self], _pool: Option<&rayon::ThreadPool>,
         _cache_b: Option<&mut ResidueCache>
     ) -> bool { false }
-    // Upper triangle of Σ aᵀ·b for column-major `rows × m` blocks, each
-    // entry the exact sum rounded once into `c[i + j*m]` (`i <= j`).
+    // Upper triangle of Σ aᵀ·b over `(a, b, columns)` blocks (column-major
+    // `w × columns.len()` over sorted global columns), each entry the exact
+    // sum rounded once into `c[i + j*m]` (`i <= j`).
     // Use the output only on success: `false` may leave partial writes.
     fn xgemm_blocks_upper_exact(
-        _m: usize, _rows: usize, _blocks: &[(&[Self], &[Self])], _c: &mut [Self],
+        _m: usize, _blocks: &[(&[Self], &[Self], &[usize])], _c: &mut [Self],
         _pool: Option<&rayon::ThreadPool>
     ) -> bool { false }
     // Upper triangle of `aᵀ·diag(d)·a` for a constant column-major `k × m`
