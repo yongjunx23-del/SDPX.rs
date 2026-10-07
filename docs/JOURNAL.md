@@ -8,6 +8,31 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-08 — multi-node layout: match ranks to independent components
+
+Λ19 spins 0–50 has 26 independent owner components (each block's two PSD
+cones are coupled), not 52. With MPI the owner count is the world size, so
+16 ranks hold one or two components (per-rank SVD 6 versus 12 s; up to 13 s
+of a 41 s solve waits in allreduce) and 52 ranks leave 26 idle. Measured-cost
+balancing (`--cost-history-in`) cannot fix granularity: 42.3 → 41.6 s.
+
+Spins 0–50/768, 30 it, TCP over ib0, idle nodes, w5 binary:
+
+| Nodes | Old best layout | Component-matched |
+|---|---|---|
+| 1 | 64 threads 57 s; 4x16 66 s | 13 ranks x 4: 49.3 s (26x2: 56.8 s) |
+| 2 | 8x16 52 s | 26 x 4: 43.3 s (13x9: 44.2 s) |
+| 4 | 16x16 42-45 s; 52x4 47 s | 26 x 9: 40.5 s (13x16: 43.5 s) |
+
+With one component per rank the largest component's iteration time is the
+floor (rank-max KKT update 17.6 s, scaling 5.2 s, allreduce waits 5.8-14.5 s
+from component size spread), so four nodes give 1.22x over one on this
+26-component problem. Added: rank 0 warns when the world size does not
+divide the component count and lists balancing rank counts. Replicated
+border work (border assemble 0.7 s, triangular solves 2-3 s per rank) is
+small next to the per-component floor; not sharded.
+Evidence: `hpc:~/projects/sdpx-ising11-scaling-20261007/runs/mn{3,4}-*`.
+
 ## 2026-10-08 — multi-thread and multi-node scaling of sampled Ising solves
 
 Baseline (perf/cc1007 8384986, UCAS EPYC 7742 2x64, ising11/512, 1e-42):

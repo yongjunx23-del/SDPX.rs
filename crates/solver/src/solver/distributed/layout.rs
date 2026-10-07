@@ -86,6 +86,36 @@ fn structural_finish(mut hash: u64) -> u64 {
     }
 }
 
+/// Tell the user when a fixed owner count (the MPI world size) cannot be
+/// balanced: owners beyond the component count stay idle, and an uneven
+/// count per owner leaves the busiest owner up to twice the lightest one's
+/// work while every collective waits for it (Λ19 spins 0–50, 26 components
+/// on 16 ranks: per-rank SVD time 6 versus 12 s, journal 2026-10-08).
+fn warn_uneven(roots: &[usize], assigned: &[usize], owners: usize) {
+    let mut counts = vec![0usize; owners];
+    for &root in roots {
+        counts[assigned[root]] += 1;
+    }
+    let (lo, hi) = (
+        counts.iter().copied().min().unwrap_or(0),
+        counts.iter().copied().max().unwrap_or(0),
+    );
+    let first = crate::mpi::World::get().is_none_or(|world| world.rank() == 0);
+    if lo == hi || !first {
+        return;
+    }
+    let components = roots.len();
+    let even: Vec<String> = (1..=components)
+        .filter(|d| components % d == 0 && *d <= 2 * owners)
+        .map(|d| d.to_string())
+        .collect();
+    eprintln!(
+        "SDPX: {components} independent components over {owners} ranks gives {lo} to {hi} per rank; \
+         rank counts dividing {components} ({}) balance them",
+        even.join(", ")
+    );
+}
+
 /// Components above this count keep the plain LPT plan (refinement is
 /// quadratic in the busiest owner's members).
 const REFINE_COMPONENTS: usize = 4096;
@@ -418,6 +448,20 @@ impl OwnerLayout {
             if component_roots.len() <= REFINE_COMPONENTS {
                 refine_assignment(&component_roots, &work, owners, &mut assigned);
             }
+        }
+        if explicit.is_some() {
+            let mut with_cone = vec![false; count];
+            for (i, unit) in units.iter().enumerate() {
+                if !unit.rows.is_empty() {
+                    with_cone[roots[n + i]] = true;
+                }
+            }
+            let coned: Vec<usize> = component_roots
+                .iter()
+                .copied()
+                .filter(|&root| with_cone[root])
+                .collect();
+            warn_uneven(&coned, &assigned, owners);
         }
         let mut owner_structural_weights = vec![0u128; owners];
         for &root in &component_roots {
