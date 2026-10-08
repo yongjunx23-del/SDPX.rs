@@ -8,6 +8,33 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-08 — larger problem: Λ27 spins 0–50 (generated)
+
+Input: PyCFTBoot 5a8ed19 at 768 bits (private copy; generator script
+`~/.cache/sdpx-e2e/ising-scale/gen_single.py`), same model as L19-s50 at
+Λ = 27: 26 blocks (bases 55–57), 105 components, 82 MB PMP, 129 MB SDP
+(`hpc:.../sdpx-ising11-scaling-20261007/inputs/L27-s50c`). Λ35 spins 0–70
+is generating.
+
+30 iterations (SDPB 768 bits, one rank per core, same thresholds):
+
+| Resources | SDPX best | SDPB |
+|---|---|---|
+| 1 node | 58.0 s (13 x 7; 64 threads 61.1 s) | 40 s (64 ranks) |
+| 2 nodes | 56.3 s (13 x 9) | 34 s |
+| 4 nodes | 53.3 s (13 x 16) | 42 s |
+
+SDPB is faster per iteration here; on L19-s50 SDPX won full solves through
+fewer iterations (177 vs SDPB 265). A 4-node rank (two components, 16
+threads) runs at 5.2x CPU/wall: single-column reduced solves (`trsv`
+7.8 s, 2.9x), collective waits 8.4 s, owner border factor 1.3 s serial,
+leaf refactor 3.4x. The leaf backward sweeps are a sequential FMA chain
+that cannot be split bitwise. Kept (e608eec): border factor split from 64
+rows (64 threads 1.18 -> 0.25 s, -1%). The next step for larger problems is
+SDPB-style distribution of one component's dense work over several cores
+(blocked leaf factor/solves with an exact, order-independent accumulation),
+which changes the bits and needs an audit gate.
+
 ## 2026-10-08 — split congruences: prime groups, then output columns
 
 Probe (EPYC, 64-thread pool, one m = 53/768-bit upper congruence): serial
