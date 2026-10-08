@@ -152,6 +152,9 @@ where
     pub(crate) callbacks: SolverCallbacks<I>,
     /// Starting τ of the current attempt (`initial_tau` until a restart).
     pub(crate) start_tau: Option<T>,
+    /// Original-coordinate acceptance progress: the best tolerance multiple
+    /// so far and the failed checks since it last halved.
+    pub(crate) original_progress: (Option<T>, u32),
     pub(crate) phantom: std::marker::PhantomData<T>,
 }
 
@@ -288,6 +291,7 @@ where
 
         timeit! {"solve"; {
         self.start_tau = None;
+        self.original_progress = (None, 0);
         timeit! {"default start"; {
             self.start_point();
         }}
@@ -370,6 +374,7 @@ where
             );
         }
         self.start_tau = Some(next);
+        self.original_progress = (None, 0);
         self.info.restart();
         self.kktsystem.reset_solve();
         let iter = state.iter;
@@ -597,6 +602,34 @@ mod internal {
             );
             if !is_done {
                 return Flow::Proceed;
+            }
+            if self.info.get_status() == SolverStatus::Solved {
+                if let Some(ratio) =
+                    self.solution
+                        .original_ratio(&self.data, &self.variables, &self.settings, false)
+                {
+                    if !crate::mpi::agreed_branch(ratio <= T::one()) {
+                        // The returned point would miss the tolerances in
+                        // original coordinates: keep iterating while that
+                        // residual halves within three checks.
+                        let (best, stale) = &mut self.original_progress;
+                        if best.map_or(true, |b| ratio < b * (0.5).as_T()) {
+                            *best = Some(ratio);
+                            *stale = 0;
+                        } else {
+                            *stale += 1;
+                        }
+                        let status = if *stale >= 3 {
+                            SolverStatus::InsufficientProgress
+                        } else if state.iter >= self.settings.core().max_iter {
+                            SolverStatus::MaxIterations
+                        } else {
+                            self.info.set_status(SolverStatus::Unsolved);
+                            return Flow::Proceed;
+                        };
+                        self.info.set_status(status);
+                    }
+                }
             }
             // Slow progress may continue under another scaling strategy.
             match self
@@ -861,7 +894,22 @@ mod internal {
                 );
             }
             // "Almost" convergence check, then solution extraction.
+            let before = self.info.get_status();
             self.info.post_process(&self.residuals, &self.settings);
+            if before != SolverStatus::AlmostSolved
+                && self.info.get_status() == SolverStatus::AlmostSolved
+            {
+                // The reduced status also needs its tolerances in original
+                // coordinates; otherwise the failure status stands.
+                if let Some(ratio) =
+                    self.solution
+                        .original_ratio(&self.data, &self.variables, &self.settings, true)
+                {
+                    if !crate::mpi::agreed_branch(ratio <= T::one()) {
+                        self.info.set_status(before);
+                    }
+                }
+            }
             self.solution
                 .post_process(&self.data, &mut self.variables, &self.info, &self.settings);
         }

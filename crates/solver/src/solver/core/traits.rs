@@ -427,6 +427,20 @@ pub trait Solution<T: FloatT> {
 
     /// finalize the solution, e.g. extract final timing from info
     fn finalize(&mut self, info: &Self::I);
+
+    /// Original-coordinate acceptance of the current iterate: the largest
+    /// multiple of the `Solved` (`reduced`: `AlmostSolved`) tolerances over
+    /// the residuals of the point that would be returned. At most one
+    /// passes. `None` when the test does not apply.
+    fn original_ratio(
+        &mut self,
+        _data: &Self::D,
+        _variables: &Self::V,
+        _settings: &Self::SE,
+        _reduced: bool,
+    ) -> Option<T> {
+        None
+    }
 }
 
 /// Settings for a conic optimization problem.

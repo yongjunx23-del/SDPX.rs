@@ -104,40 +104,25 @@ impl DenseBlockSolver {
                 }
             }
         }
+        // Every blocked kernel runs the same tiles whatever the worker count
+        // (a single-worker pool when there is no pool), so the factor does
+        // not depend on the number of threads.
         let pool = self
             .pool
             .as_deref()
-            .filter(|pool| pool.current_num_threads() > 1 && n >= 2 * TILE);
+            .filter(|pool| pool.current_num_threads() > 1);
+        let blocked = pool.unwrap_or(serial_pool());
         let rule = self.pivot_rule();
-        let mut info = 0;
-        match pool {
-            Some(pool) => {
-                if !tiled_potrf(&mut self.h, n, pool, &mut self.tiles, rule) {
-                    return false;
-                }
-            }
-            None => {
-                // LAPACK first; a rejected pivot reruns with the dynamic
-                // pivot rule applied inside the factorization.
-                let saved = rule.map(|_| self.h.clone());
-                unsafe { lapack::dpotrf(b'U', n as i32, &mut self.h, n as i32, &mut info) };
-                if let Some(saved) = saved.filter(|_| info != 0 || !self.valid_factor(&self.h, n)) {
-                    self.h = saved;
-                    info = 0;
-                    if !tiled_potrf(&mut self.h, n, serial_pool(), &mut self.tiles, rule) {
-                        return false;
-                    }
-                }
-            }
-        }
-        if info != 0 || !self.valid_factor(&self.h, n) {
+        if !factor_block(&mut self.h, n, blocked, &mut self.tiles, rule)
+            || !self.valid_factor(&self.h, n)
+        {
             return false;
         }
         if m == 0 {
             return true;
         }
-        // Columns of Y are independent right-hand sides: split them across
-        // the pool. Each column's triangular solve is unchanged.
+        // Columns of Y are independent right-hand sides, solved in fixed
+        // TILE-column chunks (split across the pool when there is one).
         let h = &self.h;
         let trsm = |y: &mut [f64]| unsafe {
             blas::dtrsm(
@@ -155,29 +140,26 @@ impl DenseBlockSolver {
             );
         };
         match pool {
-            Some(pool) => {
-                let per = m.div_ceil(pool.current_num_threads()).max(1);
-                pool.install(|| self.y.par_chunks_mut(per * n).for_each(trsm));
-            }
-            None => trsm(&mut self.y),
+            Some(pool) => pool.install(|| self.y.par_chunks_mut(TILE * n).for_each(trsm)),
+            None => self.y.chunks_mut(TILE * n).for_each(trsm),
         }
         // S += Y'Y: upper column blocks of S are independent.
-        match pool {
-            Some(pool) if m >= 2 * TILE => {
-                let y = &self.y;
-                pool.install(|| {
-                    self.s
-                        .par_chunks_mut(TILE * m)
-                        .enumerate()
-                        .for_each(|(b, cols)| {
-                            let (c0, w) = (b * TILE, cols.len() / m);
-                            // Rows 0..c0 of this block, then its diagonal tile.
-                            tile_gemm(c0, w, n, &y[..c0 * n], n, &y[c0 * n..], n, cols, m);
-                            tile_syrk(w, n, &y[c0 * n..], n, &mut cols[c0..], m);
-                        })
-                });
+        if m >= 2 * TILE {
+            let y = &self.y;
+            let block = |(b, cols): (usize, &mut [f64])| {
+                let (c0, w) = (b * TILE, cols.len() / m);
+                // Rows 0..c0 of this block, then its diagonal tile.
+                tile_gemm(c0, w, n, &y[..c0 * n], n, &y[c0 * n..], n, cols, m);
+                tile_syrk(w, n, &y[c0 * n..], n, &mut cols[c0..], m);
+            };
+            match pool {
+                Some(pool) => {
+                    pool.install(|| self.s.par_chunks_mut(TILE * m).enumerate().for_each(block))
+                }
+                None => self.s.chunks_mut(TILE * m).enumerate().for_each(block),
             }
-            _ => unsafe {
+        } else {
+            unsafe {
                 blas::dsyrk(
                     b'U',
                     b'T',
@@ -190,31 +172,13 @@ impl DenseBlockSolver {
                     &mut self.s,
                     m as i32,
                 );
-            },
-        }
-        if let Some(pool) = pool.filter(|_| m >= 2 * TILE) {
-            let mut tiles = Vec::new();
-            return tiled_potrf(&mut self.s, m, pool, &mut tiles, rule)
-                && self.y.iter().all(|v| v.is_finite())
-                && self.valid_factor(&self.s, m);
-        }
-        let saved = rule.map(|_| self.s.clone());
-        unsafe { lapack::dpotrf(b'U', m as i32, &mut self.s, m as i32, &mut info) };
-        if let Some(saved) = saved.filter(|_| info != 0 || !self.valid_factor(&self.s, m)) {
-            self.s = saved;
-            info = 0;
-            let mut tiles = Vec::new();
-            if !tiled_potrf(
-                &mut self.s,
-                m,
-                pool.unwrap_or(serial_pool()),
-                &mut tiles,
-                rule,
-            ) {
-                return false;
             }
         }
-        info == 0 && self.y.iter().all(|v| v.is_finite()) && self.valid_factor(&self.s, m)
+        let mut tiles = Vec::new();
+        if !factor_block(&mut self.s, m, blocked, &mut tiles, rule) {
+            return false;
+        }
+        self.y.iter().all(|v| v.is_finite()) && self.valid_factor(&self.s, m)
     }
 
     /// `(eps, delta)` of the dynamic pivot rule, when enabled: a Cholesky
@@ -261,7 +225,36 @@ impl DenseBlockSolver {
 /// number of workers.
 const TILE: usize = 128;
 
-/// Single-worker pool for the serial dynamic-pivot rerun.
+/// Cholesky of the upper triangle of `a` (n x n): tiled on `pool` from
+/// `2 * TILE`, where the tile boundaries alone fix the arithmetic, so any
+/// worker count gives the same factor; LAPACK below that. A pivot rejected by
+/// LAPACK reruns tiled with the dynamic pivot rule.
+fn factor_block(
+    a: &mut [f64],
+    n: usize,
+    pool: &rayon::ThreadPool,
+    tiles: &mut Vec<Vec<Vec<f64>>>,
+    rule: Option<(f64, f64)>,
+) -> bool {
+    if n >= 2 * TILE {
+        return tiled_potrf(a, n, pool, tiles, rule);
+    }
+    let saved = rule.map(|_| a.to_vec());
+    let mut info = 0;
+    unsafe { lapack::dpotrf(b'U', n as i32, a, n as i32, &mut info) };
+    let rejected = info != 0
+        || !a.iter().all(|v| v.is_finite())
+        || rule.is_some_and(|(eps, _)| (0..n).any(|i| a[i + i * n] * a[i + i * n] <= eps));
+    match saved {
+        Some(saved) if rejected => {
+            a.copy_from_slice(&saved);
+            tiled_potrf(a, n, serial_pool(), tiles, rule)
+        }
+        _ => info == 0,
+    }
+}
+
+/// Single-worker pool for the blocked kernels when no pool is set.
 fn serial_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
@@ -370,10 +363,10 @@ fn tile_syrk(n: usize, k: usize, a: &[f64], lda: usize, c: &mut [f64], ldc: usiz
     };
 }
 
-/// Tile products run on faer when it is built in: many concurrent
-/// single-threaded OpenBLAS calls serialized at 64 workers (79% of large's
-/// samples in dgemm). The product order differs from BLAS; the factor is
-/// still independent of the worker count.
+/// Tile products through the linked BLAS. faer tile products (tried for
+/// OpenBLAS contention at 64 workers) changed the rounding enough that the
+/// medium Float64 SDP stalled at `AlmostSolved`/28 instead of `Solved`/21;
+/// with BLAS the tiled factor matches LAPACK's `dpotrf` result.
 #[allow(clippy::too_many_arguments)]
 fn tile_product(
     m: usize,
@@ -392,17 +385,6 @@ fn tile_product(
     }
     assert!((k - 1) + (m - 1) * lda < a.len() && (k - 1) + (n - 1) * ldb < b.len());
     assert!((m - 1) + (n - 1) * ldc < c.len());
-    #[cfg(feature = "faer-sparse")]
-    {
-        // SAFETY: the asserts bound every strided access.
-        unsafe {
-            let a = faer::MatRef::from_raw_parts(a.as_ptr(), m, k, lda as isize, 1);
-            let b = faer::MatRef::from_raw_parts(b.as_ptr(), k, n, 1, ldb as isize);
-            let c = faer::MatMut::from_raw_parts_mut(c.as_mut_ptr(), m, n, 1, ldc as isize);
-            faer::linalg::matmul::matmul(c, faer::Accum::Add, a, b, alpha, faer::Par::Seq);
-        }
-    }
-    #[cfg(not(feature = "faer-sparse"))]
     unsafe {
         blas::dgemm(
             b'T', b'N', m as i32, n as i32, k as i32, alpha, a, lda as i32, b, ldb as i32, 1., c,
@@ -676,6 +658,64 @@ mod tests {
         fresh.solve(&k, &mut x2, &mut b2);
         assert_eq!(x, x2);
     }
+    #[test]
+    fn dense_block_factor_is_thread_invariant() {
+        // Leading block above the tiling threshold and a border above it too:
+        // with and without a pool the factor runs the same tiles.
+        let (n, m) = (2 * TILE + 9, 2 * TILE + 3);
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let total = n + m;
+        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+        for j in 0..total {
+            for i in 0..=j {
+                let v = if i == j {
+                    if j < n {
+                        n as f64
+                    } else {
+                        -(m as f64)
+                    }
+                } else if (i < n) == (j < n) || i < n {
+                    next() * 0.1
+                } else {
+                    0.
+                };
+                rows.push(i);
+                cols.push(j);
+                vals.push(v);
+            }
+        }
+        let k = CscMatrix::new_from_triplets(total, total, rows, cols, vals);
+        let signs: Vec<i8> = (0..total).map(|i| if i < n { 1 } else { -1 }).collect();
+        let settings = CoreSettings::default();
+        let run = |threads: usize| {
+            let mut s = DenseBlockSolver::new(&k, &signs, &settings, n);
+            if threads > 1 {
+                s.set_pool(Some(Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap(),
+                )));
+            }
+            assert!(s.factor_dense(&k));
+            (s.h, s.y, s.s)
+        };
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let (h1, y1, s1) = run(1);
+        for threads in [2, 5] {
+            let (h, y, s) = run(threads);
+            assert_eq!(bits(&h1), bits(&h));
+            assert_eq!(bits(&y1), bits(&y));
+            assert_eq!(bits(&s1), bits(&s));
+        }
+    }
+
     #[test]
     fn tiled_potrf_matches_lapack_and_is_thread_invariant() {
         let n = 2 * TILE + 45;

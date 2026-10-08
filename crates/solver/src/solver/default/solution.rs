@@ -54,6 +54,42 @@ where
     }
 }
 
+impl<T> DefaultSolution<T>
+where
+    T: FloatT,
+{
+    /// Map internal variables to the original problem: undo equilibration
+    /// and τ (or κ for certificates), then chordal decomposition, then
+    /// presolve. `variables` is left unscaled.
+    fn reconstruct(
+        &mut self,
+        data: &DefaultProblemData<T>,
+        variables: &mut DefaultVariables<T>,
+        settings: &DefaultSettings<T>,
+        is_infeasible: bool,
+    ) {
+        // unscale the variables to get a solution
+        // to the internal problem as we solved it
+        variables.unscale(data, is_infeasible);
+
+        // unwind the chordal decomp and presolve, in the
+        // reverse of the order in which they were applied
+        let tmp = data
+            .chordal_info
+            .as_ref()
+            .map(|chordal_info| chordal_info.decomp_reverse(variables, &data.cones, settings));
+        let variables = tmp.as_ref().unwrap_or(variables);
+
+        if let Some(ref presolver) = data.presolver {
+            presolver.reverse_presolve(self, variables);
+        } else {
+            self.x.copy_from(&variables.x);
+            self.z.copy_from(&variables.z);
+            self.s.copy_from(&variables.s);
+        }
+    }
+}
+
 impl<T> Solution<T> for DefaultSolution<T>
 where
     T: FloatT,
@@ -85,25 +121,37 @@ where
         self.r_prim = info.res_primal;
         self.r_dual = info.res_dual;
 
-        // unscale the variables to get a solution
-        // to the internal problem as we solved it
-        variables.unscale(data, is_infeasible);
+        self.reconstruct(data, variables, settings, is_infeasible);
+    }
 
-        // unwind the chordal decomp and presolve, in the
-        // reverse of the order in which they were applied
-        let tmp = data
-            .chordal_info
-            .as_ref()
-            .map(|chordal_info| chordal_info.decomp_reverse(variables, &data.cones, settings));
-        let variables = tmp.as_ref().unwrap_or(variables);
-
-        if let Some(ref presolver) = data.presolver {
-            presolver.reverse_presolve(self, variables);
-        } else {
-            self.x.copy_from(&variables.x);
-            self.z.copy_from(&variables.z);
-            self.s.copy_from(&variables.s);
+    fn original_ratio(
+        &mut self,
+        data: &DefaultProblemData<T>,
+        variables: &DefaultVariables<T>,
+        settings: &DefaultSettings<T>,
+        reduced: bool,
+    ) -> Option<T> {
+        let tol = settings.tol_original?;
+        if data.sampled.is_some() {
+            return None;
         }
+        let mut scratch = variables.copy_of();
+        let status = self.status;
+        self.status = SolverStatus::Solved;
+        self.reconstruct(data, &mut scratch, settings, false);
+        self.status = status;
+        let original = data.original_data();
+        let psd_dual = data.chordal_info.is_none() || settings.chordal_decomposition_complete_dual;
+        let residuals = original.residuals(&self.x, &self.s, &self.z, psd_dual);
+        Some(if reduced {
+            residuals.ratio(
+                T::max(tol, settings.reduced_tol_feas),
+                T::max(tol, settings.reduced_tol_gap_abs),
+                T::max(tol, settings.reduced_tol_gap_rel),
+            )
+        } else {
+            residuals.ratio(tol, tol, tol)
+        })
     }
 
     fn finalize(&mut self, info: &DefaultInfo<T>) {

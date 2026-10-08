@@ -60,6 +60,11 @@ const FORWARD_BLOCK: usize = 32;
 /// Leaf sweeps split with smaller blocks: Λ27 leaves of order 88-113 on
 /// ranks with two leaves and 16 workers ran their sweeps serially.
 const LEAF_BLOCK: usize = 16;
+/// Row block of every backward sweep. Row `i` applies its terms `k > i`
+/// block by block from the bottom (`[n-B, n)`, `[n-2B, n-B)`, ...),
+/// ascending within a block: the only order a pooled sweep can follow, so
+/// the serial, batched and pooled sweeps all give the same bits.
+const BACKWARD_BLOCK: usize = LEAF_BLOCK;
 const LEAF_SPLIT_MIN: usize = 4 * LEAF_BLOCK;
 
 fn find(parent: &mut [usize], mut i: usize) -> usize {
@@ -288,11 +293,12 @@ impl<T: FloatT> DenseLeaf<T> {
 
     /// [`Self::backward`] split over the ambient pool: the bottom row block
     /// finishes serially, then every earlier row applies that block's columns
-    /// in parallel. Each term is still one rounded FMA, but a row now sums its
-    /// terms block by block from the bottom, so the bits differ from the
-    /// serial sweep (gated by the solve audit, not bitwise identity).
-    fn backward_blocked(&self, x: &mut [T], block: usize) {
+    /// in parallel. A row sums its terms block by block from the bottom,
+    /// ascending within a block: the [`BACKWARD_BLOCK`] order of the serial
+    /// sweep, so the bits are identical.
+    fn backward_blocked(&self, x: &mut [T]) {
         let n = self.n;
+        let block = BACKWARD_BLOCK;
         let mut r1 = n;
         while r1 > 0 {
             let r0 = r1.saturating_sub(block);
@@ -319,10 +325,17 @@ impl<T: FloatT> DenseLeaf<T> {
         }
     }
 
+    /// Backward sweep in the [`BACKWARD_BLOCK`] order.
     fn backward(&self, x: &mut [T]) {
-        for i in (0..self.n).rev() {
-            for k in i + 1..self.n {
-                x[i] = (-self.l[k + i * self.n]).mul_add(x[k], x[i]);
+        let n = self.n;
+        for i in (0..n).rev() {
+            let mut r1 = n;
+            while r1 > i + 1 {
+                let r0 = r1.saturating_sub(BACKWARD_BLOCK);
+                for k in r0.max(i + 1)..r1 {
+                    x[i] = (-self.l[k + i * n]).mul_add(x[k], x[i]);
+                }
+                r1 = r0;
             }
         }
     }
@@ -340,12 +353,18 @@ impl<T: FloatT> DenseLeaf<T> {
         }
     }
     fn backward_many(&self, x: &mut [T], cols: usize) {
-        for i in (0..self.n).rev() {
-            for k in i + 1..self.n {
-                let l = -self.l[k + i * self.n];
-                for c in 0..cols {
-                    x[i * cols + c] = l.mul_add(x[k * cols + c], x[i * cols + c]);
+        let n = self.n;
+        for i in (0..n).rev() {
+            let mut r1 = n;
+            while r1 > i + 1 {
+                let r0 = r1.saturating_sub(BACKWARD_BLOCK);
+                for k in r0.max(i + 1)..r1 {
+                    let l = -self.l[k + i * n];
+                    for c in 0..cols {
+                        x[i * cols + c] = l.mul_add(x[k * cols + c], x[i * cols + c]);
+                    }
                 }
+                r1 = r0;
             }
         }
     }
@@ -415,7 +434,7 @@ impl<T: FloatT> DenseLeaf<T> {
                 for (x, d) in x.iter_mut().zip(&self.dinv) {
                     *x *= *d;
                 }
-                self.backward_blocked(x, FORWARD_BLOCK);
+                self.backward_blocked(x);
             }),
             None => {
                 self.forward(x);
@@ -643,7 +662,7 @@ impl<T: FloatT> Leaf<T> {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::backward_many);
         } else if cols == 1 && split && self.factor.n >= LEAF_SPLIT_MIN {
-            self.factor.backward_blocked(&mut self.batch_w, LEAF_BLOCK);
+            self.factor.backward_blocked(&mut self.batch_w);
         } else {
             self.factor.backward_many(&mut self.batch_w, cols);
         }
@@ -698,7 +717,7 @@ impl<T: FloatT> Leaf<T> {
             self.w.iter_mut().enumerate().for_each(update);
         }
         if split && self.factor.n >= LEAF_SPLIT_MIN {
-            self.factor.backward_blocked(&mut self.w, LEAF_BLOCK);
+            self.factor.backward_blocked(&mut self.w);
         } else {
             self.factor.backward(&mut self.w);
         }
@@ -745,7 +764,7 @@ impl<T: FloatT> Leaf<T> {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::backward_many);
         } else if cols == 1 && split && self.factor.n >= LEAF_SPLIT_MIN {
-            self.factor.backward_blocked(&mut self.batch_w, LEAF_BLOCK);
+            self.factor.backward_blocked(&mut self.batch_w);
         } else {
             self.factor.backward_many(&mut self.batch_w, cols);
         }
@@ -1918,7 +1937,7 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
                     for (x, d) in tx.iter_mut().zip(&tf.dinv) {
                         *x *= *d;
                     }
-                    tf.backward_blocked(tx, FORWARD_BLOCK);
+                    tf.backward_blocked(tx);
                 });
             }
             None => {
@@ -2081,16 +2100,17 @@ mod tests {
         leaf.forward(&mut s);
         pool.install(|| leaf.forward_blocked(&mut b, LEAF_BLOCK));
         assert_eq!(s, b);
-        // Backward: reordered sums, equal to working precision.
+        // Backward: the shared block order, bitwise identical, and equal to
+        // the batched sweep column by column.
         let (mut s, mut b) = (rhs.clone(), rhs.clone());
         leaf.backward(&mut s);
-        pool.install(|| leaf.backward_blocked(&mut b, LEAF_BLOCK));
-        for (x, y) in s.iter().zip(&b) {
-            let d = (*x - *y).to_f64().unwrap().abs();
-            assert!(
-                d <= 1e-70 * (1.0 + x.to_f64().unwrap().abs()),
-                "{x:?} vs {y:?}"
-            );
+        pool.install(|| leaf.backward_blocked(&mut b));
+        assert_eq!(s, b);
+        let mut many: Vec<T> = rhs.iter().flat_map(|&v| [v, -v]).collect();
+        leaf.backward_many(&mut many, 2);
+        for (i, &v) in s.iter().enumerate() {
+            assert_eq!(many[2 * i], v);
+            assert_eq!(many[2 * i + 1], -v);
         }
     }
     use sdpx_arithmetic::MpFloat;

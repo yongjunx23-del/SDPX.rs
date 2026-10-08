@@ -88,6 +88,21 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "None")]
     pub tol_dual_qnorm: Option<T>,
 
+    /// Original-coordinate acceptance tolerance. When set, `Solved` also
+    /// requires the point returned in original coordinates to pass the audit
+    /// at this tolerance: `‖b-Ax-s‖∞`, `dist_K(s)`, `dist_K(b-Ax)` at most
+    /// `tol·(1+‖b‖∞)`; `‖Px+A'z+q‖∞`, `dist_K*(z)` at most `tol·(1+‖q‖∞)`;
+    /// the duality gap at most `tol` or `tol·(1+|primal objective|)`.
+    /// `AlmostSolved` uses the larger of this and the reduced tolerances.
+    /// Otherwise the solver keeps iterating while these residuals improve.
+    /// The internal test divides by `‖x‖+‖s‖` (`‖x‖+‖z‖`) of the transformed
+    /// problem, which presolve, chordal overlap variables and large solutions
+    /// inflate (SDP_control1: decomposed `‖x‖` 1.2e5 against 18 and
+    /// `‖A'z+q‖∞ = 0.036` at `Solved`). Default `1e-6` (the Float64 audit
+    /// tolerance) in binary64; `None` (internal test only) in MPFR.
+    #[builder(default = "is_primitive::<T>().then(|| (1e-6).as_T())")]
+    pub tol_original: Option<T>,
+
     ///absolute infeasibility tolerance (primal and dual)
     #[builder(default = "accuracy_default::<T>(1e-8)")]
     pub tol_infeas_abs: T,
