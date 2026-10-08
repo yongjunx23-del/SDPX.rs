@@ -408,6 +408,10 @@ where
     fn gap_rel(&self) -> Option<T> {
         None
     }
+    /// Larger of the primal and dual feasibility residuals, if recorded.
+    fn residual_max(&self) -> Option<T> {
+        None
+    }
     /// Set the termination status
     fn set_status(&mut self, status: SolverStatus);
     /// Forget the status and progress history before a restart.

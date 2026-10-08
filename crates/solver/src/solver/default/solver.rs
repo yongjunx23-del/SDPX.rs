@@ -320,6 +320,7 @@ impl<T: FloatT> DefaultSolver<T> {
             timers: None,
             callbacks: SolverCallbacks::default(),
             start_tau: None,
+            small_steps: 0,
             phantom: std::marker::PhantomData,
         };
         timers.stop_setup();

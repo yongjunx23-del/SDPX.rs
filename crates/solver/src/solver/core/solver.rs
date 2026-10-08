@@ -152,6 +152,8 @@ where
     pub(crate) callbacks: SolverCallbacks<I>,
     /// Starting τ of the current attempt (`initial_tau` until a restart).
     pub(crate) start_tau: Option<T>,
+    /// Consecutive steps at or below `min_terminate_step_length`.
+    pub(crate) small_steps: u32,
     pub(crate) phantom: std::marker::PhantomData<T>,
 }
 
@@ -288,35 +290,45 @@ where
 
         timeit! {"solve"; {
         self.start_tau = None;
+        self.small_steps = 0;
         timeit! {"default start"; {
             self.start_point();
         }}
         timeit! {"IP iteration"; {
         'attempts: loop {
         let mut chase = TauChase::default();
+        let mut switch = FixedTauSwitch::default();
         let mut chase_tau = None;
         loop {
             self.evaluate(&mut state, &timers);
             if self.terminate(&mut state).stop() {
                 break;
             }
-            let fixed_phase = self.settings.core().fixed_tau_phase;
             if self.start_tau.is_none()
-                && (self.settings.core().auto_start_scale || fixed_phase)
+                && self.settings.core().auto_start_scale
                 && self.callbacks.checkpoint.restart.is_none()
-                && !self.variables.tau_frozen()
             {
                 let tau0 = self.settings.core().initial_tau;
                 if let (Some(tau), Some(gap)) = (self.variables.tau(), self.info.gap_rel()) {
                     if chase.observe(gap, state.μ, tau, tau0) {
-                        if fixed_phase && self.variables.freeze_tau() {
-                            // Continue from this iterate on the original
-                            // problem at the reached scale; μ now counts
-                            // the cones only.
+                        chase_tau = Some(TauChase::restart_tau(tau));
+                        break;
+                    }
+                }
+            }
+            if let (Some(tau), Some(gap)) = (self.variables.tau(), self.info.gap_rel()) {
+                trace_tau(state.iter, tau, gap, state.μ);
+                if self.settings.core().fixed_tau_phase
+                    && self.callbacks.checkpoint.restart.is_none()
+                    && !self.variables.tau_frozen()
+                {
+                    let res = self.info.residual_max().unwrap_or(T::infinity());
+                    if let Some(reason) = switch.observe(state.iter, gap, tau, res) {
+                        if self.variables.freeze_tau() {
                             if self.settings.core().verbose {
                                 let _ = writeln!(
                                     self.info.print_target(),
-                                    "fixed tau phase: from iteration {}, tau {:.1e}",
+                                    "fixed tau phase ({reason}): from iteration {}, tau {:.1e}",
                                     state.iter,
                                     tau
                                 );
@@ -325,10 +337,8 @@ where
                                 "fixed tau phase",
                                 std::time::Duration::ZERO,
                             );
+                            // μ now counts the cones only.
                             state.μ = self.variables.calc_mu(&self.residuals, &self.cones);
-                        } else {
-                            chase_tau = Some(TauChase::restart_tau(tau));
-                            break;
                         }
                     }
                 }
@@ -391,6 +401,7 @@ where
             );
         }
         self.start_tau = Some(next);
+        self.small_steps = 0;
         self.info.restart();
         self.kktsystem.reset_solve();
         let iter = state.iter;
@@ -1027,12 +1038,22 @@ mod internal {
                 && α < self.settings.core().min_switch_step_length
             {
                 output = StrategyCheckpoint::Update(ScalingStrategy::Dual);
-            } else if α <= T::max(T::zero(), self.settings.core().min_terminate_step_length)
-                && !(crate::solver::core::test_no_progress_stop() && α > T::zero())
-            {
-                self.info.set_status(SolverStatus::InsufficientProgress);
-                output = StrategyCheckpoint::Fail;
+            } else if α <= T::max(T::zero(), self.settings.core().min_terminate_step_length) {
+                // One short step inside a long plateau is not a stall (Λ35:
+                // α 8e-5 at iteration 598, then 4e-4, 0.03, 0.5, 0.7 and the
+                // escape). Stop on three consecutive short steps; a zero step
+                // stops at once since the iterate cannot move.
+                self.small_steps += 1;
+                if (self.small_steps >= 3 || α <= T::zero())
+                    && !(crate::solver::core::test_no_progress_stop() && α > T::zero())
+                {
+                    self.info.set_status(SolverStatus::InsufficientProgress);
+                    output = StrategyCheckpoint::Fail;
+                } else {
+                    output = StrategyCheckpoint::NoUpdate;
+                }
             } else {
+                self.small_steps = 0;
                 output = StrategyCheckpoint::NoUpdate;
             }
 
@@ -1053,6 +1074,76 @@ mod internal {
         }
     } // end trait impl
 } //end internals module
+
+/// Diagnostic only: with `SDPX_TRACE_TAU` set, print τ, the relative gap
+/// and μ of every evaluated iterate to stderr.
+fn trace_tau<T: FloatT>(iter: u32, tau: T, gap: T, mu: T) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("SDPX_TRACE_TAU").is_some()) {
+        eprintln!("tau-trace {iter} {tau:.3e} {gap:.3e} {mu:.3e}");
+    }
+}
+
+/// When to enter the fixed-τ phase. Both rules need the relative gap at or
+/// below 1e-6, so HSD infeasibility detection (τ → 0 with κ bounded) has
+/// had the run's start to act.
+/// - `converged`: τ within a factor 2 over the last 10 iterates while the
+///   larger feasibility residual fell tenfold: the embedding is settling on
+///   a τ > 0 point, and fixing τ removes the constant right-hand side.
+/// - `escape`: after a plateau (50 iterations without a tenfold gap
+///   improvement), the gap fell 1e6-fold within 50 iterations (Λ35 at 768
+///   bits: 5e-21 at 599, 8e-38 at 699, then the HSD end game stalls).
+#[derive(Default)]
+struct FixedTauSwitch<T> {
+    recent: std::collections::VecDeque<(u32, T, T, T)>,
+    anchor: Option<(u32, T)>,
+    plateau: bool,
+}
+
+impl<T: FloatT> FixedTauSwitch<T> {
+    const WINDOW: usize = 10;
+    const SPAN: u32 = 50;
+
+    fn observe(&mut self, iter: u32, gap: T, tau: T, res: T) -> Option<&'static str> {
+        if !(gap.is_finite() && tau.is_finite() && tau > T::zero()) {
+            return None;
+        }
+        match self.anchor {
+            Some((_, best)) if gap >= best * (0.1).as_T() => {}
+            _ => self.anchor = Some((iter, gap)),
+        }
+        if iter >= self.anchor.unwrap().0 + Self::SPAN {
+            self.plateau = true;
+        }
+        self.recent.push_back((iter, gap, tau, res));
+        while self.recent.front().is_some_and(|e| e.0 + Self::SPAN < iter) {
+            self.recent.pop_front();
+        }
+        if gap > (1e-6).as_T() {
+            return None;
+        }
+        if self.plateau
+            && self
+                .recent
+                .iter()
+                .any(|e| e.1.is_finite() && e.1 >= gap * (1e6).as_T())
+        {
+            return Some("escape");
+        }
+        let n = self.recent.len();
+        if n > Self::WINDOW {
+            let window = self.recent.range(n - 1 - Self::WINDOW..);
+            let (lo, hi) = window.fold((T::infinity(), T::zero()), |(lo, hi), e| {
+                (T::min(lo, e.2), T::max(hi, e.2))
+            });
+            let before = self.recent[n - 1 - Self::WINDOW].3;
+            if hi <= lo * (2.0).as_T() && (res.is_finite() && res <= before * (0.1).as_T()) {
+                return Some("converged");
+            }
+        }
+        None
+    }
+}
 
 /// Detects a τ chase on a unit-scale first attempt: since the relative gap
 /// last improved tenfold, μ fell by 1e10 while τ fell below `1e-4·τ₀`. On
@@ -1115,5 +1206,53 @@ mod tau_chase_tests {
         let mut c = TauChase::<f64>::default();
         assert!((0..40).all(|k| !c.observe(1e-13, 10f64.powi(-k), 1e-40, 1e-30)));
         assert_eq!(TauChase::<f64>::restart_tau(1e-11), 1e-11);
+    }
+}
+
+#[cfg(test)]
+mod fixed_tau_switch_tests {
+    use super::FixedTauSwitch;
+
+    #[test]
+    fn converged_needs_stable_tau_small_gap_and_falling_residuals() {
+        let mut s = FixedTauSwitch::<f64>::default();
+        let mut fired = None;
+        for k in 0..40u32 {
+            let gap = 10f64.powi(-(k as i32) / 2);
+            let res = gap * 1e-3;
+            if let Some(r) = s.observe(k, gap, 0.5, res) {
+                fired = Some((k, r));
+                break;
+            }
+        }
+        // gap <= 1e-6 from k = 12; 10 earlier iterates exist from k = 10.
+        assert_eq!(fired, Some((12, "converged")));
+        // A collapsing τ never counts as converged.
+        let mut s = FixedTauSwitch::<f64>::default();
+        assert!((0..60u32).all(|k| {
+            let gap = 10f64.powi(-(k as i32) / 2);
+            s.observe(k, gap, 10f64.powi(-(k as i32)), gap).is_none()
+        }));
+    }
+
+    #[test]
+    fn escape_needs_a_plateau_first() {
+        let mut s = FixedTauSwitch::<f64>::default();
+        // Plateau at 1e-18 with τ collapsing and flat residuals.
+        for k in 0..80u32 {
+            assert!(s
+                .observe(k, 1e-18, 10f64.powi(-(k as i32)), 1e-200)
+                .is_none());
+        }
+        // Escape: 1e6-fold within 50 iterations.
+        let mut fired = None;
+        for (j, k) in (80..140u32).enumerate() {
+            let gap = 1e-18 * 10f64.powi(-(j as i32) / 4);
+            if let Some(r) = s.observe(k, gap, 1e-70, 1e-200) {
+                fired = Some((k, r));
+                break;
+            }
+        }
+        assert_eq!(fired, Some((104, "escape")));
     }
 }
