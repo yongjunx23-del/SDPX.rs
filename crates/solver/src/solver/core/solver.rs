@@ -323,12 +323,12 @@ where
                     && !self.variables.tau_frozen()
                 {
                     let res = self.info.residual_max().unwrap_or(T::infinity());
-                    if let Some(reason) = switch.observe(state.iter, gap, tau, res) {
+                    if switch.observe(gap, tau, res, state.α) {
                         if self.variables.freeze_tau() {
                             if self.settings.core().verbose {
                                 let _ = writeln!(
                                     self.info.print_target(),
-                                    "fixed tau phase ({reason}): from iteration {}, tau {:.1e}",
+                                    "fixed tau phase: from iteration {}, tau {:.1e}",
                                     state.iter,
                                     tau
                                 );
@@ -1084,64 +1084,48 @@ fn trace_tau<T: FloatT>(iter: u32, tau: T, gap: T, mu: T) {
     }
 }
 
-/// When to enter the fixed-τ phase. Both rules need the relative gap at or
-/// below 1e-6, so HSD infeasibility detection (τ → 0 with κ bounded) has
-/// had the run's start to act.
-/// - `converged`: τ within a factor 2 over the last 10 iterates while the
-///   larger feasibility residual fell tenfold: the embedding is settling on
-///   a τ > 0 point, and fixing τ removes the constant right-hand side.
-/// - `escape`: after a plateau (50 iterations without a tenfold gap
-///   improvement), the gap fell 1e6-fold within 50 iterations (Λ35 at 768
-///   bits: 5e-21 at 599, 8e-38 at 699, then the HSD end game stalls).
+/// When to enter the fixed-τ phase: the embedding has settled on a τ > 0
+/// point and is in its fast phase. Over the last 10 iterates τ stays within
+/// 10% and the larger feasibility residual fell tenfold; the relative gap is
+/// at most 1e-8 and the last three steps were at least 0.8. τ can sit on a
+/// false plateau before the τ chase (Λ19: 0.15 over iterations 15–24, then
+/// 0.0096 from 42; Λ27: 0.066, then a 50-fold fall), and fixing it there
+/// cost 8–112 iterations; the fast-phase test waits for the settled value.
+/// HSD infeasibility detection has acted by then (τ → 0 with κ bounded
+/// never satisfies the τ test).
 #[derive(Default)]
 struct FixedTauSwitch<T> {
-    recent: std::collections::VecDeque<(u32, T, T, T)>,
-    anchor: Option<(u32, T)>,
-    plateau: bool,
+    recent: std::collections::VecDeque<(T, T, T)>,
 }
 
 impl<T: FloatT> FixedTauSwitch<T> {
     const WINDOW: usize = 10;
-    const SPAN: u32 = 50;
 
-    fn observe(&mut self, iter: u32, gap: T, tau: T, res: T) -> Option<&'static str> {
-        if !(gap.is_finite() && tau.is_finite() && tau > T::zero()) {
-            return None;
+    fn observe(&mut self, gap: T, tau: T, res: T, α: T) -> bool {
+        if !(gap.is_finite() && tau.is_finite() && tau > T::zero() && res.is_finite()) {
+            self.recent.clear();
+            return false;
         }
-        match self.anchor {
-            Some((_, best)) if gap >= best * (0.1).as_T() => {}
-            _ => self.anchor = Some((iter, gap)),
-        }
-        if iter >= self.anchor.unwrap().0 + Self::SPAN {
-            self.plateau = true;
-        }
-        self.recent.push_back((iter, gap, tau, res));
-        while self.recent.front().is_some_and(|e| e.0 + Self::SPAN < iter) {
+        self.recent.push_back((tau, res, α));
+        if self.recent.len() > Self::WINDOW + 1 {
             self.recent.pop_front();
         }
-        if gap > (1e-6).as_T() {
-            return None;
+        if self.recent.len() <= Self::WINDOW || gap > (1e-8).as_T() {
+            return false;
         }
-        if self.plateau
-            && self
-                .recent
-                .iter()
-                .any(|e| e.1.is_finite() && e.1 >= gap * (1e6).as_T())
-        {
-            return Some("escape");
-        }
-        let n = self.recent.len();
-        if n > Self::WINDOW {
-            let window = self.recent.range(n - 1 - Self::WINDOW..);
-            let (lo, hi) = window.fold((T::infinity(), T::zero()), |(lo, hi), e| {
-                (T::min(lo, e.2), T::max(hi, e.2))
+        let (lo, hi) = self
+            .recent
+            .iter()
+            .fold((T::infinity(), T::zero()), |(lo, hi), e| {
+                (T::min(lo, e.0), T::max(hi, e.0))
             });
-            let before = self.recent[n - 1 - Self::WINDOW].3;
-            if hi <= lo * (2.0).as_T() && (res.is_finite() && res <= before * (0.1).as_T()) {
-                return Some("converged");
-            }
-        }
-        None
+        let fast = self
+            .recent
+            .iter()
+            .rev()
+            .take(3)
+            .all(|e| e.2 >= (0.8).as_T());
+        hi <= lo * (1.1).as_T() && fast && res <= self.recent[0].1 * (0.1).as_T()
     }
 }
 
@@ -1214,45 +1198,27 @@ mod fixed_tau_switch_tests {
     use super::FixedTauSwitch;
 
     #[test]
-    fn converged_needs_stable_tau_small_gap_and_falling_residuals() {
+    fn needs_settled_tau_fast_steps_and_small_gap() {
+        // Fast phase with τ settled: fires once 11 iterates exist.
         let mut s = FixedTauSwitch::<f64>::default();
-        let mut fired = None;
-        for k in 0..40u32 {
-            let gap = 10f64.powi(-(k as i32) / 2);
-            let res = gap * 1e-3;
-            if let Some(r) = s.observe(k, gap, 0.5, res) {
-                fired = Some((k, r));
-                break;
-            }
-        }
-        // gap <= 1e-6 from k = 12; 10 earlier iterates exist from k = 10.
-        assert_eq!(fired, Some((12, "converged")));
-        // A collapsing τ never counts as converged.
+        let fired = (0..30)
+            .position(|k| s.observe(1e-9 * 0.5f64.powi(k), 0.0096, 1e-3 * 0.5f64.powi(k), 0.9));
+        assert_eq!(fired, Some(10));
+        // Λ19-like false plateau: τ flat while steps are short (0.4–0.75),
+        // then τ falls 20% per iterate with long steps; neither qualifies.
         let mut s = FixedTauSwitch::<f64>::default();
-        assert!((0..60u32).all(|k| {
-            let gap = 10f64.powi(-(k as i32) / 2);
-            s.observe(k, gap, 10f64.powi(-(k as i32)), gap).is_none()
+        assert!((0..40).all(|k| {
+            let (tau, α) = if k < 12 {
+                (0.15, 0.6)
+            } else {
+                (0.15 * 0.8f64.powi(k - 12), 0.9)
+            };
+            !s.observe(1e-9, tau, 1e-3 * 0.5f64.powi(k), α)
         }));
-    }
-
-    #[test]
-    fn escape_needs_a_plateau_first() {
+        // Short steps or a large gap block it.
         let mut s = FixedTauSwitch::<f64>::default();
-        // Plateau at 1e-18 with τ collapsing and flat residuals.
-        for k in 0..80u32 {
-            assert!(s
-                .observe(k, 1e-18, 10f64.powi(-(k as i32)), 1e-200)
-                .is_none());
-        }
-        // Escape: 1e6-fold within 50 iterations.
-        let mut fired = None;
-        for (j, k) in (80..140u32).enumerate() {
-            let gap = 1e-18 * 10f64.powi(-(j as i32) / 4);
-            if let Some(r) = s.observe(k, gap, 1e-70, 1e-200) {
-                fired = Some((k, r));
-                break;
-            }
-        }
-        assert_eq!(fired, Some((104, "escape")));
+        assert!((0..30).all(|k| !s.observe(1e-9, 0.01, 1e-3 * 0.5f64.powi(k), 0.5)));
+        let mut s = FixedTauSwitch::<f64>::default();
+        assert!((0..30).all(|k| !s.observe(1e-6, 0.01, 1e-3 * 0.5f64.powi(k), 0.9)));
     }
 }

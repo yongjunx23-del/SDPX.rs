@@ -54,11 +54,11 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "false")]
     pub auto_start_scale: bool,
 
-    ///on the same τ-chase signature, freeze τ and κ instead of restarting:
-    ///later directions keep Δτ = Δκ = 0 and μ counts the cones only, an
-    ///infeasible-start path of the original problem at the reached scale
-    ///(as SDPB's). Termination tests are unchanged. Takes precedence over
-    ///`auto_start_scale`; single-process solver only.
+    ///enter a fixed-τ end phase once the embedding has settled on τ > 0
+    ///(τ within 10% over 10 iterates, gap ≤ 1e-8, steps ≥ 0.8): later
+    ///directions keep Δτ = Δκ = 0, μ counts the cones only, and the constant
+    ///right-hand side is no longer solved. Termination tests are unchanged.
+    ///Single-process solver only.
     #[builder(default = "false")]
     pub fixed_tau_phase: bool,
 
