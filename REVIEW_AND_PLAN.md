@@ -284,6 +284,38 @@ Parallel branches from b718ace:
 - Float64 scoreboard against MOSEK over the regression suite.
 - Literature and code survey.
 
+**Survey leads (2026-10-08; data in `~/.cache/sdpx-e2e/work/su2-large-scaling-20261008/`):**
+
+- **Float64 SU(2) medium and large have no Slater point.**
+  - Every PSD block has a kernel shared by all A_j and b. Large: 30/30/30/30/60/12/14 of 95/92/94/92/186/74/71. The relations are sparse, with coefficients 1, −1, −4/3.
+  - MOSEK's "optimal" points fail the 1e-6 audit (r_d≈1e-4).
+  - Fix: facial reduction in presolve (`perf-facial`, opt-in). The detection tolerance is a contract decision.
+  - Presolve already drops large's 1317 dependent equalities. Columns that are empty (74) or appear only in equalities (609) are still not eliminated.
+- **Float64 factor ordering.** Large's Schur columns split into blocks 1–5 only (3729), blocks 6–7 only (1817) and both (825). Two leaves plus a border would cut factor flops about 5×; refactor was 65% of one-thread time. Next: tiled Cholesky lookahead, phase lanes capped by work, position-blocked Schur dots.
+- **MPFR, in order:**
+  1. τ₀ from the data (SDPB uses Ω = 1e20, and 1e60 for Λ43).
+  2. Refining the full direction including Δτ, with batched corrections. This changes the refinement scope, so it needs approval.
+  3. A dataflow pipeline per component, with idle workers parked.
+  4. BLAS-3 rotation replay in the MPFR SVD (replay is 63% of SVD time).
+  5. A distributed border factor.
+- **Closed:**
+  - HKM or mixed NT/HKM, and NT scaling through eig(LᵀSL).
+  - MPFR PSD Gondzio correctors (about +33% per iteration).
+  - Low-rank DSDP formulas (already covered).
+  - Strassen or Ozaki residue GEMM (≤3%).
+  - A backward-error refinement stop (changes the refinement rule).
+
+**Approved by the user (2026-10-09):**
+- facial reduction with a tolerance-based kernel detection, gated by the
+  original-coordinate audit;
+- refinement of the full HSD direction (including Δτ), with tolerances
+  unchanged;
+- a data-chosen τ₀ that may cost ising11 iterations, if every Ising case
+  still beats SDPB.
+
+The user also delegated further contract decisions within the fixed precision
+rules (AGENTS.md "Numerical contracts").
+
 **A. Convergence of large sampled problems**
 
 1. **MPFR regularization scale (needs approval: regularization contract).**

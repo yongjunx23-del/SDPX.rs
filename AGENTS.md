@@ -65,14 +65,22 @@ run one matching solve, and continue once it passes.
   the repo.
 - Preserve upstream attribution and licenses.
 
-## Numerical contracts (do not change without explicit approval)
+## Numerical contracts
 
-- Precision: no silent precision lowering, mixed-precision factorization,
-  or precision-ladder warm starts. MPFR values own their storage.
-  Correctly rounded exact accumulation (RNS, `exactdot`) is allowed.
-- Keep Clarabel-style convergence, reduced tolerances, infeasibility
-  detection, regularization (including escalation) and iterative refinement.
-  Never promote `AlmostSolved`; `tol_feas_componentwise` stays off by default.
+The user delegated contract decisions to the agent (2026-10-09). The precision
+rules below stay fixed. The agent may change any other contract here:
+convergence, regularization, refinement scope, presolve tolerances, or a
+gate trade-off. It needs measured evidence, full solves that pass the
+original-coordinate audit, and a journal entry plus a plan line naming the
+change and its evidence. Never weaken an accuracy gate to pass a check.
+
+- Precision (fixed): no silent precision lowering, mixed-precision
+  factorization, or precision-ladder warm starts. MPFR values own their
+  storage. Correctly rounded exact accumulation (RNS, `exactdot`) is allowed.
+- Keep Clarabel-style convergence and infeasibility detection. Iterative
+  refinement may change scope (for example, refining the full HSD direction)
+  but never its acceptance tolerances. Never promote `AlmostSolved`;
+  `tol_feas_componentwise` stays off by default.
 - Keep original-coordinate outputs and accepted-iterate recovery. Sampled
   factors define their operator; never swap in rounded materializations.
 - Direct solves default to Ruiz + presolve + chordal; prepared handles keep
@@ -152,7 +160,9 @@ python3 benchmark/e2e/e2e.py ab CASE OLD NEW
 
 Use identical precision, settings, input and thread/BLAS budgets. Keep a
 speed optimization on a repeatable ≥2% end-to-end gain, or a clear memory or
-correctness benefit. Report the median and native/API/process scope. Repeat
+correctness benefit. A change that slows one case is acceptable when the
+suite gains overall and the goals still hold (SDPX ahead of MOSEK in Float64
+and of SDPB on the Ising problems); record the trade in the journal. Report the median and native/API/process scope. Repeat
 only if noise leaves the decision unresolved. Record a short kept/rejected
 entry in the journal; do not reopen closed directions without new evidence.
 
@@ -161,9 +171,13 @@ entry in the journal; do not reopen closed directions without new evidence.
 - Keep small E2E checks local. Send long builds, solves and substantial
   benchmarks to the cluster using `ucas-hpc`; use its validated dynamic
   OpenBLAS configuration until the recorded static-provider issue is fixed.
-- Work yourself by default, including job submission and monitoring. Use a
-  subagent only when genuinely needed for independent, bounded work; a long
-  run alone does not require delegation. No mandatory agent or model.
+- Parallel agents are welcome for independent tasks. Each works in its own
+  git worktree and branch (from the lead's current branch) and commits there.
+  The lead merges a branch after its gate passes and alone edits the plan and
+  journal; agents report evidence. No mandatory agent or model.
+- Each agent names its cluster jobs with its own prefix. It may cancel
+  (`qdel`) or clean up only its own jobs and run directories, without
+  asking; never touch other jobs or shared inputs.
 - Freeze source and inputs, use bounded resources, and record job state,
   exit code, status, audit, time, memory and evidence paths.
 - Keep timed runs serial per host. Compare frozen sources, not a moving tree.
