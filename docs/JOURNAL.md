@@ -8,6 +8,89 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — Λ35 plateau: primal divergence, not equilibration or τ₀
+
+- Hypothesis: the Λ35 gap plateau at 768 bits comes from the equilibration
+  bounds or the starting scale.
+- Runs (b718ace, 768 bits, 64 threads, tol 1e-42, max_iter 800), all
+  `MaxIterations`:
+
+  | Run | Final gap_rel | p − ref | Seconds |
+  |---|---|---|---|
+  | equilibration bounds 1e±29 | 1.5e-18 | 1.7e-12 | 2543 |
+  | equilibration off | 1.6e-19 | 2.3e-11 | 2540 |
+  | τ₀ 1e-30 (InsufficientProgress at 730 → 1e-20) | 1.5e-7 | 2.0e-6 | 2783 |
+  | τ₀ 1e-40 (InsufficientProgress at 598 → 1e-30) | 2.0e-17 | 8.6e-11 | 2475 |
+  | τ₀ 1, auto_start_scale (τ chase at 75 → 1.4e-29) | 6.9e-24 | 3.4e-18 | 2439 |
+
+- Observed: the absolute gap equals κ/τ throughout and τ falls toward
+  1e-60. In every run p − d < 0, while p − ref is far larger than |p − d|.
+  At the end of the eq29 run, max |x| = 8e130 and max |s| = 1.6e92, while z
+  stays bounded (5.7e10 on the 170 equality rows, ≤ 1.6 in the grams).
+  In every gram block s has a dominant subspace of rank 2–4 (relative
+  eigenvalues 1, 1e-5 to 1e-8, 1e-10; the rest below 1e-13), and z on it is
+  ≤ 2e-11 relative (script `~/.cache/sdpx-e2e/l35_face.py`).
+- SDPB (default Ω = 1e20, 64 ranks) solves Λ35 in 746 iterations / 2004 s
+  after the same plateau. Gap 1e-13 to 1e-17 over iterations 200–650, with μ
+  held near the gap by β = 1 recentering. Its P-err grows from 1e-135 to
+  1e-107. It escapes at 650–746 (steps 0.64–0.77); its objective is 6e-30
+  from the reference.
+- Hypothesis: a zero-cost primal recession direction (−Ad ⪰ 0) exists, so the
+  primal infimum is not attained and the dual has no Slater point. With no
+  complementary pair the HSD limit has τ = κ = 0, and τ₀ only moves the
+  plateau.
+- Decision: equilibration and τ₀ are closed as Λ35 fixes. Next on perf-l35:
+  a baseline without the InsufficientProgress restart, then facial reduction,
+  with an SDPB-like fixed-τ end phase as the fallback.
+
+## 2026-10-09 — Float64 scoreboard against MOSEK, every point audited
+
+- 58 cases at tolerance 1e-8 (b718ace), against MOSEK 11.2.2 through the
+  repo runner and through CVXPY. Every point is audited with
+  `native_oracle.jl` at 1e-6 in original coordinates, s := b − Ax.
+- 1 thread: 7 wins (3 by a MOSEK audit failure), 46 losses, 5 both fail;
+  geo-mean SDPX/MOSEK 5.4×, or 1.7× where MOSEK takes ≥ 0.1 s. 16 threads:
+  3 wins (all by MOSEK failure), 50 losses; 5.6×, or 2.0×.
+- Losses:
+  - The ten worst are LPs. In each, the `local_bounds_faer` dense equality
+    border is 67–88% of the solve. qdldl takes the same iterations 4–80×
+    faster, and the LP geo-mean would go from 22× to 3.0×.
+  - On the SOCP sched and nql cases, setup is presolve: sched_50_50 goes
+    3.38 → 0.11 s with presolve off.
+  - SDP: chordal off takes arch0 6.3 → 1.5 s; condensed is 2–3× faster on
+    qap5 and qap6.
+- Defects:
+  - SDP_control1 reports Solved with |A'z+q| = 0.036, λ_min(z) = −3.2e-3 and
+    objective 18.039 vs 17.785.
+  - SDP_hinf3 and SOCP_sched_100_50/100_100 report Solved but fail the 1e-6
+    audit.
+  - The returned s differs from b − Ax by up to 1e-2 on 14 Solved points.
+  - Outcomes depend on thread count. gpp100 is Solved with condensed_arrow
+    at 1 thread but AlmostSolved with condensed_qdldl at 16. f64_medium and
+    gpp124 behave likewise.
+  - MOSEK's "optimal" fails the audit in 8–9 cases per leg.
+- Decision: correctness first (task 9), then cost-based selection
+  independent of thread count (task 10), both on perf-audit. Full table:
+  `~/.cache/sdpx-e2e/scoreboard-f64.md`.
+
+## 2026-10-09 — refinement and starting scale; parked branches
+
+- Shared linear products in the sampled recover (perf-sharedrhs). On Λ27
+  (node57, 64 threads), q1 613.7 s → t4cj 603.1 s and t4b 599.0 s; the
+  linear products went 30.4 → 12.0 s. Unaudited; parked at `d34869c`.
+- Full-direction refinement including Δτ (perf-fulldir), t4d ABBA gate at
+  64 threads, same iterations: Λ27 690–697 → 874–882 s, Λ19 243–255 →
+  408–416 s. Not kept; parked at `6af5724`.
+- Data-chosen τ₀ (perf-tau0, `auto_initial_tau`): ties the default (Λ27 183
+  it / 312.7 s, Λ19 122 it, s50 152 it). Fixed τ₀ = 1e-40 gives Λ27 156 it /
+  276 s, but ising11 goes 52 → 90 it. Parked at `0fccf2f`.
+- All eight agents stopped at the session usage limit. At the user's request
+  the campaign continues with two agents: one for the Float64 suite, one for
+  Λ35 and Ising.
+- Parked WIP, unverified: perf-f64large `50325c4`, perf-threads `946d4be`,
+  perf-facial `a3a7271`. perf-border `a80cfa1` is committed but its gate has
+  not run.
+
 ## 2026-10-08 — batched outer refinement across right-hand sides (perf-sharedrhs, not kept)
 
 - Hypothesis: the three right-hand sides per iteration share operator

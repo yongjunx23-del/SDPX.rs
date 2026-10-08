@@ -239,7 +239,7 @@ the full tables are in the journal ("diagnosis: Λ35 768-bit stall…" and
 | Case | SDPX b0088bb | Reference |
 |---|---|---|
 | Λ27 spins 0–50, one node | 451 it, 943 s (2.08 s/it); τ₀ 1e-30: 181 it, 385 s | SDPB 265 it, 375 s (1.41 s/it) |
-| Λ35 spins 0–70, one node | MaxIterations 1000 (3.19 s/it), μ stuck at 3e-24 | SDPB stalls after iteration 225 (gap ~1e-15; 2.6 s/it) |
+| Λ35 spins 0–70, one node | MaxIterations 1000 (3.19 s/it), μ stuck at 3e-24 | SDPB 746 it, 2004 s (2.68 s/it), after a gap plateau of 1e-13 to 1e-17 over iterations 200–650 |
 | spins 0–50, one node | 177 it, 252 s | SDPB 265 it, 285 s |
 | medium Float64, 1 / 8 / 64 threads | 5.57 / 3.03 / 3.97 s, 19 it | MOSEK 5.24 / 2.60 (16 threads) / 3.20 s, 16 it |
 | large Float64, 1 / 16 / 64 threads | AlmostSolved: 132 / 66 / 70 s (NumericalError at 64) | MOSEK optimal: 82 / 15.2 / 26 s |
@@ -267,22 +267,37 @@ large at 16 threads.
 
 **Goals (user, 2026-10-08):** beat MOSEK on every Float64 problem; beat
 SDPB at 768+ bits on the Ising problems (Λ19, Λ27, Λ35, ising11). Current
-gaps:
-- Λ27: SDPX 376 iterations / 611 s versus SDPB 265 / 375 s.
-- Float64 large: SDPX 41–47 s, AlmostSolved or NumericalError.
-  - MOSEK takes 15–29 s, and its "optimal" objective varies about 1.4e-3
-    between runs, so large is ill-conditioned.
-  - Medium is at parity: 3.17 s versus CVXPY→MOSEK's 2.96 s.
+gaps (2026-10-09):
+- Λ27: τ₀ = 1e-40 gives 156 it / 276 s and the default 183 it / 312–368 s,
+  against SDPB's 265 / 375 s. SDPX is still slower per iteration (1.77 vs
+  1.41 s).
+- Λ35: SDPX does not converge in 800 iterations. The primal diverges along a
+  rank-2–4 subspace per gram block, so the dual has no Slater point (journal
+  2026-10-09). SDPB takes 746 it / 2004 s through the same plateau.
+- Float64 suite (58 cases, every point audited): SDPX loses 46 at 1 thread
+  and 50 at 16. Geo-mean SDPX/MOSEK is 5.4× (1.7× where MOSEK takes
+  ≥ 0.1 s). Four cases report Solved but fail the audit.
+- Float64 large: SDPX 41–47 s, AlmostSolved or NumericalError; MOSEK 15–29 s,
+  and its points fail the audit. Medium is at parity: 3.17 s versus
+  CVXPY→MOSEK's 2.96 s.
 
-Parallel branches from b718ace:
-- `perf-l35input`: Λ35 conversion precision.
-- `perf-f64large`: large robustness and speed.
-- `perf-tau0`: starting scale from the data.
-- `perf-sharedrhs`: batched outer refinement.
-- `perf-component`: parallelism inside one component.
-- `perf-border`: distributed border factor and batched agreement flags.
-- Float64 scoreboard against MOSEK over the regression suite.
-- Literature and code survey.
+Active branches (2026-10-09; two agents, at the user's request):
+- `perf-audit`, Float64 suite:
+  - Task 9: Solved must imply an audit pass (control1, hinf3, sched_100_*;
+    s ≠ b − Ax; thread-dependent outcomes).
+  - Task 10: cost-based LP backend, presolve and SDP formulation choice,
+    independent of thread count.
+- `perf-l35`, Ising (task 11): a Λ35 baseline without the InsufficientProgress
+  restart, then facial reduction from the primal recession direction. An
+  SDPB-like fixed-τ end phase is the fallback.
+
+Parked, with WIP committed on each branch (journal 2026-10-09):
+- `perf-sharedrhs` `d34869c`: Λ27 −2.4%, unaudited.
+- `perf-fulldir` `6af5724`: regression.
+- `perf-tau0` `0fccf2f`: ties the default.
+- `perf-f64large` `50325c4`, `perf-threads` `946d4be`, `perf-facial`
+  `a3a7271`: unverified.
+- `perf-border` `a80cfa1`: gate not run.
 
 **Survey leads (2026-10-08; data in `~/.cache/sdpx-e2e/work/su2-large-scaling-20261008/`):**
 
