@@ -58,8 +58,9 @@ pub struct DefaultSettings<T: FloatT> {
     ///(τ within 10% over 10 iterates, gap ≤ 1e-8, steps ≥ 0.8): later
     ///directions keep Δτ = Δκ = 0, μ counts the cones only, and the constant
     ///right-hand side is no longer solved. Termination tests are unchanged.
-    ///Single-process solver only.
-    #[builder(default = "false")]
+    ///Single-process solver only. Λ19/s50/Λ27/ising11 at 768/512 bits:
+    ///−14%/−10%/−4%/−6% time, same points (2026-10-09 journal).
+    #[builder(default = "true")]
     pub fixed_tau_phase: bool,
 
     ///neighborhood bound on the homogeneous pair: a step is shortened until

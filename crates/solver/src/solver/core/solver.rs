@@ -299,6 +299,7 @@ where
         let mut chase = TauChase::default();
         let mut switch = FixedTauSwitch::default();
         let mut chase_tau = None;
+        let mut best_gap = T::infinity();
         loop {
             self.evaluate(&mut state, &timers);
             if self.terminate(&mut state).stop() {
@@ -317,6 +318,9 @@ where
                 }
             }
             if let (Some(tau), Some(gap)) = (self.variables.tau(), self.info.gap_rel()) {
+                if gap.is_finite() {
+                    best_gap = T::min(best_gap, gap);
+                }
                 trace_tau(state.iter, tau, gap, state.μ);
                 if self.settings.core().fixed_tau_phase
                     && self.callbacks.checkpoint.restart.is_none()
@@ -371,7 +375,10 @@ where
         }
         // A large starting scale overshoots on some problems: restart with
         // a 1e10 times larger τ₀ (up to the unit start) within the same
-        // iteration budget, as SDPA's guidance to retune lambdaStar.
+        // iteration budget, as SDPA's guidance to retune lambdaStar. An
+        // attempt that already reached a relative gap of 1e-6 did not
+        // overshoot; restarting it discards the iterate (Λ35 at 768 bits
+        // restarted from gap 1e-37 at iteration 723).
         let tau = self.start_tau.unwrap_or(self.settings.core().initial_tau);
         let failed = matches!(
             self.info.get_status(),
@@ -380,6 +387,7 @@ where
         if chase_tau.is_none()
             && !(failed
                 && tau < T::one()
+                && best_gap > (1e-6).as_T()
                 && state.iter < self.settings.core().max_iter
                 && self.callbacks.checkpoint.restart.is_none())
         {
