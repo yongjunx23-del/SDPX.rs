@@ -327,7 +327,9 @@ where
                     && !self.variables.tau_frozen()
                 {
                     let res = self.info.residual_max().unwrap_or(T::infinity());
-                    if switch.observe(gap, tau, res, state.α) {
+                    if switch.observe(gap, tau, res, state.α)
+                        || test_fixed_tau_at().is_some_and(|k| state.iter >= k)
+                    {
                         if self.variables.freeze_tau() {
                             if self.settings.core().verbose {
                                 let _ = writeln!(
@@ -1082,6 +1084,17 @@ mod internal {
         }
     } // end trait impl
 } //end internals module
+
+/// Diagnostic only: `SDPX_TEST_FIXED_TAU_AT=k` also enters the fixed-τ phase
+/// at iteration k (with `fixed_tau_phase` on), to probe end games.
+fn test_fixed_tau_at() -> Option<u32> {
+    static AT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        std::env::var("SDPX_TEST_FIXED_TAU_AT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
 
 /// Diagnostic only: with `SDPX_TRACE_TAU` set, print τ, the relative gap
 /// and μ of every evaluated iterate to stderr.
