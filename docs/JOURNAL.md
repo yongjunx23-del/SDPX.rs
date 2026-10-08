@@ -8,6 +8,25 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-08 — batched outer refinement across right-hand sides (perf-sharedrhs, not kept)
+
+- Hypothesis: the three right-hand sides per iteration share operator
+  sweeps, so batching their outer refinement saves refined-solve time.
+- Finding: only two of the three can be batched, because the combined
+  solve depends on the affine result. The reduced corrections are cheap
+  (about 15 ms each). Real sharing needs per-column copies of solver scratch.
+- Test of the premise: the residual's three products (A'z, A x, H z) were
+  run concurrently, bitwise identical to q1. On Λ19 at 64 threads, A'z went
+  26 → 39 s and A x 18 → 41 s, and the residual wall time went 46.5 → 44.1 s.
+  The products are throughput-bound, so batching sweeps gains little.
+  Reverted.
+- Kept (`c87e7c0`, perf-sharedrhs, bitwise identical): skip the linear
+  product L x − b in the fused recover when no orthant, eliminated-SOC or
+  unsampled PSD block reads it. Λ19 recover_rhs went 29.0 → 27.7 s; end to
+  end this is within node noise (233.7 s vs 229.5 s on a different node).
+- Lead: the linear product is mostly serial on Λ27 (44.6 s total, 30 s
+  serial). Follow-up on the same branch.
+
 ## 2026-10-08 — performance plan items 1, 2, 4, 8, 9, 10, 12 (cluster q1/q2)
 
 One 64-core node each (`one2.pbs`, `f64q.pbs`); q1 = items 1 + 8 on

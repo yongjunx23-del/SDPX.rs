@@ -265,6 +265,25 @@ Open: 3 (needs a discriminating signal), 6, 7, 11, 13, 14; Float64 large
 still AlmostSolved (cause not the dense fallback); MOSEK still 3x faster on
 large at 16 threads.
 
+**Goals (user, 2026-10-08):** beat MOSEK on every Float64 problem; beat
+SDPB at 768+ bits on the Ising problems (Λ19, Λ27, Λ35, ising11). Current
+gaps:
+- Λ27: SDPX 376 iterations / 611 s versus SDPB 265 / 375 s.
+- Float64 large: SDPX 41–47 s, AlmostSolved or NumericalError.
+  - MOSEK takes 15–29 s, and its "optimal" objective varies about 1.4e-3
+    between runs, so large is ill-conditioned.
+  - Medium is at parity: 3.17 s versus CVXPY→MOSEK's 2.96 s.
+
+Parallel branches from b718ace:
+- `perf-l35input`: Λ35 conversion precision.
+- `perf-f64large`: large robustness and speed.
+- `perf-tau0`: starting scale from the data.
+- `perf-sharedrhs`: batched outer refinement.
+- `perf-component`: parallelism inside one component.
+- `perf-border`: distributed border factor and batched agreement flags.
+- Float64 scoreboard against MOSEK over the regression suite.
+- Literature and code survey.
+
 **A. Convergence of large sampled problems**
 
 1. **MPFR regularization scale (needs approval: regularization contract).**
