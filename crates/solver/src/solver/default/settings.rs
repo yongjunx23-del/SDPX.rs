@@ -54,6 +54,14 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "false")]
     pub auto_start_scale: bool,
 
+    ///on the same τ-chase signature, freeze τ and κ instead of restarting:
+    ///later directions keep Δτ = Δκ = 0 and μ counts the cones only, an
+    ///infeasible-start path of the original problem at the reached scale
+    ///(as SDPB's). Termination tests are unchanged. Takes precedence over
+    ///`auto_start_scale`; single-process solver only.
+    #[builder(default = "false")]
+    pub fixed_tau_phase: bool,
+
     ///neighborhood bound on the homogeneous pair: a step is shortened until
     ///τκ ≥ β·μ at the new point (MOSEK's homogeneous model and Hypatia keep
     ///every complementarity pair, τκ included, above a fraction of μ).

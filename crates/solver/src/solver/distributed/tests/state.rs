@@ -456,6 +456,7 @@ fn owned_border_applies_affine_term_after_sum() {
         z: vec![0.; 3],
         τ: 1.,
         κ: 0.,
+        fixed_tau: false,
     };
     let mut owned = runtime(data, 2, settings(), (point.x.len(), point.s.len()));
     scatter(&mut owned.variables, &point);

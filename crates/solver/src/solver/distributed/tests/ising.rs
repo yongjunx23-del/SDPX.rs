@@ -62,6 +62,7 @@ fn owned_ising_accepted_point() {
             .collect(),
         τ: T::one(),
         κ: T::zero(),
+        fixed_tau: false,
     };
     let mut residual = DefaultResiduals::new(data.n, data.m);
     residual.update(&point, &data);

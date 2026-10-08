@@ -300,15 +300,36 @@ where
             if self.terminate(&mut state).stop() {
                 break;
             }
+            let fixed_phase = self.settings.core().fixed_tau_phase;
             if self.start_tau.is_none()
-                && self.settings.core().auto_start_scale
+                && (self.settings.core().auto_start_scale || fixed_phase)
                 && self.callbacks.checkpoint.restart.is_none()
+                && !self.variables.tau_frozen()
             {
                 let tau0 = self.settings.core().initial_tau;
                 if let (Some(tau), Some(gap)) = (self.variables.tau(), self.info.gap_rel()) {
                     if chase.observe(gap, state.μ, tau, tau0) {
-                        chase_tau = Some(TauChase::restart_tau(tau));
-                        break;
+                        if fixed_phase && self.variables.freeze_tau() {
+                            // Continue from this iterate on the original
+                            // problem at the reached scale; μ now counts
+                            // the cones only.
+                            if self.settings.core().verbose {
+                                let _ = writeln!(
+                                    self.info.print_target(),
+                                    "fixed tau phase: from iteration {}, tau {:.1e}",
+                                    state.iter,
+                                    tau
+                                );
+                            }
+                            crate::receipt::phase_record(
+                                "fixed tau phase",
+                                std::time::Duration::ZERO,
+                            );
+                            state.μ = self.variables.calc_mu(&self.residuals, &self.cones);
+                        } else {
+                            chase_tau = Some(TauChase::restart_tau(tau));
+                            break;
+                        }
                     }
                 }
             }

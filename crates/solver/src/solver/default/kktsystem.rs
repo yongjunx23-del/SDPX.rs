@@ -258,8 +258,12 @@ where
         }
 
         // One shared homogeneous scalar formula, independent of storage layout.
-        let terms = hsd_terms(workx, &variables.x, variables.τ, data, x1, z1, x2, z2);
-        lhs.τ = hsd_tau(terms, rhs.τ, rhs.κ, variables.τ, variables.κ);
+        lhs.τ = if variables.fixed_tau {
+            T::zero()
+        } else {
+            let terms = hsd_terms(workx, &variables.x, variables.τ, data, x1, z1, x2, z2);
+            hsd_tau(terms, rhs.τ, rhs.κ, variables.τ, variables.κ)
+        };
         lhs.x.waxpby(T::one(), x1, lhs.τ, x2);
         lhs.z.waxpby(T::one(), z1, lhs.τ, z2);
 
@@ -284,7 +288,11 @@ where
 
         // solve for Δκ
         // --------------
-        lhs.κ = -(rhs.κ + variables.κ * lhs.τ) / variables.τ;
+        lhs.κ = if variables.fixed_tau {
+            T::zero()
+        } else {
+            -(rhs.κ + variables.κ * lhs.τ) / variables.τ
+        };
 
         // we don't check the validity of anything
         // after the KKT solve, so just return is_success
