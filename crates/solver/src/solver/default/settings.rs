@@ -29,6 +29,30 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "(0.99).as_T()")]
     pub max_step_fraction: T,
 
+    ///lower bound on the centering parameter σ = (1-α_aff)³; 0 keeps the
+    ///pure Mehrotra rule (SDPA/SDPB use a fixed 0.1 once feasible)
+    #[builder(default = "T::zero()")]
+    pub centering_floor: T,
+
+    ///starting τ of the homogeneous embedding, with κ = 1/τ so that τκ = 1.
+    ///τ₀ plays the role of SDPA's/SDPB's initial matrix scale 1/τ₀ (SDPB's
+    ///default 1e20): when the solution is large in the equilibrated units, a
+    ///unit start spends many iterations driving τ down (Λ27 spins 0–50: 451
+    ///iterations at 1, 295 at 1e-20, 181 at 1e-30) while a small solution
+    ///pays for a large start (ising11: 52 at 1, 77 at 1e-20). A solve from
+    ///τ₀ < 1 that stops on insufficient progress or a numerical error
+    ///restarts with τ₀ 1e10 times larger, up to the unit start.
+    #[builder(default = "T::one()")]
+    pub initial_tau: T,
+
+    ///neighborhood bound on the homogeneous pair: a step is shortened until
+    ///τκ ≥ β·μ at the new point (MOSEK's homogeneous model and Hypatia keep
+    ///every complementarity pair, τκ included, above a fraction of μ).
+    ///Off by default: alone it stalls infeasibility detection, where τκ
+    ///must leave the band, and on Λ27 the pair stayed near 0.2–0.3·μ
+    #[builder(default = "T::zero()")]
+    pub taukappa_proximity: T,
+
     ///absolute duality gap tolerance
     #[builder(default = "accuracy_default::<T>(1e-8)")]
     pub tol_gap_abs: T,
@@ -184,6 +208,14 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "(5.0).as_T()")]
     pub iterative_refinement_stop_ratio: T,
 
+    ///refine with restarted GMRES preconditioned by the factorization
+    ///(GMRES-IR) instead of stationary refinement. Each inner step costs one
+    ///factor solve and one exact product, like a stationary step, but removes
+    ///the few slowly contracting error directions of a nearly singular KKT
+    ///in a few steps. Steps count against `iterative_refinement_max_iter`.
+    #[builder(default = "false")]
+    pub iterative_refinement_gmres: bool,
+
     ///enable presolve constraint reduction
     #[builder(default = "true")]
     pub presolve_enable: bool,
@@ -320,6 +352,18 @@ where
         validate_direct_solve_method(&self.direct_solve_method)?;
         validate_kkt_form(&self.kkt_form)?;
         validate_linesearch_backtrack_step(self.linesearch_backtrack_step)?;
+        if !(self.centering_floor >= T::zero() && self.centering_floor < T::one()) {
+            return Err(SettingsError::BadFieldValue("centering_floor"));
+        }
+        if !(self.initial_tau.is_finite()
+            && self.initial_tau > T::zero()
+            && self.initial_tau <= T::one())
+        {
+            return Err(SettingsError::BadFieldValue("initial_tau"));
+        }
+        if !(self.taukappa_proximity >= T::zero() && self.taukappa_proximity < T::one()) {
+            return Err(SettingsError::BadFieldValue("taukappa_proximity"));
+        }
 
         if let Some(tol) = self.tol_feas_componentwise {
             if !tol.is_finite() || tol <= T::zero() {

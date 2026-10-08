@@ -389,6 +389,57 @@ impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
     fn restore_product(&mut self) {
         self.kernel.restore_scaled_product(self.x);
     }
+    // Each correction here runs a complete refined reduced solve: GMRES-IR
+    // at this level multiplied those solves (L35, 30 iterations: 180 -> 690 s)
+    // while stationary steps converge in about two, so only the reduced
+    // DirectLDL level runs GMRES-IR (the trait default keeps this level
+    // stationary).
+}
+
+#[cfg(test)]
+mod gmres_tests {
+    use super::*;
+    use crate::solver::core::ScalingStrategy;
+
+    /// GMRES-IR on the condensed original system reaches the stationary
+    /// refinement's accuracy on a small PSD KKT.
+    fn condensed_gmres<T: FloatT>() {
+        let kinds = vec![SupportedConeT::PSDTriangleConeT(3); 2];
+        let mut cones = CompositeCone::<T>::new(&kinds);
+        let (mut slack, mut dual) = (vec![T::zero(); 12], vec![T::zero(); 12]);
+        cones.unit_initialization(&mut dual, &mut slack);
+        for (i, v) in slack.iter_mut().enumerate() {
+            *v += T::from_f64(0.01 * (i % 5) as f64).unwrap();
+        }
+        assert!(cones.update_scaling(&slack, &dual, T::one(), ScalingStrategy::PrimalDual));
+        let p = CscMatrix::identity(12);
+        let a = CscMatrix::identity(12);
+        let rhs: Vec<T> = (0..24)
+            .map(|i| T::from_f64(((i * 7) % 11) as f64 - 5.0).unwrap())
+            .collect();
+        let mut results = Vec::new();
+        for gmres in [false, true] {
+            let mut settings = CoreSettings::<T>::default();
+            settings.iterative_refinement_gmres = gmres;
+            let mut kkt = CondensedKKTSolver::new(&p, &a, &kinds, &cones, &settings);
+            assert!(kkt.update(&cones, &settings));
+            let mut out = vec![T::zero(); 24];
+            assert_eq!(kkt.solve_many(12, &rhs, &mut out, 1, &settings), [true]);
+            let mut error = vec![T::zero(); 24];
+            let norm = kkt.residual(&mut error, &rhs, &out, false);
+            results.push((norm, out));
+        }
+        let tol = T::from_f64(1e-30).unwrap();
+        assert!(results[1].0 <= T::max(results[0].0 * T::from_f64(10.0).unwrap(), tol));
+        for (a, b) in results[0].1.iter().zip(&results[1].1) {
+            assert!(T::abs(*a - *b) <= tol * (T::one() + T::abs(*a)));
+        }
+    }
+
+    #[test]
+    fn condensed_gmres_matches_stationary_f64_tolerance_mpfr256() {
+        condensed_gmres::<sdpx_arithmetic::Bits256>();
+    }
 }
 
 #[cfg(test)]

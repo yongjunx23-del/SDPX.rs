@@ -13,6 +13,20 @@ solve 2.02 s/50 it (objective error 4.5e-7) → 9 ms/0 it (6.6e-14), whole CLI
 
 ### Added
 
+- Settings for the interior-point start and steps, all neutral by default:
+  `initial_tau` (start the homogeneous embedding at τ = τ₀, κ = 1/τ₀, the
+  counterpart of SDPA's lambdaStar / SDPB's initial matrix scale 1/τ₀),
+  `centering_floor` (lower bound on Mehrotra's σ), `taukappa_proximity`
+  (shorten steps to keep τκ ≥ β·μ, as MOSEK's homogeneous model and Hypatia
+  do) and `iterative_refinement_gmres` (GMRES-IR on the reduced KKT,
+  preconditioned by the factorization, aiming at the rounding floor
+  `4u·‖|K||x|‖∞`). A solve started from τ₀ < 1 that stops on insufficient
+  progress or a numerical error restarts with τ₀ 1e10 times larger within the
+  same iteration budget. Λ27 spins 0–50 (768 bits, 64 threads): 451
+  iterations / 832 s at τ₀ = 1, 295 / 529 s at 1e-20, 181 / 385 s at 1e-30
+  (SDPB: 265 / 375 s); ising11 prefers the unit start (52 vs 77 iterations
+  at 1e-20), so the default stays 1.
+
 - Presolve merges second-order-cone tail coordinates whose rows of `A` are
   zero: `(s1, s_V, s_C) ∈ K` iff `(s1, s_V, ‖b_C‖) ∈ K`; a fully constant tail
   becomes the orthant row `s1 − ‖b_C‖ ≥ 0`. Postsolve lifts `s`, `z` (and
@@ -25,6 +39,9 @@ solve 2.02 s/50 it (objective error 4.5e-7) → 9 ms/0 it (6.6e-14), whole CLI
 
 ### Performance
 
+- Upper-only exact congruences compute their second residue product on the
+  upper block triangle (16-column panels), about half its flops; every kept
+  entry is the same exact integer, so results are bitwise identical.
 - Exact residue products run on faer's GEMM kernel instead of the linked
   OpenBLAS (Accelerate stays on macOS; `SDPX_INT_GEMM=blas|faer` overrides).
   Concurrent single-thread OpenBLAS calls lost 8x per-thread throughput at

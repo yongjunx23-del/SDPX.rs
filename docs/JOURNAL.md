@@ -8,6 +8,70 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-08 — iteration count: start scale, refinement, centering
+
+Hypothesis: SDPX needs 451 iterations on Λ27 spins 0–50 against SDPB's 265
+because of its algorithm, not its kernels. A τ/κ trace (diagnostic build)
+showed two stalls. (1) Iterations 40–160: τ falls from 4e-2 to 1e-11 while μ
+falls from 1e-13 to 1e-34, so κ/τ and the gap stay near 1e-11: the
+homogeneous embedding chases a solution that is huge in the equilibrated
+units (‖x‖∞ ≈ 6e73 scaled). Spins 0–50 shows the same, τ 0.15 → 1e-6.
+Uniform primal/dual rescaling of the iterate leaves the Newton steps
+invariant, so only the start or the step rules can change this.
+(2) Iterations 160–390: μ flat near 1e-34 with feasible iterates and steps of
+0.1–0.5, which a feasible HSD direction cannot do (Δsᵀ Δz + Δτ Δκ ≈ 0). The
+reduced-KKT refinement trace shows why: first solve 1e-105 relative, about
+seven digits per stationary step, the 10-step cap reached from iteration 41,
+final 1e-160..1e-171 against a 6.8e-174 tolerance. The last 22 iterations
+(422 → 444) are the componentwise dual tolerance 1e-30, kept.
+
+Reference solvers: SDPA X₀ = λ·I (λ = 1e2, 1e4 in SDPA-GMP), SDPB Ω = 1e20
+(its paper used 1e40), SDPT3 a data formula
+max(10, √n, n·max (1+|b_k|)/(1+‖a_k‖)), SCIP-SDP λ = 1.5 or 1e5 from a
+bound guess, clamped to [1, 1e8]; MOSEK/Clarabel/Hypatia unit HSD starts,
+MOSEK and Hypatia keeping τκ ≥ β·μ. Norm formulas cannot see these
+solutions (equilibrated data is O(1)).
+
+Full solves, 768 bits, 64 threads, one node each (all Solved, objectives
+equal to 34 digits):
+
+| Case | Λ27 it / s | spins 0–50 it |
+|---|---|---|
+| base (τ₀ = 1) | 451 / 832 | 177 |
+| σ floor 0.1 / 0.2 / step 0.9 | 443 / 469 / 420 | 166 / – / 189 |
+| GMRES-IR | 372 / 884 | 177 |
+| τ₀ = 1e-12 / 1e-16 / 1e-20 / 1e-24 | 382 / 345 / 295 / 261 | 132 / – / 152 / 155 |
+| τ₀ = 1e-30 | 181 / 385 | 161 |
+| GMRES-IR + τ₀ 1e-12 / 1e-30 / 1e-40 / 1e-60 | 303 / 163 / InsufficientProgress at 156 / 264 | 132 / – / – / – |
+
+ising11 (512 bits): 52 iterations at τ₀ = 1, 77 at 1e-20. Λ35 spins 0–70
+at τ₀ = 1e-20 reached the 1000-iteration cap with μ ≈ 1e-42 from iteration
+100 (stall 2); its unit-start full solve is pending. A fixed large start is
+therefore not general: kept as `initial_tau` (default 1) with an automatic
+restart toward the unit start on failure.
+
+GMRES-IR: first version (outer levels too, no floor) 30 Λ35 iterations
+180 → 690 s, since each outer step is a complete refined inner solve; kept
+only at the reduced level, aiming at u·‖|K||x|‖∞ with single steps after the
+first cycle. Λ35 30 iterations 181 s → 266–269 s on one node (inner steps
+gain about five digits each here, error spread over many directions); 4 nodes
+12×16 62.8 → 58.4 s and 24×8 67.6 → 62.5 s (10 iterations, all-level
+version). Kept opt-in (`iterative_refinement_gmres`). `taukappa_proximity`
+alone shortened the first step of an ill-conditioned dual-infeasible LP to
+nothing (infeasibility needs τκ to leave the band) and never binds on Λ27
+(τκ ≈ 0.2–0.3·μ in stall 2): opt-in. Rejected: a 768 → 384-bit factor (the
+1e-105 first solve implies cond ≈ 1e126); SDPB-like steps 0.7/0.8 with σ ≥
+0.1 (spins 0–50 274/224 iterations); offered rayon ways for ungranted residue
+products (Λ35 +5–7%).
+
+Kernel: upper-only second residue product in congruences, bitwise identical,
+Λ35 30 iterations 174.9/174.0 s vs 175.7/173.9 s (neutral at this size).
+Multi-node Λ35 per-rank receipts: ranks balanced (allreduce wait 8–9 s each)
+but the dense border (n = 4071) is solved on every rank, about 143
+single-RHS solves per iteration through two nested refinements; 4 nodes 54 s
+vs 1 node 63 s per 10 iterations. Next: distribute the border factor
+(SDPB distributes its Schur complement).
+
 ## 2026-10-08 — larger problem: Λ27 spins 0–50 (generated)
 
 Input: PyCFTBoot 5a8ed19 at 768 bits (private copy; generator script

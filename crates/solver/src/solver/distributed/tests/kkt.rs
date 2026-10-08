@@ -266,7 +266,15 @@ fn check_pair_pool_widths<T: FloatT>(make: impl Fn() -> DefaultProblemData<T>) {
 }
 
 fn check<T: FloatT>(make: impl Fn() -> DefaultProblemData<T>) {
+    // Stationary refinement and GMRES-IR share the acceptance policy.
+    for gmres in [false, true] {
+        check_refinement(&make, gmres);
+    }
+}
+
+fn check_refinement<T: FloatT>(make: &impl Fn() -> DefaultProblemData<T>, gmres: bool) {
     let settings = CoreSettings {
+        iterative_refinement_gmres: gmres,
         iterative_refinement_reltol: T::epsilon().sqrt() / n(1000),
         iterative_refinement_abstol: T::epsilon().sqrt() / n(1000),
         ..CoreSettings::<T>::default()

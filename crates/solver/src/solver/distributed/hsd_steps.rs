@@ -444,6 +444,13 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         self.border_z.fill(T::zero());
         self.refresh_border_from_owner_zero();
     }
+    fn set_initial_tau(&mut self, tau: T) {
+        for v in &mut self.blocks {
+            v.set_initial_tau(tau);
+        }
+        self.tau = tau;
+        self.kappa = T::recip(tau);
+    }
     fn new_like(&self) -> Self {
         Self {
             blocks: self.blocks.iter().map(|v| v.new_like()).collect(),
@@ -527,6 +534,30 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
             ok
         };
         self.collective.all_true(480, local_ok).unwrap_or(false)
+    }
+    fn taukappa_backtrack(&self, step: &Self, alpha: T, beta: T, shrink: T, cones: &Self::C) -> T {
+        // Global coefficients of s(α)ᵀz(α) = sz + α·lin + α²·quad over the
+        // owned cones (the same rows as `barrier`), one reduction.
+        let mut c = [T::zero(); 3];
+        for &(o, k) in &cones.step_order {
+            let (v, d) = (&self.blocks[o], &step.blocks[o]);
+            for i in cones.blocks[o].rng_cones[k].clone() {
+                c[0] = v.s[i].mul_add(v.z[i], c[0]);
+                c[1] = v.s[i].mul_add(d.z[i], v.z[i].mul_add(d.s[i], c[1]));
+                c[2] = d.s[i].mul_add(d.z[i], c[2]);
+            }
+        }
+        if self.collective.reduce_sum_in_place(526, &mut c).is_err() {
+            return alpha;
+        }
+        crate::solver::default::taukappa_backtrack(
+            c,
+            [self.tau(), self.kappa(), step.tau(), step.kappa()],
+            cones.degree,
+            alpha,
+            beta,
+            shrink,
+        )
     }
     fn barrier(&self, step: &Self, alpha: T, cones: &mut Self::C) -> T {
         let central = T::from_usize(cones.degree + 1).unwrap();

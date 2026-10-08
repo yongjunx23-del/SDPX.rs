@@ -226,6 +226,13 @@ where
             "  max iter = {}, time limit = {},  max step = {:.3}",
             set.max_iter, time_lim_str, set.max_step_fraction
         )?;
+        if set.centering_floor > T::zero() || set.initial_tau != T::one() {
+            writeln!(
+                out,
+                "  centering floor = {:.2e}, initial tau = {:.2e}",
+                set.centering_floor, set.initial_tau
+            )?;
+        }
 
         writeln!(
             out,

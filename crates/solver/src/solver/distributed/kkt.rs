@@ -132,6 +132,62 @@ impl<T: FloatT> Point<T> {
         }
         norm
     }
+    fn zeros_like(&self) -> Self {
+        Self {
+            blocks: self
+                .blocks
+                .iter()
+                .map(|b| vec![T::zero(); b.len()])
+                .collect(),
+            border: vec![T::zero(); self.border.len()],
+        }
+    }
+    fn clone_point(&self) -> Self {
+        Self {
+            blocks: self.blocks.clone(),
+            border: self.border.clone(),
+        }
+    }
+    fn copy_from_point(&mut self, other: &Self) {
+        for (a, b) in self.blocks.iter_mut().zip(&other.blocks) {
+            a.copy_from_slice(b);
+        }
+        self.border.copy_from_slice(&other.border);
+    }
+    fn scale(&mut self, c: T) {
+        for v in self
+            .blocks
+            .iter_mut()
+            .flatten()
+            .chain(self.border.iter_mut())
+        {
+            *v *= c;
+        }
+    }
+    fn negate(&mut self) {
+        for v in self
+            .blocks
+            .iter_mut()
+            .flatten()
+            .chain(self.border.iter_mut())
+        {
+            *v = -*v;
+        }
+    }
+    fn axpy(&mut self, a: T, other: &Self) {
+        for (x, y) in self.blocks.iter_mut().zip(&other.blocks) {
+            x.axpby(a, y, T::one());
+        }
+        self.border.axpby(a, &other.border, T::one());
+    }
+    /// This rank's owned-block part of the inner product.
+    fn block_dot(&self, other: &Self) -> T {
+        let mut s = T::zero();
+        for (x, y) in self.blocks.iter().zip(&other.blocks) {
+            s += x.dot(y);
+        }
+        s
+    }
     fn add(&mut self, other: &Self) {
         for (a, b) in self.blocks.iter_mut().zip(&other.blocks) {
             for (a, &b) in a.iter_mut().zip(b) {
@@ -207,6 +263,8 @@ pub(crate) struct OwnedKkt<T: FloatT> {
     pool: Option<Arc<rayon::ThreadPool>>,
     rhs_applied: u64,
     refinements: u64,
+    /// Residual floor of the last reduced-level GMRES-IR solve.
+    gmres_floor: Option<T>,
     record_costs: bool,
     collective: Arc<dyn crate::solver::distributed::collective::Collective<T>>,
     last_border: Vec<T>,
@@ -367,6 +425,7 @@ impl<T: FloatT> OwnedKkt<T> {
             pool,
             rhs_applied: 0,
             refinements: 0,
+            gmres_floor: None,
             record_costs,
             collective,
             last_border: vec![T::zero(); border],
@@ -673,6 +732,8 @@ impl<T: FloatT> OwnedKkt<T> {
                     solver: self,
                     work: &mut work,
                     reduced: false,
+                    basis: Vec::new(),
+                    directions: Vec::new(),
                 },
                 settings,
             );
@@ -756,6 +817,8 @@ impl<T: FloatT> OwnedKkt<T> {
                     solver: self,
                     work: if c == 0 { &mut inner0 } else { &mut inner1 },
                     reduced: true,
+                    basis: Vec::new(),
+                    directions: Vec::new(),
                 },
                 settings,
             );
@@ -787,6 +850,8 @@ impl<T: FloatT> OwnedKkt<T> {
                     solver: self,
                     work: if c == 0 { &mut outer0 } else { &mut outer1 },
                     reduced: false,
+                    basis: Vec::new(),
+                    directions: Vec::new(),
                 },
                 settings,
             );
@@ -1170,6 +1235,8 @@ impl<T: FloatT> OwnedKkt<T> {
                     solver: self,
                     work: &mut work,
                     reduced: true,
+                    basis: Vec::new(),
+                    directions: Vec::new(),
                 },
                 settings,
             );
@@ -1454,6 +1521,9 @@ struct OwnedRefinement<'a, T: FloatT> {
     solver: &'a mut OwnedKkt<T>,
     work: &'a mut Work<T>,
     reduced: bool,
+    /// GMRES bases V and Z = M⁻¹V (empty unless GMRES-IR runs).
+    basis: Vec<Point<T>>,
+    directions: Vec<Point<T>>,
 }
 impl<T: FloatT> Refinement<T> for OwnedRefinement<'_, T> {
     fn all_succeeded(&self, value: bool) -> bool {
@@ -1516,6 +1586,84 @@ impl<T: FloatT> Refinement<T> for OwnedRefinement<'_, T> {
             for (local, x) in self.solver.locals.iter_mut().zip(&self.work.x.blocks) {
                 local.kernel.restore_scaled_product(x);
             }
+        }
+    }
+    // Blocks are rank-owned and summed over ranks; the border is replicated
+    // (identical on every rank after each residual) and counted once.
+    // Only the reduced level: an original-level correction is a complete
+    // refined reduced solve (see the condensed kernel).
+    fn gmres_supported(&self) -> bool {
+        self.reduced
+    }
+    fn gmres_reset(&mut self) {
+        self.basis.clear();
+        self.directions.clear();
+    }
+    fn gmres_push_basis(&mut self, scale: T) {
+        let mut v = self.work.error.clone_point();
+        v.scale(scale);
+        self.basis.push(v);
+    }
+    fn gmres_precondition(&mut self, _settings: &CoreSettings<T>) -> bool {
+        debug_assert!(self.reduced);
+        let v = self.basis.last().unwrap();
+        let mut z = v.zeros_like();
+        let ok = self.solver.solve_reduced_raw(&mut z, v);
+        self.directions.push(z);
+        ok
+    }
+    fn gmres_operator(&mut self) -> bool {
+        let z = self.directions.last().unwrap();
+        let zero = z.zeros_like();
+        let norm = self.solver.residual(&mut self.work.error, &zero, z, true);
+        self.work.error.negate();
+        norm.is_finite()
+    }
+    fn gmres_dots(&mut self) -> Vec<T> {
+        let e = &self.work.error;
+        let mut local: Vec<T> = self.basis.iter().map(|v| e.block_dot(v)).collect();
+        if self
+            .solver
+            .collective
+            .reduce_sum_in_place(702, &mut local)
+            .is_err()
+        {
+            return vec![T::nan(); self.basis.len()];
+        }
+        for (d, v) in local.iter_mut().zip(&self.basis) {
+            *d += e.border.dot(&v.border);
+        }
+        local
+    }
+    fn gmres_subtract(&mut self, c: &[T]) {
+        for (v, &a) in self.basis.iter().zip(c) {
+            self.work.error.axpy(-a, v);
+        }
+    }
+    fn gmres_norm2(&mut self) -> T {
+        let e = &self.work.error;
+        let mut local = [e.block_dot(e)];
+        if self
+            .solver
+            .collective
+            .reduce_sum_in_place(703, &mut local)
+            .is_err()
+        {
+            return T::nan();
+        }
+        T::sqrt(local[0] + e.border.dot(&e.border))
+    }
+    fn gmres_floor(&self) -> Option<T> {
+        self.solver.gmres_floor
+    }
+    fn set_gmres_floor(&mut self, floor: T) {
+        self.solver.gmres_floor = Some(floor);
+    }
+    fn gmres_candidate(&mut self, y: &[T]) {
+        let candidate = &mut self.work.candidate;
+        candidate.copy_from_point(&self.work.x);
+        for (z, &yi) in self.directions.iter().zip(y) {
+            candidate.axpy(yi, z);
         }
     }
 }

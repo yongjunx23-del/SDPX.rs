@@ -398,6 +398,10 @@ impl<T: FloatT> Info<T> for OwnedInfo<T> {
         }
     }
 
+    fn restart(&mut self) {
+        self.0.restart();
+    }
+
     fn save_prev_iterate(
         &mut self,
         variables: &OwnedVariables<T>,

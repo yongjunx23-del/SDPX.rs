@@ -2355,10 +2355,7 @@ pub(super) fn congruence<const N: usize>(
         for v in t.iter_mut() {
             *v = reduce(*v, p, pinv);
         }
-        int_gemm(ta, b'N', m, m, k, aq, lda, t, k, cq, m);
-        for v in cq.iter_mut() {
-            *v = reduce(*v, p, pinv);
-        }
+        second_product(ta, m, 0, m, k, aq, lda, t, cq, upper_only, p, pinv);
     };
     let split = split_plan(pool, (m * k * (m + k)) as u128 * plan.count() as u128);
     let ca = match cache_a {
@@ -2444,6 +2441,43 @@ pub(super) fn congruence<const N: usize>(
 /// Fewest output columns one way of a split congruence computes.
 const CONGRUENCE_MIN_COLS: usize = 4;
 
+/// Column panel of an upper-only congruence's second product.
+const UPPER_PANEL: usize = 16;
+
+/// Output columns `j0..j0 + n` of `C = op(A)·T` modulo `p`, for `T` stored
+/// `k × n` and `C` stored `m × n`. With `upper_only` each panel of
+/// [`UPPER_PANEL`] columns stops at the last row its final column keeps, so
+/// the product covers the upper block triangle only (about half the flops of
+/// a square output). Entries below that are never read; every kept entry is
+/// the same exact integer as in the full product.
+#[allow(clippy::too_many_arguments)]
+fn second_product(
+    ta: u8,
+    m: usize,
+    j0: usize,
+    n: usize,
+    k: usize,
+    aq: &[f64],
+    lda: usize,
+    t: &[f64],
+    c: &mut [f64],
+    upper_only: bool,
+    p: f64,
+    pinv: f64,
+) {
+    let panel = if upper_only { UPPER_PANEL } else { n.max(1) };
+    for c0 in (0..n).step_by(panel) {
+        let c1 = (c0 + panel).min(n);
+        let rows = if upper_only { (j0 + c1).min(m) } else { m };
+        int_gemm(ta, b'N', rows, c1 - c0, k, aq, lda, &t[c0 * k..], k, &mut c[c0 * m..], m);
+        for col in c[c0 * m..c1 * m].chunks_mut(m) {
+            for v in &mut col[..rows] {
+                *v = reduce(*v, p, pinv);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CongruenceShape {
     ta: u8,
@@ -2504,10 +2538,7 @@ fn congruence_prime_groups<const N: usize>(
                 *v = reduce(*v, p, pinv);
             }
             let cq = &mut chunk[(q - q0) * outputs..(q - q0 + 1) * outputs];
-            int_gemm(ta, b'N', m, m, k, aq, lda, &t, k, cq, m);
-            for v in cq.iter_mut() {
-                *v = reduce(*v, p, pinv);
-            }
+            second_product(ta, m, 0, m, k, aq, lda, &t, cq, upper_only, p, pinv);
         }
         for v in [a, x, t] {
             release_buffer(v);
@@ -2668,10 +2699,7 @@ fn congruence_columns<const N: usize>(
                     *v = reduce(*v, p, pinv);
                 }
                 let cq = &mut prod[(q - q0) * outputs..(q - q0 + 1) * outputs];
-                int_gemm(ta, b'N', m, width, k, aq, lda, &t, k, cq, m);
-                for v in cq.iter_mut() {
-                    *v = reduce(*v, p, pinv);
-                }
+                second_product(ta, m, j0, width, k, aq, lda, &t, cq, upper_only, p, pinv);
             }
             acc.add(plan, q0, q1, &mut prod, outputs, &Split::Serial);
         }

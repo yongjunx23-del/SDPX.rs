@@ -307,6 +307,17 @@ where
         self.status != SolverStatus::Unsolved
     }
 
+    fn restart(&mut self) {
+        self.status = SolverStatus::Unsolved;
+        // A restarted iterate is compared with its own history only.
+        self.prev_res_primal = T::infinity();
+        self.prev_res_dual = T::infinity();
+        self.prev_gap_abs = T::infinity();
+        self.prev_gap_rel = T::infinity();
+        self.prev_res_dual_componentwise = None;
+        self.prev_res_dual_qnorm = T::infinity();
+    }
+
     fn save_prev_iterate(&mut self, variables: &Self::V, prev_variables: &mut Self::V) {
         self.prev_cost_primal = self.cost_primal;
         self.prev_cost_dual = self.cost_dual;

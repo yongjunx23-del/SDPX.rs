@@ -150,6 +150,8 @@ where
     pub(crate) settings: SE, // not public to avoid unchecked modifications
     pub timers: Option<Timers>,
     pub(crate) callbacks: SolverCallbacks<I>,
+    /// Starting τ of the current attempt (`initial_tau` until a restart).
+    pub(crate) start_tau: Option<T>,
     pub(crate) phantom: std::marker::PhantomData<T>,
 }
 
@@ -285,10 +287,12 @@ where
         let mut curve = CurveSearch::new(&self.variables, &self.cones);
 
         timeit! {"solve"; {
+        self.start_tau = None;
         timeit! {"default start"; {
             self.start_point();
         }}
         timeit! {"IP iteration"; {
+        'attempts: loop {
         loop {
             self.evaluate(&mut state, &timers);
             if self.terminate(&mut state).stop() {
@@ -319,6 +323,41 @@ where
             self.variables
                 .add_step_with_pool(&self.step_lhs, state.α, self.cones.worker_pool());
             }}
+        }
+        // A large starting scale overshoots on some problems: restart with
+        // a 1e10 times larger τ₀ (up to the unit start) within the same
+        // iteration budget, as SDPA's guidance to retune lambdaStar.
+        let tau = self.start_tau.unwrap_or(self.settings.core().initial_tau);
+        let failed = matches!(
+            self.info.get_status(),
+            SolverStatus::InsufficientProgress | SolverStatus::NumericalError
+        );
+        if !(failed
+            && tau < T::one()
+            && state.iter < self.settings.core().max_iter
+            && self.callbacks.checkpoint.restart.is_none())
+        {
+            break 'attempts;
+        }
+        let next = T::min(T::one(), tau * (1e10).as_T());
+        if self.settings.core().verbose {
+            let status = self.info.get_status();
+            let _ = writeln!(
+                self.info.print_target(),
+                "restart: {:?} at iteration {}, initial tau {:.1e} -> {:.1e}",
+                status,
+                state.iter,
+                tau,
+                next
+            );
+        }
+        self.start_tau = Some(next);
+        self.info.restart();
+        self.kktsystem.reset_solve();
+        let iter = state.iter;
+        state = IterationState::new(self.cones.supports_primal_dual());
+        state.iter = iter;
+        self.default_start();
         }
         }}
         }}
@@ -704,6 +743,11 @@ mod internal {
                     }
                 }
             }
+            let beta = self.settings.core().taukappa_proximity;
+            if beta > T::zero() && state.α > T::zero() {
+                let shrink = self.settings.core().linesearch_backtrack_step;
+                state.α = self.variables.taukappa_backtrack(&self.step_lhs, state.α, beta, shrink, &self.cones);
+            }
             flow = match self.strategy_checkpoint_small_step(state.α, state.scaling).synchronized() {
                 StrategyCheckpoint::NoUpdate => Flow::Proceed,
                 StrategyCheckpoint::Update(s) => {
@@ -834,10 +878,17 @@ mod internal {
                 // Assigns unit (z,s) and zeros the primal variables
                 self.variables.unit_initialization(&self.cones);
             }
+            let tau = self.start_tau.unwrap_or(self.settings.core().initial_tau);
+            if tau != T::one() {
+                self.variables.set_initial_tau(tau);
+            }
         }
 
         fn centering_parameter(&self, α: T) -> T {
-            T::powi(T::one() - α, 3)
+            T::max(
+                T::powi(T::one() - α, 3),
+                self.settings.core().centering_floor,
+            )
         }
 
         fn get_step_length(

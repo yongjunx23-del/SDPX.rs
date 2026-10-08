@@ -9,6 +9,29 @@ use crate::solver::{
 };
 use rayon::prelude::*;
 
+/// Shorten `α` by `shrink` (at most 50 times) until the homogeneous pair
+/// stays in the neighborhood `τκ ≥ β·μ` at the new point, where
+/// `sᵀz(α) = c₀ + α·c₁ + α²·c₂` and `tk = [τ, κ, Δτ, Δκ]`.
+pub(crate) fn taukappa_backtrack<T: FloatT>(
+    c: [T; 3],
+    tk: [T; 4],
+    degree: usize,
+    mut α: T,
+    beta: T,
+    shrink: T,
+) -> T {
+    let central = T::from_usize(degree + 1).unwrap();
+    for _ in 0..50 {
+        let pair = (tk[0] + α * tk[2]) * (tk[1] + α * tk[3]);
+        let mu = (c[0] + α * (c[1] + α * c[2]) + pair) / central;
+        if !(pair < beta * mu) {
+            break;
+        }
+        α *= shrink;
+    }
+    α
+}
+
 // ---------------
 // Variables type for default problem format
 // ---------------
@@ -310,6 +333,34 @@ where
         self.x.set(T::zero());
         self.τ = T::one();
         self.κ = T::one();
+    }
+
+    fn taukappa_backtrack(
+        &self,
+        step: &Self,
+        α: T,
+        beta: T,
+        shrink: T,
+        cones: &CompositeCone<T>,
+    ) -> T {
+        let c = [
+            self.s.dot(&self.z),
+            self.s.dot(&step.z) + self.z.dot(&step.s),
+            step.s.dot(&step.z),
+        ];
+        taukappa_backtrack(
+            c,
+            [self.τ, self.κ, step.τ, step.κ],
+            cones.degree(),
+            α,
+            beta,
+            shrink,
+        )
+    }
+
+    fn set_initial_tau(&mut self, tau: T) {
+        self.τ = tau;
+        self.κ = T::recip(tau);
     }
 
     fn new_like(&self) -> Self {

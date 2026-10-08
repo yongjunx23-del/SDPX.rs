@@ -194,6 +194,15 @@ pub trait Variables<T: FloatT> {
     /// Initialize all conic variables to unit values.
     fn unit_initialization(&mut self, cones: &Self::C);
 
+    /// Start the embedding at `τ = tau`, `κ = 1/tau` (τκ unchanged at 1).
+    fn set_initial_tau(&mut self, tau: T);
+
+    /// Shorten `α` by `shrink` until `τκ ≥ beta·μ` at the new point (at
+    /// most 50 times). The default leaves `α` unchanged.
+    fn taukappa_backtrack(&self, _step: &Self, α: T, _beta: T, _shrink: T, _cones: &Self::C) -> T {
+        α
+    }
+
     /// Independent scratch for a curve direction.
     fn new_like(&self) -> Self;
     /// Form (1-weight)*left + weight*right without changing either source.
@@ -381,6 +390,10 @@ where
     fn get_status(&self) -> SolverStatus;
     /// Set the termination status
     fn set_status(&mut self, status: SolverStatus);
+    /// Forget the status and progress history before a restart.
+    fn restart(&mut self) {
+        self.set_status(SolverStatus::Unsolved);
+    }
 }
 
 /// Solution for a conic optimization problem.

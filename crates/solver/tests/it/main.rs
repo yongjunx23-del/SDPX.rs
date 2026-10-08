@@ -32,3 +32,4 @@ mod rns_scaling;
 mod sampled_integration;
 mod sampled_solver;
 mod sdp_chordal;
+mod start_scale;

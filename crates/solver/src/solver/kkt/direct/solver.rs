@@ -101,6 +101,9 @@ pub struct DirectLDLKKTSolver<T> {
     packed_residual: bool,
     /// Incoming symmetric mirrors of the fixed KKT pattern (MPFR exact residuals).
     exact_rows: Option<ExactRows>,
+    /// `|K|` in binary64 for the GMRES-IR rounding floor; rebuilt after
+    /// each factorization (the KKT values change only there).
+    abs_kkt: Option<Vec<f64>>,
     residual_pool: Option<std::sync::Arc<rayon::ThreadPool>>,
     /// Ranks sharing the replicated system: exact residual rows are split
     /// between them and gathered (each row is rounded once, so the result
@@ -211,6 +214,7 @@ where
             residual_dense: None,
             packed_residual,
             exact_rows: None,
+            abs_kkt: None,
             residual_world: None,
             residual_pool: None,
         }
@@ -456,6 +460,7 @@ where
         settings: &CoreSettings<T>,
         shift: Option<T>,
     ) -> bool {
+        self.abs_kkt = None;
         let map = &self.map;
         let KKT = &mut self.KKT;
         let dsigns = &self.dsigns;
@@ -673,6 +678,9 @@ where
         cols: usize,
         settings: &CoreSettings<T>,
     ) -> Vec<bool> {
+        if settings.iterative_refinement_gmres {
+            return self.refine_gmres(x, b, cols, settings);
+        }
         let reltol = settings.iterative_refinement_reltol;
         let abstol = settings.iterative_refinement_abstol;
         let maxiter = settings.iterative_refinement_max_iter;
@@ -743,6 +751,249 @@ where
         }
         (self.work1, self.work2) = (e, dx);
         ok
+    }
+
+    /// GMRES-IR (Carson & Higham): each cycle solves the correction equation
+    /// `K d = r` by GMRES right-preconditioned with the factorization, then
+    /// recomputes the true residual exactly. Arnoldi products `K z` use the
+    /// same exact rows as the residual. Columns run in lockstep so every
+    /// pass over the factor and the matrix serves all active columns. A
+    /// cycle's update is accepted only if it lowers the true residual; the
+    /// stop ratio and step budget are those of stationary refinement.
+    fn refine_gmres(
+        &mut self,
+        x: &mut [T],
+        b: &[T],
+        cols: usize,
+        settings: &CoreSettings<T>,
+    ) -> Vec<bool> {
+        let reltol = settings.iterative_refinement_reltol;
+        let abstol = settings.iterative_refinement_abstol;
+        let maxiter = settings.iterative_refinement_max_iter as usize;
+        let stopratio = settings.iterative_refinement_stop_ratio;
+        let full = self.KKT.n;
+        let column = |c: usize| c * full..(c + 1) * full;
+        let (mut e, mut work) = (
+            std::mem::take(&mut self.work1),
+            std::mem::take(&mut self.work2),
+        );
+        e.resize(cols * full, T::zero());
+        work.resize(cols * full, T::zero());
+        let zero = vec![T::zero(); cols * full];
+        let normb: Vec<T> = (0..cols).map(|c| b[column(c)].norm_inf()).collect();
+        let tol: Vec<T> = normb.iter().map(|&n| abstol + reltol * n).collect();
+        // Arnoldi aims at the floor met last time; a cycle that ends there
+        // with the true residual tracking the estimate retries at `tol`.
+        // With an exact residual the attainable residual is the rounding of
+        // the update, about u·‖|K||x|‖∞: the first Arnoldi cycle aims there
+        // (or at `tol`). Later cycles take one step each, as stationary
+        // refinement does, until a step gains less than the stop ratio.
+        let target: Vec<T> = (0..cols)
+            .map(|c| T::max(tol[c], self.rounding_floor(&x[column(c)])))
+            .collect();
+        let mut cap = vec![usize::MAX; cols];
+        let all: Vec<usize> = (0..cols).collect();
+        let mut norme = self.refine_residual(&mut e, b, x, &all, cols);
+        let mut ok: Vec<bool> = norme.iter().map(|n| n.is_finite()).collect();
+        let mut active: Vec<bool> = (0..cols).map(|c| ok[c] && norme[c] > tol[c]).collect();
+        let mut steps = 0usize;
+        // Per column: Arnoldi basis V, preconditioned directions Z, Hessenberg
+        // columns (rotated in place), Givens rotations and the rotated rhs g.
+        struct Arnoldi<T> {
+            v: Vec<Vec<T>>,
+            z: Vec<Vec<T>>,
+            h: Vec<Vec<T>>,
+            rot: Vec<(T, T)>,
+            g: Vec<T>,
+            done: bool,
+        }
+        while steps < maxiter && active.iter().any(|&a| a) {
+            let mut arn: Vec<Option<Arnoldi<T>>> = (0..cols)
+                .map(|c| {
+                    active[c].then(|| {
+                        let r = &e[column(c)];
+                        let beta = r.norm();
+                        let mut v0 = r.to_vec();
+                        v0.scale(T::recip(beta));
+                        Arnoldi {
+                            v: vec![v0],
+                            z: Vec::new(),
+                            h: Vec::new(),
+                            rot: Vec::new(),
+                            g: vec![beta],
+                            done: false,
+                        }
+                    })
+                })
+                .collect();
+            let budget = maxiter - steps;
+            for _ in 0..budget {
+                let act: Vec<usize> = (0..cols)
+                    .filter(|&c| arn[c].as_ref().is_some_and(|a| !a.done))
+                    .collect();
+                if act.is_empty() {
+                    break;
+                }
+                steps += 1;
+                self.counters.linear_solves += act.len() as u64;
+                self.counters.refinements += act.len() as u64;
+                // z_j = M⁻¹ v_j for every active column (one factor pass).
+                for &c in &act {
+                    let a = arn[c].as_ref().unwrap();
+                    e[column(c)].copy_from_slice(a.v.last().unwrap());
+                }
+                let timer = crate::receipt::start();
+                if act.len() == cols && cols > 1 {
+                    self.ldlsolver
+                        .solve_many(&self.KKT, &mut work, &mut e, cols);
+                } else {
+                    for &c in &act {
+                        let r = column(c);
+                        self.ldlsolver
+                            .solve(&self.KKT, &mut work[r.clone()], &mut e[r]);
+                    }
+                }
+                crate::receipt::finish("ir.solve", timer);
+                for &c in &act {
+                    arn[c].as_mut().unwrap().z.push(work[column(c)].to_vec());
+                }
+                // w = K z_j by exact rows: e = 0 − K z.
+                let timer = crate::receipt::start();
+                self.refine_residual(&mut e, &zero, &mut work, &act, cols);
+                crate::receipt::finish("ir.residual", timer);
+                for &c in &act {
+                    let a = arn[c].as_mut().unwrap();
+                    let mut w: Vec<T> = e[column(c)].iter().map(|&v| -v).collect();
+                    // Modified Gram–Schmidt, applied twice for orthogonality.
+                    let j = a.v.len() - 1;
+                    let mut h = vec![T::zero(); j + 2];
+                    for _ in 0..2 {
+                        for (i, vi) in a.v.iter().enumerate() {
+                            let hij = w.dot(vi);
+                            h[i] += hij;
+                            w.axpby(-hij, vi, T::one());
+                        }
+                    }
+                    let hnext = w.norm();
+                    h[j + 1] = hnext;
+                    for (i, &(cs, sn)) in a.rot.iter().enumerate() {
+                        let (hi, hi1) = (h[i], h[i + 1]);
+                        h[i] = cs * hi + sn * hi1;
+                        h[i + 1] = -sn * hi + cs * hi1;
+                    }
+                    let (hj, hj1) = (h[j], h[j + 1]);
+                    let rho = T::sqrt(hj * hj + hj1 * hj1);
+                    let (cs, sn) = if rho == T::zero() {
+                        (T::one(), T::zero())
+                    } else {
+                        (hj / rho, hj1 / rho)
+                    };
+                    h[j] = rho;
+                    h[j + 1] = T::zero();
+                    a.rot.push((cs, sn));
+                    let gj = a.g[j];
+                    a.g[j] = cs * gj;
+                    a.g.push(-sn * gj);
+                    a.h.push(h);
+                    let estimate = T::abs(a.g[j + 1]);
+                    // The 2-norm estimate bounds the infinity norm the
+                    // stationary test uses.
+                    if !estimate.is_finite()
+                        || hnext == T::zero()
+                        || estimate <= target[c]
+                        || a.z.len() >= cap[c]
+                    {
+                        a.done = true;
+                    } else {
+                        w.scale(T::recip(hnext));
+                        a.v.push(w);
+                    }
+                }
+            }
+            // d = Z y with H y = g (upper triangular); trial x + d.
+            let cycle: Vec<usize> = (0..cols).filter(|&c| arn[c].is_some()).collect();
+            for &c in &cycle {
+                let a = arn[c].as_ref().unwrap();
+                let k = a.z.len();
+                let mut y = vec![T::zero(); k];
+                for i in (0..k).rev() {
+                    let mut s = a.g[i];
+                    for l in i + 1..k {
+                        s -= a.h[l][i] * y[l];
+                    }
+                    y[i] = s / a.h[i][i];
+                }
+                let dst = &mut work[column(c)];
+                dst.copy_from_slice(&x[column(c)]);
+                for (zi, &yi) in a.z.iter().zip(&y) {
+                    dst.axpby(yi, zi, T::one());
+                }
+            }
+            let timer = crate::receipt::start();
+            let trial = self.refine_residual(&mut e, b, &mut work, &cycle, cols);
+            crate::receipt::finish("ir.residual", timer);
+            for &c in &cycle {
+                if !trial[c].is_finite() {
+                    (ok[c], active[c]) = (false, false);
+                    continue;
+                }
+                let improved_ratio = norme[c] / trial[c];
+                if improved_ratio <= T::one() {
+                    // Keep the previous iterate.
+                    active[c] = false;
+                    continue;
+                }
+                x[column(c)].copy_from_slice(&work[column(c)]);
+                norme[c] = trial[c];
+                if trial[c] <= tol[c] || improved_ratio < stopratio {
+                    active[c] = false;
+                } else {
+                    cap[c] = 1;
+                }
+            }
+            // Columns that keep refining need e = b − Kx of the accepted x.
+            let stale: Vec<usize> = cycle
+                .iter()
+                .copied()
+                .filter(|&c| active[c] && norme[c] != trial[c])
+                .collect();
+            if !stale.is_empty() {
+                self.refine_residual(&mut e, b, x, &stale, cols);
+            }
+        }
+        (self.work1, self.work2) = (e, work);
+        ok
+    }
+
+    /// `4u·‖|K||x|‖∞` in binary64 arithmetic: the residual level below
+    /// which rounding the refined `x` stops further progress.
+    fn rounding_floor(&mut self, x: &[T]) -> T {
+        let kkt = &self.KKT;
+        let abs = self.abs_kkt.get_or_insert_with(|| {
+            kkt.nzval
+                .iter()
+                .map(|v| v.to_f64().unwrap_or(f64::INFINITY).abs())
+                .collect()
+        });
+        let xa: Vec<f64> = x
+            .iter()
+            .map(|v| v.to_f64().unwrap_or(f64::INFINITY).abs())
+            .collect();
+        let mut acc = vec![0.0f64; kkt.n];
+        for j in 0..kkt.n {
+            for p in kkt.colptr[j]..kkt.colptr[j + 1] {
+                let i = kkt.rowval[p];
+                acc[i] += abs[p] * xa[j];
+                if i != j {
+                    acc[j] += abs[p] * xa[i];
+                }
+            }
+        }
+        let max = acc.into_iter().fold(0.0f64, f64::max);
+        if !max.is_finite() {
+            return T::zero();
+        }
+        T::from_f64(4.0 * max).unwrap() * T::epsilon()
     }
 
     /// `e = b − K·x` and its infinity norm for the listed columns. MPFR uses
@@ -1237,6 +1488,81 @@ mod parallel_residual_tests {
         let mut out = [7.0];
         assert!(!solver.solve_factor_panel(&rhs, &mut out, 1));
         assert_eq!(out, [7.0]);
+    }
+
+    /// A nearly rank-deficient equality block leaves one slowly contracting
+    /// direction under the regularized factor: stationary refinement gains a
+    /// few digits per step, GMRES-IR removes it in a few steps.
+    fn gmres_refinement<T: FloatT>() -> [(u64, T, T); 2] {
+        let (n, m) = (24, 8);
+        let p = CscMatrix::<T>::identity(n);
+        let mut rng = 12345u64;
+        let mut next = || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((rng >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
+        };
+        let mut dense = vec![vec![0.0f64; n]; m];
+        for row in dense.iter_mut() {
+            for v in row.iter_mut() {
+                *v = next();
+            }
+        }
+        // The last row repeats its predecessor up to 1e-12: A·Aᵀ has an
+        // eigenvalue near 1e-24 against the 1e-30 regularization.
+        for j in 0..n {
+            dense[m - 1][j] = dense[m - 2][j] + 1e-12 * next();
+        }
+        let mut a = CscMatrix::<T>::zeros((m, n));
+        a.colptr = vec![0];
+        for j in 0..n {
+            for (i, row) in dense.iter().enumerate() {
+                a.rowval.push(i);
+                a.nzval.push(T::from_f64(row[j]).unwrap());
+            }
+            a.colptr.push(a.nzval.len());
+        }
+        let cones = CompositeCone::<T>::new(&[SupportedConeT::ZeroConeT(m)]);
+        let rhsx: Vec<T> = (0..n).map(|_| T::from_f64(next()).unwrap()).collect();
+        let rhsz: Vec<T> = (0..m).map(|_| T::from_f64(next()).unwrap()).collect();
+        let mut out = [(0, T::zero(), T::zero()); 2];
+        for (k, gmres) in [false, true].into_iter().enumerate() {
+            let mut settings = CoreSettings::<T>::default();
+            settings.direct_solve_method = "qdldl".into();
+            settings.static_regularization_constant = T::from_f64(1e-30).unwrap();
+            settings.static_regularization_proportional = T::zero();
+            settings.iterative_refinement_gmres = gmres;
+            let mut solver = DirectLDLKKTSolver::new(&p, &a, &cones, m, n, &settings);
+            assert!(solver.update(&cones, &settings));
+            solver.setrhs(&rhsx, &rhsz);
+            let (mut x, mut z) = (vec![T::zero(); n], vec![T::zero(); m]);
+            assert!(solver.solve(Some(&mut x), Some(&mut z), &settings));
+            let point: Vec<T> = x.iter().chain(&z).copied().collect();
+            let rhs: Vec<T> = rhsx.iter().chain(&rhsz).copied().collect();
+            let mut e = vec![T::zero(); n + m];
+            let norm = solver.residual_full(&mut e, &rhs, &point);
+            let tol = settings.iterative_refinement_abstol
+                + settings.iterative_refinement_reltol * rhs.norm_inf();
+            out[k] = (solver.counters().refinements, norm, tol);
+        }
+        out
+    }
+
+    #[test]
+    fn gmres_refinement_needs_fewer_steps_mpfr256() {
+        // cond(K)·eps bounds both methods near 1e-55 here; GMRES must get
+        // there in fewer steps and no less accurately.
+        let [(stationary, stationary_norm, _), (gmres, gmres_norm, _)] =
+            gmres_refinement::<sdpx_arithmetic::Bits256>();
+        assert!(
+            gmres_norm <= stationary_norm,
+            "{gmres_norm:e} vs {stationary_norm:e}"
+        );
+        assert!(
+            gmres < stationary,
+            "gmres {gmres} vs stationary {stationary} steps"
+        );
     }
 
     #[test]
