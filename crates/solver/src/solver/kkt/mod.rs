@@ -25,6 +25,9 @@ pub struct SolveCounters {
     pub rhs_applied: u64,
     /// Batched submissions; one wave may carry several columns.
     pub batches: u64,
+    /// Corrections applied by the outer (full-KKT) refinement of a condensed
+    /// or distributed solve; each one is a complete reduced solve.
+    pub outer_refinements: u64,
 }
 
 pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {

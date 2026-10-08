@@ -16,10 +16,43 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
-/// Extra per-block contribution storage allowed for the ordered parallel
-/// assembly, in bytes. The publish is bitwise identical to the serial
-/// scatter because blocks are summed in cone order.
+/// Minimum extra per-block contribution storage allowed for the ordered
+/// parallel assembly, in bytes. The publish is bitwise identical to the
+/// serial scatter because blocks are summed in cone order.
 const PARALLEL_ASSEMBLY_BUDGET_BYTES: usize = 256 << 20;
+
+/// Physical memory in bytes, when the platform reports it.
+fn physical_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let line = info.lines().find(|l| l.starts_with("MemTotal:"))?;
+        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kib.saturating_mul(1024))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Assembly buffer budget: one eighth of physical memory, never below the
+/// fixed floor. Cached after the first query.
+pub(crate) fn parallel_assembly_budget_bytes() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let share = physical_memory_bytes().map_or(0, |b| (b / 8).min(usize::MAX as u64) as usize);
+        share.max(PARALLEL_ASSEMBLY_BUDGET_BYTES)
+    })
+}
 
 /// Use per-block assembly buffers when a cone pool exists and the extra
 /// storage is bounded either by the original two-copy rule or by the byte
@@ -29,7 +62,7 @@ pub(crate) fn parallel_assembly_allowed<T: FloatT>(
     contribution_cells: u128,
     schur_stored: u128,
 ) -> bool {
-    let budget_cells = (PARALLEL_ASSEMBLY_BUDGET_BYTES / std::mem::size_of::<T>()).max(1) as u128;
+    let budget_cells = (parallel_assembly_budget_bytes() / std::mem::size_of::<T>()).max(1) as u128;
     pool_present && (contribution_cells <= 2 * schur_stored || contribution_cells <= budget_cells)
 }
 

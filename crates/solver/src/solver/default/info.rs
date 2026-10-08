@@ -356,6 +356,10 @@ where
         self.status
     }
 
+    fn gap_rel(&self) -> Option<T> {
+        Some(self.gap_rel)
+    }
+
     fn set_status(&mut self, status: SolverStatus) {
         self.status = status;
     }

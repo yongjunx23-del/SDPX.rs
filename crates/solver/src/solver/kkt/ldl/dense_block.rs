@@ -108,16 +108,27 @@ impl DenseBlockSolver {
             .pool
             .as_deref()
             .filter(|pool| pool.current_num_threads() > 1 && n >= 2 * TILE);
+        let rule = self.pivot_rule();
         let mut info = 0;
         match pool {
             Some(pool) => {
-                if !tiled_potrf(&mut self.h, n, pool, &mut self.tiles) {
+                if !tiled_potrf(&mut self.h, n, pool, &mut self.tiles, rule) {
                     return false;
                 }
             }
-            None => unsafe {
-                lapack::dpotrf(b'U', n as i32, &mut self.h, n as i32, &mut info);
-            },
+            None => {
+                // LAPACK first; a rejected pivot reruns with the dynamic
+                // pivot rule applied inside the factorization.
+                let saved = rule.map(|_| self.h.clone());
+                unsafe { lapack::dpotrf(b'U', n as i32, &mut self.h, n as i32, &mut info) };
+                if let Some(saved) = saved.filter(|_| info != 0 || !self.valid_factor(&self.h, n)) {
+                    self.h = saved;
+                    info = 0;
+                    if !tiled_potrf(&mut self.h, n, serial_pool(), &mut self.tiles, rule) {
+                        return false;
+                    }
+                }
+            }
         }
         if info != 0 || !self.valid_factor(&self.h, n) {
             return false;
@@ -150,22 +161,69 @@ impl DenseBlockSolver {
             }
             None => trsm(&mut self.y),
         }
-        unsafe {
-            blas::dsyrk(
-                b'U',
-                b'T',
-                m as i32,
-                n as i32,
-                1.,
-                &self.y,
-                n as i32,
-                1.,
+        // S += Y'Y: upper column blocks of S are independent.
+        match pool {
+            Some(pool) if m >= 2 * TILE => {
+                let y = &self.y;
+                pool.install(|| {
+                    self.s
+                        .par_chunks_mut(TILE * m)
+                        .enumerate()
+                        .for_each(|(b, cols)| {
+                            let (c0, w) = (b * TILE, cols.len() / m);
+                            // Rows 0..c0 of this block, then its diagonal tile.
+                            tile_gemm(c0, w, n, &y[..c0 * n], n, &y[c0 * n..], n, cols, m);
+                            tile_syrk(w, n, &y[c0 * n..], n, &mut cols[c0..], m);
+                        })
+                });
+            }
+            _ => unsafe {
+                blas::dsyrk(
+                    b'U',
+                    b'T',
+                    m as i32,
+                    n as i32,
+                    1.,
+                    &self.y,
+                    n as i32,
+                    1.,
+                    &mut self.s,
+                    m as i32,
+                );
+            },
+        }
+        if let Some(pool) = pool.filter(|_| m >= 2 * TILE) {
+            let mut tiles = Vec::new();
+            return tiled_potrf(&mut self.s, m, pool, &mut tiles, rule)
+                && self.y.iter().all(|v| v.is_finite())
+                && self.valid_factor(&self.s, m);
+        }
+        let saved = rule.map(|_| self.s.clone());
+        unsafe { lapack::dpotrf(b'U', m as i32, &mut self.s, m as i32, &mut info) };
+        if let Some(saved) = saved.filter(|_| info != 0 || !self.valid_factor(&self.s, m)) {
+            self.s = saved;
+            info = 0;
+            let mut tiles = Vec::new();
+            if !tiled_potrf(
                 &mut self.s,
-                m as i32,
-            );
-            lapack::dpotrf(b'U', m as i32, &mut self.s, m as i32, &mut info);
+                m,
+                pool.unwrap_or(serial_pool()),
+                &mut tiles,
+                rule,
+            ) {
+                return false;
+            }
         }
         info == 0 && self.y.iter().all(|v| v.is_finite()) && self.valid_factor(&self.s, m)
+    }
+
+    /// `(eps, delta)` of the dynamic pivot rule, when enabled: a Cholesky
+    /// pivot at or below `eps` is replaced by `delta`, as in the sparse LDL.
+    fn pivot_rule(&self) -> Option<(f64, f64)> {
+        self.settings.dynamic_regularization_enable.then_some((
+            self.settings.dynamic_regularization_eps,
+            self.settings.dynamic_regularization_delta,
+        ))
     }
 
     fn valid_factor(&self, a: &[f64], n: usize) -> bool {
@@ -203,6 +261,156 @@ impl DenseBlockSolver {
 /// number of workers.
 const TILE: usize = 128;
 
+/// Single-worker pool for the serial dynamic-pivot rerun.
+fn serial_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("serial pool")
+    })
+}
+
+/// Unblocked upper Cholesky of the `n x n` leading part of `a` (leading
+/// dimension `lda`) with the dynamic pivot rule: a pivot at or below `eps`
+/// becomes `delta` when it is within rounding of zero relative to the
+/// unfactored diagonal `diag`. A clearly negative pivot (indefinite block)
+/// or a non-finite one fails, leaving the sparse fallback in charge.
+fn potrf_dynamic(
+    a: &mut [f64],
+    n: usize,
+    lda: usize,
+    (eps, delta): (f64, f64),
+    diag: &[f64],
+) -> bool {
+    for k in 0..n {
+        let mut d = a[k + k * lda];
+        if !d.is_finite() {
+            return false;
+        }
+        if d <= eps {
+            if d < -64. * f64::EPSILON * (n as f64) * diag[k].abs() {
+                return false;
+            }
+            d = delta;
+        }
+        let r = d.sqrt();
+        a[k + k * lda] = r;
+        for j in k + 1..n {
+            a[k + j * lda] /= r;
+        }
+        for j in k + 1..n {
+            let akj = a[k + j * lda];
+            for i in k + 1..=j {
+                a[i + j * lda] -= a[k + i * lda] * akj;
+            }
+        }
+    }
+    true
+}
+
+/// Factor one diagonal tile: LAPACK, then the dynamic rule on a rejected
+/// pivot. Without the rule a failed or nonpositive pivot fails the tile.
+fn potrf_tile(t: &mut [f64], n: usize, rule: Option<(f64, f64)>, diag: &[f64]) -> bool {
+    let saved = rule.map(|_| t.to_vec());
+    let mut info = 0;
+    unsafe { lapack::dpotrf(b'U', n as i32, t, n as i32, &mut info) };
+    let Some((eps, delta)) = rule else {
+        return info == 0;
+    };
+    if info == 0 && (0..n).all(|i| t[i + i * n] * t[i + i * n] > eps) {
+        return true;
+    }
+    t.copy_from_slice(&saved.unwrap());
+    potrf_dynamic(t, n, n, (eps, delta), diag)
+}
+
+/// `C(m x n) -= A' B` with `A` (k x m) and `B` (k x n) column-major.
+#[allow(clippy::too_many_arguments)]
+fn tile_gemm_sub(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f64],
+    lda: usize,
+    b: &[f64],
+    ldb: usize,
+    c: &mut [f64],
+    ldc: usize,
+) {
+    tile_product(m, n, k, a, lda, b, ldb, c, ldc, -1.)
+}
+
+/// `C(m x n) += A' B` (border update `S += Y'Y`, off-diagonal part).
+#[allow(clippy::too_many_arguments)]
+fn tile_gemm(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f64],
+    lda: usize,
+    b: &[f64],
+    ldb: usize,
+    c: &mut [f64],
+    ldc: usize,
+) {
+    tile_product(m, n, k, a, lda, b, ldb, c, ldc, 1.)
+}
+
+/// Upper `C(n x n) += A' A` with `A` (k x n).
+fn tile_syrk(n: usize, k: usize, a: &[f64], lda: usize, c: &mut [f64], ldc: usize) {
+    if n == 0 || k == 0 {
+        return;
+    }
+    unsafe {
+        blas::dsyrk(
+            b'U', b'T', n as i32, k as i32, 1., a, lda as i32, 1., c, ldc as i32,
+        )
+    };
+}
+
+/// Tile products run on faer when it is built in: many concurrent
+/// single-threaded OpenBLAS calls serialized at 64 workers (79% of large's
+/// samples in dgemm). The product order differs from BLAS; the factor is
+/// still independent of the worker count.
+#[allow(clippy::too_many_arguments)]
+fn tile_product(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f64],
+    lda: usize,
+    b: &[f64],
+    ldb: usize,
+    c: &mut [f64],
+    ldc: usize,
+    alpha: f64,
+) {
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    assert!((k - 1) + (m - 1) * lda < a.len() && (k - 1) + (n - 1) * ldb < b.len());
+    assert!((m - 1) + (n - 1) * ldc < c.len());
+    #[cfg(feature = "faer-sparse")]
+    {
+        // SAFETY: the asserts bound every strided access.
+        unsafe {
+            let a = faer::MatRef::from_raw_parts(a.as_ptr(), m, k, lda as isize, 1);
+            let b = faer::MatRef::from_raw_parts(b.as_ptr(), k, n, 1, ldb as isize);
+            let c = faer::MatMut::from_raw_parts_mut(c.as_mut_ptr(), m, n, 1, ldc as isize);
+            faer::linalg::matmul::matmul(c, faer::Accum::Add, a, b, alpha, faer::Par::Seq);
+        }
+    }
+    #[cfg(not(feature = "faer-sparse"))]
+    unsafe {
+        blas::dgemm(
+            b'T', b'N', m as i32, n as i32, k as i32, alpha, a, lda as i32, b, ldb as i32, 1., c,
+            ldc as i32,
+        );
+    }
+}
+
 /// Right-looking tiled Cholesky `A = U'U` of the upper triangle of the
 /// column-major `a` (n x n), run on `pool`. Tiles are packed into separate
 /// buffers so lanes borrow disjoint storage. Returns false on a failed pivot.
@@ -211,9 +419,11 @@ fn tiled_potrf(
     n: usize,
     pool: &rayon::ThreadPool,
     tiles: &mut Vec<Vec<Vec<f64>>>,
+    rule: Option<(f64, f64)>,
 ) -> bool {
     let p = n.div_ceil(TILE);
     let size = |b: usize| TILE.min(n - b * TILE);
+    let diag: Vec<f64> = (0..n).map(|i| a[i + i * n]).collect();
     // tiles[j][i], i <= j: rows of block i, columns of block j, ld = size(i).
     // Buffers are reused across calls; packing overwrites every element.
     tiles.resize_with(p, Vec::new);
@@ -231,9 +441,7 @@ fn tiled_potrf(
     let ok = pool.install(|| {
         for k in 0..p {
             let kk = size(k) as i32;
-            let mut info = 0;
-            unsafe { lapack::dpotrf(b'U', kk, &mut tiles[k][k], kk, &mut info) };
-            if info != 0 {
+            if !potrf_tile(&mut tiles[k][k], kk as usize, rule, &diag[k * TILE..]) {
                 return false;
             }
             // Panel row k: U_kk' X = A_kj for every later block column.
@@ -269,15 +477,11 @@ fn tiled_potrf(
                     .for_each(|(s, tile)| {
                         let i = k + 1 + s;
                         let ri = size(i) as i32;
-                        unsafe {
-                            if i == j {
-                                blas::dsyrk(b'U', b'T', cj, kk, -1., akj, kk, 1., tile, cj);
-                            } else {
-                                blas::dgemm(
-                                    b'T', b'N', ri, cj, kk, -1., &panel[s], kk, akj, kk, 1., tile,
-                                    ri,
-                                );
-                            }
+                        if i == j {
+                            unsafe { blas::dsyrk(b'U', b'T', cj, kk, -1., akj, kk, 1., tile, cj) };
+                        } else {
+                            let (ri, cj, kk) = (ri as usize, cj as usize, kk as usize);
+                            tile_gemm_sub(ri, cj, kk, &panel[s], kk, akj, kk, tile, ri);
                         }
                     });
             });
@@ -500,7 +704,7 @@ mod tests {
                 .build()
                 .unwrap();
             let mut u = a.clone();
-            assert!(tiled_potrf(&mut u, n, &pool, &mut Vec::new()));
+            assert!(tiled_potrf(&mut u, n, &pool, &mut Vec::new(), None));
             u
         };
         let (two, five) = (factor(2), factor(5));
@@ -523,12 +727,56 @@ mod tests {
             .num_threads(3)
             .build()
             .unwrap();
-        assert!(!tiled_potrf(&mut indefinite, n, &pool, &mut Vec::new()));
+        assert!(!tiled_potrf(
+            &mut indefinite,
+            n,
+            &pool,
+            &mut Vec::new(),
+            None
+        ));
     }
     #[test]
-    fn dense_block_rejects_tiny_pivot() {
+    fn dense_block_replaces_tiny_pivot() {
+        // A tiny pivot takes the dynamic rule inside the dense factor
+        // (as in the sparse LDL) instead of forcing the sparse fallback.
         let k = CscMatrix::new(1, 1, vec![0, 1], vec![0], vec![1e-30]);
-        let mut s = DenseBlockSolver::new(&k, &[1], &CoreSettings::default(), 1);
+        let settings = CoreSettings::default();
+        let mut s = DenseBlockSolver::new(&k, &[1], &settings, 1);
+        assert!(s.factor_dense(&k));
+        assert_eq!(s.h[0], settings.dynamic_regularization_delta.sqrt());
+        // Without the rule it is still rejected.
+        let mut off = settings.clone();
+        off.dynamic_regularization_enable = false;
+        let k = CscMatrix::new(1, 1, vec![0, 1], vec![0], vec![-1e-30]);
+        let mut s = DenseBlockSolver::new(&k, &[1], &off, 1);
         assert!(!s.factor_dense(&k));
+    }
+
+    #[test]
+    fn tiled_dynamic_pivot_matches_serial_rerun() {
+        // Rank-deficient PSD H: rounding-level pivots get the rule in both
+        // the pooled tiles and the serial rerun, with the same factor.
+        let n = 2 * TILE + 7;
+        let r = 40;
+        let g: Vec<f64> = (0..n * r)
+            .map(|i| ((i * 37 % 101) as f64 - 50.) / 50.)
+            .collect();
+        let mut h = vec![0.; n * n];
+        for j in 0..n {
+            for i in 0..=j {
+                h[i + j * n] = (0..r).map(|t| g[i * r + t] * g[j * r + t]).sum();
+            }
+        }
+        let rule = Some((1e-13, 2e-7));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut a = h.clone();
+        assert!(tiled_potrf(&mut a, n, &pool, &mut Vec::new(), rule));
+        let mut b = h.clone();
+        assert!(tiled_potrf(&mut b, n, serial_pool(), &mut Vec::new(), rule));
+        assert_eq!(a, b);
+        assert!((0..n).all(|i| a[i + i * n] > 0.));
     }
 }

@@ -21,7 +21,7 @@ pub trait ConeCollection<T: FloatT> {
     /// Whether every member cone is symmetric.
     fn all_symmetric(&self) -> bool;
     /// Whether any member has rows the centrality correctors act on
-    /// (nonnegative orthant or second-order cone).
+    /// (nonnegative orthant, second-order cone, or binary64 PSD cone).
     fn has_correctable(&self) -> bool {
         false
     }
@@ -39,7 +39,7 @@ impl<T: FloatT> ConeCollection<T> for crate::solver::cones::CompositeCone<T> {
             matches!(
                 c,
                 SupportedCone::NonnegativeCone(_) | SupportedCone::SecondOrderCone(_)
-            )
+            ) || (matches!(c, SupportedCone::PSDTriangleCone(_)) && T::precision_bits() <= 53)
         })
     }
     fn all_symmetric(&self) -> bool {
@@ -196,6 +196,11 @@ pub trait Variables<T: FloatT> {
 
     /// Start the embedding at `τ = tau`, `κ = 1/tau` (τκ unchanged at 1).
     fn set_initial_tau(&mut self, tau: T);
+
+    /// Current homogeneous τ, when the variables carry one.
+    fn tau(&self) -> Option<T> {
+        None
+    }
 
     /// Shorten `α` by `shrink` until `τκ ≥ beta·μ` at the new point (at
     /// most 50 times). The default leaves `α` unchanged.
@@ -388,6 +393,10 @@ where
 
     /// Report the termination status
     fn get_status(&self) -> SolverStatus;
+    /// Relative duality gap of the last evaluated iterate, if recorded.
+    fn gap_rel(&self) -> Option<T> {
+        None
+    }
     /// Set the termination status
     fn set_status(&mut self, status: SolverStatus);
     /// Forget the status and progress history before a restart.

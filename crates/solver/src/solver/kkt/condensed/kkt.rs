@@ -100,6 +100,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         let mut counters = self.reduced.counters();
         counters.rhs_applied = self.counters.rhs_applied;
         counters.batches = self.counters.batches;
+        counters.outer_refinements = self.counters.outer_refinements;
         counters
     }
 
@@ -378,6 +379,7 @@ impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
         )
     }
     fn solve_correction(&mut self, settings: &CoreSettings<T>) -> bool {
+        self.kernel.counters.outer_refinements += 1;
         self.kernel.solve_raw(self.candidate, self.error, settings)
     }
     fn add_correction(&mut self) {

@@ -388,6 +388,7 @@ fn try_write_parts<T: crate::algebra::FloatT>(
             "factorizations": ctr.factorizations,
             "rhs_applied": ctr.rhs_applied,
             "batches": ctr.batches,
+            "outer_refinements": ctr.outer_refinements,
         },
         "phases": phase_map,
         "setup_seconds_inclusive": setup,

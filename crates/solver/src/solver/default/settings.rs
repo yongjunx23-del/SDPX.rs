@@ -45,6 +45,15 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "T::one()")]
     pub initial_tau: T,
 
+    ///restart once when a first attempt from τ₀ ≥ 1e-10 chases τ: since
+    ///the relative gap last improved tenfold, μ fell by 1e10 and τ below
+    ///1e-4·τ₀. The restart uses τ₀ = min(τ, eps^(1/8)) (Λ27: 451
+    ///iterations from 1, 181 from 1e-30). Off by default: Λ19 shows the
+    ///same signature at iteration 71 yet solves in 177 iterations from 1,
+    ///and the restart costs it 45 more (2026-10-08 journal).
+    #[builder(default = "false")]
+    pub auto_start_scale: bool,
+
     ///neighborhood bound on the homogeneous pair: a step is shortened until
     ///τκ ≥ β·μ at the new point (MOSEK's homogeneous model and Hypatia keep
     ///every complementarity pair, τκ included, above a fraction of μ).
@@ -169,7 +178,7 @@ pub struct DefaultSettings<T: FloatT> {
     pub static_regularization_enable: bool,
 
     ///KKT static regularization parameter
-    #[builder(default = "linear_default::<T>(1e-8)")]
+    #[builder(default = "regularization_default::<T>(1e-8)")]
     pub static_regularization_constant: T,
 
     ///additional regularization parameter w.r.t. the maximum abs diagonal term
@@ -181,11 +190,11 @@ pub struct DefaultSettings<T: FloatT> {
     pub dynamic_regularization_enable: bool,
 
     ///KKT dynamic regularization threshold (immutable after setup)
-    #[builder(default = "linear_default::<T>(1e-13)")]
+    #[builder(default = "regularization_default::<T>(1e-13)")]
     pub dynamic_regularization_eps: T,
 
     ///KKT dynamic regularization shift (immutable after setup)
-    #[builder(default = "accuracy_default::<T>(2e-7)")]
+    #[builder(default = "linear_default::<T>(2e-7)")]
     pub dynamic_regularization_delta: T,
 
     ///KKT direct solve with iterative refinement
@@ -311,6 +320,22 @@ fn linear_default<T: FloatT>(primitive: f64) -> T {
     } else {
         let root = T::epsilon().sqrt();
         root * root.sqrt()
+    }
+}
+
+/// MPFR KKT regularization: `eps^(15/16)`. The former `eps^(3/4)` static
+/// shift and `sqrt(eps)` pivot replacement dominated the Schur entries of
+/// large sampled problems near optimality (Λ35 at 768 bits stalled at
+/// mu 3e-24); a `1e-215` shift without pivot replacement tracked the
+/// 1024-bit run. The pivot rule keeps the same threshold as the shift and
+/// replaces with `eps^(3/4)` (2026-10-08 journal).
+fn regularization_default<T: FloatT>(primitive: f64) -> T {
+    if is_primitive::<T>() {
+        primitive.as_T()
+    } else {
+        let quarter = T::epsilon().sqrt().sqrt();
+        let sixteenth = quarter.sqrt().sqrt();
+        T::epsilon() / sixteenth
     }
 }
 

@@ -1,6 +1,6 @@
 # SDPX development plan
 
-Updated 2026-10-07. [AGENTS.md](AGENTS.md) defines working rules and numerical
+Updated 2026-10-08. [AGENTS.md](AGENTS.md) defines working rules and numerical
 contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 [Journal](docs/JOURNAL.md) holds full timings, job histories, source hashes,
 failed attempts and audit evidence. This file keeps priorities, current
@@ -220,8 +220,147 @@ regularization and refinement stay unchanged.
 - **Float64 large:** historical129 s/26 versus MOSEK25.4 s is superseded by
   the scoped222437 audited refresh above; it is not a matched optimization
   comparison with that history. Mixed Λ27 has the matched SDPB comparison above.
+- **Large SU(2) path Float64 (n 7054, 2026-10-08):** `AlmostSolved` after
+  24–25 iterations at 1–32 threads, `NumericalError`/23 at 64; the dense block
+  factor falls back to sparse LDL near convergence. MOSEK reaches optimal in
+  18–30 iterations (plan item 10).
+- **Λ35 spins 0–70 at 768 bits:** `MaxIterations` 1000, μ stuck at 3e-24 by
+  the default static and dynamic shifts (plan item 1). SDPB also stalls at
+  768 bits (gap ~1e-15 after iteration 225); compare the two at 1024 bits.
 
 ## Concrete next work
+
+### Performance plan (2026-10-08)
+
+Measured on idle 64-core allocations of the UCAS EPYC nodes; evidence and
+the full tables are in the journal ("diagnosis: Λ35 768-bit stall…" and
+"iteration count: start scale…"). MPFR at 768 bits, 1e-42; Float64 at 1e-6.
+
+| Case | SDPX b0088bb | Reference |
+|---|---|---|
+| Λ27 spins 0–50, one node | 451 it, 943 s (2.08 s/it); τ₀ 1e-30: 181 it, 385 s | SDPB 265 it, 375 s (1.41 s/it) |
+| Λ35 spins 0–70, one node | MaxIterations 1000 (3.19 s/it), μ stuck at 3e-24 | SDPB stalls after iteration 225 (gap ~1e-15; 2.6 s/it) |
+| spins 0–50, one node | 177 it, 252 s | SDPB 265 it, 285 s |
+| medium Float64, 1 / 8 / 64 threads | 5.57 / 3.03 / 3.97 s, 19 it | MOSEK 5.24 / 2.60 (16 threads) / 3.20 s, 16 it |
+| large Float64, 1 / 16 / 64 threads | AlmostSolved: 132 / 66 / 70 s (NumericalError at 64) | MOSEK optimal: 82 / 15.2 / 26 s |
+
+The SDPB gap is Λ27: 1.7x the iterations (the τ-chase) and 1.5x the time
+per iteration. Refined solves are 55% of a Λ27 iteration and 47% of a Λ35
+one: SDPX solves three right-hand sides (the homogeneous constant one
+included), each with two refinement levels and about one outer correction;
+SDPB solves twice without refinement. Factorization is 13–18%, cone scaling
+(one MPFR SVD per cone, the largest cone sets the wall) 15–16%. At 768 bits
+Λ35 defeats both solvers. Float64 loses at many threads to serial or
+collapsing kernels, and on large to a dense-factor fallback near convergence.
+
+Work in this order. Each item is one change with its own gate (AGENTS.md);
+algorithm changes pass full solves and the original-coordinate audit.
+
+**Status 2026-10-08 (uncommitted, journal "performance plan items…"):**
+done 1, 8, 9, 10, 12; item 2 shipped off by default (Λ19 regression); item 4
+reverted (corrections are at the outer rounding floor); item 5 was already in
+place (largest-first cone jobs, row-split replay); item 3 not done (Λ27
+escapes a 250-iteration gap plateau, so a floor stop would end good solves).
+Open: 3 (needs a discriminating signal), 6, 7, 11, 13, 14; Float64 large
+still AlmostSolved (cause not the dense fallback); MOSEK still 3x faster on
+large at 16 threads.
+
+**A. Convergence of large sampled problems**
+
+1. **MPFR regularization scale (needs approval: regularization contract).**
+   The default static shift eps^(3/4) (6.8e-174 at 768 bits) stops Λ35 at μ
+   3e-24, and with it lowered to 1e-215 the dynamic rule (pivots below
+   eps^(3/4) set to sqrt(eps) = 3.6e-116) stops it again at 1.5e-28 (from
+   τ₀ 1e-30 too: μ flat, gap ~3e-15); with both relaxed, 768 bits tracks the
+   1024-bit run. 40 refinement steps per solve do not help. Candidates:
+   smaller constants (eps^(7/8)…eps) relying on the existing escalation when
+   a factor fails, or shifts proportional to the reduced matrix diagonal,
+   with a replacement δ far below sqrt(eps). Pending evidence: 768 bits with
+   both shifts relaxed and τ₀ 1e-30, 1024 bits with τ₀ 1e-30, SDPB at 1024
+   bits. Gate: Λ35
+   Solved and audited; ising11, spins 0–50, Λ19, Λ27, csdr3, gravity256,
+   mpfr-dev and the normalized 2x2 PMP failure no worse; Float64 defaults
+   unchanged (`settings.rs` `linear_default`; shifts in
+   `kkt/direct/solver.rs`, pivots in `kkt/ldl/arrow.rs`).
+2. **Automatic start scale.** τ₀ 1e-30 gives Λ27 181 iterations and 1e-10 to
+   1e-12 gives spins 0–50 132, but ising11 wants 1 (77 at 1e-20). Step 1:
+   verbose τ and ‖x‖∞ columns; traces of ising11, spins 0–50, Λ19, Λ27, Λ35
+   and the Float64 SDP set. Step 2: one rule for every input — restart once,
+   on the τ-chase signature (τ falling several decades while the gap stalls),
+   from a τ₀ extrapolated from the trace, inside the same iteration budget
+   (the restart path in `core/solver.rs`). Gate: no case more than 5% more
+   iterations; Λ27 at most 250.
+3. **Stop at a precision floor.** When μ has not fallen for k iterations and
+   refinement no longer contracts, stop with a status that names the floor
+   (no precision switch) instead of running to MaxIterations (Λ35: 3200 s).
+
+**B. Per-iteration cost of the sampled MPFR path**
+
+4. **Outer refinement corrections** (Λ35 about 0.75 of 3.19 s, Λ27 about
+   0.6 of 2.08 s; one correction = prepare + reduced solve + recover + exact
+   full residual). Step 1: receipt counters per right-hand side for the
+   outer residual before and after the correction, and the inner residual and
+   steps. Step 2: aim the reduced refinement (`kkt/direct/solver.rs::refine`)
+   at the full-system tolerance divided by the measured amplification, so the
+   first recovered solution passes the unchanged outer test (an inner step
+   costs about an eighth of an outer correction). Expected up to −25% per
+   iteration if the corrections are inner-accuracy driven; if they sit at the
+   outer rounding floor instead, report that and stop (no rule change).
+5. **Cone scaling latency** (0.31–0.52 s/it). Per-cone times first, then
+   largest-first order on the cone pool and row-split SVD replay (each
+   rotation acts on rows of V independently, so bitwise identical) only when
+   threads exceed cones; adaptive SVD tiles lost 3.5% when cones outnumbered
+   threads.
+6. **Thread runtime.** About 11% of Λ35's 64-thread cycles are rayon idle
+   stealing, and busy-waiting lowers the clock (ising11 3.1 → 2.1 GHz).
+   Count parallel regions per iteration, merge short ones, size lanes to the
+   work (shared with item 11).
+7. **Per-component parallelism.** Leaf sweeps, single-column solves and
+   the border factor of one component run serially (a Λ27 rank with two
+   components runs at ~5x CPU/wall on 16 threads). Split them with an
+   order-independent exact accumulation (changes bits; audit gate).
+
+**C. Float64 SDP on many threads**
+
+8. **Parallel Schur assembly at every size.** Large's assembly is serial at
+   every thread count (33 s) because `parallel_assembly_allowed` caps the
+   per-block buffers at 256 MiB. Replace the cap with cone-order waves:
+   blocks whose buffers fit a budget derived from available memory run in
+   parallel and publish in cone order (bitwise identical); a block larger
+   than the budget runs alone, its parallel tiles adding straight into the
+   Schur matrix (disjoint positions, same per-entry order). Expected large at
+   16 threads 66 → ~35 s.
+9. **Dense factor kernels.** `tiled_potrf` issues concurrent single-thread
+   OpenBLAS calls (79% of large's 64-thread samples, packing 37%), has no
+   lookahead, and packs/unpacks, factors the border (`dsyrk`, `dpotrf`) and
+   scans for finiteness serially. Run tile GEMM/SYRK/TRSM on faer (as the
+   residue products), add one-panel lookahead, parallelize the border SYRK
+   and scans; compare with faer's parallel dense Cholesky. Gate: medium and
+   large audits; medium refactor at 8 threads 0.54 → ≤0.25 s, no loss at 64.
+10. **No sparse fallback near convergence.** `dense_block` rejects a factor
+    with any pivot below the dynamic threshold (1e-13) and refactors with
+    faer's sparse LDL; large's last factorizations take that path and the
+    solve ends AlmostSolved/NumericalError where MOSEK converges. Apply the same
+    dynamic pivot rule (eps, δ, sign) inside the dense diagonal tiles so the
+    dense path completes, then compare large's last iterations with MOSEK.
+11. **Many threads on small problems** (medium 3.03 s at 8 threads, 3.97 s
+    at 64). Measure per-lane busy time, then cap each phase's lanes by its
+    work.
+12. **Iterations** (medium 19 versus MOSEK 16 at equal time per iteration).
+    PSD Gondzio correctors (orthant/SOC/τκ have them): one W-scaled
+    eigendecomposition per corrector is small next to Float64 assembly.
+    Compare at matched final accuracy.
+
+**D. Multi-node**
+
+13. Distribute the arrow border factor (Λ35 border n 4071 replicated on every
+    rank, about 143 single-RHS solves per iteration).
+14. Batch the refinement agreement flags (2120 of 6113 collectives in 30
+    spins 0–50 iterations at four nodes).
+
+Compare Λ35 at 1024 bits (SDPX and SDPB); Λ27 stays at 768.
+
+### Other open items
 
 | Order | Action | Acceptance / constraint |
 |---|---|---|
@@ -239,8 +378,8 @@ regularization and refinement stay unchanged.
 | 11 | csdr3 residue memory | Grouped windows/primes kept 2026-10-07 (−17.1%/−6.7% time, RSS 238 → 214 MiB at four threads). Remaining above 0.9.1: ~25 MiB at four threads (per-way i128 slots and chunk buffers). Entry-compact chunks and per-column splits are superseded. |
 | 14 | Local cone arrow follow-ups (crossing SOCP) | Done 2026-10-07: degree-ordered border (no fallback), Z formed while encoding, presolve images; 19.3 s, 728 MiB. Open: per-way residue scratch (~60 MB per worker at a 300-wide border; a capped prime group cost 8% time), exponential and power cones as leaves (no MPFR test problem yet). Binary64 stays augmented (AlmostSolved/47 at 1.4e-6 versus faer 7.9e-9). |
 | 15 | Sparse QDLDL path (problems with no arrow layout) | Coalescing subtrees past the 500k-cell plan cap is bitwise identical but 24% slower on a trunk-dominated KKT (ordered trunk replay); a plan needs leaf-dominated work to pay. `solve_many` still loops single solves. Measure on a workload that keeps QDLDL. |
-| 12 | Medium four-thread scaling | 1.43× from one to four threads: refactor flat at 0.25 s, Schur assembly 66 → 39.5 ms per factorization (1.67×). Per-call phase maxima (transform 24 → 28 ms, dot/scatter 7 → 21 ms) include tasks stolen inside joins, so measure per-lane busy time before changing the schedule. |
-| 16 | Multi-node sampled Ising (owner MPI path) | 2026-10-08: threads no longer slow past the block count; in-process owners plan for their pool share; ranks should divide the independent component count (rank 0 now warns): spins 0-50 30 it 1/2/4 nodes 49.3/43.3/40.5 s. Residue GEMMs moved off OpenBLAS (concurrent calls collapsed): one node 32/64/96 threads 62.2/59.0/59.8 -> 53.5/44.2/45.5 s, now ahead of MPI 13x4 (48.4 s); makespan ways tried and reverted. MPI owner path border products/residual made parallel: 1/2/4 nodes 43.8/40.3/37.0 s; full solve one node 32/64/96 threads 300/247/263 s vs SDPB 536/285/370 s; 2/4 nodes 211/200 s vs SDPB 221/341 s. Split congruences use prime groups then output columns (-1 to -2.4%). Collectives are not the limit (93 us per allreduce at 13 ranks/4 nodes, ~0.6 s of 33 s); rank waits are per-phase component imbalance. Larger generated Λ27 spins 0-50 (30 it): SDPX 1/2/4 nodes 58.0/56.3/53.3 s vs SDPB 40/34/42 s; ranks with few components run at ~5x CPU/wall on 16 threads (serial leaf sweeps, trsv, border factor). Open: per-component parallelism (needs order-independent exact accumulation in leaf solves; audit gate), single-process multi-owner path (26 in-process owners 74.8 vs plain 44.2 s), intra-component parallel efficiency (the largest component sets the floor once each rank holds one) and component-size spread; replicated border work is minor at Λ27 but not at Λ35 (border n = 4071 solved on every rank, ~143 single-RHS solves/iteration; 4 nodes 54 s vs 1 node 63 s per 10 it): distribute the border factor next. Iteration count is now the larger lever (journal 2026-10-08): `initial_tau` 1e-20..1e-30 cuts Λ27 451 -> 295..181 iterations (832 -> 529..385 s) but costs ising11 52 -> 77, so the default stays 1; open: an automatic start-scale rule (probe or restart on the τ-chase signature) and the Λ35 μ-stall (stationary refinement capped at 10 steps; GMRES-IR opt-in, +48% per iteration on one node, -7% on 4 nodes). Gate: spins 0-50 30 it on idle nodes, bitwise against the same rank count; algorithm changes by full solves + audit. Known: `sampled_integration::dim2_signed_parities_ruiz_f64` returns AlmostSolved on the cluster (Linux) at ae2a827 and after; passes on macOS. |
+| 12 | Medium four-thread scaling | Superseded by plan items 8–11 (cluster runs at 1–64 threads against MOSEK, 2026-10-08). |
+| 16 | Multi-node sampled Ising (owner MPI path) | History 2026-10-07/08 in the journal: component-matched rank layouts, residue GEMMs on faer, parallel owner border products, start scale and opt-in GMRES-IR. Full solves one node 32/64/96 threads 300/247/263 s vs SDPB 536/285/370 s on spins 0–50; Λ27 30 it 1/2/4 nodes 58.0/56.3/53.3 s vs SDPB 40/34/42 s. Open beyond plan items 2, 7, 13 and 14: the single-process multi-owner path (26 in-process owners 74.8 vs plain 44.2 s) and component-size spread. Gate: spins 0–50 30 it on idle nodes, bitwise against the same rank count; algorithm changes by full solves + audit. Known: `sampled_integration::dim2_signed_parities_ruiz_f64` returns AlmostSolved on the cluster (Linux) at ae2a827 and after; passes on macOS. |
 | 13 | Owner-MPI correctors | `OwnedCones`/`OwnedVariables` keep the no-op defaults, so SOC/LP iterates differ from single-process runs. The matched-accuracy gain is small (item 10) and no MPI SOC/LP workload is active; port when one is, with a real MPI E2E. |
 
 ## Measurement prerequisites

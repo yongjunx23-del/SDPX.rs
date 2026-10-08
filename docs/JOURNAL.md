@@ -8,6 +8,111 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-08 — performance plan items 1, 2, 4, 8, 9, 10, 12 (cluster q1/q2)
+
+One 64-core node each (`one2.pbs`, `f64q.pbs`); q1 = items 1 + 8 on
+b0088bb, q2 = q1 + items 2, 4, 9, 10, 12. 768 bits at 1e-42; Float64 at 1e-6.
+
+- **Item 1 (kept):** MPFR static shift and pivot threshold eps^(15/16)
+  (about 1e-217 at 768 bits), replacement eps^(3/4); Float64 unchanged.
+  Λ19 (spins 0–50 s50) 177 it 240.2 → 229.5 s, same objective. Λ27
+  451 it 832 s → **376 it 611 s**. Λ35 passes the old μ 3e-24 stall
+  (μ 2.5e-98 at iteration 382, gap ~2e-17 plateau, as the 1024-bit run
+  and SDPB at 1024 bits; still running).
+- **Item 8 (kept):** assembly buffer budget max(256 MiB, RAM/8); bitwise
+  identical. Float64 large 16 thr 66 → 51 s, 64 thr 70 → 61 s.
+- **Item 2 (kept as option, default off):** τ-chase restart (μ falls 1e10
+  while the gap does not improve 10x, τ < 1e-4·τ₀) to τ₀ = min(τ, eps^(1/8)).
+  Fires on Λ27 at iteration 75 and on Λ19 at 71 with the same trace; Λ19
+  then needs 222 it / 286.9 s instead of 177 / 229.5 (fails the 5% gate).
+  The signature does not separate the two; `auto_start_scale` defaults false.
+- **Item 4 (reverted, counter kept):** adaptive tighter reduced target.
+  Λ19 still 0.74 outer corrections per right-hand side (339 / 456) and more
+  inner steps (refinements 1019 vs 601): the corrections sit at the outer
+  rounding floor, not at inner accuracy. Receipt counter
+  `outer_refinements` kept.
+- **Items 9, 10, 12 (kept):** faer tile products, parallel border SYRK and
+  tiled border factor; dynamic pivot rule inside the dense Cholesky for
+  pivots within rounding of zero (clearly negative pivots still fall back);
+  binary64 PSD Gondzio correctors (eigenvalues of the scaled trial product
+  pushed into the band). Float64 medium 19 → **15 it**: 5.29 / 3.25 /
+  4.58 s at 1 / 16 / 64 thr (was 5.93 / 3.11 / 5.84). Large 25 → **19 it**:
+  118 / 47.5 / 56.5 s (was 139 / 51 / 61); still AlmostSolved, so the
+  sparse-fallback route was not the cause of large's reduced status.
+- Local suite: the same 7 failures as b0088bb (pre-existing).
+
+## 2026-10-08 — diagnosis: Λ35 768-bit stall, SDPB on Λ35, Float64 threads versus MOSEK
+
+Measurements for the performance plan (no code change). Binary `sdpx-t11`
+(b0088bb), idle 2x64-core EPYC 7742 nodes, 64 cores per run, BLAS one, faer
+residue products; SDPB with 64 ranks; MOSEK 11.2.2 given the dual standard
+form with PSD matrix variables (the form CVXPY passes it; the affine-conic
+form took 33.6 s instead of 1.83 s on medium). Evidence:
+`hpc:~/projects/sdpx-ising11-scaling-20261007/runs/{y10,d1,d2,d3,sb35,f64}-*`,
+scripts `~/.cache/sdpx-e2e/ising-scale/{one2,sb35,sb35p,f64s}.pbs`,
+`f64/mosek_sdp.py`.
+
+**Λ35 spins 0–70 (768 bits).** τ₀ = 1: MaxIterations 1000 in 3200 s, μ flat
+at 2–4e-24 from iteration ~100 (gap 1e-16…1e-19 creeping down). τ₀ = 1e-20:
+the same stall at μ ≈ 1e-42. 40 refinement steps per solve: the same plateau
+(MaxIterations 250). 768 bits with the static shift 1e-215 instead of
+eps^(3/4) = 6.8e-174 passes that plateau (μ 1.06e-27 at iteration 99) but
+stops again near μ 1.5e-28 (iterations 139–179); with dynamic regularization
+(pivots below eps^(3/4) replaced by sqrt(eps) = 3.6e-116) also off it follows
+the 1024-bit run exactly (μ 9.76e-28 at 99, 2.6e-48 at 179). So the two
+default shifts set the 768-bit floors. Past them every variant chases τ: at
+1024 bits μ falls to 6e-65 by iteration 239 while the gap stays near 1e-15
+(MaxIterations 250, 1180 s). SDPB at 768 bits converges steadily to μ ≈ 1e-17
+(iteration 225, 595 s, 2.6 s/it) and then stalls: μ oscillates 1e-18…1e-16
+with β = 1 and steps 0.002–0.4 through iteration 352. Neither solver finishes
+Λ35 at 768 bits with default settings. From τ₀ 1e-30 at 768 bits with only
+the static shift lowered, the gap reaches 3.5e-13 by iteration 119 (no
+τ-chase) and then the dynamic rule stops it (μ flat near 8e-71, gap 3e-15 at
+iterations 137–143). Submitted: SDPB at 1024 bits; SDPX at 1024 bits with τ₀
+1e-30; SDPX at 768 bits with τ₀ 1e-30 and both shifts relaxed.
+
+**Where an iteration goes** (64 threads, wall per iteration):
+
+| Phase | Λ27 (2.08 s) | Λ35 (3.19 s) |
+|---|---|---|
+| condensed solves: prepare / recover / full exact residual / reduced refinement | 0.17 / 0.26 / 0.38 / 0.34 (55%) | 0.27 / 0.38 / 0.60 / 0.24 (47%) |
+| factorization: sampled Gram sync, assemble, arrow LDL | 0.26 (13%) | 0.57 (18%) |
+| cone scaling (one MPFR SVD per cone; replay 63% of SVD time) | 0.31 (15%) | 0.52 (16%) |
+| residual update, step lengths, RHS, μ | 0.20 | 0.39 |
+
+Each of the three right-hand sides per iteration (constant, affine, combined)
+gets one initial condensed solve and about one outer correction (Λ35: 6076
+prepares for 3003 right-hand sides). One correction costs about 0.25 s on Λ35
+(prepare 0.044, reduced solve 0.047, recover 0.063, residual 0.098 s), about
+0.75 s per iteration. SDPB does two unrefined solves per iteration (Λ27 1.40
+s/it). The 64-thread Λ35 profile spends ~11% of cycles in rayon/crossbeam
+idle stealing.
+
+**Float64 SU(2) path SDPs** (medium n 1887; large n 7054, m 42023, 1720
+equalities, blocks 95/92/94/92/186/74/71; 1e-6, qnorm 1e-6):
+
+| Threads | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| medium SDPX (19 it) | 5.57 | 4.03 | 3.43 | 3.03 | 3.02 | 2.96 | 3.97 |
+| medium MOSEK (16 it) | 5.24 | | 2.88 | | 2.60 | | 3.20 |
+| large SDPX | 132.4 | 100.7 | 78.8 | 67.6 | 65.7 | 66.0 | 70.1 |
+| large MOSEK (optimal) | 82.1 (29 it) | | 33.2 (30) | | 15.2 (18) | | 26.2 (28) |
+
+Medium per iteration already matches MOSEK (0.29 vs 0.33 s at one thread);
+its assembly gains 2x by eight threads and its tiled Cholesky 2.5x, both
+slower again at 64. Large: SDPX ends AlmostSolved after 24–25 iterations
+(gap 6.6e-6) at 1–32 threads and NumericalError at 64; its objective
+−0.087737 lies inside MOSEK's own thread-dependent spread (−0.087709…
+−0.087757). Assembly is serial at every thread count (32.8/32.7/33.0/31.9/
+33.2/33.5/32.9 s): the per-block contribution buffers exceed the 256 MiB
+`parallel_assembly_allowed` budget. The dense block Cholesky is 58% of
+one-thread samples; at 64 threads OpenBLAS `dgemm` takes 79% of samples (its
+packing `incopy` 37%), the concurrent small-GEMM collapse already seen with
+residue products. `dense_block` rejects a factor with any pivot below the
+dynamic threshold 1e-13 and refactors with faer's sparse LDL; the receipts
+end on that fallback (`condensed_faer`, faer kernels ~1% of one-thread
+samples, so only the last factorizations), and the last step fails.
+
 ## 2026-10-08 — iteration count: start scale, refinement, centering
 
 Hypothesis: SDPX needs 451 iterations on Λ27 spins 0–50 against SDPB's 265

@@ -363,6 +363,10 @@ where
         self.κ = T::recip(tau);
     }
 
+    fn tau(&self) -> Option<T> {
+        Some(self.τ)
+    }
+
     fn new_like(&self) -> Self {
         Self::new(self.x.len(), self.s.len())
     }

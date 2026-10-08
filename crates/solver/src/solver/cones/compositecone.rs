@@ -287,7 +287,9 @@ where
     /// complementarity right-hand side (`zΔs + sΔz = −ds`). Second-order
     /// cones: the spectral values `v₀ ± ‖v̄‖` of the Jordan product of the
     /// NT-scaled trial point `W⁻ᵀ(s + αΔs) ∘ W(z + αΔz)` are pushed into the
-    /// band (`λ ∘ (WΔz + W⁻ᵀΔs) = −ds`). Other cones keep their right-hand side.
+    /// band (`λ ∘ (WΔz + W⁻ᵀΔs) = −ds`). Binary64 PSD cones do the same with
+    /// the eigenvalues of the symmetrized product. Other cones keep their
+    /// right-hand side.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn centrality_correction(
         &mut self,
@@ -1611,6 +1613,9 @@ fn correct_cone<T: FloatT>(
                 }
             }
             true
+        }
+        SupportedCone::PSDTriangleCone(psd) => {
+            psd.centrality_correction(ds, s, z, step_s, step_z, α, lo, hi)
         }
         _ => false,
     }

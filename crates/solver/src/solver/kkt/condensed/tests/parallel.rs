@@ -112,7 +112,7 @@ fn assembly_buffer_budget_bounds_extra_storage() {
     // Original rule: inside two copies of the stored Schur values.
     assert!(parallel_assembly_allowed::<f64>(true, 100, 100));
     // Overlapping cliques fit the byte budget until it is exceeded.
-    let budget_cells = (PARALLEL_ASSEMBLY_BUDGET_BYTES / std::mem::size_of::<f64>()) as u128;
+    let budget_cells = (parallel_assembly_budget_bytes() / std::mem::size_of::<f64>()) as u128;
     assert!(parallel_assembly_allowed::<f64>(true, budget_cells, 10));
     assert!(!parallel_assembly_allowed::<f64>(
         true,
@@ -163,7 +163,7 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
     assert_eq!(buffer_cells(&serial), 0);
     // Buffers are bounded by whichever limit admitted them: the two-copy
     // rule or the byte budget.
-    let budget_cells = (PARALLEL_ASSEMBLY_BUDGET_BYTES / std::mem::size_of::<T>()) as u128;
+    let budget_cells = (parallel_assembly_budget_bytes() / std::mem::size_of::<T>()) as u128;
     let allowed = (2 * pooled.schur_nnz as u128).max(budget_cells);
     assert!(buffer_cells(&pooled) as u128 <= allowed);
     assert!(buffer_cells(&pooled) > 0);

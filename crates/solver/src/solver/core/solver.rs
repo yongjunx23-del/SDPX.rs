@@ -293,10 +293,24 @@ where
         }}
         timeit! {"IP iteration"; {
         'attempts: loop {
+        let mut chase = TauChase::default();
+        let mut chase_tau = None;
         loop {
             self.evaluate(&mut state, &timers);
             if self.terminate(&mut state).stop() {
                 break;
+            }
+            if self.start_tau.is_none()
+                && self.settings.core().auto_start_scale
+                && self.callbacks.checkpoint.restart.is_none()
+            {
+                let tau0 = self.settings.core().initial_tau;
+                if let (Some(tau), Some(gap)) = (self.variables.tau(), self.info.gap_rel()) {
+                    if chase.observe(gap, state.μ, tau, tau0) {
+                        chase_tau = Some(TauChase::restart_tau(tau));
+                        break;
+                    }
+                }
             }
             self.write_checkpoint(state.iter);
             if !self.scale(&state) {
@@ -332,20 +346,24 @@ where
             self.info.get_status(),
             SolverStatus::InsufficientProgress | SolverStatus::NumericalError
         );
-        if !(failed
-            && tau < T::one()
-            && state.iter < self.settings.core().max_iter
-            && self.callbacks.checkpoint.restart.is_none())
+        if chase_tau.is_none()
+            && !(failed
+                && tau < T::one()
+                && state.iter < self.settings.core().max_iter
+                && self.callbacks.checkpoint.restart.is_none())
         {
             break 'attempts;
         }
-        let next = T::min(T::one(), tau * (1e10).as_T());
+        let next = match chase_tau {
+            Some(found) => found,
+            None => T::min(T::one(), tau * (1e10).as_T()),
+        };
         if self.settings.core().verbose {
             let status = self.info.get_status();
             let _ = writeln!(
                 self.info.print_target(),
-                "restart: {:?} at iteration {}, initial tau {:.1e} -> {:.1e}",
-                status,
+                "restart: {} at iteration {}, initial tau {:.1e} -> {:.1e}",
+                if chase_tau.is_some() { "tau chase".to_string() } else { format!("{status:?}") },
                 state.iter,
                 tau,
                 next
@@ -1012,3 +1030,67 @@ mod internal {
         }
     } // end trait impl
 } //end internals module
+
+/// Detects a τ chase on a unit-scale first attempt: since the relative gap
+/// last improved tenfold, μ fell by 1e10 while τ fell below `1e-4·τ₀`. On
+/// Λ27 the gap stalls near 1e-13 while μ keeps falling (451 iterations from
+/// τ₀ = 1, 181 from 1e-30).
+#[derive(Default)]
+struct TauChase<T> {
+    anchor: Option<(T, T)>,
+}
+
+impl<T: FloatT> TauChase<T> {
+    fn observe(&mut self, gap: T, mu: T, tau: T, tau0: T) -> bool {
+        if !(gap.is_finite() && mu.is_finite() && tau.is_finite() && tau > T::zero())
+            || tau0 < (1e-10).as_T()
+        {
+            return false;
+        }
+        match self.anchor {
+            Some((best, _)) if gap >= best * (0.1).as_T() => {}
+            _ => {
+                self.anchor = Some((gap, mu));
+                return false;
+            }
+        }
+        let (_, mu0) = self.anchor.unwrap();
+        mu <= mu0 * (1e-10).as_T() && tau < tau0 * (1e-4).as_T()
+    }
+
+    /// Restart scale: the current τ, at most `eps^(1/8)` (about 1e-29 at
+    /// 768 bits, 0.01 in binary64).
+    fn restart_tau(tau: T) -> T {
+        T::min(tau, T::epsilon().sqrt().sqrt().sqrt())
+    }
+}
+
+#[cfg(test)]
+mod tau_chase_tests {
+    use super::TauChase;
+
+    #[test]
+    fn fires_on_gap_stall_with_falling_mu_only() {
+        // Healthy run: gap and μ fall together.
+        let mut c = TauChase::<f64>::default();
+        for k in 0..60 {
+            let v = 10f64.powi(-k / 2);
+            assert!(!c.observe(v, v, v, 1.0));
+        }
+        // Stall: gap flat at 1e-13 while μ falls; fires once μ drops 1e10.
+        let mut c = TauChase::<f64>::default();
+        let mut fired = None;
+        for k in 0..40 {
+            let mu = 1e-20 * 10f64.powi(-k);
+            if c.observe(1e-13, mu, 1e-11, 1.0) {
+                fired = Some(k);
+                break;
+            }
+        }
+        assert_eq!(fired, Some(10));
+        // A small user start disables the rule.
+        let mut c = TauChase::<f64>::default();
+        assert!((0..40).all(|k| !c.observe(1e-13, 10f64.powi(-k), 1e-40, 1e-30)));
+        assert_eq!(TauChase::<f64>::restart_tau(1e-11), 1e-11);
+    }
+}

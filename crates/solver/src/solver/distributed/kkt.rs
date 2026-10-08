@@ -941,6 +941,7 @@ impl<T: FloatT> OwnedKkt<T> {
             total.batches += c.batches;
         }
         total.refinements += self.refinements;
+        total.outer_refinements = self.refinements;
         total.rhs_applied = self.rhs_applied;
         // Backend work includes local response panels and the shared boundary;
         // caller RHS counts are counted only once at the global solve boundary.

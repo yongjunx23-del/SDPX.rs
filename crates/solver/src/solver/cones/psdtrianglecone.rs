@@ -625,6 +625,105 @@ where
     }
 }
 
+impl<T: FloatT> PSDTriangleCone<T> {
+    /// Gondzio correction (binary64 only): push the eigenvalues of the
+    /// NT-scaled trial product `V = W⁻ᵀ(s + αΔs) ∘ W(z + αΔz)` into
+    /// `[lo, hi]` and subtract `Q diag(t) Q'` from `ds`, as the
+    /// second-order cone does with its spectral values. Returns whether
+    /// `ds` changed; higher precisions and failed eigensolves keep it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn centrality_correction(
+        &mut self,
+        ds: &mut [T],
+        s: &[T],
+        z: &[T],
+        step_s: &[T],
+        step_z: &[T],
+        α: T,
+        lo: T,
+        hi: T,
+    ) -> bool {
+        use crate::solver::default::band_correction;
+        if T::precision_bits() > 53 {
+            return false;
+        }
+        let (n, len) = (self.n, ds.len());
+        let trial_s: Vec<T> = (0..len).map(|i| s[i] + α * step_s[i]).collect();
+        let trial_z: Vec<T> = (0..len).map(|i| z[i] + α * step_z[i]).collect();
+        let (mut ss, mut zz) = (vec![T::zero(); len], vec![T::zero(); len]);
+        self.mul_Winv(MatrixShape::T, &mut ss, &trial_s, T::one(), T::zero());
+        self.mul_W(MatrixShape::N, &mut zz, &trial_z, T::one(), T::zero());
+        let mut v = vec![T::zero(); len];
+        self.circ_op(&mut v, &ss, &zz);
+        // Unpack svec(V) to a binary64 column-major matrix.
+        let mut a = vec![0f64; n * n];
+        let r = std::f64::consts::FRAC_1_SQRT_2;
+        let mut idx = 0;
+        for j in 0..n {
+            for i in 0..=j {
+                let x = v[idx].to_f64().unwrap_or(f64::NAN);
+                a[i + j * n] = if i == j { x } else { x * r };
+                idx += 1;
+            }
+        }
+        if !a.iter().all(|x| x.is_finite()) {
+            return false;
+        }
+        let mut w = vec![0f64; n];
+        let mut info = 0;
+        let mut query = [0f64];
+        unsafe {
+            lapack::dsyev(
+                b'V', b'U', n as i32, &mut a, n as i32, &mut w, &mut query, -1, &mut info,
+            )
+        };
+        let lwork = (query[0] as usize).max(3 * n);
+        let mut work = vec![0f64; lwork];
+        unsafe {
+            lapack::dsyev(
+                b'V',
+                b'U',
+                n as i32,
+                &mut a,
+                n as i32,
+                &mut w,
+                &mut work,
+                lwork as i32,
+                &mut info,
+            )
+        };
+        if info != 0 {
+            return false;
+        }
+        let (lo, hi) = (lo.to_f64().unwrap_or(0.), hi.to_f64().unwrap_or(0.));
+        let t: Vec<f64> = w
+            .iter()
+            .map(|&l| band_correction(l, lo, hi).unwrap_or(0.))
+            .collect();
+        if t.iter().all(|&x| x == 0.) {
+            return false;
+        }
+        // ds -= svec(Q diag(t) Q').
+        let mut idx = 0;
+        for j in 0..n {
+            for i in 0..=j {
+                let c: f64 = (0..n)
+                    .filter(|&k| t[k] != 0.)
+                    .map(|k| a[i + k * n] * t[k] * a[j + k * n])
+                    .sum();
+                let c = if i == j {
+                    c
+                } else {
+                    c * std::f64::consts::SQRT_2
+                };
+                ds[idx] -= T::from_f64(c).unwrap();
+                idx += 1;
+            }
+        }
+        true
+    }
+}
+
 fn mul_Wx_inner<T>(is_transpose: MatrixShape, y: &mut [T], x: &[T], α: T, β: T, Rx: &Matrix<T>)
 where
     T: FloatT,
