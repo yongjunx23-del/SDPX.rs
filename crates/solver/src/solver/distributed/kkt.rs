@@ -328,7 +328,7 @@ impl<T: FloatT> OwnedKkt<T> {
             vec![T::zero(); border * (border + 1) / 2],
         );
         let cones = CompositeCone::new(&[]);
-        let factor = DirectLDLKKTSolver::new(
+        let mut factor = DirectLDLKKTSolver::new(
             &matrix,
             &CscMatrix::zeros((0, border)),
             &cones,
@@ -336,6 +336,9 @@ impl<T: FloatT> OwnedKkt<T> {
             border,
             settings,
         );
+        // The dense border is a single arrow leaf; without the pool its LDL
+        // and sweeps ran serially (Λ27 4 nodes: 1.3 s of 48 s per rank).
+        factor.set_factor_pool(pool.clone());
         let interior: Vec<_> = locals
             .iter()
             .map(|l| l.kernel.interior_dimension())
