@@ -271,9 +271,11 @@ gaps (2026-10-09):
 - Λ27: τ₀ = 1e-40 gives 156 it / 276 s and the default 183 it / 312–368 s,
   against SDPB's 265 / 375 s. SDPX is still slower per iteration (1.77 vs
   1.41 s).
-- Λ35: SDPX does not converge in 800 iterations. The primal diverges along a
-  rank-2–4 subspace per gram block, so the dual has no Slater point (journal
-  2026-10-09). SDPB takes 746 it / 2004 s through the same plateau.
+- Λ35: SDPX does not reach 1e-42 at 768 bits. The primal diverges and the
+  dual has no Slater point, with no exact face. SDPX and SDPB both escape a
+  plateau at about iteration 650. SDPX then stalls at about 1e-26 objective
+  accuracy (1200 it, 3428 s), while SDPB finishes in 746 it / 2009 s. At
+  1024 bits SDPX solves Λ35 in 743 it / 3565 s.
 - Float64 suite (58 cases, every point audited): SDPX loses 46 at 1 thread
   and 50 at 16. Geo-mean SDPX/MOSEK is 5.4× (1.7× where MOSEK takes
   ≥ 0.1 s). Four cases report Solved but fail the audit.
@@ -287,9 +289,11 @@ Active branches (2026-10-09; two agents, at the user's request):
     s ≠ b − Ax; thread-dependent outcomes).
   - Task 10: cost-based LP backend, presolve and SDP formulation choice,
     independent of thread count.
-- `perf-l35`, Ising (task 11): a Λ35 baseline without the InsufficientProgress
-  restart, then facial reduction from the primal recession direction. An
-  SDPB-like fixed-τ end phase is the fallback.
+- `perf-l35`, Ising, task 12: a fixed-τ phase after the HSD start, which
+  drops the constant right-hand side (one refined solve in three); the Λ35
+  end game after its plateau escape; a progress stop that lets the plateau
+  be traversed. Task 11 closed facial reduction for Λ35 (no exact face) and
+  fixed τ from the start (journal 2026-10-09).
 
 Parked, with WIP committed on each branch (journal 2026-10-09):
 - `perf-sharedrhs` `d34869c`: Λ27 −2.4%, unaudited.

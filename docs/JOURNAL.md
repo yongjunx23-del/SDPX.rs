@@ -8,6 +8,37 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — Λ35: facial reduction and fixed τ from the start (perf-l35, not kept)
+
+- Input check (verified): the 1024- and 1536-bit conversions solved at 768
+  bits give byte-identical traces and the same stall (p − ref 1.72e-12 vs
+  1.68e-12). SDPX at 1024 bits with τ₀ 1e-30 on the 768-bit input is
+  `Solved` in 743 it / 3565 s (p − ref 3.3e-37). SDPB at 768 bits takes
+  746 it / 2009 s.
+- Facial reduction: the auxiliary SDP has ω* = 0 (Solved, 108 it, 556 s),
+  so the dual has no Slater point. But D = X(d*) has no rank gap in any
+  block: eigenvalues fall about 1e-4 per index down to 1e-27–1e-88, the
+  mass sits in spins 20–35, and max |d| = 1.5e51. Reducing at threshold
+  1e-60 (1160 directions) gives MaxIterations with p − ref −2.05e-2: the
+  approximate face cuts off the optimum. Hypothesis: an asymptotic large-Δ
+  degeneracy, not an exact face.
+- Fixed τ from iteration 75 (WIP `d59acd9`, off by default):
+  InsufficientProgress at 728 (step 0), gap 8.5e-16, p − ref 1.9e-11.
+- Baselines with the progress stop disabled (test switch `10ee12c`,
+  max_iter 1200):
+  - τ₀ 1e-40 escapes the plateau at 600–700 (gap 5e-21 → 8e-38), as SDPB
+    does at about 650. It then bounces between gap 1e-31 and 1e-38 with
+    steps of 1e-6 to 0.9 and a scaled pres floor near 1e-200: MaxIterations,
+    3428 s, p − ref 8.3e-26.
+  - auto escapes at 800–850, reaching gap 1e-33 at 848 and 2.4e-37 at 898.
+- Conclusion: the plateau is intrinsic to Λ35. After escaping, SDPX at 768
+  bits stalls at about 1e-26 objective accuracy, where SDPB reaches its 1e-42
+  thresholds. Hypothesis: the HSD end game as τ → 0, with the scaling spread
+  near 1e130, loses accuracy in the Δτ coupling or the reduced solves.
+- Next (task 12): switch to fixed τ after the escape; the same switch on
+  well-posed Ising cases drops the constant right-hand side (one refined
+  solve in three); a progress stop that does not end plateau traversals.
+
 ## 2026-10-09 — Λ35 plateau: primal divergence, not equilibration or τ₀
 
 - Hypothesis: the Λ35 gap plateau at 768 bits comes from the equilibration
