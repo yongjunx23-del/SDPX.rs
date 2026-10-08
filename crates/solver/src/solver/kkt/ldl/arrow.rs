@@ -52,7 +52,9 @@ const SPLIT_FACTOR_MIN: usize = 32;
 /// this many threads per leaf (at ~2 per leaf it measured slower), and the
 /// border factor only from this dimension.
 const SPLIT_FACTOR_THREADS_PER_LEAF: usize = 4;
-const SPLIT_BORDER_FACTOR_MIN: usize = 128;
+const SPLIT_BORDER_FACTOR_MIN: usize = 64;
+/// Row block of the split forward sweep.
+const FORWARD_BLOCK: usize = 32;
 
 fn find(parent: &mut [usize], mut i: usize) -> usize {
     while parent[i] != i {
@@ -193,6 +195,34 @@ impl<T: FloatT> DenseLeaf<T> {
         self.forward_suffix(x, 0);
     }
 
+    /// [`Self::forward`] split over the ambient pool: once a row block is
+    /// final, every later row applies that block's columns in ascending order
+    /// (rows are independent), then the next block finishes serially. Each
+    /// entry sees the serial FMA order, so results are bitwise identical.
+    fn forward_blocked(&self, x: &mut [T]) {
+        let n = self.n;
+        let mut r0 = 0;
+        while r0 < n {
+            let r1 = (r0 + FORWARD_BLOCK).min(n);
+            for i in r0..r1 {
+                for k in r0..i {
+                    x[i] = (-self.l[i + k * n]).mul_add(x[k], x[i]);
+                }
+            }
+            let (head, tail) = x.split_at_mut(r1);
+            let done = &head[r0..r1];
+            tail.par_chunks_mut(16).enumerate().for_each(|(c, rows)| {
+                for (j, v) in rows.iter_mut().enumerate() {
+                    let i = r1 + c * 16 + j;
+                    for (k, &xk) in (r0..r1).zip(done) {
+                        *v = (-self.l[i + k * n]).mul_add(xk, *v);
+                    }
+                }
+            });
+            r0 = r1;
+        }
+    }
+
     // Omitted leading RHS coordinates are structurally zero. Forward solve
     // leaves them zero, so compact coupling panels need only the suffix.
     fn forward_suffix(&self, x: &mut [T], start: usize) {
@@ -281,31 +311,8 @@ impl<T: FloatT> DenseLeaf<T> {
     /// next block finishes serially. Each entry sees the serial FMA order,
     /// so results are bitwise identical. The backward sweep stays serial.
     fn solve_pooled(&self, x: &mut [T], pool: Option<&rayon::ThreadPool>) {
-        const BLOCK: usize = 32;
-        let n = self.n;
-        match pool.filter(|p| p.current_num_threads() > 1 && n >= 8 * BLOCK) {
-            Some(pool) => pool.install(|| {
-                let mut r0 = 0;
-                while r0 < n {
-                    let r1 = (r0 + BLOCK).min(n);
-                    for i in r0..r1 {
-                        for k in r0..i {
-                            x[i] = (-self.l[i + k * n]).mul_add(x[k], x[i]);
-                        }
-                    }
-                    let (head, tail) = x.split_at_mut(r1);
-                    let done = &head[r0..r1];
-                    tail.par_chunks_mut(16).enumerate().for_each(|(c, rows)| {
-                        for (j, v) in rows.iter_mut().enumerate() {
-                            let i = r1 + c * 16 + j;
-                            for (k, &xk) in (r0..r1).zip(done) {
-                                *v = (-self.l[i + k * n]).mul_add(xk, *v);
-                            }
-                        }
-                    });
-                    r0 = r1;
-                }
-            }),
+        match pool.filter(|p| p.current_num_threads() > 1 && self.n >= 8 * FORWARD_BLOCK) {
+            Some(pool) => pool.install(|| self.forward_blocked(x)),
             None => self.forward(x),
         }
         for (x, d) in x.iter_mut().zip(&self.dinv) {
@@ -469,7 +476,7 @@ impl<T: FloatT> Leaf<T> {
     /// Each entry is the dot of a Y column with the rounded column
     /// `z_j = y_j ⊙ dinv`, as one exact accumulation; entry (r, c) is owned by
     /// column max(r, c), so columns update disjoint entries in parallel.
-    fn first_many(&mut self, rhs: &[T], n: usize, cols: usize, chunks: usize) {
+    fn first_many(&mut self, rhs: &[T], n: usize, cols: usize, chunks: usize, split: bool) {
         let g = self.ids.len();
         self.batch_w.resize(g * cols, T::zero());
         if self.batch_v.is_empty() {
@@ -485,6 +492,9 @@ impl<T: FloatT> Leaf<T> {
         if chunks > 1 {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::forward_many);
+        } else if cols == 1 && split && self.factor.n >= 4 * FORWARD_BLOCK {
+            // One column has the single-RHS layout and order.
+            self.factor.forward_blocked(&mut self.batch_w);
         } else {
             self.factor.forward_many(&mut self.batch_w, cols);
         }
@@ -531,7 +541,9 @@ impl<T: FloatT> Leaf<T> {
         }
     }
 
-    fn first_solve(&mut self, rhs: &[T]) {
+    /// `split`: the pool has spare workers beyond the leaves, so a large
+    /// leaf's forward sweep runs blocked over them (bitwise identical).
+    fn first_solve(&mut self, rhs: &[T], split: bool) {
         if self.w.is_empty() {
             let g = self.ids.len();
             self.w.resize(g, T::zero());
@@ -540,7 +552,11 @@ impl<T: FloatT> Leaf<T> {
         for (w, &id) in self.w.iter_mut().zip(&self.ids) {
             *w = rhs[id];
         }
-        self.factor.forward(&mut self.w);
+        if split && self.factor.n >= 4 * FORWARD_BLOCK {
+            self.factor.forward_blocked(&mut self.w);
+        } else {
+            self.factor.forward(&mut self.w);
+        }
         for i in self.coupling_start..self.ids.len() {
             self.v[i - self.coupling_start] = self.w[i] * self.factor.dinv[i];
         }
@@ -1497,14 +1513,16 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let owned = self.owned_leaves();
         let timer = crate::receipt::start();
         if let Some(pool) = &self.pool {
+            // Spare workers (at least two per leaf) split large leaf sweeps.
+            let split = pool.current_num_threads() >= 2 * owned.len();
             pool.install(|| {
                 self.leaves[owned.clone()]
                     .par_iter_mut()
-                    .for_each(|l| l.first_solve(b))
+                    .for_each(|l| l.first_solve(b, split))
             });
         } else {
             for leaf in &mut self.leaves[owned.clone()] {
-                leaf.first_solve(b);
+                leaf.first_solve(b, false);
             }
         }
         crate::receipt::finish("arrow.leaf_forward", timer);
@@ -1692,15 +1710,16 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
                 .max(1)
         });
         if let Some(pool) = &self.pool {
+            let split = pool.current_num_threads() >= 2 * owned.len();
             pool.install(|| {
                 self.leaves[owned.clone()]
                     .par_iter_mut()
-                    .for_each(|l| l.first_many(b, n, cols, chunks))
+                    .for_each(|l| l.first_many(b, n, cols, chunks, split))
             });
         } else {
             self.leaves[owned.clone()]
                 .iter_mut()
-                .for_each(|l| l.first_many(b, n, cols, 1));
+                .for_each(|l| l.first_many(b, n, cols, 1, false));
         }
         // Use the same coupling accumulation as the single-RHS solve.
         let tx = &mut self.batch_tx;
