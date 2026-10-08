@@ -87,6 +87,14 @@ where
             self.z.copy_from(&variables.z);
             self.s.copy_from(&variables.s);
         }
+
+        // With the original-coordinate test, return the slack implied by x:
+        // the projection of b - A x onto the cone (the iterate's slack can
+        // differ from b - A x by the internal primal residual, 1e-2 on
+        // SOCP_sched_100_100_orig).
+        if settings.tol_original.is_some() && !is_infeasible && data.sampled.is_none() {
+            data.original_data().project_slack(&self.x, &mut self.s);
+        }
     }
 }
 

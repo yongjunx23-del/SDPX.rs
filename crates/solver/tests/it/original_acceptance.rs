@@ -80,7 +80,10 @@ fn solved_points_pass_the_original_audit() {
 fn unattainable_original_tolerance_is_not_solved() {
     // The internal test still passes at its own tolerance; an original-
     // coordinate tolerance below rounding must not be reported as `Solved`.
-    let (P, q, A, b, cones) = data();
+    // Inexact data keep the residuals off exact zero.
+    let (P, _, A, mut b, cones) = data();
+    let q = vec![1.0 / 3.0, 1.0 / 7.0];
+    b[0] = 0.7;
     let settings = DefaultSettings {
         tol_original: Some(1e-30),
         ..DefaultSettings::default()

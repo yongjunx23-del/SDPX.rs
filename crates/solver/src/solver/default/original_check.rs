@@ -146,6 +146,115 @@ impl<T: FloatT> OriginalData<T> {
     }
 }
 
+impl<T: FloatT> OriginalData<T> {
+    /// Replace `s` by the projection of `b - A x` onto the cone, cone by
+    /// cone, so the returned slack is consistent with `x`: `‖b-Ax-s‖` is the
+    /// distance of `b - Ax` from the cone. Zero, orthant and second-order
+    /// cones project in closed form; PSD cones through an eigendecomposition
+    /// in binary64 (higher precisions keep the iterate unless `b - Ax` is
+    /// already PSD). Other cones and rows with an infinite bound keep `s`.
+    pub(crate) fn project_slack(&self, x: &[T], s: &mut [T]) {
+        let infbound: T = crate::get_infinity().as_T();
+        let mut r: Vec<T> = self.b.clone();
+        self.A.gemv(&mut r, x, -T::one(), T::one());
+        let mut offset = 0;
+        for cone in &self.cones {
+            let len = cone.nvars();
+            let rows = offset..offset + len;
+            offset += len;
+            if rows.clone().any(|i| T::abs(self.b[i]) >= infbound) {
+                continue;
+            }
+            let (r, s) = (&r[rows.clone()], &mut s[rows]);
+            match cone {
+                SupportedConeT::ZeroConeT(_) => s.fill(T::zero()),
+                SupportedConeT::NonnegativeConeT(_) => {
+                    for (si, &ri) in s.iter_mut().zip(r) {
+                        *si = T::max(ri, T::zero());
+                    }
+                }
+                SupportedConeT::SecondOrderConeT(_) if !r.is_empty() => {
+                    let (t, norm) = (r[0], r[1..].norm());
+                    if norm <= t {
+                        s.copy_from_slice(r);
+                    } else if norm <= -t {
+                        s.fill(T::zero());
+                    } else {
+                        let half = (t + norm) / (2.).as_T();
+                        s[0] = half;
+                        for (si, &ri) in s[1..].iter_mut().zip(&r[1..]) {
+                            *si = half * ri / norm;
+                        }
+                    }
+                }
+                SupportedConeT::PSDTriangleConeT(dim) => {
+                    if cone_distance(cone, r, false) == T::zero() {
+                        s.copy_from_slice(r);
+                    } else if T::precision_bits() <= 64 {
+                        project_psd_f64(*dim, r, s);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `s = svec(V max(Λ, 0) V')` for `mat(r) = V Λ V'`, in binary64.
+fn project_psd_f64<T: FloatT>(dim: usize, r: &[T], s: &mut [T]) {
+    let r2 = std::f64::consts::FRAC_1_SQRT_2;
+    let mut a = vec![0f64; dim * dim];
+    let mut idx = 0;
+    for j in 0..dim {
+        for i in 0..=j {
+            let v = r[idx].to_f64().unwrap_or(f64::NAN);
+            a[i + j * dim] = if i == j { v } else { v * r2 };
+            idx += 1;
+        }
+    }
+    if !a.iter().all(|v| v.is_finite()) {
+        return;
+    }
+    let mut w = vec![0f64; dim];
+    let (mut info, mut query) = (0, [0f64]);
+    let n = dim as i32;
+    unsafe { lapack::dsyev(b'V', b'U', n, &mut a, n, &mut w, &mut query, -1, &mut info) };
+    let lwork = (query[0] as usize).max(3 * dim);
+    let mut work = vec![0f64; lwork];
+    unsafe {
+        lapack::dsyev(
+            b'V',
+            b'U',
+            n,
+            &mut a,
+            n,
+            &mut w,
+            &mut work,
+            lwork as i32,
+            &mut info,
+        )
+    };
+    if info != 0 {
+        return;
+    }
+    let mut idx = 0;
+    for j in 0..dim {
+        for i in 0..=j {
+            let v: f64 = (0..dim)
+                .filter(|&k| w[k] > 0.)
+                .map(|k| a[i + k * dim] * w[k] * a[j + k * dim])
+                .sum();
+            s[idx] = T::from_f64(if i == j {
+                v
+            } else {
+                v * std::f64::consts::SQRT_2
+            })
+            .unwrap();
+            idx += 1;
+        }
+    }
+}
+
 /// Distance of `v` from the cone (`dual`: from its dual cone), measured as
 /// in the audit: `|v|∞` for the zero cone, the most negative entry for the
 /// orthant, `‖v̄‖ - v₀` for second-order cones, `-λ_min` for PSD triangles.
