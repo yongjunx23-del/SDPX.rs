@@ -48,6 +48,8 @@ const ARROW_KKT_FACTOR: u128 = 8;
 const SINGLE_LEAF_MIN: usize = 16;
 /// Trailing columns below which a split factor step runs serially.
 const SPLIT_FACTOR_MIN: usize = 32;
+/// Pivots per panel of the split leaf factor (one join per panel).
+const FACTOR_PANEL: usize = 8;
 /// Per-step factor tasks are small: split a leaf factor only with at least
 /// this many threads per leaf (at ~2 per leaf it measured slower), and the
 /// border factor only from this dimension.
@@ -163,6 +165,9 @@ impl<T: FloatT> DenseLeaf<T> {
     ) -> Result<(), &'static str> {
         self.l.copy_from_slice(a);
         let n = self.n;
+        if split && n > SPLIT_FACTOR_MIN {
+            return self.factor_panels(signs, reg, regularize_count);
+        }
         for k in 0..n {
             let s = T::from_i8(signs[if signs.len() == 1 { 0 } else { k }]).unwrap();
             let d = Self::pivot(self.l[k + k * n], s, reg, regularize_count)?;
@@ -171,26 +176,67 @@ impl<T: FloatT> DenseLeaf<T> {
             for i in k + 1..n {
                 self.l[i + k * n] *= self.dinv[k];
             }
-            if split && n - k > SPLIT_FACTOR_MIN {
-                let (head, tail) = self.l.split_at_mut((k + 1) * n);
-                let pivot = &head[k * n..];
-                tail.par_chunks_mut(n)
-                    .enumerate()
-                    .for_each(|(offset, column)| {
-                        let j = k + 1 + offset;
-                        let v = pivot[j] * d;
-                        for i in j..n {
-                            column[i] = (-pivot[i]).mul_add(v, column[i]);
-                        }
-                    });
-                continue;
-            }
             for j in k + 1..n {
                 let v = self.l[j + k * n] * d;
                 for i in j..n {
                     self.l[i + j * n] = (-self.l[i + k * n]).mul_add(v, self.l[i + j * n]);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// [`Self::factor_signed`] in panels of `FACTOR_PANEL` pivots: each
+    /// panel's columns are factored serially, then every later column
+    /// receives the panel's updates in ascending pivot order in one parallel
+    /// pass (one join per panel instead of per pivot). Entry (i, j) still
+    /// sees the fused updates k = 0, 1, ..., j-1 in order with the same
+    /// operands, so the factor is bitwise identical to the serial loop.
+    fn factor_panels(
+        &mut self,
+        signs: &[i8],
+        reg: Option<(T, T)>,
+        regularize_count: &mut usize,
+    ) -> Result<(), &'static str> {
+        let n = self.n;
+        let mut d = vec![T::zero(); n];
+        let mut p = 0;
+        while p < n {
+            let pe = (p + FACTOR_PANEL).min(n);
+            for k in p..pe {
+                let s = T::from_i8(signs[if signs.len() == 1 { 0 } else { k }]).unwrap();
+                let dk = Self::pivot(self.l[k + k * n], s, reg, regularize_count)?;
+                d[k] = dk;
+                self.dinv[k] = T::one() / dk;
+                self.l[k + k * n] = T::one();
+                for i in k + 1..n {
+                    self.l[i + k * n] *= self.dinv[k];
+                }
+                for j in k + 1..pe {
+                    let v = self.l[j + k * n] * dk;
+                    for i in j..n {
+                        self.l[i + j * n] = (-self.l[i + k * n]).mul_add(v, self.l[i + j * n]);
+                    }
+                }
+            }
+            if pe < n {
+                let (head, tail) = self.l.split_at_mut(pe * n);
+                let panel = &head[p * n..];
+                let d = &d[p..pe];
+                tail.par_chunks_mut(n)
+                    .enumerate()
+                    .for_each(|(offset, column)| {
+                        let j = pe + offset;
+                        for (q, &dk) in d.iter().enumerate() {
+                            let pivot = &panel[q * n..(q + 1) * n];
+                            let v = pivot[j] * dk;
+                            for i in j..n {
+                                column[i] = (-pivot[i]).mul_add(v, column[i]);
+                            }
+                        }
+                    });
+            }
+            p = pe;
         }
         Ok(())
     }
@@ -302,6 +348,18 @@ impl<T: FloatT> DenseLeaf<T> {
                 }
             }
         }
+    }
+
+    /// `L D Lᵀ x = b` for a row-interleaved panel (entry (i, c) at
+    /// `i * cols + c`); every column keeps the single-RHS order.
+    fn solve_many(&self, x: &mut [T], cols: usize) {
+        self.forward_many(x, cols);
+        for j in 0..self.n {
+            for c in 0..cols {
+                x[j * cols + c] *= self.dinv[j];
+            }
+        }
+        self.backward_many(x, cols);
     }
 
     /// Apply a batch kernel to `chunks` column ranges of the row-interleaved
@@ -1864,13 +1922,20 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
                 });
             }
             None => {
-                self.tf.forward_many(tx, cols);
-                for j in 0..t {
-                    for c in 0..cols {
-                        tx[j * cols + c] *= self.tf.dinv[j];
+                // Several trunk columns: independent column chunks share the
+                // pool, each with the serial per-column order.
+                match self
+                    .pool
+                    .as_ref()
+                    .filter(|p| cols > 1 && p.current_num_threads() > 1 && t >= 2 * FORWARD_BLOCK)
+                {
+                    Some(pool) => {
+                        let chunks = pool.current_num_threads().min(cols);
+                        let tf = &self.tf;
+                        pool.install(|| tf.chunked(tx, cols, chunks, DenseLeaf::solve_many));
                     }
+                    None => self.tf.solve_many(tx, cols),
                 }
-                self.tf.backward_many(tx, cols);
             }
         }
         crate::receipt::finish("many.trunk", prof);
@@ -2062,6 +2127,40 @@ mod tests {
             assert!(d <= 1e4 * eps * scale, "{d} vs scale {scale}");
         }
     }
+    fn chunked_trunk_parity<T: FloatT>() {
+        let (n, cols) = (70, 5);
+        let mut leaf = DenseLeaf::<T>::new(n);
+        for j in 0..n {
+            for i in j + 1..n {
+                leaf.l[i + j * n] =
+                    T::from_usize((i * 7 + j * 13) % 17 + 1).unwrap() / T::from_usize(97).unwrap();
+            }
+            leaf.dinv[j] = T::from_usize(j % 5 + 2).unwrap().recip();
+        }
+        let rhs: Vec<T> = (0..n * cols)
+            .map(|i| T::from_usize(i % 11 + 1).unwrap() / T::from_usize(3).unwrap())
+            .collect();
+        let mut serial = rhs.clone();
+        leaf.solve_many(&mut serial, cols);
+        for workers in [2, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            let mut pooled = rhs.clone();
+            let chunks = workers.min(cols);
+            pool.install(|| leaf.chunked(&mut pooled, cols, chunks, DenseLeaf::solve_many));
+            assert_eq!(serial, pooled);
+        }
+    }
+    #[test]
+    fn chunked_trunk_parity_f64() {
+        chunked_trunk_parity::<f64>();
+    }
+    #[test]
+    fn chunked_trunk_parity_mpfr256() {
+        chunked_trunk_parity::<sdpx_arithmetic::Bits256>();
+    }
     #[test]
     fn pooled_solve_parity_f64() {
         pooled_solve_parity::<f64>();
@@ -2154,6 +2253,38 @@ mod tests {
         let mut split = DenseLeaf::<T>::new(n);
         pool.install(|| split.factor(&a, 1, None, &mut count, true))
             .unwrap();
+        assert_eq!(serial.l, split.l);
+        assert_eq!(serial.dinv, split.dinv);
+        // Panel edges off the panel width, mixed signs and clamped pivots.
+        let n = 83;
+        let signs: Vec<i8> = (0..n).map(|k| if k % 5 == 4 { -1 } else { 1 }).collect();
+        let mut a = vec![T::zero(); n * n];
+        for j in 0..n {
+            for i in j..n {
+                let v = if i == j {
+                    f64::from(signs[i])
+                        * if i % 11 == 3 {
+                            1e-40
+                        } else {
+                            n as f64 + (i % 7) as f64
+                        }
+                } else {
+                    ((i * 29 + j * 13) % 17) as f64 / 17.0 - 0.5
+                };
+                a[i + j * n] = T::from_f64(v).unwrap();
+            }
+        }
+        let reg = Some((T::from_f64(1e-20).unwrap(), T::one()));
+        let (mut c1, mut c2) = (0, 0);
+        let mut serial = DenseLeaf::<T>::new(n);
+        serial
+            .factor_signed(&a, &signs, reg, &mut c1, false)
+            .unwrap();
+        let mut split = DenseLeaf::<T>::new(n);
+        pool.install(|| split.factor_signed(&a, &signs, reg, &mut c2, true))
+            .unwrap();
+        assert!(c1 > 0);
+        assert_eq!(c1, c2);
         assert_eq!(serial.l, split.l);
         assert_eq!(serial.dinv, split.dinv);
     }
