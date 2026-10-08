@@ -394,6 +394,22 @@ where
         self.fixed_tau
     }
 
+    fn scale_stats(&self) -> String {
+        let f = |v: T| v.to_f64().unwrap_or(f64::NAN);
+        format!(
+            "x_inf={:.3e} x_2={:.3e} s_inf={:.3e} s_2={:.3e} z_inf={:.3e} z_2={:.3e} sz={:.3e} tau={:.3e} kappa={:.3e}",
+            f(self.x.norm_inf()),
+            f(self.x.norm()),
+            f(self.s.norm_inf()),
+            f(self.s.norm()),
+            f(self.z.norm_inf()),
+            f(self.z.norm()),
+            f(self.s.dot(&self.z)),
+            f(self.τ),
+            f(self.κ)
+        )
+    }
+
     fn new_like(&self) -> Self {
         Self::new(self.x.len(), self.s.len())
     }

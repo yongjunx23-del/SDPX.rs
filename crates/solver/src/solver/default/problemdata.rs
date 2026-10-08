@@ -469,6 +469,47 @@ where
     type C = CompositeCone<T>;
     type SE = DefaultSettings<T>;
 
+    fn scale_stats(&self) -> String {
+        let f = |v: T| v.to_f64().unwrap_or(f64::NAN);
+        let range = |v: &[T]| {
+            let lo = v.iter().copied().fold(T::infinity(), T::min);
+            let hi = v.iter().copied().fold(T::zero(), T::max);
+            (f(lo), f(hi))
+        };
+        let eq = &self.equilibration;
+        format!(
+            "n={} m={} q_inf={:.3e} q_2={:.3e} b_inf={:.3e} b_2={:.3e} c={:.3e} d=[{:.3e},{:.3e}] e=[{:.3e},{:.3e}]",
+            self.q.len(),
+            self.b.len(),
+            f(self.q.norm_inf()),
+            f(self.q.norm()),
+            f(self.b.norm_inf()),
+            f(self.b.norm()),
+            f(eq.c),
+            range(&eq.d).0,
+            range(&eq.d).1,
+            range(&eq.e).0,
+            range(&eq.e).1
+        )
+    }
+
+    /// `min(1, 1/max(d))`: the largest column equilibration scale. A column
+    /// scaled up by `d` carries data `d` times below the unit start, and
+    /// the slacks balancing it reach that scale (Λ27: max d 7.5e27, final
+    /// τ 5.5e-29; Λ19 6.1e25; ising11 2.2). Overshooting the solution scale
+    /// costs about one iteration per decade, undershooting about ten.
+    fn unit_start_tau(&self) -> Option<T> {
+        let dmax = self.equilibration.d.iter().copied().fold(T::one(), T::max);
+        // Replicated ranks agree on one start.
+        let global = crate::mpi::max_all_f64(dmax.to_f64().unwrap_or(f64::INFINITY));
+        let dmax = if global.is_finite() {
+            T::from_f64(global).unwrap()
+        } else {
+            dmax
+        };
+        Some(T::min(T::one(), T::recip(dmax)))
+    }
+
     fn equilibrate(&mut self, cones: &CompositeCone<T>, settings: &DefaultSettings<T>) {
         let data = self;
         let equil = &mut data.equilibration;
@@ -707,4 +748,40 @@ where
     }
 
     Some(presolver)
+}
+
+#[cfg(test)]
+mod start_tau_tests {
+    use super::*;
+
+    fn tau_for(scale: f64) -> f64 {
+        // One well-scaled column and one scaled by `scale`.
+        let A = CscMatrix::new(
+            2,
+            2,
+            vec![0, 2, 4],
+            vec![0, 1, 0, 1],
+            vec![1.0, 0.5, 0.25 * scale, scale],
+        );
+        let P = CscMatrix::zeros((2, 2));
+        let cones = [SupportedConeT::NonnegativeConeT(2)];
+        let settings = DefaultSettings::<f64>::default();
+        let mut data = DefaultProblemData::new(&P, &[1.0, 1.0], &A, &[1.0, 1.0], &cones, &settings);
+        let composite = CompositeCone::new(&cones);
+        data.equilibrate(&composite, &settings);
+        let tau = data.unit_start_tau().unwrap();
+        let dmax = data.equilibration.d.iter().copied().fold(1.0, f64::max);
+        assert_eq!(tau, f64::min(1.0, 1.0 / dmax));
+        tau
+    }
+
+    #[test]
+    fn unit_start_tau_follows_largest_column_scale() {
+        // Balanced data keeps the unit start.
+        assert_eq!(tau_for(1.0), 1.0);
+        // A tiny column is scaled up (to the binary64 bound 1e4 here) and the
+        // unit start moves out by the same factor.
+        let tau = tau_for(1e-12);
+        assert!(tau < 1e-3 && tau >= 1e-4, "tau {tau}");
+    }
 }

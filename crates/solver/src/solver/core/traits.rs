@@ -67,6 +67,17 @@ pub trait ProblemData<T: FloatT> {
 
     /// Equilibrate internal data before solver starts.
     fn equilibrate(&mut self, cones: &Self::C, settings: &Self::SE);
+
+    /// Scale statistics of the equilibrated data (diagnostics).
+    fn scale_stats(&self) -> String {
+        String::new()
+    }
+
+    /// Starting τ for the unit fallback start, when the data imply one
+    /// (see `DefaultSettings::auto_initial_tau`).
+    fn unit_start_tau(&self) -> Option<T> {
+        None
+    }
 }
 
 /// Variables for a conic optimization problem.
@@ -196,6 +207,11 @@ pub trait Variables<T: FloatT> {
 
     /// Start the embedding at `τ = tau`, `κ = 1/tau` (τκ unchanged at 1).
     fn set_initial_tau(&mut self, tau: T);
+
+    /// Scale statistics of the iterate (diagnostics).
+    fn scale_stats(&self) -> String {
+        String::new()
+    }
 
     /// Current homogeneous τ, when the variables carry one.
     fn tau(&self) -> Option<T> {

@@ -306,6 +306,9 @@ where
         let mut best_gap = T::infinity();
         loop {
             self.evaluate(&mut state, &timers);
+            if state.iter % 10 == 0 && std::env::var_os("SDPX_START_STATS").is_some() {
+                eprintln!("start-stats iter {} {}", state.iter, self.variables.scale_stats());
+            }
             if self.terminate(&mut state).stop() {
                 break;
             }
@@ -917,6 +920,9 @@ mod internal {
         }
 
         fn finish(&mut self, timers: &Timers) {
+            if std::env::var_os("SDPX_START_STATS").is_some() {
+                eprintln!("start-stats final {}", self.variables.scale_stats());
+            }
             self.info
                 .set_linear_solver_info(self.kktsystem.linear_solver_info());
             if self.info.get_status() == SolverStatus::InsufficientProgress {
@@ -973,14 +979,30 @@ mod internal {
                     &self.settings,
                 );
                 crate::receipt::finish("start.solve", timer);
+                let stats = std::env::var_os("SDPX_START_STATS").is_some();
+                if stats {
+                    eprintln!("start-stats data {}", self.data.scale_stats());
+                    eprintln!("start-stats kkt {}", self.variables.scale_stats());
+                }
                 // fix up (z,s) so that they are in the cone
                 let timer = crate::receipt::start();
                 self.variables.symmetric_initialization(&mut self.cones);
                 crate::receipt::finish("start.shift", timer);
+                if stats {
+                    eprintln!("start-stats shifted {}", self.variables.scale_stats());
+                }
                 // a failed or degenerate KKT initializer is not a valid
-                // starting point; fall back to the unit interior point
+                // starting point; fall back to the unit interior point, at
+                // the data's scale unless the caller chose τ₀
                 if !ok {
                     self.variables.unit_initialization(&self.cones);
+                    let core = self.settings.core();
+                    if self.start_tau.is_none()
+                        && core.auto_initial_tau
+                        && core.initial_tau == T::one()
+                    {
+                        self.start_tau = self.data.unit_start_tau().filter(|&t| t < T::one());
+                    }
                 }
             } else {
                 // Assigns unit (z,s) and zeros the primal variables

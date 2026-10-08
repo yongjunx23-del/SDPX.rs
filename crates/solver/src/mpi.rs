@@ -77,6 +77,11 @@ pub(crate) fn assert_agree(value: u32, message: &str) {
     }
 }
 
+/// Maximum of `v` over all ranks (`v` itself in serial runs).
+pub(crate) fn max_all_f64(v: f64) -> f64 {
+    World::get().map_or(v, |world| world.allreduce_max_f64(v))
+}
+
 /// True on rank zero and in serial runs.
 pub(crate) fn is_root() -> bool {
     World::get().is_none_or(|world| world.rank() == 0)

@@ -62,6 +62,12 @@ pub struct DefaultSettings<T: FloatT> {
     ///−14%/−10%/−4%/−6% time, same points (2026-10-09 journal).
     #[builder(default = "true")]
     pub fixed_tau_phase: bool,
+    ///when the KKT initial point is rejected and the unit start is used, and
+    ///`initial_tau` is left at 1, start from τ₀ = min(1, 1/max d) with d
+    ///the column equilibration scales. The unit start carries no scale of
+    ///its own; the accepted KKT start (ising11, binary64 SDPs) is unchanged.
+    #[builder(default = "true")]
+    pub auto_initial_tau: bool,
 
     ///neighborhood bound on the homogeneous pair: a step is shortened until
     ///τκ ≥ β·μ at the new point (MOSEK's homogeneous model and Hypatia keep
