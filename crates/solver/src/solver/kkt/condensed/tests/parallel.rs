@@ -109,18 +109,38 @@ fn data<T: FloatT>(cones: &CompositeCone<T>) -> (CscMatrix<T>, CscMatrix<T>, Vec
 
 #[test]
 fn assembly_buffer_budget_bounds_extra_storage() {
-    // Original rule: inside two copies of the stored Schur values.
-    assert!(parallel_assembly_allowed::<f64>(true, 100, 100));
-    // Overlapping cliques fit the byte budget until it is exceeded.
-    let budget_cells = (parallel_assembly_budget_bytes() / std::mem::size_of::<f64>()) as u128;
-    assert!(parallel_assembly_allowed::<f64>(true, budget_cells, 10));
-    assert!(!parallel_assembly_allowed::<f64>(
-        true,
-        budget_cells + 1,
-        10
-    ));
+    assert!(parallel_assembly_allowed(true, 100, 100));
+    assert!(!parallel_assembly_allowed(true, 101, 100));
+    let budget = parallel_assembly_budget_bytes();
+    assert!(parallel_assembly_allowed(true, budget as u128, budget));
+    assert!(!parallel_assembly_allowed(true, budget as u128 + 1, budget));
     // Without a cone pool the allocation-free serial path is kept.
-    assert!(!parallel_assembly_allowed::<f64>(false, 1, 1));
+    assert!(!parallel_assembly_allowed(false, 1, 1));
+
+    // Several in-process owners must share one allowance, including their
+    // retained column publication indices. The third owner stays serial.
+    let kinds = vec![SupportedConeT::PSDTriangleConeT(2)];
+    let mut cones = CompositeCone::<f64>::new_local(&kinds);
+    cones.configure_threads(2).unwrap();
+    let a = CscMatrix::from(&[[1., 0.], [0., 1.], [1., 1.]]);
+    let p = CscMatrix::zeros((2, 2));
+    let settings = CoreSettings::<f64>::default();
+    let mut budget = 2 * (3 * std::mem::size_of::<f64>() + 2 * std::mem::size_of::<u32>());
+    let mut owners = Vec::new();
+    for owner in 0..3 {
+        let mut kernel =
+            CondensedKKTSolver::new_local_partition(&p, &a, &kinds, &cones, &settings, false);
+        assert!(!kernel.blocks.iter().any(|b| matches!(&b.scaling,
+            Scaling::Psd(p) if !p.schur_values.is_empty())));
+        kernel.prepare_shared_pool(&mut budget);
+        let reserved = kernel.blocks.iter().any(|b| {
+            matches!(&b.scaling,
+            Scaling::Psd(p) if !p.schur_values.is_empty())
+        });
+        assert_eq!(reserved, owner < 2);
+        owners.push(kernel);
+    }
+    assert_eq!(budget, 0);
 }
 
 fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
@@ -161,11 +181,9 @@ fn pooled_equivalence<T: FloatT>(overlap_fallback: bool) {
             .sum::<usize>()
     };
     assert_eq!(buffer_cells(&serial), 0);
-    // Buffers are bounded by whichever limit admitted them: the two-copy
-    // rule or the byte budget.
+    // Buffers are bounded by the rank's byte allowance.
     let budget_cells = (parallel_assembly_budget_bytes() / std::mem::size_of::<T>()) as u128;
-    let allowed = (2 * pooled.schur_nnz as u128).max(budget_cells);
-    assert!(buffer_cells(&pooled) as u128 <= allowed);
+    assert!(buffer_cells(&pooled) as u128 <= budget_cells);
     assert!(buffer_cells(&pooled) > 0);
     let saved_buffers = buffer_cells(&pooled);
     let probe: Vec<T> = (0..m)
@@ -1160,7 +1178,7 @@ fn external_ordinary<T: FloatT>(blocks: usize) {
     };
     let mut serial = CondensedKKTSolver::new(&p, &a, &kinds, &cones, &settings);
     let mut pooled = CondensedKKTSolver::new(&p, &a, &kinds, &cones, &settings);
-    pooled.prepare_shared_pool();
+    pooled.prepare_shared_pool(&mut parallel_assembly_budget_bytes());
     let storage: Vec<_> = pooled
         .blocks
         .iter()

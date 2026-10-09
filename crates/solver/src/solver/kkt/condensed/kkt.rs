@@ -42,10 +42,15 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                     p.dense_representatives = Vec::new();
                     p.dense_column_map = Vec::new();
                     p.dense_row_first = Vec::new();
+                    p.dense_row_offsets = Vec::new();
+                    p.dense_vectors = Vec::new();
+                    p.dense_acc = Vec::new();
+                    p.transform_lanes = Vec::new();
                     p.coefficient_support = Vec::new();
                     if fused {
                         p.mat3c = Matrix::zeros(p.Rinv.size());
                         p.Ginv = Matrix::zeros((0, 0));
+                        p.ginv_cache = ResidueCache::default();
                     }
                     p.sampled = Some(SampledPsd {
                         work: SampledSchurWorkspace::new(sampled_block),
@@ -60,6 +65,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         let mut work = SampledWorkspace::new(&operator);
         work.enable_basis_caches();
         self.sampled = Some((Arc::clone(&operator), work));
+        // Every product now uses the factor operator, including its linear rows.
+        self.a_panel = None;
         // With every PSD block sampled and only retained (zero-cone) rows
         // besides, products use the operator's factors and never read this
         // copy's values; keep its structure and release the values.
@@ -83,8 +90,12 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             );
         }
         // Sampled A updates are rejected; the reduced KKT owns these values.
-        self.retained_A.nzval = Vec::new();
-        self.prepare_shared_pool();
+        self.retained_A = CscMatrix::zeros(self.retained_A.size());
+        self.retained_positions = Vec::new();
+        // Owner kernels reserve together after installing all factors.
+        if !self.local_only {
+            self.prepare_shared_pool(&mut parallel_assembly_budget_bytes());
+        }
         self.refresh_parallel_plan();
     }
     fn update(&mut self, cones: &CompositeCone<T>, settings: &CoreSettings<T>) -> bool {

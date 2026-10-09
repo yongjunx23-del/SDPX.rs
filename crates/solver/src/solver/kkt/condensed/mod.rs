@@ -16,13 +16,23 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
-/// Minimum extra per-block contribution storage allowed for the ordered
-/// parallel assembly, in bytes. The publish is bitwise identical to the
-/// serial scatter because blocks are summed in cone order.
-const PARALLEL_ASSEMBLY_BUDGET_BYTES: usize = 256 << 20;
+/// Assembly allowance when the OS exposes no memory allocation.
+const PARALLEL_ASSEMBLY_FALLBACK_BYTES: usize = 256 << 20;
 
-/// Physical memory capped by an exposed cgroup allocation.
+/// The node allocation is shared by its local MPI ranks. Process resource
+/// limits apply to this rank alone, including finite limits below the fallback.
 fn effective_memory_bytes() -> Option<u64> {
+    let ranks = crate::mpi::World::get().map_or(1, |w| w.local_size()) as u64;
+    node_memory_bytes()
+        .map(|bytes| bytes / ranks)
+        .into_iter()
+        .chain(process_memory_limit_bytes())
+        .min()
+}
+
+/// Physical memory capped by an exposed cgroup allocation. An unlimited
+/// cgroup does not imply any scheduler request that the OS cannot enforce.
+fn node_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let info = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -45,9 +55,47 @@ fn effective_memory_bytes() -> Option<u64> {
     }
 }
 
+fn process_memory_limit_bytes() -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        #[repr(C)]
+        struct Rlimit {
+            soft: u64,
+            hard: u64,
+        }
+        extern "C" {
+            fn getrlimit(resource: i32, limit: *mut Rlimit) -> i32;
+        }
+        let address = if cfg!(target_os = "macos") { 5 } else { 9 };
+        let infinity = if cfg!(target_os = "macos") {
+            i64::MAX as u64
+        } else {
+            u64::MAX
+        };
+        let mut limit: Option<u64> = None;
+        for resource in [2, address] {
+            // RLIMIT_DATA, RLIMIT_AS on 64-bit Linux/macOS.
+            let mut value = Rlimit { soft: 0, hard: 0 };
+            if unsafe { getrlimit(resource, &mut value) } == 0 && value.soft < infinity {
+                limit = Some(limit.map_or(value.soft, |old| old.min(value.soft)));
+            }
+        }
+        limit
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn cgroup_memory_limit_bytes() -> Option<u64> {
     use std::path::Path;
+    extern "C" {
+        fn getpagesize() -> i32;
+    }
+    let page = unsafe { getpagesize() } as u64;
+    let unlimited = (i64::MAX as u64 / page) * page;
     let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
     let decode = |s: &str| {
@@ -92,6 +140,7 @@ fn cgroup_memory_limit_bytes() -> Option<u64> {
                 if let Some(bytes) = std::fs::read_to_string(path.join(file))
                     .ok()
                     .and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|&bytes| bytes < unlimited)
                 {
                     limit = Some(limit.map_or(bytes, |old| old.min(bytes)));
                 }
@@ -104,26 +153,38 @@ fn cgroup_memory_limit_bytes() -> Option<u64> {
     limit
 }
 
-/// Assembly buffer budget: one eighth of effective memory, never below the
-/// fixed floor. Cached after the first query.
+/// Assembly buffer allowance: one eighth of this rank's effective memory.
+/// Cached after the first query; finite limits always override the fallback.
 pub(crate) fn parallel_assembly_budget_bytes() -> usize {
     static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
-        let share = effective_memory_bytes().map_or(0, |b| (b / 8).min(usize::MAX as u64) as usize);
-        share.max(PARALLEL_ASSEMBLY_BUDGET_BYTES)
+        effective_memory_bytes().map_or(PARALLEL_ASSEMBLY_FALLBACK_BYTES, |b| {
+            (b / 8).min(usize::MAX as u64) as usize
+        })
     })
 }
 
-/// Use per-block assembly buffers when a cone pool exists and the extra
-/// storage is bounded either by the original two-copy rule or by the byte
-/// budget.
-pub(crate) fn parallel_assembly_allowed<T: FloatT>(
+/// Per-block contributions must fit the available byte allowance.
+pub(crate) fn parallel_assembly_allowed(
     pool_present: bool,
-    contribution_cells: u128,
-    schur_stored: u128,
+    contribution_bytes: u128,
+    budget_bytes: usize,
 ) -> bool {
-    let budget_cells = (parallel_assembly_budget_bytes() / std::mem::size_of::<T>()).max(1) as u128;
-    pool_present && (contribution_cells <= 2 * schur_stored || contribution_cells <= budget_cells)
+    pool_present && contribution_bytes <= budget_bytes as u128
+}
+
+/// Packed values plus one u32 publication-column index per participating column.
+fn assembly_buffer_bytes<T: FloatT>(blocks: &[Block<T>]) -> u128 {
+    blocks
+        .iter()
+        .map(|block| match &block.scaling {
+            Scaling::Psd(p) => {
+                triangular_number(p.columns.len()) as u128 * std::mem::size_of::<T>() as u128
+                    + p.columns.len() as u128 * std::mem::size_of::<u32>() as u128
+            }
+            _ => 0,
+        })
+        .sum()
 }
 
 /// Per-iteration flop estimates for a PSD formulation, from block sizes and
@@ -1240,22 +1301,13 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         // Retain structural zeros: numerical updates never alter this plan.
         let schur = CscMatrix::new(n, n, colptr, rowval, vec![T::zero(); count]);
         let pool = cones.thread_pool();
-        let contribution_cells: u128 = blocks
-            .iter()
-            .map(|block| match &block.scaling {
-                Scaling::Psd(p) => triangular_number(p.columns.len()) as u128,
-                _ => 0,
-            })
-            .sum();
-        // Extra per-block contribution storage. The buffers let independent
-        // cones assemble on the pool while the publish stays in cone order
-        // (bitwise identical to the serial scatter), so they are used when
-        // they fit either the original two-copy rule or the byte budget.
-        // Overlapping cliques on few dense blocks previously always took the
-        // allocation-free serial path; the budget lets those multi-cone models
-        // reach the cone pool without unbounded scratch.
-        let parallel_assembly =
-            parallel_assembly_allowed::<T>(pool.is_some(), contribution_cells, count as u128);
+        // Independent cones keep their publish order, with contribution
+        // storage bounded by this process's share of the node allocation.
+        let parallel_assembly = parallel_assembly_allowed(
+            pool.is_some() && !local_only,
+            assembly_buffer_bytes(&blocks),
+            parallel_assembly_budget_bytes(),
+        );
         assert!(
             count <= u32::MAX as usize,
             "Schur pattern exceeds u32 positions"
@@ -1406,25 +1458,19 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         }
     }
 
-    /// Setup-only reservation for later use of an external shared pool. The
-    /// same contribution allowance as construction applies. Existing
-    /// allocations survive pool removal.
-    pub(crate) fn prepare_shared_pool(&mut self) {
-        let cells: u128 = self
-            .blocks
-            .iter()
-            .map(|b| match &b.scaling {
-                Scaling::Psd(p) => triangular_number(p.columns.len()) as u128,
-                _ => 0,
-            })
-            .sum();
-        if parallel_assembly_allowed::<T>(true, cells, self.schur_nnz as u128) {
+    /// Setup-only reservation for later use of an external shared pool. All
+    /// owners consume one process allowance. Existing allocations survive
+    /// pool removal.
+    pub(crate) fn prepare_shared_pool(&mut self, budget: &mut usize) {
+        let bytes = assembly_buffer_bytes(&self.blocks);
+        if parallel_assembly_allowed(true, bytes, *budget) {
             for block in &mut self.blocks {
                 if let Scaling::Psd(p) = &mut block.scaling {
                     p.schur_values
                         .resize(triangular_number(p.columns.len()), T::zero());
                 }
             }
+            *budget -= bytes as usize;
         }
         self.plan_threads = 0;
     }

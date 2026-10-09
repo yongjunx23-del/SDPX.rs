@@ -331,6 +331,7 @@ impl<T: FloatT> OwnedKkt<T> {
             Some(p) if parts.len() > 1 => (p.current_num_threads() / parts.len()).max(1),
             _ => 0,
         };
+        let mut assembly_budget = crate::solver::kkt::parallel_assembly_budget_bytes();
         let locals: Vec<_> = parts
             .into_iter()
             .zip(owner_ids.iter().enumerate())
@@ -357,7 +358,7 @@ impl<T: FloatT> OwnedKkt<T> {
                     kernel.set_sampled_operator(Arc::clone(sampled));
                 }
                 if pool.is_some() {
-                    kernel.prepare_shared_pool();
+                    kernel.prepare_shared_pool(&mut assembly_budget);
                 }
                 let rows: Vec<_> = layout
                     .border_rows

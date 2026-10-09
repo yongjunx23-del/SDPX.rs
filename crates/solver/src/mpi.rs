@@ -25,6 +25,7 @@ use std::thread::ThreadId;
 type MpiComm = *mut c_void;
 type MpiDatatype = *mut c_void;
 type MpiOp = *mut c_void;
+type MpiInfo = *mut c_void;
 
 extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
@@ -124,6 +125,7 @@ struct Fns {
     comm_size: unsafe extern "C" fn(MpiComm, *mut c_int) -> c_int,
     comm_rank: unsafe extern "C" fn(MpiComm, *mut c_int) -> c_int,
     comm_dup: unsafe extern "C" fn(MpiComm, *mut MpiComm) -> c_int,
+    comm_split_type: unsafe extern "C" fn(MpiComm, c_int, c_int, MpiInfo, *mut MpiComm) -> c_int,
     comm_free: unsafe extern "C" fn(*mut MpiComm) -> c_int,
     allgatherv: unsafe extern "C" fn(
         *const c_void,
@@ -158,6 +160,8 @@ struct Fns {
     byte: MpiDatatype,
     double: MpiDatatype,
     max: MpiOp,
+    info_null: MpiInfo,
+    shared_type: c_int,
 }
 
 // OpenMPI handles are pointers to exported objects. Do not guess integer
@@ -169,21 +173,23 @@ unsafe fn resolve_handle(lib: *mut c_void, variable: &str) -> Option<*mut c_void
     (!symbol.is_null()).then_some(symbol)
 }
 
-/// `MPI_COMM_WORLD`, `MPI_BYTE`, `MPI_DOUBLE`, `MPI_MAX` for the library's
+/// `MPI_COMM_WORLD`, `MPI_BYTE`, `MPI_DOUBLE`, `MPI_MAX`, `MPI_INFO_NULL` and
+/// `MPI_COMM_TYPE_SHARED` for the library's
 /// handle ABI. OpenMPI exports handles as global objects. The MPICH ABI
 /// (MPICH, Intel MPI, MVAPICH) uses fixed integer handles, carried here in the
 /// pointer-sized slot: x86_64 and AArch64 pass `int` arguments in the low half
 /// of a register, and handle outputs land in zero-initialized slots.
-unsafe fn handle_abi(lib: *mut c_void) -> Option<[*mut c_void; 4]> {
+unsafe fn handle_abi(lib: *mut c_void) -> Option<([*mut c_void; 5], c_int)> {
     let ompi = [
         "ompi_mpi_comm_world",
         "ompi_mpi_byte",
         "ompi_mpi_double",
         "ompi_mpi_op_max",
+        "ompi_mpi_info_null",
     ]
     .map(|name| unsafe { resolve_handle(lib, name) });
-    if let [Some(comm), Some(byte), Some(double), Some(max)] = ompi {
-        return Some([comm, byte, double, max]);
+    if let [Some(comm), Some(byte), Some(double), Some(max), Some(info)] = ompi {
+        return Some(([comm, byte, double, max, info], 0));
     }
     // MPI_Get_library_version may be called before MPI_Init.
     let version = unsafe { dlsym(lib, c"MPI_Get_library_version".as_ptr()) };
@@ -202,7 +208,17 @@ unsafe fn handle_abi(lib: *mut c_void) -> Option<[*mut c_void; 4]> {
         .iter()
         .any(|family| text.contains(family))
         .then(|| {
-            [0x4400_0000usize, 0x4c00_010d, 0x4c00_080b, 0x5800_0001].map(|h| h as *mut c_void)
+            (
+                [
+                    0x4400_0000usize,
+                    0x4c00_010d,
+                    0x4c00_080b,
+                    0x5800_0001,
+                    0x1c00_0000,
+                ]
+                .map(|h| h as *mut c_void),
+                1,
+            )
         })
 }
 
@@ -278,7 +294,7 @@ fn load() -> Option<Fns> {
                 }
                 continue;
             }
-            let Some(handles) = handle_abi(lib) else {
+            let Some((handles, shared_type)) = handle_abi(lib) else {
                 if debug {
                     eprintln!("mpi: {} has an unknown handle ABI", name.to_string_lossy());
                 }
@@ -294,6 +310,7 @@ fn load() -> Option<Fns> {
                 comm_size: sym!(lib, "MPI_Comm_size"),
                 comm_rank: sym!(lib, "MPI_Comm_rank"),
                 comm_dup: sym!(lib, "MPI_Comm_dup"),
+                comm_split_type: sym!(lib, "MPI_Comm_split_type"),
                 comm_free: sym!(lib, "MPI_Comm_free"),
                 allgatherv: sym!(lib, "MPI_Allgatherv"),
                 gatherv: sym!(lib, "MPI_Gatherv"),
@@ -302,6 +319,8 @@ fn load() -> Option<Fns> {
                 byte: handles[1],
                 double: handles[2],
                 max: handles[3],
+                info_null: handles[4],
+                shared_type,
             });
         }
     }
@@ -338,6 +357,7 @@ pub(crate) struct World {
     comms: &'static [MpiComm; NSITES],
     rank: i32,
     size: i32,
+    local_size: i32,
     owns_init: bool,
     init_thread: Option<ThreadId>,
     /// Thread which owns the solver/control-side collective sequence.
@@ -644,6 +664,42 @@ impl World {
             }
             return None;
         }
+        // A node's allocation is shared only by ranks on that node, not by
+        // the complete world. Query MPI's shared-memory communicator once.
+        let mut local = std::ptr::null_mut();
+        if unsafe {
+            (fns.comm_split_type)(
+                fns.comm_world,
+                fns.shared_type,
+                rank,
+                fns.info_null,
+                &mut local,
+            )
+        } != MPI_SUCCESS
+        {
+            return activation_failed_with_abort(
+                &fns,
+                fns.comm_world,
+                advertised,
+                requested,
+                "MPI_Comm_split_type returned an error",
+            );
+        }
+        let mut local_size = 0;
+        let rc = unsafe { (fns.comm_size)(local, &mut local_size) };
+        let freed = unsafe { (fns.comm_free)(&mut local) };
+        if rc != MPI_SUCCESS || freed != MPI_SUCCESS || !(1..=size).contains(&local_size) {
+            return activation_failed_with_abort(
+                &fns,
+                fns.comm_world,
+                advertised,
+                requested,
+                "MPI returned an invalid node-local size",
+            );
+        }
+        if debug {
+            eprintln!("mpi: local_size={local_size}");
+        }
         let comms: &'static mut [MpiComm; NSITES] =
             Box::leak(Box::new([std::ptr::null_mut(); NSITES]));
         for c in comms.iter_mut() {
@@ -662,6 +718,7 @@ impl World {
             comms,
             rank,
             size,
+            local_size,
             owns_init,
             init_thread: owns_init.then(|| std::thread::current().id()),
             collective_thread: std::thread::current().id(),
@@ -687,6 +744,10 @@ impl World {
 
     pub(crate) fn rank(&self) -> usize {
         self.rank as usize
+    }
+
+    pub(crate) fn local_size(&self) -> usize {
+        self.local_size as usize
     }
 
     fn shutdown_owned_inner(&self, source: &str) {
