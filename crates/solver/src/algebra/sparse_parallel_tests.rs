@@ -403,3 +403,138 @@ fn row_gather_mpfr256() {
 fn row_gather_mpfr512() {
     row_gather_parity::<sdpx_arithmetic::Bits512>();
 }
+
+// Few dense rows among many empty ones (the sampled operator's linear part):
+// the active-row forward product must reproduce the full product bitwise,
+// including empty rows holding signed zeros and non-finite values, in both
+// the exact wide branch (nnz >= 4m) and the rounded chain.
+fn active_row_forward_parity<T: FloatT>(m: usize) {
+    let (active, n) = (40, 200);
+    let rows: Vec<usize> = (0..active).map(|k| (k * 37 + 5) % m).collect();
+    let mut sorted = rows.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), active);
+    let mut colptr = vec![0];
+    let (mut rowval, mut nzval) = (Vec::new(), Vec::new());
+    for j in 0..n {
+        for &i in &sorted {
+            rowval.push(i);
+            let v = num::<T>(i * 13 + j * 7 + 1) / num::<T>(j % 9 + 3);
+            nzval.push(if (i + j) % 5 == 0 { -v } else { v });
+        }
+        colptr.push(rowval.len());
+    }
+    let a = CscMatrix::new(m, n, colptr, rowval, nzval);
+    let mut plan = SparseParallel::new(&a);
+    assert_eq!(plan.active, sorted);
+    let mut cones = CompositeCone::<T>::new(&[NonnegativeConeT(32768)]);
+    let x: Vec<T> = (0..n)
+        .map(|j| num::<T>(j + 2) / num::<T>(11) * if j % 3 == 0 { -T::one() } else { T::one() })
+        .collect();
+    for threads in [2, 4, 8] {
+        cones.configure_threads(threads).unwrap();
+        plan.configure(&a, cones.thread_pool());
+        assert!(plan.active_lanes.len() > 1);
+        for alpha in [T::one(), -T::one(), num::<T>(3) / num::<T>(7), T::zero()] {
+            let mut serial: Vec<T> = (0..m)
+                .map(|i| match i % 6 {
+                    0 => T::zero(),
+                    1 => -T::zero(),
+                    2 if i % 12 == 2 => T::nan(),
+                    3 if i % 18 == 3 => T::infinity(),
+                    _ => num::<T>(i + 1) / num::<T>(3),
+                })
+                .collect();
+            let mut pooled = serial.clone();
+            a.gemv(&mut serial, &x, alpha, T::one());
+            plan.pool
+                .as_ref()
+                .unwrap()
+                .install(|| plan.apply_in_pool(&a, false, &mut pooled, &x, alpha, T::one()));
+            same(&serial, &pooled);
+        }
+    }
+}
+#[test]
+fn active_row_forward_exact_mpfr256() {
+    // nnz = 8000 >= 4m: the exact wide branch.
+    active_row_forward_parity::<sdpx_arithmetic::Bits256>(1500);
+}
+#[test]
+fn active_row_forward_rounded_mpfr256() {
+    // nnz = 8000 < 4m: the rounded chain.
+    active_row_forward_parity::<sdpx_arithmetic::Bits256>(3000);
+}
+
+// The fused prepare's adjoint of a vector that is zero on every row holding
+// entries: the short path must match the full product bitwise, including
+// outputs holding signed zeros and non-finite values, mixed-sign zero inputs,
+// non-finite inputs on rows without entries, and short columns (< 4 entries,
+// the rounded chain) next to long ones (the exact branch).
+fn adjoint_of_zero_parity<T: FloatT>() {
+    let (m, n) = (900, 300);
+    let rows: Vec<usize> = (0..30).map(|k| k * 29 + 3).collect();
+    let mut colptr = vec![0];
+    let (mut rowval, mut nzval) = (Vec::new(), Vec::new());
+    for j in 0..n {
+        let take = if j % 10 == 0 { 2 } else { rows.len() };
+        for &i in &rows[..take] {
+            rowval.push(i);
+            let v = num::<T>(i * 13 + j * 7 + 1) / num::<T>(j % 9 + 3);
+            nzval.push(match (i + j) % 7 {
+                0 => -v,
+                1 => -T::zero(),
+                _ => v,
+            });
+        }
+        colptr.push(rowval.len());
+    }
+    let a = CscMatrix::new(m, n, colptr, rowval, nzval);
+    let mut plan = SparseParallel::new(&a);
+    let mut cones = CompositeCone::<T>::new(&[NonnegativeConeT(32768)]);
+    let x: Vec<T> = (0..m)
+        .map(|r| match r % 4 {
+            _ if rows.contains(&r) => {
+                if r % 2 == 0 {
+                    T::zero()
+                } else {
+                    -T::zero()
+                }
+            }
+            0 => T::nan(),
+            1 => T::infinity(),
+            _ => num::<T>(r + 1),
+        })
+        .collect();
+    for threads in [2, 4] {
+        cones.configure_threads(threads).unwrap();
+        plan.configure(&a, cones.thread_pool());
+        for alpha in [T::one(), -T::one(), num::<T>(3) / num::<T>(7), T::zero()] {
+            let mut serial: Vec<T> = (0..n)
+                .map(|j| match j % 5 {
+                    0 => T::zero(),
+                    1 => -T::zero(),
+                    2 if j % 15 == 2 => T::nan(),
+                    3 if j % 20 == 3 => -T::infinity(),
+                    _ => num::<T>(j + 1) / num::<T>(3),
+                })
+                .collect();
+            let mut pooled = serial.clone();
+            a.t().gemv(&mut serial, &x, alpha, T::one());
+            plan.pool
+                .as_ref()
+                .unwrap()
+                .install(|| plan.apply_in_pool(&a, true, &mut pooled, &x, alpha, T::one()));
+            same(&serial, &pooled);
+        }
+    }
+}
+#[test]
+fn adjoint_of_zero_mpfr256() {
+    adjoint_of_zero_parity::<sdpx_arithmetic::Bits256>();
+}
+#[test]
+fn adjoint_of_zero_f64() {
+    adjoint_of_zero_parity::<f64>();
+}
