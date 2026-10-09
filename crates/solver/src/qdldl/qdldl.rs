@@ -89,9 +89,10 @@ pub struct QDLDLFactorisation<T = f64> {
     is_symbolic: bool,
     /// shared solver thread pool for elimination-tree parallelism
     pool: Option<Arc<rayon::ThreadPool>>,
-    /// elimination-tree schedule for parallel factorisation/solve,
-    /// `None` when the symbolic pattern does not admit the scheme
-    plan: Option<ParallelPlan<T>>,
+    /// elimination-tree schedule for parallel factorisation/solve, built
+    /// when a pool is first attached (its scratch is O(groups × n));
+    /// `Some(None)` when the symbolic pattern does not admit the scheme
+    plan: Option<Option<ParallelPlan<T>>>,
 }
 
 impl<T> QDLDLFactorisation<T>
@@ -122,6 +123,31 @@ where
     /// Elimination-tree parallelism is only used when the symbolic pattern
     /// admits it; the serial kernels run otherwise.
     pub fn set_pool(&mut self, pool: Option<Arc<rayon::ThreadPool>>) {
+        if pool.is_some() && self.plan.is_none() {
+            let ws = &self.workspace;
+            let n = self.D.len();
+            let plan = ParallelPlan::build(n, &ws.etree, &ws.Lnz, &self.L.colptr, &self.L.rowval);
+            if crate::receipt::profile_requested() {
+                static DUMPED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    match &plan {
+                        Some(p) => {
+                            let (g, t) = p.shape();
+                            eprintln!(
+                                "QDLDLSTRUCT n={} nnzA={} groups={} trunk={}",
+                                n,
+                                ws.triuA.nnz(),
+                                g,
+                                t
+                            )
+                        }
+                        None => eprintln!("QDLDLSTRUCT n={} nnzA={} serial", n, ws.triuA.nnz()),
+                    }
+                }
+            }
+            self.plan = Some(plan);
+        }
         self.pool = pool;
     }
 
@@ -140,7 +166,7 @@ where
 
         //solve in place with tmp as permuted RHS
         match (self.plan.as_mut(), self.pool.as_ref()) {
-            (Some(plan), Some(pool)) if plan.parallelisable() => {
+            (Some(Some(plan)), Some(pool)) if plan.parallelisable() => {
                 plan.solve(
                     pool.as_ref(),
                     &self.L.colptr,
@@ -196,7 +222,7 @@ where
         // this function implies that we want a numerical factorization
         self.is_symbolic = false;
         match (self.plan.as_mut(), self.pool.as_ref()) {
-            (Some(plan), Some(pool)) if plan.parallelisable() => {
+            (Some(Some(plan)), Some(pool)) if plan.parallelisable() => {
                 let ws = &mut self.workspace;
                 let A = &ws.triuA;
                 let pos_d_count = plan.factor(
@@ -314,29 +340,6 @@ fn _qdldl_new<T: FloatT>(
     // factor the matrix into A = LDL^T
     _factor(&mut L, &mut D, &mut Dinv, &mut workspace, opts.logical)?;
 
-    // elimination-tree schedule for pool-based factorisation/solve; the
-    // serial kernels are used whenever this rejects the symbolic pattern
-    let plan = ParallelPlan::build(n, &workspace.etree, &workspace.Lnz, &L.colptr, &L.rowval);
-
-    if crate::receipt::profile_requested() {
-        static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            match &plan {
-                Some(p) => {
-                    let (g, t) = p.shape();
-                    eprintln!(
-                        "QDLDLSTRUCT n={} nnzA={} groups={} trunk={}",
-                        n,
-                        Ain.nnz(),
-                        g,
-                        t
-                    )
-                }
-                None => eprintln!("QDLDLSTRUCT n={} nnzA={} serial", n, Ain.nnz()),
-            }
-        }
-    }
-
     Ok(QDLDLFactorisation {
         perm,
         L,
@@ -345,7 +348,7 @@ fn _qdldl_new<T: FloatT>(
         workspace,
         is_symbolic: opts.logical,
         pool: None,
-        plan,
+        plan: None,
     })
 }
 

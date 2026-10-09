@@ -8,10 +8,11 @@ pub mod qdldl;
 #[cfg(feature = "faer-sparse")]
 pub mod faer_ldl;
 
+/// AMD permutation, its inverse and the symbolic statistics of one KKT pattern.
+pub(crate) type AmdOrdering = (Vec<usize>, Vec<usize>, amd::Info);
+
 #[cfg(feature = "faer-sparse")]
-pub(crate) fn amd_order<T>(
-    KKT: &crate::algebra::CscMatrix<T>,
-) -> (Vec<usize>, Vec<usize>, amd::Info)
+pub(crate) fn amd_order<T>(KKT: &crate::algebra::CscMatrix<T>) -> AmdOrdering
 where
     T: crate::algebra::FloatT,
 {

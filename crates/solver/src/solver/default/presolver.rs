@@ -674,8 +674,7 @@ fn short_equalities_full_rank<T: FloatT>(
     lookup: &[usize],
     work: usize,
 ) -> bool {
-    const P: u64 = (1 << 31) - 1;
-    // The dense basis takes m² words (8 MiB at the limit); larger systems use
+    // The dense basis takes m² words (4 MiB at the limit); larger systems use
     // the sparse modular elimination below.
     let m = ids.len();
     if m == 0 || m > 1024 || a.n < m {
@@ -694,8 +693,11 @@ fn short_equalities_full_rank<T: FloatT>(
     while gcd(stride, a.n) != 1 {
         stride += 1;
     }
-    let mut basis: Vec<Option<Vec<u64>>> = vec![None; m];
-    let mut column = vec![0u64; m];
+    // Echelon row `pivot` lives at basis[pivot * m..][pivot..]; its earlier
+    // entries are zero and never read.
+    let mut basis = vec![0u32; m * m];
+    let mut have = vec![false; m];
+    let mut column = vec![0u32; m];
     let mut rank = 0;
     for step in 0..=a.n {
         let c = if step == a.n {
@@ -709,7 +711,7 @@ fn short_equalities_full_rank<T: FloatT>(
                 let Some(value) = b[r].mersenne31() else {
                     return false;
                 };
-                column[i] = u64::from(value);
+                column[i] = value;
             }
         } else {
             for k in a.colptr[c]..a.colptr[c + 1] {
@@ -718,7 +720,7 @@ fn short_equalities_full_rank<T: FloatT>(
                     let Some(value) = a.nzval[k].mersenne31() else {
                         return false;
                     };
-                    column[i] = u64::from(value);
+                    column[i] = value;
                 }
             }
         }
@@ -731,16 +733,18 @@ fn short_equalities_full_rank<T: FloatT>(
                 return false;
             };
             budget = rest;
-            if let Some(previous) = &basis[pivot] {
-                for i in pivot..m {
-                    column[i] = (column[i] + P - factor * previous[i] % P) % P;
+            let row = &mut basis[pivot * m + pivot..(pivot + 1) * m];
+            if have[pivot] {
+                for (value, &previous) in column[pivot..].iter_mut().zip(row.iter()) {
+                    *value = sub_mersenne31(*value, mul_mersenne31(factor, previous));
                 }
             } else {
-                let inverse = inverse_mersenne31(factor);
-                for value in &mut column[pivot..] {
-                    *value = *value * inverse % P;
+                let inverse = inverse_mersenne31(u64::from(factor)) as u32;
+                for (value, slot) in column[pivot..].iter_mut().zip(row.iter_mut()) {
+                    *value = mul_mersenne31(*value, inverse);
+                    *slot = *value;
                 }
-                basis[pivot] = Some(column.clone());
+                have[pivot] = true;
                 rank += 1;
                 break;
             }
@@ -750,6 +754,33 @@ fn short_equalities_full_rank<T: FloatT>(
         }
     }
     false
+}
+
+/// `a·b mod (2^31 - 1)` for canonical `a, b`: two folds of `2^31 ≡ 1`
+/// instead of a division (the dense minor's inner loop).
+#[inline(always)]
+fn mul_mersenne31(a: u32, b: u32) -> u32 {
+    const P: u64 = (1 << 31) - 1;
+    let t = u64::from(a) * u64::from(b);
+    let t = (t & P) + (t >> 31);
+    let t = ((t & P) + (t >> 31)) as u32;
+    if t >= P as u32 {
+        t - P as u32
+    } else {
+        t
+    }
+}
+
+/// `a - b mod (2^31 - 1)` for canonical `a, b`.
+#[inline(always)]
+fn sub_mersenne31(a: u32, b: u32) -> u32 {
+    const P: u32 = (1 << 31) - 1;
+    let d = a + P - b;
+    if d >= P {
+        d - P
+    } else {
+        d
+    }
 }
 
 fn gcd(mut a: usize, mut b: usize) -> usize {
