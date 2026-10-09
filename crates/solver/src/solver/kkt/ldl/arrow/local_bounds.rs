@@ -23,7 +23,6 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return None;
         }
         let n = a.n;
-        debug_assert!(k.n == n + a.m && k.m == k.n && signs.len() == k.n);
         let mut bound_rows = vec![false; a.m];
         let mut trunk = Vec::new();
         for (cone, rows) in cones.iter().zip(&cones.rng_cones) {
@@ -33,6 +32,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 _ => return None,
             }
         }
+        debug_assert!(k.n == n + a.m && k.m == k.n && signs.len() == k.n);
         // Every nonnegative row must be a bound on exactly one variable.
         let mut seen = vec![false; a.m];
         let mut groups = Vec::new();

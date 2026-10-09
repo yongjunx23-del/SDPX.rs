@@ -11,7 +11,6 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         settings: &CoreSettings<T>,
     ) -> Option<Self> {
         let n = a.n;
-        debug_assert_eq!(k.n, n + a.m);
         let mut row_owner = vec![usize::MAX; a.m];
         let mut groups = Vec::new();
         let mut trunk = Vec::new();
@@ -25,6 +24,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 _ => return None,
             }
         }
+        debug_assert_eq!(k.n, n + a.m);
         if groups.len() < 8 {
             return None;
         }

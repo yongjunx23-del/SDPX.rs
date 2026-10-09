@@ -21,14 +21,15 @@ use std::sync::Arc;
 /// serial scatter because blocks are summed in cone order.
 const PARALLEL_ASSEMBLY_BUDGET_BYTES: usize = 256 << 20;
 
-/// Physical memory in bytes, when the platform reports it.
-fn physical_memory_bytes() -> Option<u64> {
+/// Physical memory capped by an exposed cgroup allocation.
+fn effective_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let info = std::fs::read_to_string("/proc/meminfo").ok()?;
         let line = info.lines().find(|l| l.starts_with("MemTotal:"))?;
         let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-        Some(kib.saturating_mul(1024))
+        let physical = kib.saturating_mul(1024);
+        Some(cgroup_memory_limit_bytes().map_or(physical, |limit| physical.min(limit)))
     }
     #[cfg(target_os = "macos")]
     {
@@ -44,12 +45,71 @@ fn physical_memory_bytes() -> Option<u64> {
     }
 }
 
-/// Assembly buffer budget: one eighth of physical memory, never below the
+#[cfg(target_os = "linux")]
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    use std::path::Path;
+    let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let decode = |s: &str| {
+        s.replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+    };
+    let mut limit: Option<u64> = None;
+    for group in groups.lines() {
+        let mut fields = group.splitn(3, ':');
+        fields.next();
+        let (controllers, group) = (fields.next()?, fields.next()?);
+        let (kind, file) = if controllers.is_empty() {
+            ("cgroup2", "memory.max")
+        } else if controllers.split(',').any(|c| c == "memory") {
+            ("cgroup", "memory.limit_in_bytes")
+        } else {
+            continue;
+        };
+        for mount in mounts.lines() {
+            let Some((fields, options)) = mount.split_once(" - ") else {
+                continue;
+            };
+            let mut options = options.split_whitespace();
+            if options.next() != Some(kind) {
+                continue;
+            }
+            options.next();
+            if kind == "cgroup" && !options.next()?.split(',').any(|c| c == "memory") {
+                continue;
+            }
+            let mut fields = fields.split_whitespace();
+            let root = decode(fields.nth(3)?);
+            let mount = decode(fields.next()?);
+            let Ok(relative) = Path::new(group).strip_prefix(&root) else {
+                continue;
+            };
+            let mount = Path::new(&mount);
+            let mut path = mount.join(relative);
+            loop {
+                if let Some(bytes) = std::fs::read_to_string(path.join(file))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                {
+                    limit = Some(limit.map_or(bytes, |old| old.min(bytes)));
+                }
+                if path == mount || !path.pop() {
+                    break;
+                }
+            }
+        }
+    }
+    limit
+}
+
+/// Assembly buffer budget: one eighth of effective memory, never below the
 /// fixed floor. Cached after the first query.
 pub(crate) fn parallel_assembly_budget_bytes() -> usize {
     static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
-        let share = physical_memory_bytes().map_or(0, |b| (b / 8).min(usize::MAX as u64) as usize);
+        let share = effective_memory_bytes().map_or(0, |b| (b / 8).min(usize::MAX as u64) as usize);
         share.max(PARALLEL_ASSEMBLY_BUDGET_BYTES)
     })
 }
@@ -1343,8 +1403,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     }
 
     /// Setup-only reservation for later use of an external shared pool. The
-    /// same contribution cap as construction applies; overlapping cliques
-    /// retain serial assembly. Existing allocations survive pool removal.
+    /// same contribution allowance as construction applies. Existing
+    /// allocations survive pool removal.
     pub(crate) fn prepare_shared_pool(&mut self) {
         let cells: u128 = self
             .blocks
@@ -1354,7 +1414,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 _ => 0,
             })
             .sum();
-        if cells <= 2 * self.schur_nnz as u128 {
+        if parallel_assembly_allowed::<T>(true, cells, self.schur_nnz as u128) {
             for block in &mut self.blocks {
                 if let Scaling::Psd(p) = &mut block.scaling {
                     p.schur_values

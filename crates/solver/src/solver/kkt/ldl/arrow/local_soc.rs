@@ -17,7 +17,6 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         settings: &CoreSettings<T>,
     ) -> Option<Self> {
         let n = a.n;
-        debug_assert!(k.n == n + a.m && k.m == k.n && signs.len() == k.n);
         let mut row_owner = vec![usize::MAX; a.m];
         let mut groups = Vec::new();
         let mut trunk = Vec::new();
@@ -31,6 +30,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 _ => return None,
             }
         }
+        debug_assert!(k.n == n + a.m && k.m == k.n && signs.len() == k.n);
         // Tiny problems stay on QDLDL.
         if groups.len() < 8 || trunk.is_empty() {
             return None;
