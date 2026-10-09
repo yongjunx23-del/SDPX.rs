@@ -344,6 +344,8 @@ struct PsdBlock<T> {
     mat3c: Matrix<T>,
     columns: Vec<Column>,
     schur_values: Vec<T>,
+    // Local columns in destination CSC order; built only for pooled publish.
+    schur_columns: Vec<u32>,
     sampled: Option<SampledPsd<T>>,
     sparse_column_lanes: Vec<usize>,
     dense_indices: Vec<usize>,
@@ -1529,8 +1531,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     }
 
     fn assemble(&mut self) -> bool {
-        // Each PSD block owns its contribution buffer. Publish in cone order
-        // after joining, preserving the serial sum even for overlapping cliques.
+        // Each PSD block owns its contribution buffer. After joining, each
+        // destination column publishes the blocks in their original cone order.
         if self.parallel_assembly {
             let inner_schur = self.inner_schur;
             let inner_sampled = self.inner_sampled;
@@ -1542,6 +1544,12 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             self.pool.as_ref().unwrap().install(|| {
                 let compute = |block: &mut Block<T>| {
                     if let Scaling::Psd(psd) = &mut block.scaling {
+                        if psd.schur_columns.is_empty() {
+                            psd.schur_columns.extend(0..psd.columns.len() as u32);
+                            let columns = &psd.columns;
+                            psd.schur_columns
+                                .sort_unstable_by_key(|&c| columns[c as usize].index);
+                        }
                         let mut output = std::mem::take(&mut psd.schur_values);
                         if inner_sampled == Some(block.rows.start) {
                             if let Some(sampled) = &psd.sampled {
@@ -1619,18 +1627,58 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 }
             }
         }
-        for block in &mut self.blocks {
-            match &mut block.scaling {
-                Scaling::Psd(psd) => {
-                    if self.parallel_assembly {
-                        psd.scatter_schur(schur);
-                    } else {
-                        psd.compute_schur(&self.A.nzval, |_, _, position, v| {
-                            schur.nzval[position] += v;
-                        });
+        if self.parallel_assembly {
+            match pool
+                .as_deref()
+                .filter(|_| self.scaling_workers > 1 && self.n > 1)
+            {
+                Some(pool) => {
+                    // Split at whole CSC columns, balancing stored entries.
+                    // Each slice has one writer; no per-pair map is duplicated.
+                    let colptr = &schur.colptr[..=self.n];
+                    let cells = self.schur_nnz.div_ceil(self.scaling_workers.min(self.n));
+                    let mut values = &mut schur.nzval[..self.schur_nnz];
+                    let mut chunks = Vec::with_capacity(self.scaling_workers);
+                    let mut start = 0;
+                    while start < self.n {
+                        let offset = colptr[start];
+                        let end = colptr
+                            .partition_point(|&p| p < offset + cells)
+                            .max(start + 1)
+                            .min(self.n);
+                        let (chunk, rest) = values.split_at_mut(colptr[end] - offset);
+                        chunks.push((start..end, offset, chunk));
+                        values = rest;
+                        start = end;
+                    }
+                    let blocks = &self.blocks;
+                    pool.install(|| {
+                        chunks
+                            .into_par_iter()
+                            .for_each(|(columns, offset, values)| {
+                                for block in blocks {
+                                    if let Scaling::Psd(psd) = &block.scaling {
+                                        psd.scatter_schur_columns(values, offset, columns.clone());
+                                    }
+                                }
+                            });
+                    });
+                }
+                None => {
+                    for block in &self.blocks {
+                        if let Scaling::Psd(psd) = &block.scaling {
+                            psd.scatter_schur(schur);
+                        }
                     }
                 }
-                _ => {}
+            }
+        } else {
+            for block in &mut self.blocks {
+                if let Scaling::Psd(psd) = &mut block.scaling {
+                    psd.compute_schur(&self.A.nzval, |_, _, position, v| {
+                        schur.nzval[position] += v;
+                    });
+                }
             }
         }
         // Orthant and eliminated SOC rows form one Gram BᵀB.

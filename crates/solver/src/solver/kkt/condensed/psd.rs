@@ -927,6 +927,7 @@ impl<T: FloatT> PsdBlock<T> {
             mat3c: Matrix::zeros((0, 0)),
             columns,
             schur_values: Vec::new(),
+            schur_columns: Vec::new(),
             sampled: None,
             sparse_column_lanes: Vec::new(),
             dense_indices,
@@ -1465,6 +1466,31 @@ impl<T: FloatT> PsdBlock<T> {
             for (a, left) in self.columns[..=b].iter().enumerate() {
                 S.nzval[column.schur_position(left, a)] +=
                     self.schur_values[triangular_number(b) + a];
+            }
+        }
+    }
+
+    /// Publish one disjoint range of destination CSC columns. Packed pairs
+    /// retain their coefficient-order addresses even when that order differs
+    /// from CSC order; each destination gets exactly one value from this block.
+    pub(super) fn scatter_schur_columns(
+        &self,
+        values: &mut [T],
+        offset: usize,
+        columns: Range<usize>,
+    ) {
+        let first = self
+            .schur_columns
+            .partition_point(|&c| self.columns[c as usize].index < columns.start);
+        let end = self
+            .schur_columns
+            .partition_point(|&c| self.columns[c as usize].index < columns.end);
+        for t in first..end {
+            let c = self.schur_columns[t] as usize;
+            for &m in &self.schur_columns[..=t] {
+                let (b, a) = (c.max(m as usize), c.min(m as usize));
+                let position = self.columns[b].schur_position(&self.columns[a], a);
+                values[position - offset] += self.schur_values[triangular_number(b) + a];
             }
         }
     }
