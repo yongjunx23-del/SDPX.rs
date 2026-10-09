@@ -535,11 +535,7 @@ impl<T: FloatT> OwnedKkt<T> {
         self.shift = if settings.static_regularization_enable {
             let base = settings.static_regularization_constant
                 + settings.static_regularization_proportional * diagonal;
-            if self.reg_boost == 0 {
-                base
-            } else {
-                base * T::from_f64(100f64.powi(self.reg_boost as i32)).unwrap()
-            }
+            crate::solver::kkt::direct::_escalated(base, self.reg_boost)
         } else {
             T::zero()
         };

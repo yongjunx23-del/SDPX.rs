@@ -475,11 +475,7 @@ where
                         *d = KKT.nzval[*idx];
                     }
 
-                    let mut eps = _compute_regularizer(diag_kkt, settings);
-                    if self.reg_boost > 0 {
-                        eps = eps * 100f64.powi(self.reg_boost as i32).as_T();
-                    }
-                    eps
+                    _escalated(_compute_regularizer(diag_kkt, settings), self.reg_boost)
                 }
             };
 
@@ -1092,6 +1088,21 @@ where
         }
         norms
     }
+}
+
+/// Static shift at escalation level `boost`: ×100 per level. A zero base
+/// shift (the MPFR default) has no shift until a factorization fails; the
+/// first escalation then starts from `eps^(15/16)`.
+pub(crate) fn _escalated<T: FloatT>(base: T, boost: usize) -> T {
+    if boost == 0 {
+        return base;
+    }
+    let base = if base.is_zero() {
+        crate::solver::default::regularization_default::<T>(0.0)
+    } else {
+        base
+    };
+    base * 100f64.powi(boost as i32).as_T()
 }
 
 fn _compute_regularizer<T: FloatT>(diag_kkt: &[T], settings: &CoreSettings<T>) -> T {
