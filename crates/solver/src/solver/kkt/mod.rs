@@ -72,6 +72,12 @@ pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
         None
     }
 
+    /// Condensed solvers: the rows kept in the reduced system. The `z` of
+    /// every other row is recovered as `H⁻¹(A x − r_z)`.
+    fn retained_rows(&self) -> Option<&[usize]> {
+        None
+    }
+
     fn update_P(&mut self, P: &CscMatrix<T>);
     fn update_A(&mut self, A: &CscMatrix<T>);
 

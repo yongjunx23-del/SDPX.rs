@@ -294,6 +294,10 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         self.reduced.escalate_regularization()
     }
 
+    fn retained_rows(&self) -> Option<&[usize]> {
+        Some(&self.retained_rows)
+    }
+
     fn update_P(&mut self, P: &CscMatrix<T>) {
         self.scaled_valid.fill(false);
         // The solver built both patterns; only the values change.
@@ -344,6 +348,9 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 b,
                 error: &mut error,
                 candidate: &mut candidate,
+                continued: false,
+                basis: Vec::new(),
+                directions: Vec::new(),
             },
             settings,
         );
@@ -359,6 +366,11 @@ struct LocalRefinement<'a, T: FloatT> {
     b: &'a [T],
     error: &'a mut Vec<T>,
     candidate: &'a mut Vec<T>,
+    /// GMRES-IR continues a stalled stationary refinement; the forward
+    /// product of the raw solve no longer matches `x`.
+    continued: bool,
+    basis: Vec<Vec<T>>,
+    directions: Vec<Vec<T>>,
 }
 impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
     fn all_succeeded(&self, value: bool) -> bool {
@@ -375,7 +387,7 @@ impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
             self.error,
             self.b,
             if candidate { self.candidate } else { self.x },
-            reuse,
+            reuse && !self.continued,
         )
     }
     fn solve_correction(&mut self, settings: &CoreSettings<T>) -> bool {
@@ -393,9 +405,61 @@ impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
     }
     // Each correction here runs a complete refined reduced solve: GMRES-IR
     // at this level multiplied those solves (L35, 30 iterations: 180 -> 690 s)
-    // while stationary steps converge in about two, so only the reduced
-    // DirectLDL level runs GMRES-IR (the trait default keeps this level
-    // stationary).
+    // while stationary steps converge in about two, so above binary64 only
+    // the reduced DirectLDL level runs GMRES-IR. In binary64 a stalled
+    // stationary refinement continues with GMRES-IR here: late in the solve
+    // the static shift and the Schur rounding leave a few slowly contracting
+    // directions (SDP_gpp250-1: dual residual 1e-8 to 1e-7 from iteration 20
+    // with the constant column's x-row residual at 1e-5 of its right-hand
+    // side; GMRES-IR reaches Solved in 21 iterations).
+    fn gmres_continuation(&mut self) -> bool {
+        self.continued = true;
+        true
+    }
+    fn gmres_supported(&self) -> bool {
+        self.continued
+    }
+    fn gmres_reset(&mut self) {
+        self.basis.clear();
+        self.directions.clear();
+    }
+    fn gmres_push_basis(&mut self, scale: T) {
+        let mut v = self.error.clone();
+        v.scale(scale);
+        self.basis.push(v);
+    }
+    fn gmres_precondition(&mut self, settings: &CoreSettings<T>) -> bool {
+        self.kernel.counters.outer_refinements += 1;
+        let v = self.basis.last().unwrap();
+        let mut z = vec![T::zero(); v.len()];
+        let ok = self.kernel.solve_raw(&mut z, v, settings);
+        self.directions.push(z);
+        ok
+    }
+    fn gmres_operator(&mut self) -> bool {
+        let z = self.directions.last().unwrap();
+        let zero = vec![T::zero(); z.len()];
+        let norm = self.kernel.residual(self.error, &zero, z, false);
+        self.error.negate();
+        norm.is_finite()
+    }
+    fn gmres_dots(&mut self) -> Vec<T> {
+        self.basis.iter().map(|v| self.error.dot(v)).collect()
+    }
+    fn gmres_subtract(&mut self, c: &[T]) {
+        for (v, &a) in self.basis.iter().zip(c) {
+            self.error.axpby(-a, v, T::one());
+        }
+    }
+    fn gmres_norm2(&mut self) -> T {
+        self.error.norm()
+    }
+    fn gmres_candidate(&mut self, y: &[T]) {
+        self.candidate.copy_from_slice(self.x);
+        for (z, &yi) in self.directions.iter().zip(y) {
+            self.candidate.axpby(yi, z, T::one());
+        }
+    }
 }
 
 #[cfg(test)]
