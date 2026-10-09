@@ -407,7 +407,18 @@ impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
             .map(|(&a, &b)| a + b.abs())
             .fold(T::zero(), T::max)
             * T::epsilon();
-        Some(format!("ex {:.3e} ez {:.3e} floor_x {:.3e}", ex.norm_inf(), ez.norm_inf(), floor))
+        let retained = self
+            .kernel
+            .retained_rows
+            .iter()
+            .fold(T::zero(), |m, &r| T::max(m, ez[r].abs()));
+        Some(format!(
+            "ex {:.3e} ez {:.3e} floor_x {:.3e} ret {:.3e}",
+            ex.norm_inf(),
+            ez.norm_inf(),
+            floor,
+            retained
+        ))
     }
     // Each correction here runs a complete refined reduced solve: GMRES-IR
     // at this level multiplied those solves (L35, 30 iterations: 180 -> 690 s)
