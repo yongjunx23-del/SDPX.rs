@@ -52,8 +52,10 @@ const SPLIT_FACTOR_MIN: usize = 32;
 const FACTOR_PANEL: usize = 8;
 /// Wide-type leaves from this order factor in exact blocked form
 /// ([`DenseLeaf::factor_exact`]) with panels of `EXACT_PANEL` pivots (the
-/// residue product needs an inner dimension of at least 24).
-const EXACT_FACTOR_MIN: usize = 96;
+/// residue product needs an inner dimension of at least 24). Below it the
+/// pooled scalar panels win: from 96, Λ35's leaves (order ~120–200) and
+/// 170-row border slowed 64-thread iterations by 2.9% and raised RSS 1.7 GB.
+const EXACT_FACTOR_MIN: usize = 256;
 const EXACT_PANEL: usize = 48;
 /// Residue-product ways a split exact factor offers to idle workers.
 const EXACT_FACTOR_WAYS: usize = 8;
