@@ -313,7 +313,7 @@ fn bound_gram(y: &[f64], z: &[f64], n: usize, t: usize, out: &mut [f64], paralle
         // Long inner products amortize square output tasks. Fixed column
         // panels otherwise leave the first task carrying the whole tall
         // rectangle (1496 of 5151 dots for a 101-column border).
-        if parallel && n * tile * tile >= 262144 && t - end > tile {
+        if parallel && n * tile * tile >= 262144 && end < t {
             let mut tails: Vec<_> = dst
                 .chunks_mut(t)
                 .enumerate()
