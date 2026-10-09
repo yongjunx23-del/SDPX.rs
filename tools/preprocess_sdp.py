@@ -300,7 +300,7 @@ def lift(data, recovery, point):
         s[start:start + side * (side + 1) // 2] = svec(w @ smat(s[retained], len(keep)) @ w.T)
     out = dict(point, x=x.tolist(), s=s.tolist(), z=z.tolist())
     if not certificate:
-        fullp = p + p.T - sp.diags(p.diagonal())
+        fullp = p + sp.triu(p, k=1, format="csc").T
         quadratic = float(x @ (fullp @ x)) / 2
         out["objective"], out["dual_objective"] = float(q @ x) + quadratic, -float(b @ z) - quadratic
     out["preprocessing"] = {k: recovery[k] for k in ("input_sha256", "reduced_sha256", "summary")}
