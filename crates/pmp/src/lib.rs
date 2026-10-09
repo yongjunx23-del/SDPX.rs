@@ -3,6 +3,7 @@
 //! Adapted from SDPB 3.1.0 pmp2sdp (MIT); see provenance/SDPB-LICENSE.
 //! Decimal strings are parsed directly at the caller's MPFR precision. No
 //! solver, MPI installation, Julia runtime, or BLAS provider is required.
+mod resample;
 mod sampling;
 mod stream;
 pub use stream::convert_file;
@@ -121,6 +122,7 @@ impl PolynomialMatrixProgram {
             self.normalization.as_deref(),
             self.matrices.len(),
             destination.as_ref(),
+            false,
             |prepared| {
                 let destination = destination.as_ref();
                 let write_block = |index: usize| -> Result<_> {
@@ -188,6 +190,8 @@ impl PolynomialMatrixProgram {
 struct Prepared<T> {
     norm: Vec<T>,
     pivot: usize,
+    /// Replace explicit sample points by the SDPB 3.1 rule (`--resample`).
+    resample: bool,
 }
 
 fn write_block<T: Scalar + FromStr>(
@@ -201,6 +205,29 @@ fn write_block<T: Scalar + FromStr>(
         .create_new(true)
         .open(destination.join(format!("block_data_{index}.json")))?;
     let mut output = BufWriter::new(file);
+    let resampled;
+    let matrix = if prepared.resample
+        && matrix.prefactor.is_none()
+        && matrix.sample_points.as_ref().is_some_and(|p| p.len() > 1)
+    {
+        let (points, scalings) = (
+            matrix.sample_points.as_ref(),
+            matrix.sample_scalings.as_ref(),
+        );
+        let prefactor = resample::prefactor(
+            points.unwrap(),
+            scalings.ok_or("resampling needs sample scalings")?,
+        )
+        .map_err(|e| format!("block {index}: {e}"))?;
+        resampled = PolynomialMatrix {
+            polynomials: matrix.polynomials.clone(),
+            prefactor: Some(prefactor),
+            ..Default::default()
+        };
+        &resampled
+    } else {
+        matrix
+    };
     let (count, info) = convert::<T>(matrix, &prepared.norm, prepared.pivot, index, &mut output)
         .map_err(|e| format!("block {index}: {e}"))?;
     output.flush()?;
@@ -217,6 +244,7 @@ fn write_output<T: Scalar + FromStr>(
     normalization: Option<&[String]>,
     count: usize,
     destination: &Path,
+    resample: bool,
     blocks: impl FnOnce(&Prepared<T>) -> Result<Vec<serde_json::Value>>,
 ) -> Result<()> {
     require(
@@ -267,7 +295,11 @@ fn write_output<T: Scalar + FromStr>(
             "objectives.json",
             &serde_json::json!({"constant":constant.decimal_string(),"b":strings(&b)}),
         )?;
-        let prepared = Prepared { norm, pivot };
+        let prepared = Prepared {
+            norm,
+            pivot,
+            resample,
+        };
         let metadata = blocks(&prepared)?;
         require(
             metadata.len() == count,

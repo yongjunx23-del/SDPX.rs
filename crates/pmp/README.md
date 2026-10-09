@@ -73,7 +73,10 @@ fn main() -> sdpx_pmp::Result<()> {
 ```
 
 The library also provides `write_sdp_with_threads::<Bits768>(path, 8)`.
-For bounded input memory, use `sdpx_pmp::convert_file::<Bits768>(input, output, 8)`.
+For bounded input memory, use `sdpx_pmp::convert_file::<Bits768>(input, output, 8, false)`;
+with `true` (CLI `--resample`), blocks given as explicit sample points and
+scalings r^x/Π(x−p), r = 3−2√2 (PyCFTBoot, SDPB.m XML), get SDPB 3.1 points and
+bases from their recovered prefactor.
 It scans the header, then converts blocks without retaining the whole program.
 JSON and XML field order is unrestricted. Conversion keeps
 MPFR coefficients for one matrix entry per worker and never expands PSD
