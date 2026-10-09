@@ -274,7 +274,7 @@ where
 {
     fn solve(&mut self) {
         let _receipt_scope = crate::receipt::Scope::begin();
-        let _affinity = crate::solver::cones::SolveAffinityGuard::enter(
+        let affinity = crate::solver::cones::SolveAffinityGuard::enter(
             crate::solver::core::worker_budget(self.settings.core().max_threads as usize),
         );
         // Long vector operations on this thread use the cone worker pool.
@@ -324,7 +324,7 @@ where
             if state.iter % 10 == 0 && std::env::var_os("SDPX_START_STATS").is_some() {
                 eprintln!("start-stats iter {} {}", state.iter, self.variables.scale_stats());
             }
-            if self.terminate(&mut state).stop() {
+            if self.terminate(&mut state, &affinity).stop() {
                 break;
             }
             if self.start_tau.is_none()
@@ -542,7 +542,11 @@ mod internal {
         fn evaluate(&mut self, state: &mut IterationState<T>, timers: &Timers);
 
         /// Callback and internal termination tests (with strategy fallback).
-        fn terminate(&mut self, state: &mut IterationState<T>) -> Flow;
+        fn terminate(
+            &mut self,
+            state: &mut IterationState<T>,
+            affinity: &crate::solver::cones::SolveAffinityGuard,
+        ) -> Flow;
 
         /// Write the accepted iterate when a checkpoint is due.
         fn write_checkpoint(&mut self, iter: u32);
@@ -646,8 +650,18 @@ mod internal {
             self.info.print_status(&self.settings).unwrap();
         }
 
-        fn terminate(&mut self, state: &mut IterationState<T>) -> Flow {
-            let callback_stop = self.callbacks.check_termination(&self.info);
+        fn terminate(
+            &mut self,
+            state: &mut IterationState<T>,
+            affinity: &crate::solver::cones::SolveAffinityGuard,
+        ) -> Flow {
+            let callback_stop = match &self.callbacks.termination_callback {
+                Callback::None => false,
+                Callback::Rust(_) => {
+                    let _callback_affinity = affinity.suspend();
+                    self.callbacks.check_termination(&self.info)
+                }
+            };
             if crate::mpi::any_true(callback_stop) {
                 self.info.set_status(SolverStatus::CallbackTerminated);
                 return Flow::Stop;

@@ -337,6 +337,28 @@ impl SolveAffinityGuard {
             Self {}
         }
     }
+
+    /// Callback-created workers must inherit the full allocation. Repin the
+    /// calling thread when this returned guard drops, including on unwind.
+    pub(crate) fn suspend(&self) -> Self {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            if let Some(allocation) = &self.original {
+                let mut pinned: libc::cpu_set_t = std::mem::zeroed();
+                let size = std::mem::size_of::<libc::cpu_set_t>();
+                if libc::sched_getaffinity(0, size, &mut pinned) == 0
+                    && libc::sched_setaffinity(0, size, allocation) == 0
+                {
+                    return Self {
+                        original: Some(pinned),
+                    };
+                }
+            }
+            Self { original: None }
+        }
+        #[cfg(not(target_os = "linux"))]
+        Self {}
+    }
 }
 
 impl Drop for SolveAffinityGuard {
