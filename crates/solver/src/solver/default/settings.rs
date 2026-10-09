@@ -59,8 +59,10 @@ pub struct DefaultSettings<T: FloatT> {
     ///directions keep Δτ = Δκ = 0, μ counts the cones only, and the constant
     ///right-hand side is no longer solved. Termination tests are unchanged.
     ///Single-process solver only. Λ19/s50/Λ27/ising11 at 768/512 bits:
-    ///−14%/−10%/−4%/−6% time, same points (2026-10-09 journal).
-    #[builder(default = "true")]
+    ///−14%/−10%/−4%/−6% time, same points (2026-10-09 journal). Off by
+    ///default in binary64: the Float64 scoreboard gains nothing (43/44 cases
+    ///identical) and SDP_arch0 drops from Solved/22 to AlmostSolved/23.
+    #[builder(default = "!is_primitive::<T>()")]
     pub fixed_tau_phase: bool,
     ///when the KKT initial point is rejected and the unit start is used, and
     ///`initial_tau` is left at 1, start from τ₀ = min(1, 1/max d) with d
