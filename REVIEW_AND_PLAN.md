@@ -1,6 +1,6 @@
 # SDPX development plan
 
-Updated 2026-10-07. [AGENTS.md](AGENTS.md) defines working rules and numerical
+Updated 2026-10-09. [AGENTS.md](AGENTS.md) defines working rules and numerical
 contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 [Journal](docs/JOURNAL.md) holds full timings, job histories, source hashes,
 failed attempts and audit evidence. This file keeps priorities, current
@@ -166,6 +166,93 @@ Full experiment history, source bindings, old timing tables and unretrieved
 receipts (including PBS222447) remain in the journal. They do not authorize
 restarting old campaigns.
 
+## Large-case review (2026-10-09)
+
+Source review: `515708f`; existing frozen receipts and audits, no new runs.
+Large mixed Ising and ordinary Float64 SU(2) exercise different paths. The
+journal entry for this review records the evidence bindings and timer scopes.
+
+### Large Ising versus SDPB
+
+The historical Lambda27 1369 s versus SDPB 2592 s comparison was not independently
+audited. The later frozen 0.9.1 `Solved`/42 point fails the original-coordinate
+1e-30 gate described above; its lower iteration count is not an equal-accuracy
+speed advantage. The large variable norm weakens the standard normalization;
+existing explicit dual gates are a pilot, not a replacement for the full audit.
+
+Frozen Lambda27/1024, 32 threads, 2349.941 s solver loop (setup excluded):
+
+| Phase | Wall seconds | Loop share |
+|---|---:|---:|
+| KKT update, including constant/affine solves | 1467.367 | 62.4% |
+| Subsequent KKT solves | 330.534 | 14.1% |
+| PSD cone scaling | 359.173 | 15.3% |
+
+Nested costs: Schur contributions 422.610 s, leaf factor/coupling work
+359.623 s, final border factor only 14.309 s (0.6%). Do not add these to the
+parent phases. There are 129 applied RHSs, 260 prepare/recover passes and
+813 counted linear solves, including 553 refinement corrections. Prioritize
+leaf work, exact Schur products and required sampled transforms/residuals;
+a border-factorizer rewrite or weaker refinement misses the main issue.
+This failed-point profile locates work, not time to an accepted solution.
+
+NT SVD remains a cone-tail limit, but its replay is already parallel. The
+recorded HKM augmented Ising11 trial was slower (52 -> 58 iterations,
+37.1 -> 41.9 s); no large condensed-HKM solve establishes a benefit.
+Ordinary MPI still replicates the reduced system and border work, unlike
+SDPB's distributed Q and node-shared residue panels; owner partitioning is
+a separate SDPX path. Historical one-to-four-node speedups were 1.54x/1.55x
+for SDPX/SDPB, not evidence that either scales well on that case. The saved
+single-process Lambda27 baseline peaks at 20.7 GiB; no matched aggregate-PSS
+memory winner is established. Count residue-batch eligibility after MPI
+partitioning: `subtract_contributions` requires pool-width batches and can
+fall back on underfilled rank-local work. Its actual impact is unmeasured.
+
+### Large SU(2) versus MOSEK
+
+Frozen `515708f`, Float64: 7054 variables, 42023 conic rows, 1720 equalities,
+seven input PSD blocks (maximum order 186). This is not the gravity SOCP.
+PBS223874 completed sequential one/four/16/64-thread runs with SDPX BLAS one
+and MOSEK 11.2.2 using the same thread budget. All eight points fail the
+unchanged original-coordinate audit. These are single time-to-termination
+observations, not an accepted speed comparison or completed ABBA:
+
+| Threads | SDPX native s / status / iterations | MOSEK native s / status / iterations |
+|---|---|---|
+| 1 | 143.684 / AlmostSolved / 25 | 60.646 / unknown / 19 |
+| 4 | 87.651 / AlmostSolved / 25 | 31.375 / unknown / 25 |
+| 16 | 89.202 / AlmostSolved / 25 | 15.893 / optimal / 18 |
+| 64 | 100.718 / NumericalError / 23 | 25.324 / optimal / 25 |
+
+At four threads, `wall.solve` = 84.225 s plus 3.425 s setup. Schur assembly
+33.551 s (39.8%) and refactorization 37.465 s (44.5%) dominate; cone scaling
+is only 0.253 s (0.3%). Top-level KKT update is 76.528 s (90.9%). The
+lower-level assembly/refactor totals also include initialization and retries;
+do not add them to KKT update. Assembly CPU/wall is 0.999: it is
+effectively serial. At one/four/16 threads, assembly stays 35.209/33.551/
+34.157 s; refactorization improves 90.738 -> 37.465 -> 36.189 s, then stalls.
+Within four-thread assembly, transform costs 15.764 s and dot/scatter
+14.742 s, including 11.961 s of indexed publication versus 2.749 s of FMA.
+
+The confirmed bottlenecks are serial assembly and factorization scaling,
+not SVD. The current all-or-nothing assembly admission allows full per-block
+buffers only within two stored-Schur copies OR 256 MiB; otherwise
+`compute_schur` receives no pool and packed parallel tiles are bypassed.
+This is a concrete candidate mechanism, but saved receipts lack the actual
+admission counts. Record them before claiming the cap caused this run.
+The final backend is `condensed_faer`; that name can also report a dense-block
+fallback, so split dense attempts/fallback timing before blaming faer alone.
+
+Acceptance comes first: four-thread SDPX dual residual 6.58e-6 and gap
+6.11e-6 fail the dual/gap gates (1.75e-6/1e-6). Even MOSEK's 16-thread
+`optimal` point has dual residual 1.19e-4. Internal stopping settings differ
+(SDPX 1e-6 plus qnorm; MOSEK 1e-8); both face the same external audit.
+SDPX process peak RSS is 2804--3139 MiB. MOSEK's measured Python-process RSS
+also includes imports, retrieval and auditing, so it is not a clean
+solver-allocation comparison.
+Evidence: `$SDPX_E2E_HOME/work/su2-large-scaling-20261008/`, especially
+`report.json` and `retrieved-223874/results-cluster/`.
+
 ## Profile
 
 Shares of the 2026-10-07 release runs of e2470e6 (receipt phases):
@@ -214,17 +301,19 @@ regularization and refinement stay unchanged.
   is replaced by dynamic regularization and refinement diverges; dynamic
   regularization off or 768 bits solves it. The proposed no-replacement
   refactor requires approval because it changes the regularization contract.
-- **Float64 large:** historical129 s/26 versus MOSEK25.4 s is superseded by
-  the scoped222437 audited refresh above; it is not a matched optimization
-  comparison with that history. Mixed Λ27 has the matched SDPB comparison above.
+- **Large SU(2) Float64:** frozen `515708f`, PBS223874: SDPX AlmostSolved/25
+  at one/four/16 threads and NumericalError/23 at 64; all original-coordinate
+  audits fail. MOSEK's four points also fail, including two `optimal` statuses.
+  The historical 129 s/26 versus 25.4 s is not an audited baseline. PBS222437
+  concerns gravity and does not supersede this different input.
 
 ## Concrete next work
 
 | Order | Action | Acceptance / constraint |
 |---|---|---|
 | 0 | Resolve Lambda27's original-coordinate accuracy gate | Saved-point diagnosis is complete; run the prepared explicit-gate pilot after approval. Full primal/dual/PSD/mapping audit still decides acceptance. |
-| 1 | Finish exact arrow batching measurement | After the accuracy gate, complete audited release ABBA. Preserve rounded Z and leaf subtraction order; diagnostic windows are insufficient. |
-| 2 | Optimize dominant sampled/PSD phases | Use the latest receipts to locate remaining serial work after shared congruence CRT. Largest-cone SVD latency and exact factor products remain; rejected SVD tile/QR directions stay closed. |
+| 1 | Finish exact arrow batching measurement | After the Lambda27 accuracy gate, complete audited release ABBA. Preserve rounded Z and leaf subtraction order; diagnostic windows are insufficient. Count eligible/underfilled batches after MPI rank partitioning before changing admission. |
+| 2 | Optimize dominant sampled KKT/PSD phases | Frozen Lambda27 KKT update/solve is 76.5% of loop time, versus 15.3% cone scaling and 0.6% final border factor. Prioritize leaf factor/coupling work, exact Schur products and required transforms/residuals. Preserve refinement; SVD replay is already parallel and rejected tile/QR directions stay closed. |
 | 3 | Remove unused storage/setup work | Packed results/Grams, shared product CRT, implicit indices and sampled owner/fused-only buffers are kept. Further removal needs a live unused allocation; Gram and scaling owners may differ. Preserve shifted factors versus unshifted residual operators. |
 | 4 | Improve LP/SOC thread balance and Float64 iteration gap | Compact SOC row supports improve256/512 native time; duplicate raw row 0 is removed. Further storage changes need a live allocation. Use gravity/MOSEK receipts for the iteration gap; preserve convergence, regularization and refinement. |
 | 5 | Scale only for the active workload | Frozen sources and bounded resources. Lambda43/1216 and broad core sweeps remain later work; avoid node70. |
@@ -236,6 +325,7 @@ regularization and refinement stay unchanged.
 | 11 | csdr3 residue memory | ce09de1: +36–40% peak RSS at four threads (about 18 MiB per extra worker) for −13% time. Tried: entry-compact chunks (`perf-compact`) gave −17% RSS but +38% serial `rns.block_gemm` (per-residue shift pass) — rejected, see journal 2026-10-07. Measured spreads: per-column ≈80–190 bits with one ≈400-bit outlier column per call, so only a two-tier column split (tight C≈17, outlier C≈25, shifts on the 903 outputs/prime) can shrink buffers without a per-residue post-pass. Reopen only with release ABBA incl. 1-thread and RSS. |
 | 12 | Medium four-thread scaling | 1.43× from one to four threads: refactor flat at 0.25 s, Schur assembly 66 → 39.5 ms per factorization (1.67×). Per-call phase maxima (transform 24 → 28 ms, dot/scatter 7 → 21 ms) include tasks stolen inside joins, so measure per-lane busy time before changing the schedule. |
 | 13 | Owner-MPI correctors | `OwnedCones`/`OwnedVariables` keep the no-op defaults, so SOC/LP iterates differ from single-process runs. The matched-accuracy gain is small (item 10) and no MPI SOC/LP workload is active; port when one is, with a real MPI E2E. |
+| 14 | Large SU(2) accuracy and serial assembly | Preserve PBS223874's 0/8 accepted points. Diagnose the first failed factor/accepted-iterate residual and independently check original-coordinate mapping. Record the assembly budget decision; if it causes the serial fallback, evaluate bounded parallel batches/tiles with unchanged cone accumulation order, not an unmeasured cap increase. Split dense-attempt/sparse-fallback factor costs and profile at four threads before another width sweep. Full audit before any speed claim. |
 
 ## Measurement prerequisites
 
@@ -284,13 +374,14 @@ Apply these to affected paths; they are not a project-wide gate:
 
 ### Survey: what other solvers do better (2026-10-07)
 
-- **SDPB (high precision):** HRVW/KSH/M (XZ) direction, so each block needs
-  only Cholesky factors of X and Y; SDPX's NT scaling needs an MPFR SVD per
-  PSD cone (≈3 s per 88×88 cone at 1024 bits, the largest serial latency).
-  Measured 2026-10-07 (JOURNAL): HKM cone update 6.5× cheaper, but +12%
-  iterations on ising11 MPFR512; net ≤ 0 on Λ27 shares. Closed. SDPB 3 forms the
-  Schur complement with blocked RNS (FLINT) BLAS, as SDPX's residue GEMM, and
-  distributes it with Elemental Cholesky.
+- **SDPB (high precision):** HRVW/KSH/M (XZ) direction uses Cholesky-based
+  products, while SDPX's NT scaling adds a direct MPFR SVD. Largest-cone
+  latency remains important, but replay is already row-parallel. The recorded
+  HKM augmented Ising11 trial has a 6.5x cheaper cone update but takes
+  58 rather than 52 iterations and 41.9 rather than 37.1 s; there is no measured
+  large condensed-HKM gain. SDPB 3 computes global Q using node-shared
+  RNS/FLINT/BLAS panels and distributed Elemental Cholesky; SDPX already has
+  exact residue products, but ordinary MPI replicates its reduced system.
 - **SDPA-GMP/QD/DD:** double-double and quad-double arithmetic (≈106/212
   bits) is several times faster than MPFR at 128/256 bits; a `DoubleDouble`
   scalar would serve medium-precision solves.
@@ -328,8 +419,9 @@ are in [the journal](docs/JOURNAL.md).
 
 - Lower/mixed precision, relaxed refinement, NaN clamping and MᵀM eigenanalysis
   violate numerical contracts. Fixed-point SVD replay erased tiny MPFR values.
-- HKM (SDPB XZ) PSD direction: 6.5× cheaper cone update, +12% iterations at
-  MPFR512 (ising11 58 vs 52); net ≤ 0 for the condensed sampled path.
+- HKM (SDPB XZ) PSD direction: 6.5x cheaper cone update, but augmented
+  Ising11/512 increases 52 -> 58 iterations and 37.1 -> 41.9 s; no demonstrated
+  large condensed-sampled gain.
 - SVD/eigen warm starts, terminal/scalar substitutions, zero-pair replay,
   cached small congruences and forced small dense factorization: no solve gain.
 - Float64 step/panel/column-alias/recovery/GEMM variants and Group-FMA loop
