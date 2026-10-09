@@ -50,6 +50,13 @@ const SINGLE_LEAF_MIN: usize = 16;
 const SPLIT_FACTOR_MIN: usize = 32;
 /// Pivots per panel of the split leaf factor (one join per panel).
 const FACTOR_PANEL: usize = 8;
+/// Wide-type leaves from this order factor in exact blocked form
+/// ([`DenseLeaf::factor_exact`]) with panels of `EXACT_PANEL` pivots (the
+/// residue product needs an inner dimension of at least 24).
+const EXACT_FACTOR_MIN: usize = 96;
+const EXACT_PANEL: usize = 48;
+/// Residue-product ways a split exact factor offers to idle workers.
+const EXACT_FACTOR_WAYS: usize = 8;
 /// Per-step factor tasks are small: split a leaf factor only with at least
 /// this many threads per leaf (at ~2 per leaf it measured slower), and the
 /// border factor only from this dimension.
@@ -188,6 +195,9 @@ impl<T: FloatT> DenseLeaf<T> {
     ) -> Result<(), &'static str> {
         self.l.copy_from_slice(a);
         let n = self.n;
+        if T::precision_bits() >= 256 && n >= EXACT_FACTOR_MIN {
+            return self.factor_exact(signs, reg, regularize_count, split);
+        }
         if split && n > f64_scaled::<T>(SPLIT_FACTOR_MIN, 8) {
             return self.factor_panels(signs, reg, regularize_count);
         }
@@ -258,6 +268,91 @@ impl<T: FloatT> DenseLeaf<T> {
                             }
                         }
                     });
+            }
+            p = pe;
+        }
+        Ok(())
+    }
+
+    /// Blocked right-looking [`Self::factor_signed`] for wide types: each
+    /// panel of `EXACT_PANEL` pivots is factored as in
+    /// [`Self::factor_panels`], then the trailing update `A22 -= L21·D1·L21ᵀ`
+    /// is one exact residue product (every entry the exact panel sum rounded
+    /// once, then subtracted). Thread-invariant but not bitwise equal to the
+    /// scalar loop (one rounding per panel instead of per pivot). A panel
+    /// without an exact plan takes the scalar trailing update. `split`: the
+    /// pool has spare workers, so products and the subtraction use them.
+    fn factor_exact(
+        &mut self,
+        signs: &[i8],
+        reg: Option<(T, T)>,
+        regularize_count: &mut usize,
+        split: bool,
+    ) -> Result<(), &'static str> {
+        let n = self.n;
+        let mut d = vec![T::zero(); n];
+        let (mut w, mut q) = (Vec::new(), Vec::new());
+        let ways = if split { EXACT_FACTOR_WAYS } else { 1 };
+        let mut p = 0;
+        while p < n {
+            let pe = (p + EXACT_PANEL).min(n);
+            for k in p..pe {
+                let s = T::from_i8(signs[if signs.len() == 1 { 0 } else { k }]).unwrap();
+                let dk = Self::pivot(self.l[k + k * n], s, reg, regularize_count)?;
+                d[k] = dk;
+                self.dinv[k] = T::one() / dk;
+                self.l[k + k * n] = T::one();
+                for i in k + 1..n {
+                    self.l[i + k * n] *= self.dinv[k];
+                }
+                for j in k + 1..pe {
+                    let v = self.l[j + k * n] * dk;
+                    for i in j..n {
+                        self.l[i + j * n] = (-self.l[i + k * n]).mul_add(v, self.l[i + j * n]);
+                    }
+                }
+            }
+            if pe == n {
+                break;
+            }
+            let (m, nb) = (n - pe, pe - p);
+            w.resize(m * nb, T::zero());
+            for c in 0..nb {
+                for i in 0..m {
+                    w[i + c * m] = self.l[pe + i + (p + c) * n] * d[p + c];
+                }
+            }
+            q.resize(m * (m + 1) / 2, T::zero());
+            // Q[a, b] (a <= b, packed by column) = Σ_c W[a, c]·L21[b, c],
+            // the update of lower entry (pe + b, pe + a).
+            let exact = crate::algebra::with_split_hint(ways, || {
+                T::xgemm_upper_exact(
+                    b'N', b'T', m, m, nb, &w, m, &self.l[pe + p * n..], n, &mut q, None, None,
+                )
+            });
+            let (head, tail) = self.l.split_at_mut(pe * n);
+            let panel = &head[p * n..];
+            let d = &d[p..pe];
+            let update = |(a, column): (usize, &mut [T])| {
+                if exact {
+                    for b in a..m {
+                        column[pe + b] -= q[b * (b + 1) / 2 + a];
+                    }
+                } else {
+                    let j = pe + a;
+                    for (c, &dk) in d.iter().enumerate() {
+                        let pivot = &panel[c * n..(c + 1) * n];
+                        let v = pivot[j] * dk;
+                        for i in j..n {
+                            column[i] = (-pivot[i]).mul_add(v, column[i]);
+                        }
+                    }
+                }
+            };
+            if split {
+                tail.par_chunks_mut(n).enumerate().for_each(update);
+            } else {
+                tail.chunks_mut(n).enumerate().for_each(update);
             }
             p = pe;
         }
