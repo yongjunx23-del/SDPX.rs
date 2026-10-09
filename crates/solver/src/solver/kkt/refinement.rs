@@ -10,6 +10,20 @@ pub(crate) trait Refinement<T: FloatT> {
     fn decision_agrees(&self, value: u32) -> bool {
         decision_agrees(value)
     }
+    /// `all_succeeded(ok) && decision_agrees(decision)` in one agreement:
+    /// the code `2·decision + !ok` agrees on every rank only when every rank
+    /// holds the same decision and the same `ok`, and `ok` then is global.
+    /// Implementations whose `decision_agrees` is one collective therefore
+    /// pay one round instead of two.
+    fn agree_pair(&self, ok: bool, decision: u32) -> bool {
+        self.decision_agrees(decision.saturating_mul(2) | u32::from(!ok)) && ok
+    }
+    /// True when a failed `solve_correction` leaves a candidate whose next
+    /// residual is non-finite on every rank, so its failure is agreed with
+    /// that residual instead of in a round of its own.
+    fn defers_solve_agreement(&self) -> bool {
+        false
+    }
     fn rhs_norm(&self) -> T;
     fn residual(&mut self, candidate: bool, reuse_forward: bool) -> T;
     fn solve_correction(&mut self, settings: &CoreSettings<T>) -> bool;
@@ -79,31 +93,30 @@ fn refine_stationary<T: FloatT>(
     stats: &mut [T; 4],
 ) -> bool {
     let normb = work.rhs_norm();
+    let tol = settings.iterative_refinement_abstol + settings.iterative_refinement_reltol * normb;
     let mut norme = work.residual(false, true);
     *stats = [normb, norme, norme, T::zero()];
-    if !work.all_succeeded(norme.is_finite()) {
+    if settings.iterative_refinement_max_iter == 0 {
+        return work.all_succeeded(norme.is_finite());
+    }
+    // Each residual's finiteness, its acceptance action and the next
+    // convergence test share one agreement (see `Refinement::agree_pair`).
+    let mut converged = norme <= tol;
+    if !work.agree_pair(norme.is_finite(), u32::from(converged)) {
         return false;
     }
     for _ in 0..settings.iterative_refinement_max_iter {
-        let converged = norme
-            <= settings.iterative_refinement_abstol + settings.iterative_refinement_reltol * normb;
-        if !work.decision_agrees(u32::from(converged)) {
-            return false;
-        }
         if converged {
             break;
         }
         let previous = norme;
         stats[3] += T::one();
         let solved = work.solve_correction(settings);
-        if !work.all_succeeded(solved) {
+        if !work.defers_solve_agreement() && !work.all_succeeded(solved) {
             return false;
         }
         work.add_correction();
         norme = work.residual(true, false);
-        if !work.all_succeeded(norme.is_finite()) {
-            return false;
-        }
         let ratio = previous / norme;
         let stop = ratio < settings.iterative_refinement_stop_ratio;
         let accept = ratio > T::one();
@@ -116,7 +129,9 @@ fn refine_stationary<T: FloatT>(
         } else {
             0
         };
-        if !work.decision_agrees(action) {
+        // Only a continuing step reads the next convergence test.
+        let next = !stop && norme <= tol;
+        if !work.agree_pair(norme.is_finite(), action + 3 * u32::from(next)) {
             return false;
         }
         if stop {
@@ -130,6 +145,7 @@ fn refine_stationary<T: FloatT>(
         }
         work.accept_candidate();
         stats[2] = norme;
+        converged = next;
     }
     true
 }
@@ -247,9 +263,6 @@ pub(crate) fn refine_gmres<T: FloatT>(
         }
         work.gmres_candidate(&y);
         let trial = work.residual(true, false);
-        if !work.all_succeeded(trial.is_finite()) {
-            return false;
-        }
         let ratio = norme / trial;
         let stopratio = settings.iterative_refinement_stop_ratio;
         let floor = trial > stopratio * estimate;
@@ -260,7 +273,8 @@ pub(crate) fn refine_gmres<T: FloatT>(
         } else {
             0
         };
-        if !work.decision_agrees(action) {
+        // A non-finite trial fails the pair whatever its action reads.
+        if !work.agree_pair(trial.is_finite(), action) {
             return false;
         }
         if action == 2 {
@@ -280,4 +294,117 @@ pub(crate) fn refine_gmres<T: FloatT>(
         target = tol;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Scalar refinement whose residual after `k` corrections is
+    /// `factors[0] * ... * factors[k-1]`; counts agreement rounds.
+    struct Mock {
+        factors: Vec<f64>,
+        accepted: usize,
+        candidate: usize,
+        restored: bool,
+        rounds: Cell<usize>,
+        /// Defer the solve flag (a failed solve poisons the candidate).
+        defer: bool,
+        /// Correction number whose solve fails.
+        fail_at: Option<usize>,
+        poisoned: bool,
+    }
+    impl Refinement<f64> for Mock {
+        fn all_succeeded(&self, value: bool) -> bool {
+            self.rounds.set(self.rounds.get() + 1);
+            value
+        }
+        fn decision_agrees(&self, _value: u32) -> bool {
+            self.rounds.set(self.rounds.get() + 1);
+            true
+        }
+        fn rhs_norm(&self) -> f64 {
+            1.0
+        }
+        fn residual(&mut self, candidate: bool, _reuse: bool) -> f64 {
+            if candidate && self.poisoned {
+                return f64::NAN;
+            }
+            let k = if candidate {
+                self.candidate
+            } else {
+                self.accepted
+            };
+            self.factors[..k].iter().product()
+        }
+        fn solve_correction(&mut self, _settings: &CoreSettings<f64>) -> bool {
+            let ok = self.fail_at != Some(self.accepted + 1);
+            self.poisoned = !ok && self.defer;
+            ok
+        }
+        fn defers_solve_agreement(&self) -> bool {
+            self.defer
+        }
+        fn add_correction(&mut self) {
+            self.candidate = self.accepted + 1;
+        }
+        fn accept_candidate(&mut self) {
+            self.accepted = self.candidate;
+        }
+        fn restore_product(&mut self) {
+            self.restored = true;
+        }
+    }
+
+    fn run(factors: Vec<f64>, tol: f64, defer: bool, fail_at: Option<usize>, ok: bool) -> Mock {
+        let mut settings = CoreSettings::<f64>::default();
+        settings.iterative_refinement_abstol = tol;
+        settings.iterative_refinement_reltol = 0.0;
+        settings.iterative_refinement_max_iter = 10;
+        let mut mock = Mock {
+            factors,
+            accepted: 0,
+            candidate: 0,
+            restored: false,
+            rounds: Cell::new(0),
+            defer,
+            fail_at,
+            poisoned: false,
+        };
+        assert_eq!(refine(&mut mock, &settings), ok);
+        mock
+    }
+
+    #[test]
+    fn one_agreement_per_residual() {
+        // Contracting tenfold: six corrections reach 2e-6. One round for the
+        // first residual, then the solve flag and one pair per correction
+        // (formerly 1 + 7 convergence + 3 per correction = 26 rounds).
+        let m = run(vec![0.1; 10], 2e-6, false, None, true);
+        assert_eq!((m.accepted, m.restored), (6, false));
+        assert_eq!(m.rounds.get(), 1 + 2 * 6);
+        // A stalled step (ratio < 5) that still improves is accepted, then
+        // refinement stops; a step that worsens is rejected and restored.
+        let m = run(vec![0.1, 0.5, 0.1], 1e-9, false, None, true);
+        assert_eq!((m.accepted, m.restored), (2, false));
+        let m = run(vec![0.1, 2.0, 0.1], 1e-9, false, None, true);
+        assert_eq!((m.accepted, m.restored), (1, true));
+        // Already converged: one round, no correction.
+        let m = run(vec![], 1.0, false, None, true);
+        assert_eq!((m.accepted, m.rounds.get()), (0, 1));
+        // A failed correction fails refinement in its own round...
+        let m = run(vec![0.1; 10], 2e-6, false, Some(3), false);
+        assert_eq!((m.accepted, m.rounds.get()), (2, 1 + 2 * 2 + 1));
+    }
+
+    #[test]
+    fn deferred_solve_flags_keep_outcomes() {
+        // One round per correction, same accepted iterate.
+        let m = run(vec![0.1; 10], 2e-6, true, None, true);
+        assert_eq!((m.accepted, m.rounds.get()), (6, 1 + 6));
+        // A failed correction still fails, in the residual's round.
+        let m = run(vec![0.1; 10], 2e-6, true, Some(3), false);
+        assert_eq!((m.accepted, m.rounds.get()), (2, 1 + 3));
+    }
 }
