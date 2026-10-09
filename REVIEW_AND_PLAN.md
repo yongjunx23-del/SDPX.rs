@@ -148,7 +148,6 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 | Task | Branch | Scope | Gate |
 |---|---|---|---|
 | 17 | `perf-l35b` | Merged `368ffe7` (no MPFR shifts, GMP basecase, opt-in host GMP). Now: a start rule for SDPB 3.1 resampled inputs (Λ27-rs is a τ chase at the default start: 345 it vs 145 at τ₀ 1e-30), then Λ35-rs at 1024 | ising11, gravity256 and the old inputs no worse; resampled Λ19/Λ27/Λ35 default start reaches the τ₀ 1e-30 result |
-| 19 | `perf-scale2` | Blocked Givens replay in the MPFR SVD through the exact residue GEMM (replay is 54% of SVD CPU at Λ35/1024; est. −4.4% Λ35, −3.5% Λ27). `perf-scale` (scheduling) not kept: ±0.5% | Ising ABBA with audits; Λ35 pace; Float64 scoreboard statuses/iterations/audits unchanged |
 | 20 | `perf-t20` | Done, merged `23e0a99`: owner-MPI agreements (−1.4…8%, bitwise identical); `pmp2sdp --resample` (SDPB 3.1 points: Λ19 −38%, Λ27 −41% at τ₀ 1e-30, 0 refinement corrections). Pending: matched SDPB on resampled inputs (224375–7), full Λ35 1024 (224373/4); start rule on 3.1 inputs (Λ27 345 it at default start) | — |
 | 21 | `perf-mc` | Multi-core scaling (user, 2026-10-09): 8–128-thread scaling curves against SDPB with perf stat/record, lock, allocation and NUMA data; then evidence-chosen fixes: persistent block ownership (SDPB-style affinity), per-socket layout for 128 cores, no per-call pools, lock-free receipts, hot-loop allocations, phase overlap | Ising ABBA at 64 and 128 threads with audits; Λ35 pace; Float64 scoreboard unchanged |
 | 16 | `perf-endgame` | Done, merged `81b1549`: binary64 condensed Δs from the primal row, GMRES-IR on residual growth; 6 more Float64 cases Solved | — |
@@ -273,6 +272,7 @@ are in [the journal](docs/JOURNAL.md).
   iterations and 37.1 → 41.9 s; net ≤ 0 for the condensed sampled path.
   Task 19 re-measures it at Λ27/Λ35 scale, where scaling is 21.6% of an
   iteration (new evidence).
+- Cone scaling by scheduling (task 19: LPT, inner ways, pool_ways ±0.5%; scaling is CPU-bound) and by a blocked Givens replay through residue GEMM (task 19b: +6–17% per iteration at L = 40–63). Fewer rotations (divide-and-conquer bidiagonal SVD) is the remaining SVD lever.
 - Hypatia-style WSOS dual-barrier cone for the Ising PMPs (task 18):
   ising11 86 vs 54 it; Λ19 gap 4.6e-9 at 107 it vs SDPX's 73; the line
   search costs more than the factor.

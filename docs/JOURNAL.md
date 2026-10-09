@@ -8,6 +8,26 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — task 19b: blocked Givens replay in the MPFR SVD, not kept
+
+- Hypothesis: accumulating the logged rotations into small orthogonal windows and applying them to V through the exact residue GEMM makes the replay (54% of SVD CPU at Λ35/1024) about 3× cheaper.
+- Change (`perf-scale2`, WIP, all inside `mpfr_svd.rs`): 16 sweeps per group, windows of 24 wavefronts. Q (width about 40) is accumulated at working precision and applied with exact GEMM; small windows are replayed directly. Matches the sequential replay to rounding (about 1e-230 at 768 bits).
+- Mac benchmark: 0.73–0.78× the sequential time.
+- Cluster (job 224389, node167, 64 threads, 30 iterations, sequential → blocked):
+
+  | Case | Replay CPU (s/it) | Scaling wall (s/it) | Iteration (s/it) |
+  |---|---|---|---|
+  | Λ35 1024 | 15.9 → 22.5 | 1.02 → 1.49 | 7.70 → 8.12 (+5.6%) |
+  | Λ35-rs 1024 | 15.8 → 24.6 | 1.03 → 1.55 | 5.58 → 6.11 (+9.6%) |
+  | Λ27-rs 768 | 4.2 → 7.7 | 0.52 → 0.84 | 2.28 → 2.67 (+17%) |
+
+- Observed:
+  - At these cone sizes (L = 40–63) each window is close to full width, so building Q costs about as much as replaying directly. The residue GEMM at these shapes is slower on Zen 2 than scalar rotation updates.
+  - The blocked path loses the row split that lets idle workers help the largest cones: the slowest SVD went 0.92 → 1.46 s.
+  - node167 ran about 1.7× slower than node99 for the same work.
+  - On resampled inputs, cone scaling is 18–23% of an iteration (Λ35-rs 1.03 of 5.58 s/it).
+- Decision: not kept. A cheaper SVD now needs fewer rotations (divide-and-conquer bidiagonal SVD in MPFR), which is not started without new evidence.
+
 ## 2026-10-09 — task 17 (perf-l35b) kept: no MPFR shifts, GMP basecase, opt-in host GMP
 
 - Hypothesis (from the SDPB design notes): Λ35's 768-bit floor and part of its 1024-bit cost come from the MPFR static shift and the dynamic pivot replacement. SDPB 2+ uses neither.
