@@ -82,7 +82,7 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 - **Performance plan 2026-10-08 (q1/q2):**
   - Historical MPFR shift/pivot rule: Λ27 451 → 376 it. Superseded by task 17 below: no shift/replacement until a failed factor triggers escalation.
   - Assembly budget max(256 MiB, RAM/8).
-  - faer tile products, parallel border SYRK, tiled border factor.
+  - Parallel border SYRK and tiled border factor use linked BLAS. The faer tile replacement was rejected after a convergence regression.
   - Dynamic pivot rule inside the dense Cholesky.
   - Binary64 PSD Gondzio correctors: medium 19 → 15 it, large 25 → 19 it.
 - **Integration `0e42ad2` (2026-10-09):**
@@ -165,9 +165,11 @@ Review repairs (2026-10-09): preserve sampled factors through singleton presolve
 3. **Float64 per-solve overhead (task 13 leads):**
    - Brandy's rational presolve pass costs 35–85 ms, because a budget counted in updates misses the GMP gcd cost.
    - Concurrent small OpenBLAS calls in cone lanes.
-   - Pool width by KKT work, and pool creation (1–6 ms at 16 threads).
+   - Size the shared pool by KKT work while keeping cheap cone tasks narrow. The cone-only cutoff limits gravity-large to four workers despite its roughly 206M-product bound Gram; check one/eight-thread audited solves before timing.
+   - Pool creation (1–6 ms at 16 threads).
    - Receipt sampling on pooled solves.
 4. **Float64 SU(2):**
+   - Publish PSD Schur buffers by disjoint destination columns, preserving cone addition order. Reprofile first: the older large case spent 11.96 s in indexed publication; the current path still scatters serially.
    - Facial reduction (`perf-facial`) with tolerance-based kernel detection, gated by the audit (approved).
    - Eliminate empty (74) and equality-only (609) columns.
    - Two leaves plus a border for large's Schur columns (blocks 1–5 / 6–7 / both: 3729 / 1817 / 825; about 5× fewer factor flops).
