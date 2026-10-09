@@ -8,6 +8,26 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-10 — task 21 first fixes: 128-thread scaling and the resampled start (perf-mc-impl)
+
+- Evidence (task 21 curves, 2026-10-09, `hpc:.../mc/logs/scale-p1-*`, `trace-tr-*`, `mixed-m1-*`): SDPX beat SDPB per iteration at ≤32 cores but flattened past 64 (Λ35/1024 at 128: 3.38 vs 2.55 s/it). Traces: every block phase waited for its single largest task; mixed Λ27/1024 arrow contributions got slower from 64 to 128 threads (only full pool-width leaf groups were batched, so 117 leaves on 128 workers fell to per-entry exact dots); μ+info scans ran serially (4× concurrency).
+- Kept (branch `perf-mc-impl`, final binary mci13; ABBA medians against `main` ee235b4 = mcib, same node, 30 it, MPFR 768/1024):
+
+  | Case | 64 threads | 128 threads |
+  |---|---|---|
+  | Λ27 | 1.437 → 1.398 s/it (−2.7%) | 1.571 → 1.366 (−13.0%) |
+  | Λ35-rs | 2.874 → 2.823 (−1.8%) | 2.637 → 2.273 (−13.8%) |
+  | mixed Λ27/1024 (3 it) | 28.49 → 25.95 (−8.9%) | 30.20 → 26.44 (−12.4%) |
+
+  1. Contributions: every eligible leaf group is batched through exact residue products (same correctly rounded entries as the per-entry dots, so bitwise neutral), at most one leaf per worker and 2^24 buffered product entries per batch; short batches grant `ceil(width/len)` ways. Short groups of light products (Σ g·q² < 2^30) keep the column path: on Λ35 batching saved 0.5% at 64 threads but raised peak RSS 4.7 → 6.4 GB. Mixed 128 threads: contributions 7.3 → 4.1 s/it; peak RSS 23 → 36 GiB (the 64-thread run already used 31 GiB).
+  2. Exact blocked LDL for leaves of order ≥ 256 (panels of 48, trailing update one exact product); the border and smaller leaves keep scalar panels (at order ≥ 96, Λ35 at 64 threads was +2.9% and the mixed border 0.58 → 2.0 s).
+  3. MPFR cone scaling always uses the largest-first job queue; workers without a cone run posted SVD replay row tiles (largest post first) and wait for posts at most the previous phase's slowest cone. A first version that waited for all cones deadlocked (ising11 at ≥24 threads): a thread blocked inside one cone's inner join stole an unstarted worker item. Nested items now return at once. Λ35-rs scaling at 128 threads 0.58 → 0.51 s/it.
+  4. Norm scans: chunked exact sums of squares from exactly added partial accumulators (bitwise identical, unit test); Λ35-rs μ+info 0.050 → 0.012 s/it. Long residual copies run on the pool. Pools narrower than the allocation take CPUs round-robin over L3/packages.
+  5. Start rule (convergence contract, measured): `auto_start_scale` on for wide types; the τ-chase trigger fires when μ fell 1e4 (was 1e10) and τ < 1e-2·τ₀ (was 1e-4) since the gap last improved tenfold. It acts only on unit (accepted-KKT) starts. τ traces (`runs/t17-tr-tr-*`): Λ27-rs gap stalls near 2e-12 from iteration 32, τ < 1e-2 from 68; Λ19-rs settles at τ 0.14, ising11 at 2.7. Λ27-rs default start 345 it / 354 s → 210 it / 218 s (restart at 68; SDPB 259 it / 367 s). Λ35-rs 694 it (restart at 82; was 794 at the default start). ising11, Λ19-rs, gravity256 unchanged.
+- Audits (original coordinates): ising11, Λ19, Λ19-rs, s50, Λ27, Λ27-rs (mci7/mci10/mci12 points) and Λ35/Λ35-rs at 1024 bits (mci7) accepted. Original-input iteration counts unchanged (Λ19 121, s50 153, Λ27 183, Λ35 688). Float64 `medium` and SOC `csdr3` points bitwise identical locally.
+- Rejected: exact blocked Y = L⁻¹B leaf solve (mixed 128-thread leaves 4.2 → 8.1 s/it; Λ27 leaves 0.073 → 0.085); non-blocking-only helpers (idle workers exited before replays were posted, no SVD gain).
+- Open: the largest-cone SVD still bounds scaling at 64 threads (svdmax ≈ 0.6 s on Λ35); Λ27-rs still spends 68 iterations before the restart (145 from τ₀ 1e-30); mixed setup is ~48 s serial at every thread count.
+
 ## 2026-10-09 — expose RNS cache cost without changing kernels
 
 The parallel review identified serial contiguous cache encoding before the
