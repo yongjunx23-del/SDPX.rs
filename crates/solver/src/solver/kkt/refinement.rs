@@ -16,6 +16,11 @@ pub(crate) trait Refinement<T: FloatT> {
     fn add_correction(&mut self);
     fn accept_candidate(&mut self);
     fn restore_product(&mut self);
+    /// Diagnostic only (`SDPX_TRACE_TAU`): residual parts of the last
+    /// evaluated point (implementer-defined), printed after each residual.
+    fn trace_parts(&mut self, _candidate: bool) -> Option<String> {
+        None
+    }
 
     // GMRES-IR support (see [`refine_gmres`]). `error` doubles as the Arnoldi
     // work vector; implementers keep the bases V (orthonormal) and Z = M⁻¹V.
@@ -78,8 +83,15 @@ fn refine_stationary<T: FloatT>(
     settings: &CoreSettings<T>,
     stats: &mut [T; 4],
 ) -> bool {
+    static PARTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let parts = *PARTS.get_or_init(|| std::env::var_os("SDPX_TRACE_TAU").is_some());
     let normb = work.rhs_norm();
     let mut norme = work.residual(false, true);
+    if parts {
+        if let Some(s) = work.trace_parts(false) {
+            eprintln!("refine-parts 0 {:.3e} {:.3e} {s}", normb, norme);
+        }
+    }
     *stats = [normb, norme, norme, T::zero()];
     if !work.all_succeeded(norme.is_finite()) {
         return false;
@@ -103,6 +115,11 @@ fn refine_stationary<T: FloatT>(
         norme = work.residual(true, false);
         if !work.all_succeeded(norme.is_finite()) {
             return false;
+        }
+        if parts {
+            if let Some(s) = work.trace_parts(true) {
+                eprintln!("refine-parts {} {:.3e} {:.3e} {s}", stats[3], normb, norme);
+            }
         }
         let ratio = previous / norme;
         let stop = ratio < settings.iterative_refinement_stop_ratio;
