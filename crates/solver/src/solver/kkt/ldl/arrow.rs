@@ -997,7 +997,7 @@ fn subtract_contributions<T: FloatT>(
             }
             batches.push(&group[start..]);
             for batch in batches {
-                let ways = (width / batch.len()).clamp(1, 8);
+                let ways = width.div_ceil(batch.len()).clamp(1, 8);
                 let build = |leaf: &Leaf<T>| crate::algebra::with_split_hint(ways, || build(leaf));
                 let products: Vec<Vec<T>> = match pool {
                     Some(p) => p.install(|| batch.par_iter().map(build).collect()),
