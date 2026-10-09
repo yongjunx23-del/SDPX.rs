@@ -299,9 +299,15 @@ impl<T: FloatT> SampledOperator<T> {
 
     /// Apply E*A*D. The caller must provide uniform E on each sampled PSD block.
     pub fn scale(&mut self, d: &[T], e: &[T]) {
+        self.scale_with(d, e, |linear| linear.lrscale(e, d));
+    }
+
+    /// [`Self::scale`] with the caller's `lrscale(e, d)` of the linear part
+    /// (e.g. pooled; it must apply the same per-entry expression).
+    pub(crate) fn scale_with(&mut self, d: &[T], e: &[T], lrscale: impl FnOnce(&mut CscMatrix<T>)) {
         assert_eq!(d.len(), self.linear.n);
         assert_eq!(e.len(), self.linear.m);
-        self.linear.lrscale(e, d);
+        lrscale(&mut self.linear);
         for block in &mut self.blocks {
             let row_scale = e[block.row_start];
             for (p, w) in block.weights.iter_mut().enumerate() {

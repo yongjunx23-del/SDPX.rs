@@ -60,8 +60,8 @@ const EXACT_PANEL: usize = 48;
 /// Product work (Σ g·q²) from which a group of fewer leaves than workers
 /// is batched through exact products.
 const SHORT_BATCH_WORK: u128 = 1 << 30;
-/// Product entries buffered by one batch of exact leaf contributions.
-const BATCH_PRODUCT_ENTRIES: usize = 1 << 24;
+/// Estimated workspace of one batch of exact leaf contributions.
+const BATCH_WORK_BYTES: usize = 4 << 30;
 /// Residue-product ways a split exact factor offers to idle workers.
 const EXACT_FACTOR_WAYS: usize = 8;
 /// Per-step factor tasks are small: split a leaf factor only with at least
@@ -995,18 +995,22 @@ fn subtract_contributions<T: FloatT>(
                 subtract_contributions_columns(group, s, t, pool);
                 continue;
             }
-            // At most one leaf per worker and `BATCH_PRODUCT_ENTRIES` product
-            // entries per batch (mixed Λ27/1024: all 117 products at once
-            // raised 128-thread peak RSS from 23 to 39 GiB).
+            // At most one leaf per worker and `BATCH_WORK_BYTES` of estimated
+            // workspace per batch: Y, Z and the product in working precision
+            // plus their per-prime residues (about bits/8 primes of 8 bytes).
+            // Mixed Λ27/1024 (border 524): batching all 117 leaves raised
+            // 128-thread peak RSS from 23 to 37 GiB.
+            let words = std::mem::size_of::<T>() + T::precision_bits() / 8 * 8;
             let mut batches = Vec::new();
-            let (mut start, mut entries) = (0, 0);
+            let (mut start, mut bytes) = (0, 0);
             for (i, leaf) in group.iter().enumerate() {
-                let e = triangular_number(leaf.coupled.len());
-                if i > start && (i - start == width || entries + e > BATCH_PRODUCT_ENTRIES) {
+                let (g, q) = (leaf.ids.len(), leaf.coupled.len());
+                let b = (2 * g * q + q * q) * words;
+                if i > start && (i - start == width || bytes + b > BATCH_WORK_BYTES) {
                     batches.push(&group[start..i]);
-                    (start, entries) = (i, 0);
+                    (start, bytes) = (i, 0);
                 }
-                entries += e;
+                bytes += b;
             }
             batches.push(&group[start..]);
             for batch in batches {

@@ -395,15 +395,47 @@ where
             operator = SampledOperator::new(linear, blocks)
                 .expect("presolve retains complete sampled blocks");
         }
-        for block in operator.blocks() {
-            let sigma = self.equilibration.e[block.row_start];
-            for row in block.row_start..block.row_start + block.row_count() {
-                self.b[row] *= sigma / self.equilibration.e[row];
-                self.equilibration.e[row] = sigma;
-                self.equilibration.einv[row] = sigma.recip();
+        // Each sampled block takes its first row's scale; blocks own disjoint
+        // rows, so they are rescaled in parallel (one division per row).
+        {
+            let eq = &mut self.equilibration;
+            let mut spans: Vec<(usize, usize, T)> = operator
+                .blocks()
+                .iter()
+                .map(|b| (b.row_start, b.row_count(), eq.e[b.row_start]))
+                .collect();
+            spans.sort_unstable_by_key(|s| s.0);
+            let mut rest = (&mut self.b[..], &mut eq.e[..], &mut eq.einv[..]);
+            let mut offset = 0;
+            let mut parts = Vec::with_capacity(spans.len());
+            for &(start, len, sigma) in &spans {
+                let (_, b) = std::mem::take(&mut rest.0).split_at_mut(start - offset);
+                let (_, e) = std::mem::take(&mut rest.1).split_at_mut(start - offset);
+                let (_, einv) = std::mem::take(&mut rest.2).split_at_mut(start - offset);
+                let (b, b_rest) = b.split_at_mut(len);
+                let (e, e_rest) = e.split_at_mut(len);
+                let (einv, einv_rest) = einv.split_at_mut(len);
+                rest = (b_rest, e_rest, einv_rest);
+                offset = start + len;
+                parts.push((b, e, einv, sigma));
+            }
+            let rescale = |(b, e, einv, sigma): (&mut [T], &mut [T], &mut [T], T)| {
+                for ((b, e), einv) in b.iter_mut().zip(e.iter_mut()).zip(einv.iter_mut()) {
+                    *b *= sigma / *e;
+                    *e = sigma;
+                    *einv = sigma.recip();
+                }
+            };
+            match pool {
+                Some(p) if p.current_num_threads() > 1 => {
+                    use rayon::prelude::*;
+                    p.install(|| parts.into_par_iter().for_each(rescale))
+                }
+                _ => parts.into_iter().for_each(rescale),
             }
         }
-        operator.scale(&self.equilibration.d, &self.equilibration.e);
+        let (d, e) = (&self.equilibration.d, &self.equilibration.e);
+        operator.scale_with(d, e, |linear| lrscale_pooled(linear, e, Some(d), pool));
         // The stored factors define this input. Assembly and operator products
         // are allowed their ordinary working-precision rounding differences.
         // Release the Ruiz-scaled copy before assembling its replacement.
@@ -509,7 +541,7 @@ where
 
         // perform scaling operations for a fixed number of steps
         for _ in 0..settings.equilibrate_max_iter {
-            kkt_col_norms(P, A, dwork, ework);
+            kkt_col_norms_pooled(P, A, dwork, ework, pool.as_deref());
 
             //zero rows or columns should not get scaled
             dwork.scalarop(|x| if x == T::zero() { T::one() } else { x });
@@ -519,11 +551,23 @@ where
             ework.rsqrt();
 
             // bound the cumulative scaling
-            for (dwork, &d) in izip!(dwork.iter_mut(), d.iter()) {
-                *dwork = T::clip(dwork, scale_min / d, scale_max / d);
-            }
-            for (ework, &e) in izip!(ework.iter_mut(), e.iter()) {
-                *ework = T::clip(ework, scale_min / e, scale_max / e);
+            let bound = |w: &mut [T], s: &[T]| {
+                for (w, &s) in izip!(w.iter_mut(), s.iter()) {
+                    *w = T::clip(w, scale_min / s, scale_max / s);
+                }
+            };
+            match pool.as_deref() {
+                Some(p) if ework.len() >= POOLED_RUIZ_MIN => p.install(|| {
+                    use rayon::prelude::*;
+                    rayon::join(
+                        || dwork.par_chunks_mut(RUIZ_CHUNK).zip(d.par_chunks(RUIZ_CHUNK)).for_each(|(w, s)| bound(w, s)),
+                        || ework.par_chunks_mut(RUIZ_CHUNK).zip(e.par_chunks(RUIZ_CHUNK)).for_each(|(w, s)| bound(w, s)),
+                    );
+                }),
+                _ => {
+                    bound(dwork, d);
+                    bound(ework, e);
+                }
             }
 
             // Scale the problem data and update the
@@ -583,6 +627,55 @@ fn kkt_col_norms<T: FloatT>(
     P.col_norms_sym(norm_LHS); // P can be triu
     A.col_norms_no_reset(norm_LHS); // incrementally from P norms
     A.row_norms(norm_RHS); // same as column norms of A'
+}
+
+/// Rows from which the Ruiz norm and bound passes run on the pool (mixed
+/// Λ27/1024, 544k rows and 61M entries: about 3.9 s per serial pass).
+const POOLED_RUIZ_MIN: usize = 1 << 14;
+const RUIZ_CHUNK: usize = 1 << 12;
+
+/// [`kkt_col_norms`] on the pool for large `A`: columns split over workers;
+/// rows split into ranges, each scanning every column's sorted rows within
+/// its range. Maxima of the same values, so the norms are identical.
+fn kkt_col_norms_pooled<T: FloatT>(
+    P: &CscMatrix<T>,
+    A: &CscMatrix<T>,
+    norm_LHS: &mut [T],
+    norm_RHS: &mut [T],
+    pool: Option<&rayon::ThreadPool>,
+) {
+    use rayon::prelude::*;
+    let Some(pool) = pool.filter(|p| p.current_num_threads() > 1 && A.m >= POOLED_RUIZ_MIN) else {
+        return kkt_col_norms(P, A, norm_LHS, norm_RHS);
+    };
+    P.col_norms_sym(norm_LHS);
+    let (colptr, rowval, nzval) = (&A.colptr, &A.rowval, &A.nzval);
+    pool.install(|| {
+        rayon::join(
+            || {
+                norm_LHS.par_iter_mut().enumerate().with_min_len(64).for_each(|(j, v)| {
+                    *v = nzval[colptr[j]..colptr[j + 1]]
+                        .iter()
+                        .fold(*v, |m, &x| T::max(m, T::abs(x)));
+                })
+            },
+            || {
+                norm_RHS.par_chunks_mut(RUIZ_CHUNK).enumerate().for_each(|(k, out)| {
+                    out.fill(T::zero());
+                    let (r0, r1) = (k * RUIZ_CHUNK, k * RUIZ_CHUNK + out.len());
+                    for j in 0..A.n {
+                        let rows = &rowval[colptr[j]..colptr[j + 1]];
+                        let lo = rows.partition_point(|&r| r < r0);
+                        let hi = lo + rows[lo..].partition_point(|&r| r < r1);
+                        for p in colptr[j] + lo..colptr[j] + hi {
+                            let v = &mut out[rowval[p] - r0];
+                            *v = T::max(*v, T::abs(nzval[p]));
+                        }
+                    }
+                })
+            },
+        )
+    });
 }
 
 fn scale_data<T: FloatT>(
