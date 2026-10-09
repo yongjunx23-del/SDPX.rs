@@ -51,12 +51,12 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 | Λ19 | 121 it / 71.0 s, audited | — |
 | ising11 (512 bits) | 54 it / 3.44 s | — |
 | Λ35 spins 0–70 | fails: InsufficientProgress 887, p − ref 1.5e-26; 1024 bits Solved 743 it / 3565 s | SDPB 746 it / 2009 s |
-| Float64 58 cases (int3) | 48 audited solves, 0 Solved-but-fail; wins 9–10 (1 thr), 9 (16 thr) | MOSEK |
+| Float64 58 cases (int4) | 48 audited solves, 0 Solved-but-fail; wins 11 (1 thr), 8 (16 thr) | MOSEK |
 
-These Ising figures include task 15. Of the Float64 figures, wins and geo-means are from int3; the same-node geo-means below include task 13.
+These Ising figures include task 15. The Float64 figures are from int4, which includes task 13.
 
 - **Float64 geo-mean SDPX/MOSEK at 1 thread:**
-  - int3: LP 3.6–4.2, SDP 1.7–2.0, SOCP 1.7–1.9.
+  - int4: LP 3.03, SDP 1.80, SOCP 1.68 (16 threads: 2.17 / 2.18 / 1.80).
   - Task 13, same-node A/B: LP 2.3, SDP 1.5, SOCP 1.5.
 - **Float64 not Solved:** hinf3, qap6, gpp100/124/250/500, sched_100_50_orig, csdr3, f64_medium (AlmostSolved/26), f64_large (AlmostSolved/20; 125 s at 1 thread, 48 s at 16).
 - **Tiny LPs** lose on per-solve overhead: 2–20 ms against MOSEK's warm 1–5 ms.
@@ -88,11 +88,11 @@ These Ising figures include task 15. Of the Float64 figures, wins and geo-means 
   - Task 12: fixed-τ phase, MPFR only.
   - Task 14: data-scaled unit-fallback τ₀ (Λ27 376 → 183 it).
   - Per-factor arrow row block.
-- **Task 15 (`perf-iter` `a68f72f`, merging):**
+- **Task 15 (`perf-iter` `a68f72f`, merged `9454332`):**
   - Shared sampled linear products (bitwise identical).
   - Square-root-free Givens replay in the MPFR SVD (replay CPU −32%, audits pass).
   - Λ27 −4.9%, s50 −7.0%, Λ19 −5.3%, ising11 −4.3%.
-- **Task 13 (`perf-small` `ad536de`, gating as int4):**
+- **Task 13 (`perf-small` `ad536de`, merged; int4 gate identical statuses/iterations/audits, geo-mean 0.835/0.911 vs int3):**
   - Lazy QDLDL parallel plan; one AMD ordering; Mersenne modular minor.
   - Receipt CPU clocks only with worker threads.
   - Binary64 arrow split thresholds; PSD scratch per cone order.
@@ -144,8 +144,7 @@ These Ising figures include task 15. Of the Float64 figures, wins and geo-means 
 
 | Task | Branch | Scope | Gate |
 |---|---|---|---|
-| 13 | `perf-small` `ad536de` | Float64 per-solve/iteration overhead (done) | int4 58-case scoreboard with FMA, then merge |
-| 15 | `perf-iter` `a68f72f` | MPFR per-iteration cost (done) | Merge; recheck with the combined build |
+| 17 | `perf-l35b` | Λ35 end game SDPB-style (next-work item 1) | Λ35 Solved + audit; Ising ABBA, csdr3, gravity256, 2×2 PMP no worse |
 | 16 | `perf-endgame` | Float64 end game: AlmostSolved → audited Solved, no test loosened | 58-case scoreboard; Λ19 ABBA if MPFR-reachable |
 
 ## Next work, in order

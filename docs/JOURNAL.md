@@ -8,6 +8,24 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — task 13 (perf-small) kept; FMA builds
+
+- Merged `perf-small` `ad536de`:
+  - lazy QDLDL parallel plan;
+  - one AMD ordering;
+  - Mersenne modular minor;
+  - receipt CPU clocks only with worker threads;
+  - binary64 arrow split thresholds;
+  - PSD scratch per cone order.
+
+  All 116 points are bitwise identical to int1. Same-node interleaved A/B over 55 cases: geo-mean 0.863 at 1 thread and 0.861 at 16.
+- Cluster builds now use `-C target-feature=+fma`. Points are bitwise identical (17 cases checked), and 1 thread is 2–18% faster (theta1 0.82, chainsing 0.88).
+- Gate: int4 (ad536de + FMA) against int3 on the 58-case scoreboard (`t7/int4v3-compare.md`). Statuses, iterations (638) and audits are identical.
+  - Geo-mean time (cross-node): 0.835 at 1 thread, 0.911 at 16.
+  - Wins vs MOSEK: 9 → 11 at 1 thread, 9 → 8 at 16 (small-case noise).
+  - Geo-mean SDPX/MOSEK at 1 thread: LP 3.03, SDP 1.80, SOCP 1.68.
+- Observed: the run-to-run bimodality of 2–20 ms solves comes from the conservative CPU governor and cold processes, not from SDPX threading.
+
 ## 2026-10-09 — one plan; SDPB design notes; task 15 result
 
 - Reconciled the two plans: slim-repo `a450d6b` (large-case review) and perf-cc1007 (the performance campaign). There is now one `REVIEW_AND_PLAN.md`.
