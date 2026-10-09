@@ -21,7 +21,7 @@
 //! constant diagonal operands rely on their owner to invalidate the cache.
 use num_traits::{FromPrimitive, Zero};
 use rayon::prelude::*;
-use sdpx_arithmetic::{DyadicKind, MpFloat};
+use sdpx_arithmetic::{DyadicKind, MpFloat, Scalar};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -868,67 +868,48 @@ impl CachedResidues {
             return Self::from_chunks(chunks, plan);
         }
         let count = plan.count();
-        let per = len.div_ceil(ways);
-        let work = |w: usize| -> CachedResidues {
-            let (r0, r1) = (w * per, ((w + 1) * per).min(len));
-            let view = chunks.rows(r0, r1);
-            let len_w = r1 - r0;
-            let mut part = if plan.bits <= 24 {
-                Self::Narrow(Vec::with_capacity(len_w * count))
-            } else {
-                Self::Wide(Vec::with_capacity(len_w * count))
-            };
-            let mut scratch = Vec::new();
-            for q0 in (0..count).step_by(STREAM_GROUP) {
-                let q1 = (q0 + STREAM_GROUP).min(count);
-                group_residues(view, plan, q0, q1, &mut scratch);
-                match &mut part {
-                    Self::Narrow(values) => values.extend(scratch.iter().map(|&value| {
-                        let [a, b, c, _] = (value as i32).to_le_bytes();
-                        [a, b, c]
-                    })),
-                    Self::Wide(values) => values.extend(scratch.iter().map(|&value| value as f32)),
+        fn encode<T: Copy + Send + Sync>(
+            chunks: &ChunkMatrix,
+            plan: &Plan,
+            split: &Split<'_>,
+            out: &mut [T],
+            compress: impl Fn(f64) -> T + Sync,
+        ) {
+            let (len, count) = (chunks.len, plan.count());
+            let ways = split_ways(split).min(len / MIN_ROWS_PER_WAY).max(1);
+            let out = SendValues(out.as_mut_ptr());
+            let work = |w: usize| {
+                let (r0, r1) = (w * len / ways, (w + 1) * len / ways);
+                let view = chunks.rows(r0, r1);
+                let mut scratch = Vec::new();
+                for q0 in (0..count).step_by(STREAM_GROUP) {
+                    let q1 = (q0 + STREAM_GROUP).min(count);
+                    group_residues(view, plan, q0, q1, &mut scratch);
+                    for (qi, column) in scratch.chunks(r1 - r0).enumerate() {
+                        let at = (q0 + qi) * len + r0;
+                        for (i, &value) in column.iter().enumerate() {
+                            // SAFETY: way w owns entries r0..r1 of every prime;
+                            // the destination stays allocated until all ways finish.
+                            unsafe { *out.get().add(at + i) = compress(value) };
+                        }
+                    }
                 }
-            }
-            part
-        };
-        let encode = || {
-            let parts: Vec<CachedResidues> = (0..ways).into_par_iter().map(work).collect();
-            // Merge prime-major part rows into the shared `[q·len + e]` layout.
-            if plan.bits <= 24 {
-                let mut out = vec![[0u8; 3]; len * count];
-                out.par_chunks_mut(len).enumerate().for_each(|(q, col)| {
-                    let mut off = 0;
-                    for part in &parts {
-                        let Self::Narrow(values) = part else {
-                            continue;
-                        };
-                        let lw = values.len() / count;
-                        col[off..off + lw].copy_from_slice(&values[q * lw..(q + 1) * lw]);
-                        off += lw;
-                    }
-                });
-                Self::Narrow(out)
-            } else {
-                let mut out = vec![0.0f32; len * count];
-                out.par_chunks_mut(len).enumerate().for_each(|(q, col)| {
-                    let mut off = 0;
-                    for part in &parts {
-                        let Self::Wide(values) = part else {
-                            continue;
-                        };
-                        let lw = values.len() / count;
-                        col[off..off + lw].copy_from_slice(&values[q * lw..(q + 1) * lw]);
-                        off += lw;
-                    }
-                });
-                Self::Wide(out)
-            }
-        };
-        match split {
-            Split::Pool(p) => p.install(encode),
-            _ => encode(),
+            };
+            run_ways(split, ways, work);
         }
+        let mut stored = if plan.bits <= 24 {
+            Self::Narrow(vec![[0u8; 3]; len * count])
+        } else {
+            Self::Wide(vec![0.0f32; len * count])
+        };
+        match &mut stored {
+            Self::Narrow(values) => encode(chunks, plan, split, values, |value| {
+                let [a, b, c, _] = (value as i32).to_le_bytes();
+                [a, b, c]
+            }),
+            Self::Wide(values) => encode(chunks, plan, split, values, |value| value as f32),
+        }
+        stored
     }
 
     fn extend(&self, range: std::ops::Range<usize>, out: &mut Vec<f64>) {
@@ -1849,10 +1830,13 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
         .max()
         .unwrap_or(0);
     let slots_per = top.div_ceil(64) + 2;
-    let ways = split_ways(&split).min(groups.len()).max(1);
+    let ways = split_ways(&split)
+        .min(groups.len())
+        .max(1)
+        .min(SLOT_BUDGET / slots_per / outputs);
     // Group windows make any exponent spread encodable; only the exact
     // accumulator grows with it. Past this, exact dots are cheaper.
-    if outputs * slots_per * ways > SLOT_BUDGET {
+    if ways == 0 {
         crate::receipt::finish("rns.block_gemm", timer);
         return false;
     }
@@ -1876,6 +1860,9 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
                     let at = local + position * width(&blocks[b]);
                     let (a0, b0) = ((j * kr + i) * ca.chunks, (j * kr + i) * cb.chunks);
                     let z = y[at] * d[local];
+                    if !z.is_finite() {
+                        return None;
+                    }
                     fill_chunk(&z, &mut ca.e[a0..a0 + ca.chunks], group.lo.0, ca.width);
                     fill_chunk(&y[at], &mut cb.e[b0..b0 + cb.chunks], group.lo.1, cb.width);
                 }
@@ -1903,12 +1890,16 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
             let shift = (group.lo.0 + group.lo.1 - base) as usize;
             acc.accumulate(plan, shift, &group.columns, &mut slots, slots_per);
         }
-        slots
+        Some(slots)
     };
-    let parts: Vec<Vec<i128>> = match &split {
-        Split::Serial => vec![build(0)],
+    let parts: Option<Vec<Vec<i128>>> = match &split {
+        Split::Serial => build(0).map(|slots| vec![slots]),
         Split::Pool(p) => p.install(|| (0..ways).into_par_iter().map(build).collect()),
         Split::Ways(_) => (0..ways).into_par_iter().map(build).collect(),
+    };
+    let Some(parts) = parts else {
+        crate::receipt::finish("rns.block_gemm", timer);
+        return false;
     };
     let mut parts = parts.into_iter();
     let mut total = parts.next().unwrap();

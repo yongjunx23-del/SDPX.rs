@@ -372,6 +372,44 @@ fn residue_split_encode_matches_serial() {
             .zip(&serial.e)
             .all(|(a, b)| a.to_bits() == b.to_bits()));
     }
+    for bits in [24, 25] {
+        let plan = Plan::with_count(bits, plan.count());
+        let chunks = chunk_matrix(x, lo, hi - lo, &plan, &Split::Serial);
+        let serial = CachedResidues::from_chunks(&chunks, &plan);
+        for split in [Split::Pool(&pool), Split::Ways(3)] {
+            let parallel =
+                pool.install(|| CachedResidues::from_chunks_split(&chunks, &plan, &split));
+            match (&serial, &parallel) {
+                (CachedResidues::Narrow(a), CachedResidues::Narrow(b)) => assert_eq!(a, b),
+                (CachedResidues::Wide(a), CachedResidues::Wide(b)) => {
+                    assert!(a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits()));
+                }
+                _ => panic!("cache widths differ"),
+            }
+        }
+    }
+}
+
+#[test]
+fn residue_block_gemm_declines_rounded_product_overflow() {
+    let y = vec![F::<2>::max_value(); 2];
+    let d = vec![F::from_f64(2.0).unwrap()];
+    assert!((y[0] * d[0]).is_infinite());
+    let columns = [[0, 1], [1, 2]];
+    let blocks = [
+        (y.as_slice(), d.as_slice(), columns[0].as_slice()),
+        (y.as_slice(), d.as_slice(), columns[1].as_slice()),
+    ];
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(3)
+        .build()
+        .unwrap();
+    let sentinel = F::from_f64(7.0).unwrap();
+    for pool in [None, Some(&pool)] {
+        let mut out = vec![sentinel; 9];
+        assert!(!gemm_blocks_upper(3, &blocks, &mut out, pool));
+        assert!(out.iter().all(|&value| value == sentinel));
+    }
 }
 
 #[test]
