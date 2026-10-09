@@ -67,11 +67,13 @@ pub(super) fn givens<const N: usize>(x: F<N>, y: F<N>) -> (F<N>, F<N>, F<N>) {
     }
 }
 /// A Givens rotation of columns `p, p+1`; the owning log identifies U or V.
+/// `replay_rotations` rewrites `c, s` into its fast-update multipliers.
 #[derive(Clone, Copy)]
 pub(super) struct Rotation<const N: usize> {
     p: usize,
     c: F<N>,
     s: F<N>,
+    swap: bool,
 }
 
 // Keep only the requested factors. NT scaling requests V alone; QR still
@@ -85,7 +87,12 @@ pub(super) struct RotationLog<const N: usize> {
 }
 impl<const N: usize> RotationLog<N> {
     fn push(&mut self, v: bool, p: usize, c: F<N>, s: F<N>) {
-        let r = Rotation { p, c, s };
+        let r = Rotation {
+            p,
+            c,
+            s,
+            swap: false,
+        };
         if v && self.keep_v {
             self.v.push(r);
         } else if !v && self.keep_u {
@@ -95,34 +102,71 @@ impl<const N: usize> RotationLog<N> {
 }
 
 /// Apply the logged rotations of one factor (`cols` columns of `rows`
-/// entries, column-major) in log order. Rows are independent: each row
-/// receives exactly the scalar operations of an in-place column rotation, in
-/// the same order, so the result is bitwise identical. The factor is processed
-/// as row-major rows (adjacent `p, p+1`), split across the ambient pool when
-/// inner parallelism is active.
+/// entries, column-major) in log order as fast (square-root-free) Givens
+/// updates. The factor is kept as `Â·diag(scale)`: a rotation of columns
+/// `p, p+1` rescales them and leaves `Â` two correctly rounded multiply-adds
+/// per row (type 1, `|c| >= |s|`: `x + αy, y + βx`; type 2: `αx + y,
+/// x + βy`), instead of two `c·x + s·y` pairs of products. Relative to the
+/// true columns each update's rounding error is the plain rotation's;
+/// `scale` stays within `[2^-k/2, 1]` after `k` rotations (MPFR exponents),
+/// and is folded back once at the end. Rows are independent and see the
+/// rotations in order, so row splits are bitwise neutral. The factor is
+/// processed as row-major rows, split across the ambient pool when inner
+/// parallelism is active.
 fn replay_rotations<const N: usize>(
-    log: &[Rotation<N>],
+    log: &mut [Rotation<N>],
     a: &mut [F<N>],
     rows: usize,
     cols: usize,
     t: &mut [F<N>],
+    scale: &mut [F<N>],
 ) {
     if a.is_empty() || log.is_empty() {
         return;
     }
     debug_assert_eq!(t.len(), rows * cols);
+    let scale = &mut scale[..cols];
+    scale.fill(F::one());
+    for r in log.iter_mut() {
+        let (p, q) = (r.p, r.p + 1);
+        let (dp, dq) = (scale[p], scale[q]);
+        r.swap = r.c.abs() < r.s.abs();
+        let (alpha, beta) = if r.swap {
+            let ratio = r.c / r.s;
+            scale[p] = r.s * dq;
+            scale[q] = -(r.s * dp);
+            (ratio * (dp / dq), -(ratio * (dq / dp)))
+        } else {
+            let ratio = r.s / r.c;
+            scale[p] = r.c * dp;
+            scale[q] = r.c * dq;
+            (ratio * (dq / dp), -(ratio * (dp / dq)))
+        };
+        r.c = alpha;
+        r.s = beta;
+    }
     for j in 0..cols {
         for i in 0..rows {
             t[j + i * cols] = a[i + j * rows];
         }
     }
-    // Small row tiles reuse coefficients without changing any row's rotation
+    // Small row tiles reuse coefficients without changing any row's update
     // order.
     let tile = 4 * cols;
+    let log = &*log;
     let apply = |rows: &mut [F<N>]| {
         for rows in rows.chunks_mut(tile) {
             for r in log {
-                F::rotate_adjacent_rows(rows, cols, r.p, &r.c, &r.s);
+                for row in rows.chunks_exact_mut(cols) {
+                    let (x, y) = (row[r.p], row[r.p + 1]);
+                    if r.swap {
+                        row[r.p] = r.c.mul_add(x, y);
+                        row[r.p + 1] = r.s.mul_add(y, x);
+                    } else {
+                        row[r.p] = r.c.mul_add(y, x);
+                        row[r.p + 1] = r.s.mul_add(x, y);
+                    }
+                }
             }
         }
     };
@@ -130,11 +174,11 @@ fn replay_rotations<const N: usize>(
     // so splitting them is bitwise neutral. On a pool worker, offer the rows
     // even without granted ways: rayon splits only when idle threads steal,
     // letting them finish the last, largest cones of a scaling phase.
-    // Tasks carry at least one grain of work (a rotation is four
-    // multiply-adds per row), so small blocks stay serial.
+    // Tasks carry at least one grain of work (an update is two multiply-adds
+    // per row), so small blocks stay serial.
     let offer =
         sdpx_arithmetic::inner_parallel::active() || rayon::current_thread_index().is_some();
-    let work = (rows * log.len() * 4) as u128 * w::<N>();
+    let work = (rows * log.len() * 2) as u128 * w::<N>();
     let parts = tasks_if(offer, work, rows);
     if parts > 1 {
         t.par_chunks_mut(rows.div_ceil(parts) * cols).for_each(apply);
@@ -143,7 +187,7 @@ fn replay_rotations<const N: usize>(
     }
     for j in 0..cols {
         for i in 0..rows {
-            a[i + j * rows] = t[j + i * cols];
+            a[i + j * rows] = t[j + i * cols] * scale[j];
         }
     }
 }
@@ -665,9 +709,9 @@ pub(super) fn svd<'a, const N: usize>(
         let timer = crate::receipt::start();
         // Output ordering runs after reflector reconstruction, so its buffers
         // can hold the row-major replay without another dense allocation.
-        replay_rotations(&log.u, u, m, uc, sorted_u);
+        replay_rotations(&mut log.u, u, m, uc, sorted_u, scratch);
         if vr > 0 {
-            replay_rotations(&log.v, v, n, n, vt);
+            replay_rotations(&mut log.v, v, n, n, vt, scratch);
         }
         crate::receipt::finish("svd.replay", timer);
         Ok::<(), i32>(())
