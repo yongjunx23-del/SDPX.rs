@@ -714,11 +714,16 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         self.reduced.set_residual_pool(self.pool.clone());
         self.reduced.set_factor_pool(self.pool.clone());
         self.refresh_parallel_plan();
+        let mut active_psd = false;
         self.parallel_assembly = self.pool.is_some()
             && self.blocks.iter().all(|block| match &block.scaling {
-                Scaling::Psd(p) => p.schur_values.len() == triangular_number(p.columns.len()),
+                Scaling::Psd(p) => {
+                    active_psd |= !p.columns.is_empty();
+                    p.schur_values.len() == triangular_number(p.columns.len())
+                }
                 _ => true,
-            });
+            })
+            && active_psd;
         let inner_sampled = self.inner_sampled;
         let pool = &self.pool;
         let world = self.mpi_world();
