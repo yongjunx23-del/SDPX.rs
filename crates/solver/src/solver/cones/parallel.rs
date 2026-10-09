@@ -430,8 +430,10 @@ impl Drop for SolveAffinityGuard {
 /// lifetime. A wider mask is left alone, so unbound processes sharing a node
 /// never collide on the same cores. Measured −4% at 52 threads (Λ19 spins 0–50). Unpinned workers migrate between cores and lose
 /// their caches, and at high thread counts every phase (serial ones too)
-/// measured 20–40% slower per call. A pool narrower than the budget uses
-/// its first `workers` CPUs. The caller keeps its mask, so later pools and
+/// measured 20–40% slower per call. A pool narrower than the budget takes
+/// its CPUs round-robin over the allocation's last-level caches and
+/// packages (64 threads spread over both sockets of a 2×64-core EPYC ran
+/// 3–9% faster per iteration than packed on one). The caller keeps its mask, so later pools and
 /// repeated handle calls inherit the original allocation. Linux only;
 /// elsewhere a no-op.
 pub(crate) fn pin_worker(budget: usize, workers: usize) -> impl Fn(usize) + Send + Sync + 'static {
@@ -449,6 +451,7 @@ pub(crate) fn pin_worker(budget: usize, workers: usize) -> impl Fn(usize) + Send
     #[cfg(not(target_os = "linux"))]
     let cpus: Vec<usize> = Vec::new();
     let pin = cpus.len() == budget;
+    let cpus = if pin && workers < budget { spread(cpus) } else { cpus };
     move |i: usize| {
         debug_assert!(i < workers);
         #[cfg(target_os = "linux")]
@@ -462,6 +465,35 @@ pub(crate) fn pin_worker(budget: usize, workers: usize) -> impl Fn(usize) + Send
         #[cfg(not(target_os = "linux"))]
         let _ = (i, pin, &cpus);
     }
+}
+
+/// `cpus` reordered round-robin over their (package, last-level cache)
+/// groups, so a prefix of any length spreads over every group.
+#[cfg(target_os = "linux")]
+fn spread(cpus: Vec<usize>) -> Vec<usize> {
+    let read = |path: String| std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<i64>().ok());
+    let mut groups: std::collections::BTreeMap<(i64, i64), Vec<usize>> = Default::default();
+    for &cpu in &cpus {
+        let base = format!("/sys/devices/system/cpu/cpu{cpu}");
+        let package = read(format!("{base}/topology/physical_package_id")).unwrap_or(0);
+        let cache = read(format!("{base}/cache/index3/id")).unwrap_or(0);
+        groups.entry((package, cache)).or_default().push(cpu);
+    }
+    let groups: Vec<Vec<usize>> = groups.into_values().collect();
+    let mut out = Vec::with_capacity(cpus.len());
+    for round in 0.. {
+        let before = out.len();
+        out.extend(groups.iter().filter_map(|g| g.get(round)));
+        if out.len() == before {
+            break;
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spread(cpus: Vec<usize>) -> Vec<usize> {
+    cpus
 }
 
 fn balanced_lanes<T: FloatT>(

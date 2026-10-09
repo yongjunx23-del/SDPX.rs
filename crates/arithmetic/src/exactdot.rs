@@ -165,6 +165,90 @@ pub(crate) fn dot_slices<'a, const N: usize>(
     exact.unwrap_or_else(|| dot(a.iter().zip(b), chain))
 }
 
+/// Accumulator limbs for exponent sums in `[emin, emax]`, if supported.
+/// Bit 0 of the accumulator weighs 2^(emin - 2P). A term with exponent sum
+/// e lands at bit offset e - emin; its 2N-limb product plus one shift limb
+/// ends at or below limb (emax - emin)/64 + 2N + 1. One further limb absorbs
+/// the carry growth of up to 2^64 terms.
+/// [`dot_slices`] over `chunks` contiguous pieces whose exact partial sums
+/// `par_for(chunks, f)` may compute concurrently (calling `f(k)` once for
+/// every `k < chunks`). The partial sums share one alignment and add exactly,
+/// so the value is the same as `dot_slices`.
+pub(crate) fn dot_slices_chunked<'a, const N: usize>(
+    a: &'a [MpFloat<N>],
+    b: &'a [MpFloat<N>],
+    chunks: usize,
+    par_for: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
+    chain: impl Fn(&mut dyn Iterator<Item = Pair<'a, N>>) -> MpFloat<N>,
+) -> MpFloat<N> {
+    assert_eq!(a.len(), b.len());
+    let chunks = chunks.min(a.len()).max(1);
+    if chunks < 2 || N > MAX_N {
+        return dot_slices(a, b, chain);
+    }
+    let size = a.len().div_ceil(chunks);
+    let chunks = a.len().div_ceil(size);
+    let regular = |k: i32| k.abs() == mpfr::REGULAR_KIND;
+    let zero = |k: i32| k.abs() == mpfr::ZERO_KIND;
+    let scans = std::sync::Mutex::new(vec![(i64::MAX, i64::MIN, true); chunks]);
+    par_for(chunks, &|k| {
+        let (mut emin, mut emax, mut finite) = (i64::MAX, i64::MIN, true);
+        let r = k * size..((k + 1) * size).min(a.len());
+        for (x, y) in a[r.clone()].iter().zip(&b[r]) {
+            if regular(x.kind) && regular(y.kind) {
+                let e = x.exponent as i64 + y.exponent as i64;
+                emin = emin.min(e);
+                emax = emax.max(e);
+            } else if !(zero(x.kind) && (zero(y.kind) || regular(y.kind))
+                || zero(y.kind) && regular(x.kind))
+            {
+                finite = false;
+            }
+        }
+        scans.lock().unwrap()[k] = (emin, emax, finite);
+    });
+    let (emin, emax, finite) = scans
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .fold((i64::MAX, i64::MIN, true), |(a, b, c), (x, y, z)| (a.min(x), b.max(y), c && z));
+    let len = match (finite, emin == i64::MAX) {
+        (_, true) if finite => return MpFloat::<N>::default(),
+        (true, false) => acc_len::<N>(emin, emax),
+        _ => None,
+    };
+    let Some(len) = len else {
+        return dot_slices(a, b, chain);
+    };
+    let parts = std::sync::Mutex::new(vec![(Vec::new(), Vec::new()); chunks]);
+    par_for(chunks, &|k| {
+        let (mut pos, mut neg) = (vec![0u64; len], vec![0u64; len]);
+        let r = k * size..((k + 1) * size).min(a.len());
+        let terms = a[r.clone()]
+            .iter()
+            .zip(&b[r])
+            .filter(|(x, y)| regular(x.kind) && regular(y.kind));
+        add_terms(&mut pos, &mut neg, emin, len, N <= INLINE_N, terms);
+        parts.lock().unwrap()[k] = (pos, neg);
+    });
+    let mut parts = parts.into_inner().unwrap().into_iter();
+    let (mut pos, mut neg) = parts.next().unwrap();
+    for (p, n) in parts {
+        // SAFETY: all accumulators hold `len` limbs; the total of all terms
+        // fits by the bound on `len`, so no carry leaves the top limb.
+        unsafe {
+            gmp::mpn_add_n(pos.as_mut_ptr(), pos.as_ptr(), p.as_ptr(), len as _);
+            gmp::mpn_add_n(neg.as_mut_ptr(), neg.as_ptr(), n.as_ptr(), len as _);
+        }
+    }
+    round_acc(&mut pos, &mut neg, len, emin).unwrap_or_else(|| dot_slices(a, b, chain))
+}
+
+fn acc_len<const N: usize>(emin: i64, emax: i64) -> Option<usize> {
+    let len = usize::try_from(emax - emin).ok()? / 64 + 2 * N + 3;
+    (len <= MAX_ACC_LIMBS).then_some(len)
+}
+
 fn accumulate<'a, const N: usize>(
     pos: &mut Vec<u64>,
     neg: &mut Vec<u64>,
@@ -173,18 +257,24 @@ fn accumulate<'a, const N: usize>(
     inline: bool,
     terms: impl Iterator<Item = Pair<'a, N>> + Clone,
 ) -> Option<MpFloat<N>> {
-    // Bit 0 of the accumulator weighs 2^(emin - 2P). A term with exponent sum
-    // e lands at bit offset e - emin; its 2N-limb product plus one shift limb
-    // ends at or below limb (emax - emin)/64 + 2N + 1. One further limb absorbs
-    // the carry growth of up to 2^64 terms.
-    let len = usize::try_from(emax - emin).ok()? / 64 + 2 * N + 3;
-    if len > MAX_ACC_LIMBS {
-        return None;
-    }
+    let len = acc_len::<N>(emin, emax)?;
     for acc in [&mut *pos, &mut *neg] {
         acc.clear();
         acc.resize(len, 0);
     }
+    add_terms(pos, neg, emin, len, inline, terms);
+    round_acc(pos, neg, len, emin)
+}
+
+/// Add every term's exact product into the `len`-limb accumulators.
+fn add_terms<'a, const N: usize>(
+    pos: &mut [u64],
+    neg: &mut [u64],
+    emin: i64,
+    len: usize,
+    inline: bool,
+    terms: impl Iterator<Item = Pair<'a, N>> + Clone,
+) {
     if inline && N <= INLINE_N {
         // The accumulator is picked by the product's sign bit, not a branch:
         // signs of consecutive terms are data-dependent and mispredict.
@@ -237,6 +327,15 @@ fn accumulate<'a, const N: usize>(
             }
         }
     }
+}
+
+/// Round `pos - neg` (bit 0 weighing 2^(emin - 2P)) once, nearest-even.
+fn round_acc<const N: usize>(
+    pos: &mut [u64],
+    neg: &mut [u64],
+    len: usize,
+    emin: i64,
+) -> Option<MpFloat<N>> {
     // SAFETY: both accumulators hold `len` limbs; the difference is written in
     // place into the larger one.
     let (sign, mag) = unsafe {

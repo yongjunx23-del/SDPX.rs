@@ -107,6 +107,17 @@ pub trait Scalar:
         debug_assert_eq!(a.len(), b.len());
         Self::dot_fma(a.iter().zip(b))
     }
+    /// `dot_slices` whose exactly accumulated types may split the work into
+    /// `chunks` pieces run by `par_for(chunks, f)` (which calls `f(k)` once
+    /// for every `k < chunks`, possibly concurrently). Same value.
+    fn dot_slices_chunked(
+        a: &[Self],
+        b: &[Self],
+        _chunks: usize,
+        _par_for: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
+    ) -> Self {
+        Self::dot_slices(a, b)
+    }
     fn ln(self) -> Self;
     fn exp(self) -> Self;
     fn sin(self) -> Self;
@@ -1350,6 +1361,14 @@ impl<const N: usize> Scalar for MpFloat<N> {
     }
     fn dot_slices(a: &[Self], b: &[Self]) -> Self {
         exactdot::dot_slices(a, b, |terms| Self::dot_fma_chain(terms))
+    }
+    fn dot_slices_chunked(
+        a: &[Self],
+        b: &[Self],
+        chunks: usize,
+        par_for: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
+    ) -> Self {
+        exactdot::dot_slices_chunked(a, b, chunks, par_for, |terms| Self::dot_fma_chain(terms))
     }
     fn ln(self) -> Self {
         self.unary(mpfr::log)

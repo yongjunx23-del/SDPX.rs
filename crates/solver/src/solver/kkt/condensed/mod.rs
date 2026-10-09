@@ -2172,8 +2172,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let rows = aligned.map(|w| rank_rows(&self.blocks, w));
         let (x, z) = solution.split_at(self.n);
         let (ex, ez) = out.split_at_mut(self.n);
-        ex.copy_from_slice(&rhs[..self.n]);
-        ez.copy_from_slice(&rhs[self.n..]);
+        copy_pooled(ex, &rhs[..self.n], self.pool.as_deref());
+        copy_pooled(ez, &rhs[self.n..], self.pool.as_deref());
         // These stages own disjoint output/scratch buffers. Sharing the existing
         // pool can fill block-tail idle time without changing either arithmetic
         // order or allocating another set of workers.
@@ -2411,3 +2411,18 @@ mod graded_action_tests;
 #[cfg(test)]
 #[path = "tests/local_policy.rs"]
 mod local_policy_tests;
+
+/// `dst.copy_from_slice(src)`, split over `pool` for long vectors (wide
+/// values make a serial copy of hundreds of thousands of rows tens of
+/// milliseconds on the critical path of every residual).
+fn copy_pooled<T: Copy + Send + Sync>(dst: &mut [T], src: &[T], pool: Option<&rayon::ThreadPool>) {
+    const CHUNK: usize = 1 << 14;
+    match pool {
+        Some(p) if dst.len() > 2 * CHUNK && p.current_num_threads() > 1 => p.install(|| {
+            dst.par_chunks_mut(CHUNK)
+                .zip(src.par_chunks(CHUNK))
+                .for_each(|(d, s)| d.copy_from_slice(s))
+        }),
+        _ => dst.copy_from_slice(src),
+    }
+}

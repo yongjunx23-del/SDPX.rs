@@ -44,6 +44,28 @@ impl<'a, T: FloatT> NormView<'a, T> {
     }
     fn scan(&self) -> ScaledNorm<T> {
         assert_eq!(self.values.len(), self.scales.len());
+        if T::precision_bits() > 64 && self.indices.is_none() && rayon::current_thread_index().is_some()
+            && self.values.len() >= POOLED_SCAN_MIN
+        {
+            // Long scans split over the ambient pool: entrywise products,
+            // then one exact sum of squares from exactly added partial sums
+            // (the same value as the serial scan).
+            let mut scaled = vec![T::zero(); self.values.len()];
+            scaled
+                .par_chunks_mut(POOLED_SCAN_MIN / 4)
+                .zip(self.values.par_chunks(POOLED_SCAN_MIN / 4))
+                .zip(self.scales.par_chunks(POOLED_SCAN_MIN / 4))
+                .for_each(|((out, v), d)| {
+                    for ((o, &v), &d) in out.iter_mut().zip(v).zip(d) {
+                        *o = v * d;
+                    }
+                });
+            let chunks = scaled.len().div_ceil(POOLED_SCAN_MIN / 4);
+            let sumsq = T::dot_slices_chunked(&scaled, &scaled, chunks, &|n, f| {
+                (0..n).into_par_iter().for_each(f)
+            });
+            return ScaledNorm::from_exact_sumsq(sumsq);
+        }
         if T::precision_bits() > 64 {
             return match self.indices {
                 Some(ids) => ScaledNorm::from_exact_squares(
@@ -61,6 +83,9 @@ impl<'a, T: FloatT> NormView<'a, T> {
         }
     }
 }
+
+/// Entries from which a wide-type norm scan is split over the pool.
+const POOLED_SCAN_MIN: usize = 1 << 15;
 
 /// Norm order: x, z, s, rx_inf, Px, rz_inf, rz, rx. Each view holds only the
 /// coordinates counted by this owner and their matching equilibration scales.

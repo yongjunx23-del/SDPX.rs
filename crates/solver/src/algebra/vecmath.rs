@@ -418,7 +418,11 @@ impl<T: FloatT> ScaledNorm<T> {
     /// unnecessary, and this is at least as accurate.
     pub(crate) fn from_exact_squares(x: impl Iterator<Item = T>) -> Self {
         let values: Vec<T> = x.collect();
-        let sumsq = T::dot_slices(&values, &values);
+        Self::from_exact_sumsq(T::dot_slices(&values, &values))
+    }
+
+    /// [`Self::from_exact_squares`] from its rounded exact sum of squares.
+    pub(crate) fn from_exact_sumsq(sumsq: T) -> Self {
         if sumsq.is_nan() {
             // Same poison form as the scaled recurrence.
             return Self {

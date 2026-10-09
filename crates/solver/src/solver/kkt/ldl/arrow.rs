@@ -911,8 +911,11 @@ fn subtract_contributions<T: FloatT>(
     if t == 0 {
         return;
     }
-    // Above the inline-dot precisions, batch substantial products only
-    // when result storage is proportional to Y and outer work fills the pool.
+    // Above the inline-dot precisions, batch substantial products when
+    // result storage is proportional to Y. A batch holds at most one leaf
+    // per worker; a short batch grants its products the spare workers. Both
+    // paths round every entry's exact sum once, so batching never changes
+    // the bits.
     let width = pool.map_or(1, |p| p.current_num_threads());
     let eligible = |leaf: &Leaf<T>| {
         let (g, q) = (leaf.ids.len(), leaf.coupled.len());
@@ -921,7 +924,7 @@ fn subtract_contributions<T: FloatT>(
             && g * q * q >= 1 << 21
             && q * q <= 8 * g * t
     };
-    if leaves.len() >= width && leaves.iter().any(eligible) {
+    if leaves.iter().any(eligible) {
         let build = |leaf: &Leaf<T>| {
             let (g, q) = (leaf.ids.len(), leaf.coupled.len());
             let mut packed = Vec::new();
@@ -954,17 +957,15 @@ fn subtract_contributions<T: FloatT>(
             product
         };
         for group in leaves.chunk_by(|a, b| eligible(a) == eligible(b)) {
-            if !eligible(&group[0]) || group.len() < width {
-                // Keep short leaves column-parallel and avoid square result
+            if !eligible(&group[0]) {
+                // Keep these leaves column-parallel and avoid square result
                 // storage, preserving their position in every entry's sum.
-                subtract_contributions(group, s, t, pool);
+                subtract_contributions_columns(group, s, t, pool);
                 continue;
             }
             for batch in group.chunks(width) {
-                if batch.len() < width {
-                    subtract_contributions(batch, s, t, pool);
-                    continue;
-                }
+                let ways = (width / batch.len()).clamp(1, 8);
+                let build = |leaf: &Leaf<T>| crate::algebra::with_split_hint(ways, || build(leaf));
                 let products: Vec<Vec<T>> = match pool {
                     Some(p) => p.install(|| batch.par_iter().map(build).collect()),
                     None => batch.iter().map(build).collect(),
@@ -995,6 +996,16 @@ fn subtract_contributions<T: FloatT>(
         }
         return;
     }
+    subtract_contributions_columns(leaves, s, t, pool);
+}
+
+/// Column-parallel `s -= Σ YᵀD⁻¹Y`, one exact dot per entry.
+fn subtract_contributions_columns<T: FloatT>(
+    leaves: &[Leaf<T>],
+    s: &mut [T],
+    t: usize,
+    pool: Option<&rayon::ThreadPool>,
+) {
     let column = |j: usize, col: &mut [T]| {
         for leaf in leaves {
             if !leaf.couples[j] {
