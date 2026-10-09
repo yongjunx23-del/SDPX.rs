@@ -8,6 +8,16 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — int6 Float64 gate (tasks 16, 17, 20 merged): neutral
+
+- Gate: int6 (`de3b64f` + FMA) against t16b on the 58-case scoreboard (`t7/int6-compare.md`). Statuses, iterations (776) and audits are identical: 54 audited solves, 0 Solved-but-fail, no new audit failures.
+- The cross-node times (node116 vs node57) suggested a slowdown: geo-mean 1.192 at 1 thread and 1.028 at 16; wins 19 → 13 and 12 → 9.
+- Same-node interleaved A/B (node116, `t13/ab-t16b-int6-224424`, 15 flipped and representative cases, 5 reps):
+  - 1 thread: every case is within −1…+3.3% of t16b (the qap5 0.59 is a t16b outlier median).
+  - 16 threads: within ±5%, except chainsing_1000_1/3 at 16 threads (medians +17–20%, minima equal: noise).
+- Decision: int6 is neutral; t16b's wins and geo-means stand as the Float64 numbers.
+- Observed for task 22: at 16 threads, many cases are slower than at 1 thread on the same node (medians, ms): theta1 33 → 91, arch0 1458 → 2879, nql60 486 → 831, mcp250 370 → 665, hinf1 4.8 → 10.6, chainsing_1000_1 72 → 134.
+
 ## 2026-10-09 — task 19b: blocked Givens replay in the MPFR SVD, not kept
 
 - Hypothesis: accumulating the logged rotations into small orthogonal windows and applying them to V through the exact residue GEMM makes the replay (54% of SVD CPU at Λ35/1024) about 3× cheaper.
