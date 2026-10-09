@@ -683,7 +683,10 @@ fn short_equalities_full_rank<T: FloatT>(
     }
     // A full minor takes about m³/2 modular updates; past twice that (a
     // dependent system), defer to the sparse modular/rational path unchanged.
-    let mut budget = (2 * m * m * m).max(16_000_000).min(work);
+    // The dense modular minor is cheap per update: keep its 16M floor (SOCP
+    // nb_L2_bessel proves its 123 rows in 5.6 ms) and bound larger systems
+    // by the work estimate.
+    let mut budget = (2 * m * m * m).max(16_000_000).min(work.max(16_000_000));
     // Any nonsingular minor is a proof, so visit the columns in a fixed
     // stride order: blocks of columns sharing a row pattern are then sampled
     // early instead of exhausting the budget one block at a time.
