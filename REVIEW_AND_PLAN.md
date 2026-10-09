@@ -140,10 +140,11 @@ These Ising figures include task 15. The Float64 figures are from int4, which in
 - **Normalized 2×2 PMP:** `AlmostSolved`/24 at MPFR512/1e-42. A tiny dual pivot is replaced by dynamic regularization, and refinement then diverges. Dynamic regularization off, or 768 bits, solves it.
 - **Cluster test:** `sampled_integration::dim2_signed_parities_ruiz_f64` is AlmostSolved on Linux since ae2a827 and passes on macOS.
 
-## Active work (two agents)
+## Active work (three agents while task 18 measures)
 
 | Task | Branch | Scope | Gate |
 |---|---|---|---|
+| 18 | `perf-wsos` (measurement first) | Large Ising speed via Hypatia's design: WSOS interpolant cone with a dual barrier (no PSD lifting, no NT SVD, no prepare/recover); Hypatia in BigFloat on ising11/Λ19/Λ27 for iteration counts, then a cost model against the Λ27 profile | Go/no-go with numbers before any solver change |
 | 17 | `perf-l35b` | Λ35 end game SDPB-style (next-work item 1) | Λ35 Solved + audit; Ising ABBA, csdr3, gravity256, 2×2 PMP no worse |
 | 16 | `perf-endgame` | Float64 end game: AlmostSolved → audited Solved, no test loosened | 58-case scoreboard; Λ19 ABBA if MPFR-reachable |
 
