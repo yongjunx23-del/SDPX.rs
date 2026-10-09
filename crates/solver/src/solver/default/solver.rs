@@ -104,7 +104,7 @@ impl<T: FloatT> PreparedProblem<T> {
             SolverError::BadInputData("A must be canonical CSC (sorted, unique, in-range rows)")
         })?;
         settings.validate()?;
-        Self::new_with_setup(P, q, A, b, cones, settings, input_fingerprint, |_, _| {})
+        Self::new_with_setup(P, q, A, b, cones, settings, input_fingerprint, None)
     }
 
     pub(crate) fn new_sampled(
@@ -138,6 +138,7 @@ impl<T: FloatT> PreparedProblem<T> {
         settings: DefaultSettings<T>,
         input_fingerprint: Option<[u8; 32]>,
     ) -> Result<Self, SolverError> {
+        let _receipt_scope = crate::receipt::Scope::setup();
         let mut sampled_timers = Timers::default();
         sampled_timers.start_setup();
         check_dimensions(&P, &q, &A_linear, &b, cones)?;
@@ -191,7 +192,7 @@ impl<T: FloatT> PreparedProblem<T> {
             cones,
             settings,
             input_fingerprint,
-            move |data, pool| data.install_sampled(operator, pool),
+            Some(operator),
         )?;
         // Include factor-input assembly in native setup time as well as the
         // ordinary preparation performed by the shared constructor.
@@ -208,14 +209,15 @@ impl<T: FloatT> PreparedProblem<T> {
         cones: &[SupportedConeT<T>],
         settings: DefaultSettings<T>,
         input_fingerprint: Option<[u8; 32]>,
-        prepare_data: impl FnOnce(&mut DefaultProblemData<T>, Option<&rayon::ThreadPool>),
+        sampled: Option<SampledOperator<T>>,
     ) -> Result<Self, SolverError> {
+        let _receipt_scope = crate::receipt::Scope::setup();
         let mut timers = Timers::default();
         timers.start_setup();
         let solution = DefaultSolution::<T>::new(A.n, A.m);
         let mut data;
         timeit! {"presolve"; {
-            data = DefaultProblemData::<T>::new_cow(P,q,A,b,cones,&settings);
+            data = DefaultProblemData::<T>::new_cow(P,q,A,b,cones,&settings,sampled.as_ref());
         }}
         crate::receipt::memory_mark("problem data");
         let mut cones = CompositeCone::<T>::new(&data.cones);
@@ -232,7 +234,9 @@ impl<T: FloatT> PreparedProblem<T> {
         }
         timeit! {"equilibration"; {
             data.equilibrate(&cones,&settings);
-            prepare_data(&mut data, cones.thread_pool().as_deref());
+            if let Some(operator) = sampled {
+                data.install_sampled(operator, cones.thread_pool().as_deref());
+            }
         }}
         crate::receipt::memory_mark("equilibrated");
         timers.stop_setup();
@@ -276,6 +280,7 @@ impl<T: FloatT> DefaultSolver<T> {
     }
 
     pub(crate) fn from_prepared(prepared: PreparedProblem<T>) -> Result<Self, SolverError> {
+        let _receipt_scope = crate::receipt::Scope::setup();
         let PreparedProblem {
             data,
             cones,

@@ -10,7 +10,7 @@ use crate::solver::{
 };
 
 use crate::solver::chordal::ChordalInfo;
-use crate::solver::sampled::{SampledBlock, SampledOperator};
+use crate::solver::sampled::SampledOperator;
 
 // ---------------
 // Data type for default problem format
@@ -130,6 +130,7 @@ where
             std::borrow::Cow::Borrowed(b),
             cones,
             settings,
+            None,
         )
     }
 
@@ -141,33 +142,35 @@ where
         b_in: std::borrow::Cow<'_, [T]>,
         cones: &[SupportedConeT<T>],
         settings: &DefaultSettings<T>,
+        sampled: Option<&SampledOperator<T>>,
     ) -> Self {
         use std::borrow::Cow;
         let (mut P, mut q, mut A, mut b) = (P_in, q_in, A_in, b_in);
         // Collapse repeated orthants, drop empty cones and turn singletons
-        // into orthant rows; this is the locally owned copy of the cones.
-        let mut cones = SupportedConeT::new_collapsed(cones);
+        // into orthant rows, except for PSD factors in sampled input.
+        let mut cones = SupportedConeT::new_collapsed(cones, sampled.is_none());
         if !P.is_triu() {
             P = Cow::Owned(P.to_triu());
         }
-        // Copy the inputs for the original-coordinate test; dropped below
-        // unless presolve or chordal decomposition changes the problem.
-        let mut original =
-            settings
-                .tol_original
-                .is_some()
-                .then(|| super::original_check::OriginalData {
-                    P: P.as_ref().clone(),
-                    q: q.as_ref().to_vec(),
-                    A: A.as_ref().clone(),
-                    b: b.as_ref().to_vec(),
-                    cones: cones.clone(),
-                });
+        let copy_original =
+            |P: &CscMatrix<T>, q: &[T], A: &CscMatrix<T>, b: &[T], cones: &[SupportedConeT<T>]| {
+                super::original_check::OriginalData {
+                    P: P.clone(),
+                    q: q.to_vec(),
+                    A: A.clone(),
+                    b: b.to_vec(),
+                    cones: cones.to_vec(),
+                }
+            };
+        let mut original = None;
 
         // Each stage replaces only what it changes, so borrowed API data is
         // copied at most once.
-        let presolver = try_presolver(&P, &q, &A, &b, &cones, settings);
+        let presolver = try_presolver(&P, &q, &A, &b, &cones, settings, sampled);
         if let Some(presolver) = &presolver {
+            if settings.tol_original.is_some() {
+                original = Some(copy_original(&P, &q, &A, &b, &cones));
+            }
             let (A_new, b_new, cones_new, objective) = presolver.presolve(&P, &q, &A, &b, &cones);
             (A, b, cones) = (Cow::Owned(A_new), Cow::Owned(b_new), cones_new);
             if let Some((P_new, q_new)) = objective {
@@ -178,8 +181,16 @@ where
         // ChordalInfo must be built on the *reduced* problem: its init_cones
         // and per-cone row ranges index the presolved A/b, and the cone_maps
         // it records map decomposed cones back to the presolved cone list.
-        let mut chordal_info = try_chordal_info(&A, &b, &cones, settings);
+        // Chordal lowering changes the sampled factors' operator.
+        let mut chordal_info = if sampled.is_some() {
+            None
+        } else {
+            try_chordal_info(&A, &b, &cones, settings)
+        };
         if let Some(chordal_info) = &mut chordal_info {
+            if original.is_none() && settings.tol_original.is_some() {
+                original = Some(copy_original(&P, &q, &A, &b, &cones));
+            }
             let (P_new, q_new, A_new, b_new, cones_new) =
                 chordal_info.decomp_augment(&P, &q, &A, &b, settings);
             (P, q, A, b, cones) = (
@@ -223,10 +234,6 @@ where
 
         let normq = Some(q_new.norm_inf());
         let normb = Some(b_new.norm_inf());
-        if presolver.is_none() && chordal_info.is_none() {
-            // Unscaling the internal data recovers the original problem.
-            original = None;
-        }
 
         Self {
             P: P_new,
@@ -354,24 +361,14 @@ where
         pool: Option<&rayon::ThreadPool>,
     ) {
         self.sampled_input = true;
-        // Chordal lowering currently uses the generic route; row-only reductions
-        // preserve the authoritative factors and merely shift their row offsets.
-        if self.is_chordal_decomposed() {
-            return;
-        }
+        debug_assert!(!self.is_chordal_decomposed());
         if let Some(presolver) = &self.presolver {
-            // Sampled factors index the original columns.
-            if presolver.keep_columns.is_some() {
-                return;
-            }
             let keep = &presolver.reduce_map.as_ref().unwrap().keep_logical;
-            if operator.blocks().iter().any(|b| {
+            debug_assert!(operator.blocks().iter().all(|b| {
                 keep[b.row_start..b.row_start + b.row_count()]
                     .iter()
-                    .any(|v| !v)
-            }) {
-                return;
-            }
+                    .all(|&v| v)
+            }));
             let mut prefix = vec![0; keep.len() + 1];
             for (i, &retained) in keep.iter().enumerate() {
                 prefix[i + 1] = prefix[i] + usize::from(retained);
@@ -380,49 +377,23 @@ where
             for block in &mut blocks {
                 block.row_start = prefix[block.row_start];
             }
-            operator = SampledOperator::new(operator.linear().select_rows(keep), blocks)
-                .expect("presolve retains complete sampled blocks");
-        }
-        let mut row = 0;
-        let ranges: Vec<_> = self
-            .cones
-            .iter()
-            .map(|cone| {
-                let start = row;
-                row += cone.nvars();
-                (start, row, cone)
-            })
-            .collect();
-        let matched = |b: &SampledBlock<T>| {
-            ranges.iter().any(|(start, end, cone)| {
-                *start == b.row_start
-                    && *end == b.row_start + b.row_count()
-                    && matches!(cone, SupportedConeT::PSDTriangleConeT(n) if *n == b.side())
-            })
-        };
-        if !operator.blocks().iter().all(matched) {
-            // Cone collapsing turns a singleton PSD cone into nonnegative rows.
-            // Fold such 1x1 blocks into the explicit linear rows; any other
-            // mismatch keeps the generic (materialized) route.
-            let in_orthant = |b: &SampledBlock<T>| {
-                ranges.iter().any(|(start, end, cone)| {
-                    matches!(cone, SupportedConeT::NonnegativeConeT(_))
-                        && *start <= b.row_start
-                        && b.row_start + b.row_count() <= *end
-                })
-            };
-            let (kept, folded): (Vec<_>, Vec<_>) =
-                operator.blocks().iter().cloned().partition(|b| matched(b));
-            if !folded.iter().all(|b| b.side() == 1 && in_orthant(b)) {
-                return;
+            let mut linear = operator.linear().select_rows(keep);
+            if let Some(keep) = &presolver.keep_columns {
+                let mut prefix = vec![0; keep.len() + 1];
+                for (i, &retained) in keep.iter().enumerate() {
+                    prefix[i + 1] = prefix[i] + usize::from(retained);
+                }
+                for block in &mut blocks {
+                    debug_assert!(keep
+                        [block.column_start..block.column_start + block.column_count()]
+                        .iter()
+                        .all(|&v| v));
+                    block.column_start = prefix[block.column_start];
+                }
+                linear = super::presolver::select_columns(&linear, keep);
             }
-            let (m, n) = operator.dims();
-            let rows = SampledOperator::new(CscMatrix::zeros((m, n)), folded)
-                .expect("subset of a valid sampled operator")
-                .materialize();
-            let linear = operator.linear().disjoint_sum(&rows);
-            operator = SampledOperator::new(linear, kept)
-                .expect("folding singleton blocks keeps a valid operator");
+            operator = SampledOperator::new(linear, blocks)
+                .expect("presolve retains complete sampled blocks");
         }
         for block in operator.blocks() {
             let sigma = self.equilibration.e[block.row_start];
@@ -733,6 +704,7 @@ fn try_presolver<T>(
     b: &[T],
     cones: &[SupportedConeT<T>],
     settings: &DefaultSettings<T>,
+    sampled: Option<&SampledOperator<T>>,
 ) -> Option<Presolver<T>>
 where
     T: FloatT,
@@ -741,7 +713,7 @@ where
         return None;
     }
 
-    let presolver = Presolver::new(P, q, A, b, cones, settings);
+    let presolver = Presolver::new(P, q, A, b, cones, sampled);
 
     if !presolver.is_reduced() {
         return None;

@@ -105,7 +105,7 @@ fn sampled_solver_mpfr512() {
 }
 
 #[test]
-fn sampled_singleton_uses_upstream_cone_collapse() {
+fn sampled_singleton_retains_factors() {
     let linear = CscMatrix::<f64>::zeros((1, 1));
     let block = SampledBlock {
         row_start: 0,
@@ -118,6 +118,7 @@ fn sampled_singleton_uses_upstream_cone_collapse() {
     };
     let mut settings = DefaultSettings::default();
     settings.verbose = false;
+    settings.kkt_form = "condensed".into();
     let mut solver = DefaultSolver::new_sampled(
         &CscMatrix::zeros((1, 1)),
         &[1.],
@@ -128,7 +129,8 @@ fn sampled_singleton_uses_upstream_cone_collapse() {
         settings,
     )
     .unwrap();
-    assert!(!solver.info.linsolver.name.contains("sampled"));
+    assert!(solver.info.linsolver.name.contains("sampled"));
+    assert!(matches!(solver.data.cones[0], PSDTriangleConeT(1)));
     assert!(matches!(
         solver.update_A(&CscMatrix::identity(1)),
         Err(DataUpdateError::SampledMatrixUpdate)
@@ -162,19 +164,35 @@ fn sampled_blocks_must_cover_whole_psd_cones() {
 }
 
 fn sampled_presolve<T: FloatT>() {
-    // Two exactly redundant equalities precede an authoritative PSD factor block.
-    let linear = CscMatrix::new(5, 2, vec![0, 0, 0], vec![], vec![]);
+    // Drop two redundant rows and a singleton column before the factor block.
+    // Its zero primitive column remains, including its singleton equality.
+    let linear = CscMatrix::new(7, 4, vec![0, 1, 1, 1, 2], vec![2, 3], vec![T::one(); 2]);
     let block = SampledBlock {
-        row_start: 2,
-        column_start: 0,
+        row_start: 4,
+        column_start: 1,
         dim: 1,
         basis_rows: 2,
-        basis_cols: 2,
-        basis: vec![T::one(), number(0.25), number(0.25), T::one()],
-        weights: vec![-T::one(); 2],
+        basis_cols: 3,
+        basis: vec![
+            T::one(),
+            number(0.25),
+            number(0.25),
+            T::one(),
+            T::zero(),
+            T::zero(),
+        ],
+        weights: vec![-T::one(), -T::one(), T::zero()],
     };
     let operator = SampledOperator::new(linear.clone(), vec![block.clone()]).unwrap();
-    let b = vec![T::zero(), T::zero(), -T::one(), T::zero(), -T::one()];
+    let b = vec![
+        T::zero(),
+        T::zero(),
+        number(2.),
+        number(3.),
+        -T::one(),
+        T::zero(),
+        -T::one(),
+    ];
     let mut settings = DefaultSettings::<T>::default();
     settings.verbose = false;
     settings.kkt_form = "condensed".into();
@@ -188,21 +206,27 @@ fn sampled_presolve<T: FloatT>() {
     settings.tol_gap_abs = tol;
     settings.tol_gap_rel = tol;
     let mut solver = DefaultSolver::new_sampled(
-        &CscMatrix::zeros((2, 2)),
-        &vec![T::one(); 2],
+        &CscMatrix::zeros((4, 4)),
+        &[T::one(), T::one(), T::one(), T::zero()],
         &linear,
         &b,
-        &[ZeroConeT(2), PSDTriangleConeT(2)],
+        &[ZeroConeT(4), PSDTriangleConeT(2)],
         vec![block],
         settings,
     )
     .unwrap();
-    assert_eq!(solver.variables.z.len(), 3);
+    assert_eq!(solver.variables.z.len(), 4);
+    assert_eq!(solver.variables.x.len(), 3);
     assert_eq!(solver.info.linsolver.name, "condensed_sampled_qdldl");
     solver.solve();
     assert_eq!(solver.solution.status, SolverStatus::Solved);
     assert_eq!(&solver.solution.s[..2], &[T::zero(); 2]);
     assert_eq!(&solver.solution.z[..2], &[T::zero(); 2]);
+    assert_eq!(solver.solution.x[0], number(2.));
+    assert!((solver.solution.x[3] - number(3.)).abs() < number::<T>(128.) * tol);
+    assert!(
+        (solver.solution.obj_val - number::<T>(50.) / number(9.)).abs() < number::<T>(128.) * tol
+    );
     let mut residual = b.iter().map(|v| -*v).collect::<Vec<_>>();
     operator.apply(
         &mut residual,

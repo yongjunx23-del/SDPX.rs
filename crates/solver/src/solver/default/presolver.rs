@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 use super::*;
 use crate::algebra::*;
+use crate::solver::sampled::SampledOperator;
 use crate::solver::SupportedConeT;
 
 // ---------------
@@ -55,7 +56,7 @@ where
         A: &CscMatrix<T>,
         b: &[T],
         cones: &[SupportedConeT<T>],
-        _settings: &DefaultSettings<T>,
+        sampled: Option<&SampledOperator<T>>,
     ) -> Self {
         let infbound = crate::get_infinity();
 
@@ -88,6 +89,7 @@ where
             cones,
             &soc_tails,
             reduce_map.as_ref().map(|map| &map.keep_logical[..]),
+            sampled,
         );
         let mut keep_columns = None;
         let mut objective_offset = T::zero();
@@ -210,7 +212,7 @@ where
         }
 
         // A fully constant SOC tail leaves a one-row cone, i.e. an orthant row.
-        SupportedConeT::new_collapsed(&cones_new)
+        SupportedConeT::new_collapsed(&cones_new, false)
     }
 
     pub(crate) fn reverse_presolve(
@@ -344,6 +346,7 @@ fn singleton_columns<T: FloatT>(
     cones: &[SupportedConeT<T>],
     tails: &[SocTail<T>],
     keep: Option<&[bool]>,
+    sampled: Option<&SampledOperator<T>>,
 ) -> Vec<FixedColumn<T>> {
     const ORTHANT: u8 = 1;
     const EQUALITY: u8 = 2;
@@ -372,18 +375,24 @@ fn singleton_columns<T: FloatT>(
             row_count[r] = row_count[r].saturating_add(1);
         }
     }
-    let mut quadratic = vec![false; A.n];
+    let mut excluded = vec![false; A.n];
     for j in 0..P.n {
         for k in P.colptr[j]..P.colptr[j + 1] {
             if P.nzval[k] != T::zero() {
-                quadratic[j] = true;
-                quadratic[P.rowval[k]] = true;
+                excluded[j] = true;
+                excluded[P.rowval[k]] = true;
             }
+        }
+    }
+    // Canonical primitives stay contiguous, including zero-weight samples.
+    if let Some(operator) = sampled {
+        for block in operator.blocks() {
+            excluded[block.column_start..block.column_start + block.column_count()].fill(true);
         }
     }
     let mut fixed = Vec::new();
     for column in 0..A.n {
-        if quadratic[column] {
+        if excluded[column] {
             continue;
         }
         let mut entries = (A.colptr[column]..A.colptr[column + 1])
@@ -404,7 +413,7 @@ fn singleton_columns<T: FloatT>(
     fixed
 }
 
-fn select_columns<T: FloatT>(A: &CscMatrix<T>, keep: &[bool]) -> CscMatrix<T> {
+pub(super) fn select_columns<T: FloatT>(A: &CscMatrix<T>, keep: &[bool]) -> CscMatrix<T> {
     let mut colptr = vec![0];
     let (mut rowval, mut nzval) = (Vec::new(), Vec::new());
     for (j, _) in keep.iter().enumerate().filter(|(_, &k)| k) {

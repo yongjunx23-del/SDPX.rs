@@ -98,7 +98,10 @@ impl<T> SupportedConeT<T>
 where
     T: FloatT,
 {
-    pub(crate) fn new_collapsed(cones: &[SupportedConeT<T>]) -> Vec<SupportedConeT<T>> {
+    pub(crate) fn new_collapsed(
+        cones: &[SupportedConeT<T>],
+        collapse_psd: bool,
+    ) -> Vec<SupportedConeT<T>> {
         let mut newcones = Vec::with_capacity(cones.len());
         let mut iter = cones.iter().peekable();
 
@@ -107,6 +110,7 @@ where
             iter: &mut std::iter::Peekable<std::slice::Iter<'_, SupportedConeT<T>>>,
             newcones: &mut Vec<SupportedConeT<T>>,
             init_dim: usize,
+            collapse_psd: bool,
         ) where
             T: FloatT,
         {
@@ -118,7 +122,7 @@ where
                         // collapsible cones.
                         SupportedConeT::NonnegativeConeT(dim) => total_dim += dim,
                         SupportedConeT::SecondOrderConeT(1) => total_dim += 1,
-                        SupportedConeT::PSDTriangleConeT(1) => total_dim += 1,
+                        SupportedConeT::PSDTriangleConeT(1) if collapse_psd => total_dim += 1,
 
                         // stop when we hit a non-collapsible cone
                         _ => break,
@@ -136,13 +140,13 @@ where
                     // as the first term in a sequence of cones to be collapsed
                     // into a single nonnegative cone.
                     SupportedConeT::NonnegativeConeT(dim) => {
-                        collapse(&mut iter, &mut newcones, *dim)
+                        collapse(&mut iter, &mut newcones, *dim, collapse_psd)
                     }
                     SupportedConeT::SecondOrderConeT(dim) if *dim == 1 => {
-                        collapse(&mut iter, &mut newcones, *dim)
+                        collapse(&mut iter, &mut newcones, *dim, collapse_psd)
                     }
-                    SupportedConeT::PSDTriangleConeT(dim) if *dim == 1 => {
-                        collapse(&mut iter, &mut newcones, *dim)
+                    SupportedConeT::PSDTriangleConeT(dim) if *dim == 1 && collapse_psd => {
+                        collapse(&mut iter, &mut newcones, *dim, collapse_psd)
                     }
 
                     // everything else
@@ -319,7 +323,7 @@ mod tests {
         ];
 
         let expected = cones.clone();
-        let result = SupportedConeT::new_collapsed(&cones);
+        let result = SupportedConeT::new_collapsed(&cones, true);
 
         assert_eq!(result, expected);
     }
@@ -336,7 +340,7 @@ mod tests {
             SupportedConeT::<f64>::NonnegativeConeT(5),
             SupportedConeT::SecondOrderConeT(4),
         ];
-        let result = SupportedConeT::new_collapsed(&cones);
+        let result = SupportedConeT::new_collapsed(&cones, true);
 
         assert_eq!(result, expected);
     }
@@ -354,7 +358,7 @@ mod tests {
             SupportedConeT::NonnegativeConeT(3),
             SupportedConeT::SecondOrderConeT(4),
         ];
-        let result = SupportedConeT::new_collapsed(&cones);
+        let result = SupportedConeT::new_collapsed(&cones, true);
 
         assert_eq!(result, expected);
     }
@@ -370,7 +374,7 @@ mod tests {
             SupportedConeT::NonnegativeConeT(1),
             SupportedConeT::SecondOrderConeT(4),
         ];
-        let result = SupportedConeT::new_collapsed(&cones);
+        let result = SupportedConeT::new_collapsed(&cones, true);
 
         assert_eq!(result, expected);
     }
@@ -386,7 +390,7 @@ mod tests {
             SupportedConeT::NonnegativeConeT(1),
             SupportedConeT::SecondOrderConeT(4),
         ];
-        let result = SupportedConeT::new_collapsed(&cones);
+        let result = SupportedConeT::new_collapsed(&cones, true);
 
         assert_eq!(result, expected);
     }
@@ -407,7 +411,7 @@ mod tests {
             SupportedConeT::ExponentialConeT(),
             SupportedConeT::NonnegativeConeT(1),
         ];
-        let result = SupportedConeT::new_collapsed(&cones);
+        let result = SupportedConeT::new_collapsed(&cones, true);
 
         assert_eq!(result, expected);
     }
@@ -428,7 +432,7 @@ mod tests {
             SupportedConeT::NonnegativeConeT(7),
             SupportedConeT::SecondOrderConeT(4),
         ];
-        let result = SupportedConeT::new_collapsed(&cones);
+        let result = SupportedConeT::new_collapsed(&cones, true);
 
         assert_eq!(result, expected);
     }
