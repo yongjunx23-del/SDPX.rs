@@ -298,7 +298,7 @@ Active branches (2026-10-09; two agents, at the user's request):
 Parked, with WIP committed on each branch (journal 2026-10-09):
 - `perf-sharedrhs` `d34869c`: Λ27 −2.4%, unaudited.
 - `perf-fulldir` `6af5724`: regression.
-- `perf-tau0` `0fccf2f`: ties the default.
+- `perf-tau0` `31caf0f`: halves Λ27 iterations against τ₀ = 1; revived as task 14 (journal correction 2026-10-09).
 - `perf-f64large` `50325c4`, `perf-threads` `946d4be`, `perf-facial`
   `a3a7271`: unverified.
 - `perf-border` `a80cfa1`: gate not run.

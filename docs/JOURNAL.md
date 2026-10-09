@@ -8,6 +8,24 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — correction: the data-scaled τ₀ rule halves Λ27 iterations
+
+- The entry "refinement and starting scale; parked branches" below says the
+  data-chosen τ₀ rule (perf-tau0) "ties the default". That is wrong: its
+  "default" column already had the rule active.
+- Measured against τ₀ = 1 (commit `31caf0f`, 64 threads, 768 bits, 1e-42):
+
+  | Case | τ₀ = 1 | rule | τ₀ chosen |
+  |---|---|---|---|
+  | Λ27 | 376 it / 638.5 s | 183 it / 367.8 s | 1.33e-28 |
+  | spins 0–50 | 177 it / 234.0 s | 153 it / 206.4 s | 1.15e-27 |
+  | Λ19 | 119 it / 90.7 s | 121 it / 88.9 s | 1.64e-26 |
+
+  ising11 and Float64 medium and large are unchanged, because their KKT
+  start is accepted. Objectives are identical.
+- Decision: revived as task 14 (`perf-tau1`), ported onto the integration
+  branch with the fixed-τ phase and gated there.
+
 ## 2026-10-09 — Λ35: facial reduction and fixed τ from the start (perf-l35, not kept)
 
 - Input check (verified): the 1024- and 1536-bit conversions solved at 768
