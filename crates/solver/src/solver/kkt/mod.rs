@@ -7,6 +7,7 @@ pub mod direct;
 pub mod ldl;
 pub(crate) mod refinement;
 pub(crate) use condensed::CondensedKKTSolver;
+pub(crate) use condensed::{columns_touching, psd_form_costs};
 
 /// Per-solve accounting. Diagnoses how many factorizations and right-hand-side
 /// applications a solver actually performs, so an iteration's cost can be

@@ -139,6 +139,62 @@ where
         !self.spatterns.is_empty()
     }
 
+    /// Whether the decomposition lowers the estimated per-iteration cost
+    /// (scaling plus the cheaper KKT form, see
+    /// [`psd_form_costs`](crate::solver::kkt::psd_form_costs)). Cliques keep
+    /// their cone's column count as an upper bound, and the compact form's
+    /// overlap entries become extra variables. Decomposing SDP_arch0's 161
+    /// block into 27 cliques (3881 variables, augmented) took 6.3 s against
+    /// 1.5 s condensed; SDP_control1's 10 block split 6 + 9 was no cheaper
+    /// and lost accuracy, while max-cut's 250 block becomes 213 tiny
+    /// cliques.
+    pub(crate) fn decomposition_pays(&self, A: &CscMatrix<T>) -> bool {
+        let ranges: Vec<std::ops::Range<usize>> = self.init_cones.rng_cones_iter().collect();
+        let mut psd = Vec::new();
+        let mut retained = 0usize;
+        for (index, (cone, rows)) in zip(&self.init_cones, &ranges).enumerate() {
+            match cone {
+                PSDTriangleConeT(dim) => psd.push((index, *dim, rows.clone())),
+                NonnegativeConeT(_) => {}
+                other => retained += other.nvars(),
+            }
+        }
+        let rows: Vec<std::ops::Range<usize>> = psd.iter().map(|(_, _, r)| r.clone()).collect();
+        let counts = crate::solver::kkt::columns_touching(A, &rows);
+        let original: Vec<(usize, usize)> = psd
+            .iter()
+            .zip(&counts)
+            .map(|((_, dim, _), &m)| (*dim, m))
+            .collect();
+        let mut decomposed = Vec::new();
+        let mut overlaps = 0usize;
+        for ((index, dim, _), &m) in psd.iter().zip(&counts) {
+            match self.spatterns.iter().find(|p| p.orig_index == *index) {
+                Some(pattern) => {
+                    let tree = &pattern.sntree;
+                    for i in 0..tree.n_cliques {
+                        decomposed.push((tree.get_nblk(i), m));
+                    }
+                    overlaps += tree.get_decomposed_dim_and_overlaps().1;
+                }
+                None => decomposed.push((*dim, m)),
+            }
+        }
+        let n = A.n;
+        let total = |blocks: &[(usize, usize)], n: usize| {
+            let (condensed, augmented, scaling) =
+                crate::solver::kkt::psd_form_costs(blocks, n, retained, 1.0);
+            scaling + condensed.min(augmented)
+        };
+        let (before, after) = (total(&original, n), total(&decomposed, n + overlaps));
+        if crate::receipt::profile_requested() {
+            eprintln!(
+                "CHORDAL cost_before={before:.3e} cost_after={after:.3e} overlaps={overlaps}"
+            );
+        }
+        after < before
+    }
+
     // total number of cones we started with
     pub(crate) fn init_cone_count(&self) -> usize {
         self.init_cones.len()
@@ -302,5 +358,70 @@ fn connect_graph<T: FloatT>(L: &mut CscMatrix<T>) {
         if !connected {
             L.set_entry((j + 1, j), T::one());
         }
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+
+    /// `A` with one column per listed PSD entry `(i, j)` of a `dim` block
+    /// (svec rows, upper triangle by columns) plus the diagonal, so the
+    /// aggregate pattern is exactly those entries.
+    fn pattern(dim: usize, entries: &[(usize, usize)]) -> (CscMatrix<f64>, Vec<f64>) {
+        let row = |i: usize, j: usize| j * (j + 1) / 2 + i;
+        let mut rows: Vec<usize> = entries
+            .iter()
+            .map(|&(i, j)| row(i.min(j), i.max(j)))
+            .collect();
+        rows.extend((0..dim).map(|i| row(i, i)));
+        let n = rows.len();
+        let m = dim * (dim + 1) / 2;
+        let a = CscMatrix::new_from_triplets(m, n, rows, (0..n).collect(), vec![1.0; n]);
+        (a, vec![0.0; m])
+    }
+
+    #[test]
+    fn small_overlapping_split_does_not_pay() {
+        // A 10 block whose pattern splits into cliques {0..5} and {1..9}
+        // (overlap 5), touched by 21 columns, as SDP_control1's 10 block:
+        // the 15 overlap variables cost more than the smaller blocks save.
+        let dim = 10;
+        let row = |i: usize, j: usize| j * (j + 1) / 2 + i;
+        let mut entries = Vec::new();
+        for j in 0..dim {
+            for i in 0..=j {
+                if j <= 5 || i >= 1 {
+                    entries.push(row(i, j));
+                }
+            }
+        }
+        let n = 21;
+        let (mut rows, mut cols) = (Vec::new(), Vec::new());
+        for (k, &r) in entries.iter().enumerate() {
+            rows.push(r);
+            cols.push(k % n);
+        }
+        let m = dim * (dim + 1) / 2;
+        let len = rows.len();
+        let a = CscMatrix::new_from_triplets(m, n, rows, cols, vec![1.0; len]);
+        let b = vec![0.0; m];
+        let cones = [PSDTriangleConeT(dim)];
+        let info = ChordalInfo::new(&a, &b, &cones, &CoreSettings::default());
+        assert!(info.is_decomposed());
+        assert!(!info.decomposition_pays(&a));
+    }
+
+    #[test]
+    fn sparse_large_block_pays() {
+        // A 120 block coupling only neighbours (a path graph): cliques of
+        // two, while the undecomposed block costs O(p^6) to factor.
+        let dim = 120;
+        let entries: Vec<(usize, usize)> = (1..dim).map(|j| (j - 1, j)).collect();
+        let (a, b) = pattern(dim, &entries);
+        let cones = [PSDTriangleConeT(dim)];
+        let info = ChordalInfo::new(&a, &b, &cones, &CoreSettings::default());
+        assert!(info.is_decomposed());
+        assert!(info.decomposition_pays(&a));
     }
 }

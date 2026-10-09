@@ -66,6 +66,58 @@ pub(crate) fn parallel_assembly_allowed<T: FloatT>(
     pool_present && (contribution_cells <= 2 * schur_stored || contribution_cells <= budget_cells)
 }
 
+/// Per-iteration flop estimates for a PSD formulation, from block sizes and
+/// column counts only (no coefficients, no thread count).
+///
+/// `blocks` holds `(p, m)` per PSD cone: side `p` and the number of
+/// variables whose columns touch the cone. `n` variables, `retained` rows
+/// kept in the reduced system, `schur_fill` the structural fraction of the
+/// dense Schur upper triangle.
+/// - condensed: per cone `m p^3` (the congruences `W A_j W`) plus
+///   `m^2 p^2 / 2` (their inner products), then the reduced factor
+///   `(n + retained)^3 / 3` scaled by the Schur fill;
+/// - augmented: per cone the dense scaling block `P^3 / 3` with
+///   `P = p (p + 1) / 2`, plus its coupling `m P^2` to the variables;
+/// - scaling: `10 p^3` per cone (eigen/SVD), common to both forms.
+pub(crate) fn psd_form_costs(
+    blocks: &[(usize, usize)],
+    n: usize,
+    retained: usize,
+    schur_fill: f64,
+) -> (f64, f64, f64) {
+    let (mut condensed, mut augmented, mut scaling) = (0f64, 0f64, 0f64);
+    for &(p, m) in blocks {
+        let (p, m) = (p as f64, m as f64);
+        let big = p * (p + 1.0) / 2.0;
+        condensed += m * p * p * p + m * m * p * p / 2.0;
+        augmented += big * big * big / 3.0 + m * big * big;
+        scaling += 10.0 * p * p * p;
+    }
+    let reduced = (n + retained) as f64;
+    condensed += reduced * reduced * reduced / 3.0 * schur_fill.clamp(0.0, 1.0);
+    (condensed, augmented, scaling)
+}
+
+/// Number of distinct columns of `A` with a nonzero in each row range.
+pub(crate) fn columns_touching<T: FloatT>(A: &CscMatrix<T>, ranges: &[Range<usize>]) -> Vec<usize> {
+    let mut owner = vec![usize::MAX; A.m];
+    for (k, rows) in ranges.iter().enumerate() {
+        owner[rows.clone()].fill(k);
+    }
+    let mut count = vec![0usize; ranges.len()];
+    let mut last = vec![usize::MAX; ranges.len()];
+    for col in 0..A.n {
+        for p in A.colptr[col]..A.colptr[col + 1] {
+            let k = owner[A.rowval[p]];
+            if k != usize::MAX && last[k] != col {
+                last[k] = col;
+                count[k] += 1;
+            }
+        }
+    }
+    count
+}
+
 /// Conservative storage selection, independent of numerical coefficients.
 pub(crate) fn prefer_condensed<T: FloatT>(
     P: &CscMatrix<T>,
@@ -101,7 +153,7 @@ pub(crate) fn prefer_condensed<T: FloatT>(
         }
     }
     let reduced = A.n.saturating_add(retained);
-    if A.n == 0 || psd < 256 || reduced > psd / 4 {
+    if A.n == 0 || psd < 256 {
         return false;
     }
 
@@ -166,7 +218,28 @@ pub(crate) fn prefer_condensed<T: FloatT>(
     // This is a selection estimate, not a guarantee on symbolic factor fill.
     let r = retained as u128 + retained_aux as u128;
     let reduced_cells = 2 * schur_upper - n + 2 * n * r + r * r;
-    6 * reduced_cells + factor_cells < 3 * augmented_cells
+    if 6 * reduced_cells + factor_cells >= 3 * augmented_cells {
+        return false;
+    }
+    // Storage allows both: take the cheaper per-iteration flops. This
+    // replaces the former `reduced > psd / 4` gate, which sent SDP_qap5 and
+    // SDP_qap6 to the augmented form at 2-3x the time.
+    let mut ranges = Vec::new();
+    let mut sides = Vec::new();
+    for (cone, rows) in cones.iter().zip(&cones.rng_cones) {
+        if let SupportedCone::PSDTriangleCone(c) = cone {
+            ranges.push(rows.clone());
+            sides.push(c.n);
+        }
+    }
+    let counts = columns_touching(A, &ranges);
+    let blocks: Vec<(usize, usize)> = sides.into_iter().zip(counts).collect();
+    let fill = schur_upper as f64 / dense_upper.max(1) as f64;
+    let (condensed, augmented, _) = psd_form_costs(&blocks, A.n, reduced - A.n, fill);
+    if crate::receipt::profile_requested() {
+        eprintln!("KKT_FORM condensed_flops={condensed:.3e} augmented_flops={augmented:.3e}");
+    }
+    condensed <= augmented
 }
 
 #[derive(Clone, Copy)]

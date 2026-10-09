@@ -530,6 +530,14 @@ where
 // past either, no row is removed.
 const MODULAR_BUDGET: usize = 400_000_000;
 const RATIONAL_BUDGET: usize = 40_000_000;
+/// Elimination updates allowed per unit of one IPM iteration's estimated
+/// work (stored coefficients and rows of `A`, plus `p^3` per PSD block for
+/// its scaling). The proof is an optional reduction: this keeps it within a
+/// few iterations' cost. The fixed budgets above let it run 1.4-3.3 s on
+/// SOCP_sched_50_50 (2526 equality rows) against 0.11 s for the whole solve
+/// without presolve, while the large Float64 SDP gains from the 1317 rows it
+/// removes in 1.2 s of a 45-125 s solve.
+const WORK_PER_UNIT: usize = 4;
 
 fn redundant_equalities<T: FloatT>(
     A: &CscMatrix<T>,
@@ -564,7 +572,17 @@ fn redundant_equalities_impl<T: FloatT>(
     for (i, &r) in ids.iter().enumerate() {
         lookup[r] = i;
     }
-    if short_equalities_full_rank(A, b, &ids, &lookup) {
+    let psd_work = cones
+        .iter()
+        .map(|c| match c {
+            SupportedConeT::PSDTriangleConeT(p) => p.saturating_pow(3),
+            _ => 0,
+        })
+        .fold(0usize, usize::saturating_add);
+    let work = (A.nnz() + b.len())
+        .saturating_add(psd_work)
+        .saturating_mul(WORK_PER_UNIT);
+    if short_equalities_full_rank(A, b, &ids, &lookup, work) {
         return Some(Vec::new());
     }
     // A full row rank image proves that no exact row can be removed. A
@@ -587,8 +605,11 @@ fn redundant_equalities_impl<T: FloatT>(
             }
         }
     }
-    if modular_full_row_rank(images) {
-        return Some(Vec::new());
+    match modular_full_row_rank(images, work.min(MODULAR_BUDGET)) {
+        Some(true) => return Some(Vec::new()),
+        // Out of budget: the costlier rational pass would not finish either.
+        None => return None,
+        Some(false) => {}
     }
     let mut rows: Vec<BTreeMap<usize, Exact>> = (0..ids.len()).map(|_| BTreeMap::new()).collect();
     for (i, &r) in ids.iter().enumerate() {
@@ -606,7 +627,7 @@ fn redundant_equalities_impl<T: FloatT>(
     }
     let mut basis: BTreeMap<usize, BTreeMap<usize, Exact>> = BTreeMap::new();
     let mut redundant = Vec::new();
-    let mut budget = RATIONAL_BUDGET;
+    let mut budget = work.min(RATIONAL_BUDGET);
     for (id, mut row) in ids.into_iter().zip(rows) {
         loop {
             let Some((&pivot, value)) = row.first_key_value() else {
@@ -651,6 +672,7 @@ fn short_equalities_full_rank<T: FloatT>(
     b: &[T],
     ids: &[usize],
     lookup: &[usize],
+    work: usize,
 ) -> bool {
     const P: u64 = (1 << 31) - 1;
     // The dense basis takes m² words (8 MiB at the limit); larger systems use
@@ -661,7 +683,7 @@ fn short_equalities_full_rank<T: FloatT>(
     }
     // A full minor takes about m³/2 modular updates; past twice that (a
     // dependent system), defer to the sparse modular/rational path unchanged.
-    let mut budget = (2 * m * m * m).max(16_000_000);
+    let mut budget = (2 * m * m * m).max(16_000_000).min(work);
     // Any nonsingular minor is a proof, so visit the columns in a fixed
     // stride order: blocks of columns sharing a row pattern are then sampled
     // early instead of exhausting the budget one block at a time.
@@ -747,20 +769,22 @@ fn inverse_mersenne31(value: u64) -> u64 {
     inverse
 }
 
-fn modular_full_row_rank(rows: Vec<std::collections::BTreeMap<usize, u64>>) -> bool {
+/// `Some(full rank)` over F_(2^31 - 1), or `None` when the budget runs out.
+fn modular_full_row_rank(
+    rows: Vec<std::collections::BTreeMap<usize, u64>>,
+    budget: usize,
+) -> Option<bool> {
     use std::collections::BTreeMap;
     const P: u64 = (1 << 31) - 1;
     let mut basis: BTreeMap<usize, BTreeMap<usize, u64>> = BTreeMap::new();
-    let mut budget = MODULAR_BUDGET;
+    let mut budget = budget;
     for mut row in rows {
         loop {
             let Some((&pivot, &factor)) = row.first_key_value() else {
-                return false;
+                return Some(false);
             };
             if let Some(previous) = basis.get(&pivot) {
-                let Some(rest) = budget.checked_sub(previous.len()) else {
-                    return false;
-                };
+                let rest = budget.checked_sub(previous.len())?;
                 budget = rest;
                 for (&column, &value) in previous {
                     let entry = row.entry(column).or_default();
@@ -779,7 +803,7 @@ fn modular_full_row_rank(rows: Vec<std::collections::BTreeMap<usize, u64>>) -> b
             }
         }
     }
-    true
+    Some(true)
 }
 
 #[cfg(test)]

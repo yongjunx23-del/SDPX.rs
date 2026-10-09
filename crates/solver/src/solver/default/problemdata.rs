@@ -677,8 +677,8 @@ where
 
     let chordal_info = ChordalInfo::new(A, b, cones, settings);
 
-    // no decomposition possible
-    if !chordal_info.is_decomposed() {
+    // no decomposition possible, or not worth its overlap variables
+    if !chordal_info.is_decomposed() || !chordal_info.decomposition_pays(A) {
         return None;
     }
 

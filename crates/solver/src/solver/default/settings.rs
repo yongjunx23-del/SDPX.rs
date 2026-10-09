@@ -240,6 +240,14 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "false")]
     pub iterative_refinement_gmres: bool,
 
+    ///binary64: a right-hand side whose stationary refinement stalls above
+    ///its tolerance continues with GMRES-IR from the refined point
+    ///(converged right-hand sides are untouched). Off by default: on the
+    ///58-case Float64 scoreboard it gained hinf3, sched_100_50 and medium
+    ///but lost sched_100_100, gpp100 and gpp124 and doubled csdr3's time.
+    #[builder(default = "false")]
+    pub iterative_refinement_gmres_fallback: bool,
+
     ///enable presolve constraint reduction
     #[builder(default = "true")]
     pub presolve_enable: bool,
