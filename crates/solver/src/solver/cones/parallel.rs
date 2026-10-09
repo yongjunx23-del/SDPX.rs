@@ -68,7 +68,7 @@ impl ConeThreading {
 
     // Scale heavy PSD cones first. Whole cones remain independent; workers
     // pull the next largest job instead of waiting for a fixed lane's tail.
-    // Cheap cone collections and wider-than-block pools keep the lane path.
+    // Workers left without a job help the running cones (see below).
     pub(super) fn update_scaling<T: FloatT>(
         &self,
         cones: &mut [SupportedCone<T>],
@@ -79,14 +79,10 @@ impl ConeThreading {
     ) -> Option<bool> {
         let workers = self.pool.current_num_threads();
         if T::precision_bits() <= 64
-            || cones.len() <= workers
-            || !cones.iter().any(|c| {
-                if matches!(c, SupportedCone::PSDTriangleCone(_)) {
-                    return true;
-                }
-                let _ = c;
-                false
-            })
+            || cones.len() < 2
+            || !cones
+                .iter()
+                .any(|c| matches!(c, SupportedCone::PSDTriangleCone(_)))
         {
             return None;
         }
@@ -100,7 +96,12 @@ impl ConeThreading {
             })
             .collect();
         jobs.sort_unstable_by_key(|job| job.0);
+        let total = jobs.len();
         let jobs = std::sync::Mutex::new(jobs);
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        // A worker without a queued cone helps the running cones' posted
+        // inner items (SVD rotation replay rows) until every cone is scaled:
+        // the slowest cone otherwise sets the phase alone.
         Some(self.pool.install(|| {
             (0..workers)
                 .into_par_iter()
@@ -110,6 +111,7 @@ impl ConeThreading {
                         let Some((_, cone, rows)) = jobs.lock().unwrap().pop() else {
                             break;
                         };
+                        let _offer = sdpx_arithmetic::inner_parallel::board::Offer::enter();
                         let _inner = (self.inner_parallel || self.paired).then(|| {
                             sdpx_arithmetic::inner_parallel::Guard::enter_levels(
                                 self.inner_parallel,
@@ -119,6 +121,17 @@ impl ConeThreading {
                         ok &= crate::algebra::with_split_hint(self.inner_ways, || {
                             cone.update_scaling(&s[rows.clone()], &z[rows], mu, strategy)
                         });
+                        done.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    }
+                    let _helper = sdpx_arithmetic::inner_parallel::board::Helper::enter();
+                    while done.load(std::sync::atomic::Ordering::Acquire) < total {
+                        // Posted rows first, then any stealable Rayon job
+                        // (paired joins, split kernels) of the running cones.
+                        if !sdpx_arithmetic::inner_parallel::board::help()
+                            && rayon::yield_now() != Some(rayon::Yield::Executed)
+                        {
+                            std::hint::spin_loop();
+                        }
                     }
                     ok
                 })

@@ -176,11 +176,27 @@ fn replay_rotations<const N: usize>(
     // letting them finish the last, largest cones of a scaling phase.
     // Tasks carry at least one grain of work (an update is two multiply-adds
     // per row), so small blocks stay serial.
+    // Scaling-phase workers without a cone help through the board, one row
+    // tile per item, preferring the cone with the most rows left.
     let offer =
         sdpx_arithmetic::inner_parallel::active() || rayon::current_thread_index().is_some();
     let work = (rows * log.len() * 2) as u128 * w::<N>();
     let parts = tasks_if(offer, work, rows);
-    if parts > 1 {
+    if parts > 1 && sdpx_arithmetic::inner_parallel::board::offered() {
+        struct Rows<T>(*mut T);
+        // SAFETY: items write disjoint row tiles of `t`.
+        unsafe impl<T> Sync for Rows<T> {}
+        let base = Rows(t.as_mut_ptr());
+        let len = t.len();
+        let tiles = len.div_ceil(tile);
+        sdpx_arithmetic::inner_parallel::board::run(tiles, &|i| {
+            let start = i * tile;
+            let end = (start + tile).min(len);
+            let base = &base;
+            // SAFETY: tile `i` is `[start, end)`, owned by item `i` alone.
+            apply(unsafe { std::slice::from_raw_parts_mut(base.0.add(start), end - start) });
+        });
+    } else if parts > 1 {
         t.par_chunks_mut(rows.div_ceil(parts) * cols).for_each(apply);
     } else {
         apply(t);

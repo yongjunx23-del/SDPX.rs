@@ -1705,6 +1705,127 @@ pub mod inner_parallel {
             PAIRED.with(|c| c.set(self.1));
         }
     }
+
+    /// Independent items a running kernel posts for idle workers of the
+    /// same phase. Unlike a Rayon split, the poster never blocks in a join
+    /// (where it could steal and start an unrelated heavy task), and helpers
+    /// go to the post with the most unclaimed items, so the longest-running
+    /// kernel is helped first. Items must be independent; who runs an item
+    /// never changes its result.
+    pub mod board {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct Post {
+            next: AtomicUsize,
+            active: AtomicUsize,
+            items: usize,
+            // Valid while the post is listed or `active > 0` (see `run`).
+            job: *const (dyn Fn(usize) + Sync),
+        }
+        // SAFETY: `job` is `Sync` and outlives every access (see `run`).
+        unsafe impl Send for Post {}
+        unsafe impl Sync for Post {}
+
+        static BOARD: Mutex<Vec<Arc<Post>>> = Mutex::new(Vec::new());
+        static HELPERS: AtomicUsize = AtomicUsize::new(0);
+
+        std::thread_local! {
+            static OFFER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+
+        /// Run `job(0..items)`, posting the items while helpers are waiting
+        /// and this thread runs under [`Offer`]; returns once every item ran.
+        pub fn run(items: usize, job: &(dyn Fn(usize) + Sync)) {
+            if items < 2 || !OFFER.with(|c| c.get()) || HELPERS.load(Ordering::Relaxed) == 0 {
+                (0..items).for_each(job);
+                return;
+            }
+            // SAFETY: the post is delisted below and this frame waits until
+            // no helper holds it, so the erased lifetime is never exceeded.
+            let job: &'static (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(job) };
+            let post = Arc::new(Post {
+                next: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                items,
+                job,
+            });
+            BOARD.lock().unwrap().push(post.clone());
+            loop {
+                let i = post.next.fetch_add(1, Ordering::Relaxed);
+                if i >= items {
+                    break;
+                }
+                job(i);
+            }
+            BOARD.lock().unwrap().retain(|p| !Arc::ptr_eq(p, &post));
+            while post.active.load(Ordering::Acquire) != 0 {
+                std::hint::spin_loop();
+            }
+        }
+
+        /// Whether [`run`] may post this thread's items (an [`Offer`] is
+        /// active and helpers are waiting).
+        pub fn offered() -> bool {
+            OFFER.with(|c| c.get()) && HELPERS.load(Ordering::Relaxed) > 0
+        }
+
+        /// Run one batch of items from the post with the most unclaimed
+        /// items; `false` when nothing is posted.
+        pub fn help() -> bool {
+            let post = {
+                let board = BOARD.lock().unwrap();
+                let Some(post) = board
+                    .iter()
+                    .max_by_key(|p| p.items.saturating_sub(p.next.load(Ordering::Relaxed)))
+                    .filter(|p| p.next.load(Ordering::Relaxed) < p.items)
+                    .cloned()
+                else {
+                    return false;
+                };
+                post.active.fetch_add(1, Ordering::Acquire);
+                post
+            };
+            // SAFETY: counted in `active` while listed; the poster waits.
+            let job = unsafe { &*post.job };
+            loop {
+                let i = post.next.fetch_add(1, Ordering::Relaxed);
+                if i >= post.items {
+                    break;
+                }
+                job(i);
+            }
+            post.active.fetch_sub(1, Ordering::Release);
+            true
+        }
+
+        /// Marks this thread's kernels as runnable with board helpers.
+        pub struct Offer(bool);
+        impl Offer {
+            pub fn enter() -> Self {
+                Self(OFFER.with(|c| c.replace(true)))
+            }
+        }
+        impl Drop for Offer {
+            fn drop(&mut self) {
+                OFFER.with(|c| c.set(self.0));
+            }
+        }
+
+        /// Counts this thread as a waiting helper until dropped.
+        pub struct Helper;
+        impl Helper {
+            pub fn enter() -> Self {
+                HELPERS.fetch_add(1, Ordering::Relaxed);
+                Self
+            }
+        }
+        impl Drop for Helper {
+            fn drop(&mut self) {
+                HELPERS.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
