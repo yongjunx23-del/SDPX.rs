@@ -127,6 +127,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 }
             }
         }
+        if T::precision_bits() <= 64 && !dense_border_pays(k, groups.len(), trunk.len()) {
+            return None;
+        }
         Some(Self::from_groups(
             k,
             signs,
@@ -136,6 +139,34 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             Some(LocalStructure::Bounds),
         ))
     }
+}
+
+/// Dense BLAS-3 flops per sparse scalar LDL flop at equal time (binary64):
+/// LP_bnl1 runs its dense border at 4.2 GF/s and QDLDL at about 0.4 GF/s.
+const DENSE_FLOP_RATIO: f64 = 10.0;
+
+/// The bound elimination leaves a dense `t x t` border: forming it costs
+/// `groups * t^2` and factoring it `t^3 / 3` per refactor, against the sparse
+/// LDL flops of the whole KKT under AMD. Keep the dense border only when it
+/// is cheaper after crediting dense kernels with [`DENSE_FLOP_RATIO`].
+/// Measured on the regression LPs, sparse LDL was 4-80x faster (LP_bnl1
+/// 8.09 -> 0.098 s, LP_agg 2.55 -> 0.032 s).
+fn dense_border_pays<T: FloatT>(k: &CscMatrix<T>, groups: usize, t: usize) -> bool {
+    let t = t as f64;
+    let dense = groups as f64 * t * t + t * t * t / 3.0;
+    let (_, _, info) = crate::solver::kkt::ldl::amd_order(k);
+    let sparse = (info.n_div + info.n_mult_subs_ldl) as f64;
+    if crate::receipt::profile_requested() {
+        eprintln!(
+            "LOCAL_BOUNDS dense_flops={dense:.3e} sparse_flops={sparse:.3e} choice={}",
+            if dense <= DENSE_FLOP_RATIO * sparse {
+                "dense"
+            } else {
+                "sparse"
+            }
+        );
+    }
+    dense <= DENSE_FLOP_RATIO * sparse
 }
 
 #[cfg(feature = "faer-sparse")]

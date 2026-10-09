@@ -750,6 +750,19 @@ where
             }
         }
         (self.work1, self.work2) = (e, dx);
+        // Binary64: a column whose stationary refinement stalled above its
+        // tolerance continues with GMRES-IR from the refined point. Late
+        // condensed SDP factors make the stationary contraction too weak
+        // (SDP_arch0: the constant HSD solve kept a residual of 8.5 against
+        // 1.4 for its right-hand side); converged columns are untouched.
+        if T::precision_bits() <= 64 && settings.iterative_refinement_gmres_fallback {
+            for c in 0..cols {
+                if ok[c] && norme[c] > abstol + reltol * normb[c] {
+                    let r = column(c);
+                    ok[c] = self.refine_gmres(&mut x[r.clone()], &b[r], 1, settings)[0];
+                }
+            }
+        }
         ok
     }
 
