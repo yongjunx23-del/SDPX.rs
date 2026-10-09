@@ -36,6 +36,12 @@ pub(crate) trait Refinement<T: FloatT> {
     fn gmres_supported(&self) -> bool {
         false
     }
+    /// Continue a stationary refinement that stalled above its tolerance
+    /// with GMRES-IR from the refined point; the implementer then reports
+    /// `gmres_supported` and treats the stored forward product as stale.
+    fn gmres_continuation(&mut self) -> bool {
+        false
+    }
     /// Drop the bases of the previous cycle.
     fn gmres_reset(&mut self) {}
     /// Append `V_k = scale · error`.
@@ -83,6 +89,17 @@ pub(crate) fn refine<T: FloatT>(work: &mut impl Refinement<T>, settings: &CoreSe
             "refine-trace {:.3e} {:.3e} {:.3e} {}",
             stats[0], stats[1], stats[2], stats[3]
         );
+    }
+    if T::precision_bits() <= 53 {
+        let tol =
+            settings.iterative_refinement_abstol + settings.iterative_refinement_reltol * stats[0];
+        let stalled = ok && stats[2] > tol;
+        if !work.decision_agrees(u32::from(stalled)) {
+            return false;
+        }
+        if stalled && work.gmres_continuation() {
+            return refine_gmres(work, settings);
+        }
     }
     ok
 }

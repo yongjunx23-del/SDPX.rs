@@ -129,6 +129,10 @@ where
         self.affine_ready = None;
     }
 
+    fn refine_further(&mut self) {
+        self.kktsolver.refine_further();
+    }
+
     fn update(
         &mut self,
         data: &DefaultProblemData<T>,
@@ -327,6 +331,23 @@ where
             cones.mul_Hs(&mut lhs.s, &lhs.z, workz);
         }
         lhs.s.axpby(-T::one(), Δs_const_term, -T::one()); // lhs.s = -(lhs.s+Δs_const_term);
+
+        // Binary64 condensed rows: the solve recovers Δz = H⁻¹(AΔx − bΔτ − r)
+        // there, so take Δs from the same linear row, AΔx + Δs − bΔτ = −r_z,
+        // as SDPT3 takes ΔZ from dual feasibility. Recomputing HΔz instead
+        // rounds H·H⁻¹ at cond(H)·eps, which near convergence put errors of
+        // 1e-3 into the primal row (SDP_qap6 and the gpp cases ended
+        // AlmostSolved with primal residuals 1e-6 to 1e-5).
+        if T::precision_bits() <= 53 && data.sampled.is_none() {
+            if let Some(retained) = self.kktsolver.retained_rows() {
+                workz.waxpby(-T::one(), &rhs.z, lhs.τ, &data.b);
+                data.A.gemv(workz, &lhs.x, -T::one(), T::one());
+                for &row in retained {
+                    workz[row] = lhs.s[row];
+                }
+                lhs.s.copy_from(workz);
+            }
+        }
 
         // solve for Δκ
         // --------------

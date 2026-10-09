@@ -72,6 +72,18 @@ pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
         None
     }
 
+    /// Binary64: continue a stationary refinement that stalls above its
+    /// tolerance with GMRES-IR for the rest of the solve. The driver asks
+    /// for it once a feasibility residual grows; until then the cheaper
+    /// stationary result stands, as before.
+    fn refine_further(&mut self) {}
+
+    /// Condensed solvers: the rows kept in the reduced system. The `z` of
+    /// every other row is recovered as `H⁻¹(A x − r_z)`.
+    fn retained_rows(&self) -> Option<&[usize]> {
+        None
+    }
+
     fn update_P(&mut self, P: &CscMatrix<T>);
     fn update_A(&mut self, A: &CscMatrix<T>);
 
