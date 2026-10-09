@@ -16,7 +16,8 @@ failure never counts as a performance win.
   audited scoreboard (`t7/cases.txt`), at 1 and 16 threads.
 - **MPFR (user, 2026-10-08):** beat SDPB at 768+ bits on the Ising problems
   (Λ19, Λ27, Λ35, ising11) with matched precision, thresholds, input and
-  hardware.
+  hardware. Λ35 runs at 1024 bits (user, 2026-10-09); the bar is SDPB at
+  1024 bits, 745 it / 2762 s on one 64-core node.
 - Memory: match SDPB peak PSS/RSS at matched thread counts; report
   speed/memory trade-offs rather than combining unmatched runs.
 - PMP conversion matters only when it limits input-to-solution time or
@@ -50,7 +51,7 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 | spins 0–50 (s50) | 153 it / 153.8 s | SDPB 285 s |
 | Λ19 | 121 it / 71.0 s, audited | — |
 | ising11 (512 bits) | 54 it / 3.44 s | — |
-| Λ35 spins 0–70 | fails: InsufficientProgress 887, p − ref 1.5e-26; 1024 bits Solved 743 it / 3565 s | SDPB 746 it / 2009 s |
+| Λ35 spins 0–70, 1024 bits | Solved 743 it / 3565 s (4.80 s/it, b0088bb era; current code not yet run); at 768 bits it fails (InsufficientProgress 887) | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
 | Float64 58 cases (int4) | 48 audited solves, 0 Solved-but-fail; wins 11 (1 thr), 8 (16 thr) | MOSEK |
 
 These Ising figures include task 15. The Float64 figures are from int4, which includes task 13.
@@ -145,7 +146,7 @@ These Ising figures include task 15. The Float64 figures are from int4, which in
 | Task | Branch | Scope | Gate |
 |---|---|---|---|
 | 18 | `perf-wsos` (measurement first) | Large Ising speed via Hypatia's design: WSOS interpolant cone with a dual barrier (no PSD lifting, no NT SVD, no prepare/recover); Hypatia in BigFloat on ising11/Λ19/Λ27 for iteration counts, then a cost model against the Λ27 profile | Go/no-go with numbers before any solver change |
-| 17 | `perf-l35b` | Λ35 end game SDPB-style (next-work item 1) | Λ35 Solved + audit; Ising ABBA, csdr3, gravity256, 2×2 PMP no worse |
+| 17 | `perf-l35b` | Λ35 at 1024 bits against SDPB 1024: baseline of the current code, then the per-iteration gap (×1.3) and the shared plateau; the 768-bit no-shift work only if it helps at 1024 | Λ35 Solved + audit; Ising ABBA, csdr3, gravity256, 2×2 PMP no worse |
 | 16 | `perf-endgame` | Float64 end game: AlmostSolved → audited Solved, no test loosened | 58-case scoreboard; Λ19 ABBA if MPFR-reachable |
 
 ## Next work, in order
