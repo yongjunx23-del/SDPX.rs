@@ -1577,7 +1577,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     }
 
     fn assemble(&mut self) -> bool {
-        let parallel_publication = self.scaling_workers > 1 && self.n > 1;
+        let mut parallel_publication = self.scaling_workers > 1 && self.n > 1;
         // Each PSD block owns its contribution buffer. After joining, each
         // destination column publishes the blocks in their original cone order.
         if self.parallel_assembly {
@@ -1588,7 +1588,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             // pool; chunk windows are disjoint, so the published values are
             // bitwise identical to the serial assembly.
             let assembly_pool = self.pool.as_deref();
-            self.pool.as_ref().unwrap().install(|| {
+            let has_psd_columns = self.pool.as_ref().unwrap().install(|| {
                 let compute = |block: &mut Block<T>| {
                     if let Scaling::Psd(psd) = &mut block.scaling {
                         if parallel_publication && psd.schur_columns.is_empty() {
@@ -1609,7 +1609,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                                         psd.columns.len(),
                                     );
                                     psd.schur_values = output;
-                                    return;
+                                    return !psd.columns.is_empty();
                                 }
                             }
                         }
@@ -1634,16 +1634,26 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                             assembly_pool,
                         );
                         psd.schur_values = output;
+                        !psd.columns.is_empty()
+                    } else {
+                        false
                     }
                 };
                 // Choose one parallel level: spare workers run independent
                 // columns, otherwise each outer task owns a complete block.
                 if inner_schur || inner_sampled.is_some() {
-                    self.blocks.iter_mut().for_each(compute);
+                    self.blocks
+                        .iter_mut()
+                        .map(compute)
+                        .fold(false, |any, present| any | present)
                 } else {
-                    self.blocks.par_iter_mut().for_each(compute);
+                    self.blocks
+                        .par_iter_mut()
+                        .map(compute)
+                        .reduce(|| false, |any, present| any | present)
                 }
             });
+            parallel_publication &= has_psd_columns;
         }
         let pool = self.pool.clone();
         let schur = self.reduced.kkt_matrix_mut();
