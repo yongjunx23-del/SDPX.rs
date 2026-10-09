@@ -170,6 +170,7 @@ impl<T: FloatT> OwnedSolver<T> {
         options: CostHistoryOptions,
         collective: Option<CollectiveHandle<T>>,
     ) -> Result<Self, String> {
+        let _receipt_scope = crate::receipt::Scope::setup();
         debug_assert!(collective.is_some() || crate::mpi::World::get().is_none());
         let local_rank = collective.as_ref().map(|c| c.rank());
         let count = if let Some(c) = &collective {
