@@ -57,6 +57,8 @@ const FACTOR_PANEL: usize = 8;
 /// 170-row border slowed 64-thread iterations by 2.9% and raised RSS 1.7 GB.
 const EXACT_FACTOR_MIN: usize = 256;
 const EXACT_PANEL: usize = 48;
+/// Product entries buffered by one batch of exact leaf contributions.
+const BATCH_PRODUCT_ENTRIES: usize = 1 << 24;
 /// Residue-product ways a split exact factor offers to idle workers.
 const EXACT_FACTOR_WAYS: usize = 8;
 /// Per-step factor tasks are small: split a leaf factor only with at least
@@ -197,9 +199,6 @@ impl<T: FloatT> DenseLeaf<T> {
     ) -> Result<(), &'static str> {
         self.l.copy_from_slice(a);
         let n = self.n;
-        if T::precision_bits() >= 256 && n >= EXACT_FACTOR_MIN {
-            return self.factor_exact(signs, reg, regularize_count, split);
-        }
         if split && n > f64_scaled::<T>(SPLIT_FACTOR_MIN, 8) {
             return self.factor_panels(signs, reg, regularize_count);
         }
@@ -274,6 +273,24 @@ impl<T: FloatT> DenseLeaf<T> {
             p = pe;
         }
         Ok(())
+    }
+
+    /// A leaf's [`Self::factor_signed`]: large wide-type leaves take the
+    /// exact blocked form. The border keeps the pooled scalar panels (mixed
+    /// Λ27/1024: its exact form took 2.0 s instead of 0.58 s per iteration).
+    fn factor_leaf(
+        &mut self,
+        a: &[T],
+        signs: &[i8],
+        reg: Option<(T, T)>,
+        regularize_count: &mut usize,
+        split: bool,
+    ) -> Result<(), &'static str> {
+        if T::precision_bits() >= 256 && self.n >= EXACT_FACTOR_MIN {
+            self.l.copy_from_slice(a);
+            return self.factor_exact(signs, reg, regularize_count, split);
+        }
+        self.factor_signed(a, signs, reg, regularize_count, split)
     }
 
     /// Blocked right-looking [`Self::factor_signed`] for wide types: each
@@ -671,7 +688,7 @@ impl<T: FloatT> Leaf<T> {
             return self.factor.factor_bounds(&self.h, reg, regularize_count);
         }
         self.factor
-            .factor_signed(&self.h, &self.signs, reg, regularize_count, split_factor)?;
+            .factor_leaf(&self.h, &self.signs, reg, regularize_count, split_factor)?;
         if self.y.is_empty() {
             return Ok(());
         }
@@ -965,7 +982,21 @@ fn subtract_contributions<T: FloatT>(
                 subtract_contributions_columns(group, s, t, pool);
                 continue;
             }
-            for batch in group.chunks(width) {
+            // At most one leaf per worker and `BATCH_PRODUCT_ENTRIES` product
+            // entries per batch (mixed Λ27/1024: all 117 products at once
+            // raised 128-thread peak RSS from 23 to 39 GiB).
+            let mut batches = Vec::new();
+            let (mut start, mut entries) = (0, 0);
+            for (i, leaf) in group.iter().enumerate() {
+                let e = triangular_number(leaf.coupled.len());
+                if i > start && (i - start == width || entries + e > BATCH_PRODUCT_ENTRIES) {
+                    batches.push(&group[start..i]);
+                    (start, entries) = (i, 0);
+                }
+                entries += e;
+            }
+            batches.push(&group[start..]);
+            for batch in batches {
                 let ways = (width / batch.len()).clamp(1, 8);
                 let build = |leaf: &Leaf<T>| crate::algebra::with_split_hint(ways, || build(leaf));
                 let products: Vec<Vec<T>> = match pool {
