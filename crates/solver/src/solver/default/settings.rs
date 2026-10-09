@@ -47,7 +47,7 @@ pub struct DefaultSettings<T: FloatT> {
 
     ///restart once when a first attempt from τ₀ ≥ 1e-10 chases τ: since
     ///the relative gap last improved tenfold, μ fell by 1e4 and τ below
-    ///1e-4·τ₀. The restart uses τ₀ = min(τ, eps^(1/8)) (Λ27: 451
+    ///1e-2·τ₀. The restart uses τ₀ = min(τ, eps^(1/8)) (Λ27: 451
     ///iterations from 1, 181 from 1e-30). On by default for wide types: it
     ///only acts on a unit start, i.e. an accepted KKT start (SDPB 3.1
     ///resampled Ising inputs: Λ27-rs 345 → 230 iterations with the former

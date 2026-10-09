@@ -1252,12 +1252,13 @@ impl<T: FloatT> FixedTauSwitch<T> {
 }
 
 /// Detects a τ chase on a unit-scale first attempt: since the relative gap
-/// last improved tenfold, μ fell by 1e4 while τ fell below `1e-4·τ₀`. On
+/// last improved tenfold, μ fell by 1e4 while τ fell below `1e-2·τ₀`. On
 /// Λ27 the gap stalls near 1e-12 while μ keeps falling (451 iterations from
 /// τ₀ = 1, 181 from 1e-30). A converging solve lowers μ and the gap together
 /// (Λ27-rs iterations 10–25: both about 1e5); in the chase μ falls 1e4 per
-/// 20 iterations while the gap stays within 10×. With 1e10 the Λ27-rs
-/// restart came only at iteration 88 (230 iterations in all).
+/// 20 iterations while the gap stays within 10×. τ < 1e-4·τ₀ held only from
+/// iteration 88 on Λ27-rs (gap stalled from 32; τ < 1e-2 from 68), while
+/// converging unit starts settle well above 1e-2 (Λ19-rs 0.14, ising11 2.7).
 #[derive(Default)]
 struct TauChase<T> {
     anchor: Option<(T, T)>,
@@ -1278,7 +1279,7 @@ impl<T: FloatT> TauChase<T> {
             }
         }
         let (_, mu0) = self.anchor.unwrap();
-        mu <= mu0 * (1e-4).as_T() && tau < tau0 * (1e-4).as_T()
+        mu <= mu0 * (1e-4).as_T() && tau < tau0 * (1e-2).as_T()
     }
 
     /// Restart scale: the current τ, at most `eps^(1/8)` (about 1e-29 at
