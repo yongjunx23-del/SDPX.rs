@@ -1048,6 +1048,87 @@ pub struct ArrowLDLSolver<T: FloatT> {
 }
 
 impl<T: FloatT> ArrowLDLSolver<T> {
+    /// Peel universal positive columns from one connected component. Stored
+    /// edges certify the remaining leaves; the border keeps its mixed signs.
+    pub(crate) fn try_separator(
+        k: &CscMatrix<T>,
+        signs: &[i8],
+        settings: &CoreSettings<T>,
+    ) -> Option<Self> {
+        let n = k.n;
+        let positive = signs.iter().filter(|&&s| s > 0).count();
+        // Complete leading positives (the dense-block case) need no graph pass.
+        if positive < 3
+            || (signs[..positive].iter().all(|&s| s > 0)
+                && k.colptr[positive] == triangular_number(positive))
+        {
+            return None;
+        }
+        let mut parent: Vec<usize> = (0..n).collect();
+        let mut degree = vec![0usize; n];
+        for j in 0..n {
+            for &i in &k.rowval[k.colptr[j]..k.colptr[j + 1]] {
+                if signs[i] > 0 && signs[j] > 0 {
+                    degree[j] += 1;
+                    degree[i] += usize::from(i != j);
+                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                    parent[a] = b;
+                }
+            }
+        }
+        let mut sizes = vec![0usize; n];
+        for i in 0..n {
+            if signs[i] > 0 {
+                sizes[find(&mut parent, i)] += 1;
+            }
+        }
+        // Preserve existing disconnected dense leaves; isolated positives
+        // may accompany the component being split.
+        let mut roots = (0..n).filter(|&i| sizes[i] > 1);
+        let root = roots.next()?;
+        if roots.next().is_some() {
+            return None;
+        }
+        let separator: Vec<bool> = (0..n)
+            .map(|i| signs[i] > 0 && find(&mut parent, i) == root && degree[i] == sizes[root])
+            .collect();
+        let count = separator.iter().filter(|&&s| s).count();
+        if count == 0 || count == sizes[root] {
+            return None;
+        }
+        for (i, p) in parent.iter_mut().enumerate() {
+            *p = i;
+        }
+        let mut positive_entries = 0;
+        for j in 0..n {
+            for &i in &k.rowval[k.colptr[j]..k.colptr[j + 1]] {
+                if signs[i] > 0 && signs[j] > 0 && !separator[i] && !separator[j] {
+                    positive_entries += 1;
+                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                    parent[a] = b;
+                }
+            }
+        }
+        let mut components: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        let mut trunk = Vec::new();
+        for i in 0..n {
+            if separator[i] {
+                trunk.push(i);
+            } else if signs[i] > 0 {
+                components.entry(find(&mut parent, i)).or_default().push(i);
+            }
+        }
+        if components.len() <= sizes.iter().filter(|&&s| s > 0).count() {
+            return None;
+        }
+        // Positive separator first, then the original negative coordinates.
+        trunk.extend((0..n).filter(|&i| signs[i] < 0));
+        let mut groups: Vec<Vec<usize>> = components.into_values().collect();
+        groups.sort_by_key(|g| g[0]);
+        Self::try_groups(k, signs, settings, groups, trunk, positive_entries)
+    }
+
     /// Eligibility is structural only: connected components of the
     /// positive-sign subgraph become leaves, negative-sign variables become
     /// the border.  Returns `None` when the shape is not exploitable, so the
@@ -1085,6 +1166,18 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         let mut groups: Vec<Vec<usize>> = components.into_values().collect();
         groups.sort_by_key(|g| g[0]);
+        Self::try_groups(k, signs, settings, groups, trunk, positive_entries)
+    }
+
+    fn try_groups(
+        k: &CscMatrix<T>,
+        signs: &[i8],
+        settings: &CoreSettings<T>,
+        groups: Vec<Vec<usize>>,
+        trunk: Vec<usize>,
+        positive_entries: usize,
+    ) -> Option<Self> {
+        let n = k.n;
         let t = trunk.len();
         let n_pos = (n - t) as u128;
         let cells: u128 = groups
@@ -1122,9 +1215,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             // edges and the dense working-set estimate.
             let mut sizes: Vec<usize> = groups.iter().map(|g| g.len()).collect();
             sizes.sort_unstable();
+            let mut border = vec![false; n];
+            for &i in &trunk {
+                border[i] = true;
+            }
             let coupling = (0..n)
                 .flat_map(|j| (k.colptr[j]..k.colptr[j + 1]).map(move |q| (k.rowval[q], j)))
-                .filter(|&(i, j)| signs[i] != signs[j])
+                .filter(|&(i, j)| border[i] != border[j])
                 .count();
             eprintln!(
                 "GROUP_STATS n={n} components={} leaf_min={} leaf_med={} leaf_max={} border={t} coupling_nnz={coupling} dense_mib={:.1} leaf_work={leaf_work} border_work={border_work} eligible={}",
