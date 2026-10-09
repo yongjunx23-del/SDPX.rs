@@ -31,6 +31,21 @@ cluster profile excludes that log write from the measured wall time. Cone
 planning width is also documented as a task-plan size, not a hard concurrency
 cap on the shared pool; no scheduler or arithmetic changed.
 
+Original Λ19, MPFR768/eight workers, frozen `39d0d01`, PBS 224502 on node58
+CPUs 50–57: exit 0, Solved/121, unchanged original 1e-30 audit accepted.
+The profile run takes 189.956 s native and 654.5 MiB solver peak RSS; this is
+diagnostic data, not a speed comparison. All 10,251 rebuilds have one granted
+way, at most 4,371 entries; median rebuild is 1.498 ms. The 85,509 hits have
+a 79.65 µs median. Keep encoding serial on this input: its outer cone/block
+work already occupies the pool, and forcing inner splits would reopen the
+rejected scheduling direction. Cache-aware same-operand GEMM is unreachable
+from current callers; SYRK supplies no cache, so changing that unused branch
+would not improve solves. The original 512-bit-produced input is unchanged;
+import, solve and audit remain at 768 bits. All 16 result hashes and the
+archive hash are verified, with unchanged input/auditor hashes. Evidence:
+`$SDPX_E2E_HOME/work/perf-next-20261009/evidence-224502/verified.json`;
+archive SHA-256 `b01a870e16bc28c7d7fc288fbeb24fdee184cc4600d24fe1f117f26b05893b69`.
+
 ## 2026-10-09 — ordered PSD publication and external SU(2) reduction
 
 Frozen baseline `1d0711f` versus candidate `60d7b8d`, PBS 224490,

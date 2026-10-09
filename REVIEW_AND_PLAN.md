@@ -178,8 +178,12 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - Profile prime-group underfill and NUMA residue placement on large calls;
      split complete inner products over output tiles only if they dominate.
    - Use `rns.cache.hit`/`rns.cache.rebuild` and profile dimensions to measure
-     serial cached-operand rebuilding before the shared-CRT phase. Parallel
-     encoding needs a material critical-path cost and spare ways.
+     serial cached-operand rebuilding before the shared-CRT phase. Original
+     Λ19/768 on PBS 224502 passes its audit; all 10,251 rebuilds have one
+     granted way (largest operand 4,371 entries). No inner encoding change is
+     justified there. Parallel encoding needs a larger call with material
+     critical-path cost and spare ways; an unused same-operand cache branch
+     is not a solver optimization.
    - `perf-border` `a80cfa1` is parked with its gate not run.
 7. **Other open items:**
    - Exact arrow batching release ABBA, after the mixed-Λ27 accuracy decision.
