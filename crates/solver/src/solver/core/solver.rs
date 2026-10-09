@@ -1010,13 +1010,20 @@ mod internal {
                 // the data's scale unless the caller chose τ₀
                 if !ok {
                     self.variables.unit_initialization(&self.cones);
-                    let core = self.settings.core();
-                    if self.start_tau.is_none()
-                        && core.auto_initial_tau
-                        && core.initial_tau == T::one()
-                    {
-                        self.start_tau = self.data.unit_start_tau().filter(|&t| t < T::one());
-                    }
+                }
+                // Start at the data's scale unless the caller chose τ₀. In
+                // MPFR this also applies to an accepted KKT start when the
+                // scale is at least a decade away (overshoot costs about one
+                // iteration per decade; ising11's 0.45 cost one): resampled
+                // Λ27 (SDPB 3.1 points) accepts it and needs 345 iterations
+                // from τ₀ = 1 but 145 from 1e-30. Binary64 keeps τ₀ = 1 there.
+                let core = self.settings.core();
+                if self.start_tau.is_none() && core.auto_initial_tau && core.initial_tau == T::one() {
+                    let decade = (0.1).as_T();
+                    self.start_tau = self
+                        .data
+                        .unit_start_tau()
+                        .filter(|&t| t < T::one() && (!ok || (T::precision_bits() > 53 && t < decade)));
                 }
             } else {
                 // Assigns unit (z,s) and zeros the primal variables
