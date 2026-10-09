@@ -313,8 +313,13 @@ splits leftover prime jobs into output tiles and uses shared memory buffers.
 SDPX retains its correctly rounded exact-product contract; NUMA placement and
 prime/output tiling need profiles on the affected large shapes before changes.
 Contiguous cached operands rebuild in 32K-entry blocks; chunk extraction is
-pooled, while residue encoding/reduction/compression is serial. Measure cache
-misses and rebuild cost before parallelizing these bounded blocks.
+pooled, while residue encoding/reduction/compression is serial. `SDPX_PROFILE`
+enables `rns.cache.hit`/`rns.cache.rebuild` timers, including fingerprint and
+lookup costs, and reports rebuild dimensions, prime counts and granted ways.
+Receipts retain those observations; ordinary receipts skip these per-access
+CPU clocks. Concurrent cache timers overlap; their summed wall/CPU time is
+not a fraction of the solve. Measure the critical calls before parallelizing
+these bounded blocks.
 [SCS](https://www.cvxgrp.org/scs/linear_solver/index.html) puts parallel work in
 its factor backend and dense Gram kernels. [MOSEK](https://docs.mosek.com/latest/capi/guidelines-optimizer.html#multithreading)
 likewise notes that useful thread counts depend on the problem and that small

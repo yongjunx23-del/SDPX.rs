@@ -177,8 +177,9 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - Single-heavy-owner sampled splitting is closed: correct on both MPI gates, but neither improves end-to-end time.
    - Profile prime-group underfill and NUMA residue placement on large calls;
      split complete inner products over output tiles only if they dominate.
-   - Measure serial cached-operand rebuilds, which precede the shared-CRT
-     timer; parallel encoding needs a material cache-miss cost and spare ways.
+   - Use `rns.cache.hit`/`rns.cache.rebuild` and profile dimensions to measure
+     serial cached-operand rebuilding before the shared-CRT phase. Parallel
+     encoding needs a material critical-path cost and spare ways.
    - `perf-border` `a80cfa1` is parked with its gate not run.
 7. **Other open items:**
    - Exact arrow batching release ABBA, after the mixed-Λ27 accuracy decision.

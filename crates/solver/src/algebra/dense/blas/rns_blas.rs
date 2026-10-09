@@ -1015,6 +1015,9 @@ impl ResidueCache {
         if plan.bits > CACHE_MAX_BITS {
             return Operand::Chunks(chunk_matrix(x, lo, spread, plan, split));
         }
+        let timer = crate::receipt::profile_requested()
+            .then(crate::receipt::start)
+            .flatten();
         let fp = fingerprint(x);
         let stale = {
             let mut entry = self.entry.lock().unwrap();
@@ -1026,7 +1029,10 @@ impl ResidueCache {
                     && c.len == x.len()
                     && c.count >= plan.count()
                 {
-                    return Operand::Cached(c.clone());
+                    let cached = c.clone();
+                    drop(entry);
+                    crate::receipt::finish("rns.cache.hit", timer);
+                    return Operand::Cached(cached);
                 }
             }
             entry.take()
@@ -1053,6 +1059,14 @@ impl ResidueCache {
             });
         {
             let wide = Plan::with_count(plan.bits, count);
+            if crate::receipt::profile_requested() {
+                eprintln!(
+                    "RNS_CACHE_REBUILD rows={} cols={} primes={count} ways={}",
+                    x.rows,
+                    x.cols,
+                    split_ways(split),
+                );
+            }
             let res = if x.ld == x.rows || x.cols == 1 {
                 CachedResidues::from_view_blocked(x, lo, spread, &wide, split, reusable)
             } else {
@@ -1072,6 +1086,7 @@ impl ResidueCache {
                 res,
             });
             *self.entry.lock().unwrap() = Some(entry.clone());
+            crate::receipt::finish("rns.cache.rebuild", timer);
             Operand::Cached(entry)
         }
     }

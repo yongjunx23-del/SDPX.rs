@@ -8,6 +8,25 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — expose RNS cache cost without changing kernels
+
+The parallel review identified serial contiguous cache encoding before the
+shared-CRT timer. Add `rns.cache.hit`/`rns.cache.rebuild` observations and
+rebuild geometry/granted ways under the existing `SDPX_PROFILE`; ordinary
+receipts skip the per-access clocks. No kernel, cache layout or worker grant
+changes. Concurrent nested timing totals overlap and are not solve shares.
+
+The local Ising11 MPFR512/four-worker diagnostic is Solved/54, point-identical
+to the frozen baseline, and passes the original 1e-30 audit. It observes
+1,210 hits and 1,188 rebuilds, all with one granted way, largest operand
+496 entries. Rebuild median is 0.166 ms; no inner-split change is justified
+on this case. Verbose logging time is not performance evidence. Evidence:
+`$SDPX_E2E_HOME/work/perf-next-20261009/cache-profile-gate.json`.
+The final profile-only guard passes the same four-worker solve, preserves
+the complete point and audit, and emits no cache clocks in ordinary receipts
+(`cache-profile-kept-gate.json`). The shared Mac had several other busy CPU
+processes; these observations make no solve-speed claim.
+
 ## 2026-10-09 — ordered PSD publication and external SU(2) reduction
 
 Frozen baseline `1d0711f` versus candidate `60d7b8d`, PBS 224490,
