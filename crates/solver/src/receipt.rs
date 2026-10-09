@@ -5,7 +5,7 @@
 //! path, also accumulates count/total/samples per phase name for the JSON
 //! receipt emitted by the FFI layer at the end of each solve.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -138,12 +138,21 @@ pub(crate) fn phase_record(name: &'static str, dur: Duration) {
     }
 }
 
-// Only instrumented solves serialize. Rayon workers join before Scope drops;
+// Only setup and solves with receipts enabled serialize. Workers join before Scope drops;
 // completed observations belong to the calling thread even if another handle
 // starts solving before the FFI writes its receipt.
 static RECORDING: Mutex<()> = Mutex::new(());
+#[derive(Default)]
+struct Snapshot {
+    phases: BTreeMap<&'static str, PhaseStat>,
+    cpu: BTreeMap<&'static str, Duration>,
+    serial: BTreeMap<&'static str, Duration>,
+    sites: BTreeMap<usize, (u64, Duration)>,
+    cpu_clocks: bool,
+}
 thread_local! {
-    static COMPLETED: RefCell<BTreeMap<&'static str, PhaseStat>> = RefCell::default();
+    static COMPLETED: RefCell<Snapshot> = RefCell::default();
+    static RECORDING_OWNED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Process CPU time (user + system, all threads) when receipts are on.
@@ -204,7 +213,10 @@ fn serial_add(name: &'static str, start: Option<Duration>) {
 /// (idle rayon workers spin briefly, so this is an upper bound).
 pub fn cpu_finish(name: &'static str, wall: &'static str, start: Option<CpuMark>) {
     if let Some(mark) = start {
-        if let Some(cpu) = mark.cpu.and_then(|start| Some(process_cpu()?.saturating_sub(start))) {
+        if let Some(cpu) = mark
+            .cpu
+            .and_then(|start| Some(process_cpu()?.saturating_sub(start)))
+        {
             phase_record(name, cpu);
         }
         phase_record(wall, mark.wall.elapsed());
@@ -257,37 +269,67 @@ pub fn profile_requested() -> bool {
     *ON.get_or_init(|| std::env::var_os("SDPX_PROFILE").is_some())
 }
 
-pub(crate) struct Scope(Option<MutexGuard<'static, ()>>);
+pub(crate) struct Scope {
+    guard: Option<MutexGuard<'static, ()>>,
+    solve: bool,
+}
 impl Scope {
     pub(crate) fn begin() -> Self {
-        Self::configured(receipts_requested())
+        Self::configured(receipts_requested(), true)
     }
 
-    fn configured(enabled: bool) -> Self {
-        if !enabled {
-            return Self(None);
+    // Construction uses the same phase timers as solving. Serialize it while
+    // receipts are enabled, discarding its observations and preserving the
+    // previous solve's snapshot. Sampled preparation nests ordinary setup.
+    pub(crate) fn setup() -> Self {
+        Self::configured(receipts_requested(), false)
+    }
+
+    fn configured(enabled: bool, solve: bool) -> Self {
+        if !enabled || (!solve && RECORDING_OWNED.get()) {
+            return Self { guard: None, solve };
         }
+        debug_assert!(!RECORDING_OWNED.get());
         let guard = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
+        RECORDING_OWNED.set(true);
         CPU_CLOCKS.store(process_threads().is_none_or(|n| n > 1), Ordering::Relaxed);
         PHASES.lock().unwrap().clear();
         SITES.lock().unwrap().clear();
         CPU.lock().unwrap().clear();
         SERIAL.lock().unwrap().clear();
-        COMPLETED.with(|c| c.borrow_mut().clear());
-        Self(Some(guard))
+        if solve {
+            COMPLETED.with(|c| *c.borrow_mut() = Snapshot::default());
+        }
+        Self {
+            guard: Some(guard),
+            solve,
+        }
     }
 }
 impl Drop for Scope {
     fn drop(&mut self) {
-        if self.0.is_some() {
-            let stats = std::mem::take(&mut *PHASES.lock().unwrap());
-            COMPLETED.with(|c| *c.borrow_mut() = stats);
+        if self.guard.is_some() {
+            let stats = Snapshot {
+                phases: std::mem::take(&mut *PHASES.lock().unwrap()),
+                cpu: std::mem::take(&mut *CPU.lock().unwrap()),
+                serial: std::mem::take(&mut *SERIAL.lock().unwrap()),
+                sites: std::mem::take(&mut *SITES.lock().unwrap()),
+                cpu_clocks: CPU_CLOCKS.load(Ordering::Relaxed),
+            };
+            if self.solve {
+                COMPLETED.with(|c| *c.borrow_mut() = stats);
+            }
+            RECORDING_OWNED.set(false);
         }
     }
 }
 
 /// Take this thread's most recently completed solve observations.
 pub fn drain() -> BTreeMap<&'static str, PhaseStat> {
+    take_completed().phases
+}
+
+fn take_completed() -> Snapshot {
     COMPLETED.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
@@ -361,9 +403,13 @@ fn try_write_parts<T: crate::algebra::FloatT>(
     if rank != 0 {
         path.push(format!(".rank{rank}"));
     }
-    let phases = drain();
-    let cpu = CPU.lock().unwrap().clone();
-    let serial = SERIAL.lock().unwrap().clone();
+    let Snapshot {
+        phases,
+        cpu,
+        serial,
+        sites,
+        cpu_clocks,
+    } = take_completed();
     let mut phase_map = serde_json::Map::new();
     for (name, s) in &phases {
         let mut entry = serde_json::json!({
@@ -381,7 +427,7 @@ fn try_write_parts<T: crate::algebra::FloatT>(
         phase_map.insert((*name).to_string(), entry);
     }
     let mut site_map = serde_json::Map::new();
-    for (site, (count, total)) in SITES.lock().unwrap().iter() {
+    for (site, (count, total)) in &sites {
         site_map.insert(
             site.to_string(),
             serde_json::json!({"count": count, "total_s": total.as_secs_f64()}),
@@ -422,7 +468,7 @@ fn try_write_parts<T: crate::algebra::FloatT>(
             "outer_refinements": ctr.outer_refinements,
         },
         "phases": phase_map,
-        "cpu_clocks": CPU_CLOCKS.load(Ordering::Relaxed),
+        "cpu_clocks": cpu_clocks,
         "setup_seconds_inclusive": setup,
         "memory": {"peak_rss_bytes": peak_rss},
         "env": {
@@ -445,12 +491,14 @@ mod tests {
     use super::*;
     #[test]
     fn concurrent_scopes_and_repeated_solves_are_isolated() {
+        let completed = std::sync::Arc::new(std::sync::Barrier::new(2));
         let handles: Vec<_> = (1..=2)
             .map(|id| {
+                let completed = completed.clone();
                 std::thread::spawn(move || {
                     for _ in 0..3 {
                         {
-                            let _scope = Scope::configured(true);
+                            let _scope = Scope::configured(true, true);
                             std::thread::scope(|s| {
                                 s.spawn(|| {
                                     let mut phases = PHASES.lock().unwrap();
@@ -458,9 +506,37 @@ mod tests {
                                     stat.count += id;
                                 });
                             });
+                            CPU.lock()
+                                .unwrap()
+                                .insert("worker", Duration::from_secs(id));
+                            SERIAL
+                                .lock()
+                                .unwrap()
+                                .insert("worker", Duration::from_secs(id + 1));
+                            SITES
+                                .lock()
+                                .unwrap()
+                                .insert(id as usize, (id, Duration::from_secs(id + 2)));
+                            CPU_CLOCKS.store(id == 2, Ordering::Relaxed);
                         }
-                        std::thread::yield_now();
-                        assert_eq!(drain()["worker"].count, id);
+                        {
+                            let _setup = Scope::configured(true, false);
+                            let _nested = Scope::configured(true, false);
+                            PHASES.lock().unwrap().entry("setup").or_default().count = 1;
+                        }
+                        // Both threads have completed another scope before either
+                        // reads its receipt, so shared globals cannot supply it.
+                        completed.wait();
+                        let stats = take_completed();
+                        assert_eq!(stats.phases["worker"].count, id);
+                        assert!(!stats.phases.contains_key("setup"));
+                        assert_eq!(stats.cpu["worker"], Duration::from_secs(id));
+                        assert_eq!(stats.serial["worker"], Duration::from_secs(id + 1));
+                        assert_eq!(
+                            stats.sites[&(id as usize)],
+                            (id, Duration::from_secs(id + 2))
+                        );
+                        assert_eq!(stats.cpu_clocks, id == 2);
                         assert!(drain().is_empty());
                     }
                 })

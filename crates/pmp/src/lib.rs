@@ -205,6 +205,7 @@ fn write_block<T: Scalar + FromStr>(
         .create_new(true)
         .open(destination.join(format!("block_data_{index}.json")))?;
     let mut output = BufWriter::new(file);
+    let polynomials = &matrix.polynomials;
     let resampled;
     let matrix = if prepared.resample
         && matrix.prefactor.is_none()
@@ -220,7 +221,6 @@ fn write_block<T: Scalar + FromStr>(
         )
         .map_err(|e| format!("block {index}: {e}"))?;
         resampled = PolynomialMatrix {
-            polynomials: matrix.polynomials.clone(),
             prefactor: Some(prefactor),
             ..Default::default()
         };
@@ -228,8 +228,15 @@ fn write_block<T: Scalar + FromStr>(
     } else {
         matrix
     };
-    let (count, info) = convert::<T>(matrix, &prepared.norm, prepared.pivot, index, &mut output)
-        .map_err(|e| format!("block {index}: {e}"))?;
+    let (count, info) = convert::<T>(
+        matrix,
+        polynomials,
+        &prepared.norm,
+        prepared.pivot,
+        index,
+        &mut output,
+    )
+    .map_err(|e| format!("block {index}: {e}"))?;
     output.flush()?;
     write_json(
         destination,
@@ -348,18 +355,19 @@ fn write_element(output: &mut impl Write, first: &mut bool, value: &impl Seriali
 }
 fn convert<T: Scalar + FromStr>(
     m: &PolynomialMatrix,
+    polynomials: &Polynomials,
     norm: &[T],
     pivot: usize,
     index: usize,
     output: &mut impl Write,
 ) -> Result<(usize, serde_json::Value)> {
-    let dim = m.polynomials.len();
+    let dim = polynomials.len();
     require(
-        dim > 0 && m.polynomials.iter().all(|row| row.len() == dim),
+        dim > 0 && polynomials.iter().all(|row| row.len() == dim),
         "polynomial matrix must be nonempty and square",
     )?;
     let mut degree = 0;
-    for row in &m.polynomials {
+    for row in polynomials {
         for vector in row {
             require(
                 vector.len() == norm.len(),
@@ -378,7 +386,7 @@ fn convert<T: Scalar + FromStr>(
         for c in 0..r {
             // Equal strings need parsing only once, when evaluating the upper
             // triangle. Otherwise preserve numeric (not textual) symmetry.
-            let (a, b) = (&m.polynomials[r][c], &m.polynomials[c][r]);
+            let (a, b) = (&polynomials[r][c], &polynomials[c][r]);
             if a != b {
                 for (a, b) in a.iter().zip(b) {
                     require(a.len() == b.len(), "polynomial matrix must be symmetric")?;
@@ -500,7 +508,7 @@ fn convert<T: Scalar + FromStr>(
     let inverse = T::one() / norm[pivot];
     let mut first = true;
     for c in 0..dim {
-        for row in m.polynomials.iter().take(c + 1) {
+        for row in polynomials.iter().take(c + 1) {
             let cp: Vec<_> = numbers::<T>(&row[c][pivot])?
                 .into_iter()
                 .map(|a| a * inverse)
@@ -516,7 +524,7 @@ fn convert<T: Scalar + FromStr>(
     let mut first = true;
     let mut values = Vec::with_capacity(norm.len() - 1);
     for c in 0..dim {
-        for row in m.polynomials.iter().take(c + 1) {
+        for row in polynomials.iter().take(c + 1) {
             let v = &row[c];
             let cp: Vec<_> = numbers::<T>(&v[pivot])?
                 .into_iter()
