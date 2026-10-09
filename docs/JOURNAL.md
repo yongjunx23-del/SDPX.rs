@@ -8,6 +8,206 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — one plan; SDPB design notes; task 15 result
+
+- Reconciled the two plans: slim-repo `a450d6b` (large-case review) and perf-cc1007 (the performance campaign). There is now one `REVIEW_AND_PLAN.md`.
+- History left the plan. Every moved item already has its entry here:
+  - the PBS2235xx accuracy-gate narrative;
+  - the matched release check of 2026-10-07;
+  - the historical timings;
+  - the per-change retained table.
+- Corrected stale plan statements:
+  - control3 is Solved/23 and audited (task 10).
+  - The Float64 defaults no longer report Solved on failed audits (task 9).
+  - Large SU(2) is AlmostSolved/20 (125 s at 1 thread, 48 s at 16), with its root cause the shared PSD kernels (no Slater point).
+  - The mixed Λ27/1024 audit failure is a different input from the 768-bit Λ27 campaign case, whose audit passes.
+- SDPB design (arXiv:1502.02033 §2.4–2.6, arXiv:1909.09745 §2–3, release notes 2.7–3.1):
+  - **IPM:** an infeasible primal-dual IPM, not HSD. Start (0, Ω_P I, 0, Ω_D I), with Ω = 1e40–1e60 in the paper's Ising runs.
+  - **Steps:** separate α_P and α_D with γ = 0.7. Predictor β 0 or 0.3; corrector β = r² or r, clamped by 0.1/0.3.
+  - **Linear algebra:** two Schur solves per iteration, without iterative refinement.
+  - **Stabilization:** SDPB 1's Cholesky stabilization (an exact low-rank border U) was removed in SDPB 2. Since then there is no regularization; users raise the precision instead.
+  - **Termination:** absolute max-norm primal and dual errors, and a relative gap.
+  - **Parallelism:** block timings with worst-fit-decreasing assignment; Elemental-distributed Q with a ring reduce-scatter.
+  - **SDPB 3.0:** Q through CRT/FLINT/BLAS in node-shared windows (about 2.5× faster).
+  - Implication, a hypothesis: Λ35's 768-bit stall comes from the HSD end game and the MPFR shifts, which SDPB has neither of. Plan item 1 tests no static or dynamic shift in the MPFR arrow.
+- Task 15 (`perf-iter`, net tree `a68f72f`): kept.
+  - Shared sampled linear products, bitwise identical.
+  - Square-root-free Givens replay in the MPFR SVD.
+  - t14a → t15b, same node, 64 threads, medians:
+
+    | Case | Before (s) | After (s) | Change |
+    |---|---|---|---|
+    | Λ27 | 271.7 | 258.5 | −4.9% (1.41 s/it, equal to SDPB) |
+    | s50 | 165.3 | 153.8 | −7.0% |
+    | Λ19 | 74.9 | 71.0 | −5.3% |
+    | ising11 | 3.60 | 3.44 | −4.3% |
+
+  - Λ19 MPI 2×32: −2.7%.
+  - Audits pass. Float64 parity: 44/44 cases identical.
+  - Rejected:
+    - Spare workers to the costliest blocks: neutral.
+    - Skipping a correction when the residual peak is in recovered rows: the premise was disproved, since 55 of those corrections were useful.
+  - Open: second corrections are futile in 118/124 cases. A cap would change the refinement rule; a safe skip needs a per-row representation floor.
+
+## 2026-10-09 — Large-Ising bottleneck review (existing evidence only)
+
+Reviewed shared HEAD `515708f`, saved Lambda19/Lambda27 receipts and audits,
+and SDPB 3.1.0's search-direction, Schur/Q and residue-BLAS source. No source,
+settings, solver runs or cluster jobs changed. The following numbers are
+historical frozen diagnostics, not a fresh HEAD timing or an accepted
+large-case speed comparison.
+
+For PBS223593's frozen 0.9.1 Lambda27/1024 baseline, 32 threads/BLAS one,
+`wall.solve` is 2349.940567 s; setup 91.409819 s, native 2441.387069 s. The
+original-coordinate audit subsequently failed in PBS223602: primal 3.730e-28,
+dual 1.475e-23, PSD mapping link 2.733e-26, componentwise dual 0.84355 at 1e-30.
+The saved-point diagnosis ties the normalization mismatch to x norm 5.832e118;
+qnorm/componentwise gates were disabled. The separate historical 1369 s
+SDPX/2592 s SDPB points were not independently audited; do not say those
+particular points were tested and failed, or treat 42 versus 125 iterations
+as an equal-accuracy advantage.
+
+| Phase | Wall s | Share of 2349.940567 s loop |
+|---|---:|---:|
+| KKT update, including constant/affine solves | 1467.366898 | 62.44% |
+| Subsequent KKT solves | 330.533613 | 14.07% |
+| Cone scaling | 359.172932 | 15.28% |
+| Refactor, nested | 800.142147 | 34.05% |
+| Arrow contributions, nested in refactor | 422.610270 | 17.98% |
+| Arrow leaf factor/coupling work, nested in refactor | 359.623316 | 15.30% |
+| Final border factor, nested in refactor | 14.309328 | 0.61% |
+
+Parent and child timers overlap; never sum the whole table. Counters:
+129 applied RHSs, 260 prepare/recover calls, 813 counted linear solves and
+553 refinement corrections. Current HSD batching shares reduced solves but
+MPFR residual rows and condensed outer recovery/refinement remain per RHS.
+Make those required passes cheaper; relaxed refinement already failed prior
+original-coordinate gates. SVD replay is 6828.945 of 9937.768 summed per-cone
+SVD seconds (68.7%), not 68.7% of solver wall time. The audited Lambda19/768
+four-thread profile from PBS222426 instead has 40.28% KKT update, 12.43% KKT
+solve and 32.65% cone scaling; do not extrapolate one size/thread mix to another.
+
+The recorded augmented HKM experiment (journal 2026-10-07) is not a successful
+large condensed replacement: Ising11/512 increases 52 -> 58 iterations and
+37.1 -> 41.9 s despite a cheaper cone update. Ordinary MPI distributes leaves
+but replicates the reduced system and border factors/solves. SDPB 3.1.0 uses
+node-shared residue panels, reduce-scatter and distributed Q; SDPX's owner
+path is separate. Historical one-to-four-node ratios are 1.54x for SDPX and
+1.55x for SDPB. The single-process baseline's peak is 20.667 GiB; no matched
+aggregate-PSS winner is established.
+
+Current `arrow::subtract_contributions` only batches eligible full
+pool-width groups and receives the rank-owned leaf slice. MPI sharding can
+therefore send underfilled work to exact dots. This is a confirmed code
+condition, not a measured explanation of the scaling curve; record per-rank
+branch counts before changing it. Priority: accepted large endpoint first,
+then leaf/coupling/Schur and sampled-transform costs, then cone-tail latency
+and persistent ownership. No new pilot is authorized by this documentation.
+
+Evidence under `$SDPX_E2E_HOME/`:
+- `work/resumed-091-arrow-full-20261006/retrieved-retry1-20261007/receipt.json`;
+- the same work directory's `retrieved-retry2-20261007/reference-audit.json`
+  and `retrieved-diagnostic-20261007/summary.json`;
+- `streamline-crt-profile-20261003-1135/results/lambda19.receipt.json` and
+  `results/summary.json` (accepted audit bound by full-point equality);
+- historical multi-node and HKM source/job bindings in the 2026-10-05/07 entries.
+SDPB reference: tag 3.1.0, `src/sdp_solve/SDP_Solver/run/bigint_syrk/Readme.md`
+and `run/step/{compute_search_direction,initialize_schur_complement_solver}/`.
+
+## 2026-10-09 — Large SU(2): assembly/factor bottlenecks and an open accuracy gate
+
+Reviewed the already completed PBS223874 evidence, not a new run. Frozen
+clean source `515708f7c1506f52dcae22d60e7c7d904dad4606`, release, Float64;
+cluster binary SHA256
+`5f289415a651b519504b8e037bcb215397de8a7998fb3015a18d5e65a06197df`.
+Input SHA256
+`be8f0f0136ed25b1dba58f3a3ef4d6fed760012e6a6c5c8ff86eef78b69746eb`:
+7054 variables, 42023 conic rows, 1720 equalities, seven input PSD orders
+95/92/94/92/186/74/71. This is the large SU(2) SDP, not the gravity SOCP.
+The stored retrieval proof records 251 verified source files and exit 0 for
+completion of the diagnostic campaign; it does not mean solver acceptance.
+
+Sequential fresh processes, physical-core pinning, 64 allocated cores/64 GiB,
+SDPX BLAS one. SDPX requests feasibility/gaps/qnorm 1e-6; MOSEK 11.2.2 uses its
+recorded 1e-8 interior-point tolerances. Both face the same native Python
+original-coordinate audit at 1e-6. Failed configurations were not repeated,
+so each engine/width below has one observation, not an ABBA median.
+
+| Threads | SDPX native s | SDPX status/it | MOSEK native s | MOSEK status/it | Audits |
+|---|---:|---|---:|---|---|
+| 1 | 143.684355 | AlmostSolved/25 | 60.646498 | unknown/19 | both FAIL |
+| 4 | 87.650627 | AlmostSolved/25 | 31.375200 | unknown/25 | both FAIL |
+| 16 | 89.201880 | AlmostSolved/25 | 15.893489 | optimal/18 | both FAIL |
+| 64 | 100.717990 | NumericalError/23 | 25.324012 | optimal/25 | both FAIL |
+
+These are times to termination, not speedups to a valid solution. Four-thread
+SDPX has original dual residual 6.577717e-6 against 1.75e-6 and relative
+gap 6.107024e-6 against 1e-6. MOSEK's 16-thread `optimal` point still has dual
+1.188037e-4 and gap3.482001e-6. The Mac runs (MOSEK 11.1.3) also all fail;
+SDPX terminates with NumericalError/19--20. Cross-host times, stopping
+statuses and iteration counts cannot be mixed into a performance ratio.
+
+Four-thread cluster receipt: final backend `condensed_faer`, setup 3.424707 s,
+`wall.solve` 84.225422 s, native 87.650627 s. The final backend name does not
+prove every refactor used only faer: `DenseBlockSolver::linear_solver_info`
+can forward a sparse fallback's name. Factor-attempt history needs its own
+trace before attributing the entire refactor cost to a particular kernel.
+
+| Phase | Wall s | Share of 84.225422 s loop |
+|---|---:|---:|
+| KKT update, parent | 76.527548 | 90.86% |
+| Schur assembly, lower-level | 33.550572 | 39.83% |
+| Refactor, lower-level | 37.465347 | 44.48% |
+| KKT solve | 3.712879 | 4.41% |
+| Cone scaling | 0.253035 | 0.30% |
+
+The lower-level assembly/refactor totals include initialization and retries
+as well as IPM updates; they overlap the top-level update/start timers.
+
+Assembly plus refactor is 84.32% of loop wall, not an SVD bottleneck. All
+three one/four/16-thread runs take 25 iterations and 29 factor attempts:
+assembly 35.208900/33.550572/34.156910 s; refactor90.738272/37.465347/
+36.189101 s. Four-thread assembly CPU 33.511744 s divided by wall 33.550572 s
+is 0.999 busy cores. The whole solve only improves 1.64x from one to four
+threads and does not improve at 16; the 64-thread run has fewer iterations and
+a different failure, so its phase totals are not a matched-work comparison.
+
+Within four-thread assembly, transform 15.763564 s, dot/scatter 14.741553 s,
+sparse 2.610336 s. Dot/scatter contains indexed publication 11.961272 s
+versus 2.748870 s in FMA (publication 81.1% of that phase). This identifies
+index/scatter work as a target; hardware bandwidth saturation has not been
+measured. SDPX process peak RSS is 2804--3139 MiB across widths. MOSEK's
+Python-process RSS includes imports, point retrieval and audit, whereas
+SDPX's CLI RSS excludes the external audit; no clean allocation ratio follows.
+
+Code trace: `parallel_assembly_allowed` admits full per-block triangular
+buffers if their total fits either two stored-Schur copies or 256 MiB.
+Outside that admission, `assemble` calls `compute_schur` with no pool;
+Float64 transform lanes stay serial and packed parallel dot tiles cannot
+run. The retained dot-store/FMA timers and one-core assembly are consistent
+with that route, but the saved receipts do not record the actual admission
+counts. The budget explanation remains a candidate, not a measured verdict.
+
+Next checks, not implemented or launched here:
+1. Isolate the first failed factorization and accepted-iterate residual;
+   independently check original-coordinate mapping. Do not promote
+   AlmostSolved, accept MOSEK status alone, or loosen the audit.
+2. Record contribution cells, stored Schur cells, pool width and assembly
+   admission after preprocessing. If the fallback is responsible, evaluate
+   bounded parallel batches/tiles that preserve per-entry cone order rather
+   than merely increasing the memory cap. Existing rejected medium streaming
+   variants are not automatically reopened.
+3. Split refactor time into dense attempts and sparse fallback, then inspect
+   factor fill, numeric kernels and thread utilization at four threads before
+   another broad width sweep. No evidence here isolates numerical failure to
+   faer, SVD, regularization or the assembly budget.
+
+The plan now distinguishes this input from PBS222437's gravity comparison.
+Evidence: `$SDPX_E2E_HOME/work/su2-large-scaling-20261008/`:
+`report.json`, `source.json`, `mac-arm.json`, `settings.json`, `worker.py`,
+`retrieved-223874/{cluster-manifest.json,retrieval-proof.json}` and
+`retrieved-223874/results-cluster/{rows.json,t*-0-sdpx.receipt.json}`.
+
 ## 2026-10-09 — integration merge perf-int (tasks 9, 10, 12, 14): kept
 
 - Merged as `0e42ad2` (perf-int `d9f12b2`).
