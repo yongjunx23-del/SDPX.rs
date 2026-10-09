@@ -8,6 +8,17 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — task 18: Hypatia WSOS dual-barrier cone for Ising, no-go
+
+- Hypothesis: Hypatia's WSOSInterpNonnegative cone (Λ(z) = Pᵀdiag(z)P, which equals SDPX's X block) removes the NT SVD and the PSD-space prepare/recover, and is faster on large Ising.
+- Formulation (verified on ising11): every block has R = 1. ν equals the SDP lifting's; only the vector dimension shrinks (Λ27 q 2613 vs 67327 lifted, Λ35 4071 vs 117992).
+- Measurements (Hypatia 0.10.2, local copy with threaded cone loops; scripts and logs in `~/.cache/sdpx-e2e/t18/`, cluster `t18/`):
+  - ising11, 512 bits: 1e-30 Optimal 69 it / 19.1 s; 1e-42 86 it / 25.4 s (line search 39%, 9.4 cone checks/it, 4 solves/it); 1e-60 109 it / 34 s. SDPX takes 54 it. Objective 4.62e-35 from the reference, the same as SDPX's audit.
+  - Λ19, 768 bits (job 224271, 32 threads, about 20 s/it): cancelled at iteration 107 with gap 4.6e-9, α ≈ 0.1, τ falling 1.0 → 0.13. SDPX reaches gap 4.75e-9 at iteration 73 and 1e-42 at 121.
+- Cost model for Λ27: the factor has the same structure as SDPX's leaves and border. Removing the SVD and the PSD-space passes gives at best 0.5× per iteration, but the line search (150–610M multiply-adds per iteration) and third-order adjustments exceed the factor. No symmetric primal-dual scaling exists for this cone.
+- Decision: no-go. Net between 0.8× SDPX (best case) and 1.3–2.5× slower, with the iteration gap widening with size.
+- Carried to task 19: re-measure HKM at Λ27/Λ35 scale. The ising11 closure (52 → 58 it) predates the Λ27 profile, where scaling is 21.6%. Estimated net 0–8% on Λ27. Hypatia's τ also collapses on Λ19, which supports task 17's fixed-τ direction.
+
 ## 2026-10-09 — int5 Float64 gate (task 15 merged); Ising target ≥2× SDPB
 
 - Gate: int5 (`a5334dd` + FMA, task 15 merged) against int4 on the 58-case scoreboard (`t7/int5-compare.md`). Statuses, iterations (638) and audits are identical; 0 Solved-but-fail.

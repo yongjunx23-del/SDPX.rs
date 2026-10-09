@@ -152,7 +152,7 @@ These Ising figures include task 15. The Float64 figures are from int5 (`a5334dd
 | 20 | `perf-t20` | Multi-node: distributed border factor, cost-balanced ranks, batched agreement flags (reuse `perf-border` `a80cfa1`); SDPB 3.1 sample points | 1/2/4-node Λ27/Λ35 pace vs SDPB; Ising A/B with audits |
 | 16 | `perf-endgame` | Float64 end game: AlmostSolved → audited Solved, no test loosened | 58-case scoreboard; Λ19 ABBA if MPFR-reachable |
 
-Task 18 (Hypatia WSOS, measurement only) is closing: no-go on the one-sided formulation (ising11: 69–109 it / 19–34 s against SDPX 54 / 3.4 s); its kernel ideas go to task 19.
+Task 17 interim: with MPFR shifts off (item D, `ee4af07`, unmerged until the ABBA gate 224308), Λ35 at 768 bits is Solved in 691 it / 1886 s and audited (SDPB 768: 746 / 2009 s). The normalized 2×2 PMP is now Solved/24.
 
 ## Next work, in order
 
@@ -270,6 +270,11 @@ are in [the journal](docs/JOURNAL.md).
 - HKM (SDPB XZ) or mixed NT/HKM PSD direction, and NT scaling through
   eig(LᵀSL): HKM's cone update is 6.5× cheaper, but ising11/512 takes 52 → 58
   iterations and 37.1 → 41.9 s; net ≤ 0 for the condensed sampled path.
+  Task 19 re-measures it at Λ27/Λ35 scale, where scaling is 21.6% of an
+  iteration (new evidence).
+- Hypatia-style WSOS dual-barrier cone for the Ising PMPs (task 18):
+  ising11 86 vs 54 it; Λ19 gap 4.6e-9 at 107 it vs SDPX's 73; the line
+  search costs more than the factor.
 - MPFR PSD Gondzio correctors (+33% per iteration); low-rank DSDP formulas
   (already covered); Strassen or Ozaki residue GEMM (≤3%); a backward-error
   refinement stop (changes the refinement rule).
