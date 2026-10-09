@@ -234,8 +234,8 @@ def reduce(data):
     qr, qc, qv = [np.arange(len(rows))], [rows], [np.ones(len(rows))]
     for comp in components:
         coeff = matrix(comp["coeff"]).tocoo()
-        qr.append(rowindex[np.asarray(comp["other_rows"])[coeff.row]])
-        qc.append(np.asarray(comp["pivot_rows"])[coeff.col])
+        qr.append(rowindex[np.asarray(comp["other_rows"], dtype=np.intp)[coeff.row]])
+        qc.append(np.asarray(comp["pivot_rows"], dtype=np.intp)[coeff.col])
         qv.append(-coeff.data)
     transform = sp.csr_matrix((np.concatenate(qv), (np.concatenate(qr), np.concatenate(qc))),
                               shape=(len(rows), a.shape[0]))
