@@ -57,6 +57,9 @@ const FACTOR_PANEL: usize = 8;
 /// 170-row border slowed 64-thread iterations by 2.9% and raised RSS 1.7 GB.
 const EXACT_FACTOR_MIN: usize = 256;
 const EXACT_PANEL: usize = 48;
+/// Product work (Σ g·q²) from which a group of fewer leaves than workers
+/// is batched through exact products.
+const SHORT_BATCH_WORK: u128 = 1 << 30;
 /// Product entries buffered by one batch of exact leaf contributions.
 const BATCH_PRODUCT_ENTRIES: usize = 1 << 24;
 /// Residue-product ways a split exact factor offers to idle workers.
@@ -976,7 +979,17 @@ fn subtract_contributions<T: FloatT>(
             product
         };
         for group in leaves.chunk_by(|a, b| eligible(a) == eligible(b)) {
-            if !eligible(&group[0]) {
+            // A short group of light products keeps the column path: on Λ35
+            // (36 leaves, Σ g·q² ≈ 2e8) batching saved 0.5% at 64 threads but
+            // its workspace raised peak RSS 4.7 → 6.4 GB; mixed Λ27/1024 at
+            // 128 threads gains 13% from it.
+            let light = group.len() < width
+                && group
+                    .iter()
+                    .map(|l| (l.ids.len() * l.coupled.len() * l.coupled.len()) as u128)
+                    .sum::<u128>()
+                    < SHORT_BATCH_WORK;
+            if !eligible(&group[0]) || light {
                 // Keep these leaves column-parallel and avoid square result
                 // storage, preserving their position in every entry's sum.
                 subtract_contributions_columns(group, s, t, pool);
