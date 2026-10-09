@@ -85,12 +85,8 @@ macro_rules! primitive_configuration {
 // the `s`-prefixed kernels; the solver itself runs at f64 and MPFR.
 primitive_configuration!(f32, |_, _, _| None);
 primitive_configuration!(f64, |matrix, signs, settings| {
-    super::arrow::ArrowLDLSolver::try_separator(matrix, signs, settings)
-        .map(|a| Box::new(a) as BoxedDirectLDLSolver<f64>)
-        .or_else(|| {
-            super::dense_block::DenseBlockSolver::try_new(matrix, signs, settings)
-                .map(|s| Box::new(s) as BoxedDirectLDLSolver<f64>)
-        })
+    super::dense_block::DenseBlockSolver::try_new(matrix, signs, settings)
+        .map(|s| Box::new(s) as BoxedDirectLDLSolver<f64>)
         .or_else(|| {
             super::arrow::ArrowLDLSolver::try_new(matrix, signs, settings)
                 .map(|a| Box::new(a) as BoxedDirectLDLSolver<f64>)
