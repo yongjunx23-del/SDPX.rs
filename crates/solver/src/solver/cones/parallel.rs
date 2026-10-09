@@ -307,10 +307,10 @@ fn width_factor() -> f64 {
 /// lifetime. A wider mask is left alone, so unbound processes sharing a node
 /// never collide on the same cores. Measured −4% at 52 threads (Λ19 spins 0–50). Unpinned workers migrate between cores and lose
 /// their caches, and at high thread counts every phase (serial ones too)
-/// measured 20–40% slower per call. When the pool is narrower than the
-/// budget (`useful_width`), the calling (main) thread is confined to the
-/// workers' CPUs as well, so it neither wanders to another NUMA domain nor
-/// first-touches the solver's memory there. Linux only; elsewhere a no-op.
+/// measured 20–40% slower per call. A pool narrower than the budget uses
+/// its first `workers` CPUs. The caller keeps its mask, so later pools and
+/// repeated handle calls inherit the original allocation. Linux only;
+/// elsewhere a no-op.
 pub(crate) fn pin_worker(budget: usize, workers: usize) -> impl Fn(usize) + Send + Sync + 'static {
     #[cfg(target_os = "linux")]
     let cpus: Vec<usize> = unsafe {
@@ -326,19 +326,8 @@ pub(crate) fn pin_worker(budget: usize, workers: usize) -> impl Fn(usize) + Send
     #[cfg(not(target_os = "linux"))]
     let cpus: Vec<usize> = Vec::new();
     let pin = cpus.len() == budget;
-    #[cfg(target_os = "linux")]
-    if pin && workers < budget {
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            for &c in &cpus[..workers] {
-                libc::CPU_SET(c, &mut set);
-            }
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = workers;
     move |i: usize| {
+        debug_assert!(i < workers);
         #[cfg(target_os = "linux")]
         if pin {
             unsafe {

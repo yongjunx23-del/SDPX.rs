@@ -75,6 +75,7 @@ pub struct FaerDirectLDLSolver<T: FloatT + faer_traits::RealField> {
     work: MemBuffer,
 
     parallelism: Par,
+    pool: Option<std::sync::Arc<rayon::ThreadPool>>,
 }
 
 impl<T> FaerDirectLDLSolver<T>
@@ -91,10 +92,9 @@ where
 
         // -----------------------------
 
-        let parallelism = match crate::solver::core::worker_budget(settings.max_threads as usize) {
-            1 => Par::Seq,
-            workers => Par::rayon(workers),
-        };
+        // The shared solver pool is supplied after construction. Until then
+        // stay serial rather than initializing a separate global Rayon pool.
+        let parallelism = Par::Seq;
 
         // perm has possibly been passed by LDL auto selector.
         // If not, find an ordering now
@@ -180,6 +180,7 @@ where
             ld_vals,
             work,
             parallelism,
+            pool: None,
         }
     }
 }
@@ -230,42 +231,76 @@ where
         let rhs = MatMut::from_column_major_slice_mut(&mut self.bperm[0..], b.len(), 1);
         let ldlt = LdltRef::new(&self.symbolic_cholesky, self.ld_vals.as_slice());
 
-        ldlt.solve_in_place_with_conj(
-            Conj::No,
-            rhs,
-            self.parallelism,
-            MemStack::new(&mut self.work),
-        );
+        let solve = || {
+            ldlt.solve_in_place_with_conj(
+                Conj::No,
+                rhs,
+                self.parallelism,
+                MemStack::new(&mut self.work),
+            );
+        };
+        match &self.pool {
+            Some(pool) => pool.install(solve),
+            None => solve(),
+        }
 
         // bperm is now the solution, permute it back to the original ordering
         permute(x, &self.bperm, &self.iperm);
     }
 
     fn refactor(&mut self, _kkt: &CscMatrix<T>) -> bool {
-        let symbKKT = SymbolicSparseColMatRef::new_checked(
-            self.perm_kkt.n,
-            self.perm_kkt.n,
-            &self.perm_kkt.colptr,
-            None,
-            &self.perm_kkt.rowval,
-        );
+        // SAFETY: new() checked this sorted CSC structure. Only nzval is
+        // modified after construction; colptr, rowval and dimensions stay fixed.
+        let symbKKT = unsafe {
+            SymbolicSparseColMatRef::new_unchecked(
+                self.perm_kkt.n,
+                self.perm_kkt.n,
+                &self.perm_kkt.colptr,
+                None,
+                &self.perm_kkt.rowval,
+            )
+        };
 
         let a: SparseColMatRef<usize, T> =
             SparseColMatRef::new(symbKKT, self.perm_kkt.nzval.as_slice());
 
         let regularizer = self.regularizer_params.to_faer(&self.perm_dsigns);
 
-        self.symbolic_cholesky
-            .factorize_numeric_ldlt(
-                self.ld_vals.as_mut_slice(),
-                a,
-                Side::Upper,
-                regularizer,
-                self.parallelism,
-                MemStack::new(&mut self.work),
-                self.ldlt_params,
-            )
-            .is_ok() // bool, as the other LDL backends report
+        let mut factorize = || {
+            self.symbolic_cholesky
+                .factorize_numeric_ldlt(
+                    self.ld_vals.as_mut_slice(),
+                    a,
+                    Side::Upper,
+                    regularizer,
+                    self.parallelism,
+                    MemStack::new(&mut self.work),
+                    self.ldlt_params,
+                )
+                .is_ok() // bool, as the other LDL backends report
+        };
+        match &self.pool {
+            Some(pool) => pool.install(factorize),
+            None => factorize(),
+        }
+    }
+
+    fn set_pool(&mut self, pool: Option<std::sync::Arc<rayon::ThreadPool>>) {
+        let parallelism = match pool.as_ref().map_or(1, |pool| pool.current_num_threads()) {
+            1 => Par::Seq,
+            workers => Par::rayon(workers),
+        };
+        if parallelism != self.parallelism {
+            let req_factor = self
+                .symbolic_cholesky
+                .factorize_numeric_ldlt_scratch::<T>(parallelism, self.ldlt_params);
+            let req_solve = self
+                .symbolic_cholesky
+                .solve_in_place_scratch::<T>(1, parallelism);
+            self.work = MemBuffer::new(StackReq::any_of(&[req_factor, req_solve]));
+            self.parallelism = parallelism;
+        }
+        self.pool = pool;
     }
 }
 
