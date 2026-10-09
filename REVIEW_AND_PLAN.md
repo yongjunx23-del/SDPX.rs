@@ -54,14 +54,14 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 | Λ19 | 121 it / 71.0 s, audited | — |
 | ising11 (512 bits) | 54 it / 3.44 s | — |
 | Λ35 spins 0–70, 1024 bits | Solved 743 it / 3565 s (4.80 s/it, b0088bb era; current code not yet run); at 768 bits it fails (InsufficientProgress 887) | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
-| Float64 58 cases (int5) | 48 audited solves, 0 Solved-but-fail; wins 11 (1 thr), 9 (16 thr) | MOSEK |
+| Float64 58 cases (t16b = int5 + task 16) | 54 audited solves, 0 Solved-but-fail; wins 19 (1 thr), 12 (16 thr) | MOSEK |
 
-These Ising figures include task 15. The Float64 figures are from int5 (`a5334dd` + FMA: tasks 13 and 15).
+These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5334dd` + FMA, plus task 16).
 
 - **Float64 geo-mean SDPX/MOSEK at 1 thread:**
   - int5: LP 2.53, SDP 1.65, SOCP 1.43 (16 threads: 2.18 / 2.29 / 1.77); int4 was 3.03 / 1.80 / 1.68.
   - Task 13, same-node A/B: LP 2.3, SDP 1.5, SOCP 1.5.
-- **Float64 not Solved:** hinf3, qap6, gpp100/124/250/500, sched_100_50_orig, csdr3, f64_medium (AlmostSolved/26), f64_large (AlmostSolved/20; 125 s at 1 thread, 48 s at 16).
+- **Float64 not Solved:** hinf3 (platform-sensitive), sched_100_50_orig, csdr3 (augmented/arrow end-game floor), f64_large (AlmostSolved/20, no Slater point; facial reduction).
 - **Tiny LPs** lose on per-solve overhead: 2–20 ms against MOSEK's warm 1–5 ms.
 
 ### Retained work (details and evidence in the journal)
@@ -148,9 +148,9 @@ These Ising figures include task 15. The Float64 figures are from int5 (`a5334dd
 | Task | Branch | Scope | Gate |
 |---|---|---|---|
 | 17 | `perf-l35b` | Λ35 at 1024 bits against SDPB: baseline; two RHS via fixed τ with a general entry rule (τ and κ falling together); infeasible-start PMP mode (fixed τ, separate α_P/α_D, data-chosen start scale); safe refinement skip at the representation floor; no MPFR shifts with escalation on failure | Λ35 Solved + audit; Ising ABBA, csdr3, gravity256, 2×2 PMP no worse; infeasibility tests green |
-| 19 | `perf-scale` | Cone scaling and in-node parallelism: LPT and in-cone split of update_scaling; warm-started NT versus HKM/XZ A/B on Λ27/Λ35; blocks assigned by measured cost; idle threads | Ising ABBA with audits; Λ35 pace; Float64 scoreboard statuses/iterations/audits unchanged |
+| 19 | `perf-scale2` | Blocked Givens replay in the MPFR SVD through the exact residue GEMM (replay is 54% of SVD CPU at Λ35/1024; est. −4.4% Λ35, −3.5% Λ27). `perf-scale` (scheduling) not kept: ±0.5% | Ising ABBA with audits; Λ35 pace; Float64 scoreboard statuses/iterations/audits unchanged |
 | 20 | `perf-t20` | Done, merged `23e0a99`: owner-MPI agreements (−1.4…8%, bitwise identical); `pmp2sdp --resample` (SDPB 3.1 points: Λ19 −38%, Λ27 −41% at τ₀ 1e-30, 0 refinement corrections). Pending: matched SDPB on resampled inputs (224375–7), full Λ35 1024 (224373/4); start rule on 3.1 inputs (Λ27 345 it at default start) | — |
-| 16 | `perf-endgame` | Float64 end game: AlmostSolved → audited Solved, no test loosened | 58-case scoreboard; Λ19 ABBA if MPFR-reachable |
+| 16 | `perf-endgame` | Done, merged `81b1549`: binary64 condensed Δs from the primal row, GMRES-IR on residual growth; 6 more Float64 cases Solved | — |
 
 Task 17 interim: with MPFR shifts off (item D, `ee4af07`, unmerged until the ABBA gate 224308), Λ35 at 768 bits is Solved in 691 it / 1886 s and audited (SDPB 768: 746 / 2009 s). The normalized 2×2 PMP is now Solved/24.
 

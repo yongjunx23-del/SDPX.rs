@@ -8,6 +8,27 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — task 16 (perf-endgame) kept; task 19 (perf-scale) not kept
+
+- Task 16, Float64 end game. Commits `04442ef` and `7802a28`, merged in `81b1549`:
+  - On the condensed binary64 path, Δs is taken from the linear primal row instead of −(HΔz + c). Verified cause: the H·H⁻¹ round trip put about cond(H)·eps into AΔx + Δs − bΔτ.
+  - The outer refinement gets a GMRES-IR continuation, used only after an unnormalized residual norm has grown.
+  - MPFR is untouched (ising11 512 bitwise identical).
+  - Gate against int5 (`t7/t16b-compare.md`): no new audit failures and no status regressions. Now Solved and audited: qap6, gpp100, gpp124-1, gpp250-1, gpp500-1, f64_medium. Still AlmostSolved: hinf3, sched_100_50_orig, csdr3, f64_large.
+  - Wins vs MOSEK: 11 → 19 at 1 thread, 9 → 12 at 16.
+  - Same-node A/B (`t13/ab-int5-t16b-224379`): 14 cases within ±3%. csdr3 is +5% with bitwise-identical points, in unchanged arrow kernels (hypothesis: codegen/layout).
+  - Merge fix `d1dacbf`: the continuation's extra `decision_agrees` round was dropped, because its inputs are already global. This restores task 20's agreement-count tests.
+  - Dropped (evidence in the task report): Δs from the row on the augmented path; DirectLDL GMRES fallbacks; relative or smaller static shifts; `fixed_tau_phase` in binary64.
+  - Open: the augmented end-game floor (sched_100_50, csdr3); hinf3 is platform-sensitive; f64_large needs facial reduction.
+- Pre-existing test failures (seen at `bdbfacc` too, macOS): `condensed::parallel_tests::solve_many_accounting_f64` and `condensed_retained_nonsymmetric_original_operator_{f64,mpfr128}` panic on the `debug_assert` at `local_soc.rs:20`. Not yet triaged.
+- Task 19, cone scaling and idle threads (branch `perf-scale`, not merged):
+  - Extra ways for the costliest cones made the largest-cone SVD slower (0.63 → 0.89 s, inner joins steal worker loops). Reverted.
+  - What remains (`pool_ways` for condensed passes, sampled products and Gram sync) is ±0.5% on a full ABBA (Λ27 −0.5%, s50 +0.4%, Λ19 +0.4%, ising11 0), below the 2% rule.
+  - Observed: scaling is CPU-bound, not idle-bound. At Λ35/1024, scaling CPU ÷ 64 is 0.61 s/it against a 0.68 s wall, so perfect balance gains about 1.5%.
+  - SVD CPU at Λ35/1024 is 31.4 s/it: replay 16.8, QR 5.6, bidiagonalization 5.2, reflectors 3.6.
+  - HKM declined: net 0–8% with two contract changes. Warm-started NT: no-go (clustered singular values).
+- Next lever: blocked replay of the logged Givens rotations through the exact residue GEMM. Estimate (hypothesis): Λ35/1024 −4.4%, Λ27 −3.5%.
+
 ## 2026-10-09 — task 20 (perf-t20): owner-MPI agreements kept; SDPB 3.1 sample points
 
 - Commit `3c7c989`: one refinement agreement per residual in owner MPI (finiteness, action and the next convergence test agreed together; three redundant agreements dropped), and upper-row border assembly. Points bitwise identical at all 6 layouts. 1024 bits, 60 iterations, A = bdbfacc, B = 3c7c989:
