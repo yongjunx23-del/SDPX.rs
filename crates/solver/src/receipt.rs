@@ -150,6 +150,25 @@ struct Snapshot {
     sites: BTreeMap<usize, (u64, Duration)>,
     cpu_clocks: bool,
 }
+impl Snapshot {
+    fn take() -> Self {
+        Self {
+            phases: std::mem::take(&mut *PHASES.lock().unwrap()),
+            cpu: std::mem::take(&mut *CPU.lock().unwrap()),
+            serial: std::mem::take(&mut *SERIAL.lock().unwrap()),
+            sites: std::mem::take(&mut *SITES.lock().unwrap()),
+            cpu_clocks: CPU_CLOCKS.load(Ordering::Relaxed),
+        }
+    }
+
+    fn restore(self) {
+        *PHASES.lock().unwrap() = self.phases;
+        *CPU.lock().unwrap() = self.cpu;
+        *SERIAL.lock().unwrap() = self.serial;
+        *SITES.lock().unwrap() = self.sites;
+        CPU_CLOCKS.store(self.cpu_clocks, Ordering::Relaxed);
+    }
+}
 thread_local! {
     static COMPLETED: RefCell<Snapshot> = RefCell::default();
     static RECORDING_OWNED: Cell<bool> = const { Cell::new(false) };
@@ -271,6 +290,7 @@ pub fn profile_requested() -> bool {
 
 pub(crate) struct Scope {
     guard: Option<MutexGuard<'static, ()>>,
+    outer: Option<Snapshot>,
     solve: bool,
 }
 impl Scope {
@@ -287,39 +307,41 @@ impl Scope {
 
     fn configured(enabled: bool, solve: bool) -> Self {
         if !enabled || (!solve && RECORDING_OWNED.get()) {
-            return Self { guard: None, solve };
+            return Self {
+                guard: None,
+                outer: None,
+                solve,
+            };
         }
-        debug_assert!(!RECORDING_OWNED.get());
-        let guard = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
+        let guard =
+            (!RECORDING_OWNED.get()).then(|| RECORDING.lock().unwrap_or_else(|e| e.into_inner()));
+        // A termination callback may solve another handle on this thread.
+        // Keep the outer lock while temporarily replacing its observations.
+        let outer = guard.is_none().then_some(Snapshot::take());
         RECORDING_OWNED.set(true);
         CPU_CLOCKS.store(process_threads().is_none_or(|n| n > 1), Ordering::Relaxed);
-        PHASES.lock().unwrap().clear();
-        SITES.lock().unwrap().clear();
-        CPU.lock().unwrap().clear();
-        SERIAL.lock().unwrap().clear();
         if solve {
             COMPLETED.with(|c| *c.borrow_mut() = Snapshot::default());
         }
         Self {
-            guard: Some(guard),
+            guard,
+            outer,
             solve,
         }
     }
 }
 impl Drop for Scope {
     fn drop(&mut self) {
-        if self.guard.is_some() {
-            let stats = Snapshot {
-                phases: std::mem::take(&mut *PHASES.lock().unwrap()),
-                cpu: std::mem::take(&mut *CPU.lock().unwrap()),
-                serial: std::mem::take(&mut *SERIAL.lock().unwrap()),
-                sites: std::mem::take(&mut *SITES.lock().unwrap()),
-                cpu_clocks: CPU_CLOCKS.load(Ordering::Relaxed),
-            };
+        if self.guard.is_some() || self.outer.is_some() {
+            let stats = Snapshot::take();
             if self.solve {
                 COMPLETED.with(|c| *c.borrow_mut() = stats);
             }
-            RECORDING_OWNED.set(false);
+            if let Some(outer) = self.outer.take() {
+                outer.restore();
+            } else {
+                RECORDING_OWNED.set(false);
+            }
         }
     }
 }
@@ -518,6 +540,17 @@ mod tests {
                                 .unwrap()
                                 .insert(id as usize, (id, Duration::from_secs(id + 2)));
                             CPU_CLOCKS.store(id == 2, Ordering::Relaxed);
+                            {
+                                let _nested_solve = Scope::configured(true, true);
+                                assert!(PHASES.lock().unwrap().is_empty());
+                                PHASES.lock().unwrap().entry("inner").or_default().count = 1;
+                                CPU.lock().unwrap().insert("worker", Duration::ZERO);
+                                SERIAL.lock().unwrap().insert("worker", Duration::ZERO);
+                                SITES.lock().unwrap().clear();
+                                CPU_CLOCKS.store(id != 2, Ordering::Relaxed);
+                            }
+                            assert!(RECORDING_OWNED.get());
+                            assert_eq!(drain()["inner"].count, 1);
                         }
                         {
                             let _setup = Scope::configured(true, false);
