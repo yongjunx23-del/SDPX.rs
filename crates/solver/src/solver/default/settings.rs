@@ -209,16 +209,16 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "true")]
     pub static_regularization_enable: bool,
 
-    ///KKT static regularization parameter
-    #[builder(default = "regularization_default::<T>(1e-8)")]
+    ///KKT static regularization parameter (MPFR: none; see `static_shift_default`)
+    #[builder(default = "static_shift_default::<T>(1e-8)")]
     pub static_regularization_constant: T,
 
     ///additional regularization parameter w.r.t. the maximum abs diagonal term
-    #[builder(default = "T::epsilon()*T::epsilon()")]
+    #[builder(default = "if is_primitive::<T>() { T::epsilon() * T::epsilon() } else { T::zero() }")]
     pub static_regularization_proportional: T,
 
-    ///enable KKT dynamic regularization (immutable after setup)
-    #[builder(default = "true")]
+    ///enable KKT dynamic regularization (immutable after setup; MPFR: off)
+    #[builder(default = "is_primitive::<T>()")]
     pub dynamic_regularization_enable: bool,
 
     ///KKT dynamic regularization threshold (immutable after setup)
@@ -363,13 +363,24 @@ fn linear_default<T: FloatT>(primitive: f64) -> T {
     }
 }
 
-/// MPFR KKT regularization: `eps^(15/16)`. The former `eps^(3/4)` static
-/// shift and `sqrt(eps)` pivot replacement dominated the Schur entries of
-/// large sampled problems near optimality (Λ35 at 768 bits stalled at
-/// mu 3e-24); a `1e-215` shift without pivot replacement tracked the
-/// 1024-bit run. The pivot rule keeps the same threshold as the shift and
-/// replaces with `eps^(3/4)` (2026-10-08 journal).
-fn regularization_default<T: FloatT>(primitive: f64) -> T {
+/// MPFR KKT regularization: none by default, as SDPB 2+ (no static shift, no
+/// pivot replacement; precision carries the factorization). A factorization
+/// that actually fails escalates from `eps^(15/16)` (see the direct solver).
+/// Λ35 at 768 bits: the former `eps^(15/16)` shift with `eps^(3/4)` pivot
+/// replacement stalled at 1.5e-26 objective error (InsufficientProgress at
+/// 887); without both it is Solved in 691 iterations (task 17). Binary64
+/// keeps upstream's values.
+fn static_shift_default<T: FloatT>(primitive: f64) -> T {
+    if is_primitive::<T>() {
+        primitive.as_T()
+    } else {
+        T::zero()
+    }
+}
+
+/// `eps^(15/16)` in MPFR: the dynamic pivot threshold (used only when dynamic
+/// regularization is enabled explicitly) and the first escalation shift.
+pub(crate) fn regularization_default<T: FloatT>(primitive: f64) -> T {
     if is_primitive::<T>() {
         primitive.as_T()
     } else {

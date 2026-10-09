@@ -408,6 +408,35 @@ impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
     fn restore_product(&mut self) {
         self.kernel.restore_scaled_product(self.x);
     }
+    /// max |e_x|, max |e_z|, and the x-row floor eps·max(|Aᵀ||z| + |b_x|).
+    fn trace_parts(&mut self, candidate: bool) -> Option<String> {
+        let n = self.kernel.n;
+        let point: &[T] = if candidate { self.candidate } else { self.x };
+        let (ex, ez) = self.error.split_at(n);
+        let mut abs = vec![T::zero(); n];
+        if let Some((operator, work)) = &mut self.kernel.sampled {
+            let z: Vec<T> = point[n..].iter().map(|v| v.abs()).collect();
+            operator.add_adjoint_abs(&mut abs, &z, work, self.kernel.pool.as_ref());
+        }
+        let floor = abs
+            .iter()
+            .zip(&self.b[..n])
+            .map(|(&a, &b)| a + b.abs())
+            .fold(T::zero(), T::max)
+            * T::epsilon();
+        let retained = self
+            .kernel
+            .retained_rows
+            .iter()
+            .fold(T::zero(), |m, &r| T::max(m, ez[r].abs()));
+        Some(format!(
+            "ex {:.3e} ez {:.3e} floor_x {:.3e} ret {:.3e}",
+            ex.norm_inf(),
+            ez.norm_inf(),
+            floor,
+            retained
+        ))
+    }
     // Each correction here runs a complete refined reduced solve: GMRES-IR
     // at this level multiplied those solves (L35, 30 iterations: 180 -> 690 s)
     // while stationary steps converge in about two, so above binary64 only

@@ -71,7 +71,13 @@ fn reset<T: FloatT>(kkt: &mut OwnedKkt<T>) {
 }
 
 fn check<T: FloatT>() {
-    let settings = CoreSettings::<T>::default();
+    // The zero-cone rows have a structurally zero diagonal: give the local
+    // factors the shift a solve would escalate to (MPFR has none by default).
+    let mut settings = CoreSettings::<T>::default();
+    if settings.static_regularization_constant.is_zero() {
+        settings.static_regularization_constant =
+            crate::solver::default::regularization_default::<T>(1e-8);
+    }
     for border in [0, 1, 7] {
         for owners in [1, 4, 8] {
             for workers in [1, 2, 4, 8] {

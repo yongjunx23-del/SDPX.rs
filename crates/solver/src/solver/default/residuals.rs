@@ -378,6 +378,10 @@ impl<T: FloatT> DefaultResiduals<T> {
         // τ = qz + bz + κ + xPx/τ;
         self.rτ = qx + bz + variables.κ + xPx / variables.τ;
 
+        if counted_rows.is_none() {
+            trace_gap(variables, data, &self.rx, &self.rz, qx, bz, sz);
+        }
+
         //save local versions
         self.products = ResidualProducts {
             qx,
@@ -386,6 +390,35 @@ impl<T: FloatT> DefaultResiduals<T> {
             xpx: xPx,
         };
     }
+}
+
+/// Diagnostic only (`SDPX_TRACE_TAU`): with P = 0, τ²(p − d) = sᵀz − xᵀr_x − zᵀr_z
+/// (unscaled by c). Prints the three terms over τ² and both costs.
+fn trace_gap<T: FloatT>(
+    v: &DefaultVariables<T>,
+    data: &DefaultProblemData<T>,
+    rx: &[T],
+    rz: &[T],
+    qx: T,
+    bz: T,
+    sz: T,
+) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("SDPX_TRACE_TAU").is_some()) {
+        return;
+    }
+    let cinv = T::recip(data.equilibration.c);
+    let t2 = T::recip(v.τ * v.τ) * cinv;
+    eprintln!(
+        "gap-trace sz {:.3e} xrx {:.3e} zrz {:.3e} rx {:.3e} rz {:.3e} p {:.45e} d {:.45e}",
+        sz * t2,
+        -v.x.dot(rx) * t2,
+        -v.z.dot(rz) * t2,
+        rx.norm_inf() * cinv / v.τ,
+        rz.norm_inf() / v.τ,
+        qx * cinv / v.τ,
+        -bz * cinv / v.τ
+    );
 }
 
 #[cfg(test)]

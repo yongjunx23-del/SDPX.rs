@@ -342,11 +342,10 @@ where
                 }
                 trace_tau(state.iter, tau, gap, state.μ);
                 if self.settings.core().fixed_tau_phase
-                    && self.callbacks.checkpoint.restart.is_none()
                     && !self.variables.tau_frozen()
                 {
                     let res = self.info.residual_max().unwrap_or(T::infinity());
-                    if switch.observe(gap, tau, res, state.α)
+                    if (self.callbacks.checkpoint.restart.is_none() && switch.observe(gap, tau, res, state.α))
                         || test_fixed_tau_at().is_some_and(|k| state.iter >= k)
                     {
                         if self.variables.freeze_tau() {
@@ -850,6 +849,9 @@ mod internal {
                         break;
                     }
                 }
+            }
+            if state.α > T::zero() {
+                state.α = self.variables.split_step(&mut self.step_lhs, state.α, &self.data, &mut self.cones, &self.settings);
             }
             let beta = self.settings.core().taukappa_proximity;
             if beta > T::zero() && state.α > T::zero() {

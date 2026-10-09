@@ -34,6 +34,9 @@ default = ["serde", "faer-sparse"]
 # Native Rust `MpFloat<N>` types are unaffected.
 all-precisions = ["sdpx-arithmetic/all-precisions"]
 
+# Link a system GMP/MPFR (see sdpx-arithmetic's `system-gmp`).
+system-gmp = ["sdpx-arithmetic/system-gmp"]
+
 # enable reading / writing of problems from json files 
 serde = ["dep:serde", "dep:serde_json", "dep:sha2", "sdpx-arithmetic/serde"]
 

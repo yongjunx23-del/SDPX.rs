@@ -229,6 +229,13 @@ pub trait Variables<T: FloatT> {
         false
     }
 
+    /// Separate primal (x, s) and dual (z) step lengths: rescale `step` so
+    /// that the returned common `α` applies each part's own longest step.
+    /// The default keeps the common step.
+    fn split_step(&self, _step: &mut Self, α: T, _data: &Self::D, _cones: &mut Self::C, _settings: &Self::SE) -> T {
+        α
+    }
+
     /// Shorten `α` by `shrink` until `τκ ≥ beta·μ` at the new point (at
     /// most 50 times). The default leaves `α` unchanged.
     fn taukappa_backtrack(&self, _step: &Self, α: T, _beta: T, _shrink: T, _cones: &Self::C) -> T {

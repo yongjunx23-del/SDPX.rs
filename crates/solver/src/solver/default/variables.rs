@@ -394,6 +394,36 @@ where
         self.fixed_tau
     }
 
+    /// Only with τ fixed and P = 0: r_z then depends on (x, s) alone and r_x
+    /// on z alone, so each residual falls by its own step (SDPB's α_P, α_D).
+    fn split_step(
+        &self,
+        step: &mut Self,
+        α: T,
+        data: &DefaultProblemData<T>,
+        cones: &mut CompositeCone<T>,
+        settings: &DefaultSettings<T>,
+    ) -> T {
+        if !self.fixed_tau || data.P.nnz() != 0 || !crate::solver::core::test_split_step() {
+            return α;
+        }
+        // The composite step length returns one common bound: get each part
+        // with the other part's direction zeroed (test switch only).
+        let zero = vec![T::zero(); step.s.len()];
+        let αz = T::min(cones.step_length(&step.z, &zero, &self.z, &self.s, settings.core(), T::one()).0, T::one());
+        let αs = T::min(cones.step_length(&zero, &step.s, &self.z, &self.s, settings.core(), T::one()).1, T::one());
+        let f = settings.core().max_step_fraction;
+        let (αp, αd) = (αs * f, αz * f);
+        let a = T::min(αp, αd);
+        if !(a > T::zero()) {
+            return α;
+        }
+        step.x.scale(αp / a);
+        step.s.scale(αp / a);
+        step.z.scale(αd / a);
+        a
+    }
+
     fn scale_stats(&self) -> String {
         let f = |v: T| v.to_f64().unwrap_or(f64::NAN);
         format!(
