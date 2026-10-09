@@ -129,6 +129,10 @@ where
         self.affine_ready = None;
     }
 
+    fn refine_further(&mut self) {
+        self.kktsolver.refine_further();
+    }
+
     fn update(
         &mut self,
         data: &DefaultProblemData<T>,

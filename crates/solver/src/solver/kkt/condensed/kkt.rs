@@ -105,6 +105,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
     }
 
     fn reset_solve(&mut self) {
+        self.gmres_continuation = false;
         self.scaled_valid.fill(false);
         self.counters = Default::default();
         self.reduced.reset_solve();
@@ -298,6 +299,10 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         Some(&self.retained_rows)
     }
 
+    fn refine_further(&mut self) {
+        self.gmres_continuation = T::precision_bits() <= 53;
+    }
+
     fn update_P(&mut self, P: &CscMatrix<T>) {
         self.scaled_valid.fill(false);
         // The solver built both patterns; only the values change.
@@ -406,15 +411,16 @@ impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
     // Each correction here runs a complete refined reduced solve: GMRES-IR
     // at this level multiplied those solves (L35, 30 iterations: 180 -> 690 s)
     // while stationary steps converge in about two, so above binary64 only
-    // the reduced DirectLDL level runs GMRES-IR. In binary64 a stalled
-    // stationary refinement continues with GMRES-IR here: late in the solve
+    // the reduced DirectLDL level runs GMRES-IR. In binary64, once the driver
+    // sees a residual norm grow (`refine_further`), a stalled stationary
+    // refinement continues with GMRES-IR here: late in the solve
     // the static shift and the Schur rounding leave a few slowly contracting
     // directions (SDP_gpp250-1: dual residual 1e-8 to 1e-7 from iteration 20
     // with the constant column's x-row residual at 1e-5 of its right-hand
     // side; GMRES-IR reaches Solved in 21 iterations).
     fn gmres_continuation(&mut self) -> bool {
-        self.continued = true;
-        true
+        self.continued = self.kernel.gmres_continuation;
+        self.continued
     }
     fn gmres_supported(&self) -> bool {
         self.continued

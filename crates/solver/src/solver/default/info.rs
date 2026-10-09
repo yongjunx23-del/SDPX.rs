@@ -42,6 +42,8 @@ pub struct DefaultInfo<T> {
     pub gap_rel: T,
     /// κ/τ ratio
     pub ktratio: T,
+    /// Unnormalized primal and dual residual norms (scaled problem).
+    pub(crate) residual_norms: (T, T),
 
     // previous iterate
     /// primal object value from previous iteration
@@ -172,6 +174,8 @@ where
         normx *= τinv;
         normz *= τinv;
         norms *= τinv;
+
+        self.residual_norms = (rz_ns, rx_ns);
 
         // primal and dual relative residuals.
         self.res_primal = rz_ns * τinv / T::max(T::one(), normb + normx + norms);
@@ -363,6 +367,10 @@ where
 
     fn residual_max(&self) -> Option<T> {
         Some(T::max(self.res_primal, self.res_dual))
+    }
+
+    fn residual_norms(&self) -> Option<(T, T)> {
+        Some(self.residual_norms)
     }
 
     fn set_status(&mut self, status: SolverStatus) {

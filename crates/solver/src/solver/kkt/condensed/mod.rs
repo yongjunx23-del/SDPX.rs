@@ -803,6 +803,8 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     x: Vec<T>,
     error: Vec<T>,
     candidate: Vec<T>,
+    /// Continue stalled outer refinements with GMRES-IR (`refine_further`).
+    gmres_continuation: bool,
     batch_rhs: Vec<T>,
     batch_out: Vec<T>,
     batch_halves: Vec<T>,
@@ -1267,6 +1269,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             x: vec![T::zero(); n + m],
             error: vec![T::zero(); n + m],
             candidate: vec![T::zero(); n + m],
+            gmres_continuation: false,
             batch_rhs: Vec::new(),
             batch_out: Vec::new(),
             batch_halves: Vec::new(),
