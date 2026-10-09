@@ -5,7 +5,7 @@ use crate::algebra::CscMatrix;
 
 pub(super) struct ConeThreading {
     pub(super) pool: std::sync::Arc<rayon::ThreadPool>,
-    // KKT work may widen the shared pool without widening cone phases.
+    // KKT may widen the shared pool; cone planning keeps its original width.
     pub(super) cone_workers: usize,
     pub(super) cone_chunk: usize,
     pub(super) lanes: Vec<Lane>,

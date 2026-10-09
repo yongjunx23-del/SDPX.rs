@@ -26,6 +26,10 @@ The final profile-only guard passes the same four-worker solve, preserves
 the complete point and audit, and emits no cache clocks in ordinary receipts
 (`cache-profile-kept-gate.json`). The shared Mac had several other busy CPU
 processes; these observations make no solve-speed claim.
+Follow-up moves geometry printing after the rebuild timer so the next
+cluster profile excludes that log write from the measured wall time. Cone
+planning width is also documented as a task-plan size, not a hard concurrency
+cap on the shared pool; no scheduler or arithmetic changed.
 
 ## 2026-10-09 — ordered PSD publication and external SU(2) reduction
 

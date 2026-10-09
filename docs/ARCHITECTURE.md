@@ -267,7 +267,9 @@ One worker pool per solver (`max_threads`) runs cone blocks, factorization
 and long vector work; dominant blocks split their tiles over the same pool.
 Non-PSD setup also sizes the pool from squared A/P column-neighbor counts
 weighted by scalar precision. KKT work can admit more workers while cone
-lanes, orthant chunks and inner split budgets retain their narrower size.
+lane plans, orthant chunks and inner split hints retain their narrower size.
+Lane tasks still share the wider pool; the planning width is not a separate
+pool or a hard concurrency cap.
 Backends receive it before initial thread reporting.
 Faer factors and solves run inside that pool at its actual width, with scratch
 resized when the width changes; no global Rayon pool participates. Numeric
@@ -316,6 +318,7 @@ Contiguous cached operands rebuild in 32K-entry blocks; chunk extraction is
 pooled, while residue encoding/reduction/compression is serial. `SDPX_PROFILE`
 enables `rns.cache.hit`/`rns.cache.rebuild` timers, including fingerprint and
 lookup costs, and reports rebuild dimensions, prime counts and granted ways.
+Rebuild geometry prints after the measured work.
 Receipts retain those observations; ordinary receipts skip these per-access
 CPU clocks. Concurrent cache timers overlap; their summed wall/CPU time is
 not a fraction of the solve. Measure the critical calls before parallelizing

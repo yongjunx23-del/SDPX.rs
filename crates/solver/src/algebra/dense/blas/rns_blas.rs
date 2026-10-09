@@ -1059,14 +1059,6 @@ impl ResidueCache {
             });
         {
             let wide = Plan::with_count(plan.bits, count);
-            if crate::receipt::profile_requested() {
-                eprintln!(
-                    "RNS_CACHE_REBUILD rows={} cols={} primes={count} ways={}",
-                    x.rows,
-                    x.cols,
-                    split_ways(split),
-                );
-            }
             let res = if x.ld == x.rows || x.cols == 1 {
                 CachedResidues::from_view_blocked(x, lo, spread, &wide, split, reusable)
             } else {
@@ -1087,6 +1079,14 @@ impl ResidueCache {
             });
             *self.entry.lock().unwrap() = Some(entry.clone());
             crate::receipt::finish("rns.cache.rebuild", timer);
+            if crate::receipt::profile_requested() {
+                eprintln!(
+                    "RNS_CACHE_REBUILD rows={} cols={} primes={count} ways={}",
+                    x.rows,
+                    x.cols,
+                    split_ways(split),
+                );
+            }
             Operand::Cached(entry)
         }
     }

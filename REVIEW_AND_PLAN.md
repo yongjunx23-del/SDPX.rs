@@ -130,7 +130,7 @@ one/four workers with exact points and unchanged 1e-30 audits.
 PBS 224493 binds to the job's eight allocated physical cores and isolates
 KKT pool widening: gravity native 1.052 → 0.974 s (7.4%), API
 1.055 → 0.978 s, peak RSS 300 → 318 MiB. Keep the wider KKT budget while
-retaining the narrower cone budget. Balanced lower Gram tiles add no gain
+retaining the cone planning width. Balanced lower Gram tiles add no gain
 on this repeat and are reverted. All points and original audits agree.
 The earlier 1.34% pool result on node54 shows that the benefit depends on
 the host; it is not a universal scaling claim.
