@@ -69,6 +69,19 @@ const LEAF_BLOCK: usize = 16;
 // trunk blocks cost +1.5% per iteration).
 const LEAF_SPLIT_MIN: usize = 4 * LEAF_BLOCK;
 
+/// The split thresholds above were measured on MPFR leaves. A binary64 FMA
+/// costs about two orders less while a pooled join still costs tens of
+/// microseconds, so binary64 splits sweeps (and row passes) from `scale`
+/// times the order: 16 for sweeps, 8 for factor panels. theta1's single
+/// 104-row leaf swept 6x and factored 2x slower split at 8 threads.
+fn f64_scaled<T: FloatT>(order: usize, scale: usize) -> usize {
+    if T::precision_bits() <= 64 {
+        order * scale
+    } else {
+        order
+    }
+}
+
 fn find(parent: &mut [usize], mut i: usize) -> usize {
     while parent[i] != i {
         parent[i] = parent[parent[i]];
@@ -175,7 +188,7 @@ impl<T: FloatT> DenseLeaf<T> {
     ) -> Result<(), &'static str> {
         self.l.copy_from_slice(a);
         let n = self.n;
-        if split && n > SPLIT_FACTOR_MIN {
+        if split && n > f64_scaled::<T>(SPLIT_FACTOR_MIN, 8) {
             return self.factor_panels(signs, reg, regularize_count);
         }
         for k in 0..n {
@@ -433,7 +446,9 @@ impl<T: FloatT> DenseLeaf<T> {
     /// next block finishes serially; the backward sweep is blocked the same
     /// way from the bottom ([`Self::backward_blocked`]).
     fn solve_pooled(&self, x: &mut [T], pool: Option<&rayon::ThreadPool>) {
-        match pool.filter(|p| p.current_num_threads() > 1 && self.n >= 2 * FORWARD_BLOCK) {
+        match pool.filter(|p| {
+            p.current_num_threads() > 1 && self.n >= f64_scaled::<T>(2 * FORWARD_BLOCK, 16)
+        }) {
             Some(pool) => pool.install(|| {
                 self.forward_blocked(x, FORWARD_BLOCK);
                 for (x, d) in x.iter_mut().zip(&self.dinv) {
@@ -622,7 +637,7 @@ impl<T: FloatT> Leaf<T> {
         if chunks > 1 {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::forward_many);
-        } else if cols == 1 && split && self.factor.n >= LEAF_SPLIT_MIN {
+        } else if cols == 1 && split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
             // One column has the single-RHS layout and order.
             self.factor.forward_blocked(&mut self.batch_w, LEAF_BLOCK);
         } else {
@@ -654,7 +669,9 @@ impl<T: FloatT> Leaf<T> {
                 *v = (*v - s) * dinv[i];
             }
         };
-        if rayon::current_thread_index().is_some() && g * coupled.len() * cols >= 1 << 14 {
+        if rayon::current_thread_index().is_some()
+            && g * coupled.len() * cols >= f64_scaled::<T>(1 << 14, 16)
+        {
             self.batch_w
                 .par_chunks_mut(cols)
                 .enumerate()
@@ -666,11 +683,17 @@ impl<T: FloatT> Leaf<T> {
         if chunks > 1 {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::backward_many);
-        } else if cols == 1 && split && self.factor.n >= LEAF_SPLIT_MIN {
+        } else if cols == 1 && split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
             self.factor.backward_blocked(&mut self.batch_w);
         } else {
             self.factor.backward_many(&mut self.batch_w, cols);
         }
+    }
+
+    /// Whether a single-RHS solve of this leaf can use pool workers.
+    fn solve_splits(&self) -> bool {
+        self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16)
+            || self.ids.len() * self.coupled.len() >= f64_scaled::<T>(1 << 14, 16)
     }
 
     /// `split`: the pool has spare workers beyond the leaves, so a large
@@ -684,7 +707,7 @@ impl<T: FloatT> Leaf<T> {
         for (w, &id) in self.w.iter_mut().zip(&self.ids) {
             *w = rhs[id];
         }
-        if split && self.factor.n >= LEAF_SPLIT_MIN {
+        if split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
             self.factor.forward_blocked(&mut self.w, LEAF_BLOCK);
         } else {
             self.factor.forward(&mut self.w);
@@ -712,7 +735,9 @@ impl<T: FloatT> Leaf<T> {
             *v = (*v - s) * dinv[i];
         };
         // Only on a pool worker: a serial caller must not reach the global pool.
-        if rayon::current_thread_index().is_some() && g * coupled.len() >= 1 << 14 {
+        if rayon::current_thread_index().is_some()
+            && g * coupled.len() >= f64_scaled::<T>(1 << 14, 16)
+        {
             self.w
                 .par_iter_mut()
                 .enumerate()
@@ -721,7 +746,7 @@ impl<T: FloatT> Leaf<T> {
         } else {
             self.w.iter_mut().enumerate().for_each(update);
         }
-        if split && self.factor.n >= LEAF_SPLIT_MIN {
+        if split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
             self.factor.backward_blocked(&mut self.w);
         } else {
             self.factor.backward(&mut self.w);
@@ -768,7 +793,7 @@ impl<T: FloatT> Leaf<T> {
         if chunks > 1 {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::backward_many);
-        } else if cols == 1 && split && self.factor.n >= LEAF_SPLIT_MIN {
+        } else if cols == 1 && split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
             self.factor.backward_blocked(&mut self.batch_w);
         } else {
             self.factor.backward_many(&mut self.batch_w, cols);
@@ -1615,7 +1640,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         // Every pool thread is idle during the border factor.
         let (tf, s) = (&mut self.tf, &self.s);
         let ok = match &self.pool {
-            Some(pool) if tf.n >= SPLIT_BORDER_FACTOR_MIN => pool
+            Some(pool) if tf.n >= f64_scaled::<T>(SPLIT_BORDER_FACTOR_MIN, 8) => pool
                 .install(|| tf.factor_signed(s, &self.border_signs, reg, &mut border_count, true)),
             _ => tf.factor_signed(s, &self.border_signs, reg, &mut border_count, false),
         }
@@ -1650,8 +1675,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         let t = self.trunk.len();
         let owned = self.owned_leaves();
+        // One leaf too small to split its sweeps gains nothing from a round
+        // trip through the pool.
+        let pool = self.pool.clone().filter(|_| {
+            owned.len() > 1 || self.leaves[owned.clone()].iter().any(Leaf::solve_splits)
+        });
         let timer = crate::receipt::start();
-        if let Some(pool) = &self.pool {
+        if let Some(pool) = &pool {
             // Large leaf sweeps split; idle workers steal their row chunks, so
             // the largest leaves stop setting the phase's tail.
             let split = pool.current_num_threads() > 1;
@@ -1711,16 +1741,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let timer = crate::receipt::start();
         let tx = &self.tx;
         let panels = self.exact_bound_panels.as_ref();
-        let split = self
-            .pool
-            .as_ref()
-            .is_some_and(|p| p.current_num_threads() > 1);
+        let split = pool.as_ref().is_some_and(|p| p.current_num_threads() > 1);
         let backward = |(i, leaf): (usize, &mut Leaf<T>)| match panels {
             Some(panels) => leaf.second_solve_bounds(tx, &panels.y, i, nl),
             None => leaf.second_solve(tx, split),
         };
         let first = owned.start;
-        if let Some(pool) = &self.pool {
+        if let Some(pool) = &pool {
             pool.install(|| {
                 self.leaves[owned.clone()]
                     .par_iter_mut()
@@ -1933,7 +1960,7 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
         match self
             .pool
             .as_ref()
-            .filter(|_| cols == 1 && t >= 2 * FORWARD_BLOCK)
+            .filter(|_| cols == 1 && t >= f64_scaled::<T>(2 * FORWARD_BLOCK, 16))
         {
             Some(pool) => {
                 let tf = &self.tf;
@@ -1951,7 +1978,11 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
                 match self
                     .pool
                     .as_ref()
-                    .filter(|p| cols > 1 && p.current_num_threads() > 1 && t >= 2 * FORWARD_BLOCK)
+                    .filter(|p| {
+                        cols > 1
+                            && p.current_num_threads() > 1
+                            && t >= f64_scaled::<T>(2 * FORWARD_BLOCK, 16)
+                    })
                 {
                     Some(pool) => {
                         let chunks = pool.current_num_threads().min(cols);
