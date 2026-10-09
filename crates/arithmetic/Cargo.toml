@@ -14,3 +14,6 @@ serde = { version = "1", optional = true }
 # Opt in to every MPFR frontend precision (128..2048 in steps of 64).
 # Without it the executable frontends dispatch six widths (53..1024).
 all-precisions = []
+# Link a system (host-tuned, non-fat) GMP/MPFR instead of the vendored fat
+# build, whose x86_64 thresholds are Zen 1's on every Zen part.
+system-gmp = ["gmp-mpfr-sys/use-system-libs"]
