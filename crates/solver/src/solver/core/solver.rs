@@ -152,6 +152,11 @@ where
     pub(crate) callbacks: SolverCallbacks<I>,
     /// Starting τ of the current attempt (`initial_tau` until a restart).
     pub(crate) start_tau: Option<T>,
+    /// Original-coordinate acceptance progress: the best tolerance multiple
+    /// so far and the failed checks since it last halved.
+    pub(crate) original_progress: (Option<T>, u32),
+    /// Consecutive steps at or below `min_terminate_step_length`.
+    pub(crate) small_steps: u32,
     pub(crate) phantom: std::marker::PhantomData<T>,
 }
 
@@ -288,15 +293,22 @@ where
 
         timeit! {"solve"; {
         self.start_tau = None;
+        self.original_progress = (None, 0);
+        self.small_steps = 0;
         timeit! {"default start"; {
             self.start_point();
         }}
         timeit! {"IP iteration"; {
         'attempts: loop {
         let mut chase = TauChase::default();
+        let mut switch = FixedTauSwitch::default();
         let mut chase_tau = None;
+        let mut best_gap = T::infinity();
         loop {
             self.evaluate(&mut state, &timers);
+            if state.iter % 10 == 0 && std::env::var_os("SDPX_START_STATS").is_some() {
+                eprintln!("start-stats iter {} {}", state.iter, self.variables.scale_stats());
+            }
             if self.terminate(&mut state).stop() {
                 break;
             }
@@ -309,6 +321,38 @@ where
                     if chase.observe(gap, state.μ, tau, tau0) {
                         chase_tau = Some(TauChase::restart_tau(tau));
                         break;
+                    }
+                }
+            }
+            if let (Some(tau), Some(gap)) = (self.variables.tau(), self.info.gap_rel()) {
+                if gap.is_finite() {
+                    best_gap = T::min(best_gap, gap);
+                }
+                trace_tau(state.iter, tau, gap, state.μ);
+                if self.settings.core().fixed_tau_phase
+                    && self.callbacks.checkpoint.restart.is_none()
+                    && !self.variables.tau_frozen()
+                {
+                    let res = self.info.residual_max().unwrap_or(T::infinity());
+                    if switch.observe(gap, tau, res, state.α)
+                        || test_fixed_tau_at().is_some_and(|k| state.iter >= k)
+                    {
+                        if self.variables.freeze_tau() {
+                            if self.settings.core().verbose {
+                                let _ = writeln!(
+                                    self.info.print_target(),
+                                    "fixed tau phase: from iteration {}, tau {:.1e}",
+                                    state.iter,
+                                    tau
+                                );
+                            }
+                            crate::receipt::phase_record(
+                                "fixed tau phase",
+                                std::time::Duration::ZERO,
+                            );
+                            // μ now counts the cones only.
+                            state.μ = self.variables.calc_mu(&self.residuals, &self.cones);
+                        }
                     }
                 }
             }
@@ -340,7 +384,10 @@ where
         }
         // A large starting scale overshoots on some problems: restart with
         // a 1e10 times larger τ₀ (up to the unit start) within the same
-        // iteration budget, as SDPA's guidance to retune lambdaStar.
+        // iteration budget, as SDPA's guidance to retune lambdaStar. An
+        // attempt that already reached a relative gap of 1e-6 did not
+        // overshoot; restarting it discards the iterate (Λ35 at 768 bits
+        // restarted from gap 1e-37 at iteration 723).
         let tau = self.start_tau.unwrap_or(self.settings.core().initial_tau);
         let failed = matches!(
             self.info.get_status(),
@@ -349,6 +396,7 @@ where
         if chase_tau.is_none()
             && !(failed
                 && tau < T::one()
+                && best_gap > (1e-6).as_T()
                 && state.iter < self.settings.core().max_iter
                 && self.callbacks.checkpoint.restart.is_none())
         {
@@ -370,6 +418,8 @@ where
             );
         }
         self.start_tau = Some(next);
+        self.original_progress = (None, 0);
+        self.small_steps = 0;
         self.info.restart();
         self.kktsystem.reset_solve();
         let iter = state.iter;
@@ -597,6 +647,34 @@ mod internal {
             );
             if !is_done {
                 return Flow::Proceed;
+            }
+            if self.info.get_status() == SolverStatus::Solved {
+                if let Some(ratio) =
+                    self.solution
+                        .original_ratio(&self.data, &self.variables, &self.settings, false)
+                {
+                    if !crate::mpi::agreed_branch(ratio <= T::one()) {
+                        // The returned point would miss the tolerances in
+                        // original coordinates: keep iterating while that
+                        // residual halves within three checks.
+                        let (best, stale) = &mut self.original_progress;
+                        if best.map_or(true, |b| ratio < b * (0.5).as_T()) {
+                            *best = Some(ratio);
+                            *stale = 0;
+                        } else {
+                            *stale += 1;
+                        }
+                        let status = if *stale >= 3 {
+                            SolverStatus::InsufficientProgress
+                        } else if state.iter >= self.settings.core().max_iter {
+                            SolverStatus::MaxIterations
+                        } else {
+                            self.info.set_status(SolverStatus::Unsolved);
+                            return Flow::Proceed;
+                        };
+                        self.info.set_status(status);
+                    }
+                }
             }
             // Slow progress may continue under another scaling strategy.
             match self
@@ -842,6 +920,9 @@ mod internal {
         }
 
         fn finish(&mut self, timers: &Timers) {
+            if std::env::var_os("SDPX_START_STATS").is_some() {
+                eprintln!("start-stats final {}", self.variables.scale_stats());
+            }
             self.info
                 .set_linear_solver_info(self.kktsystem.linear_solver_info());
             if self.info.get_status() == SolverStatus::InsufficientProgress {
@@ -861,7 +942,22 @@ mod internal {
                 );
             }
             // "Almost" convergence check, then solution extraction.
+            let before = self.info.get_status();
             self.info.post_process(&self.residuals, &self.settings);
+            if before != SolverStatus::AlmostSolved
+                && self.info.get_status() == SolverStatus::AlmostSolved
+            {
+                // The reduced status also needs its tolerances in original
+                // coordinates; otherwise the failure status stands.
+                if let Some(ratio) =
+                    self.solution
+                        .original_ratio(&self.data, &self.variables, &self.settings, true)
+                {
+                    if !crate::mpi::agreed_branch(ratio <= T::one()) {
+                        self.info.set_status(before);
+                    }
+                }
+            }
             self.solution
                 .post_process(&self.data, &mut self.variables, &self.info, &self.settings);
         }
@@ -883,14 +979,30 @@ mod internal {
                     &self.settings,
                 );
                 crate::receipt::finish("start.solve", timer);
+                let stats = std::env::var_os("SDPX_START_STATS").is_some();
+                if stats {
+                    eprintln!("start-stats data {}", self.data.scale_stats());
+                    eprintln!("start-stats kkt {}", self.variables.scale_stats());
+                }
                 // fix up (z,s) so that they are in the cone
                 let timer = crate::receipt::start();
                 self.variables.symmetric_initialization(&mut self.cones);
                 crate::receipt::finish("start.shift", timer);
+                if stats {
+                    eprintln!("start-stats shifted {}", self.variables.scale_stats());
+                }
                 // a failed or degenerate KKT initializer is not a valid
-                // starting point; fall back to the unit interior point
+                // starting point; fall back to the unit interior point, at
+                // the data's scale unless the caller chose τ₀
                 if !ok {
                     self.variables.unit_initialization(&self.cones);
+                    let core = self.settings.core();
+                    if self.start_tau.is_none()
+                        && core.auto_initial_tau
+                        && core.initial_tau == T::one()
+                    {
+                        self.start_tau = self.data.unit_start_tau().filter(|&t| t < T::one());
+                    }
                 }
             } else {
                 // Assigns unit (z,s) and zeros the primal variables
@@ -1007,9 +1119,21 @@ mod internal {
             {
                 output = StrategyCheckpoint::Update(ScalingStrategy::Dual);
             } else if α <= T::max(T::zero(), self.settings.core().min_terminate_step_length) {
-                self.info.set_status(SolverStatus::InsufficientProgress);
-                output = StrategyCheckpoint::Fail;
+                // One short step inside a long plateau is not a stall (Λ35:
+                // α 8e-5 at iteration 598, then 4e-4, 0.03, 0.5, 0.7 and the
+                // escape). Stop on three consecutive short steps; a zero step
+                // stops at once since the iterate cannot move.
+                self.small_steps += 1;
+                if (self.small_steps >= 3 || α <= T::zero())
+                    && !(crate::solver::core::test_no_progress_stop() && α > T::zero())
+                {
+                    self.info.set_status(SolverStatus::InsufficientProgress);
+                    output = StrategyCheckpoint::Fail;
+                } else {
+                    output = StrategyCheckpoint::NoUpdate;
+                }
             } else {
+                self.small_steps = 0;
                 output = StrategyCheckpoint::NoUpdate;
             }
 
@@ -1030,6 +1154,71 @@ mod internal {
         }
     } // end trait impl
 } //end internals module
+
+/// Diagnostic only: `SDPX_TEST_FIXED_TAU_AT=k` also enters the fixed-τ phase
+/// at iteration k (with `fixed_tau_phase` on), to probe end games.
+fn test_fixed_tau_at() -> Option<u32> {
+    static AT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        std::env::var("SDPX_TEST_FIXED_TAU_AT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+/// Diagnostic only: with `SDPX_TRACE_TAU` set, print τ, the relative gap
+/// and μ of every evaluated iterate to stderr.
+fn trace_tau<T: FloatT>(iter: u32, tau: T, gap: T, mu: T) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("SDPX_TRACE_TAU").is_some()) {
+        eprintln!("tau-trace {iter} {tau:.3e} {gap:.3e} {mu:.3e}");
+    }
+}
+
+/// When to enter the fixed-τ phase: the embedding has settled on a τ > 0
+/// point and is in its fast phase. Over the last 10 iterates τ stays within
+/// 10% and the larger feasibility residual fell tenfold; the relative gap is
+/// at most 1e-8 and the last three steps were at least 0.8. τ can sit on a
+/// false plateau before the τ chase (Λ19: 0.15 over iterations 15–24, then
+/// 0.0096 from 42; Λ27: 0.066, then a 50-fold fall), and fixing it there
+/// cost 8–112 iterations; the fast-phase test waits for the settled value.
+/// HSD infeasibility detection has acted by then (τ → 0 with κ bounded
+/// never satisfies the τ test).
+#[derive(Default)]
+struct FixedTauSwitch<T> {
+    recent: std::collections::VecDeque<(T, T, T)>,
+}
+
+impl<T: FloatT> FixedTauSwitch<T> {
+    const WINDOW: usize = 10;
+
+    fn observe(&mut self, gap: T, tau: T, res: T, α: T) -> bool {
+        if !(gap.is_finite() && tau.is_finite() && tau > T::zero() && res.is_finite()) {
+            self.recent.clear();
+            return false;
+        }
+        self.recent.push_back((tau, res, α));
+        if self.recent.len() > Self::WINDOW + 1 {
+            self.recent.pop_front();
+        }
+        if self.recent.len() <= Self::WINDOW || gap > (1e-8).as_T() {
+            return false;
+        }
+        let (lo, hi) = self
+            .recent
+            .iter()
+            .fold((T::infinity(), T::zero()), |(lo, hi), e| {
+                (T::min(lo, e.0), T::max(hi, e.0))
+            });
+        let fast = self
+            .recent
+            .iter()
+            .rev()
+            .take(3)
+            .all(|e| e.2 >= (0.8).as_T());
+        hi <= lo * (1.1).as_T() && fast && res <= self.recent[0].1 * (0.1).as_T()
+    }
+}
 
 /// Detects a τ chase on a unit-scale first attempt: since the relative gap
 /// last improved tenfold, μ fell by 1e10 while τ fell below `1e-4·τ₀`. On
@@ -1092,5 +1281,35 @@ mod tau_chase_tests {
         let mut c = TauChase::<f64>::default();
         assert!((0..40).all(|k| !c.observe(1e-13, 10f64.powi(-k), 1e-40, 1e-30)));
         assert_eq!(TauChase::<f64>::restart_tau(1e-11), 1e-11);
+    }
+}
+
+#[cfg(test)]
+mod fixed_tau_switch_tests {
+    use super::FixedTauSwitch;
+
+    #[test]
+    fn needs_settled_tau_fast_steps_and_small_gap() {
+        // Fast phase with τ settled: fires once 11 iterates exist.
+        let mut s = FixedTauSwitch::<f64>::default();
+        let fired = (0..30)
+            .position(|k| s.observe(1e-9 * 0.5f64.powi(k), 0.0096, 1e-3 * 0.5f64.powi(k), 0.9));
+        assert_eq!(fired, Some(10));
+        // Λ19-like false plateau: τ flat while steps are short (0.4–0.75),
+        // then τ falls 20% per iterate with long steps; neither qualifies.
+        let mut s = FixedTauSwitch::<f64>::default();
+        assert!((0..40).all(|k| {
+            let (tau, α) = if k < 12 {
+                (0.15, 0.6)
+            } else {
+                (0.15 * 0.8f64.powi(k - 12), 0.9)
+            };
+            !s.observe(1e-9, tau, 1e-3 * 0.5f64.powi(k), α)
+        }));
+        // Short steps or a large gap block it.
+        let mut s = FixedTauSwitch::<f64>::default();
+        assert!((0..30).all(|k| !s.observe(1e-9, 0.01, 1e-3 * 0.5f64.powi(k), 0.5)));
+        let mut s = FixedTauSwitch::<f64>::default();
+        assert!((0..30).all(|k| !s.observe(1e-6, 0.01, 1e-3 * 0.5f64.powi(k), 0.9)));
     }
 }

@@ -48,6 +48,10 @@ pub struct DefaultVariables<T> {
     pub τ: T,
     /// homogenization scalar κ
     pub κ: T,
+    /// Fixed-τ end phase: directions keep `Δτ = Δκ = 0` and μ counts the
+    /// cones only, so the iterate follows an infeasible-start path of the
+    /// original problem at the current scale. Not copied by `copy_from`.
+    pub fixed_tau: bool,
 }
 
 impl<T: std::fmt::Display + std::fmt::Debug> std::fmt::Debug for DefaultVariables<T> {
@@ -72,7 +76,14 @@ where
         let τ = T::one();
         let κ = T::one();
 
-        Self { x, s, z, τ, κ }
+        Self {
+            x,
+            s,
+            z,
+            τ,
+            κ,
+            fixed_tau: false,
+        }
     }
 }
 
@@ -135,6 +146,9 @@ where
     type SE = DefaultSettings<T>;
 
     fn calc_mu(&mut self, residuals: &DefaultResiduals<T>, cones: &CompositeCone<T>) -> T {
+        if self.fixed_tau {
+            return residuals.products.sz / T::from_usize(cones.degree().max(1)).unwrap();
+        }
         let denom = T::from_usize(cones.degree() + 1).unwrap();
         (residuals.products.sz + self.τ * self.κ) / denom
     }
@@ -197,8 +211,9 @@ where
             hi,
         );
         // κΔτ + τΔκ = −rhs.κ, as the orthant rows' zΔs + sΔz = −ds.
+        // The fixed-τ phase holds the pair, so it has nothing to correct.
         let v = (variables.τ + α * step.τ) * (variables.κ + α * step.κ);
-        if let Some(t) = band_correction(v, lo, hi) {
+        if let (false, Some(t)) = (variables.fixed_tau, band_correction(v, lo, hi)) {
             self.κ -= t;
             changed = true;
         }
@@ -343,6 +358,9 @@ where
         shrink: T,
         cones: &CompositeCone<T>,
     ) -> T {
+        if self.fixed_tau {
+            return α;
+        }
         let c = [
             self.s.dot(&self.z),
             self.s.dot(&step.z) + self.z.dot(&step.s),
@@ -365,6 +383,31 @@ where
 
     fn tau(&self) -> Option<T> {
         Some(self.τ)
+    }
+
+    fn freeze_tau(&mut self) -> bool {
+        self.fixed_tau = true;
+        true
+    }
+
+    fn tau_frozen(&self) -> bool {
+        self.fixed_tau
+    }
+
+    fn scale_stats(&self) -> String {
+        let f = |v: T| v.to_f64().unwrap_or(f64::NAN);
+        format!(
+            "x_inf={:.3e} x_2={:.3e} s_inf={:.3e} s_2={:.3e} z_inf={:.3e} z_2={:.3e} sz={:.3e} tau={:.3e} kappa={:.3e}",
+            f(self.x.norm_inf()),
+            f(self.x.norm()),
+            f(self.s.norm_inf()),
+            f(self.s.norm()),
+            f(self.z.norm_inf()),
+            f(self.z.norm()),
+            f(self.s.dot(&self.z)),
+            f(self.τ),
+            f(self.κ)
+        )
     }
 
     fn new_like(&self) -> Self {
@@ -480,6 +523,18 @@ where
 
     pub(crate) fn dims(&self) -> (usize, usize) {
         (self.x.len(), self.s.len())
+    }
+
+    /// An independent copy of the iterate.
+    pub(crate) fn copy_of(&self) -> Self {
+        Self {
+            x: self.x.clone(),
+            s: self.s.clone(),
+            z: self.z.clone(),
+            τ: self.τ,
+            κ: self.κ,
+            fixed_tau: self.fixed_tau,
+        }
     }
 }
 

@@ -45,6 +45,7 @@ fn large_iterate_upstream_normalization<T: FloatT>() {
             z: vec![if primal_fault { T::zero() } else { T::one() }],
             τ: T::one(),
             κ: T::zero(),
+            fixed_tau: false,
         };
         let mut residuals = DefaultResiduals::new(2, 1);
         residuals.update(&variables, &data);
@@ -112,6 +113,7 @@ fn ruiz_qp_original_coordinates<T: FloatT>() {
             .collect(),
         τ: tau,
         κ: T::one() / c(4),
+        fixed_tau: false,
     };
     let saved = (
         variables.x.clone(),
@@ -174,6 +176,7 @@ fn updated_q_b_refresh_original_normalizers() {
         z: vec![0.; 2],
         τ: 2.,
         κ: 0.,
+        fixed_tau: false,
     };
     let mut residuals = DefaultResiduals::new(2, 2);
     residuals.update(&variables, &solver.data);
@@ -211,6 +214,7 @@ fn affine_scale_accuracy<T: FloatT>(tiny: T) {
         z: vec![-T::one(), T::zero()],
         τ: T::one(),
         κ: T::zero(),
+        fixed_tau: false,
     };
     let mut residuals = DefaultResiduals::new(2, 2);
     residuals.update(&variables, &data);
@@ -415,6 +419,7 @@ fn componentwise_metric_tracks_hsd_and_ruiz<T: FloatT>() {
         z: vec![physical_z],
         τ: T::one(),
         κ: T::zero(),
+        fixed_tau: false,
     };
     let mut residuals = DefaultResiduals::new(1, 1);
     residuals.update(&variables, &data);
@@ -433,6 +438,7 @@ fn componentwise_metric_tracks_hsd_and_ruiz<T: FloatT>() {
         z: vec![two * physical_z],
         τ: two,
         κ: T::zero(),
+        fixed_tau: false,
     };
     let mut doubled_residuals = DefaultResiduals::new(1, 1);
     doubled_residuals.update(&doubled, &data);
@@ -453,6 +459,7 @@ fn componentwise_metric_tracks_hsd_and_ruiz<T: FloatT>() {
         z: vec![physical_z * eq.c * eq.einv[0]],
         τ: T::one(),
         κ: T::zero(),
+        fixed_tau: false,
     };
     let mut scaled_residuals = DefaultResiduals::new(1, 1);
     scaled_residuals.update(&scaled_variables, &scaled);
@@ -486,6 +493,7 @@ fn componentwise_metric_zero_and_nonfinite_rows_are_conservative() {
         z: vec![0.],
         τ: 1.,
         κ: 0.,
+        fixed_tau: false,
     };
     let mut residuals = DefaultResiduals::new(1, 1);
     residuals.update(&finite, &data);

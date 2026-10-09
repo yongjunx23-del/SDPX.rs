@@ -54,6 +54,23 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "false")]
     pub auto_start_scale: bool,
 
+    ///enter a fixed-τ end phase once the embedding has settled on τ > 0
+    ///(τ within 10% over 10 iterates, gap ≤ 1e-8, steps ≥ 0.8): later
+    ///directions keep Δτ = Δκ = 0, μ counts the cones only, and the constant
+    ///right-hand side is no longer solved. Termination tests are unchanged.
+    ///Single-process solver only. Λ19/s50/Λ27/ising11 at 768/512 bits:
+    ///−14%/−10%/−4%/−6% time, same points (2026-10-09 journal). Off by
+    ///default in binary64: the Float64 scoreboard gains nothing (43/44 cases
+    ///identical) and SDP_arch0 drops from Solved/22 to AlmostSolved/23.
+    #[builder(default = "!is_primitive::<T>()")]
+    pub fixed_tau_phase: bool,
+    ///when the KKT initial point is rejected and the unit start is used, and
+    ///`initial_tau` is left at 1, start from τ₀ = min(1, 1/max d) with d
+    ///the column equilibration scales. The unit start carries no scale of
+    ///its own; the accepted KKT start (ising11, binary64 SDPs) is unchanged.
+    #[builder(default = "true")]
+    pub auto_initial_tau: bool,
+
     ///neighborhood bound on the homogeneous pair: a step is shortened until
     ///τκ ≥ β·μ at the new point (MOSEK's homogeneous model and Hypatia keep
     ///every complementarity pair, τκ included, above a fraction of μ).
@@ -87,6 +104,21 @@ pub struct DefaultSettings<T: FloatT> {
     /// normalization. `None` (default) keeps the standard test.
     #[builder(default = "None")]
     pub tol_dual_qnorm: Option<T>,
+
+    /// Original-coordinate acceptance tolerance. When set, `Solved` also
+    /// requires the point returned in original coordinates to pass the audit
+    /// at this tolerance: `‖b-Ax-s‖∞`, `dist_K(s)`, `dist_K(b-Ax)` at most
+    /// `tol·(1+‖b‖∞)`; `‖Px+A'z+q‖∞`, `dist_K*(z)` at most `tol·(1+‖q‖∞)`;
+    /// the duality gap at most `tol` or `tol·(1+|primal objective|)`.
+    /// `AlmostSolved` uses the larger of this and the reduced tolerances.
+    /// Otherwise the solver keeps iterating while these residuals improve.
+    /// The internal test divides by `‖x‖+‖s‖` (`‖x‖+‖z‖`) of the transformed
+    /// problem, which presolve, chordal overlap variables and large solutions
+    /// inflate (SDP_control1: decomposed `‖x‖` 1.2e5 against 18 and
+    /// `‖A'z+q‖∞ = 0.036` at `Solved`). Default `1e-6` (the Float64 audit
+    /// tolerance) in binary64; `None` (internal test only) in MPFR.
+    #[builder(default = "is_primitive::<T>().then(|| (1e-6).as_T())")]
+    pub tol_original: Option<T>,
 
     ///absolute infeasibility tolerance (primal and dual)
     #[builder(default = "accuracy_default::<T>(1e-8)")]
@@ -224,6 +256,14 @@ pub struct DefaultSettings<T: FloatT> {
     ///in a few steps. Steps count against `iterative_refinement_max_iter`.
     #[builder(default = "false")]
     pub iterative_refinement_gmres: bool,
+
+    ///binary64: a right-hand side whose stationary refinement stalls above
+    ///its tolerance continues with GMRES-IR from the refined point
+    ///(converged right-hand sides are untouched). Off by default: on the
+    ///58-case Float64 scoreboard it gained hinf3, sched_100_50 and medium
+    ///but lost sched_100_100, gpp100 and gpp124 and doubled csdr3's time.
+    #[builder(default = "false")]
+    pub iterative_refinement_gmres_fallback: bool,
 
     ///enable presolve constraint reduction
     #[builder(default = "true")]

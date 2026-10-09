@@ -23,6 +23,9 @@ fn settings<T: FloatT>() -> DefaultSettings<T> {
         presolve_enable: false,
         equilibrate_enable: true,
         chordal_decomposition_enable: false,
+        // The owned recovery mirrors the default extraction without the
+        // original-coordinate test and its projected slack.
+        tol_original: None,
         ..DefaultSettings::default()
     }
 }

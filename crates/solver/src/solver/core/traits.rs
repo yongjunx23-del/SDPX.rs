@@ -67,6 +67,17 @@ pub trait ProblemData<T: FloatT> {
 
     /// Equilibrate internal data before solver starts.
     fn equilibrate(&mut self, cones: &Self::C, settings: &Self::SE);
+
+    /// Scale statistics of the equilibrated data (diagnostics).
+    fn scale_stats(&self) -> String {
+        String::new()
+    }
+
+    /// Starting τ for the unit fallback start, when the data imply one
+    /// (see `DefaultSettings::auto_initial_tau`).
+    fn unit_start_tau(&self) -> Option<T> {
+        None
+    }
 }
 
 /// Variables for a conic optimization problem.
@@ -197,9 +208,25 @@ pub trait Variables<T: FloatT> {
     /// Start the embedding at `τ = tau`, `κ = 1/tau` (τκ unchanged at 1).
     fn set_initial_tau(&mut self, tau: T);
 
+    /// Scale statistics of the iterate (diagnostics).
+    fn scale_stats(&self) -> String {
+        String::new()
+    }
+
     /// Current homogeneous τ, when the variables carry one.
     fn tau(&self) -> Option<T> {
         None
+    }
+
+    /// Enter the fixed-τ end phase (`Δτ = Δκ = 0`, μ over the cones).
+    /// Returns false when the variables do not support it.
+    fn freeze_tau(&mut self) -> bool {
+        false
+    }
+
+    /// Whether the fixed-τ end phase is active.
+    fn tau_frozen(&self) -> bool {
+        false
     }
 
     /// Shorten `α` by `shrink` until `τκ ≥ beta·μ` at the new point (at
@@ -397,6 +424,10 @@ where
     fn gap_rel(&self) -> Option<T> {
         None
     }
+    /// Larger of the primal and dual feasibility residuals, if recorded.
+    fn residual_max(&self) -> Option<T> {
+        None
+    }
     /// Set the termination status
     fn set_status(&mut self, status: SolverStatus);
     /// Forget the status and progress history before a restart.
@@ -427,6 +458,20 @@ pub trait Solution<T: FloatT> {
 
     /// finalize the solution, e.g. extract final timing from info
     fn finalize(&mut self, info: &Self::I);
+
+    /// Original-coordinate acceptance of the current iterate: the largest
+    /// multiple of the `Solved` (`reduced`: `AlmostSolved`) tolerances over
+    /// the residuals of the point that would be returned. At most one
+    /// passes. `None` when the test does not apply.
+    fn original_ratio(
+        &mut self,
+        _data: &Self::D,
+        _variables: &Self::V,
+        _settings: &Self::SE,
+        _reduced: bool,
+    ) -> Option<T> {
+        None
+    }
 }
 
 /// Settings for a conic optimization problem.

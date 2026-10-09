@@ -60,6 +60,13 @@ const FORWARD_BLOCK: usize = 32;
 /// Leaf sweeps split with smaller blocks: Λ27 leaves of order 88-113 on
 /// ranks with two leaves and 16 workers ran their sweeps serially.
 const LEAF_BLOCK: usize = 16;
+// Backward sweeps use a per-factor row block (`DenseLeaf::back`): row `i`
+// applies its terms `k > i` block by block from the bottom (`[n-B, n)`,
+// `[n-2B, n-B)`, ...), ascending within a block. That is the only order a
+// pooled sweep can follow, so a factor's serial, batched and pooled sweeps
+// give the same bits. Leaves use `LEAF_BLOCK`; the trunk keeps
+// `FORWARD_BLOCK`, halving its pooled phases (Λ27 at 64 threads: 16-row
+// trunk blocks cost +1.5% per iteration).
 const LEAF_SPLIT_MIN: usize = 4 * LEAF_BLOCK;
 
 fn find(parent: &mut [usize], mut i: usize) -> usize {
@@ -77,14 +84,17 @@ struct DenseLeaf<T> {
     n: usize,
     l: Vec<T>,
     dinv: Vec<T>,
+    /// Row block of every backward sweep of this factor.
+    back: usize,
 }
 
 impl<T: FloatT> DenseLeaf<T> {
-    fn new(n: usize) -> Self {
+    fn new(n: usize, back: usize) -> Self {
         Self {
             n,
             l: vec![T::zero(); n * n],
             dinv: vec![T::zero(); n],
+            back,
         }
     }
 
@@ -288,11 +298,12 @@ impl<T: FloatT> DenseLeaf<T> {
 
     /// [`Self::backward`] split over the ambient pool: the bottom row block
     /// finishes serially, then every earlier row applies that block's columns
-    /// in parallel. Each term is still one rounded FMA, but a row now sums its
-    /// terms block by block from the bottom, so the bits differ from the
-    /// serial sweep (gated by the solve audit, not bitwise identity).
-    fn backward_blocked(&self, x: &mut [T], block: usize) {
+    /// in parallel. A row sums its terms block by block from the bottom,
+    /// ascending within a block: the `back` order of the serial sweep, so
+    /// the bits are identical.
+    fn backward_blocked(&self, x: &mut [T]) {
         let n = self.n;
+        let block = self.back;
         let mut r1 = n;
         while r1 > 0 {
             let r0 = r1.saturating_sub(block);
@@ -319,10 +330,17 @@ impl<T: FloatT> DenseLeaf<T> {
         }
     }
 
+    /// Backward sweep in the `back` order.
     fn backward(&self, x: &mut [T]) {
-        for i in (0..self.n).rev() {
-            for k in i + 1..self.n {
-                x[i] = (-self.l[k + i * self.n]).mul_add(x[k], x[i]);
+        let n = self.n;
+        for i in (0..n).rev() {
+            let mut r1 = n;
+            while r1 > i + 1 {
+                let r0 = r1.saturating_sub(self.back);
+                for k in r0.max(i + 1)..r1 {
+                    x[i] = (-self.l[k + i * n]).mul_add(x[k], x[i]);
+                }
+                r1 = r0;
             }
         }
     }
@@ -340,12 +358,18 @@ impl<T: FloatT> DenseLeaf<T> {
         }
     }
     fn backward_many(&self, x: &mut [T], cols: usize) {
-        for i in (0..self.n).rev() {
-            for k in i + 1..self.n {
-                let l = -self.l[k + i * self.n];
-                for c in 0..cols {
-                    x[i * cols + c] = l.mul_add(x[k * cols + c], x[i * cols + c]);
+        let n = self.n;
+        for i in (0..n).rev() {
+            let mut r1 = n;
+            while r1 > i + 1 {
+                let r0 = r1.saturating_sub(self.back);
+                for k in r0.max(i + 1)..r1 {
+                    let l = -self.l[k + i * n];
+                    for c in 0..cols {
+                        x[i * cols + c] = l.mul_add(x[k * cols + c], x[i * cols + c]);
+                    }
                 }
+                r1 = r0;
             }
         }
     }
@@ -415,7 +439,7 @@ impl<T: FloatT> DenseLeaf<T> {
                 for (x, d) in x.iter_mut().zip(&self.dinv) {
                     *x *= *d;
                 }
-                self.backward_blocked(x, FORWARD_BLOCK);
+                self.backward_blocked(x);
             }),
             None => {
                 self.forward(x);
@@ -465,7 +489,7 @@ impl<T: FloatT> Leaf<T> {
             packed: false,
             h: vec![T::zero(); g * g],
             b: vec![T::zero(); g * t],
-            factor: DenseLeaf::new(g),
+            factor: DenseLeaf::new(g, LEAF_BLOCK),
             y: vec![T::zero(); g * t],
             // Generic leaves form Z = D⁻¹Y one column at a time while the
             // border Schur is assembled; only local structures store it.
@@ -643,7 +667,7 @@ impl<T: FloatT> Leaf<T> {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::backward_many);
         } else if cols == 1 && split && self.factor.n >= LEAF_SPLIT_MIN {
-            self.factor.backward_blocked(&mut self.batch_w, LEAF_BLOCK);
+            self.factor.backward_blocked(&mut self.batch_w);
         } else {
             self.factor.backward_many(&mut self.batch_w, cols);
         }
@@ -698,7 +722,7 @@ impl<T: FloatT> Leaf<T> {
             self.w.iter_mut().enumerate().for_each(update);
         }
         if split && self.factor.n >= LEAF_SPLIT_MIN {
-            self.factor.backward_blocked(&mut self.w, LEAF_BLOCK);
+            self.factor.backward_blocked(&mut self.w);
         } else {
             self.factor.backward(&mut self.w);
         }
@@ -745,7 +769,7 @@ impl<T: FloatT> Leaf<T> {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::backward_many);
         } else if cols == 1 && split && self.factor.n >= LEAF_SPLIT_MIN {
-            self.factor.backward_blocked(&mut self.batch_w, LEAF_BLOCK);
+            self.factor.backward_blocked(&mut self.batch_w);
         } else {
             self.factor.backward_many(&mut self.batch_w, cols);
         }
@@ -1270,7 +1294,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             leaves,
             c: vec![T::zero(); t * t],
             s: vec![T::zero(); t * t],
-            tf: DenseLeaf::new(t),
+            tf: DenseLeaf::new(t, FORWARD_BLOCK),
             tx: vec![T::zero(); t],
             batch_tx: Vec::new(),
             pool: None,
@@ -1918,7 +1942,7 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
                     for (x, d) in tx.iter_mut().zip(&tf.dinv) {
                         *x *= *d;
                     }
-                    tf.backward_blocked(tx, FORWARD_BLOCK);
+                    tf.backward_blocked(tx);
                 });
             }
             None => {
@@ -2065,32 +2089,35 @@ mod tests {
                 a[i + j * n] = T::from_f64(v).unwrap();
             }
         }
-        let mut leaf = DenseLeaf::<T>::new(n);
-        let mut count = 0;
-        leaf.factor_signed(&a, &[1], None, &mut count, false)
-            .unwrap();
-        let rhs: Vec<T> = (0..n)
-            .map(|i| T::from_f64((i % 7) as f64 - 3.0).unwrap())
-            .collect();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
-        // Forward: bitwise identical.
-        let (mut s, mut b) = (rhs.clone(), rhs.clone());
-        leaf.forward(&mut s);
-        pool.install(|| leaf.forward_blocked(&mut b, LEAF_BLOCK));
-        assert_eq!(s, b);
-        // Backward: reordered sums, equal to working precision.
-        let (mut s, mut b) = (rhs.clone(), rhs.clone());
-        leaf.backward(&mut s);
-        pool.install(|| leaf.backward_blocked(&mut b, LEAF_BLOCK));
-        for (x, y) in s.iter().zip(&b) {
-            let d = (*x - *y).to_f64().unwrap().abs();
-            assert!(
-                d <= 1e-70 * (1.0 + x.to_f64().unwrap().abs()),
-                "{x:?} vs {y:?}"
-            );
+        for back in [LEAF_BLOCK, FORWARD_BLOCK] {
+            let mut leaf = DenseLeaf::<T>::new(n, back);
+            let mut count = 0;
+            leaf.factor_signed(&a, &[1], None, &mut count, false)
+                .unwrap();
+            let rhs: Vec<T> = (0..n)
+                .map(|i| T::from_f64((i % 7) as f64 - 3.0).unwrap())
+                .collect();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap();
+            // Forward: bitwise identical.
+            let (mut s, mut b) = (rhs.clone(), rhs.clone());
+            leaf.forward(&mut s);
+            pool.install(|| leaf.forward_blocked(&mut b, LEAF_BLOCK));
+            assert_eq!(s, b);
+            // Backward: the shared block order, bitwise identical, and equal to
+            // the batched sweep column by column.
+            let (mut s, mut b) = (rhs.clone(), rhs.clone());
+            leaf.backward(&mut s);
+            pool.install(|| leaf.backward_blocked(&mut b));
+            assert_eq!(s, b);
+            let mut many: Vec<T> = rhs.iter().flat_map(|&v| [v, -v]).collect();
+            leaf.backward_many(&mut many, 2);
+            for (i, &v) in s.iter().enumerate() {
+                assert_eq!(many[2 * i], v);
+                assert_eq!(many[2 * i + 1], -v);
+            }
         }
     }
     use sdpx_arithmetic::MpFloat;
@@ -2099,7 +2126,7 @@ mod tests {
     // backward sums by row block: equal to working precision.
     fn pooled_solve_parity<T: FloatT>() {
         let n = 300;
-        let mut leaf = DenseLeaf::<T>::new(n);
+        let mut leaf = DenseLeaf::<T>::new(n, LEAF_BLOCK);
         for j in 0..n {
             for i in j + 1..n {
                 leaf.l[i + j * n] =
@@ -2129,7 +2156,7 @@ mod tests {
     }
     fn chunked_trunk_parity<T: FloatT>() {
         let (n, cols) = (70, 5);
-        let mut leaf = DenseLeaf::<T>::new(n);
+        let mut leaf = DenseLeaf::<T>::new(n, LEAF_BLOCK);
         for j in 0..n {
             for i in j + 1..n {
                 leaf.l[i + j * n] =
@@ -2243,14 +2270,14 @@ mod tests {
                 a[i + j * n] = T::from_f64(v).unwrap();
             }
         }
-        let mut serial = DenseLeaf::<T>::new(n);
+        let mut serial = DenseLeaf::<T>::new(n, LEAF_BLOCK);
         let mut count = 0;
         serial.factor(&a, 1, None, &mut count, false).unwrap();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(8)
             .build()
             .unwrap();
-        let mut split = DenseLeaf::<T>::new(n);
+        let mut split = DenseLeaf::<T>::new(n, LEAF_BLOCK);
         pool.install(|| split.factor(&a, 1, None, &mut count, true))
             .unwrap();
         assert_eq!(serial.l, split.l);
@@ -2276,11 +2303,11 @@ mod tests {
         }
         let reg = Some((T::from_f64(1e-20).unwrap(), T::one()));
         let (mut c1, mut c2) = (0, 0);
-        let mut serial = DenseLeaf::<T>::new(n);
+        let mut serial = DenseLeaf::<T>::new(n, LEAF_BLOCK);
         serial
             .factor_signed(&a, &signs, reg, &mut c1, false)
             .unwrap();
-        let mut split = DenseLeaf::<T>::new(n);
+        let mut split = DenseLeaf::<T>::new(n, LEAF_BLOCK);
         pool.install(|| split.factor_signed(&a, &signs, reg, &mut c2, true))
             .unwrap();
         assert!(c1 > 0);

@@ -457,6 +457,8 @@ impl<T: FloatT> OwnedSolver<T> {
             timers: None,
             callbacks: crate::solver::core::callbacks::SolverCallbacks::default(),
             start_tau: None,
+            original_progress: (None, 0),
+            small_steps: 0,
             phantom: std::marker::PhantomData,
         };
         timers.stop_setup();

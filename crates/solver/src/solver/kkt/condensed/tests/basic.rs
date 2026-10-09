@@ -531,7 +531,18 @@ fn selector_preserves_coarse_guards_and_dense_storage_comparison() {
         &cones,
         &settings
     ));
-    let wide = CscMatrix::zeros((A.m, 300));
+    // 300 columns each touching every 10x10 block: the congruences and
+    // their inner products (m p^3 + m^2 p^2 / 2 per block) cost more than
+    // factoring the 55x55 scaling blocks, so the augmented form wins.
+    let psd_cones = cones.rng_cones.len() - 1;
+    let mut rowval = Vec::new();
+    let mut colptr = vec![0];
+    for _ in 0..300 {
+        rowval.extend((0..psd_cones).map(|k| cones.rng_cones[k].start));
+        colptr.push(rowval.len());
+    }
+    let nnz = rowval.len();
+    let wide = CscMatrix::new(A.m, 300, colptr, rowval, vec![1.; nnz]);
     assert!(!prefer_condensed(
         &CscMatrix::identity(wide.n),
         &wide,

@@ -28,6 +28,9 @@ pub struct DefaultKKTSystem<T> {
     batch_out: Vec<T>,
     affine_ready: Option<bool>,
     hs2: Vec<T>,
+    // Fixed-τ phase: the constant column (−q, b) is not solved and the
+    // prepared affine output is batch column 0 instead of 1.
+    fixed_tau: bool,
 }
 
 impl<T> DefaultKKTSystem<T>
@@ -91,6 +94,7 @@ where
             batch_out: vec![T::zero(); 2 * (n + m)],
             affine_ready: None,
             hs2: Vec::new(),
+            fixed_tau: false,
         }
     }
 }
@@ -139,8 +143,9 @@ where
         // refinement still runs against the unshifted matrix.
         loop {
             let updated = all_succeeded(self.kktsolver.update(cones, settings.core()));
-            let is_success =
-                updated && all_succeeded(self.solve_constant_rhs(data, settings.core()));
+            let is_success = updated
+                && (self.fixed_tau
+                    || all_succeeded(self.solve_constant_rhs(data, settings.core())));
             if is_success
                 || !settings.core().static_regularization_enable
                 || !all_succeeded(self.kktsolver.escalate_regularization())
@@ -161,6 +166,37 @@ where
         self.affine_ready = None;
         let (n, m) = (data.n, data.m);
         let width = n + m;
+        self.fixed_tau = variables.fixed_tau;
+        if self.fixed_tau {
+            // Δτ = 0: only the affine column, prepared as batch column 0.
+            self.hs2.clear();
+            loop {
+                let updated = all_succeeded(self.kktsolver.update(cones, settings.core()));
+                let mut affine_ok = false;
+                if updated {
+                    let (rhs_x, rhs_z) = self.batch_rhs[width..].split_at_mut(n);
+                    rhs_x.copy_from_slice(&rhs.x);
+                    rhs_z.waxpby(T::one(), &variables.s, -T::one(), &rhs.z);
+                    let ok = self.kktsolver.solve_many(
+                        n,
+                        &self.batch_rhs[width..],
+                        &mut self.batch_out[width..],
+                        1,
+                        settings.core(),
+                    );
+                    affine_ok = all_succeeded(ok[0]);
+                    if affine_ok {
+                        self.affine_ready = Some(true);
+                    }
+                }
+                if affine_ok
+                    || !settings.core().static_regularization_enable
+                    || !all_succeeded(self.kktsolver.escalate_regularization())
+                {
+                    return affine_ok;
+                }
+            }
+        }
         loop {
             let updated = all_succeeded(self.kktsolver.update(cones, settings.core()));
             let mut constant_ok = false;
@@ -258,22 +294,32 @@ where
         }
 
         // One shared homogeneous scalar formula, independent of storage layout.
-        let terms = hsd_terms(workx, &variables.x, variables.τ, data, x1, z1, x2, z2);
-        lhs.τ = hsd_tau(terms, rhs.τ, rhs.κ, variables.τ, variables.κ);
-        lhs.x.waxpby(T::one(), x1, lhs.τ, x2);
-        lhs.z.waxpby(T::one(), z1, lhs.τ, z2);
+        if variables.fixed_tau {
+            lhs.τ = T::zero();
+            lhs.x.copy_from(x1);
+            lhs.z.copy_from(z1);
+        } else {
+            let terms = hsd_terms(workx, &variables.x, variables.τ, data, x1, z1, x2, z2);
+            trace_dtau(&terms, rhs.τ, rhs.κ, variables.τ, variables.κ);
+            lhs.τ = hsd_tau(terms, rhs.τ, rhs.κ, variables.τ, variables.κ);
+            lhs.x.waxpby(T::one(), x1, lhs.τ, x2);
+            lhs.z.waxpby(T::one(), z1, lhs.τ, z2);
+        }
 
         // solve for Δs
         // -------------
         //  compute the linear term HₛΔz, where Hs = WᵀW for symmetric
         //  cones and Hs = μH(z) for asymmetric cones
         // Cached affine output is batch column 1; a fresh solve is column 0.
+        let column = usize::from(prepared.is_some() && !variables.fixed_tau);
         let hs1 = self
             .kktsolver
-            .scaled_solution(usize::from(prepared.is_some()))
+            .scaled_solution(column)
             .filter(|_| T::precision_bits() > 53)
             .unwrap_or(&[]);
-        if hs1.len() == data.m && self.hs2.len() == data.m {
+        if hs1.len() == data.m && variables.fixed_tau {
+            lhs.s.copy_from(hs1);
+        } else if hs1.len() == data.m && self.hs2.len() == data.m {
             // Linearity: reuse original-operator products from the two accepted
             // KKT solutions. No product from a rejected refinement is reused.
             lhs.s.waxpby(T::one(), hs1, lhs.τ, &self.hs2);
@@ -284,7 +330,11 @@ where
 
         // solve for Δκ
         // --------------
-        lhs.κ = -(rhs.κ + variables.κ * lhs.τ) / variables.τ;
+        lhs.κ = if variables.fixed_tau {
+            T::zero()
+        } else {
+            -(rhs.κ + variables.κ * lhs.τ) / variables.τ
+        };
 
         // we don't check the validity of anything
         // after the KKT solve, so just return is_success
@@ -392,6 +442,30 @@ pub(crate) fn hsd_terms<T: FloatT>(
         quad2: data.P.sym_up().quad_form(x2, x2),
     }
 }
+/// Diagnostic only (`SDPX_TRACE_TAU`): the Δτ numerator and denominator and
+/// their cancellation (sum of absolute terms over the absolute sum).
+fn trace_dtau<T: FloatT>(v: &HsdTerms<T>, rt: T, rk: T, tau: T, kappa: T) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("SDPX_TRACE_TAU").is_some()) {
+        return;
+    }
+    let two = T::from_f64(2.).unwrap();
+    let num = [rt, -rk / tau, v.q1, v.b1, two * v.quad1];
+    let den = [kappa / tau, -v.q2, -v.b2, v.delta, -v.quad2];
+    let sum = |a: &[T]| a.iter().fold(T::zero(), |s, &x| s + x);
+    let abs = |a: &[T]| a.iter().fold(T::zero(), |s, &x| s + T::abs(x));
+    let (n, d) = (sum(&num), sum(&den));
+    eprintln!(
+        "dtau-trace num {:.3e} cancel {:.3e} den {:.3e} cancel {:.3e} q1 {:.3e} b1 {:.3e}",
+        n,
+        abs(&num) / T::abs(n),
+        d,
+        abs(&den) / T::abs(d),
+        v.q1,
+        v.b1
+    );
+}
+
 pub(crate) fn hsd_tau<T: FloatT>(v: HsdTerms<T>, rt: T, rk: T, tau: T, kappa: T) -> T {
     let numerator = rt - rk / tau + v.q1 + v.b1 + T::from_f64(2.).unwrap() * v.quad1;
     let mut denominator = kappa / tau - v.q2 - v.b2;
