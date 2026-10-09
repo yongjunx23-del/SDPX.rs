@@ -1297,6 +1297,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         // The reduced system is replicated; a structured backend shares its
         // factorization work over the ranks.
         reduced.set_world(local_world(local_only));
+        reduced.set_factor_pool(pool.clone());
+        reduced.set_residual_pool(pool.clone());
         let kkt = reduced.kkt_matrix_mut();
         debug_assert_eq!(kkt.colptr[..n + 1], schur.colptr);
         debug_assert_eq!(kkt.rowval[..count], schur.rowval);
