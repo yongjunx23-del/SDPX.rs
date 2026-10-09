@@ -1013,7 +1013,7 @@ mod internal {
                 let stats = std::env::var_os("SDPX_START_STATS").is_some();
                 if stats {
                     eprintln!("start-stats data {}", self.data.scale_stats());
-                    eprintln!("start-stats kkt {}", self.variables.scale_stats());
+                    eprintln!("start-stats kkt {} accepted={ok}", self.variables.scale_stats());
                 }
                 // fix up (z,s) so that they are in the cone
                 let timer = crate::receipt::start();

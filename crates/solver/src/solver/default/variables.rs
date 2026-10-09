@@ -499,6 +499,21 @@ where
 {
     let (min_margin, pos_margin) = cones.margins(z, pd);
     let (first, second) = interior_shifts(min_margin, pos_margin, cones.degree());
+    if std::env::var_os("SDPX_START_STATS").is_some() {
+        let side = match pd {
+            PrimalOrDualCone::PrimalCone => "primal",
+            PrimalOrDualCone::DualCone => "dual",
+        };
+        let f = |v: T| v.to_f64().unwrap_or(f64::NAN);
+        eprintln!(
+            "start-stats interior side={side} degree={} min_margin={:.3e} pos_margin={:.3e} first_shift={:.3e} second_shift={:.3e}",
+            cones.degree(),
+            f(min_margin),
+            f(pos_margin),
+            f(first),
+            f(second.unwrap_or(T::zero()))
+        );
+    }
     cones.scaled_unit_shift(z, first, pd);
     if let Some(second) = second {
         cones.scaled_unit_shift(z, second, pd);
