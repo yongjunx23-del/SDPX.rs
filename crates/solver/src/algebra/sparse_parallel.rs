@@ -20,6 +20,11 @@ pub(crate) struct SparseParallel {
     entries: Vec<Entry>,
     row_lanes: Vec<usize>,
     column_lanes: Vec<usize>,
+    // Rows holding entries, when some rows hold none, with their prefix
+    // entry counts and lanes (`forward_active`).
+    active: Vec<usize>,
+    active_ptr: Vec<usize>,
+    active_lanes: Vec<usize>,
     workers: usize,
     pool: Option<Arc<rayon::ThreadPool>>,
 }
@@ -85,11 +90,30 @@ impl SparseParallel {
         // Filled cursors are row ends; shift them back into row starts.
         rowptr.copy_within(..a.m, 1);
         rowptr[0] = 0;
+        let mut active = Vec::new();
+        let mut active_ptr = vec![0];
+        if !symmetric {
+            for r in 0..a.m {
+                let len = rowptr[r + 1] - rowptr[r];
+                if len > 0 {
+                    active.push(r);
+                    active_ptr.push(active_ptr.last().unwrap() + len);
+                }
+            }
+            if active.len() == a.m {
+                // Every row holds entries: the ordinary row lanes apply.
+                active = Vec::new();
+                active_ptr = vec![0];
+            }
+        }
         Self {
             rowptr,
             entries,
             row_lanes: Vec::new(),
             column_lanes: Vec::new(),
+            active,
+            active_ptr,
+            active_lanes: Vec::new(),
             workers: 0,
             pool: None,
         }
@@ -112,6 +136,11 @@ impl SparseParallel {
             let lanes = workers.min((work / grain).max(1).min(usize::MAX as u128) as usize);
             self.row_lanes = partitions(&self.rowptr, lanes);
             self.column_lanes = partitions(&a.colptr, lanes);
+            self.active_lanes = if self.active.is_empty() {
+                Vec::new()
+            } else {
+                partitions(&self.active_ptr, lanes)
+            };
         }
     }
 
@@ -410,6 +439,18 @@ impl SparseParallel {
         alpha: T,
         beta: T,
     ) {
+        if !transpose && beta == T::one() && self.active_lanes.len() > 1 {
+            self.forward_active(a, y, x, alpha, beta);
+            return;
+        }
+        if transpose
+            && beta == T::one()
+            && !self.active.is_empty()
+            && self.active.iter().all(|&r| x[r].is_zero())
+        {
+            self.adjoint_of_zero(a, y, x, alpha, beta);
+            return;
+        }
         let lanes = if transpose {
             &self.column_lanes
         } else {
@@ -425,6 +466,66 @@ impl SparseParallel {
         }
         split_outputs(y, lanes, &|output, y| {
             self.output(a, transpose, output, y, x, alpha, beta)
+        });
+    }
+
+    /// Forward product with `beta = 1` when some rows hold no entries: the
+    /// rows holding entries run on lanes balanced by their entry counts, and
+    /// an empty row is evaluated only where the evaluation can change it.
+    /// With `beta = 1` an empty row's output is `y` itself, except in the
+    /// exact wide branch, which rounds `y` alone: a zero takes the sign that
+    /// branch gives it, and a non-finite value goes through the chain. Those
+    /// rows still run `output`, so every output equals the full product's.
+    /// (Λ27's sampled linear part: 104 of 67431 rows hold all entries, and
+    /// evaluating every empty row through the exact branch set the wall.)
+    fn forward_active<T: FloatT>(&self, a: &CscMatrix<T>, y: &mut [T], x: &[T], alpha: T, beta: T) {
+        use rayon::prelude::*;
+        debug_assert!(beta == T::one());
+        let mut values: Vec<T> = self.active.iter().map(|&r| y[r]).collect();
+        split_outputs(&mut values, &self.active_lanes, &|k, value| {
+            self.output(a, false, self.active[k], value, x, alpha, beta)
+        });
+        for (&r, value) in self.active.iter().zip(values) {
+            y[r] = value;
+        }
+        let exact = T::precision_bits() > 64 && a.nnz() >= 4 * a.m;
+        if !exact || alpha == T::zero() {
+            return;
+        }
+        const CHUNK: usize = 4096;
+        let rowptr = &self.rowptr;
+        y.par_chunks_mut(CHUNK).enumerate().for_each(|(c, chunk)| {
+            for (i, value) in chunk.iter_mut().enumerate() {
+                let r = c * CHUNK + i;
+                if rowptr[r + 1] == rowptr[r] && (value.is_zero() || !value.is_finite()) {
+                    self.output(a, false, r, value, x, alpha, beta);
+                }
+            }
+        });
+    }
+
+    /// Adjoint product with `beta = 1` of an `x` that is zero on every row
+    /// holding entries (the fused prepare's `L'·0`): every product is zero,
+    /// so an output whose `y` is finite and nonzero is `y` itself in each
+    /// branch (exact or rounded). Zero and non-finite outputs still run
+    /// `output`, which fixes the sign of a zero sum as the full product does.
+    fn adjoint_of_zero<T: FloatT>(
+        &self,
+        a: &CscMatrix<T>,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+    ) {
+        use rayon::prelude::*;
+        debug_assert!(beta == T::one());
+        const CHUNK: usize = 4096;
+        y.par_chunks_mut(CHUNK).enumerate().for_each(|(c, chunk)| {
+            for (i, value) in chunk.iter_mut().enumerate() {
+                if value.is_zero() || !value.is_finite() {
+                    self.output(a, true, c * CHUNK + i, value, x, alpha, beta);
+                }
+            }
         });
     }
 

@@ -1527,7 +1527,14 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         }
         let pool = self.pool.clone();
         let schur = self.reduced.kkt_matrix_mut();
-        schur.nzval[..self.schur_nnz].fill(T::zero());
+        match pool.as_deref().filter(|p| p.current_num_threads() > 1) {
+            Some(pool) => pool.install(|| {
+                schur.nzval[..self.schur_nnz]
+                    .par_chunks_mut(8192)
+                    .for_each(|chunk| chunk.fill(T::zero()))
+            }),
+            None => schur.nzval[..self.schur_nnz].fill(T::zero()),
+        }
         // A complete upper Schur stores rows 0..=j in column j: address
         // entries directly instead of searching the column.
         let dense = self.schur_nnz == triangular_number(self.n);
@@ -1844,6 +1851,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 T::one(),
                 T::one(),
                 self.pool.as_ref(),
+                "sampled.linear.prepare",
             );
             for block in &self.blocks {
                 if let Scaling::Psd(p) = &block.scaling {
@@ -1890,7 +1898,16 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let fused = self.fused_sampled();
         let aligned = !fused && self.align_sampled_parts().is_some();
         if fused {
-            self.recover_linear(x, bz);
+            // `L x - bz` feeds only blocks recovered from `workz`; sampled PSD,
+            // zero and retained rows never read it (and the fused residual
+            // recomputes its own forward product), so skip it without them.
+            if self.blocks.iter().any(|b| match &b.scaling {
+                Scaling::Psd(p) => p.sampled.is_none(),
+                Scaling::Orthant { .. } | Scaling::SocElim { .. } => true,
+                _ => false,
+            }) {
+                self.recover_linear(x, bz);
+            }
         } else if let Some((operator, work)) = &mut self.sampled {
             // Aligned: only this rank's rows are needed by its scaling.
             if aligned {
@@ -2019,7 +2036,52 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             a_panel,
             ..
         } = self;
+        // Single process: the linear halves of both sampled products run
+        // first, on the whole pool. Inside the join below the scaling lanes
+        // hold every other worker, so the linear lanes ran on the calling
+        // worker alone (Λ27: the 272k-term adjoint took 11.7 ms median).
+        // Each output keeps its operation order (P, linear, then blocks).
+        let split = !reuse_forward
+            && world.is_none()
+            && pool.as_ref().is_some_and(|p| p.current_num_threads() > 1)
+            && sampled
+                .as_ref()
+                .is_some_and(|(operator, work)| operator.pooled_halves_apply(work, pool.as_ref()));
+        if split {
+            let (operator, work) = sampled.as_mut().unwrap();
+            P.sym_up().symv(ex, x, -T::one(), T::one());
+            work.linear_product_in_pool(
+                operator,
+                true,
+                ex,
+                z,
+                -T::one(),
+                T::one(),
+                pool.as_ref(),
+                "sampled.linear.adj",
+            );
+            work.linear_product_in_pool(
+                operator,
+                false,
+                ez,
+                x,
+                -T::one(),
+                T::one(),
+                pool.as_ref(),
+                "sampled.linear.fwd",
+            );
+        }
         let mut products = || {
+            if split {
+                let (operator, work) = sampled.as_mut().unwrap();
+                let __t = std::time::Instant::now();
+                operator.adjoint_blocks_with_pool(ex, z, -T::one(), work, pool.as_ref());
+                crate::receipt::phase("residual.adj", __t.elapsed());
+                let __t = std::time::Instant::now();
+                operator.forward_blocks_with_pool(ez, x, -T::one(), work, pool.as_ref());
+                crate::receipt::phase("residual.fwd", __t.elapsed());
+                return;
+            }
             P.sym_up().symv(ex, x, -T::one(), T::one());
             if let Some((operator, work)) = sampled {
                 let __t = std::time::Instant::now();
@@ -2146,6 +2208,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             T::one(),
             T::zero(),
             self.pool.as_ref(),
+            "sampled.linear.recover",
         );
         let subtract = |(v, &b): (&mut T, &T)| *v -= b;
         match &self.pool {
