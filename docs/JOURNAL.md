@@ -8,6 +8,46 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — integration merge perf-int (tasks 9, 10, 12, 14): kept
+
+- Merged as `0e42ad2` (perf-int `d9f12b2`).
+- Task 9 (`2c7e3af`, `e723abb`): kept.
+  - Float64 Solved now implies the original-coordinate audit (`tol_original` 1e-6, MPFR off).
+  - The returned s is the cone projection of b − Ax.
+  - Arrow and dense factors are thread-invariant.
+  - Before: control1 Solved with |A'z+q| = 0.036; hinf3 and sched_100_* Solved with r_p up to 8e-5.
+- Task 10 (`95a161c`, `b8b4464`): kept.
+  - The LP backend, presolve rank budget, condensed/augmented and chordal choices are cost-based, and none reads the thread count.
+  - bnl1 8.09 → 0.08 s, agg 2.55 → 0.03 s, arch0 6.3 → 1.5 s; qap5/qap6 run 2–3× faster; control1 is Solved/19.
+- Arrow fix (`dbe99e6`): each factor keeps its own backward row block (trunk 32, leaves 16).
+  - The shared 16-row block slowed Λ27 1.554 → 1.578 s/it and Λ19 1.263 → 1.277 (ABBA, node116).
+  - Solves stay bitwise identical across thread counts.
+- Task 12 (`800b72f`, `ebbbfa8`, `d9f12b2`): the fixed-τ phase. Kept, on by default above binary64 only.
+  - The phase starts once τ is settled: within 10% over 10 iterates, gap ≤ 1e-8, three steps ≥ 0.8, residual down 10×.
+  - The constant right-hand side is dropped.
+  - InsufficientProgress now needs three short steps; there is no τ₀ restart once gap ≤ 1e-6.
+  - Λ19 −11% and Λ27 −4% against int1.
+  - In binary64 it gains nothing (43/44 cases identical), and SDP_arch0 fell Solved/22 → AlmostSolved/23 (int2). It is therefore off there.
+  - Λ35 still fails: InsufficientProgress at 887, p − ref 1.5e-26.
+- Task 14 (`3e7c062`): the data-scaled unit-fallback τ₀. Kept.
+  - Λ27 376 → 183 it, spins 0–50 177 → 153.
+  - Λ19 single node is unchanged. Λ19 2×32 MPI is +7% time (trade-off accepted).
+- Ising on int2 with the rule (64 threads, 768 bits, 1e-42):
+
+  | Case | SDPX | SDPB |
+  |---|---|---|
+  | Λ27 | 183 it / 272 s | 265 / 375 s |
+  | spins 0–50 | 153 / 169 s | 285 s |
+  | Λ19 | 121 / 79 s | |
+  | ising11 | 54 it / about 3.5 s | |
+
+- Float64 gate: int3 vs int1 on the 58-case scoreboard, every point audited (`t7/int3-compare.md`).
+  - Statuses, iterations (638 = 638) and audits are identical.
+  - 48 audited solves; no Solved-but-fails.
+  - Timing differences are cross-node noise: 2–20 ms solves are bimodal under the conservative governor (task 13).
+- Wins vs MOSEK: 9–10 at 1 thread and 9 at 16.
+  - Still AlmostSolved: hinf3, qap6, gpp100/124/250/500, sched_100_50_orig, csdr3, f64_medium, f64_large (task 16).
+
 ## 2026-10-09 — correction: the data-scaled τ₀ rule halves Λ27 iterations
 
 - The entry "refinement and starting scale; parked branches" below says the

@@ -267,38 +267,41 @@ large at 16 threads.
 
 **Goals (user, 2026-10-08):** beat MOSEK on every Float64 problem; beat
 SDPB at 768+ bits on the Ising problems (Λ19, Λ27, Λ35, ising11). Current
-gaps (2026-10-09):
-- Λ27: τ₀ = 1e-40 gives 156 it / 276 s and the default 183 it / 312–368 s,
-  against SDPB's 265 / 375 s. SDPX is still slower per iteration (1.77 vs
-  1.41 s).
-- Λ35: SDPX does not reach 1e-42 at 768 bits. The primal diverges and the
-  dual has no Slater point, with no exact face. SDPX and SDPB both escape a
-  plateau at about iteration 650. SDPX then stalls at about 1e-26 objective
-  accuracy (1200 it, 3428 s), while SDPB finishes in 746 it / 2009 s. At
-  1024 bits SDPX solves Λ35 in 743 it / 3565 s.
-- Float64 suite (58 cases, every point audited): SDPX loses 46 at 1 thread
-  and 50 at 16. Geo-mean SDPX/MOSEK is 5.4× (1.7× where MOSEK takes
-  ≥ 0.1 s). Four cases report Solved but fail the audit.
-- Float64 large: SDPX 41–47 s, AlmostSolved or NumericalError; MOSEK 15–29 s,
-  and its points fail the audit. Medium is at parity: 3.17 s versus
-  CVXPY→MOSEK's 2.96 s.
+gaps (2026-10-09, after merge `0e42ad2`):
+- Λ27 183 it / 272 s and spins 0–50 153 / 169 s beat SDPB (265 / 375 s;
+  285 s). Per iteration SDPX is still 1.49 vs 1.41 s on Λ27 (task 15).
+- Λ35: SDPX does not reach 1e-42 at 768 bits.
+  - The primal diverges and the dual has no Slater point, with no exact face.
+  - Both solvers escape a plateau at about iteration 650. SDPX then stalls near 1e-26 objective accuracy (InsufficientProgress at 887), where SDPB finishes in 746 it / 2009 s.
+  - At 1024 bits SDPX solves Λ35 in 743 it / 3565 s.
+- Float64 suite (58 cases, every point audited, int3):
+  - 48 audited solves, no Solved-but-fails.
+  - Wins vs MOSEK: 9–10 at 1 thread, 9 at 16.
+  - Geo-mean SDPX/MOSEK at 1 thread: LP 3.6–4.2, SDP 1.7–2.0, SOCP 1.7–1.9.
+  - Not Solved: hinf3, qap6, gpp100/124/250/500, sched_100_50_orig, csdr3, f64_medium, f64_large.
+  - The tiny LPs lose on per-solve overhead: 2–20 ms against MOSEK's warm minimum-of-3.
+- Float64 builds on the cluster use `-C target-feature=+fma` (`t6bld.pbs`; `NOFMA=1` disables it).
+  - Points are bitwise identical, and 1 thread is 2–18% faster (task 13).
 
 Active branches (2026-10-09; two agents, at the user's request):
-- `perf-audit`, Float64 suite:
-  - Task 9: Solved must imply an audit pass (control1, hinf3, sched_100_*;
-    s ≠ b − Ax; thread-dependent outcomes).
-  - Task 10: cost-based LP backend, presolve and SDP formulation choice,
-    independent of thread count.
-- `perf-l35`, Ising, task 12: a fixed-τ phase after the HSD start, which
-  drops the constant right-hand side (one refined solve in three); the Λ35
-  end game after its plateau escape; a progress stop that lets the plateau
-  be traversed. Task 11 closed facial reduction for Λ35 (no exact face) and
-  fixed τ from the start (journal 2026-10-09).
+- `perf-small`, task 13 (done, gating as int4 with FMA): Float64 per-solve
+  and per-iteration overhead. Lazy QDLDL plan, one AMD ordering, Mersenne
+  modular minor, receipt CPU clocks only with workers, binary64 arrow split
+  thresholds, PSD scratch per cone order. Points bitwise identical; same-node
+  A/B geo-mean 0.86 at 1 and 16 threads.
+- `perf-iter`, task 15: MPFR per-iteration speed (sampled products, SVD
+  rotation replay, measured ways).
+- `perf-endgame`, task 16: Float64 end game; turn the AlmostSolved cases into
+  audited Solved without loosening any test.
+- Next candidates:
+  - Float64 LP overhead: brandy's rational presolve pass costs 35–85 ms, because a budget counted in updates misses the GMP gcd cost.
+  - Concurrent small OpenBLAS calls in the cone lanes: summed cone_wprod time on mcp500 goes 33 → 2439 ms at 16 threads.
+  - Pool width by KKT work, and pool creation cost (1–6 ms at 16 threads).
+  - The Λ35 end game.
 
 Parked, with WIP committed on each branch (journal 2026-10-09):
 - `perf-sharedrhs` `d34869c`: Λ27 −2.4%, unaudited.
 - `perf-fulldir` `6af5724`: regression.
-- `perf-tau0` `31caf0f`: halves Λ27 iterations against τ₀ = 1; revived as task 14 (journal correction 2026-10-09).
 - `perf-f64large` `50325c4`, `perf-threads` `946d4be`, `perf-facial`
   `a3a7271`: unverified.
 - `perf-border` `a80cfa1`: gate not run.
