@@ -8,6 +8,20 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — int5 Float64 gate (task 15 merged); Ising target ≥2× SDPB
+
+- Gate: int5 (`a5334dd` + FMA, task 15 merged) against int4 on the 58-case scoreboard (`t7/int5-compare.md`). Statuses, iterations (638) and audits are identical; 0 Solved-but-fail.
+  - Geo-mean time: 0.861 at 1 thread, 1.018 at 16 (cross-node noise).
+  - Wins vs MOSEK: 11 → 11 at 1 thread, 8 → 9 at 16.
+  - Geo-mean SDPX/MOSEK at 1 thread: LP 2.53, SDP 1.65, SOCP 1.43 (16 threads: 2.18 / 2.29 / 1.77).
+- Decision: int5 is the Float64 baseline.
+- Λ35 loss analysis (from the 2026-10-08 profile; old binary): iterations match SDPB (743 vs 745), and the ~650-iteration plateau erases SDPX's usual iteration advantage. SDPX's per-iteration extras (third RHS for τ, about one refinement correction per solve, MPFR SVD per cone, ~11% idle threads) are about 1.5 s of a 3.19 s iteration at 768 bits.
+- User asked for ≥2× over SDPB and approved implementing the reconciled design (SDPB skeleton plus SDPX step control and kernels). Assignment:
+  - Task 17 (`perf-l35b`): 1024 baseline, two RHS via fixed τ, infeasible-start PMP mode with separate α_P/α_D and data-chosen start scale, safe refinement skip, no shifts with escalation.
+  - Task 19 (`perf-scale`): cone scaling (LPT and in-cone split; warm-started NT versus HKM A/B), cost-based block assignment, idle threads.
+  - Task 20 (`perf-t20`): multi-node border/Schur distribution and cost-balanced ranks; SDPB 3.1 sample points.
+- Estimate (hypothesis): Λ27 2× needs ≤1.02 s/it (now 1.41), 3× ≤0.68; Λ35 at 1024 2× needs ≤1.85 s/it at 745 iterations; beyond ~1.7–2× on Λ35 needs a shorter plateau.
+
 ## 2026-10-09 — task 13 (perf-small) kept; FMA builds
 
 - Merged `perf-small` `ad536de`:

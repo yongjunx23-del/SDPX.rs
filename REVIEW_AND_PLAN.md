@@ -17,7 +17,9 @@ failure never counts as a performance win.
 - **MPFR (user, 2026-10-08):** beat SDPB at 768+ bits on the Ising problems
   (Λ19, Λ27, Λ35, ising11) with matched precision, thresholds, input and
   hardware. Λ35 runs at 1024 bits (user, 2026-10-09); the bar is SDPB at
-  1024 bits, 745 it / 2762 s on one 64-core node.
+  1024 bits, 745 it / 2762 s on one 64-core node. Target (user,
+  2026-10-09): ≥2× faster than SDPB; 3× is a stretch on Λ19–Λ27, and on
+  Λ35 it needs a shorter plateau.
 - Memory: match SDPB peak PSS/RSS at matched thread counts; report
   speed/memory trade-offs rather than combining unmatched runs.
 - PMP conversion matters only when it limits input-to-solution time or
@@ -52,12 +54,12 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 | Λ19 | 121 it / 71.0 s, audited | — |
 | ising11 (512 bits) | 54 it / 3.44 s | — |
 | Λ35 spins 0–70, 1024 bits | Solved 743 it / 3565 s (4.80 s/it, b0088bb era; current code not yet run); at 768 bits it fails (InsufficientProgress 887) | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
-| Float64 58 cases (int4) | 48 audited solves, 0 Solved-but-fail; wins 11 (1 thr), 8 (16 thr) | MOSEK |
+| Float64 58 cases (int5) | 48 audited solves, 0 Solved-but-fail; wins 11 (1 thr), 9 (16 thr) | MOSEK |
 
-These Ising figures include task 15. The Float64 figures are from int4, which includes task 13.
+These Ising figures include task 15. The Float64 figures are from int5 (`a5334dd` + FMA: tasks 13 and 15).
 
 - **Float64 geo-mean SDPX/MOSEK at 1 thread:**
-  - int4: LP 3.03, SDP 1.80, SOCP 1.68 (16 threads: 2.17 / 2.18 / 1.80).
+  - int5: LP 2.53, SDP 1.65, SOCP 1.43 (16 threads: 2.18 / 2.29 / 1.77); int4 was 3.03 / 1.80 / 1.68.
   - Task 13, same-node A/B: LP 2.3, SDP 1.5, SOCP 1.5.
 - **Float64 not Solved:** hinf3, qap6, gpp100/124/250/500, sched_100_50_orig, csdr3, f64_medium (AlmostSolved/26), f64_large (AlmostSolved/20; 125 s at 1 thread, 48 s at 16).
 - **Tiny LPs** lose on per-solve overhead: 2–20 ms against MOSEK's warm 1–5 ms.
@@ -141,13 +143,16 @@ These Ising figures include task 15. The Float64 figures are from int4, which in
 - **Normalized 2×2 PMP:** `AlmostSolved`/24 at MPFR512/1e-42. A tiny dual pivot is replaced by dynamic regularization, and refinement then diverges. Dynamic regularization off, or 768 bits, solves it.
 - **Cluster test:** `sampled_integration::dim2_signed_parities_ruiz_f64` is AlmostSolved on Linux since ae2a827 and passes on macOS.
 
-## Active work (three agents while task 18 measures)
+## Active work
 
 | Task | Branch | Scope | Gate |
 |---|---|---|---|
-| 18 | `perf-wsos` (measurement first) | Large Ising speed via Hypatia's design: WSOS interpolant cone with a dual barrier (no PSD lifting, no NT SVD, no prepare/recover); Hypatia in BigFloat on ising11/Λ19/Λ27 for iteration counts, then a cost model against the Λ27 profile | Go/no-go with numbers before any solver change |
-| 17 | `perf-l35b` | Λ35 at 1024 bits against SDPB 1024: baseline of the current code, then the per-iteration gap (×1.3) and the shared plateau; the 768-bit no-shift work only if it helps at 1024 | Λ35 Solved + audit; Ising ABBA, csdr3, gravity256, 2×2 PMP no worse |
+| 17 | `perf-l35b` | Λ35 at 1024 bits against SDPB: baseline; two RHS via fixed τ with a general entry rule (τ and κ falling together); infeasible-start PMP mode (fixed τ, separate α_P/α_D, data-chosen start scale); safe refinement skip at the representation floor; no MPFR shifts with escalation on failure | Λ35 Solved + audit; Ising ABBA, csdr3, gravity256, 2×2 PMP no worse; infeasibility tests green |
+| 19 | `perf-scale` | Cone scaling and in-node parallelism: LPT and in-cone split of update_scaling; warm-started NT versus HKM/XZ A/B on Λ27/Λ35; blocks assigned by measured cost; idle threads | Ising ABBA with audits; Λ35 pace; Float64 scoreboard statuses/iterations/audits unchanged |
+| 20 | `perf-t20` | Multi-node: distributed border factor, cost-balanced ranks, batched agreement flags (reuse `perf-border` `a80cfa1`); SDPB 3.1 sample points | 1/2/4-node Λ27/Λ35 pace vs SDPB; Ising A/B with audits |
 | 16 | `perf-endgame` | Float64 end game: AlmostSolved → audited Solved, no test loosened | 58-case scoreboard; Λ19 ABBA if MPFR-reachable |
+
+Task 18 (Hypatia WSOS, measurement only) is closing: no-go on the one-sided formulation (ising11: 69–109 it / 19–34 s against SDPX 54 / 3.4 s); its kernel ideas go to task 19.
 
 ## Next work, in order
 
