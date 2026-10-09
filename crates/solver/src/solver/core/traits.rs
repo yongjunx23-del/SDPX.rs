@@ -202,6 +202,17 @@ pub trait Variables<T: FloatT> {
         None
     }
 
+    /// Enter the fixed-τ end phase (`Δτ = Δκ = 0`, μ over the cones).
+    /// Returns false when the variables do not support it.
+    fn freeze_tau(&mut self) -> bool {
+        false
+    }
+
+    /// Whether the fixed-τ end phase is active.
+    fn tau_frozen(&self) -> bool {
+        false
+    }
+
     /// Shorten `α` by `shrink` until `τκ ≥ beta·μ` at the new point (at
     /// most 50 times). The default leaves `α` unchanged.
     fn taukappa_backtrack(&self, _step: &Self, α: T, _beta: T, _shrink: T, _cones: &Self::C) -> T {
@@ -395,6 +406,10 @@ where
     fn get_status(&self) -> SolverStatus;
     /// Relative duality gap of the last evaluated iterate, if recorded.
     fn gap_rel(&self) -> Option<T> {
+        None
+    }
+    /// Larger of the primal and dual feasibility residuals, if recorded.
+    fn residual_max(&self) -> Option<T> {
         None
     }
     /// Set the termination status

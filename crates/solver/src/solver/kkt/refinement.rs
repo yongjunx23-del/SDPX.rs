@@ -60,8 +60,27 @@ pub(crate) fn refine<T: FloatT>(work: &mut impl Refinement<T>, settings: &CoreSe
     if settings.iterative_refinement_gmres && work.gmres_supported() {
         return refine_gmres(work, settings);
     }
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mut stats = [T::zero(); 4];
+    let ok = refine_stationary(work, settings, &mut stats);
+    if *TRACE.get_or_init(|| std::env::var_os("SDPX_TRACE_TAU").is_some()) {
+        // Diagnostic only: rhs norm, first and last residual, corrections.
+        eprintln!(
+            "refine-trace {:.3e} {:.3e} {:.3e} {}",
+            stats[0], stats[1], stats[2], stats[3]
+        );
+    }
+    ok
+}
+
+fn refine_stationary<T: FloatT>(
+    work: &mut impl Refinement<T>,
+    settings: &CoreSettings<T>,
+    stats: &mut [T; 4],
+) -> bool {
     let normb = work.rhs_norm();
     let mut norme = work.residual(false, true);
+    *stats = [normb, norme, norme, T::zero()];
     if !work.all_succeeded(norme.is_finite()) {
         return false;
     }
@@ -75,6 +94,7 @@ pub(crate) fn refine<T: FloatT>(work: &mut impl Refinement<T>, settings: &CoreSe
             break;
         }
         let previous = norme;
+        stats[3] += T::one();
         let solved = work.solve_correction(settings);
         if !work.all_succeeded(solved) {
             return false;
@@ -102,12 +122,14 @@ pub(crate) fn refine<T: FloatT>(work: &mut impl Refinement<T>, settings: &CoreSe
         if stop {
             if accept {
                 work.accept_candidate();
+                stats[2] = norme;
             } else {
                 work.restore_product();
             }
             break;
         }
         work.accept_candidate();
+        stats[2] = norme;
     }
     true
 }

@@ -270,6 +270,7 @@ where
         // ----------------------
         if self.status == SolverStatus::Unsolved
             && iter > 1u32
+            && !crate::solver::core::test_no_progress_stop()
             && (self.res_dual > self.prev_res_dual || self.res_primal > self.prev_res_primal)
         {
             // Poor progress at high tolerance.
@@ -358,6 +359,10 @@ where
 
     fn gap_rel(&self) -> Option<T> {
         Some(self.gap_rel)
+    }
+
+    fn residual_max(&self) -> Option<T> {
+        Some(T::max(self.res_primal, self.res_dual))
     }
 
     fn set_status(&mut self, status: SolverStatus) {

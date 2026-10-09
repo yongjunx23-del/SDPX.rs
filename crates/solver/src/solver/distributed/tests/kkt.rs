@@ -698,6 +698,7 @@ fn owned_ising_linear_direction() {
             .collect(),
         τ: T::one(),
         κ: T::zero(),
+        fixed_tau: false,
     };
     let mu = (point.z.dot(&point.s) + point.τ * point.κ)
         / T::from_usize(full.cones.degree() + 1).unwrap();
