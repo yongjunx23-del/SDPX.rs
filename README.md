@@ -73,6 +73,24 @@ nonfinite values and nonpositive homogenization or scaling factors.
 `SDPX_RECEIPT=FILE` records phase timings and peak RSS. Run each executable
 with `--help` for its full argument list, including MPI partitioning.
 
+## Reducing explicit SDP inputs
+
+For Float64 equality/PSD models such as SU(2), reduce the input before
+constructing the solver, then recover the original point:
+
+```sh
+python3 tools/preprocess_sdp.py reduce original.json reduced.json recovery.json
+target/fast/sdpx reduced.json --precision 53 --output reduced-point.json
+python3 tools/preprocess_sdp.py lift original.json recovery.json reduced-point.json solution.json
+```
+
+The tool verifies shared PSD kernels and removes objective-free empty or
+equality-only variables. It preserves PSD coefficient supports and records
+how to lift `x`, `s` and `z`. Audit `solution.json` against `original.json`
+at the original tolerance. NumPy and SciPy are required; sampled and MPFR
+inputs are rejected. Preprocessing and lifting times are reported separately
+from the reduced solve.
+
 ## Rust API
 
 ```rust

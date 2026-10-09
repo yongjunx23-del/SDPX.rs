@@ -8,6 +8,117 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — ordered PSD publication and external SU(2) reduction
+
+Frozen baseline `1d0711f` versus candidate `60d7b8d`, PBS 224490,
+eight cores / 32 GiB / 45 minutes, dynamic OpenBLAS with one BLAS thread.
+Release ABBA runs are serial on one host. Medium Float64 at four workers:
+
+| Input | Baseline native / API s | Candidate native / API s | Native gain | Candidate peak RSS |
+|---|---|---|---|---|
+| Original | 3.203 / 3.204 | 2.948 / 2.949 | 8.0% | 412 MiB |
+| Reduced | 2.432 / 2.433 | 2.207 / 2.208 | 9.2% | 353 MiB |
+
+All runs are Solved/15, have identical complete points for each input, and
+pass the unchanged original 1e-6 audit after lifting reduced points.
+**Keep** disjoint-column PSD publication with original cone addition order.
+The compact u32 publication index is allocated only for pooled publication;
+owners with no active PSD columns skip it. The final admission simplification
+`b7cbd39` passed a matching MPFR768 owner solve at four workers: Solved/23,
+exact baseline points and original-factor 1e-30 audit.
+
+**Keep** standalone `tools/preprocess_sdp.py`: verified shared PSD kernels
+select principal submatrices; objective-free empty/equality-only variables
+are removed before engine setup. Medium rows 13,739 → 7,275, nonzeros
+138,192 → 73,869, PSD orders 60/57/59/57/116 → 44/41/43/41/84.
+The reduced candidate's reused solve is 31.1% faster than the old original
+solve and uses 14.9% less peak RSS. This excludes one-time preprocessing
+(0.291 s tool work; 2.369 s process/imports) and lifting (about 0.56 s).
+Sampled and MPFR inputs are rejected. The diagonal-overflow and empty
+NumPy-index repairs passed their small reduce/solve/lift checks.
+
+**Keep for correctness/memory:** one hard rank allowance shared by all
+owners, capped by node memory per local MPI rank and process limits; release
+unused generic PSD/sample storage. Actual one/two-rank probes and a two-rank
+original-coordinate solve pass. On node54, the 32 GiB process limit binds,
+so both MPI layouts have a 4 GiB assembly allowance per rank. The targeted
+allowance selector passes. Ising11 MPFR512 at one/four workers remains
+Solved/54 with exact baseline points and unchanged 1e-30 audits.
+
+**Keep** KKT-based pool widening, with narrower cone lanes/chunks retained.
+Gravity's first ABBA on node54 gives only 1.34% less native time
+(0.964 → 0.951 s), below the retention threshold, with 5.3% higher RSS.
+PBS 224492 suggests a larger gain but used CPUs 0–7 instead of its allocated
+slots 50–57; do not rely on that timing for selection. The short clarification
+PBS 224493 uses the same frozen binaries and eight distinct physical cores
+on one socket, bound to its assigned slots 50–57. Its isolated pool ABBA:
+
+| Scope | Baseline (4 actual workers) | Candidate (8 actual workers) |
+|---|---:|---:|
+| Native solve | 1.052 s | 0.974 s (7.4% less) |
+| API | 1.055 s | 0.978 s |
+| Process | 1.418 s | 1.343 s |
+| Peak RSS | 300 MiB | 318 MiB (6.0% more) |
+
+All legs are Solved/23, point-identical and pass the original 1e-6 audit.
+The gain varies by host; the memory trade-off is explicit. **Reject** balanced
+lower Gram output tiles (`3eaa9b9` / `f138a47`): the initial tile-only 2.19%
+gain is noisy; the allocated-core repeat is 0.13% slower
+(0.947237 → 0.948437 s). Reverted after this one clarification. Seven uneven
+column tasks remain, but splitting them further did not earn its overhead.
+**Reject** single-heavy sampled splitting: the uniform MPI gate is correct
+but 0.91% slower overall (5.523 → 5.573 s). Operator phases improve 24–25%,
+so one q-only dense-dual gate was warranted. It is also neutral/slower:
+12.673 → 12.684 s native, Solved/23, exact one/four-worker points and original
+1e-30 audits. The candidate is reverted; this direction is closed.
+Large SU(2) reduction succeeds (n 7054 → 6371, m 42023 → 21262), but the
+saved baseline is AlmostSolved/21. Remaining-only PBS 224492 reuses that
+point and runs the candidate once: both remain AlmostSolved/21 and are not
+accepted. Candidate lifted residuals meet the audit's numeric limits, but
+status is still AlmostSolved; it is never promoted. **Revert and park** the positive
+separator: reduction makes auto choose augmented/faer, whose diagonal
+positive graph cannot exercise it. An affected condensed-form gate and
+accepted original point are required before keeping that candidate.
+
+Accepted initializer/interior-shift diagnostics were added under
+`SDPX_START_STATS`; no start rule changed. Resampled Lambda27 accepts its
+KKT start and max(d)=3.827, so d alone does not justify a tiny tau. The
+benchmark-specific small-tau results remain separate from default behavior.
+
+Evidence: `$SDPX_E2E_HOME/work/perf-next-20261009/evidence-224490/`, archive
+SHA256 `03278402c21dd631204031be3c8a6898fdc7718aa89ad7090a4470510b3299d1`.
+Its 124 top-level receipts/points/log hashes were verified. Baseline executable
+`fffbc928d07a799caafa87092fb6be7beebccb3624eaa6a1c3c515a77a78abbd`, candidate
+`1ba2a1d0678b1c07688c9a7317ef82fa4f9be766201d3c593515333ead040473`.
+Completed PBS 224492 evidence archive SHA256
+`9e5e613a9a616e9853ad0c97c1fde9a29154163974f5fb82188cd3c1c1ff435d`;
+PBS 224493 archive SHA256
+`cd923ee234a8975497c6bf90bd7e7e9115ccd0375c6260702419a11aadec1f3a`.
+The latter requested eight cores / 32 GiB / ten minutes, reused existing
+release executables without rebuilding, and completed all twelve solves.
+Its Gram executable SHA256 is
+`de9acd83819225358bf77c0be4800063cc3d79fd56e436a21d64bfe1f6ab9064`.
+Packet and per-result hashes are retained beside both summaries. Scheduler
+exit codes were unavailable at final retrieval. The 224493 runner records
+all twelve process exits as 0 and final `pass=true`; 224492 separately records
+the known large solve exit 2 and a completed diagnostic harness.
+PBS 224487 timings remain invalid: archive mtimes reused the baseline binary
+for both arms. Force changed crate rebuilds after cache reuse and verify
+binary hashes/execution plans. Its preserved archive SHA256 is
+`3d798366c421426568d6ab355cbfb0eba6b721cdd2925db7c8a74e2ea24c7340`.
+
+Parallel references and remaining prime-underfill/NUMA questions are in the
+architecture document. Read-only GPT-6.1 Sol xhigh reviews found no blockers
+in the kept sampled ownership, allowance accounting or ordered publication.
+Contiguous RNS cache rebuilds remain serial after pooled chunk extraction and
+precede the shared-CRT timer; profile their actual cost before changing them.
+The final selected-source fast gate (`perf-next-kept-fast-20261009`, medium,
+four workers) is Solved/15, point-identical to the matching frozen baseline,
+and passes the original 1e-6 audit. Receipt and comparison are in
+`$SDPX_E2E_HOME/work/perf-next-20261009/final-kept-gate.json`.
+No convergence, precision, escalation or refinement rule changed; no broad
+suite was run.
+
 ## 2026-10-09 — review repairs: retained for correctness and memory
 
 - Checked the current tree and newer cluster experiment archives before assigning five independent GPT-6.1 Sol xhigh workers. Existing task 16/17/20 changes were retained. The unmerged thread/start-rule experiments were not treated as completed fixes.

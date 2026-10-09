@@ -71,13 +71,23 @@ store the internal iterate with its equilibration; hot starts map through
 original coordinates. Loading rejects nonfinite values and nonpositive
 homogenization or scaling factors before installing the iterate.
 
+The standalone `tools/preprocess_sdp.py` reduces explicit Float64
+equality/PSD models before engine setup. Verified common kernels select
+principal PSD submatrices without changing their coefficients. Objective-free
+empty columns disappear; equality-only columns are eliminated within sparse
+connected components. Recovery metadata lifts the primal variables, cone
+slacks and dual variables for the original-coordinate audit. The tool
+rejects sampled and MPFR inputs.
+
 Sampled setup preserves PSD singletons and their primitive columns. Presolve
 can remove other columns and rows, remapping the factor offsets and linear
 operator together. Chordal lowering is disabled for sampled inputs because
 it would replace the factors with rounded coefficients.
 Sampled problems keep the factored operator authoritative: once installed,
-the retained linear-A values are released and the reduced KKT storage owns
-the coefficients. Rounded materializations never replace the operator.
+the retained linear-A values and update-only mappings are released; generic
+PSD dense scratch and unused inverse residue caches are discarded. The
+reduced KKT storage owns the coefficients. Rounded materializations never
+replace the operator.
 Fully sampled KKT setup retains column patterns without generic PSD entry
 coordinates or value plans. Sampled MPFR workspaces retain packed upper Grams;
 SYRK and MPI gather read/write that layout directly. Float64 keeps dense BLAS
@@ -159,9 +169,9 @@ reported as `linear_solver`.
 | 2 | `shared_soc_arrow` | Zero and ≥ 8 SOC3 cones only (augmented form; condensed eliminates SOC3), shared primal border, workspace ≤ 512 MiB (the arrow memory cap) and a dense border of at most 8 × the `A` entries. A leaf's single primal column follows its SPD cone block and keeps its true diagonal (no static shift) until a factorization fails (approved 2026-10-07). |
 | 3 | `local_bounds_faer` / `local_bounds_arrow` | ≥ 64 variables with one or two local bound rows, diagonal `P` and a nonempty equality/free border, admitted by added storage. Float64 needs `faer-sparse`; MPFR uses exact bound Gram products. |
 | 4 | `local_cone_arrow` | MPFR only: Zero, orthant and SOC cones. Each orthant row or SOC (with its sparse-expansion coordinates) is a unit; variables touching at most four units join them while the leaf stays ≤ 64 coordinates (≥ 8 leaves). Equality rows, other variables and oversized cones form the border, ordered by coupling degree within each sign; workspace and border density as above. Couplings are stored per leaf over its own border columns; the border Schur complement is one exact residue block product with Z = D⁻¹Y formed while encoding. |
-| 4 | `dense_block` | Float64: an eligible dense leading positive block, pooled tiled Cholesky. |
-| 5 | `arrow` | Disconnected positive dense leaves around a negative border, estimated workspace ≤ max(512 MiB, 8 × KKT storage) (Float64 and MPFR). Leaf contributions are recomputed in bounded batches. |
-| 6 | `faer` / `qdldl` | General sparse LDL. Float64 with `faer-sparse` uses faer when estimated flops ≥ 1e8 and flops per factor nonzero ≥ 40, else QDLDL. MPFR uses QDLDL. |
+| 5 | `dense_block` | Float64: an eligible dense leading positive block, pooled tiled Cholesky. |
+| 6 | `arrow` | Disconnected positive dense leaves around a negative border, estimated workspace ≤ max(512 MiB, 8 × KKT storage) (Float64 and MPFR). Leaf contributions are recomputed in bounded batches. |
+| 7 | `faer` / `qdldl` | General sparse LDL. Float64 with `faer-sparse` uses faer when estimated flops ≥ 1e8 and flops per factor nonzero ≥ 40, else QDLDL. MPFR uses QDLDL. |
 
 Packed local bound leaves store their couplings in shared panels; their
 unused dense coupling matrices, per-border coupling index/mask vectors and
@@ -255,8 +265,10 @@ rotation order. Float32 is configured only for dense kernel tests.
 
 One worker pool per solver (`max_threads`) runs cone blocks, factorization
 and long vector work; dominant blocks split their tiles over the same pool.
-Equality-only problems also share this pool with KKT kernels when they meet
-the existing work cutoff. Backends receive it before initial thread reporting.
+Non-PSD setup also sizes the pool from squared A/P column-neighbor counts
+weighted by scalar precision. KKT work can admit more workers while cone
+lanes, orthant chunks and inner split budgets retain their narrower size.
+Backends receive it before initial thread reporting.
 Faer factors and solves run inside that pool at its actual width, with scratch
 resized when the width changes; no global Rayon pool participates. Numeric
 refactors reuse the validated immutable CSC structure.
@@ -264,8 +276,10 @@ Linux worker binding preserves the caller's CPU mask. When the allocation
 matches the requested budget, the calling thread stays on its first CPU
 during a solve and regains its original mask on return. User termination
 callbacks temporarily receive the full mask so new pools inherit the allocation.
-Splits preserve each output's operation order, so results are independent of
-the thread count. Scratch is per thread (`algebra/scratch.rs`) and reused
+Publication preserves each output's addition order; exact MPFR products
+produce the same rounded dot across thread counts. Float64 factor backends may change
+rounding; the original-coordinate audit remains the accuracy gate. Scratch
+is per thread (`algebra/scratch.rs`) and reused
 across iterations; dense kernels reuse dead input/output storage instead of
 allocating temporaries. Parallel packed Float64 Schur tiles use worker
 scratch; the per-block dense accumulator is allocated only for serial
@@ -277,11 +291,38 @@ workspace separately. BLAS providers must support concurrent calls from
 workers (source-built OpenBLAS needs
 `USE_LOCKING=1`).
 
-Serial and owner setup use the same Schur assembly allowance:
-max(256 MiB, effective memory / 8), or the existing two-copy storage rule.
-Linux effective memory includes exposed finite cgroup limits; a PBS request
-is not inferred when the host exposes no limit. This is a per-process
-allowance; multiple ranks in one allocation can still multiply it.
+PSD contribution buffers publish by disjoint CSC columns after joining
+block computations. Each destination adds blocks in their original cone
+order, with P first and eliminated orthant/SOC terms last. Publication keeps
+one compact column-order index per participating column, allocated only
+when parallel publication uses it. Owners without active PSD columns skip
+publication tasks.
+
+Serial and owner setup use one eighth of effective rank memory as the hard
+allowance for packed contributions and publication indices. MPI queries its
+shared-memory communicator once to divide node memory among local ranks;
+all owners on a rank consume one allowance. Physical memory and visible
+finite cgroup limits bound node memory; process address/data limits cap the
+rank separately. The 256 MiB fallback applies only when memory is unknown.
+An unenforced PBS request is not inferred.
+
+Parallel design references: [SDPB](https://arxiv.org/html/1909.09745v1)
+allocates workers by measured block cost and keeps large blocks within a node.
+Its [exact-BLAS implementation](https://github.com/davidsd/sdpb/blob/master/src/sdp_solve/SDP_Solver/run/bigint_syrk/Readme.md)
+splits leftover prime jobs into output tiles and uses shared memory buffers.
+SDPX retains its correctly rounded exact-product contract; NUMA placement and
+prime/output tiling need profiles on the affected large shapes before changes.
+Contiguous cached operands rebuild in 32K-entry blocks; chunk extraction is
+pooled, while residue encoding/reduction/compression is serial. Measure cache
+misses and rebuild cost before parallelizing these bounded blocks.
+[SCS](https://www.cvxgrp.org/scs/linear_solver/index.html) puts parallel work in
+its factor backend and dense Gram kernels. [MOSEK](https://docs.mosek.com/latest/capi/guidelines-optimizer.html#multithreading)
+likewise notes that useful thread counts depend on the problem and that small
+problems can lose time to threading overhead. For SDPX, size the existing
+pool for substantial KKT work while retaining each cone phase's useful
+width. Output subdivision needs an end-to-end gain; a phase-only gain is
+insufficient. Keep BLAS at one thread when cone or tile tasks already occupy
+that pool.
 
 With receipts enabled, setup and solves serialize access to phase counters.
 A completed solve captures all timing fields in a caller-local snapshot before

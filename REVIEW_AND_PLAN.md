@@ -64,62 +64,21 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 - **Float64 not Solved:** hinf3 (platform-sensitive), sched_100_50_orig, csdr3 (augmented/arrow end-game floor), f64_large (AlmostSolved/20, no Slater point; facial reduction).
 - **Tiny LPs** lose on per-solve overhead: 2–20 ms against MOSEK's warm 1–5 ms.
 
-### Retained work (details and evidence in the journal)
+### Retained mechanisms and bottlenecks
 
-- **Release 0.9.1 (`4863de1`)** keeps the reviewed repairs: per-RHS refinement progress, accepted-iterate residual restoration, boundary validation, mixed-cone MPI exchanges. Ising11 MPFR512 is `Solved`/52 at one and four threads, with identical points and a 1e-30 original-coordinate audit.
-- **Storage and exact products (2026-10-05..07):**
-  - reused H·z and in-place gather decode;
-  - borrowed SVD/eigen work and packed Grams;
-  - shared exact-product CRT;
-  - bound-leaf Schur destination reuse;
-  - bounded and compact local-SOC exact products;
-  - grouped residue block Schur (csdr3 −17%);
-  - local cone arrow (crossing SOCP MPFR128 698.8 → 19.3 s);
-  - memory/density size gates;
-  - presolve F_p rank images;
-  - PMP basis release;
-  - ordinary residue GEMM ≥1024 bits at side ≥12.
-- **Performance plan 2026-10-08 (q1/q2):**
-  - Historical MPFR shift/pivot rule: Λ27 451 → 376 it. Superseded by task 17 below: no shift/replacement until a failed factor triggers escalation.
-  - Assembly budget max(256 MiB, RAM/8).
-  - Parallel border SYRK and tiled border factor use linked BLAS. The faer tile replacement was rejected after a convergence regression.
-  - Dynamic pivot rule inside the dense Cholesky.
-  - Binary64 PSD Gondzio correctors: medium 19 → 15 it, large 25 → 19 it.
-- **Integration `0e42ad2` (2026-10-09):**
-  - Task 9: Float64 Solved implies the original-coordinate audit (`tol_original` 1e-6, MPFR off); the returned s is the cone projection of b − Ax; thread-invariant factors.
-  - Task 10: cost-based LP backend, presolve budget, condensed/augmented and chordal choices that never read the thread count.
-  - Task 12: fixed-τ phase, MPFR only.
-  - Task 14: data-scaled unit-fallback τ₀ (Λ27 376 → 183 it).
-  - Per-factor arrow row block.
-- **Task 15 (`perf-iter` `a68f72f`, merged `9454332`):**
-  - Shared sampled linear products (bitwise identical).
-  - Square-root-free Givens replay in the MPFR SVD (replay CPU −32%, audits pass).
-  - Λ27 −4.9%, s50 −7.0%, Λ19 −5.3%, ising11 −4.3%.
-- **Task 13 (`perf-small` `ad536de`, merged; int4 gate identical statuses/iterations/audits, geo-mean 0.835/0.911 vs int3):**
-  - Lazy QDLDL parallel plan; one AMD ordering; Mersenne modular minor.
-  - Receipt CPU clocks only with worker threads.
-  - Binary64 arrow split thresholds; PSD scratch per cone order.
-  - All 116 points bitwise identical; same-node geo-mean 0.86 at 1 and 16 threads.
-
-### Profiles
-
-- **Λ27 at 768 bits, 64 threads (task 15 base):**
-  - Refined solves are 50%: 938 passes at about 120 ms each (prepare 23, reduced 14, recover 33, residual 51 ms). The outer corrections alone are 19%.
-  - Cone scaling 21.6%: largest-cone SVD wall 0.30 s; replay was 54% of SVD CPU before task 15.
-  - Factorization 15%.
-  - Cycles: GMP `mul_basecase` 22%, RNS GEMM pipeline about 18%, rayon idle stealing about 8%.
-- **Mixed Lambda27 at 1024 bits, 32 threads (frozen 0.9.1, failed point, 2349.9 s loop):**
-  - KKT update 62.4% (Schur contributions 422.6 s, leaf factor/coupling 359.6 s).
-  - Later KKT solves 14.1%; cone scaling 15.3%; border factor 0.6%.
-  - 813 linear solves, 553 of them refinement corrections.
-- **Float64 large SU(2) at `515708f`, 4 threads:**
-  - Schur assembly 33.6 s (serial, CPU/wall 0.999) and refactor 37.5 s, out of an 84.2 s solve.
-  - Refactor scaling stalls at 16 threads.
-  - The assembly budget (2026-10-08 item 8) and the faer tiles came after this profile: large at 16 threads went 66 → 47.5 s.
-- **Float64 small (task 13):**
-  - Setup was 1.5–5.7 ms of QDLDL plan allocation on tiny LPs (fixed).
-  - The out-of-line `fma` call was 5–9% of cycles without `+fma` (fixed by the build flag).
-  - At 16 threads, concurrent small OpenBLAS calls serialize: summed `cone_wprod` time on mcp500 goes 33 → 2439 ms.
+- Exact residue products, packed Grams, bounded arrow kernels and shared
+  operator products are retained. Their implementation is in the architecture;
+  completed comparisons and source hashes are in the journal.
+- Float64 uses original-coordinate acceptance, condensed slack recovery and
+  continuation refinement after residual growth. Old small-case setup overhead
+  repairs are retained; remaining presolve/pool/receipt costs need current profiles.
+- MPFR starts without shifts or pivot replacement, escalating after failed
+  factors. Resampled Ising can remove most refinement corrections; old profiles
+  that attributed half the solve to refinement are not sufficient evidence now.
+- Cone scaling is already close to its CPU balance limit. The largest SVD and
+  replay remain important; blocked replay and extra-worker trials are closed.
+- Mixed Lambda27's older profile was dominated by KKT assembly and leaf work,
+  but its point failed the original audit. It is not accepted timing evidence.
 
 ## Known failures (keep visible)
 
@@ -131,7 +90,10 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 - **Large SU(2) Float64 (n 7054):** every PSD block has a kernel shared by all A_j and b (30/30/30/30/60/12/14 of 95/92/94/92/186/74/71).
   - SDPX is AlmostSolved, and MOSEK's "optimal" points fail the 1e-6 audit (r_d about 1e-4).
   - Medium SU(2) is now Solved and audited after task 16; the large case still fails.
-  - Remedy: facial reduction (`perf-facial`, opt-in, unverified).
+  - Standalone common-kernel reduction shrinks the model but default
+    augmented/faer remains AlmostSolved/21 on PBS 224492. A positive Schur
+    separator is reverted and parked until an affected condensed-form solve
+    is accepted.
 - **Float64 unresolved cases:** hinf3, sched_100_50_orig, csdr3 and f64_large. Task 16 resolved qap6, gpp100, gpp124-1, gpp250-1 and gpp500-1.
 - **Gravity Float64 default:** `Solved`/17 with r_d 4.01e-6 > 2e-6 before task 9. Not re-run since `tol_original`.
 - **MPFR `condensed_graded`:** kept as designed.
@@ -144,14 +106,46 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 | Task | Branch | Scope | Gate |
 |---|---|---|---|
 | 17 | `perf-l35b` | Merged `368ffe7` (no MPFR shifts, GMP basecase, opt-in host GMP). Remaining, not merged: (F) a start rule for SDPB 3.1 resampled inputs (Λ27-rs is a τ chase at the default start: 345 it vs 145 at τ₀ 1e-30); (G) `sdpx-pmp2sdp` resamples verified PyCFTBoot/SDPB.m blocks by default (`--keep-samples` opts out), with threads defaulting to the cores within a memory cap; then Λ35-rs at 1024 | Default solve on resampled inputs no worse than today on old inputs (Λ19 ≤121, Λ27 ≤183, Λ35 ≤683 it, audited); ising11, gravity256 and the old inputs no worse |
-| 20 | `perf-t20` | Done, merged `23e0a99`: owner-MPI agreements (−1.4…8%, bitwise identical); `pmp2sdp --resample` (SDPB 3.1 points: Λ19 −38%, Λ27 −41% at τ₀ 1e-30, 0 refinement corrections). Matched SDPB and full resampled Λ35 comparisons are complete (journal). Remaining: start rule on 3.1 inputs (Λ27 345 it at default start), then Λ35-rs with task 17's factor changes | — |
 | 21 | `perf-mc` | Multi-core scaling (user, 2026-10-09): 8–128-thread curves against SDPB on Λ27, Λ35 and mixed Λ27/1024 (`sdpx-mpi-20261004/inputs/mixed-L27-sdp-1024`, n 18703, the SDPB-benchmark-scale case; SDPB 2 paper: Λ43 mixed 2861 s → 59 s per iteration from 4 to 448 cores), with perf stat/record, lock, allocation and NUMA data. Then evidence-chosen fixes: persistent block ownership (SDPB-style affinity), per-socket layout for 128 cores, phase overlap, distributed border/Schur for mixed problems | Ising ABBA at 64 and 128 threads with audits; Λ35 pace; mixed Λ27 2nd-iteration time vs SDPB; Float64 scoreboard unchanged |
 | 22 | `perf-f64mc` | Binary64 and non-PSD cone multi-thread scaling on large cases (user, 2026-10-09: small cases are too small for threads): gravity-large (n 20202, m 20299), SU(2) medium/large, gpp500, arch0, large LPs, against MOSEK at 1–32 threads; small cases only need a measured-work guard so 16 threads never loses to 1. Also owns lock-free receipts and the process-wide pool cache (the per-call pool sites are test-only). Phase 1: serial phases run about 2× slower at t>1 under the conservative governor because the unpinned main thread hops cores | 58-case scoreboard at 1 and 16 threads unchanged; same-node A/B; large cases audited; ising11 bitwise |
-| 16 | `perf-endgame` | Done, merged `81b1549`: binary64 condensed Δs from the primal row, GMRES-IR on residual growth; 6 more Float64 cases Solved | — |
 
 Task 17 items D/E passed their gates and are merged. The normalized 2×2 PMP is Solved/24. Resampling remains opt-in, and converter threads default to one; the proposed new defaults require the remaining start-rule gate.
 
 Review repairs (2026-10-09): preserve sampled factors through singleton presolve, defer unused audit copies, bound split residue caches, reject overflow before result publication, use the existing pool for faer, and isolate complete receipts. Local audited checks preserve baseline points for medium/faer, ising11 and csdr3 at one/four threads. Linux affinity, owner assembly and MPI checks are recorded in the journal.
+
+### Current performance changes (2026-10-09)
+
+Release ABBA on PBS 224490 verifies ordered PSD publication: medium SU(2)
+at four workers improves 3.203 → 2.948 s native (8.0%), preserving complete
+points and the original 1e-6 audit. The standalone preprocessor reduces
+medium rows 13,739 → 7,275 and nonzeros 138,192 → 73,869. With publication,
+its reused solve takes 2.207 s and 353 MiB peak RSS: 31.1% less native time
+and 14.9% less RSS than the old original solve. Preprocessing/imports and
+lifting are separate costs. Sampled/MPFR inputs are rejected by this tool.
+
+Hard rank/shared-owner assembly allowances and sampled storage pruning pass
+actual MPI, the targeted allowance check and local Ising11 MPFR512 at
+one/four workers with exact points and unchanged 1e-30 audits.
+
+PBS 224493 binds to the job's eight allocated physical cores and isolates
+KKT pool widening: gravity native 1.052 → 0.974 s (7.4%), API
+1.055 → 0.978 s, peak RSS 300 → 318 MiB. Keep the wider KKT budget while
+retaining the narrower cone budget. Balanced lower Gram tiles add no gain
+on this repeat and are reverted. All points and original audits agree.
+The earlier 1.34% pool result on node54 shows that the benefit depends on
+the host; it is not a universal scaling claim.
+
+Single-heavy sampled splitting is reverted after uniform and denser MPI
+ABBA gates show no end-to-end benefit. Large reduced SU(2), checked on
+PBS 224492, remains AlmostSolved/21 in both arms. Candidate lifted residuals
+meet the numeric audit limits, but the status remains unaccepted. Its auto
+form is augmented/faer, so the positive separator is reverted and parked
+until a relevant condensed-form solve passes the original audit.
+
+PBS 224487 A/B timings remain invalid because both executable hashes identify
+the baseline. Archive timestamps reused cached Cargo artifacts. Force the
+changed crate to rebuild after cache reuse, and verify binary hashes and
+execution plans. The journal preserves all failed evidence and final decisions.
 
 ## Next work, in order
 
@@ -165,14 +159,13 @@ Review repairs (2026-10-09): preserve sampled factors through singleton presolve
 3. **Float64 per-solve overhead (task 13 leads):**
    - Brandy's rational presolve pass costs 35–85 ms, because a budget counted in updates misses the GMP gcd cost.
    - Concurrent small OpenBLAS calls in cone lanes.
-   - Size the shared pool by KKT work while keeping cheap cone tasks narrow. The cone-only cutoff limits gravity-large to four workers despite its roughly 206M-product bound Gram; check one/eight-thread audited solves before timing.
+   - KKT-based pool widening is retained on gravity; profile other substantial non-PSD workloads before extending the policy. Balanced Gram tiles are closed after the allocated-core repeat shows no gain.
    - Pool creation (1–6 ms at 16 threads).
    - Receipt sampling on pooled solves.
 4. **Float64 SU(2):**
-   - Publish PSD Schur buffers by disjoint destination columns, preserving cone addition order. Reprofile first: the older large case spent 11.96 s in indexed publication; the current path still scatters serially.
-   - Facial reduction (`perf-facial`) with tolerance-based kernel detection, gated by the audit (approved).
-   - Eliminate empty (74) and equality-only (609) columns.
-   - Two leaves plus a border for large's Schur columns (blocks 1–5 / 6–7 / both: 3729 / 1817 / 825; about 5× fewer factor flops).
+   - Ordered column publication and external reduction pass medium's original audit; keep those measured improvements.
+   - Resolve large's failure after reduction without changing acceptance rules. Its auto form is augmented, so a positive Schur separator needs a separate relevant gate before integration.
+   - Large reduction removes 74 empty and 609 equality-only columns; recovery remains mandatory.
 5. **MPFR cone scaling:**
    - The largest-cone SVD sets the wall; replay is still 44% of SVD CPU.
    - Rayon idle stealing is about 8% of cycles.
@@ -181,7 +174,11 @@ Review repairs (2026-10-09): preserve sampled factors through singleton presolve
    - (Border distribution closed: the border is 170 rows on Λ35, 2.1% at 4 nodes.)
    - Task 20 already batched refinement agreements; measure remaining collectives before changing them.
    - The single-process multi-owner path (74.8 vs 44.2 s).
-   - Rank-local residue batch eligibility after partitioning (unmeasured).
+   - Single-heavy-owner sampled splitting is closed: correct on both MPI gates, but neither improves end-to-end time.
+   - Profile prime-group underfill and NUMA residue placement on large calls;
+     split complete inner products over output tiles only if they dominate.
+   - Measure serial cached-operand rebuilds, which precede the shared-CRT
+     timer; parallel encoding needs a material cache-miss cost and spare ways.
    - `perf-border` `a80cfa1` is parked with its gate not run.
 7. **Other open items:**
    - Exact arrow batching release ABBA, after the mixed-Λ27 accuracy decision.
@@ -197,23 +194,15 @@ Parked with WIP committed (journal 2026-10-09):
 - `perf-f64large` `50325c4`, `perf-threads` `946d4be`, `perf-facial` `a3a7271`: unverified.
 - `perf-sharedrhs` is superseded by task 15.
 
-## SDPB design reference (papers arXiv:1502.02033, 1909.09745; releases 2.7–3.1)
+## Parallel design reference
 
-What SDPB does, and what it implies for SDPX:
-
-| SDPB | SDPX today | Use |
-|---|---|---|
-| Infeasible primal-dual IPM from (x, X, y, Y) = (0, Ω_P I, 0, Ω_D I); no τ/κ. Ω = 1e40–1e60 for Λ19–Λ43 in the paper (default 1e20) | HSD (Clarabel) with τ/κ; τ₀ from the data (task 14); fixed-τ phase (task 12) | Λ35's dual has no Slater point, and HSD's τ collapses there. The fixed-τ phase is SDPX's route to the infeasible-IPM behaviour; consider an infeasible-start mode for PMP inputs if item 1 falls short |
-| Separate primal and dual step lengths α_P, α_D, with γ = 0.7 | One HSD step for all variables, 0.99 of the boundary | A separate α_P/α_D is possible only with τ fixed; test inside the fixed-τ phase |
-| XZ (HRVW/KSH/M) direction, symmetrized dY; Cholesky of X, Y | NT scaling with an MPFR SVD per cone | HKM measured: +12% iterations on ising11; closed |
-| Mehrotra predictor (β = 0 if feasible, else 0.3) and corrector (β = r² or r, clamped by 0.1/0.3, as SDPA); two solves per iteration, no refinement | Predictor/corrector with 3 RHS (2 in the fixed-τ phase), two refinement levels plus about one outer correction each | SDPB relies on precision instead of refinement; SDPX refinement levels stay (contract), but futile corrections are item 2 |
-| Free variables kept: T = [S −B; Bᵀ 0], blockwise Cholesky S = LLᵀ, Q = Bᵀ L⁻ᵀ L⁻¹ B, Cholesky of Q | Same arrow (leaves = S blocks, border = Q) | Already matched |
-| SDPB 1 had "Cholesky stabilization": pivots below θ·geomean get +Λ, corrected exactly through a low-rank border U (Q′ by LU). **SDPB 2 removed it**: no regularization at all, raise precision instead | MPFR starts without shifts or pivot replacement; a failed factor escalates (task 17) | Retained and audited; further changes require new evidence |
-| Termination: absolute max-norm primalError = max(\|p_i\|, \|P_ij\|), dualError = max\|d_i\|, and dualityGap = \|P−D\|/max(1, \|P+D\|) | Relative normalized residuals, plus the original-coordinate audit | "Matched thresholds" means the same numbers under different norms; the audit decides acceptance |
-| Block timings from iteration 2, written to a file; worst-fit-decreasing assignment of blocks to cores | Owner cost histories (opt-in) | Same idea; adopt for multi-node only with a real scaling gain |
-| SDPB 2: Elemental-distributed Q, a hand-written ring reduce-scatter (memory), Cholesky of Q distributed | Ordinary MPI replicates the border; owner path partitions leaves | Border distribution closed for Λ35 (2.1% at four nodes); reconsider only on a larger measured border |
-| SDPB 3.0: Q by CRT residues into double BLAS (FLINT), in node-shared MPI windows split by `--maxSharedMemory`; about 2.5× faster than 2.7 | Exact residue GEMMs on faer per process | SDPX already has the residue products; node-shared panels matter only for multi-rank memory |
-| SDPB 3.1: sample points that minimise interpolation error (lower condition numbers) | Opt-in `pmp2sdp --resample` | Matched comparisons completed; default-start work remains (task 17) |
+The architecture links primary SDPB, SCS and MOSEK sources. SDPX already
+uses measured block costs, one shared pool, inner exact products and owner
+partitioning. Remaining questions are substantial output-task balance,
+prime-group underfill and producer/consumer NUMA placement. Measure those
+on the affected shapes before adding a scheduler or distributed backend.
+SDPB's different start, direction and convergence policies are described
+in the journal; they do not override SDPX's numerical contracts.
 
 ## Measurement prerequisites
 
@@ -226,38 +215,18 @@ What SDPB does, and what it implies for SDPX:
 
 ## Decisions
 
-**Approved by the user:**
-- 2026-10-07: shared-SOC arrow leaf primal columns skip the static shift.
-- 2026-10-07: Gondzio correctors.
-- 2026-10-09: facial reduction with tolerance-based kernel detection, gated by the original-coordinate audit.
-- 2026-10-09: refinement of the full HSD direction including Δτ, with tolerances unchanged.
-- 2026-10-09: a data-chosen τ₀.
-- 2026-10-09: further contract decisions within the fixed-precision rules are delegated to the lead. Never lower precision, never loosen refinement acceptance, never promote AlmostSolved.
+[AGENTS.md](AGENTS.md) governs numerical changes and approvals. Preserve
+requested precision and every acceptance/refinement rule.
 
 **Open:**
 - **Mixed Lambda27/1024 explicit-gate pilot.** The frozen baseline binary, 32 cores, 64 GiB, 2 h, ≤100 iterations. Prepared and awaiting approval after two exhausted retries.
-- **Independence from Clarabel.rs.** About 36% of non-test lines still match same-named Clarabel.rs files (Apache-2.0 notices kept).
-  - Done (bitwise-neutral): the staged driver, banner/report, NOTICE.
-  - Next neutral candidates: the `problemdata.rs` preprocessing pipeline, a uniform presolve/postsolve record, and the configuration printer.
-  - Changing numerical policies conflicts with the "Clarabel-style convergence/refinement/regularization" rule and needs a decision.
 - **Deferred until a concrete need:**
   - owner cost histories as a public interface;
   - ordinary/owner MPI convergence (only after real MPI E2Es; `direct_kkt_solver` stays in the settings schema);
-  - Python/Julia bindings, a certificate product, backend unification and line-count rewrites;
+  - Python/Julia bindings, a certificate product, backend unification and line-count/independence rewrites; preserve attribution;
   - sequential Schur writes;
   - dense-leaf packing (0.91% RSS);
   - distributed restart, broad sweeps and the old g0/application campaigns.
-
-### Survey: other solvers (2026-10-07)
-
-- **SDPA-GMP/QD/DD:** double-double and quad-double arithmetic (about 106/212 bits) is several times faster than MPFR at 128/256 bits. A `DoubleDouble` scalar would serve medium-precision solves.
-- **MOSEK/HiGHS:**
-  - Presolve (singleton columns, dualization) decides small and separable SOCPs.
-  - Gondzio correctors (adopted).
-- **Hypatia.jl:** a neighbourhood-based step, and interpolant-basis (WSOS) cones that avoid lifting PMPs to SDP.
-- **COSMO.jl / SCS / CVXOPT:**
-  - Clique merging (SDPX has it).
-  - Indirect CG with warm starts for very large KKTs.
 
 ## Closed directions
 
@@ -269,8 +238,8 @@ are in [the journal](docs/JOURNAL.md).
 - HKM (SDPB XZ) or mixed NT/HKM PSD direction, and NT scaling through
   eig(LᵀSL): HKM's cone update is 6.5× cheaper, but ising11/512 takes 52 → 58
   iterations and 37.1 → 41.9 s; net ≤ 0 for the condensed sampled path.
-  Task 19 re-measures it at Λ27/Λ35 scale, where scaling is 21.6% of an
-  iteration (new evidence).
+  Task 19 also declined HKM at larger scale; its proposed gains required
+  contract changes.
 - Cone scaling by scheduling (task 19: LPT, inner ways, pool_ways ±0.5%; scaling is CPU-bound) and by a blocked Givens replay through residue GEMM (task 19b: +6–17% per iteration at L = 40–63). Fewer rotations (divide-and-conquer bidiagonal SVD) is the remaining SVD lever.
 - Hypatia-style WSOS dual-barrier cone for the Ising PMPs (task 18):
   ising11 86 vs 54 it; Λ19 gap 4.6e-9 at 107 it vs SDPX's 73; the line
@@ -329,3 +298,7 @@ are in [the journal](docs/JOURNAL.md).
   precomputed alias index (−0.7%): identical points, not kept.
 - Lower Gram triangle/common 16-column tiles on larger gravity: serial and
   eight-thread runs regress 19.9%/8.1%.
+- Balanced rectangular lower Gram tasks: correct and point-identical, but
+  the allocated-core release repeat is neutral (+0.13% native time).
+- Single-heavy sampled operator splitting: operator phases are 24–25%
+  faster, but uniform and denser MPI full solves have no end-to-end gain.
