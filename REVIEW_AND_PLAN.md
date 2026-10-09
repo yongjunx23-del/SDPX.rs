@@ -53,7 +53,7 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 | spins 0–50 (s50) | 153 it / 153.8 s | SDPB 285 s |
 | Λ19 | 121 it / 71.0 s, audited | — |
 | ising11 (512 bits) | 54 it / 3.44 s | — |
-| Λ35 spins 0–70, 1024 bits | Solved 743 it / 3565 s (4.80 s/it, b0088bb era; current code not yet run); at 768 bits it fails (InsufficientProgress 887) | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
+| Λ35 spins 0–70, 1024 bits | Solved 683 it / 2426.5 s (3.55 s/it), audited; 768 bits Solved 691 it / 1886 s, audited | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
 | Float64 58 cases (t16b = int5 + task 16) | 54 audited solves, 0 Solved-but-fail; wins 19 (1 thr), 12 (16 thr) | MOSEK |
 
 These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5334dd` + FMA, plus task 16).
@@ -147,7 +147,7 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 
 | Task | Branch | Scope | Gate |
 |---|---|---|---|
-| 17 | `perf-l35b` | Λ35 at 1024 bits against SDPB: baseline; two RHS via fixed τ with a general entry rule (τ and κ falling together); infeasible-start PMP mode (fixed τ, separate α_P/α_D, data-chosen start scale); safe refinement skip at the representation floor; no MPFR shifts with escalation on failure | Λ35 Solved + audit; Ising ABBA, csdr3, gravity256, 2×2 PMP no worse; infeasibility tests green |
+| 17 | `perf-l35b` | Merged `368ffe7` (no MPFR shifts, GMP basecase, opt-in host GMP). Now: a start rule for SDPB 3.1 resampled inputs (Λ27-rs is a τ chase at the default start: 345 it vs 145 at τ₀ 1e-30), then Λ35-rs at 1024 | ising11, gravity256 and the old inputs no worse; resampled Λ19/Λ27/Λ35 default start reaches the τ₀ 1e-30 result |
 | 19 | `perf-scale2` | Blocked Givens replay in the MPFR SVD through the exact residue GEMM (replay is 54% of SVD CPU at Λ35/1024; est. −4.4% Λ35, −3.5% Λ27). `perf-scale` (scheduling) not kept: ±0.5% | Ising ABBA with audits; Λ35 pace; Float64 scoreboard statuses/iterations/audits unchanged |
 | 20 | `perf-t20` | Done, merged `23e0a99`: owner-MPI agreements (−1.4…8%, bitwise identical); `pmp2sdp --resample` (SDPB 3.1 points: Λ19 −38%, Λ27 −41% at τ₀ 1e-30, 0 refinement corrections). Pending: matched SDPB on resampled inputs (224375–7), full Λ35 1024 (224373/4); start rule on 3.1 inputs (Λ27 345 it at default start) | — |
 | 21 | `perf-mc` | Multi-core scaling (user, 2026-10-09): 8–128-thread scaling curves against SDPB with perf stat/record, lock, allocation and NUMA data; then evidence-chosen fixes: persistent block ownership (SDPB-style affinity), per-socket layout for 128 cores, no per-call pools, lock-free receipts, hot-loop allocations, phase overlap | Ising ABBA at 64 and 128 threads with audits; Λ35 pace; Float64 scoreboard unchanged |

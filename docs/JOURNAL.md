@@ -8,6 +8,38 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — task 17 (perf-l35b) kept: no MPFR shifts, GMP basecase, opt-in host GMP
+
+- Hypothesis (from the SDPB design notes): Λ35's 768-bit floor and part of its 1024-bit cost come from the MPFR static shift and the dynamic pivot replacement. SDPB 2+ uses neither.
+- Merged `97ae0f5` in `368ffe7`:
+  - D `ee4af07` + `adf1120`: MPFR static shift 0 and no pivot replacement. A failed factor escalates, first to exactly the former eps^(15/16), then ×100 per level. Binary64 is unchanged.
+  - E `4e1044a`: fixed-size products below 19 limbs use GMP's basecase on x86_64. The fat GMP uses Zen 1 thresholds (Toom-22 at 16 limbs) on Zen 2.
+  - `146affb` / `27249d5`: opt-in `system-gmp` feature. `t6bld.pbs GMPHOST=1` links a host-tuned non-fat GMP 6.3.0 / MPFR 4.2.2; GMP checks pass and MPFR has 0 FAIL in 198.
+  - Default-off test switches and diagnostics: `2a91bb2`, `17238b2`, `37bf57d`.
+  - The composite split step fold `8d9daed` was reverted (`3680624`; serial and pooled step lengths disagreed). The start rule F `8a6f65b` was reverted (`97ae0f5`; gravity256 19 → 22 it).
+- Results (64 threads):
+
+  | Case | Before | After | Audit |
+  |---|---|---|---|
+  | Λ35 768 bits | InsufficientProgress / 887 | Solved 691 it / 1886.3 s (SDPB 746 / 2009 s) | accepted (gap 7.5e-43) |
+  | Λ35 1024 bits | 682 it / 2738.8 s (t15b) | 683 it / 2426.5 s, 3.55 s/it (SDPB 745 / 2762 s) | accepted (gap 5.7e-43, primal 5.4e-231) |
+  | ising11 / Λ19 / s50 / Λ27 (no-shift ABBA 224308) | — | identical status/iterations/objectives, 1–3% faster | B1 legs accepted (224383) |
+  | Normalized 2×2 PMP MPFR512 | InsufficientProgress / 10 | Solved / 24 | accepted |
+  | csdr3, gravity256 | Solved 36 / 19 | same | pass |
+
+  - E alone on Λ35 1024 (60 it, same node): 253.2 → 245.9 s (−2.9%), bitwise identical.
+  - GMPHOST: 244.6 → 236.1 s (−3.5%), bitwise identical.
+  - Inner refinement steps on Λ35 1024: 1319 → 124.
+  - Cluster lib tests 469/469 (t17i). The 1024-bit audits use `audit/audit_point_t17.jl`, a copy that accepts 1024; the shared script is unchanged.
+- Closed:
+  - Fixed τ from iteration 1 (an SDPB-like infeasible start) stalls on the Λ35 plateau at 768 and 1024 bits (no escape by 479; MaxIterations at 1000).
+  - A "τ and κ fall together" entry rule would fire near iteration 120 and hurt.
+  - Separate α_P/α_D acts only in the last ~20 iterations (681 vs 683 it); kept as a test switch.
+  - Batching the constant and affine passes is ≤3.5% (phases already at 40–47 of 64 cores); deferred.
+  - The simple refinement skip rule: on Λ27, 3 of 214 RHS reach tolerance only through a correction the rule would skip.
+  - The column-scale start rule F: on Λ27-rs, max d = 3.8, so it never fires.
+- Open: the start rule on resampled inputs. Λ27-rs at the default start is a τ chase (gap stuck at 1e-12 from iteration 35, τ falls to 4.9e-27 by 300). Λ19-rs needs no change (89 it). Next: the τ-chase restart on resampled inputs.
+
 ## 2026-10-09 — matched SDPB on the SDPB 3.1 resampled Ising inputs
 
 - Hypothesis: the resampled inputs (`sdpx-pmp2sdp --resample`, task 20) speed SDPB as much as SDPX, so the A/B gain would not carry over to the comparison.
