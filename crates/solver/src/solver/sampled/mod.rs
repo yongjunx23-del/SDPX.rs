@@ -655,6 +655,36 @@ impl<T: FloatT> SampledOperator<T> {
     ) {
         if self.ordered_rows {
             let chunks = block_chunks(&self.blocks, pool);
+            if self.mpi_world().is_none() {
+                let mut active = self
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| b.basis_cols > 0);
+                if let Some((i, b)) = active.next().filter(|_| active.next().is_none()) {
+                    // Keep direct row writes while granting the lone block's
+                    // residue products the existing measured inner ways.
+                    let w = &mut work.blocks[i];
+                    let pool = pool.unwrap();
+                    assign_block_ways(std::slice::from_mut(w), 0, pool.current_num_threads());
+                    let (ways, start) = (w.ways[0], std::time::Instant::now());
+                    pool.install(|| {
+                        with_split_hint(ways, || {
+                            forward_disjoint(
+                                std::slice::from_ref(b),
+                                std::slice::from_mut(w),
+                                y,
+                                0,
+                                x,
+                                alpha,
+                                chunks,
+                            )
+                        })
+                    });
+                    w.cost[0] = start.elapsed().as_secs_f64() * ways as f64;
+                    return;
+                }
+            }
             if let Some(world) = self.mpi_world() {
                 // Rank-sharded forward pass. Each rank evaluates a contiguous
                 // block range on its own row segment; gathered segments
@@ -1477,13 +1507,17 @@ impl<T: FloatT> SampledWorkspace<T> {
         }
         let mut active = 0;
         let mut work = 0u128;
+        let mut splittable = false;
         for b in &operator.blocks {
             if b.basis_cols > 0 {
                 active += 1;
                 work += b.scheduled_work();
+                // Split levels, or forward row bands and adjoint columns;
+                // residue kernels use measured inner ways for these shapes.
+                splittable |= b.dim > 1 || (b.basis_rows > 1 && b.basis_cols > 1);
             }
         }
-        active > 1 && work >= 8192
+        (active > 1 || splittable) && work >= 8192
     }
     /// Keep residue encodings of every block's basis across calls; for the
     /// long-lived workspace that applies the operator every refinement pass.
