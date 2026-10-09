@@ -96,16 +96,26 @@ impl ConeThreading {
             })
             .collect();
         jobs.sort_unstable_by_key(|job| job.0);
-        let total = jobs.len();
         let jobs = std::sync::Mutex::new(jobs);
-        let done = std::sync::atomic::AtomicUsize::new(0);
         // A worker without a queued cone helps the running cones' posted
-        // inner items (SVD rotation replay rows) until every cone is scaled:
-        // the slowest cone otherwise sets the phase alone.
+        // inner items (SVD rotation replay rows), largest post first: the
+        // slowest cone otherwise sets the phase alone. A worker item that
+        // starts nested (stolen by a thread blocked in a cone's inner join)
+        // returns at once instead of starting another whole cone.
         Some(self.pool.install(|| {
             (0..workers)
                 .into_par_iter()
                 .map(|_| {
+                    if SCALING_ITEM.with(|c| c.replace(true)) {
+                        return true;
+                    }
+                    struct Leave;
+                    impl Drop for Leave {
+                        fn drop(&mut self) {
+                            SCALING_ITEM.with(|c| c.set(false));
+                        }
+                    }
+                    let _leave = Leave;
                     let mut ok = true;
                     loop {
                         let Some((_, cone, rows)) = jobs.lock().unwrap().pop() else {
@@ -121,18 +131,11 @@ impl ConeThreading {
                         ok &= crate::algebra::with_split_hint(self.inner_ways, || {
                             cone.update_scaling(&s[rows.clone()], &z[rows], mu, strategy)
                         });
-                        done.fetch_add(1, std::sync::atomic::Ordering::Release);
                     }
-                    let _helper = sdpx_arithmetic::inner_parallel::board::Helper::enter();
-                    while done.load(std::sync::atomic::Ordering::Acquire) < total {
-                        // Posted rows first, then any stealable Rayon job
-                        // (paired joins, split kernels) of the running cones.
-                        if !sdpx_arithmetic::inner_parallel::board::help()
-                            && rayon::yield_now() != Some(rayon::Yield::Executed)
-                        {
-                            std::hint::spin_loop();
-                        }
-                    }
+                    // Out of cones: help the running cones' posted items, then
+                    // return. Never wait for unposted work: this thread may
+                    // hold a suspended cone below (a stolen item).
+                    while sdpx_arithmetic::inner_parallel::board::help() {}
                     ok
                 })
                 .reduce(|| true, |a, b| a && b)
@@ -343,6 +346,11 @@ fn useful_width<T: FloatT>(cones: &[SupportedCone<T>]) -> usize {
 fn psd_unit<T: FloatT>() -> u128 {
     let words = T::precision_bits().div_ceil(64) as u128;
     64u128.pow(3) * words * words
+}
+
+std::thread_local! {
+    /// Set while this thread runs a top-level scaling worker item.
+    static SCALING_ITEM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Width per useful unit.
