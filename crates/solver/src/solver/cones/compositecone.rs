@@ -171,12 +171,7 @@ where
         let all_symmetric = self.is_symmetric();
 
         // Force symmetric cones first.
-        let (mut α, αz, αs) = self.fold_pass(αmax, true, cached_sym, &mut evaluate);
-        if all_symmetric {
-            // Separate bounds for separate primal and dual steps; their
-            // minimum is the common step.
-            return (αz, αs);
-        }
+        let mut α = self.fold_pass(αmax, true, cached_sym, &mut evaluate);
 
         // if we have any nonsymmetric cones, then back off from full steps slightly
         // so that centrality checks and logarithms don't fail right at the boundaries
@@ -189,7 +184,7 @@ where
         if let Some(parallel) = nonsym.and_then(|args| self.nonsym_step_parallel(α, args)) {
             return (parallel, parallel);
         }
-        α = self.fold_pass(α, false, cached_sym, &mut evaluate).0;
+        α = self.fold_pass(α, false, cached_sym, &mut evaluate);
 
         (α, α)
     }
@@ -200,10 +195,8 @@ where
         symcond: bool,
         cached_sym: bool,
         evaluate: &mut impl FnMut(&mut SupportedCone<T>, std::ops::Range<usize>, T) -> (T, T),
-    ) -> (T, T, T) {
-        // `α` folds both components at the running cap (the common step);
-        // `αz`/`αs` fold each component alone at the initial cap.
-        let (cap0, mut α, mut αz, mut αs) = (α, α, α, α);
+    ) -> T {
+        let mut α = α;
         for (_index, (cone, rng)) in zip(&mut self.cones, &self.rng_cones).enumerate() {
             if cone.is_symmetric() != symcond {
                 continue;
@@ -216,17 +209,12 @@ where
                 // evaluating them at αmax folds to the same minimum.
                 let (nextαz, nextαs) = (T::min(boundz, α), T::min(bounds, α));
                 α = T::min(α, T::min(nextαz, nextαs));
-                (αz, αs) = (T::min(αz, boundz), T::min(αs, bounds));
                 continue;
             }
-            // Symmetric cones are evaluated at the initial cap so each
-            // component's bound is its own (cap-insensitive: same common α).
-            let cap = if symcond { cap0 } else { α };
-            let (nextαz, nextαs) = evaluate(cone, rng.clone(), cap);
+            let (nextαz, nextαs) = evaluate(cone, rng.clone(), α);
             α = T::min(α, T::min(nextαz, nextαs));
-            (αz, αs) = (T::min(αz, nextαz), T::min(αs, nextαs));
         }
-        (α, αz, αs)
+        α
     }
 
     /// Nonsymmetric cones backtrack along the common chain α0·stepᵏ. The

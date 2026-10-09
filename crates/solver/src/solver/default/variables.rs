@@ -407,7 +407,11 @@ where
         if !self.fixed_tau || data.P.nnz() != 0 || !crate::solver::core::test_split_step() {
             return α;
         }
-        let (αz, αs) = cones.step_length(&step.z, &step.s, &self.z, &self.s, settings.core(), T::one());
+        // The composite step length returns one common bound: get each part
+        // with the other part's direction zeroed (test switch only).
+        let zero = vec![T::zero(); step.s.len()];
+        let αz = T::min(cones.step_length(&step.z, &zero, &self.z, &self.s, settings.core(), T::one()).0, T::one());
+        let αs = T::min(cones.step_length(&zero, &step.s, &self.z, &self.s, settings.core(), T::one()).1, T::one());
         let f = settings.core().max_step_fraction;
         let (αp, αd) = (αs * f, αz * f);
         let a = T::min(αp, αd);
