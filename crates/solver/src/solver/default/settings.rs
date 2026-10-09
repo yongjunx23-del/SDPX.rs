@@ -46,12 +46,15 @@ pub struct DefaultSettings<T: FloatT> {
     pub initial_tau: T,
 
     ///restart once when a first attempt from τ₀ ≥ 1e-10 chases τ: since
-    ///the relative gap last improved tenfold, μ fell by 1e10 and τ below
+    ///the relative gap last improved tenfold, μ fell by 1e4 and τ below
     ///1e-4·τ₀. The restart uses τ₀ = min(τ, eps^(1/8)) (Λ27: 451
-    ///iterations from 1, 181 from 1e-30). Off by default: Λ19 shows the
-    ///same signature at iteration 71 yet solves in 177 iterations from 1,
-    ///and the restart costs it 45 more (2026-10-08 journal).
-    #[builder(default = "false")]
+    ///iterations from 1, 181 from 1e-30). On by default for wide types: it
+    ///only acts on a unit start, i.e. an accepted KKT start (SDPB 3.1
+    ///resampled Ising inputs: Λ27-rs 345 → 230 iterations with the former
+    ///1e10 trigger; ising11, Λ19-rs and gravity256 unchanged). Binary64
+    ///keeps it off. Before the data-scaled τ₀ rule, Λ19 showed the signature
+    ///at iteration 71 and lost 45 iterations to the restart (2026-10-08).
+    #[builder(default = "!is_primitive::<T>()")]
     pub auto_start_scale: bool,
 
     ///enter a fixed-τ end phase once the embedding has settled on τ > 0

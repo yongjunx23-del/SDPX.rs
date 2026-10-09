@@ -1252,9 +1252,12 @@ impl<T: FloatT> FixedTauSwitch<T> {
 }
 
 /// Detects a τ chase on a unit-scale first attempt: since the relative gap
-/// last improved tenfold, μ fell by 1e10 while τ fell below `1e-4·τ₀`. On
-/// Λ27 the gap stalls near 1e-13 while μ keeps falling (451 iterations from
-/// τ₀ = 1, 181 from 1e-30).
+/// last improved tenfold, μ fell by 1e4 while τ fell below `1e-4·τ₀`. On
+/// Λ27 the gap stalls near 1e-12 while μ keeps falling (451 iterations from
+/// τ₀ = 1, 181 from 1e-30). A converging solve lowers μ and the gap together
+/// (Λ27-rs iterations 10–25: both about 1e5); in the chase μ falls 1e4 per
+/// 20 iterations while the gap stays within 10×. With 1e10 the Λ27-rs
+/// restart came only at iteration 88 (230 iterations in all).
 #[derive(Default)]
 struct TauChase<T> {
     anchor: Option<(T, T)>,
@@ -1275,7 +1278,7 @@ impl<T: FloatT> TauChase<T> {
             }
         }
         let (_, mu0) = self.anchor.unwrap();
-        mu <= mu0 * (1e-10).as_T() && tau < tau0 * (1e-4).as_T()
+        mu <= mu0 * (1e-4).as_T() && tau < tau0 * (1e-4).as_T()
     }
 
     /// Restart scale: the current τ, at most `eps^(1/8)` (about 1e-29 at
@@ -1297,7 +1300,7 @@ mod tau_chase_tests {
             let v = 10f64.powi(-k / 2);
             assert!(!c.observe(v, v, v, 1.0));
         }
-        // Stall: gap flat at 1e-13 while μ falls; fires once μ drops 1e10.
+        // Stall: gap flat at 1e-13 while μ falls; fires once μ drops 1e4.
         let mut c = TauChase::<f64>::default();
         let mut fired = None;
         for k in 0..40 {
@@ -1307,7 +1310,7 @@ mod tau_chase_tests {
                 break;
             }
         }
-        assert_eq!(fired, Some(10));
+        assert_eq!(fired, Some(4));
         // A small user start disables the rule.
         let mut c = TauChase::<f64>::default();
         assert!((0..40).all(|k| !c.observe(1e-13, 10f64.powi(-k), 1e-40, 1e-30)));
