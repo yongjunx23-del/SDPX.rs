@@ -11,7 +11,8 @@ $$
 
 Supported cones are zero, nonnegative, second-order, exponential, power,
 generalized power and PSD triangle. Sampled bootstrap SDPs retain their PSD
-coefficients as bases and sample weights.
+coefficients as bases and sample weights through presolve; these factors
+remain the operator used by the solver.
 
 Use the native Rust API, the `sdpx` CLI or the C ABI in
 [`include/sdpx.h`](include/sdpx.h). The separate `sdpx-pmp2sdp` converter

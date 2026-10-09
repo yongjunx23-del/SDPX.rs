@@ -43,7 +43,7 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 - Ising ABBA `t14abba.pbs` / `t15abba.pbs`, with audit `audit_point.jl` (`t4dgate.pbs`'s Λ27 audit call is broken; use `t14aud.pbs`).
 - Small-case timing across nodes is bimodal: the conservative governor, a cold process, and MOSEK's warm minimum-of-3. Decide small Float64 timing with same-node interleaved A/B (`t13/abfam.py`).
 
-## Current state (2026-10-09, `perf-cc1007`)
+## Current state (2026-10-09)
 
 ### Scoreboard against the goals
 
@@ -80,7 +80,7 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
   - PMP basis release;
   - ordinary residue GEMM ≥1024 bits at side ≥12.
 - **Performance plan 2026-10-08 (q1/q2):**
-  - MPFR static shift and pivot threshold eps^(15/16) with replacement eps^(3/4). Λ27 451 → 376 it; Λ35 gets past μ 3e-24.
+  - Historical MPFR shift/pivot rule: Λ27 451 → 376 it. Superseded by task 17 below: no shift/replacement until a failed factor triggers escalation.
   - Assembly budget max(256 MiB, RAM/8).
   - faer tile products, parallel border SYRK, tiled border factor.
   - Dynamic pivot rule inside the dense Cholesky.
@@ -123,47 +123,45 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 
 ## Known failures (keep visible)
 
-- **Λ35 spins 0–70 at 768 bits / 1e-42:**
-  - The primal diverges and the dual has no Slater point, with no exact face (facial reduction gives ω* = 0 but no rank gap).
-  - Both solvers escape a gap plateau near iteration 650. SDPX then stalls near 1e-26 objective accuracy; SDPB finishes.
-  - SDPX at 1024 bits is Solved in 743 it.
+- **Λ35 conditioning:** the dual has no Slater point and both solvers retain a long gap plateau. Task 17 resolved the former 768-bit floor: Solved and audited at 768/1024 bits (scoreboard above). Shortening the plateau remains performance work.
 - **Mixed Lambda27 MPFR1024 (frozen 0.9.1):** `Solved`/42 but fails the 1e-30 original-coordinate audit: dual 1.475e-23, primal 3.73e-28, PSD link 2.73e-26, componentwise dual 0.84355.
   - Primal variables reach 5.8e118.
   - The explicit-gate pilot is prepared but not run (decision below).
   - Not the same input as the 768-bit Λ27 above, which passes its audit.
 - **Large SU(2) Float64 (n 7054):** every PSD block has a kernel shared by all A_j and b (30/30/30/30/60/12/14 of 95/92/94/92/186/74/71).
   - SDPX is AlmostSolved, and MOSEK's "optimal" points fail the 1e-6 audit (r_d about 1e-4).
-  - Medium SU(2) has the same structure (AlmostSolved/26).
+  - Medium SU(2) is now Solved and audited after task 16; the large case still fails.
   - Remedy: facial reduction (`perf-facial`, opt-in, unverified).
-- **Float64 AlmostSolved SDPLIB/SOCP cases:** hinf3, qap6, gpp*, sched_100_50_orig, csdr3 (task 16).
+- **Float64 unresolved cases:** hinf3, sched_100_50_orig, csdr3 and f64_large. Task 16 resolved qap6, gpp100, gpp124-1, gpp250-1 and gpp500-1.
 - **Gravity Float64 default:** `Solved`/17 with r_d 4.01e-6 > 2e-6 before task 9. Not re-run since `tol_original`.
 - **MPFR `condensed_graded`:** kept as designed.
   - Applying H through R fixes the synthetic test but costs +5.5% on Ising.
   - The synthetic failure remains.
-- **Normalized 2×2 PMP:** `AlmostSolved`/24 at MPFR512/1e-42. A tiny dual pivot is replaced by dynamic regularization, and refinement then diverges. Dynamic regularization off, or 768 bits, solves it.
 - **Cluster test:** `sampled_integration::dim2_signed_parities_ruiz_f64` is AlmostSolved on Linux since ae2a827 and passes on macOS.
 
 ## Active work
 
 | Task | Branch | Scope | Gate |
 |---|---|---|---|
-| 17 | `perf-l35b` | Merged `368ffe7` (no MPFR shifts, GMP basecase, opt-in host GMP). Now, shipped together: (F) a start rule for SDPB 3.1 resampled inputs (Λ27-rs is a τ chase at the default start: 345 it vs 145 at τ₀ 1e-30); (G) `sdpx-pmp2sdp` resamples verified PyCFTBoot/SDPB.m blocks by default (`--keep-samples` opts out), with threads defaulting to the cores within a memory cap; then Λ35-rs at 1024 | Default solve on resampled inputs no worse than today on old inputs (Λ19 ≤121, Λ27 ≤183, Λ35 ≤683 it, audited); ising11, gravity256 and the old inputs no worse |
-| 20 | `perf-t20` | Done, merged `23e0a99`: owner-MPI agreements (−1.4…8%, bitwise identical); `pmp2sdp --resample` (SDPB 3.1 points: Λ19 −38%, Λ27 −41% at τ₀ 1e-30, 0 refinement corrections). Pending: matched SDPB on resampled inputs (224375–7), full Λ35 1024 (224373/4); start rule on 3.1 inputs (Λ27 345 it at default start) | — |
+| 17 | `perf-l35b` | Merged `368ffe7` (no MPFR shifts, GMP basecase, opt-in host GMP). Remaining, not merged: (F) a start rule for SDPB 3.1 resampled inputs (Λ27-rs is a τ chase at the default start: 345 it vs 145 at τ₀ 1e-30); (G) `sdpx-pmp2sdp` resamples verified PyCFTBoot/SDPB.m blocks by default (`--keep-samples` opts out), with threads defaulting to the cores within a memory cap; then Λ35-rs at 1024 | Default solve on resampled inputs no worse than today on old inputs (Λ19 ≤121, Λ27 ≤183, Λ35 ≤683 it, audited); ising11, gravity256 and the old inputs no worse |
+| 20 | `perf-t20` | Done, merged `23e0a99`: owner-MPI agreements (−1.4…8%, bitwise identical); `pmp2sdp --resample` (SDPB 3.1 points: Λ19 −38%, Λ27 −41% at τ₀ 1e-30, 0 refinement corrections). Matched SDPB and full resampled Λ35 comparisons are complete (journal). Remaining: start rule on 3.1 inputs (Λ27 345 it at default start), then Λ35-rs with task 17's factor changes | — |
 | 21 | `perf-mc` | Multi-core scaling (user, 2026-10-09): 8–128-thread curves against SDPB on Λ27, Λ35 and mixed Λ27/1024 (`sdpx-mpi-20261004/inputs/mixed-L27-sdp-1024`, n 18703, the SDPB-benchmark-scale case; SDPB 2 paper: Λ43 mixed 2861 s → 59 s per iteration from 4 to 448 cores), with perf stat/record, lock, allocation and NUMA data. Then evidence-chosen fixes: persistent block ownership (SDPB-style affinity), per-socket layout for 128 cores, phase overlap, distributed border/Schur for mixed problems | Ising ABBA at 64 and 128 threads with audits; Λ35 pace; mixed Λ27 2nd-iteration time vs SDPB; Float64 scoreboard unchanged |
 | 22 | `perf-f64mc` | Binary64 and non-PSD cone multi-thread scaling on large cases (user, 2026-10-09: small cases are too small for threads): gravity-large (n 20202, m 20299), SU(2) medium/large, gpp500, arch0, large LPs, against MOSEK at 1–32 threads; small cases only need a measured-work guard so 16 threads never loses to 1. Also owns lock-free receipts and the process-wide pool cache (the per-call pool sites are test-only). Phase 1: serial phases run about 2× slower at t>1 under the conservative governor because the unpinned main thread hops cores | 58-case scoreboard at 1 and 16 threads unchanged; same-node A/B; large cases audited; ising11 bitwise |
 | 16 | `perf-endgame` | Done, merged `81b1549`: binary64 condensed Δs from the primal row, GMRES-IR on residual growth; 6 more Float64 cases Solved | — |
 
-Task 17 interim: with MPFR shifts off (item D, `ee4af07`, unmerged until the ABBA gate 224308), Λ35 at 768 bits is Solved in 691 it / 1886 s and audited (SDPB 768: 746 / 2009 s). The normalized 2×2 PMP is now Solved/24.
+Task 17 items D/E passed their gates and are merged. The normalized 2×2 PMP is Solved/24. Resampling remains opt-in, and converter threads default to one; the proposed new defaults require the remaining start-rule gate.
+
+Review repairs (2026-10-09): preserve sampled factors through singleton presolve, defer unused audit copies, bound split residue caches, reject overflow before result publication, use the existing pool for faer, and isolate complete receipts. Local audited checks preserve baseline points for medium/faer, ising11 and csdr3 at one/four threads. Linux affinity, owner assembly and MPI checks are recorded in the journal.
 
 ## Next work, in order
 
-1. **Λ35 end game, SDPB-style (see the SDPB reference below).**
-   - Measure SDPX at 768 bits with the static shift and dynamic replacement off in the MPFR arrow (SDPB 2+ uses neither; a failed factor still escalates).
-   - Then a fixed-τ phase entered at the plateau escape.
-   - Gate: Λ35 Solved and audited. ising11, s50, Λ19, Λ27, csdr3, gravity256 and the normalized 2×2 PMP no worse.
-2. **Refinement corrections (task 15 data).**
-   - Second corrections are futile in 118/124 cases; capping at one saves about 5.5% on Λ27 but leaves 6 solves up to 3.8× the tolerance. That changes the refinement rule and is not allowed as is.
-   - A safe skip needs a per-row representation floor ≈ eps·(|H||z|)ᵢ (binary64 absolute congruence with exponent scaling).
+1. **Resampled Ising inputs (task 17).**
+   - Fix the default-start τ chase without regressing old inputs or gravity256.
+   - Then compare Λ35-rs at 1024 bits with the retained no-shift/GMP changes.
+   - Gate: audited time at matched precision/settings against SDPB; the task 17 iteration limits above remain.
+2. **Refinement corrections.**
+   - Reprofile after no-shift factors and resampling: older task 15 inputs spent 50% in refined solves, but resampled runs can need no corrections.
+   - Capping corrections or weakening acceptance remains prohibited. Investigate a representation floor only if the updated profile still identifies futile corrections.
 3. **Float64 per-solve overhead (task 13 leads):**
    - Brandy's rational presolve pass costs 35–85 ms, because a budget counted in updates misses the GMP gcd cost.
    - Concurrent small OpenBLAS calls in cone lanes.
@@ -179,7 +177,7 @@ Task 17 interim: with MPFR shifts off (item D, `ee4af07`, unmerged until the ABB
    - Per-component pipelines for leaf sweeps and the border factor (order-changing; audit gate).
 6. **Multi-node:**
    - (Border distribution closed: the border is 170 rows on Λ35, 2.1% at 4 nodes.)
-   - Batch the refinement agreement flags (2120 of 6113 collectives).
+   - Task 20 already batched refinement agreements; measure remaining collectives before changing them.
    - The single-process multi-owner path (74.8 vs 44.2 s).
    - Rank-local residue batch eligibility after partitioning (unmeasured).
    - `perf-border` `a80cfa1` is parked with its gate not run.
@@ -208,12 +206,12 @@ What SDPB does, and what it implies for SDPX:
 | XZ (HRVW/KSH/M) direction, symmetrized dY; Cholesky of X, Y | NT scaling with an MPFR SVD per cone | HKM measured: +12% iterations on ising11; closed |
 | Mehrotra predictor (β = 0 if feasible, else 0.3) and corrector (β = r² or r, clamped by 0.1/0.3, as SDPA); two solves per iteration, no refinement | Predictor/corrector with 3 RHS (2 in the fixed-τ phase), two refinement levels plus about one outer correction each | SDPB relies on precision instead of refinement; SDPX refinement levels stay (contract), but futile corrections are item 2 |
 | Free variables kept: T = [S −B; Bᵀ 0], blockwise Cholesky S = LLᵀ, Q = Bᵀ L⁻ᵀ L⁻¹ B, Cholesky of Q | Same arrow (leaves = S blocks, border = Q) | Already matched |
-| SDPB 1 had "Cholesky stabilization": pivots below θ·geomean get +Λ, corrected exactly through a low-rank border U (Q′ by LU). **SDPB 2 removed it**: no regularization at all, raise precision instead | Static shift eps^(15/16) and dynamic replacement eps^(3/4) in MPFR | Item 1: SDPB's evidence says MPFR needs no shift; if a pivot really fails, the exact low-rank border is the SDPB-1 fallback that keeps the system exact |
+| SDPB 1 had "Cholesky stabilization": pivots below θ·geomean get +Λ, corrected exactly through a low-rank border U (Q′ by LU). **SDPB 2 removed it**: no regularization at all, raise precision instead | MPFR starts without shifts or pivot replacement; a failed factor escalates (task 17) | Retained and audited; further changes require new evidence |
 | Termination: absolute max-norm primalError = max(\|p_i\|, \|P_ij\|), dualError = max\|d_i\|, and dualityGap = \|P−D\|/max(1, \|P+D\|) | Relative normalized residuals, plus the original-coordinate audit | "Matched thresholds" means the same numbers under different norms; the audit decides acceptance |
 | Block timings from iteration 2, written to a file; worst-fit-decreasing assignment of blocks to cores | Owner cost histories (opt-in) | Same idea; adopt for multi-node only with a real scaling gain |
-| SDPB 2: Elemental-distributed Q, a hand-written ring reduce-scatter (memory), Cholesky of Q distributed | Ordinary MPI replicates the border; owner path partitions leaves | Item 6: a distributed border factor |
+| SDPB 2: Elemental-distributed Q, a hand-written ring reduce-scatter (memory), Cholesky of Q distributed | Ordinary MPI replicates the border; owner path partitions leaves | Border distribution closed for Λ35 (2.1% at four nodes); reconsider only on a larger measured border |
 | SDPB 3.0: Q by CRT residues into double BLAS (FLINT), in node-shared MPI windows split by `--maxSharedMemory`; about 2.5× faster than 2.7 | Exact residue GEMMs on faer per process | SDPX already has the residue products; node-shared panels matter only for multi-rank memory |
-| SDPB 3.1: sample points that minimise interpolation error (lower condition numbers) | PMP2SDP sampling | Worth testing on Λ35's conditioning (PMP side, no solver contract) |
+| SDPB 3.1: sample points that minimise interpolation error (lower condition numbers) | Opt-in `pmp2sdp --resample` | Matched comparisons completed; default-start work remains (task 17) |
 
 ## Measurement prerequisites
 
@@ -236,8 +234,6 @@ What SDPB does, and what it implies for SDPX:
 
 **Open:**
 - **Mixed Lambda27/1024 explicit-gate pilot.** The frozen baseline binary, 32 cores, 64 GiB, 2 h, ≤100 iterations. Prepared and awaiting approval after two exhausted retries.
-- **MPFR regularization without the static shift (item 1).** This is a regularization-contract change, delegated; record the evidence in the journal before keeping it.
-- **Normalized 2×2 PMP no-replacement refactor.** It changes the regularization contract; decide together with item 1.
 - **Independence from Clarabel.rs.** About 36% of non-test lines still match same-named Clarabel.rs files (Apache-2.0 notices kept).
   - Done (bitwise-neutral): the staged driver, banner/report, NOTICE.
   - Next neutral candidates: the `problemdata.rs` preprocessing pipeline, a uniform presolve/postsolve record, and the configuration printer.

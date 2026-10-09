@@ -23,7 +23,8 @@ job IDs, rejected trials) is in [JOURNAL.md](JOURNAL.md).
 
 PMP conversion streams blocks and writes rows directly. Each worker releases
 the parsed/generated basis after both parity arrays are written, before
-building normalized `c`/`B` coefficients.
+building normalized `c`/`B` coefficients. Resampling borrows the original
+polynomial coefficients; only the replacement sampling metadata is owned.
 
 ## Solver modules
 
@@ -60,6 +61,8 @@ the local owner from its communicator. Cost-history input fingerprints are
 computed once at the JSON boundary, only for history import or recording.
 Ordinary solves do not collect history metadata. Immutable local/global
 layouts share storage when all owners are local.
+Original-coordinate audit data is copied only when structural preprocessing
+changes the problem.
 Sparse row-plan construction reuses row offsets as insertion cursors, then
 restores their starts; no temporary cursor copy is allocated. Entry order
 and the retained row layout are unchanged.
@@ -68,6 +71,10 @@ store the internal iterate with its equilibration; hot starts map through
 original coordinates. Loading rejects nonfinite values and nonpositive
 homogenization or scaling factors before installing the iterate.
 
+Sampled setup preserves PSD singletons and their primitive columns. Presolve
+can remove other columns and rows, remapping the factor offsets and linear
+operator together. Chordal lowering is disabled for sampled inputs because
+it would replace the factors with rounded coefficients.
 Sampled problems keep the factored operator authoritative: once installed,
 the retained linear-A values are released and the reduced KKT storage owns
 the coefficients. Rounded materializations never replace the operator.
@@ -224,7 +231,9 @@ their joined products, before CRT allocates its buffers.
 Ordinary square GEMMs of side ≥12 use the residue kernel from 1024 bits;
 SYRK, upper products and cached congruences keep their existing eligibility.
 Each ordinary GEMM still rounds separately, including congruence fallback
-intermediates.
+intermediates. Block products reject nonfinite scalar-rounded intermediates
+before writing results. Split constant-operand caches encode directly into
+their final ranges; the worker count is capped by the total residue allowance.
 MPFR transposed SYRK uses contiguous exact slice dots when residues are
 unprofitable. Upper GEMM requests stream packed
 triangle residues through CRT. Contiguous results use implicit indices;
@@ -244,10 +253,17 @@ rotation order. Float32 is configured only for dense kernel tests.
 
 ## Parallelism and memory
 
-One worker pool per solve (`max_threads`) runs cone blocks, factorization
+One worker pool per solver (`max_threads`) runs cone blocks, factorization
 and long vector work; dominant blocks split their tiles over the same pool.
 Equality-only problems also share this pool with KKT kernels when they meet
 the existing work cutoff. Backends receive it before initial thread reporting.
+Faer factors and solves run inside that pool at its actual width, with scratch
+resized when the width changes; no global Rayon pool participates. Numeric
+refactors reuse the validated immutable CSC structure.
+Linux worker binding preserves the caller's CPU mask. When the allocation
+matches the requested budget, the calling thread stays on its first CPU
+during a solve and regains its original mask on return. User termination
+callbacks temporarily receive the full mask so new pools inherit the allocation.
 Splits preserve each output's operation order, so results are independent of
 the thread count. Scratch is per thread (`algebra/scratch.rs`) and reused
 across iterations; dense kernels reuse dead input/output storage instead of
@@ -260,6 +276,18 @@ bounds also lend a dead matrix to the eigensolver, retaining only its integer
 workspace separately. BLAS providers must support concurrent calls from
 workers (source-built OpenBLAS needs
 `USE_LOCKING=1`).
+
+Serial and owner setup use the same Schur assembly allowance:
+max(256 MiB, effective memory / 8), or the existing two-copy storage rule.
+Linux effective memory includes exposed finite cgroup limits; a PBS request
+is not inferred when the host exposes no limit. This is a per-process
+allowance; multiple ranks in one allocation can still multiply it.
+
+With receipts enabled, setup and solves serialize access to phase counters.
+A completed solve captures all timing fields in a caller-local snapshot before
+releasing the recorder. Nested callback solves restore the outer observations;
+receipt writing reads only the completed snapshot. Ordinary runs skip this
+recording scope.
 
 MPI is loaded at runtime. The ordinary MPI path replicates input data and
 shards the expensive work by blocks. Allgathered scalars decode directly into
