@@ -8,6 +8,35 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — task 20 (perf-t20): owner-MPI agreements kept; SDPB 3.1 sample points
+
+- Commit `3c7c989`: one refinement agreement per residual in owner MPI (finiteness, action and the next convergence test agreed together; three redundant agreements dropped), and upper-row border assembly. Points bitwise identical at all 6 layouts. 1024 bits, 60 iterations, A = bdbfacc, B = 3c7c989:
+
+  | Case | Layout | A (s) | B (s) | Change | SDPB 64 ranks/node (s) |
+  |---|---|---|---|---|---|
+  | Λ27 1 node | 13×4 | 117.2 / 116.6 | 113.5 / 113.4 | −3.0% | 119 |
+  | Λ27 2 nodes | 26×4 | 95.6 / 94.8 | 93.0 / 92.9 | −2.4% | 87 |
+  | Λ27 4 nodes | 13×16 | 72.7 / 71.7 | 71.4 / 70.8 | −1.4% | 107 |
+  | Λ35 1 node | 12×5 | 291.7 / 291.2 | 267.7 / 268.0 | −8.1% | 228 |
+  | Λ35 2 nodes | 18×7 | 177.0 / 177.1 | 168.7 / 168.0 | −4.9% | 148 |
+  | Λ35 4 nodes | 12×16 | 137.8 / 138.8 | 132.8 / 133.8 | −3.6% | 126 |
+
+  Plain 64-thread one-node runs: Λ27 121.0 s, Λ35 250.3 s. Collective rounds at 4 nodes: Λ27 7014 → 5790, Λ35 8444 → 6670.
+- Closed: distributing the border factor. The plan's n 4071 was Λ35's variable count; the border is 170 rows (Λ27 104) and its factor is 2.1% at 4 nodes. Also closed: SDPB-style timing-run assignment. The existing LPT on measured costs (`--cost-history`) is already balanced (max/mean 1.02–1.08) and gave no gain.
+- Commit `b12ed49`: `sdpx-pmp2sdp --resample`. It recovers each block's prefactor (2048 bits, refused unless every given scaling is reproduced to 1e-60) and applies the SDPB 3.1 sample points that `crates/pmp` already implements. On ising11 they match SDPB's `sample_points.cxx` to 4e-152.
+- Sample-point A/B (64 threads, one node; A = current PyCFTBoot points, B = 3.1 points; audits at 1e-30):
+
+  | Case | A it / s | B it / s | Audit |
+  |---|---|---|---|
+  | Λ19 768 | 121 / 70.3 | 89 / 43.6 (−38%) | both accepted |
+  | Λ27 768, default start | 183 / 246.4 | 345 / 354.2 | all accepted |
+  | Λ27 768, τ₀ 1e-30 | 163 / 219.9 | 145 / 144.4 (−41% against default A) | all accepted |
+  | Λ35 1024, 60 it | 250.5 | 191.1 (3.18 s/it, −24%) | not a solution yet |
+
+  Observed: refinement corrections per iteration fall to 0 (Λ27 3.19 → 0, Λ35 4.15 → 0), and linear solves per iteration fall from 8.3 to 3.05. On 3.1 inputs the KKT initial point is accepted, which bypasses task 14's data-scaled τ₀; that is why Λ27 needs 345 iterations at the default start.
+- Matched-input comparison pending: SDPB on the resampled inputs (`t20/sbrs.pbs`, jobs 224375–224377), and full SDPX Λ35 1024 solves on them (224373 default start, 224374 τ₀ 1e-30).
+- Decision: merge both commits (`23e0a99`). Converting the Ising inputs with `--resample` becomes the default once the matched SDPB runs are in. Follow-up: the start rule on 3.1 inputs.
+
 ## 2026-10-09 — task 18: Hypatia WSOS dual-barrier cone for Ising, no-go
 
 - Hypothesis: Hypatia's WSOSInterpNonnegative cone (Λ(z) = Pᵀdiag(z)P, which equals SDPX's X block) removes the NT SVD and the PSD-space prepare/recover, and is faster on large Ising.

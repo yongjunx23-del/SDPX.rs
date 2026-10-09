@@ -149,7 +149,7 @@ These Ising figures include task 15. The Float64 figures are from int5 (`a5334dd
 |---|---|---|---|
 | 17 | `perf-l35b` | Λ35 at 1024 bits against SDPB: baseline; two RHS via fixed τ with a general entry rule (τ and κ falling together); infeasible-start PMP mode (fixed τ, separate α_P/α_D, data-chosen start scale); safe refinement skip at the representation floor; no MPFR shifts with escalation on failure | Λ35 Solved + audit; Ising ABBA, csdr3, gravity256, 2×2 PMP no worse; infeasibility tests green |
 | 19 | `perf-scale` | Cone scaling and in-node parallelism: LPT and in-cone split of update_scaling; warm-started NT versus HKM/XZ A/B on Λ27/Λ35; blocks assigned by measured cost; idle threads | Ising ABBA with audits; Λ35 pace; Float64 scoreboard statuses/iterations/audits unchanged |
-| 20 | `perf-t20` | Multi-node: distributed border factor, cost-balanced ranks, batched agreement flags (reuse `perf-border` `a80cfa1`); SDPB 3.1 sample points | 1/2/4-node Λ27/Λ35 pace vs SDPB; Ising A/B with audits |
+| 20 | `perf-t20` | Done, merged `23e0a99`: owner-MPI agreements (−1.4…8%, bitwise identical); `pmp2sdp --resample` (SDPB 3.1 points: Λ19 −38%, Λ27 −41% at τ₀ 1e-30, 0 refinement corrections). Pending: matched SDPB on resampled inputs (224375–7), full Λ35 1024 (224373/4); start rule on 3.1 inputs (Λ27 345 it at default start) | — |
 | 16 | `perf-endgame` | Float64 end game: AlmostSolved → audited Solved, no test loosened | 58-case scoreboard; Λ19 ABBA if MPFR-reachable |
 
 Task 17 interim: with MPFR shifts off (item D, `ee4af07`, unmerged until the ABBA gate 224308), Λ35 at 768 bits is Solved in 691 it / 1886 s and audited (SDPB 768: 746 / 2009 s). The normalized 2×2 PMP is now Solved/24.
@@ -177,7 +177,7 @@ Task 17 interim: with MPFR shifts off (item D, `ee4af07`, unmerged until the ABB
    - Rayon idle stealing is about 8% of cycles.
    - Per-component pipelines for leaf sweeps and the border factor (order-changing; audit gate).
 6. **Multi-node:**
-   - Distribute the arrow border factor (Λ35 border n 4071, replicated on every rank).
+   - (Border distribution closed: the border is 170 rows on Λ35, 2.1% at 4 nodes.)
    - Batch the refinement agreement flags (2120 of 6113 collectives).
    - The single-process multi-owner path (74.8 vs 44.2 s).
    - Rank-local residue batch eligibility after partitioning (unmeasured).
