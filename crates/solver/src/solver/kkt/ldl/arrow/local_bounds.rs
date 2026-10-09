@@ -288,81 +288,6 @@ fn bound_gram(y: &[f64], z: &[f64], n: usize, t: usize, out: &mut [f64], paralle
         let first = j * tile;
         let columns = dst.len() / t;
         let end = first + columns;
-        let diagonal = |col: usize, dst: &mut [f64]| {
-            let start = first + col;
-            // Z contains individually rounded Y*d products. A symmetric
-            // rank-k update would change that operator, so keep YᵀZ dots.
-            unsafe {
-                blas::dgemm(
-                    b'T',
-                    b'N',
-                    (end - start) as i32,
-                    1,
-                    n as i32,
-                    1.0,
-                    &y[start * n..],
-                    n as i32,
-                    &z[start * n..],
-                    n as i32,
-                    0.0,
-                    &mut dst[start..],
-                    t as i32,
-                );
-            }
-        };
-        // Long inner products amortize square output tasks. Fixed column
-        // panels otherwise leave the first task carrying the whole tall
-        // rectangle (1496 of 5151 dots for a 101-column border).
-        if parallel && n * tile * tile >= 262144 && end < t {
-            let mut tails: Vec<_> = dst
-                .chunks_mut(t)
-                .enumerate()
-                .map(|(col, column)| {
-                    let (head, tail) = column.split_at_mut(end);
-                    diagonal(col, head);
-                    tail
-                })
-                .collect();
-            rayon::scope(|scope| {
-                for row in (end..t).step_by(tile) {
-                    let height = tile.min(t - row);
-                    let outputs: Vec<_> = tails
-                        .iter_mut()
-                        .map(|tail| {
-                            let (output, rest) = std::mem::take(tail).split_at_mut(height);
-                            *tail = rest;
-                            output
-                        })
-                        .collect();
-                    scope.spawn(move |_| {
-                        let mut product = [0.0; BOUND_BLAS_COLS * BOUND_BLAS_COLS];
-                        // Outputs own disjoint row slices of every column.
-                        // The compact tile avoids a strided mutable alias.
-                        unsafe {
-                            blas::dgemm(
-                                b'T',
-                                b'N',
-                                height as i32,
-                                columns as i32,
-                                n as i32,
-                                1.0,
-                                &y[row * n..],
-                                n as i32,
-                                &z[first * n..],
-                                n as i32,
-                                0.0,
-                                &mut product,
-                                height as i32,
-                            );
-                        }
-                        for (output, column) in outputs.into_iter().zip(product.chunks(height)) {
-                            output.copy_from_slice(column);
-                        }
-                    });
-                }
-            });
-            return;
-        }
         // SAFETY: each task owns complete output columns. The off-diagonal
         // rectangle starts below its diagonal tile, with leading dimension t.
         unsafe {
@@ -383,9 +308,26 @@ fn bound_gram(y: &[f64], z: &[f64], n: usize, t: usize, out: &mut [f64], paralle
                     t as i32,
                 );
             }
-        }
-        for (col, column) in dst.chunks_mut(t).enumerate() {
-            diagonal(col, column);
+            // Z contains individually rounded Y*d products. A symmetric
+            // rank-k update would change that operator, so keep YᵀZ dots.
+            for col in 0..columns {
+                let start = first + col;
+                blas::dgemm(
+                    b'T',
+                    b'N',
+                    (end - start) as i32,
+                    1,
+                    n as i32,
+                    1.0,
+                    &y[start * n..],
+                    n as i32,
+                    &z[start * n..],
+                    n as i32,
+                    0.0,
+                    &mut dst[col * t + start..],
+                    t as i32,
+                );
+            }
         }
     };
     if parallel {
