@@ -8,6 +8,21 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — matched SDPB on the SDPB 3.1 resampled Ising inputs
+
+- Hypothesis: the resampled inputs (`sdpx-pmp2sdp --resample`, task 20) speed SDPB as much as SDPX, so the A/B gain would not carry over to the comparison.
+- SDPB (64 ranks, one node, thresholds 1e-42; `t20/sbrs.pbs`, jobs 224375–224377) against SDPX on the same inputs:
+
+  | Case | SDPB | SDPX | SDPX faster by |
+  |---|---|---|---|
+  | Λ19-rs, 768 bits | 240 it / 146 s | 89 it / 43.6 s (bdbfacc) | 3.3× |
+  | Λ27-rs, 768 bits | 259 it / 367 s | τ₀ 1e-30: 145 it / 144.4 s; default start: 345 it / 354.2 s | 2.5× (1.04× at default) |
+  | Λ35-rs, 1024 bits | 734 it / 2749 s | t20base (shifts on): τ₀ 1e-30 682 it / 2471.8 s; default 794 it / 2766.0 s | 1.11× (0.99× at default) |
+
+- Observed: SDPB gains little from resampling (Λ27 375 → 367 s, Λ35 2762 → 2749 s). SDPX gains because its refinement corrections disappear. Λ35-rs objective −26.38800964771676386790817478977229875923 matches the reference.
+- The Λ35-rs SDPX runs predate D+E (−11.4% on the old input at 1024 bits). A run with them is pending.
+- Decision: once task 17's start-rule item F makes the default start reach the τ₀ 1e-30 results without regressing gravity256, the resampled conversion becomes the Ising default. Until then the scoreboard keeps the original inputs.
+
 ## 2026-10-09 — task 16 (perf-endgame) kept; task 19 (perf-scale) not kept
 
 - Task 16, Float64 end game. Commits `04442ef` and `7802a28`, merged in `81b1549`:
