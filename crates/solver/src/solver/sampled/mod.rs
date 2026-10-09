@@ -612,7 +612,47 @@ impl<T: FloatT> SampledOperator<T> {
         assert_eq!(y.len(), self.linear.m);
         assert_eq!(x.len(), self.linear.n);
         assert_eq!(work.blocks.len(), self.blocks.len());
-        work.linear_product_in_pool(self, false, y, x, alpha, beta, pool);
+        work.linear_product_in_pool(self, false, y, x, alpha, beta, pool, "sampled.linear.fwd");
+        self.forward_blocks(y, x, alpha, work, pool, gather);
+    }
+
+    /// Whether the pooled products apply (`apply_with_pool` and
+    /// `apply_transpose_with_pool` otherwise take the serial route), so a
+    /// caller may run their linear and sampled halves separately:
+    /// [`SampledWorkspace::linear_product_in_pool`] first, then
+    /// [`Self::forward_blocks_with_pool`] / [`Self::adjoint_blocks_with_pool`].
+    pub(crate) fn pooled_halves_apply(
+        &self,
+        work: &SampledWorkspace<T>,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) -> bool {
+        self.mpi_world().is_none() && work.parallel_eligible(self, pool)
+    }
+
+    /// The sampled half of `apply_with_pool` (`alpha != 0`), after the
+    /// caller applied the linear half with the same `alpha` and `beta`.
+    pub(crate) fn forward_blocks_with_pool(
+        &self,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        work: &mut SampledWorkspace<T>,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) {
+        debug_assert!(self.pooled_halves_apply(work, pool) && alpha != T::zero());
+        self.forward_blocks(y, x, alpha, work, pool, true);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_blocks(
+        &self,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        work: &mut SampledWorkspace<T>,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+        gather: bool,
+    ) {
         if self.ordered_rows {
             let chunks = block_chunks(&self.blocks, pool);
             if let Some(world) = self.mpi_world() {
@@ -804,7 +844,32 @@ impl<T: FloatT> SampledOperator<T> {
         assert_eq!(y.len(), self.linear.n);
         assert_eq!(x.len(), self.linear.m);
         assert_eq!(work.blocks.len(), self.blocks.len());
-        work.linear_product_in_pool(self, true, y, x, alpha, beta, pool);
+        work.linear_product_in_pool(self, true, y, x, alpha, beta, pool, "sampled.linear.adj");
+        self.adjoint_blocks(y, x, alpha, work, pool);
+    }
+
+    /// The sampled half of `apply_transpose_with_pool` (`alpha != 0`), after
+    /// the caller applied the linear half with the same `alpha` and `beta`.
+    pub(crate) fn adjoint_blocks_with_pool(
+        &self,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        work: &mut SampledWorkspace<T>,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) {
+        debug_assert!(self.pooled_halves_apply(work, pool) && alpha != T::zero());
+        self.adjoint_blocks(y, x, alpha, work, pool);
+    }
+
+    fn adjoint_blocks(
+        &self,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        work: &mut SampledWorkspace<T>,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) {
         let chunks = block_chunks(&self.blocks, pool);
         let world = self.mpi_world();
         let parts = world.map(|w| self.rank_parts(work, w));
@@ -1286,6 +1351,7 @@ impl<T: FloatT> SampledWorkspace<T> {
 
     /// Configure the ordinary-product plan for the current pool width. Called
     /// on every pooled product; the lane plan is rebuilt only on width changes.
+    #[allow(clippy::too_many_arguments)]
     fn linear_product(
         &mut self,
         operator: &SampledOperator<T>,
@@ -1295,6 +1361,7 @@ impl<T: FloatT> SampledWorkspace<T> {
         alpha: T,
         beta: T,
         pool: Option<&Arc<rayon::ThreadPool>>,
+        site: &'static str,
     ) {
         if self.linear_plan_workers == 0 && crate::receipt::profile_requested() {
             let a = &operator.linear;
@@ -1311,7 +1378,9 @@ impl<T: FloatT> SampledWorkspace<T> {
             );
         }
         let timer = crate::receipt::start();
+        let site_timer = crate::receipt::start();
         self.linear_product_inner(operator, transpose, y, x, alpha, beta, pool);
+        crate::receipt::finish(site, site_timer);
         crate::receipt::finish("sampled.linear", timer);
     }
 
@@ -1378,6 +1447,7 @@ impl<T: FloatT> SampledWorkspace<T> {
 
     /// `linear_product` inside `pool` (its lanes split with `rayon::join`,
     /// which must run on the solver's workers, not the global pool).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn linear_product_in_pool(
         &mut self,
         operator: &SampledOperator<T>,
@@ -1387,12 +1457,13 @@ impl<T: FloatT> SampledWorkspace<T> {
         alpha: T,
         beta: T,
         pool: Option<&Arc<rayon::ThreadPool>>,
+        site: &'static str,
     ) {
         match pool {
             Some(pool) if pool.current_num_threads() > 1 => pool.install(|| {
-                self.linear_product(operator, transpose, y, x, alpha, beta, Some(pool))
+                self.linear_product(operator, transpose, y, x, alpha, beta, Some(pool), site)
             }),
-            _ => self.linear_product(operator, transpose, y, x, alpha, beta, None),
+            _ => self.linear_product(operator, transpose, y, x, alpha, beta, None, site),
         }
     }
 
