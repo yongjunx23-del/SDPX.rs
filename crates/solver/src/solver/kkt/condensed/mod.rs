@@ -1577,6 +1577,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     }
 
     fn assemble(&mut self) -> bool {
+        let parallel_publication = self.scaling_workers > 1 && self.n > 1;
         // Each PSD block owns its contribution buffer. After joining, each
         // destination column publishes the blocks in their original cone order.
         if self.parallel_assembly {
@@ -1590,7 +1591,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             self.pool.as_ref().unwrap().install(|| {
                 let compute = |block: &mut Block<T>| {
                     if let Scaling::Psd(psd) = &mut block.scaling {
-                        if psd.schur_columns.is_empty() {
+                        if parallel_publication && psd.schur_columns.is_empty() {
                             psd.schur_columns.extend(0..psd.columns.len() as u32);
                             let columns = &psd.columns;
                             psd.schur_columns
@@ -1674,10 +1675,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             }
         }
         if self.parallel_assembly {
-            match pool
-                .as_deref()
-                .filter(|_| self.scaling_workers > 1 && self.n > 1)
-            {
+            match pool.as_deref().filter(|_| parallel_publication) {
                 Some(pool) => {
                     // Split at whole CSC columns, balancing stored entries.
                     // Each slice has one writer; no per-pair map is duplicated.
