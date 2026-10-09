@@ -57,9 +57,6 @@ const FACTOR_PANEL: usize = 8;
 /// 170-row border slowed 64-thread iterations by 2.9% and raised RSS 1.7 GB.
 const EXACT_FACTOR_MIN: usize = 256;
 const EXACT_PANEL: usize = 48;
-/// Leaf suffixes from this width solve Y = L⁻¹B in exact blocked form
-/// ([`DenseLeaf::forward_columns_exact`]).
-const EXACT_SOLVE_MIN: usize = 96;
 /// Product entries buffered by one batch of exact leaf contributions.
 const BATCH_PRODUCT_ENTRIES: usize = 1 << 24;
 /// Residue-product ways a split exact factor offers to idle workers.
@@ -385,63 +382,6 @@ impl<T: FloatT> DenseLeaf<T> {
         self.forward_suffix(x, 0);
     }
 
-    /// [`Self::forward_suffix`] for all columns of `y` (column-major, the
-    /// suffix from `start` per column), blocked by `EXACT_PANEL` rows: each
-    /// diagonal block is swept per column, then the rows below receive
-    /// `Y2 -= L21·Y1` as one exact product, rounded once per entry before
-    /// the subtraction. Thread-invariant; not bitwise equal to the per-column
-    /// FMA sweep.
-    fn forward_columns_exact(&self, y: &mut [T], start: usize, split: bool) {
-        let (n, width) = (self.n, self.n - start);
-        let cols = y.len() / width;
-        if cols == 0 {
-            return;
-        }
-        let ways = if split { EXACT_FACTOR_WAYS } else { 1 };
-        let mut r0 = 0;
-        while r0 < width {
-            let r1 = (r0 + EXACT_PANEL).min(width);
-            let sweep = |column: &mut [T]| {
-                for i in r0..r1 {
-                    for k in r0..i {
-                        column[i] = (-self.l[start + i + (start + k) * n]).mul_add(column[k], column[i]);
-                    }
-                }
-            };
-            if split {
-                y.par_chunks_mut(width).for_each(sweep);
-            } else {
-                y.chunks_mut(width).for_each(sweep);
-            }
-            if r1 < width {
-                let (m, nb) = (width - r1, r1 - r0);
-                let a = &self.l[start + r1 + (start + r0) * n..];
-                let mut b = Vec::with_capacity(nb * cols);
-                for column in y.chunks(width) {
-                    b.extend_from_slice(&column[r0..r1]);
-                }
-                crate::algebra::with_split_hint(ways, || {
-                    T::xgemm(
-                        b'N',
-                        b'N',
-                        m as i32,
-                        cols as i32,
-                        nb as i32,
-                        -T::one(),
-                        a,
-                        n as i32,
-                        &b,
-                        nb as i32,
-                        T::one(),
-                        &mut y[r1..],
-                        width as i32,
-                    )
-                });
-            }
-            r0 = r1;
-        }
-    }
-
     /// [`Self::forward`] split over the ambient pool: once a row block is
     /// final, every later row applies that block's columns in ascending order
     /// (rows are independent), then the next block finishes serially. Each
@@ -765,23 +705,7 @@ impl<T: FloatT> Leaf<T> {
             self.y.copy_from_slice(&self.b);
         }
         let (factor, couples, packed) = (&self.factor, &self.couples, self.packed);
-        if T::precision_bits() >= 256 && width >= EXACT_SOLVE_MIN {
-            // Y = L⁻¹B for every coupled column at once: blocked forward
-            // substitution whose off-diagonal updates are exact products.
-            // Uncoupled columns are gathered out only when present.
-            if packed || self.coupled.len() * width == self.y.len() {
-                factor.forward_columns_exact(&mut self.y, start, split);
-            } else {
-                let mut buf = Vec::with_capacity(width * self.coupled.len());
-                for &j in &self.coupled {
-                    buf.extend_from_slice(&self.y[j * width..(j + 1) * width]);
-                }
-                factor.forward_columns_exact(&mut buf, start, split);
-                for (column, &j) in buf.chunks(width).zip(&self.coupled) {
-                    self.y[j * width..(j + 1) * width].copy_from_slice(column);
-                }
-            }
-        } else if split && width > 0 {
+        if split && width > 0 {
             self.y
                 .par_chunks_mut(width)
                 .enumerate()
