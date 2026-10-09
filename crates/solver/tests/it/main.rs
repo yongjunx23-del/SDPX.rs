@@ -25,6 +25,7 @@ mod mpfr_gemm_syrk;
 mod mpfr_parallel;
 mod mpfr_workspace;
 mod native_input;
+mod original_acceptance;
 mod pmp_solve;
 mod presolve;
 mod print_streams;

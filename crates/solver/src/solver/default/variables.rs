@@ -481,6 +481,17 @@ where
     pub(crate) fn dims(&self) -> (usize, usize) {
         (self.x.len(), self.s.len())
     }
+
+    /// An independent copy of the iterate.
+    pub(crate) fn copy_of(&self) -> Self {
+        Self {
+            x: self.x.clone(),
+            s: self.s.clone(),
+            z: self.z.clone(),
+            τ: self.τ,
+            κ: self.κ,
+        }
+    }
 }
 
 impl<T: FloatT> DefaultVariables<T> {

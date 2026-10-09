@@ -54,6 +54,10 @@ pub struct DefaultProblemData<T> {
     pub(crate) dropped_zeros: usize, // number of eliminated structural zeros
 
     pub(crate) chordal_info: Option<ChordalInfo<T>>,
+
+    /// Problem data before presolve and chordal decomposition, kept for the
+    /// original-coordinate acceptance test when either changed the problem.
+    pub(crate) original: Option<super::original_check::OriginalData<T>>,
 }
 
 impl<T> DefaultProblemData<T>
@@ -146,6 +150,19 @@ where
         if !P.is_triu() {
             P = Cow::Owned(P.to_triu());
         }
+        // Copy the inputs for the original-coordinate test; dropped below
+        // unless presolve or chordal decomposition changes the problem.
+        let mut original =
+            settings
+                .tol_original
+                .is_some()
+                .then(|| super::original_check::OriginalData {
+                    P: P.as_ref().clone(),
+                    q: q.as_ref().to_vec(),
+                    A: A.as_ref().clone(),
+                    b: b.as_ref().to_vec(),
+                    cones: cones.clone(),
+                });
 
         // Each stage replaces only what it changes, so borrowed API data is
         // copied at most once.
@@ -206,6 +223,10 @@ where
 
         let normq = Some(q_new.norm_inf());
         let normb = Some(b_new.norm_inf());
+        if presolver.is_none() && chordal_info.is_none() {
+            // Unscaling the internal data recovers the original problem.
+            original = None;
+        }
 
         Self {
             P: P_new,
@@ -225,7 +246,48 @@ where
             dropped_zeros,
             presolver,
             chordal_info,
+            original,
         }
+    }
+
+    /// Original problem data for the acceptance test: the stored copy, or
+    /// the internal data with the equilibration undone.
+    pub(crate) fn original_data(
+        &self,
+    ) -> std::borrow::Cow<'_, super::original_check::OriginalData<T>> {
+        if let Some(original) = &self.original {
+            return std::borrow::Cow::Borrowed(original);
+        }
+        let eq = &self.equilibration;
+        let cinv = T::recip(eq.c);
+        let mut A = self.A.clone();
+        for col in 0..A.n {
+            for p in A.colptr[col]..A.colptr[col + 1] {
+                let row = A.rowval[p];
+                A.nzval[p] *= eq.einv[row] * eq.dinv[col];
+            }
+        }
+        let mut P = self.P.clone();
+        for col in 0..P.n {
+            for p in P.colptr[col]..P.colptr[col + 1] {
+                let row = P.rowval[p];
+                P.nzval[p] *= eq.dinv[row] * eq.dinv[col] * cinv;
+            }
+        }
+        let q = self
+            .q
+            .iter()
+            .zip(&eq.dinv)
+            .map(|(&v, &d)| v * d * cinv)
+            .collect();
+        let b = self.b.iter().zip(&eq.einv).map(|(&v, &e)| v * e).collect();
+        std::borrow::Cow::Owned(super::original_check::OriginalData {
+            P,
+            q,
+            A,
+            b,
+            cones: self.cones.clone(),
+        })
     }
 
     /// Materialize the equilibrated constraint matrix, including sampled rows.
