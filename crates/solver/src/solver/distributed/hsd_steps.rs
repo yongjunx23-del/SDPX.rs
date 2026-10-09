@@ -183,6 +183,17 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
     type R = OwnedResiduals<T>;
     type C = OwnedCones<T>;
     type SE = DefaultSettings<T>;
+    fn slack_dual_scale(&self) -> T {
+        // Global maxima of the owned blocks and the replicated border; the
+        // product is only compared with a threshold, so f64 agreement suffices.
+        let (mut s, mut z) = (self.border_s.norm_inf(), self.border_z.norm_inf());
+        for b in &self.blocks {
+            s = T::max(s, b.s.norm_inf());
+            z = T::max(z, b.z.norm_inf());
+        }
+        let (s, z) = (s.to_f64().unwrap_or(f64::INFINITY), z.to_f64().unwrap_or(f64::INFINITY));
+        T::from_f64(crate::mpi::max_all_f64(s) * crate::mpi::max_all_f64(z)).unwrap_or(T::infinity())
+    }
     fn calc_mu(&mut self, r: &Self::R, c: &Self::C) -> T {
         let sz = r
             .summary

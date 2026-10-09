@@ -213,6 +213,9 @@ pub trait Variables<T: FloatT> {
         String::new()
     }
 
+    /// `‖s‖∞·‖z‖∞` of the iterate (the scale of a KKT initializer).
+    fn slack_dual_scale(&self) -> T;
+
     /// Current homogeneous τ, when the variables carry one.
     fn tau(&self) -> Option<T> {
         None

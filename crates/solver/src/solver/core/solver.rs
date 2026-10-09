@@ -1015,6 +1015,22 @@ mod internal {
                     eprintln!("start-stats data {}", self.data.scale_stats());
                     eprintln!("start-stats kkt {} accepted={ok}", self.variables.scale_stats());
                 }
+                // An accepted KKT start whose slacks and duals are already
+                // huge in equilibrated units leads a unit-τ solve into a τ
+                // chase: start at the chase-restart scale instead. Raw
+                // ‖s‖∞·‖z‖∞: gravity256 0.29, ising11 8.8e4, Λ19-rs 1.8e12
+                // (converge from τ₀ = 1); Λ27-rs 6.4e17, Λ35-rs 1.1e24
+                // (chase, restarted at iterations 68 and 82).
+                let core = self.settings.core();
+                if ok
+                    && core.auto_start_scale
+                    && self.start_tau.is_none()
+                    && core.initial_tau == T::one()
+                    && self.callbacks.checkpoint.restart.is_none()
+                    && self.variables.slack_dual_scale() > (CHASE_START_SCALE).as_T()
+                {
+                    self.start_tau = Some(TauChase::restart_tau(T::one()));
+                }
                 // fix up (z,s) so that they are in the cone
                 let timer = crate::receipt::start();
                 self.variables.symmetric_initialization(&mut self.cones);
@@ -1250,6 +1266,10 @@ impl<T: FloatT> FixedTauSwitch<T> {
         hi <= lo * (1.1).as_T() && fast && res <= self.recent[0].1 * (0.1).as_T()
     }
 }
+
+/// KKT-initializer scale `‖s‖∞·‖z‖∞` above which a wide-type solve starts at
+/// the τ-chase restart scale (see `default_start`).
+const CHASE_START_SCALE: f64 = 1e15;
 
 /// Detects a τ chase on a unit-scale first attempt: since the relative gap
 /// last improved tenfold, μ fell by 1e4 while τ fell below `1e-2·τ₀`. On
