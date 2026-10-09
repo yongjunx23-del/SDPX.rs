@@ -84,17 +84,42 @@ impl<T: FloatT> PsdWork<T> {
     }
 }
 
-/// Run `f` with this thread's scratch for a cone of order `n`. A set built for
-/// another order is replaced by a fresh one, so the Cholesky factors' upper
-/// triangles start at zero exactly as in a newly constructed cone.
+/// Run `f` with this thread's scratch for a cone of order `n`. A set serves
+/// only its own order, so the Cholesky factors' upper triangles start at zero
+/// exactly as in a newly constructed cone. Binary64 threads keep recently
+/// used sets of other orders within [`F64_WORK_BYTES`] (alternating orders,
+/// e.g. chordal cliques, otherwise rebuilt every set on every call: SDP_hinf1
+/// rebuilt ~400 sets per solve); MPFR threads keep one set.
 fn with_work<T: FloatT, R>(n: usize, f: impl FnOnce(&mut PsdWork<T>) -> R) -> R {
-    crate::algebra::scratch::with_scratch(|slot: &mut Option<PsdWork<T>>| {
-        if slot.as_ref().map_or(true, |w| w.n != n) {
-            *slot = Some(PsdWork::new(n));
+    crate::algebra::scratch::with_scratch(|sets: &mut Vec<PsdWork<T>>| {
+        match sets.iter().position(|w| w.n == n) {
+            Some(0) => {}
+            Some(i) => sets[..=i].rotate_right(1),
+            None => {
+                sets.insert(0, PsdWork::new(n));
+                let budget = if T::precision_bits() <= 64 {
+                    F64_WORK_BYTES / std::mem::size_of::<T>()
+                } else {
+                    0
+                };
+                // Most recent first; the current set is always kept.
+                let mut used = 0;
+                let keep = sets
+                    .iter()
+                    .position(|w| {
+                        used += 5 * w.n * w.n;
+                        used > budget
+                    })
+                    .map_or(sets.len(), |i| i.max(1));
+                sets.truncate(keep);
+            }
         }
-        f(slot.as_mut().unwrap())
+        f(&mut sets[0])
     })
 }
+
+/// Per-thread bytes of binary64 cone scratch kept across cone orders.
+const F64_WORK_BYTES: usize = 8 << 20;
 
 pub struct PSDTriangleCone<T> {
     pub(crate) n: usize,                  // matrix dimension, i.e. matrix is n × n
