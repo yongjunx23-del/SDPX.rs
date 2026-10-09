@@ -60,6 +60,9 @@ impl DenseBlockSolver {
 
     fn new(k: &CscMatrix<f64>, signs: &[i8], settings: &CoreSettings<f64>, n: usize) -> Self {
         let m = k.n - n;
+        // Start the blocked kernels' worker before the solve, so receipts
+        // see a multi-threaded process from its first phase.
+        serial_pool();
         Self {
             nnz: k.nzval.len(),
             signs: signs.to_vec(),
@@ -203,7 +206,7 @@ impl DenseBlockSolver {
     fn factor_fallback(&mut self, k: &CscMatrix<f64>) -> bool {
         if self.fallback.is_none() {
             #[cfg(feature = "faer-sparse")]
-            let solver = super::auto::ldl_auto_select(k, &self.signs, &self.settings);
+            let solver = super::auto::ldl_auto_select(k, &self.signs, &self.settings, None);
             #[cfg(not(feature = "faer-sparse"))]
             let solver: BoxedDirectLDLSolver<f64> = Box::new(
                 super::qdldl::QDLDLDirectLDLSolver::new(k, &self.signs, &self.settings, None),

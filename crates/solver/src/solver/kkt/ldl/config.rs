@@ -5,8 +5,10 @@ use crate::{
 };
 use sdpx_arithmetic::MpFloat;
 
+/// The last argument is an AMD ordering of the same pattern computed earlier
+/// in backend selection (`None` when none was needed).
 type LDLConstructor<T> =
-    fn(&CscMatrix<T>, &[i8], &CoreSettings<T>, Option<Vec<usize>>) -> BoxedDirectLDLSolver<T>;
+    fn(&CscMatrix<T>, &[i8], &CoreSettings<T>, Option<super::AmdOrdering>) -> BoxedDirectLDLSolver<T>;
 
 /// Sparse numerical-provider selection, separate from scalar arithmetic.
 /// Implementations select only backends that support their scalar type.
@@ -22,6 +24,7 @@ pub trait LDLConfiguration: Sized {
         matrix: &CscMatrix<Self>,
         signs: &[i8],
         settings: &CoreSettings<Self>,
+        amd: Option<super::AmdOrdering>,
     ) -> BoxedDirectLDLSolver<Self>
     where
         Self: FloatT;
@@ -34,15 +37,15 @@ macro_rules! primitive_configuration {
                 settings: &CoreSettings<Self>,
             ) -> (MatrixTriangle, LDLConstructor<Self>) {
                 match settings.direct_solve_method.as_str() {
-                    "auto" => (MatrixTriangle::Triu, |m, d, s, _p| {
-                        Self::auto_ldlsolver(m, d, s)
+                    "auto" => (MatrixTriangle::Triu, |m, d, s, amd| {
+                        Self::auto_ldlsolver(m, d, s, amd)
                     }),
-                    "qdldl" => (MatrixTriangle::Triu, |m, d, s, p| {
-                        Box::new(QDLDLDirectLDLSolver::new(m, d, s, p))
+                    "qdldl" => (MatrixTriangle::Triu, |m, d, s, amd| {
+                        Box::new(QDLDLDirectLDLSolver::new(m, d, s, amd.map(|o| o.0)))
                     }),
                     #[cfg(feature = "faer-sparse")]
-                    "faer" => (MatrixTriangle::Triu, |m, d, s, p| {
-                        Box::new(super::faer_ldl::FaerDirectLDLSolver::new(m, d, s, p))
+                    "faer" => (MatrixTriangle::Triu, |m, d, s, amd| {
+                        Box::new(super::faer_ldl::FaerDirectLDLSolver::new(m, d, s, amd.map(|o| o.0)))
                     }),
                     method => panic!(
                         "LDL backend {method:?} is unavailable for {}",
@@ -55,6 +58,7 @@ macro_rules! primitive_configuration {
                 matrix: &CscMatrix<Self>,
                 signs: &[i8],
                 settings: &CoreSettings<Self>,
+                amd: Option<super::AmdOrdering>,
             ) -> BoxedDirectLDLSolver<Self> {
                 let dense: fn(
                     &CscMatrix<Self>,
@@ -66,11 +70,11 @@ macro_rules! primitive_configuration {
                 }
                 #[cfg(feature = "faer-sparse")]
                 {
-                    super::auto::ldl_auto_select(matrix, signs, settings)
+                    super::auto::ldl_auto_select(matrix, signs, settings, amd)
                 }
                 #[cfg(not(feature = "faer-sparse"))]
                 {
-                    Box::new(QDLDLDirectLDLSolver::new(matrix, signs, settings, None))
+                    Box::new(QDLDLDirectLDLSolver::new(matrix, signs, settings, amd.map(|o| o.0)))
                 }
             }
         }
@@ -96,11 +100,11 @@ impl<const N: usize> LDLConfiguration for MpFloat<N> {
         match settings.direct_solve_method.as_str() {
             // "auto" promotes eligible quasidefinite systems to the dense
             // multi-leaf arrow factorization; "qdldl" pins the baseline.
-            "auto" => (MatrixTriangle::Triu, |m, d, s, _p| {
-                Self::auto_ldlsolver(m, d, s)
+            "auto" => (MatrixTriangle::Triu, |m, d, s, amd| {
+                Self::auto_ldlsolver(m, d, s, amd)
             }),
-            "qdldl" => (MatrixTriangle::Triu, |m, d, s, p| {
-                Box::new(QDLDLDirectLDLSolver::new(m, d, s, p))
+            "qdldl" => (MatrixTriangle::Triu, |m, d, s, amd| {
+                Box::new(QDLDLDirectLDLSolver::new(m, d, s, amd.map(|o| o.0)))
             }),
             method => panic!(
                 "LDL backend {method:?} does not support {}-bit arithmetic",
@@ -113,9 +117,12 @@ impl<const N: usize> LDLConfiguration for MpFloat<N> {
         matrix: &CscMatrix<Self>,
         signs: &[i8],
         settings: &CoreSettings<Self>,
+        amd: Option<super::AmdOrdering>,
     ) -> BoxedDirectLDLSolver<Self> {
         super::arrow::ArrowLDLSolver::try_new(matrix, signs, settings)
             .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
-            .unwrap_or_else(|| Box::new(QDLDLDirectLDLSolver::new(matrix, signs, settings, None)))
+            .unwrap_or_else(|| {
+                Box::new(QDLDLDirectLDLSolver::new(matrix, signs, settings, amd.map(|o| o.0)))
+            })
     }
 }

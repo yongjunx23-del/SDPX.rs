@@ -9,6 +9,7 @@ pub(super) fn ldl_auto_select<T>(
     KKT: &CscMatrix<T>,
     Dsigns: &[i8],
     settings: &CoreSettings<T>,
+    amd: Option<super::AmdOrdering>,
 ) -> BoxedDirectLDLSolver<T>
 where
     T: FloatT + faer_traits::RealField,
@@ -25,8 +26,9 @@ where
     // as the one internal to faer.   Done this way because
     // QDLDL appears to be faster than faer's simplicial method.
 
-    // manually compute an AMD ordering for the KKT matrix
-    let (perm, _iperm, info) = super::amd_order(KKT);
+    // manually compute an AMD ordering for the KKT matrix, unless backend
+    // selection already ordered this pattern
+    let (perm, _iperm, info) = amd.unwrap_or_else(|| super::amd_order(KKT));
 
     // estimate flops and then use the faer switching rule
     let flops = (info.n_div + info.n_mult_subs_ldl) as f64;
