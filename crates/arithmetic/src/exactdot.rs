@@ -222,12 +222,7 @@ fn accumulate<'a, const N: usize>(
         // covers the shifted product and its carry by the bound on `len`.
         // In-place mpn operands are identical, which GMP permits.
         unsafe {
-            gmp::mpn_mul_n(
-                prod.as_mut_ptr(),
-                a.limbs.as_ptr(),
-                b.limbs.as_ptr(),
-                N as _,
-            );
+            mpn_mul_n::<N>(prod.as_mut_ptr(), a.limbs.as_ptr(), b.limbs.as_ptr());
             let width = if shift == 0 {
                 2 * N
             } else {
@@ -270,6 +265,26 @@ fn accumulate<'a, const N: usize>(
     }))
 }
 
+/// `rp[..2N] = up * vp` for `N` limbs. GMP's fat x86_64 build gives every
+/// Zen part Zen 1's `MUL_TOOM22_THRESHOLD` of 16, so 1024-bit (16-limb)
+/// products went through Toom-22 (EPYC 7742 at 1024 bits: `toom22`, `add_n`
+/// and `sub_n` 12% of cycles); GMP's own Zen 2 tuning keeps the basecase
+/// through 18 limbs. The product is exact either way.
+///
+/// # Safety
+/// `rp` holds `2N` limbs and does not overlap the `N`-limb inputs.
+#[inline(always)]
+pub(crate) unsafe fn mpn_mul_n<const N: usize>(rp: *mut u64, up: *const u64, vp: *const u64) {
+    #[cfg(target_arch = "x86_64")]
+    if N < 19 {
+        extern "C" {
+            fn __gmpn_mul_basecase(rp: *mut u64, up: *const u64, un: gmp::size_t, vp: *const u64, vn: gmp::size_t);
+        }
+        return __gmpn_mul_basecase(rp, up, N as _, vp, N as _);
+    }
+    gmp::mpn_mul_n(rp, up, vp, N as _);
+}
+
 /// `out[..2N] = a * b` for `N`-limb little-endian mantissas: an inlined
 /// schoolbook up to `SCHOOLBOOK_N` limbs (row 0 writes, later rows
 /// accumulate, so `out` needs no zeroing), GMP's assembly `mpn_mul_n` above.
@@ -278,7 +293,7 @@ pub(crate) fn mul_limbs<const N: usize>(a: &[u64; N], b: &[u64; N], out: &mut [u
     debug_assert!(out.len() >= 2 * N);
     if N > SCHOOLBOOK_N {
         // SAFETY: `out` holds 2N limbs and does not overlap the inputs.
-        unsafe { gmp::mpn_mul_n(out.as_mut_ptr(), a.as_ptr(), b.as_ptr(), N as _) };
+        unsafe { mpn_mul_n::<N>(out.as_mut_ptr(), a.as_ptr(), b.as_ptr()) };
         return;
     }
     let mut carry = 0u64;

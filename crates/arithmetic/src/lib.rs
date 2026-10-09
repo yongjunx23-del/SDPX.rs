@@ -580,7 +580,7 @@ impl<const N: usize> MpFloat<N> {
             // the operands; mpn_mul_n initializes exactly those 2N limbs, and
             // only they are referenced afterwards.
             let prod = unsafe {
-                gmp::mpn_mul_n(ptr, self.limbs.as_ptr(), b.limbs.as_ptr(), N as _);
+                exactdot::mpn_mul_n::<N>(ptr, self.limbs.as_ptr(), b.limbs.as_ptr());
                 std::slice::from_raw_parts_mut(ptr, 2 * N)
             };
             return self.round_product(b, prod, e);
