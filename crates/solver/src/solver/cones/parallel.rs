@@ -24,6 +24,9 @@ pub(super) struct ConeThreading {
     // Choleskys) need only one stealer, so they activate with any spare
     // cone worker — a weaker condition than `inner_parallel`.
     pub(super) paired: bool,
+    // Slowest cone of the last scaling phase (ns): how long idle workers
+    // wait for inner items to be posted (see `update_scaling`).
+    pub(super) slowest_cone: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -96,7 +99,14 @@ impl ConeThreading {
             })
             .collect();
         jobs.sort_unstable_by_key(|job| job.0);
+        let total = jobs.len();
         let jobs = std::sync::Mutex::new(jobs);
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let start = std::time::Instant::now();
+        let wait = std::time::Duration::from_nanos(
+            self.slowest_cone.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let slowest = std::sync::atomic::AtomicU64::new(0);
         // A worker without a queued cone helps the running cones' posted
         // inner items (SVD rotation replay rows), largest post first: the
         // slowest cone otherwise sets the phase alone. A worker item that
@@ -128,18 +138,42 @@ impl ConeThreading {
                                 self.paired,
                             )
                         });
+                        let began = std::time::Instant::now();
                         ok &= crate::algebra::with_split_hint(self.inner_ways, || {
                             cone.update_scaling(&s[rows.clone()], &z[rows], mu, strategy)
                         });
+                        slowest.fetch_max(
+                            began.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        done.fetch_add(1, std::sync::atomic::Ordering::Release);
                     }
-                    // Out of cones: help the running cones' posted items, then
-                    // return. Never wait for unposted work: this thread may
-                    // hold a suspended cone below (a stolen item).
-                    while sdpx_arithmetic::inner_parallel::board::help() {}
+                    // Out of cones: help the running cones' posted items (SVD
+                    // replays start late in a cone) until all are scaled, but
+                    // never past the last phase's slowest cone: a thread that
+                    // stole this item while blocked inside a cone would
+                    // otherwise wait for that cone forever.
+                    loop {
+                        if sdpx_arithmetic::inner_parallel::board::help() {
+                            continue;
+                        }
+                        if done.load(std::sync::atomic::Ordering::Acquire) == total
+                            || start.elapsed() >= wait
+                        {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
                     ok
                 })
                 .reduce(|| true, |a, b| a && b)
         }))
+        .inspect(|_| {
+            self.slowest_cone.store(
+                slowest.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            )
+        })
     }
 
     fn build<T: FloatT>(
@@ -304,6 +338,7 @@ impl ConeThreading {
             inner_parallel,
             inner_ways,
             paired,
+            slowest_cone: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 }
