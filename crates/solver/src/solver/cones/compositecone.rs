@@ -1,9 +1,9 @@
 use super::*;
 #[path = "parallel.rs"]
 mod cone_parallel;
-use crate::algebra::triangular_number;
-pub(crate) use cone_parallel::{pin_worker, SolveAffinityGuard};
+use crate::algebra::{triangular_number, CscMatrix};
 use cone_parallel::ConeThreading;
+pub(crate) use cone_parallel::{pin_worker, SolveAffinityGuard};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::iter::zip;
@@ -225,7 +225,7 @@ where
     /// disagreement return `None` and keep the sequential fold.
     fn nonsym_step_parallel(&mut self, α0: T, args: NonsymStep<'_, T>) -> Option<T> {
         const MIN_CONES: usize = 64;
-        let threading = self.threading.as_ref()?;
+        let threading = self.threading.as_ref().filter(|t| t.cone_workers > 1)?;
         if self.cones.iter().filter(|c| !c.is_symmetric()).count() < MIN_CONES {
             return None;
         }
@@ -247,6 +247,7 @@ where
         let αstar = threading.pool.install(|| {
             cones
                 .par_iter_mut()
+                .with_min_len(threading.cone_chunk)
                 .enumerate()
                 .filter(|(_, c)| !c.is_symmetric())
                 .map(|(i, c)| step_at(i, c, α0))
@@ -258,6 +259,7 @@ where
         let confirmed = threading.pool.install(|| {
             cones
                 .par_iter_mut()
+                .with_min_len(threading.cone_chunk)
                 .enumerate()
                 .filter(|(_, c)| !c.is_symmetric())
                 .all(|(i, c)| step_at(i, c, αstar) == αstar)
@@ -304,7 +306,7 @@ where
     ) -> bool {
         let serial = self.mpi_world().is_some() || self.cones.len() < 2;
         if !serial {
-            if let Some(threading) = &self.threading {
+            if let Some(threading) = self.threading.as_ref().filter(|t| t.cone_workers > 1) {
                 let changed = std::sync::atomic::AtomicBool::new(false);
                 threading.pool.install(|| {
                     cone_parallel::apply(
@@ -367,7 +369,7 @@ where
         if let Some(world) = self.mpi_world() {
             return self.combined_shift_sharded(world, shift, step_z, step_s, σμ, prepared);
         }
-        if let Some(threading) = &self.threading {
+        if let Some(threading) = self.threading.as_ref().filter(|t| t.cone_workers > 1) {
             if let (Some(chunk), [SupportedCone::NonnegativeCone(cone)]) =
                 (threading.orthant_chunk, self.cones.as_mut_slice())
             {
@@ -446,7 +448,9 @@ where
                     )
                 });
             }
-            let cached = if let Some(threading) = &self.threading {
+            let cached = if let Some(threading) =
+                self.threading.as_ref().filter(|t| t.cone_workers > 1)
+            {
                 if αmax.is_finite() && αmax > T::zero() && threading.sym_step_lanes.len() > 1 {
                     self.sym_step_bounds.resize(self.cones.len(), (αmax, αmax));
                     threading.pool.install(|| {
@@ -494,8 +498,18 @@ where
     /// CPU budget; one and structurally small workloads keep the serial path.
     /// Native BLAS must use one thread when cone workers execute PSD kernels.
     pub fn configure_threads(&mut self, threads: usize) -> Result<(), rayon::ThreadPoolBuildError> {
-        let threading = ConeThreading::new(&self.cones, threads)?;
-        self.threading = threading;
+        self.threading = ConeThreading::new(&self.cones, threads, None)?;
+        Ok(())
+    }
+
+    /// Admit the shared pool for the preprocessed KKT as well as cone work.
+    pub(crate) fn configure_threads_for_kkt(
+        &mut self,
+        threads: usize,
+        p: &CscMatrix<T>,
+        a: &CscMatrix<T>,
+    ) -> Result<(), rayon::ThreadPoolBuildError> {
+        self.threading = ConeThreading::new(&self.cones, threads, Some((p, a)))?;
         Ok(())
     }
 
@@ -1206,9 +1220,10 @@ where
                 Some(ok)
             })
             .all(|ok| ok);
-        if let Some(pool) = self
-            .thread_pool()
-            .filter(|p| p.current_num_threads() > 1 && self.cones.len() > 1 && contiguous)
+        if let Some(threading) = self
+            .threading
+            .as_ref()
+            .filter(|t| t.cone_workers > 1 && self.cones.len() > 1 && contiguous)
         {
             let mut parts: Vec<&mut [T]> = Vec::with_capacity(self.cones.len());
             let mut rest = &mut *z;
@@ -1217,10 +1232,11 @@ where
                 parts.push(part);
                 rest = tail;
             }
-            let margins: Vec<(T, T)> = pool.install(|| {
+            let margins: Vec<(T, T)> = threading.pool.install(|| {
                 self.cones
                     .par_iter_mut()
                     .zip(parts.into_par_iter())
+                    .with_min_len(threading.cone_chunk)
                     .map(|(cone, part)| cone.margins(part, pd))
                     .collect()
             });
@@ -1266,7 +1282,7 @@ where
         if let Some(world) = self.mpi_world() {
             return self.update_scaling_sharded(world, s, z, μ, scaling_strategy);
         }
-        if let Some(threading) = &self.threading {
+        if let Some(threading) = self.threading.as_ref().filter(|t| t.cone_workers > 1) {
             if let Some(ok) = threading.update_scaling(&mut self.cones, s, z, μ, scaling_strategy)
             {
                 return ok;
@@ -1330,7 +1346,7 @@ where
         if let Some(world) = self.mpi_world() {
             return self.mul_Hs_sharded(world, y, x);
         }
-        if let Some(threading) = &self.threading {
+        if let Some(threading) = self.threading.as_ref().filter(|t| t.cone_workers > 1) {
             if let (Some(chunk), [SupportedCone::NonnegativeCone(cone)]) =
                 (threading.orthant_chunk, self.cones.as_mut_slice())
             {
@@ -1382,7 +1398,7 @@ where
         if let Some(world) = self.mpi_world() {
             return self.Δs_sharded(world, out, ds, z);
         }
-        if let Some(threading) = &self.threading {
+        if let Some(threading) = self.threading.as_ref().filter(|t| t.cone_workers > 1) {
             if let (Some(chunk), [SupportedCone::NonnegativeCone(cone)]) =
                 (threading.orthant_chunk, self.cones.as_mut_slice())
             {
@@ -1434,7 +1450,7 @@ where
         let cached_sym = if let Some(world) = self.mpi_world() {
             self.mpi_step_bounds(world, dz, ds, z, s, settings, αmax, false);
             true
-        } else if let Some(threading) = &self.threading {
+        } else if let Some(threading) = self.threading.as_ref().filter(|t| t.cone_workers > 1) {
             if let (Some(chunk), [SupportedCone::NonnegativeCone(cone)]) =
                 (threading.orthant_chunk, self.cones.as_mut_slice())
             {
@@ -1516,13 +1532,17 @@ where
         }
         // Each nonsymmetric barrier costs several logarithms: evaluate the
         // cones in the pool, then add in cone order (the same sum).
-        if let Some(threading) = self.threading.as_ref().filter(|_| self.cones.len() > 1) {
+        if let Some(threading) = self
+            .threading
+            .as_ref()
+            .filter(|t| t.cone_workers > 1 && self.cones.len() > 1)
+        {
             let rng_cones = &self.rng_cones;
             let values: Vec<T> = threading.pool.install(|| {
                 self.cones
                     .par_iter_mut()
                     .zip(rng_cones.par_iter())
-                    .with_min_len(8)
+                    .with_min_len(8.max(threading.cone_chunk))
                     .map(|(cone, rng)| {
                         cone.compute_barrier(
                             &z[rng.clone()],

@@ -222,7 +222,7 @@ impl<T: FloatT> PreparedProblem<T> {
         crate::receipt::memory_mark("problem data");
         let mut cones = CompositeCone::<T>::new(&data.cones);
         cones
-            .configure_threads(settings.max_threads as usize)
+            .configure_threads_for_kkt(settings.max_threads as usize, &data.P, &data.A)
             .map_err(|_| SettingsError::LinearSolverProblem {
                 solver: "cone workers",
                 problem: "failed to create worker pool",

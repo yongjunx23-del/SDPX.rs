@@ -1,25 +1,28 @@
 //! Cached, structurally weighted cone scheduling. Every task owns disjoint
 //! cone state and row slices; joining a phase is its only synchronization.
 use super::*;
+use crate::algebra::CscMatrix;
 
 pub(super) struct ConeThreading {
     pub(super) pool: std::sync::Arc<rayon::ThreadPool>,
+    // KKT work may widen the shared pool without widening cone phases.
+    pub(super) cone_workers: usize,
+    pub(super) cone_chunk: usize,
     pub(super) lanes: Vec<Lane>,
     pub(super) sym_step_lanes: Vec<Lane>,
     // A single large orthant, optionally with equality rows, uses disjoint
     // elementwise chunks on the same worker pool.
     pub(super) orthant_chunk: Option<usize>,
     // Inner (within-cone) work re-offered to the ambient pool only pays
-    // when spare workers exist beyond the cone lanes; when lanes already
-    // saturate the pool the extra scheduling overhead is a net loss.
+    // when the cone budget has spare workers beyond its lanes.
     pub(super) inner_parallel: bool,
     // Workers per lane for split-capable kernels inside a cone (residue
-    // congruences): SDPB-style, a pool wider than its lanes shares each
+    // congruences): SDPB-style, a cone budget wider than its lanes shares each
     // lane's heavy calls among ways = workers / lanes.
     pub(super) inner_ways: usize,
     // Paired joins of two independent operations (e.g. the two cone
     // Choleskys) need only one stealer, so they activate with any spare
-    // worker — a weaker condition than `inner_parallel`.
+    // cone worker — a weaker condition than `inner_parallel`.
     pub(super) paired: bool,
 }
 
@@ -32,6 +35,9 @@ pub(super) struct Lane {
 // Conservative initial launch threshold, expressed in scalar work units.
 // Costs depend only on dimensions and precision, never on problem identities.
 const MIN_LANE_WORK: u128 = 4096;
+// Initial KKT admission cutoff in precision-weighted neighbor products.
+// Much more work is needed to amortize extra workers for short KKT phases.
+const MIN_KKT_WORK: u128 = 8 << 20;
 
 fn cone_cost<T: FloatT>(cone: &SupportedCone<T>) -> u128 {
     let dimension_cost = match cone {
@@ -46,8 +52,9 @@ impl ConeThreading {
     pub(super) fn new<T: FloatT>(
         cones: &[SupportedCone<T>],
         requested: usize,
+        kkt: Option<(&CscMatrix<T>, &CscMatrix<T>)>,
     ) -> Result<Option<Self>, rayon::ThreadPoolBuildError> {
-        Self::build(cones, requested, None)
+        Self::build(cones, requested, kkt, None)
     }
 
     /// Plan lanes for `cones` on an existing pool (its width is the budget).
@@ -56,7 +63,7 @@ impl ConeThreading {
         pool: std::sync::Arc<rayon::ThreadPool>,
     ) -> Option<Self> {
         let width = pool.current_num_threads();
-        Self::build(cones, width, Some(pool)).ok().flatten()
+        Self::build(cones, width, None, Some(pool)).ok().flatten()
     }
 
     // Scale heavy PSD cones first. Whole cones remain independent; workers
@@ -122,6 +129,7 @@ impl ConeThreading {
     fn build<T: FloatT>(
         cones: &[SupportedCone<T>],
         requested: usize,
+        kkt: Option<(&CscMatrix<T>, &CscMatrix<T>)>,
         existing: Option<std::sync::Arc<rayon::ThreadPool>>,
     ) -> Result<Option<Self>, rayon::ThreadPoolBuildError> {
         let budget = crate::solver::core::worker_budget(requested);
@@ -154,7 +162,7 @@ impl ConeThreading {
         });
         if budget <= 1
             || cones.is_empty()
-            || (cones.len() < 2 && !single_orthant && !single_zero && !has_psd)
+            || (kkt.is_none() && cones.len() < 2 && !single_orthant && !single_zero && !has_psd)
         {
             return Ok(None);
         }
@@ -164,46 +172,69 @@ impl ConeThreading {
             prefix.push(prefix.last().unwrap().saturating_add(cone_cost(cone)));
         }
         let total = *prefix.last().unwrap();
-        // A new pool is no wider than the PSD work can keep busy (see
-        // `useful_width`); receipts report the width actually used.
+        // Preserve the measured PSD admission. Materialized PSD A columns
+        // do not describe the condensed factor's work.
         let cap = if existing.is_none() {
             useful_width(cones)
         } else {
             usize::MAX
         };
-        let workers = budget
+        let cone_workers = budget
             .min(cap)
             .min(if single_orthant {
                 cones[0].numel()
             } else {
-                // Outer cone lanes stay bounded by the cone count (see
-                // balanced_lanes below), but this pool is also the KKT
-                // backend's worker budget: condensed Schur columns and
-                // arrow leaves can use workers beyond the number of cones.
                 budget
             })
             .min((total / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
+        let cone_workers = if cones.len() < 2 && !single_orthant && !single_zero && !has_psd {
+            1
+        } else {
+            cone_workers.max(1)
+        };
+        // Squared column-neighbor counts estimate Gram/initial factor work
+        // from the validated, preprocessed CSC pattern without another AMD
+        // ordering or a dense allocation. This is a proxy, not a fill count.
+        let kkt_workers = if has_psd {
+            0
+        } else {
+            let words = T::precision_bits().div_ceil(64) as u128;
+            let work = kkt.map_or(0, |(p, a)| {
+                a.colptr
+                    .windows(2)
+                    .zip(p.colptr.windows(2))
+                    .fold(0u128, |work, (a, p)| {
+                        let neighbors = (a[1] - a[0]) as u128 + (p[1] - p[0]) as u128;
+                        work.saturating_add(neighbors.saturating_pow(2))
+                    })
+            });
+            (work.saturating_mul(words * words) / MIN_KKT_WORK).min(budget as u128) as usize
+        };
+        let workers = cone_workers.max(kkt_workers).min(cap);
         if workers <= 1 {
             return Ok(None);
         }
         // Contiguous lanes preserve original cone/data ordering and permit
         // safe slice splitting, without raw pointers or per-call job vectors.
-        let orthant_chunk = orthant_size.map(|n| n.div_ceil(workers));
+        let orthant_chunk = orthant_size
+            .filter(|_| cone_workers > 1)
+            .map(|n| n.div_ceil(cone_workers));
         // Deliberate over-splitting: balanced lanes follow a structural cost
         // model, so spare tasks are what lets work stealing absorb model error.
         // Measured worse when reduced to one lane per worker (w8 13.35 -> 14.37,
         // w16 12.47 -> 14.11), so the task budget stays as it was.
-        let task_budget = workers
+        let task_budget = cone_workers
             .saturating_mul(4)
-            .min((total / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
+            .min((total / MIN_LANE_WORK).min(usize::MAX as u128) as usize)
+            .max(1);
         let lanes = balanced_lanes(cones, &prefix, task_budget.min(cones.len()));
         // Any spare worker may steal a heavy cone's inner work (SVD rotation
         // replay rows, reflector columns); the slowest cone otherwise sets
         // the phase (Λ19 spins 0–50: 52 lanes on 64 workers, SVD 200 ms
         // median, 406 ms max). Inner splits are bitwise neutral.
-        let inner_parallel = workers > lanes.len().max(1);
+        let inner_parallel = cone_workers > lanes.len().max(1);
         // Any spare worker can steal the second half of a paired join.
-        let paired = workers > lanes.len().max(1);
+        let paired = cone_workers > lanes.len().max(1);
         let sym_step_lanes = {
             // Step-to-boundary bounds are cap-insensitive for symmetric
             // cones (Nonnegative/SOC/PSD/Zero): every cone is evaluated at
@@ -222,7 +253,7 @@ impl ConeThreading {
                 };
                 prefix.push(prefix.last().unwrap().saturating_add(cost));
             }
-            let lanes = workers
+            let lanes = cone_workers
                 .saturating_mul(4)
                 .min(active)
                 .min((*prefix.last().unwrap() / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
@@ -241,9 +272,16 @@ impl ConeThreading {
                     .build()?,
             ),
         };
-        let inner_ways = (workers / lanes.len().max(1)).max(1);
+        let inner_ways = (cone_workers / lanes.len().max(1)).max(1);
+        let cone_chunk = if workers > cone_workers {
+            cones.len().div_ceil(cone_workers)
+        } else {
+            1
+        };
         Ok(Some(Self {
             pool,
+            cone_workers,
+            cone_chunk,
             lanes,
             sym_step_lanes,
             orthant_chunk,
@@ -624,7 +662,7 @@ mod tests {
     fn balanced_partition_and_joined_failure_own_each_row_once() {
         let kinds = vec![SupportedConeT::<f64>::NonnegativeConeT(4096); 4];
         let mut cones: Vec<_> = kinds.iter().map(make_cone).collect();
-        let threading = ConeThreading::new(&cones, 2).unwrap().unwrap();
+        let threading = ConeThreading::new(&cones, 2, None).unwrap().unwrap();
         assert_eq!(threading.pool.current_num_threads(), 2);
         assert_eq!(threading.lanes.len(), 4);
         for (i, lane) in threading.lanes.iter().enumerate() {
