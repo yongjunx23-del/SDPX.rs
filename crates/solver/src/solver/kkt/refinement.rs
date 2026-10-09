@@ -93,10 +93,9 @@ pub(crate) fn refine<T: FloatT>(work: &mut impl Refinement<T>, settings: &CoreSe
     if T::precision_bits() <= 53 {
         let tol =
             settings.iterative_refinement_abstol + settings.iterative_refinement_reltol * stats[0];
+        // `ok` and the residual norms are already globally agreed, so no
+        // further agreement round is needed.
         let stalled = ok && stats[2] > tol;
-        if !work.decision_agrees(u32::from(stalled)) {
-            return false;
-        }
         if stalled && work.gmres_continuation() {
             return refine_gmres(work, settings);
         }
