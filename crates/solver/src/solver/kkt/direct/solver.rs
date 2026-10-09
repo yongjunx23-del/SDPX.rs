@@ -160,6 +160,9 @@ where
         // AMD ordering vectors to its selected solver
         // If using a solver directly and no ordering is
         // provided, the solver finds one for itself
+        // One AMD ordering of the KKT pattern serves both the bound
+        // elimination's cost test and the sparse factor chosen after it.
+        let mut amd = std::cell::OnceCell::new();
         let mut ldlsolver = if KKT.n == 0 {
             Box::new(EmptyDirectLDLSolver) as BoxedDirectLDLSolver<T>
         } else if settings.direct_solve_method == "auto" {
@@ -173,7 +176,7 @@ where
             })
             .or_else(|| {
                 crate::solver::kkt::ldl::arrow::ArrowLDLSolver::try_local_bounds(
-                    &KKT, &dsigns, A, cones, settings,
+                    &KKT, &dsigns, A, cones, settings, &amd,
                 )
             })
             .or_else(|| {
@@ -182,7 +185,7 @@ where
                 )
             })
             .map(|solver| Box::new(solver) as BoxedDirectLDLSolver<T>)
-            .unwrap_or_else(|| ldl_ctor(&KKT, &dsigns, settings, None))
+            .unwrap_or_else(|| ldl_ctor(&KKT, &dsigns, settings, amd.take()))
         } else {
             ldl_ctor(&KKT, &dsigns, settings, None)
         };

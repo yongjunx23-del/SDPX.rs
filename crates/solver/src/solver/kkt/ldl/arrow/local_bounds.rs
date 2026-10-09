@@ -16,6 +16,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         a: &CscMatrix<T>,
         cones: &CompositeCone<T>,
         settings: &CoreSettings<T>,
+        amd: &std::cell::OnceCell<crate::solver::kkt::ldl::AmdOrdering>,
     ) -> Option<Self> {
         // Binary64 requires the packed faer Schur kernel.
         if T::precision_bits() <= 53 && !cfg!(feature = "faer-sparse") {
@@ -127,7 +128,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 }
             }
         }
-        if T::precision_bits() <= 64 && !dense_border_pays(k, groups.len(), trunk.len()) {
+        if T::precision_bits() <= 64 && !dense_border_pays(k, groups.len(), trunk.len(), amd) {
             return None;
         }
         Some(Self::from_groups(
@@ -151,10 +152,16 @@ const DENSE_FLOP_RATIO: f64 = 10.0;
 /// is cheaper after crediting dense kernels with [`DENSE_FLOP_RATIO`].
 /// Measured on the regression LPs, sparse LDL was 4-80x faster (LP_bnl1
 /// 8.09 -> 0.098 s, LP_agg 2.55 -> 0.032 s).
-fn dense_border_pays<T: FloatT>(k: &CscMatrix<T>, groups: usize, t: usize) -> bool {
+/// The AMD ordering is kept in `amd` for the sparse factor that follows.
+fn dense_border_pays<T: FloatT>(
+    k: &CscMatrix<T>,
+    groups: usize,
+    t: usize,
+    amd: &std::cell::OnceCell<crate::solver::kkt::ldl::AmdOrdering>,
+) -> bool {
     let t = t as f64;
     let dense = groups as f64 * t * t + t * t * t / 3.0;
-    let (_, _, info) = crate::solver::kkt::ldl::amd_order(k);
+    let info = &amd.get_or_init(|| crate::solver::kkt::ldl::amd_order(k)).2;
     let sparse = (info.n_div + info.n_mult_subs_ldl) as f64;
     if crate::receipt::profile_requested() {
         eprintln!(

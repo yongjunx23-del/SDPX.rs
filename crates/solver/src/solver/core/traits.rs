@@ -293,6 +293,10 @@ pub trait KKTSystem<T: FloatT>: crate::solver::kkt::HasLinearSolverInfo {
     /// Reset per-solve accounting and numerical retry state.
     fn reset_solve(&mut self) {}
 
+    /// Binary64: from now on, continue stalled refinements with GMRES-IR
+    /// (see [`crate::solver::kkt::KKTSolver::refine_further`]).
+    fn refine_further(&mut self) {}
+
     /// Update the KKT system.   In particular, update KKT
     /// matrix entries with new variable and refactor.
     fn update(&mut self, data: &Self::D, cones: &Self::C, settings: &Self::SE) -> bool;
@@ -433,6 +437,12 @@ where
     }
     /// Larger of the primal and dual feasibility residuals, if recorded.
     fn residual_max(&self) -> Option<T> {
+        None
+    }
+    /// Unnormalized primal and dual residual norms `‖Ax+s−bτ‖`, `‖Px+A'z+qτ‖`
+    /// of the scaled problem, if recorded. Exact Newton steps never increase
+    /// them (each step scales both by `1 − α(1−σ)`).
+    fn residual_norms(&self) -> Option<(T, T)> {
         None
     }
     /// Set the termination status

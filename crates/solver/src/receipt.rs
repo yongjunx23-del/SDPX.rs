@@ -7,6 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -59,6 +60,31 @@ fn receipts_requested() -> bool {
     *ON.get_or_init(|| std::env::var_os("SDPX_RECEIPT").is_some())
 }
 
+/// Whether timers sample CPU clocks (receipt `cpu.*`, `cpu_s`, `serial_s`).
+/// Each sample costs two system calls per timer end; a solve that starts in
+/// a single-threaded process has no worker time to attribute and records
+/// wall phases only (`cpu_clocks: false`).
+static CPU_CLOCKS: AtomicBool = AtomicBool::new(true);
+
+fn cpu_clocks() -> bool {
+    receipts_requested() && CPU_CLOCKS.load(Ordering::Relaxed)
+}
+
+/// Threads in this process, where the OS reports it cheaply.
+fn process_threads() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        // Field 20 (num_threads); the command name before it may hold spaces.
+        let tail = &stat[stat.rfind(')')? + 2..];
+        tail.split(' ').nth(17)?.parse().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// A detailed timer: wall start plus, under receipts, process CPU time.
 pub struct Mark {
     wall: Instant,
@@ -70,8 +96,8 @@ pub struct Mark {
 pub fn start() -> Option<Mark> {
     (receipts_requested() || profile_requested()).then(|| Mark {
         wall: Instant::now(),
-        cpu: receipts_requested().then(process_cpu).flatten(),
-        serial: receipts_requested().then(thread_cpu).flatten(),
+        cpu: cpu_clocks().then(process_cpu).flatten(),
+        serial: cpu_clocks().then(thread_cpu).flatten(),
     })
 }
 
@@ -81,8 +107,10 @@ pub fn start() -> Option<Mark> {
 pub fn finish(name: &'static str, timer: Option<Mark>) {
     if let Some(timer) = timer {
         phase(name, timer.wall.elapsed());
-        if let (Some(cpu), Some(now)) = (timer.cpu, process_cpu()) {
-            *CPU.lock().unwrap().entry(name).or_default() += now.saturating_sub(cpu);
+        if let Some(cpu) = timer.cpu {
+            if let Some(now) = process_cpu() {
+                *CPU.lock().unwrap().entry(name).or_default() += now.saturating_sub(cpu);
+            }
         }
         serial_add(name, timer.serial);
     }
@@ -147,27 +175,27 @@ fn clock_cpu(clock: i32) -> Option<Duration> {
 
 /// Start a CPU-time mark for a top-level solver phase (receipts only).
 pub fn cpu_start() -> Option<CpuMark> {
-    receipts_requested()
-        .then(process_cpu)
-        .flatten()
-        .map(|cpu| CpuMark {
+    receipts_requested().then(|| {
+        let clocks = cpu_clocks();
+        CpuMark {
             wall: Instant::now(),
-            cpu,
-            serial: thread_cpu(),
-        })
+            cpu: clocks.then(process_cpu).flatten(),
+            serial: clocks.then(thread_cpu).flatten(),
+        }
+    })
 }
 
 /// Wall, process-CPU and calling-thread-CPU start of a phase.
 pub struct CpuMark {
     wall: Instant,
-    cpu: Duration,
+    cpu: Option<Duration>,
     serial: Option<Duration>,
 }
 
 /// Add calling-thread CPU time since `start` to phase `name`'s serial time.
 fn serial_add(name: &'static str, start: Option<Duration>) {
-    if let (Some(start), Some(now)) = (start, thread_cpu()) {
-        *SERIAL.lock().unwrap().entry(name).or_default() += now.saturating_sub(start);
+    if let Some(serial) = start.and_then(|start| Some(thread_cpu()?.saturating_sub(start))) {
+        *SERIAL.lock().unwrap().entry(name).or_default() += serial;
     }
 }
 
@@ -175,8 +203,10 @@ fn serial_add(name: &'static str, start: Option<Duration>) {
 /// divided by the phase's wall time it gives the average busy threads
 /// (idle rayon workers spin briefly, so this is an upper bound).
 pub fn cpu_finish(name: &'static str, wall: &'static str, start: Option<CpuMark>) {
-    if let (Some(mark), Some(now)) = (start, process_cpu()) {
-        phase_record(name, now.saturating_sub(mark.cpu));
+    if let Some(mark) = start {
+        if let Some(cpu) = mark.cpu.and_then(|start| Some(process_cpu()?.saturating_sub(start))) {
+            phase_record(name, cpu);
+        }
         phase_record(wall, mark.wall.elapsed());
         serial_add(wall, mark.serial);
     }
@@ -238,6 +268,7 @@ impl Scope {
             return Self(None);
         }
         let guard = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
+        CPU_CLOCKS.store(process_threads().is_none_or(|n| n > 1), Ordering::Relaxed);
         PHASES.lock().unwrap().clear();
         SITES.lock().unwrap().clear();
         CPU.lock().unwrap().clear();
@@ -391,6 +422,7 @@ fn try_write_parts<T: crate::algebra::FloatT>(
             "outer_refinements": ctr.outer_refinements,
         },
         "phases": phase_map,
+        "cpu_clocks": CPU_CLOCKS.load(Ordering::Relaxed),
         "setup_seconds_inclusive": setup,
         "memory": {"peak_rss_bytes": peak_rss},
         "env": {

@@ -8,6 +8,99 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-09 — task 16 (perf-endgame) kept; task 19 (perf-scale) not kept
+
+- Task 16, Float64 end game. Commits `04442ef` and `7802a28`, merged in `81b1549`:
+  - On the condensed binary64 path, Δs is taken from the linear primal row instead of −(HΔz + c). Verified cause: the H·H⁻¹ round trip put about cond(H)·eps into AΔx + Δs − bΔτ.
+  - The outer refinement gets a GMRES-IR continuation, used only after an unnormalized residual norm has grown.
+  - MPFR is untouched (ising11 512 bitwise identical).
+  - Gate against int5 (`t7/t16b-compare.md`): no new audit failures and no status regressions. Now Solved and audited: qap6, gpp100, gpp124-1, gpp250-1, gpp500-1, f64_medium. Still AlmostSolved: hinf3, sched_100_50_orig, csdr3, f64_large.
+  - Wins vs MOSEK: 11 → 19 at 1 thread, 9 → 12 at 16.
+  - Same-node A/B (`t13/ab-int5-t16b-224379`): 14 cases within ±3%. csdr3 is +5% with bitwise-identical points, in unchanged arrow kernels (hypothesis: codegen/layout).
+  - Merge fix `d1dacbf`: the continuation's extra `decision_agrees` round was dropped, because its inputs are already global. This restores task 20's agreement-count tests.
+  - Dropped (evidence in the task report): Δs from the row on the augmented path; DirectLDL GMRES fallbacks; relative or smaller static shifts; `fixed_tau_phase` in binary64.
+  - Open: the augmented end-game floor (sched_100_50, csdr3); hinf3 is platform-sensitive; f64_large needs facial reduction.
+- Pre-existing test failures (seen at `bdbfacc` too, macOS): `condensed::parallel_tests::solve_many_accounting_f64` and `condensed_retained_nonsymmetric_original_operator_{f64,mpfr128}` panic on the `debug_assert` at `local_soc.rs:20`. Not yet triaged.
+- Task 19, cone scaling and idle threads (branch `perf-scale`, not merged):
+  - Extra ways for the costliest cones made the largest-cone SVD slower (0.63 → 0.89 s, inner joins steal worker loops). Reverted.
+  - What remains (`pool_ways` for condensed passes, sampled products and Gram sync) is ±0.5% on a full ABBA (Λ27 −0.5%, s50 +0.4%, Λ19 +0.4%, ising11 0), below the 2% rule.
+  - Observed: scaling is CPU-bound, not idle-bound. At Λ35/1024, scaling CPU ÷ 64 is 0.61 s/it against a 0.68 s wall, so perfect balance gains about 1.5%.
+  - SVD CPU at Λ35/1024 is 31.4 s/it: replay 16.8, QR 5.6, bidiagonalization 5.2, reflectors 3.6.
+  - HKM declined: net 0–8% with two contract changes. Warm-started NT: no-go (clustered singular values).
+- Next lever: blocked replay of the logged Givens rotations through the exact residue GEMM. Estimate (hypothesis): Λ35/1024 −4.4%, Λ27 −3.5%.
+
+## 2026-10-09 — task 20 (perf-t20): owner-MPI agreements kept; SDPB 3.1 sample points
+
+- Commit `3c7c989`: one refinement agreement per residual in owner MPI (finiteness, action and the next convergence test agreed together; three redundant agreements dropped), and upper-row border assembly. Points bitwise identical at all 6 layouts. 1024 bits, 60 iterations, A = bdbfacc, B = 3c7c989:
+
+  | Case | Layout | A (s) | B (s) | Change | SDPB 64 ranks/node (s) |
+  |---|---|---|---|---|---|
+  | Λ27 1 node | 13×4 | 117.2 / 116.6 | 113.5 / 113.4 | −3.0% | 119 |
+  | Λ27 2 nodes | 26×4 | 95.6 / 94.8 | 93.0 / 92.9 | −2.4% | 87 |
+  | Λ27 4 nodes | 13×16 | 72.7 / 71.7 | 71.4 / 70.8 | −1.4% | 107 |
+  | Λ35 1 node | 12×5 | 291.7 / 291.2 | 267.7 / 268.0 | −8.1% | 228 |
+  | Λ35 2 nodes | 18×7 | 177.0 / 177.1 | 168.7 / 168.0 | −4.9% | 148 |
+  | Λ35 4 nodes | 12×16 | 137.8 / 138.8 | 132.8 / 133.8 | −3.6% | 126 |
+
+  Plain 64-thread one-node runs: Λ27 121.0 s, Λ35 250.3 s. Collective rounds at 4 nodes: Λ27 7014 → 5790, Λ35 8444 → 6670.
+- Closed: distributing the border factor. The plan's n 4071 was Λ35's variable count; the border is 170 rows (Λ27 104) and its factor is 2.1% at 4 nodes. Also closed: SDPB-style timing-run assignment. The existing LPT on measured costs (`--cost-history`) is already balanced (max/mean 1.02–1.08) and gave no gain.
+- Commit `b12ed49`: `sdpx-pmp2sdp --resample`. It recovers each block's prefactor (2048 bits, refused unless every given scaling is reproduced to 1e-60) and applies the SDPB 3.1 sample points that `crates/pmp` already implements. On ising11 they match SDPB's `sample_points.cxx` to 4e-152.
+- Sample-point A/B (64 threads, one node; A = current PyCFTBoot points, B = 3.1 points; audits at 1e-30):
+
+  | Case | A it / s | B it / s | Audit |
+  |---|---|---|---|
+  | Λ19 768 | 121 / 70.3 | 89 / 43.6 (−38%) | both accepted |
+  | Λ27 768, default start | 183 / 246.4 | 345 / 354.2 | all accepted |
+  | Λ27 768, τ₀ 1e-30 | 163 / 219.9 | 145 / 144.4 (−41% against default A) | all accepted |
+  | Λ35 1024, 60 it | 250.5 | 191.1 (3.18 s/it, −24%) | not a solution yet |
+
+  Observed: refinement corrections per iteration fall to 0 (Λ27 3.19 → 0, Λ35 4.15 → 0), and linear solves per iteration fall from 8.3 to 3.05. On 3.1 inputs the KKT initial point is accepted, which bypasses task 14's data-scaled τ₀; that is why Λ27 needs 345 iterations at the default start.
+- Matched-input comparison pending: SDPB on the resampled inputs (`t20/sbrs.pbs`, jobs 224375–224377), and full SDPX Λ35 1024 solves on them (224373 default start, 224374 τ₀ 1e-30).
+- Decision: merge both commits (`23e0a99`). Converting the Ising inputs with `--resample` becomes the default once the matched SDPB runs are in. Follow-up: the start rule on 3.1 inputs.
+
+## 2026-10-09 — task 18: Hypatia WSOS dual-barrier cone for Ising, no-go
+
+- Hypothesis: Hypatia's WSOSInterpNonnegative cone (Λ(z) = Pᵀdiag(z)P, which equals SDPX's X block) removes the NT SVD and the PSD-space prepare/recover, and is faster on large Ising.
+- Formulation (verified on ising11): every block has R = 1. ν equals the SDP lifting's; only the vector dimension shrinks (Λ27 q 2613 vs 67327 lifted, Λ35 4071 vs 117992).
+- Measurements (Hypatia 0.10.2, local copy with threaded cone loops; scripts and logs in `~/.cache/sdpx-e2e/t18/`, cluster `t18/`):
+  - ising11, 512 bits: 1e-30 Optimal 69 it / 19.1 s; 1e-42 86 it / 25.4 s (line search 39%, 9.4 cone checks/it, 4 solves/it); 1e-60 109 it / 34 s. SDPX takes 54 it. Objective 4.62e-35 from the reference, the same as SDPX's audit.
+  - Λ19, 768 bits (job 224271, 32 threads, about 20 s/it): cancelled at iteration 107 with gap 4.6e-9, α ≈ 0.1, τ falling 1.0 → 0.13. SDPX reaches gap 4.75e-9 at iteration 73 and 1e-42 at 121.
+- Cost model for Λ27: the factor has the same structure as SDPX's leaves and border. Removing the SVD and the PSD-space passes gives at best 0.5× per iteration, but the line search (150–610M multiply-adds per iteration) and third-order adjustments exceed the factor. No symmetric primal-dual scaling exists for this cone.
+- Decision: no-go. Net between 0.8× SDPX (best case) and 1.3–2.5× slower, with the iteration gap widening with size.
+- Carried to task 19: re-measure HKM at Λ27/Λ35 scale. The ising11 closure (52 → 58 it) predates the Λ27 profile, where scaling is 21.6%. Estimated net 0–8% on Λ27. Hypatia's τ also collapses on Λ19, which supports task 17's fixed-τ direction.
+
+## 2026-10-09 — int5 Float64 gate (task 15 merged); Ising target ≥2× SDPB
+
+- Gate: int5 (`a5334dd` + FMA, task 15 merged) against int4 on the 58-case scoreboard (`t7/int5-compare.md`). Statuses, iterations (638) and audits are identical; 0 Solved-but-fail.
+  - Geo-mean time: 0.861 at 1 thread, 1.018 at 16 (cross-node noise).
+  - Wins vs MOSEK: 11 → 11 at 1 thread, 8 → 9 at 16.
+  - Geo-mean SDPX/MOSEK at 1 thread: LP 2.53, SDP 1.65, SOCP 1.43 (16 threads: 2.18 / 2.29 / 1.77).
+- Decision: int5 is the Float64 baseline.
+- Λ35 loss analysis (from the 2026-10-08 profile; old binary): iterations match SDPB (743 vs 745), and the ~650-iteration plateau erases SDPX's usual iteration advantage. SDPX's per-iteration extras (third RHS for τ, about one refinement correction per solve, MPFR SVD per cone, ~11% idle threads) are about 1.5 s of a 3.19 s iteration at 768 bits.
+- User asked for ≥2× over SDPB and approved implementing the reconciled design (SDPB skeleton plus SDPX step control and kernels). Assignment:
+  - Task 17 (`perf-l35b`): 1024 baseline, two RHS via fixed τ, infeasible-start PMP mode with separate α_P/α_D and data-chosen start scale, safe refinement skip, no shifts with escalation.
+  - Task 19 (`perf-scale`): cone scaling (LPT and in-cone split; warm-started NT versus HKM A/B), cost-based block assignment, idle threads.
+  - Task 20 (`perf-t20`): multi-node border/Schur distribution and cost-balanced ranks; SDPB 3.1 sample points.
+- Estimate (hypothesis): Λ27 2× needs ≤1.02 s/it (now 1.41), 3× ≤0.68; Λ35 at 1024 2× needs ≤1.85 s/it at 745 iterations; beyond ~1.7–2× on Λ35 needs a shorter plateau.
+
+## 2026-10-09 — task 13 (perf-small) kept; FMA builds
+
+- Merged `perf-small` `ad536de`:
+  - lazy QDLDL parallel plan;
+  - one AMD ordering;
+  - Mersenne modular minor;
+  - receipt CPU clocks only with worker threads;
+  - binary64 arrow split thresholds;
+  - PSD scratch per cone order.
+
+  All 116 points are bitwise identical to int1. Same-node interleaved A/B over 55 cases: geo-mean 0.863 at 1 thread and 0.861 at 16.
+- Cluster builds now use `-C target-feature=+fma`. Points are bitwise identical (17 cases checked), and 1 thread is 2–18% faster (theta1 0.82, chainsing 0.88).
+- Gate: int4 (ad536de + FMA) against int3 on the 58-case scoreboard (`t7/int4v3-compare.md`). Statuses, iterations (638) and audits are identical.
+  - Geo-mean time (cross-node): 0.835 at 1 thread, 0.911 at 16.
+  - Wins vs MOSEK: 9 → 11 at 1 thread, 9 → 8 at 16 (small-case noise).
+  - Geo-mean SDPX/MOSEK at 1 thread: LP 3.03, SDP 1.80, SOCP 1.68.
+- Observed: the run-to-run bimodality of 2–20 ms solves comes from the conservative CPU governor and cold processes, not from SDPX threading.
+
 ## 2026-10-09 — one plan; SDPB design notes; task 15 result
 
 - Reconciled the two plans: slim-repo `a450d6b` (large-case review) and perf-cc1007 (the performance campaign). There is now one `REVIEW_AND_PLAN.md`.

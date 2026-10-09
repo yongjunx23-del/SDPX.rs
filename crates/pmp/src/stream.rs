@@ -134,11 +134,14 @@ fn scan(path: &Path, emit: Emit<'_>) -> Result<Header> {
 /// A header scan supports any field order. The second pass feeds at most one
 /// matrix per worker plus the reader's current matrix. Output matches the
 /// in-memory API; errors join workers before removing this call's directory.
-/// Returns the number of converted blocks.
+/// Returns the number of converted blocks. With `resample`, blocks given as
+/// explicit sample points and scalings (PyCFTBoot/SDPB.m XML) take the SDPB
+/// 3.1 points and bases of their recovered prefactor instead.
 pub fn convert_file<T: Scalar + FromStr>(
     input: impl AsRef<Path>,
     destination: impl AsRef<Path>,
     threads: usize,
+    resample: bool,
 ) -> Result<usize> {
     require(threads > 0, "threads must be positive")?;
     let (input, destination) = (input.as_ref(), destination.as_ref());
@@ -148,6 +151,7 @@ pub fn convert_file<T: Scalar + FromStr>(
         header.normalization.as_deref(),
         header.count,
         destination,
+        resample,
         |prepared| {
             let workers = threads.min(header.count);
             if workers == 1 {

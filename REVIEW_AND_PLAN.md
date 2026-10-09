@@ -16,7 +16,10 @@ failure never counts as a performance win.
   audited scoreboard (`t7/cases.txt`), at 1 and 16 threads.
 - **MPFR (user, 2026-10-08):** beat SDPB at 768+ bits on the Ising problems
   (Λ19, Λ27, Λ35, ising11) with matched precision, thresholds, input and
-  hardware.
+  hardware. Λ35 runs at 1024 bits (user, 2026-10-09); the bar is SDPB at
+  1024 bits, 745 it / 2762 s on one 64-core node. Target (user,
+  2026-10-09): ≥2× faster than SDPB; 3× is a stretch on Λ19–Λ27, and on
+  Λ35 it needs a shorter plateau.
 - Memory: match SDPB peak PSS/RSS at matched thread counts; report
   speed/memory trade-offs rather than combining unmatched runs.
 - PMP conversion matters only when it limits input-to-solution time or
@@ -50,15 +53,15 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 | spins 0–50 (s50) | 153 it / 153.8 s | SDPB 285 s |
 | Λ19 | 121 it / 71.0 s, audited | — |
 | ising11 (512 bits) | 54 it / 3.44 s | — |
-| Λ35 spins 0–70 | fails: InsufficientProgress 887, p − ref 1.5e-26; 1024 bits Solved 743 it / 3565 s | SDPB 746 it / 2009 s |
-| Float64 58 cases (int3) | 48 audited solves, 0 Solved-but-fail; wins 9–10 (1 thr), 9 (16 thr) | MOSEK |
+| Λ35 spins 0–70, 1024 bits | Solved 743 it / 3565 s (4.80 s/it, b0088bb era; current code not yet run); at 768 bits it fails (InsufficientProgress 887) | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
+| Float64 58 cases (t16b = int5 + task 16) | 54 audited solves, 0 Solved-but-fail; wins 19 (1 thr), 12 (16 thr) | MOSEK |
 
-These Ising figures include task 15. Of the Float64 figures, wins and geo-means are from int3; the same-node geo-means below include task 13.
+These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5334dd` + FMA, plus task 16).
 
 - **Float64 geo-mean SDPX/MOSEK at 1 thread:**
-  - int3: LP 3.6–4.2, SDP 1.7–2.0, SOCP 1.7–1.9.
+  - int5: LP 2.53, SDP 1.65, SOCP 1.43 (16 threads: 2.18 / 2.29 / 1.77); int4 was 3.03 / 1.80 / 1.68.
   - Task 13, same-node A/B: LP 2.3, SDP 1.5, SOCP 1.5.
-- **Float64 not Solved:** hinf3, qap6, gpp100/124/250/500, sched_100_50_orig, csdr3, f64_medium (AlmostSolved/26), f64_large (AlmostSolved/20; 125 s at 1 thread, 48 s at 16).
+- **Float64 not Solved:** hinf3 (platform-sensitive), sched_100_50_orig, csdr3 (augmented/arrow end-game floor), f64_large (AlmostSolved/20, no Slater point; facial reduction).
 - **Tiny LPs** lose on per-solve overhead: 2–20 ms against MOSEK's warm 1–5 ms.
 
 ### Retained work (details and evidence in the journal)
@@ -88,11 +91,11 @@ These Ising figures include task 15. Of the Float64 figures, wins and geo-means 
   - Task 12: fixed-τ phase, MPFR only.
   - Task 14: data-scaled unit-fallback τ₀ (Λ27 376 → 183 it).
   - Per-factor arrow row block.
-- **Task 15 (`perf-iter` `a68f72f`, merging):**
+- **Task 15 (`perf-iter` `a68f72f`, merged `9454332`):**
   - Shared sampled linear products (bitwise identical).
   - Square-root-free Givens replay in the MPFR SVD (replay CPU −32%, audits pass).
   - Λ27 −4.9%, s50 −7.0%, Λ19 −5.3%, ising11 −4.3%.
-- **Task 13 (`perf-small` `ad536de`, gating as int4):**
+- **Task 13 (`perf-small` `ad536de`, merged; int4 gate identical statuses/iterations/audits, geo-mean 0.835/0.911 vs int3):**
   - Lazy QDLDL parallel plan; one AMD ordering; Mersenne modular minor.
   - Receipt CPU clocks only with worker threads.
   - Binary64 arrow split thresholds; PSD scratch per cone order.
@@ -140,13 +143,16 @@ These Ising figures include task 15. Of the Float64 figures, wins and geo-means 
 - **Normalized 2×2 PMP:** `AlmostSolved`/24 at MPFR512/1e-42. A tiny dual pivot is replaced by dynamic regularization, and refinement then diverges. Dynamic regularization off, or 768 bits, solves it.
 - **Cluster test:** `sampled_integration::dim2_signed_parities_ruiz_f64` is AlmostSolved on Linux since ae2a827 and passes on macOS.
 
-## Active work (two agents)
+## Active work
 
 | Task | Branch | Scope | Gate |
 |---|---|---|---|
-| 13 | `perf-small` `ad536de` | Float64 per-solve/iteration overhead (done) | int4 58-case scoreboard with FMA, then merge |
-| 15 | `perf-iter` `a68f72f` | MPFR per-iteration cost (done) | Merge; recheck with the combined build |
-| 16 | `perf-endgame` | Float64 end game: AlmostSolved → audited Solved, no test loosened | 58-case scoreboard; Λ19 ABBA if MPFR-reachable |
+| 17 | `perf-l35b` | Λ35 at 1024 bits against SDPB: baseline; two RHS via fixed τ with a general entry rule (τ and κ falling together); infeasible-start PMP mode (fixed τ, separate α_P/α_D, data-chosen start scale); safe refinement skip at the representation floor; no MPFR shifts with escalation on failure | Λ35 Solved + audit; Ising ABBA, csdr3, gravity256, 2×2 PMP no worse; infeasibility tests green |
+| 19 | `perf-scale2` | Blocked Givens replay in the MPFR SVD through the exact residue GEMM (replay is 54% of SVD CPU at Λ35/1024; est. −4.4% Λ35, −3.5% Λ27). `perf-scale` (scheduling) not kept: ±0.5% | Ising ABBA with audits; Λ35 pace; Float64 scoreboard statuses/iterations/audits unchanged |
+| 20 | `perf-t20` | Done, merged `23e0a99`: owner-MPI agreements (−1.4…8%, bitwise identical); `pmp2sdp --resample` (SDPB 3.1 points: Λ19 −38%, Λ27 −41% at τ₀ 1e-30, 0 refinement corrections). Pending: matched SDPB on resampled inputs (224375–7), full Λ35 1024 (224373/4); start rule on 3.1 inputs (Λ27 345 it at default start) | — |
+| 16 | `perf-endgame` | Done, merged `81b1549`: binary64 condensed Δs from the primal row, GMRES-IR on residual growth; 6 more Float64 cases Solved | — |
+
+Task 17 interim: with MPFR shifts off (item D, `ee4af07`, unmerged until the ABBA gate 224308), Λ35 at 768 bits is Solved in 691 it / 1886 s and audited (SDPB 768: 746 / 2009 s). The normalized 2×2 PMP is now Solved/24.
 
 ## Next work, in order
 
@@ -171,7 +177,7 @@ These Ising figures include task 15. Of the Float64 figures, wins and geo-means 
    - Rayon idle stealing is about 8% of cycles.
    - Per-component pipelines for leaf sweeps and the border factor (order-changing; audit gate).
 6. **Multi-node:**
-   - Distribute the arrow border factor (Λ35 border n 4071, replicated on every rank).
+   - (Border distribution closed: the border is 170 rows on Λ35, 2.1% at 4 nodes.)
    - Batch the refinement agreement flags (2120 of 6113 collectives).
    - The single-process multi-owner path (74.8 vs 44.2 s).
    - Rank-local residue batch eligibility after partitioning (unmeasured).
@@ -264,6 +270,11 @@ are in [the journal](docs/JOURNAL.md).
 - HKM (SDPB XZ) or mixed NT/HKM PSD direction, and NT scaling through
   eig(LᵀSL): HKM's cone update is 6.5× cheaper, but ising11/512 takes 52 → 58
   iterations and 37.1 → 41.9 s; net ≤ 0 for the condensed sampled path.
+  Task 19 re-measures it at Λ27/Λ35 scale, where scaling is 21.6% of an
+  iteration (new evidence).
+- Hypatia-style WSOS dual-barrier cone for the Ising PMPs (task 18):
+  ising11 86 vs 54 it; Λ19 gap 4.6e-9 at 107 it vs SDPX's 73; the line
+  search costs more than the factor.
 - MPFR PSD Gondzio correctors (+33% per iteration); low-rank DSDP formulas
   (already covered); Strassen or Ozaki residue GEMM (≤3%); a backward-error
   refinement stop (changes the refinement rule).

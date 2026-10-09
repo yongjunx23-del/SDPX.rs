@@ -304,8 +304,20 @@ where
         let mut switch = FixedTauSwitch::default();
         let mut chase_tau = None;
         let mut best_gap = T::infinity();
+        let mut last_residual = None;
         loop {
             self.evaluate(&mut state, &timers);
+            // Exact directions never increase the residual norms, so growth
+            // means the solves are no longer accurate enough: refine harder
+            // from here on.
+            let residual = self.info.residual_norms();
+            if residual
+                .zip(last_residual)
+                .is_some_and(|((p, d), (lp, ld))| p > lp || d > ld)
+            {
+                self.kktsystem.refine_further();
+            }
+            last_residual = residual;
             if state.iter % 10 == 0 && std::env::var_os("SDPX_START_STATS").is_some() {
                 eprintln!("start-stats iter {} {}", state.iter, self.variables.scale_stats());
             }

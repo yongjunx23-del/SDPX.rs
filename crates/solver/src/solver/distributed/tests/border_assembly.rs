@@ -66,11 +66,8 @@ fn reset<T: FloatT>(kkt: &mut OwnedKkt<T>) {
     for j in 0..kkt.border_matrix.n {
         kkt.border_matrix.nzval[kkt.border_matrix.colptr[j] + j] = kkt.shift;
     }
-    // GEMV beta=0 must discard any previous scratch content.
+    // The assembly must not read previous scratch content.
     kkt.border_rhs.fill(T::nan());
-    for work in &mut kkt.border_work {
-        work.fill(T::nan());
-    }
 }
 
 fn check<T: FloatT>() {
@@ -100,8 +97,6 @@ fn check<T: FloatT>() {
                     false,
                 );
                 let cones: Vec<_> = state.owners.into_iter().map(|o| o.cones).collect();
-                let buffers: Vec<_> = kkt.border_work.iter().map(|w| w.as_ptr()).collect();
-                assert_eq!(buffers.len(), workers.min(border));
                 assert!(kkt.update_local(&cones, &settings));
                 let expected = original(&kkt);
                 assert_eq!(kkt.border_matrix.nzval, expected);
@@ -127,13 +122,6 @@ fn check<T: FloatT>() {
                     kkt.assemble_border();
                     assert_eq!(kkt.border_matrix.nzval, expected);
                 }
-                assert_eq!(
-                    buffers,
-                    kkt.border_work
-                        .iter()
-                        .map(|w| w.as_ptr())
-                        .collect::<Vec<_>>()
-                );
             }
         }
     }

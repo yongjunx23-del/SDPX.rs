@@ -21,6 +21,8 @@ struct LocalKkt<T: FloatT> {
     width: usize,
     border_rows: Vec<usize>,
     coupling: CscMatrix<T>,
+    /// Row-grouped view of `coupling` for the border assembly.
+    coupling_rows: CouplingRows,
     /// Lanes for the border coupling products (54 x ~1200 dense on Λ19
     /// spins 0-50; 18 of 77 s serial on a 32-thread rank without them).
     coupling_plan: SparseParallel,
@@ -154,6 +156,16 @@ impl<T: FloatT> Point<T> {
         }
         self.border.copy_from_slice(&other.border);
     }
+    fn fill(&mut self, c: T) {
+        for v in self
+            .blocks
+            .iter_mut()
+            .flatten()
+            .chain(self.border.iter_mut())
+        {
+            *v = c;
+        }
+    }
     fn scale(&mut self, c: T) {
         for v in self
             .blocks
@@ -249,7 +261,6 @@ pub(crate) struct OwnedKkt<T: FloatT> {
     border_matrix: CscMatrix<T>,
     border_factor: DirectLDLKKTSolver<T>,
     border_rhs: Vec<T>,
-    border_work: Vec<Vec<T>>,
     inner: Option<Work<T>>,
     outer: Option<Work<T>>,
     // One extra lane; the scalar inner/outer workspaces provide the other
@@ -356,6 +367,7 @@ impl<T: FloatT> OwnedKkt<T> {
                 // Only coupling entries are selected, not all data columns/rows.
                 let columns: Vec<_> = (0..data.n).collect();
                 let coupling = select_rows(&data.A, &rows, &columns);
+                let coupling_rows = CouplingRows::new(&coupling);
                 let mut coupling_plan = SparseParallel::new(&coupling);
                 coupling_plan.configure(&coupling, pool.clone());
                 let cells = kernel.interior_dimension() * border;
@@ -365,6 +377,7 @@ impl<T: FloatT> OwnedKkt<T> {
                     width: data.n + data.m,
                     border_rows: rows,
                     coupling,
+                    coupling_rows,
                     coupling_plan,
                     coupling_rhs: vec![T::zero(); cells],
                     response: vec![T::zero(); cells],
@@ -402,16 +415,11 @@ impl<T: FloatT> OwnedKkt<T> {
             .map(|l| l.kernel.interior_dimension())
             .collect();
         let original: Vec<_> = locals.iter().map(|l| l.width).collect();
-        let lanes = pool
-            .as_ref()
-            .map_or(1, |p| p.current_num_threads())
-            .min(border);
         Self {
             locals,
             border_matrix: matrix,
             border_factor: factor,
             border_rhs: vec![T::zero(); border],
-            border_work: (0..lanes).map(|_| vec![T::zero(); border]).collect(),
             inner: Some(Work::new(&interior, border)),
             outer: Some(Work::new(&original, border)),
             // Pair lanes are allocated lazily; scalar-only callers retain
@@ -600,51 +608,41 @@ impl<T: FloatT> OwnedKkt<T> {
         let border = self.border_matrix.n;
         let locals = &self.locals;
         let pointers = &self.border_matrix.colptr;
-        // Each column retains the same local GEMV and owner summation order.
-        // Only disjoint output columns run concurrently. Scratch is O(p * B),
-        // rather than storing an O(B^2) contribution for every owner.
-        let assemble = |first: usize, last: usize, values: &mut [T], work: &mut [T]| {
-            let base = pointers[first];
-            for j in first..last {
-                let column = &mut values[pointers[j] - base..pointers[j + 1] - base];
-                for local in locals {
-                    let d = local.kernel.interior_dimension();
-                    local.coupling.gemv(
-                        work,
-                        &local.response[j * d..j * d + local.n],
-                        T::one(),
-                        T::zero(),
-                    );
-                    for (entry, &value) in column.iter_mut().zip(work.iter()) {
-                        *entry += value;
-                    }
+        // Column j of the upper triangle needs coupling rows 0..=j only. Each
+        // entry is the value the full local GEMV gives that row (same terms,
+        // order and rounding) added in owner order, so the matrix is
+        // unchanged while about half the products are skipped. Columns are
+        // independent; the row grouping is built once, not per GEMV.
+        let assemble = |j: usize, column: &mut [T]| {
+            for local in locals {
+                let d = local.kernel.interior_dimension();
+                let x = &local.response[j * d..j * d + local.n];
+                for (i, entry) in column.iter_mut().enumerate() {
+                    *entry += local.coupling_rows.value(&local.coupling, i, x);
                 }
             }
         };
-        if let Some(pool) = self.pool.as_ref().filter(|_| self.border_work.len() > 1) {
-            let lanes = self.border_work.len();
-            let mut remaining = self.border_matrix.nzval.as_mut_slice();
-            pool.install(|| {
-                rayon::scope(|scope| {
-                    let mut first = 0;
-                    for (lane, work) in self.border_work.iter_mut().enumerate() {
-                        let last = border * (lane + 1) / lanes;
-                        let (values, tail) =
-                            remaining.split_at_mut(pointers[last] - pointers[first]);
-                        remaining = tail;
-                        let assemble = &assemble;
-                        scope.spawn(move |_| assemble(first, last, values, work));
-                        first = last;
-                    }
+        let mut columns: Vec<(usize, &mut [T])> = Vec::with_capacity(border);
+        let mut remaining = self.border_matrix.nzval.as_mut_slice();
+        for j in 0..border {
+            let (column, tail) = remaining.split_at_mut(pointers[j + 1] - pointers[j]);
+            columns.push((j, column));
+            remaining = tail;
+        }
+        match self.pool.as_ref().filter(|p| p.current_num_threads() > 1) {
+            Some(pool) => {
+                // Longest columns first; workers take one column at a time.
+                columns.reverse();
+                pool.install(|| {
+                    columns
+                        .into_par_iter()
+                        .with_max_len(1)
+                        .for_each(|(j, column)| assemble(j, column))
                 });
-            });
-        } else {
-            assemble(
-                0,
-                border,
-                &mut self.border_matrix.nzval,
-                &mut self.border_rhs,
-            );
+            }
+            None => columns
+                .into_iter()
+                .for_each(|(j, column)| assemble(j, column)),
         }
         self.collective
             .reduce_sum_in_place(103, &mut self.border_matrix.nzval)
@@ -1175,18 +1173,14 @@ impl<T: FloatT> OwnedKkt<T> {
                 T::one(),
             );
         }
+        // The reduced border RHS is identical on every rank, so its
+        // finiteness needs no agreement of its own.
         if self
             .collective
             .reduce_sum_in_place(240, &mut self.border_rhs)
             .is_err()
+            || !self.border_rhs.is_finite()
         {
-            return false;
-        }
-        let valid = self
-            .collective
-            .all_true(241, self.border_rhs.is_finite())
-            .unwrap_or(false);
-        if !valid {
             return false;
         }
         if !self
@@ -1226,6 +1220,8 @@ impl<T: FloatT> OwnedKkt<T> {
             prepare
         );
         work.b.border.copy_from_slice(&rhs.border);
+        // Both outcomes are already agreed: every exit of the reduced solve
+        // and of the refinement follows a collective or a replicated value.
         let mut success = self.solve_reduced_raw(&mut work.x, &work.b)
             && refine(
                 &mut OwnedRefinement {
@@ -1237,7 +1233,6 @@ impl<T: FloatT> OwnedKkt<T> {
                 },
                 settings,
             );
-        success = self.collective.all_true(290, success).unwrap_or(false);
         if success {
             success = self.recover_original_work(out, rhs, &work.x, None);
             success = self.collective.all_true(291, success).unwrap_or(false);
@@ -1476,20 +1471,64 @@ impl<T: FloatT> OwnedKkt<T> {
         for (e, &b) in out.border.iter_mut().zip(&rhs.border) {
             *e += b;
         }
-        let finite = self
-            .collective
-            .all_true(321, out.norm().is_finite())
-            .unwrap_or(false);
-        let norm = self
-            .collective
+        // `Point::norm` is infinite on any non-finite entry, so the global
+        // maximum also carries finiteness.
+        self.collective
             .reduce_max(322, &[out.norm()])
             .ok()
             .and_then(|values| values.into_iter().next())
-            .unwrap_or(T::infinity());
-        if finite {
-            norm
+            .unwrap_or(T::infinity())
+    }
+}
+
+/// Entries of a CSC matrix grouped by row, each row in column order: the
+/// grouping `_csc_axpby_N` builds per call, kept so one output row of the
+/// product can be formed alone with the same terms in the same order.
+struct CouplingRows {
+    ptr: Vec<usize>,
+    /// `(position in nzval, column)` per entry.
+    entries: Vec<(usize, usize)>,
+    /// Whether the CSC product takes its exact wide-precision path.
+    wide: bool,
+}
+
+impl CouplingRows {
+    fn new<T: FloatT>(a: &CscMatrix<T>) -> Self {
+        let mut ptr = vec![0usize; a.m + 1];
+        for &r in &a.rowval {
+            ptr[r + 1] += 1;
+        }
+        for i in 0..a.m {
+            ptr[i + 1] += ptr[i];
+        }
+        let mut next = ptr.clone();
+        let mut entries = vec![(0usize, 0usize); a.nnz()];
+        for j in 0..a.n {
+            for k in a.colptr[j]..a.colptr[j + 1] {
+                let r = a.rowval[k];
+                entries[next[r]] = (k, j);
+                next[r] += 1;
+            }
+        }
+        Self {
+            ptr,
+            entries,
+            wide: T::precision_bits() > 64 && a.nnz() >= 4 * a.m,
+        }
+    }
+
+    /// Row `i` of `a·x`, bitwise equal to `a.gemv(y, x, 1, 0)` at `y[i]`.
+    fn value<T: FloatT>(&self, a: &CscMatrix<T>, i: usize, x: &[T]) -> T {
+        let row = &self.entries[self.ptr[i]..self.ptr[i + 1]];
+        if self.wide {
+            let terms = row.iter().map(|&(k, j)| (&a.nzval[k], &x[j]));
+            crate::algebra::wide_output(T::zero(), terms, T::one(), T::one())
         } else {
-            T::infinity()
+            let mut y = T::zero();
+            for &(k, j) in row {
+                y += a.nzval[k] * x[j];
+            }
+            y
         }
     }
 }
@@ -1532,6 +1571,13 @@ impl<T: FloatT> Refinement<T> for OwnedRefinement<'_, T> {
             .agree_u32(701, value)
             .unwrap_or(false)
     }
+    fn agree_pair(&self, ok: bool, decision: u32) -> bool {
+        self.solver
+            .collective
+            .agree_u32(702, decision.saturating_mul(2) | u32::from(!ok))
+            .unwrap_or(false)
+            && ok
+    }
     fn rhs_norm(&self) -> T {
         self.solver
             .collective
@@ -1565,12 +1611,21 @@ impl<T: FloatT> Refinement<T> for OwnedRefinement<'_, T> {
     }
     fn solve_correction(&mut self, settings: &CoreSettings<T>) -> bool {
         self.solver.refinements += 1;
-        if self.reduced {
+        let solved = if self.reduced {
             self.solver.solve_reduced_fused(&mut self.work.candidate)
         } else {
             self.solver
                 .solve_original(&mut self.work.candidate, &self.work.error, settings)
+        };
+        if !solved {
+            // The next residual (a global maximum) is then non-finite on
+            // every rank, which fails refinement in the residual's agreement.
+            self.work.candidate.fill(T::nan());
         }
+        solved
+    }
+    fn defers_solve_agreement(&self) -> bool {
+        true
     }
     fn add_correction(&mut self) {
         self.work.candidate.add(&self.work.x);
