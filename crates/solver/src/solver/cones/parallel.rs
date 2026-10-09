@@ -301,6 +301,56 @@ fn width_factor() -> f64 {
     WIDTH_FACTOR
 }
 
+/// Keep serial solve work on the first allocated CPU while existing worker
+/// pools retain the full allocation. Restore the caller's mask on return.
+pub(crate) struct SolveAffinityGuard {
+    #[cfg(target_os = "linux")]
+    original: Option<libc::cpu_set_t>,
+}
+
+impl SolveAffinityGuard {
+    pub(crate) fn enter(budget: usize) -> Self {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let mut original: libc::cpu_set_t = std::mem::zeroed();
+            let size = std::mem::size_of::<libc::cpu_set_t>();
+            if budget > 1
+                && libc::sched_getaffinity(0, size, &mut original) == 0
+                && libc::CPU_COUNT(&original) as usize == budget
+            {
+                let first = (0..libc::CPU_SETSIZE as usize)
+                    .find(|&cpu| libc::CPU_ISSET(cpu, &original))
+                    .unwrap();
+                let mut pinned: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_SET(first, &mut pinned);
+                if libc::sched_setaffinity(0, size, &pinned) == 0 {
+                    return Self {
+                        original: Some(original),
+                    };
+                }
+            }
+            Self { original: None }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = budget;
+            Self {}
+        }
+    }
+}
+
+impl Drop for SolveAffinityGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(original) = &self.original {
+            // This guard stays on Solver::solve's calling thread.
+            unsafe {
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), original);
+            }
+        }
+    }
+}
+
 /// SDPB-style static placement: when the process is bound to exactly as
 /// many CPUs as the requested thread budget (numactl/taskset/MPI binding
 /// gave it its own cores), worker `i` is bound to the i-th of them for its

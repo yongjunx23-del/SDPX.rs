@@ -274,6 +274,9 @@ where
 {
     fn solve(&mut self) {
         let _receipt_scope = crate::receipt::Scope::begin();
+        let _affinity = crate::solver::cones::SolveAffinityGuard::enter(
+            crate::solver::core::worker_budget(self.settings.core().max_threads as usize),
+        );
         // Long vector operations on this thread use the cone worker pool.
         let _vector_pool = crate::algebra::VectorPoolGuard::install(self.cones.worker_pool());
         self.kktsystem.reset_solve();

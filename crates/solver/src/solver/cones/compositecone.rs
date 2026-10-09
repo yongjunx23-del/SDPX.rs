@@ -2,7 +2,7 @@ use super::*;
 #[path = "parallel.rs"]
 mod cone_parallel;
 use crate::algebra::triangular_number;
-pub(crate) use cone_parallel::pin_worker;
+pub(crate) use cone_parallel::{pin_worker, SolveAffinityGuard};
 use cone_parallel::ConeThreading;
 use rayon::prelude::*;
 use std::collections::HashMap;
