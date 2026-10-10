@@ -275,14 +275,85 @@ pub fn memory_mark(label: &str) {
     if profile_requested() {
         if let Some(bytes) = peak_rss_bytes() {
             let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+            let heap = heap_bytes()
+                .map(|(free, arena)| {
+                    format!(" heap_free={:.0} MiB arena={:.0} MiB", mib(free), mib(arena))
+                })
+                .unwrap_or_default();
             match current_rss_bytes() {
                 Some(now) => eprintln!(
-                    "MEMORY {label} peak_rss={:.0} MiB rss={:.0} MiB",
+                    "MEMORY {label} peak_rss={:.0} MiB rss={:.0} MiB{heap}",
                     mib(bytes),
                     mib(now)
                 ),
-                None => eprintln!("MEMORY {label} peak_rss={:.0} MiB", mib(bytes)),
+                None => eprintln!("MEMORY {label} peak_rss={:.0} MiB{heap}", mib(bytes)),
             }
+        }
+    }
+}
+
+/// Free bytes held in glibc's arenas and the arena bytes obtained from the
+/// system (`malloc_info` totals over every arena; mmapped chunks excluded).
+#[cfg(target_os = "linux")]
+fn heap_bytes() -> Option<(u64, u64)> {
+    use std::os::raw::{c_char, c_int, c_void};
+    extern "C" {
+        fn open_memstream(ptr: *mut *mut c_char, size: *mut usize) -> *mut c_void;
+        fn malloc_info(options: c_int, stream: *mut c_void) -> c_int;
+        fn fclose(stream: *mut c_void) -> c_int;
+        fn free(ptr: *mut c_void);
+    }
+    let (mut buf, mut len) = (std::ptr::null_mut::<c_char>(), 0usize);
+    // SAFETY: the stream owns `buf` until `fclose`, after which it is a
+    // malloc'd buffer of `len` bytes that we copy and free.
+    let text = unsafe {
+        let stream = open_memstream(&mut buf, &mut len);
+        if stream.is_null() {
+            return None;
+        }
+        let ok = malloc_info(0, stream) == 0;
+        fclose(stream);
+        let text = (!buf.is_null()).then(|| {
+            String::from_utf8_lossy(std::slice::from_raw_parts(buf as *const u8, len)).into_owned()
+        });
+        free(buf as *mut c_void);
+        if !ok {
+            return None;
+        }
+        text?
+    };
+    // The totals after the last heap cover every arena.
+    let tail = &text[text.rfind("</heap>")?..];
+    let size = |tag: &str| -> Option<u64> {
+        let rest = &tail[tail.find(tag)?..];
+        let start = rest.find("size=\"")? + 6;
+        rest[start..start + rest[start..].find('"')?].parse().ok()
+    };
+    Some((
+        size("<total type=\"fast\"")? + size("<total type=\"rest\"")?,
+        size("<system type=\"current\"")?,
+    ))
+}
+#[cfg(not(target_os = "linux"))]
+fn heap_bytes() -> Option<(u64, u64)> {
+    None
+}
+
+/// Experiment switch `SDPX_MALLOC_TRIM`: return free arena pages to the
+/// system at each iteration start (glibc `malloc_trim(0)`; Linux only).
+pub fn trim_heap() {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("SDPX_MALLOC_TRIM").is_some()) {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> std::os::raw::c_int;
+        }
+        // SAFETY: malloc_trim only releases free memory.
+        unsafe {
+            malloc_trim(0);
         }
     }
 }
