@@ -53,7 +53,7 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 | spins 0–50 (s50) | 153 it / 153.8 s | SDPB 285 s |
 | Λ19 | 121 it / 71.0 s, audited | — |
 | ising11 (512 bits) | 54 it / 3.44 s | — |
-| Λ35 spins 0–70, 1024 bits | Solved 683 it / 2426.5 s (3.55 s/it), audited; 768 bits Solved 691 it / 1886 s, audited | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
+| Λ35 spins 0–70, 1024 bits | Solved 435 it / 2098.8 s (4.82 s/it, other node), audited (perf-mc-impl mci19; was 683 it / 2426.5 s); 768 bits Solved 691 it / 1886 s, audited | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
 | Float64 58 cases (t16b = int5 + task 16) | 54 audited solves, 0 Solved-but-fail; wins 19 (1 thr), 12 (16 thr) | MOSEK |
 
 These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5334dd` + FMA, plus task 16).
@@ -110,6 +110,8 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 | 22 | `perf-f64mc` | Binary64 and non-PSD cone multi-thread scaling on large cases (user, 2026-10-09: small cases are too small for threads): gravity-large (n 20202, m 20299), SU(2) medium/large, gpp500, arch0, large LPs, against MOSEK at 1–32 threads; small cases only need a measured-work guard so 16 threads never loses to 1. Also owns lock-free receipts and the process-wide pool cache (the per-call pool sites are test-only). Phase 1: serial phases run about 2× slower at t>1 under the conservative governor because the unpinned main thread hops cores | 58-case scoreboard at 1 and 16 threads unchanged; same-node A/B; large cases audited; ising11 bitwise |
 
 Task 21 first fixes (journal 2026-10-10, branch `perf-mc-impl`): 128-thread Λ27 −13%, Λ35-rs −14%, mixed Λ27/1024 −12% per iteration (64 threads −2…−9%), audited; the τ-chase restart is now on by default for MPFR unit starts (Λ27-rs 345 → 210 it). Mixed at 128 threads trades +13 GiB peak RSS for its gain.
+
+Automatic τ rule (journal 2026-10-10, perf-mc-impl mci19, convergence contract, audited): large KKT start scales start at eps^(1/8); a start that still chases restarts once at eps^(1/3). Λ35-rs/1024 680 → 423 it, Λ35/1024 688 → 435, Λ27-rs 210 → 138; Λ27, Λ19-rs, ising11 unchanged. Not merged; gravity256 and the Float64 scoreboard still need a check before merge.
 
 Task 17 items D/E passed their gates and are merged. The normalized 2×2 PMP is Solved/24. Resampling remains opt-in, and converter threads default to one; the proposed new defaults require the remaining start-rule gate.
 

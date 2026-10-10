@@ -8,6 +8,29 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-10 — automatic τ start and second chase restart; mixed setup and batching (perf-mc-impl)
+
+- Hypothesis: an over-large KKT start scale predicts a τ chase, so such starts should begin at the restart scale; a start that still chases (τ falls far below its own peak while the gap stalls) needs one deeper restart. One rule, no per-input settings.
+- Change (convergence contract):
+  1. `d2c2e28`: a wide-type accepted KKT start with `‖s‖∞·‖z‖∞ > 1e15` starts at `eps^(1/8)` (3e-39 at 1024 bits, 1.4e-29 at 768).
+  2. `9a9e20e`, `558a50b`: such an automatic start keeps the chase test armed, measured against its peak τ instead of τ₀, anchored only once the gap is below 1e-6, and restarts once at `eps^(1/3)` (2.2e-103 at 1024 bits). The convergence-phase anchor fixes a false restart in mci17: Λ27-rs anchored at its start (gap ~1e-222), stalled near gap 1e-13 at iterations 89–99 with τ 100× below its early peak, and restarted at 99 (job 224624, cancelled).
+- Probes (mci15, fixed start τ, 64 threads): Λ35-rs/1024 605 it from the automatic start (one chase from 3e-33 to 2.5e-89 over ~470 it), 535/405/283/284 it from 1e-50/1e-70/1e-90/1e-120; Λ27-rs/768 138/158/200 it from 1e-29/1e-50/1e-78. A small fixed start helps Λ35-rs and hurts Λ27-rs, so the deep start is taken only after a detected chase.
+- Result (mci19, full solves, 64 threads, jobs 224631–224633; all audited, 224636/224637):
+
+  | Case | mci13 | mci15 (start rule) | mci19 |
+  |---|---|---|---|
+  | Λ35-rs/1024 | 680 it / 2340 s | 605 / 2102 | 423 / 1581 (restart at 169) |
+  | Λ35/1024 | 688 / 2572 | — | 435 / 2099 (restart at 173) |
+  | Λ27-rs/768 | 210 / 210 | 138 / 137 | 138 / 145 |
+  | Λ19-rs/768 | 89 | 89 | 89 |
+  | Λ27/768 | 183 / 235 | — | 183 / 234 |
+  | ising11/512 | 54 | 54 | 54 |
+
+  Final relative gaps: Λ35-rs 9e-44, Λ35 5e-44. SDPB on Λ35-rs: 734 it / 2749 s.
+- Mixed Λ27/1024 setup: the Ruiz norm and bound passes and the sampled rescaling run on the pool (`43b0c9c`): setup 48 → 25.5 s, points bitwise identical.
+- Contribution batches are sized by working-precision bytes in equal-count batches (`331b21a`). The first byte bound counted residues, about 8× too much, and split mixed into 2–3-leaf batches. mci16 vs mci14 mixed: 64 threads 28.1 → 25.5 s/it, 128 threads 32.3 → 25.9; bitwise identical to mci15.
+- Not kept (reverted in `216d7bd`): one-panel lookahead in the border factor (`9c2ffe5`, bitwise identical). ABBA mci17 → mci19 (jobs 224634/224635): border 0.46 → 0.69 s/it on mixed at 64 threads and 0.56 → 0.66 at 128; Λ35-rs 2.85 → 2.91 s/it at 64 threads. The lookahead task updates the next panel serially, which lengthens the critical path.
+
 ## 2026-10-10 — task 21 first fixes: 128-thread scaling and the resampled start (perf-mc-impl)
 
 - Evidence (task 21 curves, 2026-10-09, `hpc:.../mc/logs/scale-p1-*`, `trace-tr-*`, `mixed-m1-*`): SDPX beat SDPB per iteration at ≤32 cores but flattened past 64 (Λ35/1024 at 128: 3.38 vs 2.55 s/it). Traces: every block phase waited for its single largest task; mixed Λ27/1024 arrow contributions got slower from 64 to 128 threads (only full pool-width leaf groups were batched, so 117 leaves on 128 workers fell to per-entry exact dots); μ+info scans ran serially (4× concurrency).
