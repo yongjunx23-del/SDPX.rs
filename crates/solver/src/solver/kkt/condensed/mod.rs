@@ -1225,6 +1225,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             }
             colptr.push(nzval.len());
         }
+        crate::receipt::memory_mark("kkt cone blocks");
         let nr = retained_rows.len();
         let retained_A = CscMatrix::new(nr, n, colptr, rowval, nzval);
         // Exact structural union. Each PSD block couples its active columns;
@@ -1357,6 +1358,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         debug_assert_eq!(kkt.colptr[..n + 1], schur.colptr);
         debug_assert_eq!(kkt.rowval[..count], schur.rowval);
         drop(schur);
+        crate::receipt::memory_mark("kkt reduced solver");
         let mut solver = Self {
             local_only,
             n,

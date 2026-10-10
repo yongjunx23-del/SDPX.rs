@@ -388,8 +388,8 @@ where
             }
             // Only iterations that update the KKT system are counted.
             state.iter += 1;
-            if state.iter <= 2 {
-                crate::receipt::memory_mark(if state.iter == 1 { "iteration 1 start" } else { "iteration 2 start" });
+            if state.iter <= 3 && crate::receipt::profile_requested() {
+                crate::receipt::memory_mark(&format!("iteration {} start", state.iter));
             }
             match self.direction(&mut state, &mut curve) {
                 Flow::Proceed => {}
@@ -771,6 +771,9 @@ mod internal {
             timeit! {"kkt update"; {
                 ok = self.kktsystem.update_affine(&self.data, &self.cones, &self.step_rhs, &self.variables, &self.settings);
             }}
+            if state.iter <= 3 && crate::receipt::profile_requested() {
+                crate::receipt::memory_mark(&format!("iteration {} kkt updated", state.iter));
+            }
             ok = crate::mpi::all_succeeded(ok);
             timeit! {"kkt solve"; {
                 ok = ok && self.kktsystem.solve(

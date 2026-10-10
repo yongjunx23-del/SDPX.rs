@@ -274,12 +274,24 @@ pub fn peak_rss_bytes() -> Option<u64> {
 pub fn memory_mark(label: &str) {
     if profile_requested() {
         if let Some(bytes) = peak_rss_bytes() {
-            eprintln!(
-                "MEMORY {label} peak_rss={:.0} MiB",
-                bytes as f64 / (1u64 << 20) as f64
-            );
+            let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+            match current_rss_bytes() {
+                Some(now) => eprintln!(
+                    "MEMORY {label} peak_rss={:.0} MiB rss={:.0} MiB",
+                    mib(bytes),
+                    mib(now)
+                ),
+                None => eprintln!("MEMORY {label} peak_rss={:.0} MiB", mib(bytes)),
+            }
         }
     }
+}
+
+/// Resident set size now (Linux `/proc/self/statm`, 4 KiB pages).
+fn current_rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4096)
 }
 
 /// Cached profile configuration; disabled instrumentation does no environment lookup.

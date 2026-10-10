@@ -83,8 +83,10 @@ where
             augmented()
         };
 
+        crate::receipt::memory_mark("kkt built");
         if let Some(operator) = &data.sampled {
             kktsolver.set_sampled_operator(std::sync::Arc::clone(operator));
+            crate::receipt::memory_mark("kkt sampled installed");
         }
 
         Self {
