@@ -226,9 +226,13 @@ impl<T: FloatT> DenseLeaf<T> {
     /// [`Self::factor_signed`] in panels of `FACTOR_PANEL` pivots: each
     /// panel's columns are factored serially, then every later column
     /// receives the panel's updates in ascending pivot order in one parallel
-    /// pass (one join per panel instead of per pivot). Entry (i, j) still
-    /// sees the fused updates k = 0, 1, ..., j-1 in order with the same
-    /// operands, so the factor is bitwise identical to the serial loop.
+    /// pass (one join per panel instead of per pivot). With one panel of
+    /// lookahead, a single task updates and factors the next panel while the
+    /// others update the remaining columns (mixed Λ27/1024's 524-row border
+    /// took 0.57 s at 64 threads and 1.40 s at 128 with the panels serial).
+    /// Entry (i, j) still sees the fused updates k = 0, 1, ..., j-1 in order
+    /// with the same operands, so the factor is bitwise identical to the
+    /// serial loop.
     fn factor_panels(
         &mut self,
         signs: &[i8],
@@ -237,43 +241,68 @@ impl<T: FloatT> DenseLeaf<T> {
     ) -> Result<(), &'static str> {
         let n = self.n;
         let mut d = vec![T::zero(); n];
-        let mut p = 0;
-        while p < n {
-            let pe = (p + FACTOR_PANEL).min(n);
+        // Factor columns p..pe of `cols` (column p first), whose earlier
+        // updates are complete.
+        let factor = |cols: &mut [T], d: &mut [T], dinv: &mut [T], p: usize, count: &mut usize| {
+            let pe = p + d.len();
             for k in p..pe {
+                let c = (k - p) * n;
                 let s = T::from_i8(signs[if signs.len() == 1 { 0 } else { k }]).unwrap();
-                let dk = Self::pivot(self.l[k + k * n], s, reg, regularize_count)?;
-                d[k] = dk;
-                self.dinv[k] = T::one() / dk;
-                self.l[k + k * n] = T::one();
+                let dk = Self::pivot(cols[k + c], s, reg, count)?;
+                d[k - p] = dk;
+                dinv[k - p] = T::one() / dk;
+                cols[k + c] = T::one();
                 for i in k + 1..n {
-                    self.l[i + k * n] *= self.dinv[k];
+                    cols[i + c] *= dinv[k - p];
                 }
                 for j in k + 1..pe {
-                    let v = self.l[j + k * n] * dk;
+                    let v = cols[j + c] * dk;
+                    let cj = (j - p) * n;
                     for i in j..n {
-                        self.l[i + j * n] = (-self.l[i + k * n]).mul_add(v, self.l[i + j * n]);
+                        cols[i + cj] = (-cols[i + c]).mul_add(v, cols[i + cj]);
                     }
                 }
             }
-            if pe < n {
-                let (head, tail) = self.l.split_at_mut(pe * n);
-                let panel = &head[p * n..];
-                let d = &d[p..pe];
-                tail.par_chunks_mut(n)
-                    .enumerate()
-                    .for_each(|(offset, column)| {
-                        let j = pe + offset;
-                        for (q, &dk) in d.iter().enumerate() {
-                            let pivot = &panel[q * n..(q + 1) * n];
-                            let v = pivot[j] * dk;
-                            for i in j..n {
-                                column[i] = (-pivot[i]).mul_add(v, column[i]);
-                            }
-                        }
-                    });
+            Ok(())
+        };
+        // Column j's updates from the factored panel `panel` (pivots p..).
+        let update = |panel: &[T], d: &[T], j: usize, column: &mut [T]| {
+            for (q, &dk) in d.iter().enumerate() {
+                let pivot = &panel[q * n..(q + 1) * n];
+                let v = pivot[j] * dk;
+                for i in j..n {
+                    column[i] = (-pivot[i]).mul_add(v, column[i]);
+                }
             }
+        };
+        let mut pe = FACTOR_PANEL.min(n);
+        factor(&mut self.l[..pe * n], &mut d[..pe], &mut self.dinv[..pe], 0, regularize_count)?;
+        let mut p = 0;
+        while pe < n {
+            let ne = (pe + FACTOR_PANEL).min(n);
+            let (head, tail) = self.l.split_at_mut(pe * n);
+            let (next, rest) = tail.split_at_mut((ne - pe) * n);
+            let panel = &head[p * n..];
+            let (done, ahead) = d.split_at_mut(pe);
+            let dp = &done[p..];
+            let dinv = &mut self.dinv[pe..ne];
+            let (factored, ()) = rayon::join(
+                || {
+                    for (offset, column) in next.chunks_mut(n).enumerate() {
+                        update(panel, dp, pe + offset, column);
+                    }
+                    let mut count = 0;
+                    factor(next, &mut ahead[..ne - pe], dinv, pe, &mut count).map(|()| count)
+                },
+                || {
+                    rest.par_chunks_mut(n)
+                        .enumerate()
+                        .for_each(|(offset, column)| update(panel, dp, ne + offset, column))
+                },
+            );
+            *regularize_count += factored?;
             p = pe;
+            pe = ne;
         }
         Ok(())
     }
