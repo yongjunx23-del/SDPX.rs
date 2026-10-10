@@ -8,6 +8,52 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-11 — levers L1–L9 and wave balance at 64 threads (perf-mc-impl)
+
+ABBA legs are A1 B1 B2 A2 on one node at 64 threads, giving s/it means. Λ35-rs/1024 runs 10 or 30 iterations; mixed and mixrs Λ27/1024 run 3. Full solves use t17case with SDPX_TRACE_TAU.
+
+- **Y-solve by exact-dot rows (`a115328`, yr64, job 224775): kept.**
+  - mixrs 18.79 → 17.31 s/it (−7.9%); Λ35-rs 2.861 → 2.772 (−3.1%).
+  - Points differ, and the full-solve audit (224800) accepts them.
+- **Exact power-of-two operand balancing (bal64, 224779): reverted (`18241a5`).**
+  - mixrs 17.40 → 17.80 (+2.3%); Λ35-rs 2.798 → 2.780 (−0.7%).
+- **Allocator settings: not kept.**
+  - `MALLOC_ARENA_MAX=16` (arena64, 224777): mixed 25.56 → 27.89 s/it (+9%) for RSS 29.7 → 27.7 GB.
+  - `SDPX_MALLOC_TRIM=1` (trim64, 224786): mixed +0.7% for peak RSS 29.1 → 28.0 GB (−3.8%). It stays opt-in.
+- **L3, host-tuned GMP (`GMPHOST=1`, gmp26, 224817): kept for cluster builds.**
+  - Λ35-rs 2.849 → 2.744 (−3.7%), mixed −1.1%, points bitwise identical.
+- **L2, cached R and R⁻¹ residues in mul_W: rejected.** About 0.6% gain for about 270 MB more peak memory on Λ35-rs.
+- **L9, full Newton step when the boundary step exceeds 1/f (`SDPX_TEST_FULL_STEP`, fs26 vs g25): rejected.** No iteration saving:
+
+  | Case | g25 | fs26 |
+  |---|---|---|
+  | Λ35-rs | 423 | 427 |
+  | Λ35 | 435 | 435 |
+  | Λ27 | 183 | 184 |
+  | Λ27-rs | 138 | 142 |
+  | Λ19-rs | 89 | 89 |
+  | ising11 | 54 | 54 |
+
+- **L5, cone SVD bidiagonal QR (sv28 dumps every 151st call on Λ35-rs): no cheaper sweep found.**
+  - About 3.5 shifted sweeps per singular value, which is cubic convergence to 1024-bit tolerance; the zero-shift sweep never fires.
+  - About 6,885 V rotations per call; the replay is about 57% of SVD time.
+  - A LAPACK-style directed sweep did not cut sweeps and was reverted.
+  - Divide and conquer (V only, merges as exact residue gemms) is estimated at about −4% per iteration. Deferred.
+- **L1, earlier τ-chase detection by τ fall rate: shelved.**
+  - Λ27-rs, a converging unit start, has τ falling 2.2 decades between iterations 90 and 105. A rate rule that fires early on Λ35-rs would also fire there.
+- **Residue-product way overhead (`congruence_way_overhead`, ignored test):** 8 ways cost +7.5% at n=57 and +14–23% at n=48, and save 5% at n=160.
+- **Wave balance, LPT-planned ways per parallel phase (`planned_ways`):**
+  - wb27 (cones and condensed KKT, 224815): cone phases −10…−35%, KKT prepare/recover/residual +6…+12%. Net Λ35-rs +0.9%, mixed +0.8%. Not kept.
+  - wb29 (cone lanes only, KKT back on `measured_ways`, 224835): Λ35-rs 2.940 → 2.867 s/it (−2.5%), with combined RHS 0.119 → 0.075 s and step lengths about 0.100 → 0.089 s.
+  - Mixed Λ27 changes only in Schur noise; its cone phases are unchanged. Points are bitwise identical.
+  - Kept (`2dff54b`).
+- **Integration tests (task 15), bisected:**
+  - `actual_chordal_fallback_{f64,mpfr256}` changed with `5b9980e`: setup now preserves sampled factors, so the chordal pass has nothing to change. The test was updated to `actual_chordal_keeps_factors_*` (`2dff54b`).
+  - `overshooting_start_still_solves` changed with `b718ace`, the commit that removed the MPFR static shift.
+    - Observed: after an accepted 0.99 step a PSD block of z leaves the cone, so the step length and Δz disagree.
+    - A static shift of eps^(3/4) makes the test pass. A step retake and tighter refinement do not.
+    - Still failing. Changing the regularization default is a convergence-contract decision.
+
 ## 2026-10-10 — short-step stop removed; unconverged ends report the best iterate (perf-mc-impl)
 
 User report: the step-length cutoff made solvable models fail ("for high

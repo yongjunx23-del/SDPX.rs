@@ -84,7 +84,7 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 
 - **Λ35 conditioning:** the dual has no Slater point and both solvers retain a long gap plateau. Task 17 resolved the former 768-bit floor: Solved and audited at 768/1024 bits (scoreboard above). Shortening the plateau remains performance work.
 - **Mixed Lambda27 MPFR1024 (frozen 0.9.1):** `Solved`/42 but fails the 1e-30 original-coordinate audit: dual 1.475e-23, primal 3.73e-28, PSD link 2.73e-26, componentwise dual 0.84355. The resampled input (2026-10-10) also fails (dual 2.34e-23) and takes 57 iterations.
-- **Integration tests failing on `main` (ee235b4) and `perf-mc-impl`:** `actual_chordal_fallback_{f64,mpfr256}` (fixture no longer changed by the chordal pass) and `overshooting_start_still_solves` (NumericalError from τ₀ 1e-70). Cause not yet bisected.
+- **Integration test failing on `main` (ee235b4) and `perf-mc-impl`:** `overshooting_start_still_solves` (NumericalError from τ₀ 1e-70), since `b718ace` removed the MPFR static shift. After an accepted 0.99 step, z leaves the PSD cone. A static shift of eps^(3/4) fixes it, while a step retake or refinement does not. Changing the default needs a decision (journal 2026-10-11). The chordal fixture tests were updated for `5b9980e`.
   - Primal variables reach 5.8e118.
   - The explicit-gate pilot is prepared but not run (decision below).
   - Not the same input as the 768-bit Λ27 above, which passes its audit.
@@ -114,6 +114,20 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 Task 21 first fixes (journal 2026-10-10, branch `perf-mc-impl`): 128-thread Λ27 −13%, Λ35-rs −14%, mixed Λ27/1024 −12% per iteration (64 threads −2…−9%), audited; the τ-chase restart is now on by default for MPFR unit starts (Λ27-rs 345 → 210 it). Mixed at 128 threads trades +13 GiB peak RSS for its gain.
 
 Automatic τ rule (journal 2026-10-10, perf-mc-impl mci19, convergence contract, audited): large KKT start scales start at eps^(1/8); a start that still chases restarts once at eps^(1/3). Λ35-rs/1024 680 → 423 it, Λ35/1024 688 → 435, Λ27-rs 210 → 138; Λ27, Λ19-rs, ising11 unchanged. gravity256 (MPFR256, 4 threads) Solved 19 it, no restart; Float64 is untouched (wide types only). Not merged.
+
+Levers L1–L9 and wave balance (journal 2026-10-11, perf-mc-impl, 64 threads, Λ35-rs):
+- Kept:
+  - exact-dot Y-solve rows (−3.1%; mixrs −7.9%, audited);
+  - host GMP for cluster builds (−3.7%);
+  - LPT-planned cone-lane ways (`2dff54b`, −2.5%, bitwise).
+- Rejected:
+  - planned ways for the KKT phases;
+  - power-of-two balancing;
+  - cached R residues;
+  - full Newton step;
+  - directed SVD sweep;
+  - τ fall-rate chase detection.
+- Next: the start point. The deep τ₀ deflates both sides by 1/τ₀ at no more than 2 decades per iteration, although only the primal is large at the Λ35 solution. Also next: the solve pipeline (38% of wall) and a divide-and-conquer SVD (about −4%).
 
 Step-length stop (journal 2026-10-10, perf-mc-impl, convergence contract): only a zero step ends a solve; an unconverged end reports its best iterate; the exp/pow backtracking floor is eps^(1/4) in MPFR. Goldstone unitarity K4 case: InsufficientProgress/141 at gap 6.5e-6 → gap 4.5e-12 at 300; Float64 46/46 and csdr3 unchanged. Not merged.
 
