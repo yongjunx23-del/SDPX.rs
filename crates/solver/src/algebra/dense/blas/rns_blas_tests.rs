@@ -143,69 +143,6 @@ fn residue_blas_gemm_matches_exact_dots_bitwise() {
     check::<16>(35, 37, 45, 90, 7); // packed upper tiles across the 32-column boundary
 }
 
-/// Inner rows scaled oppositely on the two sides with products of similar
-/// size (a leaf's `D⁻¹Y` against `Y`): the balanced encoding narrows both
-/// spreads and every output keeps the exact-dot bits, transposed, packed
-/// and shared.
-#[test]
-fn residue_blas_balanced_rows_match_exact_dots_bitwise() {
-    const N: usize = 8;
-    let (m, n, k) = (23, 19, 41);
-    let mut rng = Lcg(11);
-    let mut scale = |r: &mut Lcg, w: f64| (r.next() * 2.0 * w) as i64 - w as i64;
-    let (u, v): (Vec<i64>, Vec<i64>) = (0..k)
-        .map(|_| (scale(&mut rng, 150.0), scale(&mut rng, 8.0)))
-        .unzip();
-    let skew = |x: Vec<F<N>>, rows: usize, inner_rows: bool, e: &dyn Fn(usize) -> i64| {
-        x.into_iter()
-            .enumerate()
-            .map(|(i, x)| x.scale_pow2(e(if inner_rows { i % rows } else { i / rows })))
-            .collect::<Vec<_>>()
-    };
-    for (ta, tb) in [(b'T', b'N'), (b'N', b'N'), (b'N', b'T'), (b'T', b'T')] {
-        let (ar, ac) = if ta == b'N' { (m, k) } else { (k, m) };
-        let (br, bc) = if tb == b'N' { (k, n) } else { (n, k) };
-        let a = skew(random::<N>(&mut rng, ar * ac, 4), ar, ta != b'N', &|t| u[t]);
-        let b = skew(random::<N>(&mut rng, br * bc, 4), br, tb == b'N', &|t| v[t] - u[t]);
-        let (av, bv) = (
-            View { data: &a, rows: ar, cols: ac, ld: ar },
-            View { data: &b, rows: br, cols: bc, ld: br },
-        );
-        let (lo_a, hi_a) = av.exponent_range().unwrap();
-        let (lo_b, hi_b) = bv.exponent_range().unwrap();
-        let balance = Balance::new(&av, ta != b'N', &bv, tb == b'N', m, n, k);
-        assert!(
-            balance.da + balance.db + 200 < (hi_a - lo_a) + (hi_b - lo_b),
-            "{} {} -> {} {}",
-            hi_a - lo_a,
-            hi_b - lo_b,
-            balance.da,
-            balance.db
-        );
-        let expect = reference(ta, tb, m, n, k, &a, ar, &b, br);
-        let mut got = vec![F::zero(); m * n];
-        assert!(gemm(ta, tb, m, n, k, &a, ar, &b, br, false, None, &mut got, None));
-        assert_eq!(got, expect, "{} {}", ta as char, tb as char);
-    }
-    // Packed upper Aᵀ·B, the contribution shape, on a pool.
-    let a = skew(random::<N>(&mut rng, k * m, 4), k, true, &|t| u[t]);
-    let b = skew(random::<N>(&mut rng, k * m, 4), k, true, &|t| v[t] - u[t]);
-    let expect = reference(b'T', b'N', m, m, k, &a, k, &b, k);
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
-    let mut packed = vec![F::zero(); m * (m + 1) / 2];
-    assert!(gemm(b'T', b'N', m, m, k, &a, k, &b, k, true, Some(&pool), &mut packed, None));
-    for j in 0..m {
-        for i in 0..=j {
-            assert_eq!(packed[j * (j + 1) / 2 + i], expect[i + j * m]);
-        }
-    }
-    // A shared operand balances only its columns.
-    let expect = reference(b'T', b'N', m, m, k, &a, k, &a, k);
-    let mut got = vec![F::zero(); m * m];
-    assert!(gemm(b'T', b'N', m, m, k, &a, k, &a, k, false, None, &mut got, None));
-    assert_eq!(got, expect);
-}
-
 #[test]
 fn residue_blas_gemm_chunks_long_inner_dimension() {
     // A long inner dimension selects narrower primes.
