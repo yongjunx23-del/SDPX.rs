@@ -10,10 +10,18 @@ pub use settings::*;
 pub use solver::*;
 
 /// Test only: `SDPX_TEST_SPLIT_STEP` set gives the fixed-τ phase separate
-/// primal and dual step lengths.
+/// primal and dual step lengths. It diverges on Λ27 (journal 2026-10-11).
 pub(crate) fn test_split_step() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("SDPX_TEST_SPLIT_STEP").is_some())
+}
+
+/// Diagnostic only: `SDPX_DBG_STEPCONE` set prints each iteration's affine
+/// step and σ, and the PSD cones that limit the combined step with their
+/// NT centrality spread (λ²/μ).
+pub(crate) fn dbg_stepcone() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("SDPX_DBG_STEPCONE").is_some())
 }
 
 /// Diagnostic only: `SDPX_TEST_NO_PROGRESS_STOP` set keeps iterating where

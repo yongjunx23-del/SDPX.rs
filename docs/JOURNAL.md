@@ -8,6 +8,31 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-11 — L10/L11: what limits the step on the Ising inputs (perf-mc-impl)
+
+- Diagnostic `SDPX_DBG_STEPCONE` (kept, env-gated): per iteration the affine step and σ, the three PSD cones with the smallest step bound (dual `bz`, primal `bs`) and the λ²/μ spread. mci34, 64 threads, node101/104/106/107.
+- Observed, steady phase (fixed τ):
+  - On Λ19-rs α_aff stays at 0.60–0.68 for every iteration from 47 to 89, so σ ≈ 0.04, and the combined step ends at 0.88–0.93. That gives 0.8 decades of μ per iteration.
+  - The primal side limits (`bs` ≈ 0.91, `bz` ≈ 1.0), in the largest cones (n 52–56 on Λ27-rs). λ²/μ spans 0.1–6. ising11 runs at 0.97–0.99.
+- Observed, landing (gap 1e-3 → 1e-12):
+  - On Λ19-rs (iterations 10–38) τ falls 3.8 → 0.13 while the original-coordinate primal ‖s‖∞/τ grows 28 → 3750. The landing is a small primal chase.
+  - On Λ27-rs (60–90) and Λ35-rs (78–114) τ is constant, and λ²/μ spreads to 0.01–20.
+  - Λ27-rs from τ₀ 1.4e-29: the dual starts 30 decades over-scaled (z/τ 9.6e35, 1.5e5 at the solution) and deflates over 60 iterations. τ rises 6e4×, which deflates the primal 9.7e30 → 5e26, and the primal must grow back (iterations 90–104).
+  - On every input the first iterations raise z/τ and lower s/τ, the reverse of the eventual pattern. Early growth therefore does not reveal which side to keep (L1 stays shelved).
+- Variants (test switches, full solves, iterations / native s):
+
+  | Case | base | curve search at MPFR | split αp/αd (fixed τ) | PSD Gondzio corrector at MPFR |
+  |---|---|---|---|---|
+  | Λ19-rs/768 | 89 / 43.0 | 90 / 46.1 | 85 / 42.6 | 75 / 49.1 |
+  | ising11/512 | 54 / 3.5 | 52 / 3.6 | 53 / 3.6 | 46 / 3.3 |
+  | Λ27-rs/768 | 138 / 144.0 | 140 / 152.1 | 139 / 147.1 | 114 / 158.5 |
+  | Λ27/768 | 183 / 246.8 | 181 / 251.9 | MaxIterations 1000 | 153 / 255.3 |
+
+  - Curve search (`CurveSearch`, binary64 only) gains nothing.
+  - Split steps diverge on Λ27 once τ is fixed at iteration 143 (objectives reach 1e75 and −1e81).
+  - The corrector (Colombo–Gondzio, binary64 eigenvalues of the trial products in units of the band) cuts iterations 15–17% on every input. Steady-phase steps rise 0.90 → 0.93 and the landing shortens 30 → 24 iterations on Λ19-rs. Each call costs a full KKT solve plus MPFR W-products: 0.28 s against a 1.02 s base iteration on Λ27-rs, at about one call per iteration. Time rises 3–14%. Rebuilding its right-hand side from the step length's scaled directions would save at most 0.07 s per call, which is still break-even.
+- Decision: all three rejected; switches removed except the existing `SDPX_TEST_SPLIT_STEP`, now documented as divergent. The step limit is the primal centrality of the largest cones. A cheaper corrector solve is the only route found to cash in the corrector's 16%.
+
 ## 2026-10-11 — L8: a chase restart keeps the side that did not grow (perf-mc-impl)
 
 - Hypothesis: the restart from the deep τ₀ = eps^(1/3) puts both sides at 1/τ₀ in original coordinates. On Λ35-rs only the primal is large at the solution (near 1e94); the dual ends near 1.5e8 against a KKT start of 4.6e9. Deflating an over-scaled side runs at no more than 2 decades per iteration, so restarting the dual at its own scale should save iterations.
@@ -30,7 +55,7 @@ status and next actions.
   | Λ27-rs/768, Λ19-rs/768, ising11/512, Λ27/768 | 138 / 89 / 54 / 183 | same iterations, points bitwise identical |
   | mixrs Λ27/1024 | 57 | 57 / 949 s |
 
-  The Λ35-rs objective is unchanged to 38 digits; full audit 224854.
+  The Λ35-rs objective is unchanged to 38 digits; full audit 224854 accepted.
 - Recorded, not pursued: on Λ35-rs the batched constant column (−q, b) stalls in refinement every iteration (its second correction gains nothing), about 4.7% of the time. No floor model predicted the stall safely, so the correction stays.
 - Decision: kept. Remaining gap: a correct deep start from the first iteration would give 243 (v1 at 1e-90) instead of 372. Earlier chase detection (L1) is the open lever.
 

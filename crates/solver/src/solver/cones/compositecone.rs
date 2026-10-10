@@ -161,6 +161,50 @@ impl<T> CompositeCone<T>
 where
     T: FloatT,
 {
+    /// `SDPX_DBG_STEPCONE`: the three PSD cones with the smallest step bound
+    /// (dual `bz`, primal `bs`), the count of cones within 5% of the step,
+    /// and the λ²/μ spread overall and per listed cone.
+    fn diag_step_bounds(&self, α: T) {
+        let (mut sum, mut deg) = (T::zero(), 0usize);
+        let mut stats = Vec::new();
+        for (k, cone) in self.cones.iter().enumerate() {
+            if let SupportedCone::PSDTriangleCone(c) = cone {
+                let (lo, hi, s) = c.diag_lambda_sq();
+                sum += s;
+                deg += c.n;
+                let (bz, bs) = self.sym_step_bounds[k];
+                stats.push((k, c.n, bz, bs, lo, hi));
+            }
+        }
+        if deg == 0 {
+            return;
+        }
+        let mu = sum / T::from_usize(deg).unwrap();
+        stats.sort_by(|a, b| T::min(a.2, a.3).partial_cmp(&T::min(b.2, b.3)).unwrap());
+        let gmin = stats.iter().map(|t| t.4).fold(T::max_value(), T::min) / mu;
+        let gmax = stats.iter().map(|t| t.5).fold(T::zero(), T::max) / mu;
+        let near = stats
+            .iter()
+            .filter(|t| T::min(t.2, t.3) < α * T::from_f64(1.05).unwrap())
+            .count();
+        let mut line = format!(
+            "stepcone α {:.3e} μc {:.3e} cent [{:.2e},{:.2e}] near {}",
+            α, mu, gmin, gmax, near
+        );
+        for t in stats.iter().take(3) {
+            line += &format!(
+                " | k{} n{} bz {:.3e} bs {:.3e} c[{:.2e},{:.2e}]",
+                t.0,
+                t.1,
+                T::min(t.2, T::from_f64(9.99).unwrap()),
+                T::min(t.3, T::from_f64(9.99).unwrap()),
+                t.4 / mu,
+                t.5 / mu
+            );
+        }
+        eprintln!("{line}");
+    }
+
     fn fold_step_bounds(
         &mut self,
         αmax: T,
@@ -1501,7 +1545,7 @@ where
                     .orthant_chunk
                     .map(|chunk| (std::sync::Arc::clone(&threading.pool), chunk))
             });
-        self.fold_step_bounds(αmax, cached_sym, nonsym, |cone, rows, cap| {
+        let out = self.fold_step_bounds(αmax, cached_sym, nonsym, |cone, rows, cap| {
             if let (Some((pool, chunk)), SupportedCone::NonnegativeCone(c)) = (&orthant, &mut *cone)
             {
                 return pool.install(|| {
@@ -1523,7 +1567,11 @@ where
                 settings,
                 cap,
             )
-        })
+        });
+        if cached_sym && crate::solver::core::dbg_stepcone() {
+            self.diag_step_bounds(out.0);
+        }
+        out
     }
 
     fn compute_barrier(&mut self, z: &[T], s: &[T], dz: &[T], ds: &[T], α: T) -> T {

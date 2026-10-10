@@ -129,7 +129,9 @@ Levers L1–L9 and wave balance (journal 2026-10-11, perf-mc-impl, 64 threads, �
   - τ fall-rate chase detection.
 - Next: the solve pipeline (38% of wall) and a divide-and-conquer SVD (about −4%).
 
-L8, chase restart keeps the side that did not grow (journal 2026-10-11, perf-mc-impl, convergence contract): Λ35-rs/1024 423 → 372 it (1511 → 1195 s); the other Ising inputs are bitwise unchanged. Audit 224854 pending. Next: earlier chase detection (a correct deep start from iteration 0 would need 243 it) and the landing phase (gap O(1) → 1e-12 takes 30–50 iterations at mean step 0.4–0.5 on every Ising input; diagnostic `SDPX_DBG_STEPCONE`).
+L8, chase restart keeps the side that did not grow (journal 2026-10-11, perf-mc-impl, convergence contract): Λ35-rs/1024 423 → 372 it (1511 → 1195 s); the other Ising inputs are bitwise unchanged. Audit 224854 accepted.
+
+Step limits L10/L11 (journal 2026-10-11): the steady phase is limited by primal centrality in the largest cones (α_aff 0.65, step 0.90). MPFR curve search and split steps were rejected; split steps diverge on Λ27. The MPFR PSD Gondzio corrector cuts iterations 15–17% but costs 3–14% more time, so it was also rejected. Diagnostic: `SDPX_DBG_STEPCONE`. Next: cheaper KKT solves (the solve pipeline is 1.4 of 3.19 s per Λ35-rs iteration, 41–48 of 64 cores busy), which would also make the corrector pay.
 
 Step-length stop (journal 2026-10-10, perf-mc-impl, convergence contract): only a zero step ends a solve; an unconverged end reports its best iterate; the exp/pow backtracking floor is eps^(1/4) in MPFR. Goldstone unitarity K4 case: InsufficientProgress/141 at gap 6.5e-6 → gap 4.5e-12 at 300; Float64 46/46 and csdr3 unchanged. Not merged.
 

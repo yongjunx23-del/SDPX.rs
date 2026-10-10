@@ -821,6 +821,9 @@ mod internal {
                 };
                 }}
                 state.σ = self.centering_parameter(state.α);
+                if crate::solver::core::dbg_stepcone() {
+                    eprintln!("stepaff {} α {:.3e} σ {:.3e}", iter, state.α, state.σ);
+                }
                 timeit! {"combined rhs"; {
                 if iter > 1 {
                     self.step_rhs.combined_step_rhs_prepared(&self.residuals, &self.variables,

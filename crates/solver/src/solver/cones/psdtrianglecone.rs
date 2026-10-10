@@ -144,6 +144,20 @@ where
         &self.data.R
     }
 
+    /// `SDPX_DBG_STEPCONE`: (min λᵢ², max λᵢ², Σ λᵢ²) of the NT-scaled point.
+    pub(crate) fn diag_lambda_sq(&self) -> (T, T, T) {
+        let mut lo = T::max_value();
+        let mut hi = T::zero();
+        let mut sum = T::zero();
+        for &l in &self.data.λ {
+            let q = l * l;
+            lo = T::min(lo, q);
+            hi = T::max(hi, q);
+            sum += q;
+        }
+        (lo, hi, sum)
+    }
+
     pub(crate) fn scaling_Rinv(&self) -> &Matrix<T> {
         &self.data.Rinv
     }
