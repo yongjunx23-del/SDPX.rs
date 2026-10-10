@@ -663,6 +663,19 @@ fn chunk_matrix<const N: usize>(
     plan: &Plan,
     split: &Split<'_>,
 ) -> ChunkMatrix {
+    chunk_matrix_shifted(x, lo, spread, plan, split, None)
+}
+
+/// [`chunk_matrix`] of `x` with entry `e` scaled by `2^shift.at(e)`; `lo`
+/// and `spread` describe the scaled exponents.
+fn chunk_matrix_shifted<const N: usize>(
+    x: View<'_, N>,
+    lo: i64,
+    spread: i64,
+    plan: &Plan,
+    split: &Split<'_>,
+    shift: Option<&Shift<'_>>,
+) -> ChunkMatrix {
     let len = x.len();
     let mut matrix = ChunkMatrix::new::<N>(len, spread, plan);
     let (chunks, width) = (matrix.chunks, matrix.width);
@@ -673,6 +686,7 @@ fn chunk_matrix<const N: usize>(
             if !x.stored(r) {
                 continue;
             }
+            let lo = lo - shift.map_or(0, |s| s.at(r));
             fill_chunk(&x.data[r], row, lo, width);
         }
     };
@@ -968,11 +982,12 @@ fn packed_operand<const N: usize>(
     spread: i64,
     plan: &Plan,
     split: &Split<'_>,
+    shift: Option<&Shift<'_>>,
 ) -> Operand {
     if plan.bits > CACHE_MAX_BITS || x.len().saturating_mul(plan.count()) < PACK_OPERAND_MIN {
-        return Operand::Chunks(chunk_matrix(x, lo, spread, plan, split));
+        return Operand::Chunks(chunk_matrix_shifted(x, lo, spread, plan, split, shift));
     }
-    let chunks = chunk_matrix(x, lo, spread, plan, split);
+    let chunks = chunk_matrix_shifted(x, lo, spread, plan, split, shift);
     Operand::Packed(
         CachedResidues::from_chunks_split(&chunks, plan, split),
         chunks.len,
@@ -1182,11 +1197,24 @@ impl<'a> CrtAccumulator<'a> {
     /// Subtract `round(frac)·M`, then pack and round each output once;
     /// outputs are independent, so a split call shares them over its ways.
     fn finish<const N: usize>(
+        self,
+        plan: &Plan,
+        scale: i64,
+        out: &mut [F<N>],
+        split: &Split<'_>,
+    ) -> bool {
+        self.finish_shifted(plan, scale, out, split, None)
+    }
+
+    /// [`Self::finish`] with output `o` scaled by `2^shift(o)`: exact, so
+    /// the rounding is that of the unscaled value.
+    fn finish_shifted<const N: usize>(
         mut self,
         plan: &Plan,
         scale: i64,
         out: &mut [F<N>],
         split: &Split<'_>,
+        shift: Option<&(dyn Fn(usize) -> i64 + Sync)>,
     ) -> bool {
         let (n, rows, kp) = (self.frac.len(), plan.count() + 1, plan.count());
         let ways = split_ways(split).min(n.div_ceil(64)).max(1);
@@ -1209,7 +1237,11 @@ impl<'a> CrtAccumulator<'a> {
                 let digits = (0..crt.chunks).map(|l| unsafe { *y(l) });
                 let value = match pack(digits, crt.width, crt.chunks, &mut mag) {
                     Some(_) if mag.is_empty() => F::zero(),
-                    Some(negative) => F::from_scaled_integer(negative, &mag, scale),
+                    Some(negative) => F::from_scaled_integer(
+                        negative,
+                        &mag,
+                        scale + shift.map_or(0, |f| f(o)),
+                    ),
                     None => {
                         failed.store(true, std::sync::atomic::Ordering::Relaxed);
                         return;
@@ -1587,6 +1619,14 @@ pub(super) fn gemm<const N: usize>(
         return true;
     }
     let (da, db) = (hi_a - lo_a, hi_b - lo_b);
+    // A shared operand needs one encoding: equal shifts on both sides.
+    let balance = (cache_b.is_none() && (!same_operand || ta_n != tb_n) && da + db > BALANCE_MIN)
+        .then(|| Balance::new(&av, !ta_n, &bv, tb_n, m, n, k))
+        .filter(|b| b.da + b.db < da + db);
+    let (lo_a, da, lo_b, db) = match &balance {
+        Some(b) => (b.lo_a, b.da, b.lo_b, b.db),
+        None => (lo_a, da, lo_b, db),
+    };
     if da > MAX_SPREAD || db > MAX_SPREAD {
         return false;
     }
@@ -1597,15 +1637,6 @@ pub(super) fn gemm<const N: usize>(
     let Some(plan) = Plan::new(k, needed) else {
         return false;
     };
-    if packed_output && m >= 300 && !ta_n && tb_n && spread_probe() {
-        let (da2, db2, cola, colb) = balanced_spreads(&av, &bv, k);
-        let after = 2.0 * p_bits + (da2 + db2) as f64 + (k.max(1) as f64).log2() + 3.0;
-        eprintln!(
-            "RNSSPREAD m {m} k {k} da {da} db {db} col_a {cola} col_b {colb} balanced {da2} {db2} primes {} -> {}",
-            plan.count(),
-            Plan::new(k, after).map_or(0, |p| p.count())
-        );
-    }
     let (len_a, len_b) = (av.len(), bv.len());
     let selected = if upper_only && !packed_output {
         selection(m, n, upper_only)
@@ -1629,10 +1660,11 @@ pub(super) fn gemm<const N: usize>(
         ldb,
     };
     let split = split_plan(pool, (m * n * k) as u128 * plan.count() as u128);
-    let ca = packed_operand(av, lo_a, da, &plan, &split);
+    let shifts = balance.as_ref().map(|b| b.shifts(&av, !ta_n, &bv, tb_n));
+    let ca = packed_operand(av, lo_a, da, &plan, &split, shifts.as_ref().map(|s| &s.0));
     let cb = (!same_operand).then(|| match cache_b {
         Some(cache) => cache.operand(bv, lo_b, db, &plan, &split),
-        None => packed_operand(bv, lo_b, db, &plan, &split),
+        None => packed_operand(bv, lo_b, db, &plan, &split, shifts.as_ref().map(|s| &s.1)),
     });
     // A small group cap bounds per-way residue scratch only when both operand
     // fills are scalar copies; a chunk-matrix source needs fat GEMM groups.
@@ -1676,69 +1708,169 @@ pub(super) fn gemm<const N: usize>(
     if upper_only && !packed_output {
         acc.selected = &selected;
     }
-    acc.finish(&plan, lo_a + lo_b, out, &split)
+    let Some(b) = &balance else {
+        return acc.finish(&plan, lo_a + lo_b, out, &split);
+    };
+    // Output `o` is `i + j·m`, or packed column-major upper.
+    let unscale = |o: usize| {
+        let (i, j) = if packed_output {
+            let mut j = (((8 * o + 1) as f64).sqrt() as usize).saturating_sub(1) / 2;
+            while (j + 1) * (j + 2) / 2 <= o {
+                j += 1;
+            }
+            while j * (j + 1) / 2 > o {
+                j -= 1;
+            }
+            (o - j * (j + 1) / 2, j)
+        } else {
+            (o % m, o / m)
+        };
+        b.ca[i] + b.cb[j]
+    };
+    acc.finish_shifted(&plan, lo_a + lo_b, out, &split, Some(&unscale))
 }
 
-fn spread_probe() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SDPX_RNS_SPREAD").is_some())
+/// Combined operand spread below which [`Balance`] is not tried.
+const BALANCE_MIN: i64 = 64;
+
+/// Exact power-of-two rescaling of `op(A)·op(B)`. Inner index `t` scales
+/// A by `2^-s_t` and B by `2^s_t`; outer index `i` of A by `2^-ca_i` and `j`
+/// of B by `2^-cb_j`. The exact products are unchanged up to `2^-(ca_i +
+/// cb_j)`, returned when output `(i, j)` is rounded, so every result is
+/// bitwise identical. Rows of very different size on the two sides (a
+/// leaf's `D⁻¹Y` against `Y`) otherwise widen both integer images: mixed
+/// Λ27 contributions drop from 106–120 primes to 88–99.
+struct Balance {
+    s: Vec<i64>,
+    ca: Vec<i64>,
+    cb: Vec<i64>,
+    lo_a: i64,
+    da: i64,
+    lo_b: i64,
+    db: i64,
 }
 
-/// Diagnostic: spreads of `Aᵀ·B` operands (`k` rows each) after exact
-/// power-of-two column scaling and balanced row scaling (2^-s on A's row,
-/// 2^s on B's), and the largest single-column spreads.
-fn balanced_spreads<const N: usize>(a: &View<'_, N>, b: &View<'_, N>, k: usize) -> (i64, i64, i64, i64) {
-    let exponents = |v: &View<'_, N>| -> Vec<Option<i64>> {
-        let mut e = vec![None; k * v.cols];
-        for j in 0..v.cols {
-            for i in 0..k {
-                let (mut lo, mut hi) = (i64::MAX, i64::MIN);
-                if scan_exponent(&v.data[i + j * v.ld], &mut lo, &mut hi) == Some(true) {
-                    e[i + j * k] = Some(hi);
+/// Per-entry exponent shift of one operand under a [`Balance`].
+struct Shift<'a> {
+    ld: usize,
+    inner_rows: bool,
+    s: &'a [i64],
+    sign: i64,
+    c: &'a [i64],
+}
+
+impl Shift<'_> {
+    #[inline]
+    fn at(&self, e: usize) -> i64 {
+        let (r, c) = (e % self.ld, e / self.ld);
+        let (t, o) = if self.inner_rows { (r, c) } else { (c, r) };
+        self.sign * self.s[t] - self.c[o]
+    }
+}
+
+/// Visit `(inner, outer, exponent - P)` of every stored non-zero entry.
+fn each_exponent<const N: usize>(
+    v: &View<'_, N>,
+    inner_rows: bool,
+    mut f: impl FnMut(usize, usize, i64),
+) {
+    for c in 0..v.cols {
+        for r in 0..v.rows {
+            let view = v.data[r + c * v.ld].dyadic_view();
+            if let DyadicKind::Finite { .. } = view.kind {
+                let x = view.exponent as i64 - F::<N>::PRECISION_BITS as i64;
+                if inner_rows {
+                    f(r, c, x)
+                } else {
+                    f(c, r, x)
                 }
             }
         }
-        e
-    };
-    let normalize = |e: &mut Vec<Option<i64>>, cols: usize| -> i64 {
-        let mut widest = 0;
-        for j in 0..cols {
-            let column = &mut e[j * k..(j + 1) * k];
-            let hi = column.iter().flatten().copied().max();
-            let lo = column.iter().flatten().copied().min();
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                widest = widest.max(hi - lo);
-                column.iter_mut().flatten().for_each(|x| *x -= hi);
-            }
-        }
-        widest
-    };
-    let (mut ea, mut eb) = (exponents(a), exponents(b));
-    let cola = normalize(&mut ea, a.cols);
-    let colb = normalize(&mut eb, b.cols);
-    let row_max = |e: &Vec<Option<i64>>, cols: usize, i: usize| {
-        (0..cols).filter_map(|j| e[i + j * k]).max()
-    };
-    let shift: Vec<i64> = (0..k)
-        .map(|i| match (row_max(&ea, a.cols, i), row_max(&eb, b.cols, i)) {
-            (Some(x), Some(y)) => (x - y).div_euclid(2),
-            _ => 0,
-        })
-        .collect();
-    let spread = |e: &Vec<Option<i64>>, cols: usize, sign: i64| {
-        let (mut lo, mut hi) = (i64::MAX, i64::MIN);
-        for j in 0..cols {
-            for i in 0..k {
-                if let Some(x) = e[i + j * k] {
-                    let x = x - sign * shift[i];
-                    lo = lo.min(x);
-                    hi = hi.max(x);
+    }
+}
+
+impl Balance {
+    /// `a_rows`/`b_rows`: the inner index is the view's row. Every entry is
+    /// finite (the caller's exponent scan declined otherwise).
+    fn new<const N: usize>(
+        a: &View<'_, N>,
+        a_rows: bool,
+        b: &View<'_, N>,
+        b_rows: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Self {
+        let outer_max = |v: &View<'_, N>, rows: bool, len: usize| {
+            let mut c = vec![i64::MIN; len];
+            each_exponent(v, rows, |_, o, x| c[o] = c[o].max(x));
+            c.iter_mut().filter(|x| **x == i64::MIN).for_each(|x| *x = 0);
+            c
+        };
+        let (ca, cb) = (outer_max(a, a_rows, m), outer_max(b, b_rows, n));
+        let inner_max = |v: &View<'_, N>, rows: bool, c: &[i64]| {
+            let mut r = vec![i64::MIN; k];
+            each_exponent(v, rows, |t, o, x| r[t] = r[t].max(x - c[o]));
+            r
+        };
+        let (ra, rb) = (inner_max(a, a_rows, &ca), inner_max(b, b_rows, &cb));
+        let s: Vec<i64> = ra
+            .iter()
+            .zip(&rb)
+            .map(|(&x, &y)| {
+                if x == i64::MIN || y == i64::MIN {
+                    0
+                } else {
+                    (x - y).div_euclid(2)
                 }
-            }
+            })
+            .collect();
+        let range = |v: &View<'_, N>, rows: bool, sign: i64, c: &[i64]| {
+            let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+            each_exponent(v, rows, |t, o, x| {
+                let y = x + sign * s[t] - c[o];
+                lo = lo.min(y);
+                hi = hi.max(y);
+            });
+            (lo, hi)
+        };
+        let (lo_a, hi_a) = range(a, a_rows, -1, &ca);
+        let (lo_b, hi_b) = range(b, b_rows, 1, &cb);
+        Self {
+            lo_a,
+            da: hi_a - lo_a,
+            lo_b,
+            db: hi_b - lo_b,
+            s,
+            ca,
+            cb,
         }
-        if lo == i64::MAX { 0 } else { hi - lo }
-    };
-    (spread(&ea, a.cols, 1), spread(&eb, b.cols, -1), cola, colb)
+    }
+
+    fn shifts<'a, const N: usize>(
+        &'a self,
+        a: &View<'_, N>,
+        a_rows: bool,
+        b: &View<'_, N>,
+        b_rows: bool,
+    ) -> (Shift<'a>, Shift<'a>) {
+        (
+            Shift {
+                ld: a.ld,
+                inner_rows: a_rows,
+                s: &self.s,
+                sign: -1,
+                c: &self.ca,
+            },
+            Shift {
+                ld: b.ld,
+                inner_rows: b_rows,
+                s: &self.s,
+                sign: 1,
+                c: &self.cb,
+            },
+        )
+    }
 }
 
 /// Upper triangle of `Σ_b Z_bᵀ·Y_b` with `Z_b = diag(d_b)·Y_b` rounded
