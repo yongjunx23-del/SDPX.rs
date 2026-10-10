@@ -58,11 +58,14 @@ fn fit<W: Scalar + FromStr>(points: &[String], scalings: &[String]) -> Result<Pr
         (p, dp)
     };
     // Poles are real and nonpositive: bracket sign changes on a 1/8 grid
-    // from 0 downwards, then bisect and polish with Newton steps.
+    // downwards from below the first sample point, then bisect and polish
+    // with Newton steps. Starting above 0 also brackets a pole at 0 that the
+    // generator rounded upwards (2^-124 in mixed Ising PyCFTBoot output).
     let step = number(0.125);
     let lowest = -(x[n - 1] + number(4.0 * n as f64 + 200.0));
     let mut poles = Vec::with_capacity(m);
-    let (mut hi, mut fhi) = (W::zero(), value(W::zero()).0);
+    let start = x[0] / number(2.0);
+    let (mut hi, mut fhi) = (start, value(start).0);
     while poles.len() < m && hi > lowest {
         let lo = hi - step;
         let flo = value(lo).0;
@@ -87,8 +90,10 @@ fn fit<W: Scalar + FromStr>(points: &[String], scalings: &[String]) -> Result<Pr
         }
         (hi, fhi) = (lo, flo);
     }
+    // A pole within rounding of 0 is the unitarity-bound pole at 0.
+    let zero = decimal::<W>("1e-30")?;
     require(
-        poles.len() == m && poles.iter().all(|q| q.is_finite() && *q <= W::zero()),
+        poles.len() == m && poles.iter().all(|q| q.is_finite() && *q <= zero),
         "resampling found no damped-rational prefactor with base 3-2*sqrt(2)",
     )?;
     let constant = dd[m].recip();
@@ -102,9 +107,48 @@ fn fit<W: Scalar + FromStr>(points: &[String], scalings: &[String]) -> Result<Pr
             "recovered prefactor does not reproduce the sample scalings",
         )?;
     }
+    // The given scalings are reproduced with the recovered poles; the new
+    // prefactor writes a rounded-up pole at 0. Scalings only weight the
+    // sampled constraints, so this never changes the program's solution.
     Ok(Prefactor {
         constant: constant.decimal_string(),
         base: base.decimal_string(),
-        poles: poles.iter().map(Scalar::decimal_string).collect(),
+        poles: poles
+            .iter()
+            .map(|&q| q.min(W::zero()).decimal_string())
+            .collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mixed Ising PyCFTBoot output writes the unitarity pole at 0 as 2^-124.
+    #[test]
+    fn recovers_pole_rounded_above_zero() {
+        type W = MpFloat<32>;
+        fn convert<W: Scalar>(n: f64) -> W {
+            W::from_f64(n).unwrap()
+        }
+        let number = convert::<W>;
+        let poles = [number(2f64.powi(-124)), number(-1.0), number(-1.5), number(-2.0)];
+        let base = number(3.0) - number(8.0).sqrt();
+        let x: Vec<W> = (0..8).map(|k| number(0.01 + 0.7 * k as f64)).collect();
+        let scalings: Vec<String> = x
+            .iter()
+            .map(|&xk| {
+                let s = poles.iter().fold(number(2.5) * base.powf(xk), |a, &q| a / (xk - q));
+                s.decimal_string()
+            })
+            .collect();
+        let points: Vec<String> = x.iter().map(Scalar::decimal_string).collect();
+        let fit = prefactor(&points, &scalings).unwrap();
+        assert_eq!(fit.poles.len(), 4);
+        let recovered: Vec<f64> = fit.poles.iter().map(|p| p.parse().unwrap()).collect();
+        assert_eq!(recovered[0], 0.0);
+        for (r, e) in recovered[1..].iter().zip([-1.0, -1.5, -2.0]) {
+            assert!((r - e).abs() < 1e-12, "{r} vs {e}");
+        }
+    }
 }
