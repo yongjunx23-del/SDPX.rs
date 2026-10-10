@@ -111,7 +111,7 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 
 Task 21 first fixes (journal 2026-10-10, branch `perf-mc-impl`): 128-thread Λ27 −13%, Λ35-rs −14%, mixed Λ27/1024 −12% per iteration (64 threads −2…−9%), audited; the τ-chase restart is now on by default for MPFR unit starts (Λ27-rs 345 → 210 it). Mixed at 128 threads trades +13 GiB peak RSS for its gain.
 
-Automatic τ rule (journal 2026-10-10, perf-mc-impl mci19, convergence contract, audited): large KKT start scales start at eps^(1/8); a start that still chases restarts once at eps^(1/3). Λ35-rs/1024 680 → 423 it, Λ35/1024 688 → 435, Λ27-rs 210 → 138; Λ27, Λ19-rs, ising11 unchanged. Not merged; gravity256 and the Float64 scoreboard still need a check before merge.
+Automatic τ rule (journal 2026-10-10, perf-mc-impl mci19, convergence contract, audited): large KKT start scales start at eps^(1/8); a start that still chases restarts once at eps^(1/3). Λ35-rs/1024 680 → 423 it, Λ35/1024 688 → 435, Λ27-rs 210 → 138; Λ27, Λ19-rs, ising11 unchanged. gravity256 (MPFR256, 4 threads) Solved 19 it, no restart; Float64 is untouched (wide types only). Not merged.
 
 Task 17 items D/E passed their gates and are merged. The normalized 2×2 PMP is Solved/24. Resampling remains opt-in, and converter threads default to one; the proposed new defaults require the remaining start-rule gate.
 
