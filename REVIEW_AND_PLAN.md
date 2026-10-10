@@ -95,6 +95,7 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
     augmented/faer remains AlmostSolved/21 on PBS 224492. A positive Schur
     separator is reverted and parked until an affected condensed-form solve
     is accepted.
+- **Goldstone LP/SOC dual-residual stall (MPFR256, tol 1e-27):** pres reaches 1e-29 while dres stays 1e-8…1e-11 with steps near 1; 512 bits stalls lower (1e-14). The dual part of the direction is inaccurate; under investigation after the step-stop change.
 - **Float64 unresolved cases:** hinf3, sched_100_50_orig, csdr3 and f64_large. Task 16 resolved qap6, gpp100, gpp124-1, gpp250-1 and gpp500-1.
 - **Gravity Float64 default:** `Solved`/17 with r_d 4.01e-6 > 2e-6 before task 9. Not re-run since `tol_original`.
 - **MPFR `condensed_graded`:** kept as designed.
@@ -113,6 +114,8 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 Task 21 first fixes (journal 2026-10-10, branch `perf-mc-impl`): 128-thread Λ27 −13%, Λ35-rs −14%, mixed Λ27/1024 −12% per iteration (64 threads −2…−9%), audited; the τ-chase restart is now on by default for MPFR unit starts (Λ27-rs 345 → 210 it). Mixed at 128 threads trades +13 GiB peak RSS for its gain.
 
 Automatic τ rule (journal 2026-10-10, perf-mc-impl mci19, convergence contract, audited): large KKT start scales start at eps^(1/8); a start that still chases restarts once at eps^(1/3). Λ35-rs/1024 680 → 423 it, Λ35/1024 688 → 435, Λ27-rs 210 → 138; Λ27, Λ19-rs, ising11 unchanged. gravity256 (MPFR256, 4 threads) Solved 19 it, no restart; Float64 is untouched (wide types only). Not merged.
+
+Step-length stop (journal 2026-10-10, perf-mc-impl, convergence contract): only a zero step ends a solve; an unconverged end reports its best iterate; the exp/pow backtracking floor is eps^(1/4) in MPFR. Goldstone unitarity K4 case: InsufficientProgress/141 at gap 6.5e-6 → gap 4.5e-12 at 300; Float64 46/46 and csdr3 unchanged. Not merged.
 
 Task 17 items D/E passed their gates and are merged. The normalized 2×2 PMP is Solved/24. Resampling remains opt-in, and converter threads default to one; the proposed new defaults require the remaining start-rule gate.
 

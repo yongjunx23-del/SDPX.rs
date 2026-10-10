@@ -155,8 +155,9 @@ where
     /// Original-coordinate acceptance progress: the best tolerance multiple
     /// so far and the failed checks since it last halved.
     pub(crate) original_progress: (Option<T>, u32),
-    /// Consecutive steps at or below `min_terminate_step_length`.
-    pub(crate) small_steps: u32,
+    /// The iterate with the smallest tolerance multiple so far, reported
+    /// when the solve ends unconverged.
+    pub(crate) best: Option<(T, V)>,
     pub(crate) phantom: std::marker::PhantomData<T>,
 }
 
@@ -297,7 +298,7 @@ where
         timeit! {"solve"; {
         self.start_tau = None;
         self.original_progress = (None, 0);
-        self.small_steps = 0;
+        self.best = None;
         timeit! {"default start"; {
             self.start_point();
         }}
@@ -404,6 +405,13 @@ where
             }
             // Keep the previous iterate in case the next one is a dud.
             self.info.save_prev_iterate(&self.variables, &mut self.prev_vars);
+            if let Some(m) = self.tolerance_multiple() {
+                if crate::mpi::agreed_branch(self.best.as_ref().map_or(true, |(b, _)| m < *b)) {
+                    let best = self.best.get_or_insert_with(|| (m, self.variables.new_like()));
+                    best.0 = m;
+                    best.1.copy_from(&self.variables);
+                }
+            }
             timeit! {"iterate update"; {
             self.variables
                 .add_step_with_pool(&self.step_lhs, state.α, self.cones.worker_pool());
@@ -446,7 +454,6 @@ where
         }
         self.start_tau = Some(next);
         self.original_progress = (None, 0);
-        self.small_steps = 0;
         self.info.restart();
         self.kktsystem.reset_solve();
         let iter = state.iter;
@@ -585,6 +592,10 @@ mod internal {
 
         /// Find an initial condition
         fn default_start(&mut self);
+
+        /// Larger of the feasibility residual and duality gap, each over its
+        /// tolerance, if the info records them.
+        fn tolerance_multiple(&self) -> Option<T>;
 
         /// Compute a centering parameter
         fn centering_parameter(&self, α: T) -> T;
@@ -988,20 +999,53 @@ mod internal {
                     self.cones.worker_pool(),
                 );
             }
-            // "Almost" convergence check, then solution extraction.
+            // "Almost" convergence check, then solution extraction. An
+            // unconverged end that misses it reports the best iterate seen
+            // instead: short steps no longer stop a stalled run, which may
+            // wander away from a better point before its iteration limit.
             let before = self.info.get_status();
-            self.info.post_process(&self.residuals, &self.settings);
-            if before != SolverStatus::AlmostSolved
-                && self.info.get_status() == SolverStatus::AlmostSolved
-            {
-                // The reduced status also needs its tolerances in original
-                // coordinates; otherwise the failure status stands.
-                if let Some(ratio) =
-                    self.solution
-                        .original_ratio(&self.data, &self.variables, &self.settings, true)
+            let unconverged = before.is_errored()
+                || matches!(before, SolverStatus::MaxIterations | SolverStatus::MaxTime);
+            for restore in [false, true] {
+                if restore {
+                    let (Some(now), Some((best, _))) = (self.tolerance_multiple(), &self.best) else {
+                        break;
+                    };
+                    if !(unconverged
+                        && self.info.get_status() == before
+                        && crate::mpi::agreed_branch(*best < now))
+                    {
+                        break;
+                    }
+                    let (_, vars) = self.best.take().unwrap();
+                    self.variables.copy_from(&vars);
+                    self.residuals.update_with_pool(
+                        &self.variables,
+                        &self.data,
+                        self.cones.worker_pool(),
+                    );
+                    self.info.update_with_pool(
+                        &mut self.data,
+                        &self.variables,
+                        &self.residuals,
+                        timers,
+                        self.cones.worker_pool(),
+                    );
+                    self.info.set_status(before);
+                }
+                self.info.post_process(&self.residuals, &self.settings);
+                if before != SolverStatus::AlmostSolved
+                    && self.info.get_status() == SolverStatus::AlmostSolved
                 {
-                    if !crate::mpi::agreed_branch(ratio <= T::one()) {
-                        self.info.set_status(before);
+                    // The reduced status also needs its tolerances in original
+                    // coordinates; otherwise the failure status stands.
+                    if let Some(ratio) =
+                        self.solution
+                            .original_ratio(&self.data, &self.variables, &self.settings, true)
+                    {
+                        if !crate::mpi::agreed_branch(ratio <= T::one()) {
+                            self.info.set_status(before);
+                        }
                     }
                 }
             }
@@ -1075,6 +1119,17 @@ mod internal {
             if tau != T::one() {
                 self.variables.set_initial_tau(tau);
             }
+        }
+
+        /// The iterate's distance from convergence: its larger feasibility
+        /// residual and its better duality gap, each over its tolerance.
+        fn tolerance_multiple(&self) -> Option<T> {
+            let core = self.settings.core();
+            let gap = T::min(
+                self.info.gap_abs()? / core.tol_gap_abs,
+                self.info.gap_rel()? / core.tol_gap_rel,
+            );
+            Some(T::max(self.info.residual_max()? / core.tol_feas, gap))
         }
 
         fn centering_parameter(&self, α: T) -> T {
@@ -1181,22 +1236,15 @@ mod internal {
                 && α < self.settings.core().min_switch_step_length
             {
                 output = StrategyCheckpoint::Update(ScalingStrategy::Dual);
-            } else if α <= T::max(T::zero(), self.settings.core().min_terminate_step_length) {
-                // One short step inside a long plateau is not a stall (Λ35:
-                // α 8e-5 at iteration 598, then 4e-4, 0.03, 0.5, 0.7 and the
-                // escape). Stop on three consecutive short steps; a zero step
-                // stops at once since the iterate cannot move.
-                self.small_steps += 1;
-                if (self.small_steps >= 3 || α <= T::zero())
-                    && !(crate::solver::core::test_no_progress_stop() && α > T::zero())
-                {
-                    self.info.set_status(SolverStatus::InsufficientProgress);
-                    output = StrategyCheckpoint::Fail;
-                } else {
-                    output = StrategyCheckpoint::NoUpdate;
-                }
+            } else if α <= T::zero() {
+                // A zero step leaves the iterate, and so the next direction,
+                // unchanged. Short positive steps continue: runs of them
+                // precede recovery (Λ35: α 8e-5 at iteration 598, then 4e-4,
+                // 0.03, 0.5, 0.7 and the escape), and max_iter and
+                // time_limit bound a genuine stall.
+                self.info.set_status(SolverStatus::InsufficientProgress);
+                output = StrategyCheckpoint::Fail;
             } else {
-                self.small_steps = 0;
                 output = StrategyCheckpoint::NoUpdate;
             }
 

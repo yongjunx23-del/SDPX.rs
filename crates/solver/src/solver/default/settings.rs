@@ -187,8 +187,9 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "(1e-1).as_T()")]
     pub min_switch_step_length: T,
 
-    ///minimum step size allowed for symmetric cones & asymmetric cones with Dual scaling
-    #[builder(default = "(1e-4).as_T()")]
+    ///backtracking floor of the exponential and power cone step searches;
+    ///only a zero step ends the solve
+    #[builder(default = "step_floor_default(1e-4)")]
     pub min_terminate_step_length: T,
 
     ///maximum worker budget for cone phases and multithreaded KKT solvers
@@ -331,6 +332,18 @@ fn equilibrate_bound_default<T: FloatT>(primitive: f64, upper: bool) -> T {
         primitive.as_T()
     } else if upper {
         T::epsilon().sqrt().sqrt().recip()
+    } else {
+        T::epsilon().sqrt().sqrt()
+    }
+}
+
+/// Backtracking floor of the exp/pow cone step searches. Binary64 keeps
+/// upstream's `1e-4`, about `eps^(1/4)`; MPFR uses the same rule at its own
+/// precision. A fixed `1e-4` turns any shorter feasible step into a zero step,
+/// which ends the solve, although high precision resolves far shorter steps.
+fn step_floor_default<T: FloatT>(primitive: f64) -> T {
+    if is_primitive::<T>() {
+        primitive.as_T()
     } else {
         T::epsilon().sqrt().sqrt()
     }

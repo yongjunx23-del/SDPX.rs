@@ -8,6 +8,29 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-10 — short-step stop removed; unconverged ends report the best iterate (perf-mc-impl)
+
+User report: the step-length cutoff made solvable models fail ("for high
+precision this may not be needed, or decrease it more").
+
+- Before: three consecutive steps ≤ `min_terminate_step_length` (1e-4) gave
+  InsufficientProgress (task 12; one step before that).
+- Change (convergence contract):
+  - Only a zero step stops. Short positive steps continue; `max_iter` and `time_limit` bound a stall.
+  - An unconverged end (InsufficientProgress, NumericalError, MaxIterations, MaxTime) that misses AlmostSolved reports the iterate with the smallest tolerance multiple, max(res/tol_feas, min(gap_abs/tol, gap_rel/tol)), instead of the last one.
+  - The exp/pow backtracking floor (same setting) is eps^(1/4) in MPFR (1e-19 at 256 bits). Binary64 keeps 1e-4.
+- Goldstone unitarity `J060_N00_E0080_A030_K4` (k01, 256 bits, tol 1e-27, 2 threads, Mac):
+  - Old: InsufficientProgress/141 at gap 6.5e-6, dres 3.5e-4, objective −1.0333. The stop returned a point 50% off the optimum.
+  - New: the run escapes at iterations 151–159 and ends MaxIterations/300 at gap 4.5e-12, pres 2.2e-26, dres 1.7e-10, objective −1.5540.
+- Goldstone positivity `P_tree_g1_J080_E0300_A030` d00/d05/d09 (256 bits): no rule converges these; dres stalls at 1e-8…1e-11.
+  - Best-iterate report: d05 gap 2.5e-5 → 2.1e-14, d09 3.9e-5 → 2.5e-12, d00 unchanged.
+- Float64 46-case set (max_iter 200, 1 thread): 46/46 identical status, iterations and objective.
+- csdr3 MPFR256 e2e (arm `stepbest`): Solved/36, point identical to mci13, audit PASS.
+- `start_scale` tests: unchanged. `overshooting_start_still_solves` is still the known NumericalError, with every step 0.99.
+- Cluster Ising logs: every restart under the current default start is a τ chase. Restarts from InsufficientProgress appear only in older explicit-τ₀ runs (Λ35 at 598 is the short-step false stop).
+- Open: on the Goldstone models pres falls to 1e-29 while dres sits near 1e-9 with steps of 0.99. Exact Newton steps scale both, so the dual part of the direction is inaccurate. This is not a stop rule.
+- Decision: kept.
+
 ## 2026-10-10 — mixed Λ27 resampling, allocator and NUMA probes, RNS spread and memory diagnostics (perf-mc-impl)
 
 - Converter fix (`9cad781`): SDPB 3.1 resampling failed on mixed blocks 44/45 because the PyCFTBoot unitarity pole sits at +2^-124, above the scan start 0. The scan now starts at x[0]/2, accepts poles within 1e-30 of zero and writes them as 0. Λ19-rs reconversion is byte-identical.

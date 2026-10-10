@@ -438,6 +438,10 @@ where
     fn gap_rel(&self) -> Option<T> {
         None
     }
+    /// Absolute duality gap of the last evaluated iterate, if recorded.
+    fn gap_abs(&self) -> Option<T> {
+        None
+    }
     /// Larger of the primal and dual feasibility residuals, if recorded.
     fn residual_max(&self) -> Option<T> {
         None

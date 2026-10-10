@@ -365,6 +365,10 @@ where
         Some(self.gap_rel)
     }
 
+    fn gap_abs(&self) -> Option<T> {
+        Some(self.gap_abs)
+    }
+
     fn residual_max(&self) -> Option<T> {
         Some(T::max(self.res_primal, self.res_dual))
     }
