@@ -8,6 +8,32 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-11 — L8: a chase restart keeps the side that did not grow (perf-mc-impl)
+
+- Hypothesis: the restart from the deep τ₀ = eps^(1/3) puts both sides at 1/τ₀ in original coordinates. On Λ35-rs only the primal is large at the solution (near 1e94); the dual ends near 1.5e8 against a KKT start of 4.6e9. Deflating an over-scaled side runs at no more than 2 decades per iteration, so restarting the dual at its own scale should save iterations.
+- Start variants (test switch, 64 threads, full solves; τ₀ fixed unless "auto"):
+
+  | Variant | Λ35-rs/1024, τ₀ 1e-90 | Λ27-rs/768, τ₀ 1e-78 | Λ27-rs auto | Λ35-rs auto |
+  |---|---|---|---|---|
+  | v0: both sides at 1/τ₀, κ = 1/τ₀ (default) | 283 it / 1108 s | 200 / 290 | 138 | 423 (restart 169) |
+  | v1: z ×τ₀ (dual at its KKT scale), κ = 1 | 243 / 906 | 164 / 224 | 127 | 347 (restart 144) |
+  | v2: x, s ×τ₀ (primal at its KKT scale), κ = 1 | stopped | 381 / 392 | 462 (restart 80) | stopped (restart 81) |
+  | v3: κ = 1 only | — | 340 / 343 | chased at 80, stopped | — |
+
+  v1 wins on every Ising input and v2 loses badly: the right side to keep is the one that does not grow, and the KKT start does not reveal which one that is. v3 alone removes ising11's deep-τ penalty (54–55 it at τ₀ 1e-30/1e-100/1e-150) but loses on Λ27-rs. So nothing changes on the first attempt.
+- Change (convergence contract): a chase records the original-coordinate `(‖s‖∞, ‖z‖∞)` of the stopped attempt. The restart compares them with its unscaled start: when exactly one side grew past its start, the other side keeps that start (×τ₀ in HSD coordinates) and κ = 1. Otherwise the restart is unchanged. It prints `restart: dual keeps its start scale`. Both solvers (default and distributed) implement the rule. The test switch is removed.
+- Result (mci32, node102/node114, 64 threads; 224851/224852):
+
+  | Case | g25 (before) | mci32 |
+  |---|---|---|
+  | Λ35-rs/1024 | 423 it / 1511 s | **372 / 1195** (restart at 169, dual kept) |
+  | Λ27-rs/768, Λ19-rs/768, ising11/512, Λ27/768 | 138 / 89 / 54 / 183 | same iterations, points bitwise identical |
+  | mixrs Λ27/1024 | 57 | 57 / 949 s |
+
+  The Λ35-rs objective is unchanged to 38 digits; full audit 224854.
+- Recorded, not pursued: on Λ35-rs the batched constant column (−q, b) stalls in refinement every iteration (its second correction gains nothing), about 4.7% of the time. No floor model predicted the stall safely, so the correction stays.
+- Decision: kept. Remaining gap: a correct deep start from the first iteration would give 243 (v1 at 1e-90) instead of 372. Earlier chase detection (L1) is the open lever.
+
 ## 2026-10-11 — levers L1–L9 and wave balance at 64 threads (perf-mc-impl)
 
 ABBA legs are A1 B1 B2 A2 on one node at 64 threads, giving s/it means. Λ35-rs/1024 runs 10 or 30 iterations; mixed and mixrs Λ27/1024 run 3. Full solves use t17case with SDPX_TRACE_TAU.

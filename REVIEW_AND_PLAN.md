@@ -127,7 +127,9 @@ Levers L1–L9 and wave balance (journal 2026-10-11, perf-mc-impl, 64 threads, �
   - full Newton step;
   - directed SVD sweep;
   - τ fall-rate chase detection.
-- Next: the start point. The deep τ₀ deflates both sides by 1/τ₀ at no more than 2 decades per iteration, although only the primal is large at the Λ35 solution. Also next: the solve pipeline (38% of wall) and a divide-and-conquer SVD (about −4%).
+- Next: the solve pipeline (38% of wall) and a divide-and-conquer SVD (about −4%).
+
+L8, chase restart keeps the side that did not grow (journal 2026-10-11, perf-mc-impl, convergence contract): Λ35-rs/1024 423 → 372 it (1511 → 1195 s); the other Ising inputs are bitwise unchanged. Audit 224854 pending. Next: earlier chase detection (a correct deep start from iteration 0 would need 243 it) and the landing phase (gap O(1) → 1e-12 takes 30–50 iterations at mean step 0.4–0.5 on every Ising input; diagnostic `SDPX_DBG_STEPCONE`).
 
 Step-length stop (journal 2026-10-10, perf-mc-impl, convergence contract): only a zero step ends a solve; an unconverged end reports its best iterate; the exp/pow backtracking floor is eps^(1/4) in MPFR. Goldstone unitarity K4 case: InsufficientProgress/141 at gap 6.5e-6 → gap 4.5e-12 at 300; Float64 46/46 and csdr3 unchanged. Not merged.
 

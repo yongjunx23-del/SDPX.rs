@@ -183,16 +183,19 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
     type R = OwnedResiduals<T>;
     type C = OwnedCones<T>;
     type SE = DefaultSettings<T>;
-    fn slack_dual_scale(&self) -> T {
-        // Global maxima of the owned blocks and the replicated border; the
-        // product is only compared with a threshold, so f64 agreement suffices.
+    fn slack_dual_norms(&self) -> (T, T) {
+        // Global maxima of the owned blocks and the replicated border; they
+        // are only compared with thresholds, so f64 agreement suffices.
         let (mut s, mut z) = (self.border_s.norm_inf(), self.border_z.norm_inf());
         for b in &self.blocks {
             s = T::max(s, b.s.norm_inf());
             z = T::max(z, b.z.norm_inf());
         }
-        let (s, z) = (s.to_f64().unwrap_or(f64::INFINITY), z.to_f64().unwrap_or(f64::INFINITY));
-        T::from_f64(crate::mpi::max_all_f64(s) * crate::mpi::max_all_f64(z)).unwrap_or(T::infinity())
+        let all = |v: T| {
+            T::from_f64(crate::mpi::max_all_f64(v.to_f64().unwrap_or(f64::INFINITY)))
+                .unwrap_or(T::infinity())
+        };
+        (all(s), all(z))
     }
     fn calc_mu(&mut self, r: &Self::R, c: &Self::C) -> T {
         let sz = r
@@ -461,6 +464,14 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         }
         self.tau = tau;
         self.kappa = T::recip(tau);
+    }
+    fn keep_start_side(&mut self, dual: bool) {
+        let tau = self.tau;
+        for v in &mut self.blocks {
+            v.keep_start_side(dual);
+        }
+        if dual { &mut self.border_z } else { &mut self.border_s }.scale(tau);
+        self.kappa = T::one();
     }
     fn new_like(&self) -> Self {
         Self {

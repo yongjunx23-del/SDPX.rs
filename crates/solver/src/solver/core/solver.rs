@@ -152,6 +152,9 @@ where
     pub(crate) callbacks: SolverCallbacks<I>,
     /// Starting τ of the current attempt (`initial_tau` until a restart).
     pub(crate) start_tau: Option<T>,
+    /// Original-coordinate `(‖s‖∞, ‖z‖∞)` of an attempt stopped for a τ
+    /// chase, for the restart's choice of the side to rescale.
+    pub(crate) chase_sides: Option<(T, T)>,
     /// Original-coordinate acceptance progress: the best tolerance multiple
     /// so far and the failed checks since it last halved.
     pub(crate) original_progress: (Option<T>, u32),
@@ -297,6 +300,7 @@ where
 
         timeit! {"solve"; {
         self.start_tau = None;
+        self.chase_sides = None;
         self.original_progress = (None, 0);
         self.best = None;
         timeit! {"default start"; {
@@ -348,6 +352,8 @@ where
                             Some(_) => TauChase::restart_tau(tau),
                             None => T::min(tau, TauChase::<T>::deep_tau()),
                         });
+                        let (s, z) = self.variables.slack_dual_norms();
+                        self.chase_sides = Some((s / tau, z / tau));
                         break;
                     }
                 }
@@ -356,7 +362,7 @@ where
                 if gap.is_finite() {
                     best_gap = T::min(best_gap, gap);
                 }
-                trace_tau(state.iter, tau, gap, state.μ);
+                trace_tau(state.iter, tau, gap, state.μ, || self.variables.slack_dual_norms());
                 if self.settings.core().fixed_tau_phase
                     && !self.variables.tau_frozen()
                 {
@@ -1116,8 +1122,23 @@ mod internal {
                 self.variables.unit_initialization(&self.cones);
             }
             let tau = self.start_tau.unwrap_or(self.settings.core().initial_tau);
+            // After a τ chase only the side that outgrew its start needs the
+            // deep scale. The other keeps its unscaled start instead of
+            // shrinking back from 1/τ₀ (Λ35-rs: the dual ends near 1e8, its
+            // KKT start 4.6e9, the primal near 1e94).
+            let keep = self
+                .chase_sides
+                .take()
+                .and_then(|now| TauChase::kept_side(now, self.variables.slack_dual_norms()));
             if tau != T::one() {
                 self.variables.set_initial_tau(tau);
+                if let Some(dual) = keep.filter(|_| tau < T::one()) {
+                    self.variables.keep_start_side(dual);
+                    if self.settings.core().verbose {
+                        let side = if dual { "dual" } else { "primal" };
+                        let _ = writeln!(self.info.print_target(), "restart: {side} keeps its start scale");
+                    }
+                }
             }
         }
 
@@ -1277,12 +1298,14 @@ fn test_fixed_tau_at() -> Option<u32> {
     })
 }
 
-/// Diagnostic only: with `SDPX_TRACE_TAU` set, print τ, the relative gap
-/// and μ of every evaluated iterate to stderr.
-fn trace_tau<T: FloatT>(iter: u32, tau: T, gap: T, mu: T) {
+/// Diagnostic only: with `SDPX_TRACE_TAU` set, print τ, the relative gap,
+/// μ and the original-coordinate `‖s‖∞`, `‖z‖∞` of every evaluated iterate
+/// to stderr.
+fn trace_tau<T: FloatT>(iter: u32, tau: T, gap: T, mu: T, sides: impl FnOnce() -> (T, T)) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("SDPX_TRACE_TAU").is_some()) {
-        eprintln!("tau-trace {iter} {tau:.3e} {gap:.3e} {mu:.3e}");
+        let (s, z) = sides();
+        eprintln!("tau-trace {iter} {tau:.3e} {gap:.3e} {mu:.3e} {:.3e} {:.3e}", s / tau, z / tau);
     }
 }
 
@@ -1393,6 +1416,19 @@ impl<T: FloatT> TauChase<T> {
     fn deep_tau() -> T {
         T::epsilon().cbrt()
     }
+
+    /// The side a chase restart keeps at its unscaled start: the dual
+    /// (`true`) when only the primal grew past its start, the primal when
+    /// only the dual did; `None` (both rescaled) otherwise. `now`: the
+    /// chased iterate's original-coordinate `(‖s‖∞, ‖z‖∞)`; `start`: the
+    /// restart's before scaling.
+    fn kept_side(now: (T, T), start: (T, T)) -> Option<bool> {
+        match (now.0 > start.0, now.1 > start.1) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1435,6 +1471,15 @@ mod tau_chase_tests {
         assert!(!c.observe(1e-13, 1e-62, 1e-30, None));
         assert_eq!(TauChase::<f64>::deep_tau(), f64::EPSILON.cbrt());
         assert_eq!(TauChase::<f64>::restart_tau(1e-11), 1e-11);
+    }
+
+    #[test]
+    fn restart_keeps_the_side_that_did_not_grow() {
+        // Λ35-rs: primal 1e94 against a start of 1.3e3, dual 1.5e8 against 4.6e9.
+        assert_eq!(TauChase::<f64>::kept_side((1e94, 1.5e8), (1.3e3, 4.6e9)), Some(true));
+        assert_eq!(TauChase::<f64>::kept_side((1e2, 1e40), (1e3, 1e9)), Some(false));
+        assert_eq!(TauChase::<f64>::kept_side((1e94, 1e40), (1e3, 1e9)), None);
+        assert_eq!(TauChase::<f64>::kept_side((1e2, 1e8), (1e3, 1e9)), None);
     }
 }
 

@@ -208,13 +208,24 @@ pub trait Variables<T: FloatT> {
     /// Start the embedding at `τ = tau`, `κ = 1/tau` (τκ unchanged at 1).
     fn set_initial_tau(&mut self, tau: T);
 
+    /// After `set_initial_tau(τ₀)`: multiply the dual (`dual`) or the primal
+    /// iterate by τ₀, so in original coordinates that side keeps its
+    /// unscaled start, and set κ = 1 so that τκ = τ₀ matches the cones.
+    fn keep_start_side(&mut self, dual: bool);
+
     /// Scale statistics of the iterate (diagnostics).
     fn scale_stats(&self) -> String {
         String::new()
     }
 
+    /// `(‖s‖∞, ‖z‖∞)` of the iterate, equal on every rank.
+    fn slack_dual_norms(&self) -> (T, T);
+
     /// `‖s‖∞·‖z‖∞` of the iterate (the scale of a KKT initializer).
-    fn slack_dual_scale(&self) -> T;
+    fn slack_dual_scale(&self) -> T {
+        let (s, z) = self.slack_dual_norms();
+        s * z
+    }
 
     /// Current homogeneous τ, when the variables carry one.
     fn tau(&self) -> Option<T> {

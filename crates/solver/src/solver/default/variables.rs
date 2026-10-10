@@ -381,6 +381,17 @@ where
         self.κ = T::recip(tau);
     }
 
+    fn keep_start_side(&mut self, dual: bool) {
+        let tau = self.τ;
+        if dual {
+            self.z.scale(tau);
+        } else {
+            self.x.scale(tau);
+            self.s.scale(tau);
+        }
+        self.κ = T::one();
+    }
+
     fn tau(&self) -> Option<T> {
         Some(self.τ)
     }
@@ -424,8 +435,8 @@ where
         a
     }
 
-    fn slack_dual_scale(&self) -> T {
-        self.s.norm_inf() * self.z.norm_inf()
+    fn slack_dual_norms(&self) -> (T, T) {
+        (self.s.norm_inf(), self.z.norm_inf())
     }
 
     fn scale_stats(&self) -> String {

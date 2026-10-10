@@ -325,6 +325,7 @@ impl<T: FloatT> DefaultSolver<T> {
             timers: None,
             callbacks: SolverCallbacks::default(),
             start_tau: None,
+            chase_sides: None,
             original_progress: (None, 0),
             best: None,
             phantom: std::marker::PhantomData,
