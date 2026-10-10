@@ -426,6 +426,32 @@ impl<T: FloatT> DenseLeaf<T> {
         }
     }
 
+    /// Copy the negated factor rows from `start` into the strict upper
+    /// triangle, which no sweep reads after factoring (the next factor
+    /// recopies its input): row `r` lies at `l[r * n + start..=r * n + r]`,
+    /// ending in the unit diagonal.
+    fn stage_rows(&mut self, start: usize) {
+        let n = self.n;
+        for r in start..n {
+            for k in start..r {
+                self.l[k + r * n] = -self.l[r + k * n];
+            }
+            self.l[r + r * n] = T::one();
+        }
+    }
+
+    /// [`Self::forward_suffix`] after [`Self::stage_rows`]: each entry is
+    /// `x[i] - Σ L x` as one exact dot product rounded once. Never less
+    /// accurate than the FMA chain, but not bitwise equal to it.
+    fn forward_suffix_rows(&self, x: &mut [T], start: usize) {
+        let n = self.n;
+        for i in 0..x.len() {
+            let r = i + start;
+            let v = T::dot_slices(&self.l[r * n + start..=r * n + r], &x[..=i]);
+            x[i] = v;
+        }
+    }
+
     /// [`Self::backward`] split over the ambient pool: the bottom row block
     /// finishes serially, then every earlier row applies that block's columns
     /// in parallel. A row sums its terms block by block from the bottom,
@@ -707,20 +733,32 @@ impl<T: FloatT> Leaf<T> {
         } else {
             self.y.copy_from_slice(&self.b);
         }
+        // Exactly accumulated types solve Y by rows: one exact dot per entry.
+        let rows = T::precision_bits() > 64;
+        if rows {
+            self.factor.stage_rows(start);
+        }
         let (factor, couples, packed) = (&self.factor, &self.couples, self.packed);
+        let solve = |column: &mut [T]| {
+            if rows {
+                factor.forward_suffix_rows(column, start)
+            } else {
+                factor.forward_suffix(column, start)
+            }
+        };
         if split && width > 0 {
             self.y
                 .par_chunks_mut(width)
                 .enumerate()
                 .filter(|(j, _)| packed || couples[*j])
-                .for_each(|(_, column)| factor.forward_suffix(column, start));
+                .for_each(|(_, column)| solve(column));
         } else if packed {
             for column in self.y.chunks_mut(width) {
-                factor.forward_suffix(column, start);
+                solve(column);
             }
         } else {
             for &j in &self.coupled {
-                factor.forward_suffix(&mut self.y[j * width..(j + 1) * width], start);
+                solve(&mut self.y[j * width..(j + 1) * width]);
             }
         }
         if !self.z.is_empty() {
