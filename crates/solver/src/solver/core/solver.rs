@@ -1311,6 +1311,14 @@ impl<T: FloatT> TauChase<T> {
             return false;
         }
         self.peak = T::max(self.peak, tau);
+        // A start's gap is ~0 (equal costs), so a first anchor there never
+        // moves. Against the peak, anchor in the convergence phase only:
+        // Λ27-rs (no chase) stalls near gap 1e-13 at iterations 89–99 while
+        // μ falls 266-fold, and fired from its start anchor.
+        if reference.is_none() && gap > (1e-6).as_T() {
+            self.anchor = None;
+            return false;
+        }
         let tau0 = reference.unwrap_or(self.peak);
         match self.anchor {
             Some((best, _)) if gap >= best * (0.1).as_T() => {}
@@ -1367,6 +1375,12 @@ mod tau_chase_tests {
             c.observe(1e-17, 10f64.powi(-2 * k), 1e-33 * 10f64.powi(-k / 4), None)
         });
         assert_eq!(fired, Some(12));
+        // ... but not from a start-phase anchor (gap above 1e-6).
+        let mut c = TauChase::<f64>::default();
+        assert!(!c.observe(1e-222, 1.0, 1e-27, None));
+        assert!((0..12).all(|k| !c.observe(1e3, 10f64.powi(-4 * k), 1e-27, None)));
+        assert!(!c.observe(1e-13, 1e-60, 1e-30, None));
+        assert!(!c.observe(1e-13, 1e-62, 1e-30, None));
         assert_eq!(TauChase::<f64>::deep_tau(), f64::EPSILON.cbrt());
         assert_eq!(TauChase::<f64>::restart_tau(1e-11), 1e-11);
     }
