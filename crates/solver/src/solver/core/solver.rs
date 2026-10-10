@@ -327,14 +327,26 @@ where
             if self.terminate(&mut state, &affinity).stop() {
                 break;
             }
-            if self.start_tau.is_none()
-                && self.settings.core().auto_start_scale
-                && self.callbacks.checkpoint.restart.is_none()
-            {
-                let tau0 = self.settings.core().initial_tau;
+            // A first attempt from the user's τ₀ watches τ against τ₀; an
+            // automatic start or restart above the deep scale watches τ
+            // against its own peak and restarts at the deep scale.
+            let core = self.settings.core();
+            let reference = match self.start_tau {
+                None if core.initial_tau >= (1e-10).as_T() => Some(Some(core.initial_tau)),
+                Some(t) if core.initial_tau == T::one() && t > TauChase::<T>::deep_tau() => Some(None),
+                _ => None,
+            };
+            if let (Some(reference), true, true) = (
+                reference,
+                core.auto_start_scale,
+                self.callbacks.checkpoint.restart.is_none(),
+            ) {
                 if let (Some(tau), Some(gap)) = (self.variables.tau(), self.info.gap_rel()) {
-                    if chase.observe(gap, state.μ, tau, tau0) {
-                        chase_tau = Some(TauChase::restart_tau(tau));
+                    if chase.observe(gap, state.μ, tau, reference) {
+                        chase_tau = Some(match reference {
+                            Some(_) => TauChase::restart_tau(tau),
+                            None => T::min(tau, TauChase::<T>::deep_tau()),
+                        });
                         break;
                     }
                 }
@@ -1279,18 +1291,27 @@ const CHASE_START_SCALE: f64 = 1e15;
 /// 20 iterations while the gap stays within 10×. τ < 1e-4·τ₀ held only from
 /// iteration 88 on Λ27-rs (gap stalled from 32; τ < 1e-2 from 68), while
 /// converging unit starts settle well above 1e-2 (Λ19-rs 0.14, ising11 2.7).
+///
+/// An automatic start at the restart scale can chase again: Λ35-rs at 1024
+/// bits from τ₀ = 3e-39 rises to 3e-33, then from iteration ~115 (gap 1e-12)
+/// τ falls 0.12 orders per iteration to 2.5e-89 (605 iterations). Such an
+/// attempt is measured against its peak τ and restarts at `deep_tau`. Too
+/// small a τ₀ costs far less than a chase: Λ35-rs takes 283–284 iterations
+/// from 1e-90 or 1e-120, Λ27-rs 138/158/200 from 1e-29/1e-50/1e-78.
 #[derive(Default)]
 struct TauChase<T> {
     anchor: Option<(T, T)>,
+    peak: T,
 }
 
 impl<T: FloatT> TauChase<T> {
-    fn observe(&mut self, gap: T, mu: T, tau: T, tau0: T) -> bool {
-        if !(gap.is_finite() && mu.is_finite() && tau.is_finite() && tau > T::zero())
-            || tau0 < (1e-10).as_T()
-        {
+    /// `reference`: the attempt's τ₀, or `None` for its peak τ so far.
+    fn observe(&mut self, gap: T, mu: T, tau: T, reference: Option<T>) -> bool {
+        if !(gap.is_finite() && mu.is_finite() && tau.is_finite() && tau > T::zero()) {
             return false;
         }
+        self.peak = T::max(self.peak, tau);
+        let tau0 = reference.unwrap_or(self.peak);
         match self.anchor {
             Some((best, _)) if gap >= best * (0.1).as_T() => {}
             _ => {
@@ -1307,6 +1328,11 @@ impl<T: FloatT> TauChase<T> {
     fn restart_tau(tau: T) -> T {
         T::min(tau, T::epsilon().sqrt().sqrt().sqrt())
     }
+
+    /// Second restart scale `eps^(1/3)`: 1.1e-103 at 1024 bits, 8.6e-78 at 768.
+    fn deep_tau() -> T {
+        T::epsilon().cbrt()
+    }
 }
 
 #[cfg(test)]
@@ -1319,22 +1345,29 @@ mod tau_chase_tests {
         let mut c = TauChase::<f64>::default();
         for k in 0..60 {
             let v = 10f64.powi(-k / 2);
-            assert!(!c.observe(v, v, v, 1.0));
+            assert!(!c.observe(v, v, v, Some(1.0)));
         }
         // Stall: gap flat at 1e-13 while μ falls; fires once μ drops 1e4.
         let mut c = TauChase::<f64>::default();
         let mut fired = None;
         for k in 0..40 {
             let mu = 1e-20 * 10f64.powi(-k);
-            if c.observe(1e-13, mu, 1e-11, 1.0) {
+            if c.observe(1e-13, mu, 1e-11, Some(1.0)) {
                 fired = Some(k);
                 break;
             }
         }
         assert_eq!(fired, Some(4));
-        // A small user start disables the rule.
+        // Against the peak: a settled τ never fires; τ falling 100-fold
+        // below its peak with a stalled gap does.
         let mut c = TauChase::<f64>::default();
-        assert!((0..40).all(|k| !c.observe(1e-13, 10f64.powi(-k), 1e-40, 1e-30)));
+        assert!((0..40).all(|k| !c.observe(1e-13, 10f64.powi(-k), 1e-33, None)));
+        let mut c = TauChase::<f64>::default();
+        let fired = (0..40).position(|k| {
+            c.observe(1e-17, 10f64.powi(-2 * k), 1e-33 * 10f64.powi(-k / 4), None)
+        });
+        assert_eq!(fired, Some(12));
+        assert_eq!(TauChase::<f64>::deep_tau(), f64::EPSILON.cbrt());
         assert_eq!(TauChase::<f64>::restart_tau(1e-11), 1e-11);
     }
 }
