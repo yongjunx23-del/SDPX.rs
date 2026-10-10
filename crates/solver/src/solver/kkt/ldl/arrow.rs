@@ -1016,31 +1016,12 @@ fn subtract_contributions<T: FloatT>(
                 .min(group.len());
             let batches = group.chunks(group.len().div_ceil(count));
             for batch in batches {
-                // Products run largest-first, each with at least its even
-                // share of the pool and more ways in proportion to its g·q²
-                // (SDPB-style measured balancing): with an even 2 ways each,
-                // mixed Λ27/1024's 117 leaves on 128 workers took 6.1 s/it
-                // for 1.7 s of fair-share product time.
-                let cost: Vec<f64> = batch
-                    .iter()
-                    .map(|l| (l.ids.len() * l.coupled.len() * l.coupled.len()) as f64)
-                    .collect();
-                let share = cost.iter().sum::<f64>() / width as f64;
-                let even = width.div_ceil(batch.len()).clamp(1, 8);
-                let mut order: Vec<usize> = (0..batch.len()).collect();
-                order.sort_by(|&a, &b| cost[b].total_cmp(&cost[a]));
-                let build = |&i: &usize| {
-                    let ways = even.max(crate::algebra::measured_ways(cost[i], share));
-                    (i, crate::algebra::with_split_hint(ways, || build(&batch[i])))
+                let ways = width.div_ceil(batch.len()).clamp(1, 8);
+                let build = |leaf: &Leaf<T>| crate::algebra::with_split_hint(ways, || build(leaf));
+                let products: Vec<Vec<T>> = match pool {
+                    Some(p) => p.install(|| batch.par_iter().map(build).collect()),
+                    None => batch.iter().map(build).collect(),
                 };
-                let built: Vec<(usize, Vec<T>)> = match pool {
-                    Some(p) => p.install(|| order.par_iter().with_max_len(1).map(build).collect()),
-                    None => order.iter().map(build).collect(),
-                };
-                let mut products = vec![Vec::new(); batch.len()];
-                for (i, product) in built {
-                    products[i] = product;
-                }
                 // Columns are independent; each entry still subtracts leaves
                 // in the original order before the next batch begins.
                 let scatter = |(j, col): (usize, &mut [T])| {
