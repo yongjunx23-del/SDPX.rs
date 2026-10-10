@@ -1597,6 +1597,15 @@ pub(super) fn gemm<const N: usize>(
     let Some(plan) = Plan::new(k, needed) else {
         return false;
     };
+    if packed_output && m >= 300 && !ta_n && tb_n && spread_probe() {
+        let (da2, db2, cola, colb) = balanced_spreads(&av, &bv, k);
+        let after = 2.0 * p_bits + (da2 + db2) as f64 + (k.max(1) as f64).log2() + 3.0;
+        eprintln!(
+            "RNSSPREAD m {m} k {k} da {da} db {db} col_a {cola} col_b {colb} balanced {da2} {db2} primes {} -> {}",
+            plan.count(),
+            Plan::new(k, after).map_or(0, |p| p.count())
+        );
+    }
     let (len_a, len_b) = (av.len(), bv.len());
     let selected = if upper_only && !packed_output {
         selection(m, n, upper_only)
@@ -1668,6 +1677,68 @@ pub(super) fn gemm<const N: usize>(
         acc.selected = &selected;
     }
     acc.finish(&plan, lo_a + lo_b, out, &split)
+}
+
+fn spread_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SDPX_RNS_SPREAD").is_some())
+}
+
+/// Diagnostic: spreads of `Aᵀ·B` operands (`k` rows each) after exact
+/// power-of-two column scaling and balanced row scaling (2^-s on A's row,
+/// 2^s on B's), and the largest single-column spreads.
+fn balanced_spreads<const N: usize>(a: &View<'_, N>, b: &View<'_, N>, k: usize) -> (i64, i64, i64, i64) {
+    let exponents = |v: &View<'_, N>| -> Vec<Option<i64>> {
+        let mut e = vec![None; k * v.cols];
+        for j in 0..v.cols {
+            for i in 0..k {
+                let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+                if scan_exponent(&v.data[i + j * v.ld], &mut lo, &mut hi) == Some(true) {
+                    e[i + j * k] = Some(hi);
+                }
+            }
+        }
+        e
+    };
+    let normalize = |e: &mut Vec<Option<i64>>, cols: usize| -> i64 {
+        let mut widest = 0;
+        for j in 0..cols {
+            let column = &mut e[j * k..(j + 1) * k];
+            let hi = column.iter().flatten().copied().max();
+            let lo = column.iter().flatten().copied().min();
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                widest = widest.max(hi - lo);
+                column.iter_mut().flatten().for_each(|x| *x -= hi);
+            }
+        }
+        widest
+    };
+    let (mut ea, mut eb) = (exponents(a), exponents(b));
+    let cola = normalize(&mut ea, a.cols);
+    let colb = normalize(&mut eb, b.cols);
+    let row_max = |e: &Vec<Option<i64>>, cols: usize, i: usize| {
+        (0..cols).filter_map(|j| e[i + j * k]).max()
+    };
+    let shift: Vec<i64> = (0..k)
+        .map(|i| match (row_max(&ea, a.cols, i), row_max(&eb, b.cols, i)) {
+            (Some(x), Some(y)) => (x - y).div_euclid(2),
+            _ => 0,
+        })
+        .collect();
+    let spread = |e: &Vec<Option<i64>>, cols: usize, sign: i64| {
+        let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+        for j in 0..cols {
+            for i in 0..k {
+                if let Some(x) = e[i + j * k] {
+                    let x = x - sign * shift[i];
+                    lo = lo.min(x);
+                    hi = hi.max(x);
+                }
+            }
+        }
+        if lo == i64::MAX { 0 } else { hi - lo }
+    };
+    (spread(&ea, a.cols, 1), spread(&eb, b.cols, -1), cola, colb)
 }
 
 /// Upper triangle of `Σ_b Z_bᵀ·Y_b` with `Z_b = diag(d_b)·Y_b` rounded
