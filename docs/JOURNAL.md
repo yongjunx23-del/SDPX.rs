@@ -8,6 +8,28 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-10 — mixed Λ27 resampling, allocator and NUMA probes, RNS spread and memory diagnostics (perf-mc-impl)
+
+- Converter fix (`9cad781`): SDPB 3.1 resampling failed on mixed blocks 44/45 because the PyCFTBoot unitarity pole sits at +2^-124, above the scan start 0. The scan now starts at x[0]/2, accepts poles within 1e-30 of zero and writes them as 0. Λ19-rs reconversion is byte-identical.
+- Hypothesis: the resampled mixed input removes the refinement work (47 → 12 linear solves in a 3-iteration probe, 26.1 → 19.0 s/it) and shortens the solve.
+- Result (full solves, sdpx-mci19, 64 threads, jobs 224759/224760, audit 224768):
+
+  | Mixed Λ27/1024 | Old input | Resampled |
+  |---|---|---|
+  | Status / iterations | Solved / 42 | Solved / 57 |
+  | Wall | 998 s | 1066 s (+7%) |
+  | s/it (KKT solve) | 22.8 (3.20) | 18.1 (1.58) |
+  | Linear solves / refinements | 322 / 221 | 145 / 0 |
+  | Peak RSS | 34.5 GB | 35.4 GB |
+  | Audit (1e-30) | fails: dual 1.48e-23, primal 3.7e-28 | fails: dual 2.34e-23, primal 1.2e-31, gap 2.4e-33 |
+
+  Observed: the old input's relative primal residual is ~1e-127 from iteration 1 (a norm inflated by the 2^-124 scaling); the resampled run's stalls near 5e-8…1e-5 over iterations 8–14 with steps 0.3–0.5. Decision: resampling is not a mixed default; it does not fix the dual audit failure, which stays open.
+- Not kept (mci20, 128 threads, mixed 3 it, ABBA, points identical): `numactl --interleave=all` no gain (node104, noisy legs); `MALLOC_MMAP_THRESHOLD_=1 MiB` RSS 37.3 → 32.2 GB (−14%) for +24% time, the slowdown in prep/recov/res (per-call temporaries of 1–32 MiB); `MALLOC_MMAP_MAX_=0` +49% time and +9% RSS (Λ35-rs +13% time).
+- Diagnostics (`a79ff7e` memory marks, `c7db42b` spread probe; mci22, old mixed, 64 threads, job 224770):
+  - RSS by stage (GB): input 1.8; sampled materialized 10.6; equilibrated 11.4; cone blocks 13.5; reduced solver 19.3; sampled installed (peak) 20.6, back to 11.4 after A compaction; iteration 1 start 19.3 (the start factorization adds 7.6); iteration 3 steady 25.9, peak 30.1.
+  - Contribution operands: per-operand spreads 230–400 bits; exact power-of-two row/column balancing leaves 20–35 bits (q 315 leaves) and 28–108 (q 419); primes 106–120 → 88–89 and 105–114 → 93–99.
+- Pre-existing test failures (observed on `main` ee235b4 and on this branch): `sampled_integration::actual_chordal_fallback_{f64,mpfr256}` (the fixture's chordal pass no longer changes the matrix) and `start_scale::overshooting_start_still_solves` (`NumericalError` from τ₀ 1e-70).
+
 ## 2026-10-10 — automatic τ start and second chase restart; mixed setup and batching (perf-mc-impl)
 
 - Hypothesis: an over-large KKT start scale predicts a τ chase, so such starts should begin at the restart scale; a start that still chases (τ falls far below its own peak while the gap stalls) needs one deeper restart. One rule, no per-input settings.

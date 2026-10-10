@@ -83,7 +83,8 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 ## Known failures (keep visible)
 
 - **Λ35 conditioning:** the dual has no Slater point and both solvers retain a long gap plateau. Task 17 resolved the former 768-bit floor: Solved and audited at 768/1024 bits (scoreboard above). Shortening the plateau remains performance work.
-- **Mixed Lambda27 MPFR1024 (frozen 0.9.1):** `Solved`/42 but fails the 1e-30 original-coordinate audit: dual 1.475e-23, primal 3.73e-28, PSD link 2.73e-26, componentwise dual 0.84355.
+- **Mixed Lambda27 MPFR1024 (frozen 0.9.1):** `Solved`/42 but fails the 1e-30 original-coordinate audit: dual 1.475e-23, primal 3.73e-28, PSD link 2.73e-26, componentwise dual 0.84355. The resampled input (2026-10-10) also fails (dual 2.34e-23) and takes 57 iterations.
+- **Integration tests failing on `main` (ee235b4) and `perf-mc-impl`:** `actual_chordal_fallback_{f64,mpfr256}` (fixture no longer changed by the chordal pass) and `overshooting_start_still_solves` (NumericalError from τ₀ 1e-70). Cause not yet bisected.
   - Primal variables reach 5.8e118.
   - The explicit-gate pilot is prepared but not run (decision below).
   - Not the same input as the 768-bit Λ27 above, which passes its audit.
