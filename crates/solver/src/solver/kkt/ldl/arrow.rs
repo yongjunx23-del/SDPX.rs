@@ -995,24 +995,26 @@ fn subtract_contributions<T: FloatT>(
                 subtract_contributions_columns(group, s, t, pool);
                 continue;
             }
-            // At most one leaf per worker and `BATCH_WORK_BYTES` of estimated
-            // workspace per batch: Y, Z and the product in working precision
-            // plus their per-prime residues (about bits/8 primes of 8 bytes).
+            // At most one leaf per worker and about `BATCH_WORK_BYTES` of
+            // workspace per batch, in batches of equal leaf counts: Y, Z and
+            // the product in working precision (the residues are transient).
             // Mixed Λ27/1024 (border 524): batching all 117 leaves raised
-            // 128-thread peak RSS from 23 to 37 GiB.
-            let words = std::mem::size_of::<T>() + T::precision_bits() / 8 * 8;
-            let mut batches = Vec::new();
-            let (mut start, mut bytes) = (0, 0);
-            for (i, leaf) in group.iter().enumerate() {
-                let (g, q) = (leaf.ids.len(), leaf.coupled.len());
-                let b = (2 * g * q + q * q) * words;
-                if i > start && (i - start == width || bytes + b > BATCH_WORK_BYTES) {
-                    batches.push(&group[start..i]);
-                    (start, bytes) = (i, 0);
-                }
-                bytes += b;
-            }
-            batches.push(&group[start..]);
+            // 128-thread peak RSS from 23 to 36 GiB, about this estimate;
+            // also counting residues split it into batches of 2–3 leaves
+            // and slowed contributions 6.2 → 10.7 s at 64 threads.
+            let bytes: usize = group
+                .iter()
+                .map(|l| {
+                    let (g, q) = (l.ids.len(), l.coupled.len());
+                    (2 * g * q + q * q) * std::mem::size_of::<T>()
+                })
+                .sum();
+            let count = group
+                .len()
+                .div_ceil(width)
+                .max(bytes.div_ceil(BATCH_WORK_BYTES))
+                .min(group.len());
+            let batches = group.chunks(group.len().div_ceil(count));
             for batch in batches {
                 let ways = width.div_ceil(batch.len()).clamp(1, 8);
                 let build = |leaf: &Leaf<T>| crate::algebra::with_split_hint(ways, || build(leaf));
