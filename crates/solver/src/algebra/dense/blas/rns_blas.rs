@@ -262,7 +262,76 @@ fn release_buffer(v: Vec<f64>) {
 /// Ways granted to a block of measured `cost` when the pool's fair share is
 /// `share` (SDPB-style measured load balancing).
 pub(crate) fn measured_ways(cost: f64, share: f64) -> usize {
-    ((cost / share).floor() as usize).clamp(1, 8)
+    ((cost / share).floor() as usize).clamp(1, MAX_WAYS)
+}
+
+/// Most ways one block's residue products are split into.
+pub(crate) const MAX_WAYS: usize = 8;
+
+/// Work each extra way adds to its block (joins, thinner panels, per-way CRT).
+const WAY_OVERHEAD: f64 = 0.03;
+
+/// Ways per block for one parallel phase of `costs` on `workers`: every
+/// block splits into pieces no larger than a common grain, the grain chosen
+/// among `total / (workers·k)`, k = 1..=[`MAX_WAYS`], by the
+/// longest-processing-time makespan of the pieces, each extra way charged
+/// [`WAY_OVERHEAD`] of its block. Granting ways only above the fair share
+/// ([`measured_ways`]) kept 72 equal cones on 64 workers at one way each:
+/// two waves, the second with 8 cones and 56 idle workers. Planned cone-lane
+/// ways cut Λ35-rs's cone W-product phases (combined RHS 0.115 → 0.075 s,
+/// step lengths 0.095 → 0.085 s at 64 threads; 2.940 → 2.867 s/it, ABBA
+/// 2026-10-11, mixed unchanged); the condensed
+/// KKT's own phases measured slower with them and keep `measured_ways`.
+/// Splits are exact (residue products round once), so the plan changes
+/// timing only.
+pub(crate) fn planned_ways(costs: &[f64], workers: usize) -> Vec<usize> {
+    let ones = vec![1; costs.len()];
+    let total: f64 = costs.iter().sum();
+    if workers <= 1 || !(total > 0.0) || !total.is_finite() || costs.iter().any(|c| *c < 0.0) {
+        return ones;
+    }
+    let pieces = |ways: &[usize]| -> f64 {
+        let mut all: Vec<f64> = Vec::with_capacity(ways.iter().sum());
+        for (&c, &w) in costs.iter().zip(ways) {
+            let piece = c / w as f64 * (1.0 + WAY_OVERHEAD * (w - 1) as f64);
+            all.extend(std::iter::repeat(piece).take(w));
+        }
+        lpt_makespan_f64(&mut all, workers)
+    };
+    let mut best = (pieces(&ones), ones);
+    for k in 1..=MAX_WAYS {
+        let grain = total / (workers * k) as f64;
+        let ways: Vec<usize> = costs
+            .iter()
+            .map(|&c| ((c / grain).ceil() as usize).clamp(1, MAX_WAYS))
+            .collect();
+        let makespan = pieces(&ways);
+        if makespan < best.0 {
+            best = (makespan, ways);
+        }
+    }
+    best.1
+}
+
+/// Longest-processing-time makespan of `loads` on `workers` identical
+/// workers (sorts `loads`).
+fn lpt_makespan_f64(loads: &mut [f64], workers: usize) -> f64 {
+    loads.sort_unstable_by(|a, b| b.total_cmp(a));
+    let workers = workers.max(1);
+    if loads.len() <= workers {
+        return loads.first().copied().unwrap_or(0.0);
+    }
+    // Min-heap of worker loads, as ordered bits of the nonnegative values.
+    let mut busy: std::collections::BinaryHeap<std::cmp::Reverse<u64>> =
+        (0..workers).map(|_| std::cmp::Reverse(0f64.to_bits())).collect();
+    let mut makespan = 0f64;
+    for &load in loads.iter() {
+        let std::cmp::Reverse(bits) = busy.pop().unwrap();
+        let next = f64::from_bits(bits) + load;
+        makespan = makespan.max(next);
+        busy.push(std::cmp::Reverse(next.to_bits()));
+    }
+    makespan
 }
 
 /// Run `f` with this thread's residue products split into `ways`

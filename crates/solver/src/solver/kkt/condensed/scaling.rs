@@ -185,6 +185,8 @@ fn action_index<T>(action: &ScalingAction<'_, T>) -> usize {
 /// gets `floor(cost/share)` ways for its residue products; the rest stay
 /// serial. Costs are data dependent (prime counts follow exponent spreads),
 /// so they are measured rather than modelled; the first call keeps 1 way.
+/// Granting ways to fill a wave's idle tail (`planned_ways`) measured slower
+/// here (Λ35-rs at 64 threads: prepare/recover/residual +5–10%, 2026-10-10).
 fn assign_ways<T>(blocks: &mut [Block<T>], action: usize, workers: usize) {
     let total: f64 = blocks.iter().map(|b| b.cost[action]).sum();
     if workers <= 1 || total <= 0.0 {

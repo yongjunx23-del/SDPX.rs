@@ -726,3 +726,54 @@ fn prime_group_congruence_matches_unsplit() {
     run::<4>(9, 71);
     run::<12>(53, 72);
 }
+
+/// Cost of granting ways to one congruence when nobody steals them (a single
+/// worker runs every way): the per-way overhead `planned_ways` must model.
+/// `cargo test --release … congruence_way_overhead -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn congruence_way_overhead() {
+    fn bench<const N: usize>(n: usize) {
+        let full = |i: usize, j: usize| {
+            F::<N>::from_usize(i + 1).unwrap() / F::<N>::from_usize(j + 7).unwrap()
+                - F::<N>::from_f64(0.5).unwrap()
+        };
+        let a: Vec<F<N>> = (0..n * n).map(|t| full(t % n, t / n + 3)).collect();
+        let x: Vec<F<N>> = (0..n * n)
+            .map(|t| {
+                let (i, j) = (t % n, t / n);
+                full(i.min(j), i.max(j))
+            })
+            .collect();
+        let mut out = vec![F::<N>::zero(); n * n];
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let mut base = 0.0;
+        for ways in [1usize, 2, 3, 4, 8] {
+            let reps = 20;
+            let secs = pool.install(|| {
+                with_split_hint(ways, || {
+                    assert!(congruence::<N>(b'N', n, n, &a, n, &x, n, true, None, &mut out, None));
+                    let t = std::time::Instant::now();
+                    for _ in 0..reps {
+                        congruence::<N>(b'N', n, n, &a, n, &x, n, true, None, &mut out, None);
+                    }
+                    t.elapsed().as_secs_f64() / reps as f64
+                })
+            });
+            if ways == 1 {
+                base = secs;
+            }
+            println!(
+                "bits {} n {n} ways {ways}: {:.2} ms ({:+.1}% vs 1 way)",
+                N * 64,
+                secs * 1e3,
+                100.0 * (secs / base - 1.0)
+            );
+        }
+    }
+    for n in [24, 48, 57, 96, 160] {
+        bench::<16>(n);
+    }
+    bench::<8>(57);
+    bench::<12>(57);
+}

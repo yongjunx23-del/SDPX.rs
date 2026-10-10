@@ -314,7 +314,7 @@ where
                         &threading.lanes,
                         threading.inner_parallel,
                         threading.paired,
-                        threading.inner_ways,
+                        &threading.lane_ways,
                         ds,
                         &|cone, rows, ds| {
                             let mut work: [Vec<T>; 3] = Default::default();
@@ -384,7 +384,7 @@ where
                     &threading.lanes,
                     threading.inner_parallel,
                     threading.paired,
-                    threading.inner_ways,
+                    &threading.lane_ways,
                     (shift, step_z, step_s),
                     &|cone, _rows, (shift, step_z, step_s)| {
                         if let (Some(chunk), SupportedCone::NonnegativeCone(c)) =
@@ -460,7 +460,7 @@ where
                             &threading.sym_step_lanes,
                             threading.inner_parallel,
                             threading.paired,
-                            threading.inner_ways,
+                            &threading.step_lane_ways,
                             dz,
                             ds,
                             z,
@@ -1301,7 +1301,7 @@ where
                     &threading.lanes,
                     threading.inner_parallel,
                     threading.paired,
-                    threading.inner_ways,
+                    &threading.lane_ways,
                     (),
                     &|cone, rows, ()| {
                         if let (Some(chunk), SupportedCone::NonnegativeCone(c)) =
@@ -1361,7 +1361,7 @@ where
                     &threading.lanes,
                     threading.inner_parallel,
                     threading.paired,
-                    threading.inner_ways,
+                    &threading.lane_ways,
                     (y, work),
                     &|cone, rows, (y, work)| {
                         if let (Some(chunk), SupportedCone::NonnegativeCone(c)) =
@@ -1413,7 +1413,7 @@ where
                     &threading.lanes,
                     threading.inner_parallel,
                     threading.paired,
-                    threading.inner_ways,
+                    &threading.lane_ways,
                     (out, work),
                     &|cone, rows, (out, work)| {
                         if let (Some(chunk), SupportedCone::NonnegativeCone(c)) =
@@ -1471,7 +1471,7 @@ where
                         &threading.sym_step_lanes,
                         threading.inner_parallel,
                         threading.paired,
-                        threading.inner_ways,
+                        &threading.step_lane_ways,
                         dz,
                         ds,
                         z,

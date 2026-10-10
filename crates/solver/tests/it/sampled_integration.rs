@@ -377,21 +377,17 @@ fn structural_fallback<T: FloatT>(presolve: bool) {
     let mut generic = DefaultSolver::new(&p, &q, &original, &b, &cones, settings.clone()).unwrap();
     let mut sampled =
         DefaultSolver::new_sampled(&p, &q, &linear, &b, &cones, vec![block], settings).unwrap();
-    // Prove preprocessing actually changed the matrix, rather than merely
-    // enabling a setting on a fixture that never takes the fallback path.
+    // Presolve must actually change the matrix while keeping the factors.
+    // Chordal lowering would change the factors' operator, so sampled input
+    // skips it (5b9980e) and keeps the sampled solver; the generic solve of
+    // the same fixture does decompose.
     if presolve {
         assert_eq!(sampled.data.m, m - 1);
     } else {
-        assert!(sampled.data.m != m || sampled.data.n != h);
+        assert_eq!((sampled.data.m, sampled.data.n), (m, h));
+        assert!(generic.data.m != m || generic.data.n != h);
     }
-    assert_eq!(
-        sampled.info.linsolver.name,
-        if presolve {
-            "condensed_sampled_qdldl"
-        } else {
-            "condensed_qdldl"
-        }
-    );
+    assert_eq!(sampled.info.linsolver.name, "condensed_sampled_qdldl");
     generic.solve();
     sampled.solve();
     audit(&p, &q, &original, &b, &cones, &generic.solution);
@@ -414,10 +410,10 @@ fn actual_presolve_retains_factors_mpfr256() {
     structural_fallback::<sdpx_arithmetic::Bits256>(true);
 }
 #[test]
-fn actual_chordal_fallback_f64() {
+fn actual_chordal_keeps_factors_f64() {
     structural_fallback::<f64>(false);
 }
 #[test]
-fn actual_chordal_fallback_mpfr256() {
+fn actual_chordal_keeps_factors_mpfr256() {
     structural_fallback::<sdpx_arithmetic::Bits256>(false);
 }

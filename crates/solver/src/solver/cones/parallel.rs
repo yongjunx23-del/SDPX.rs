@@ -16,10 +16,12 @@ pub(super) struct ConeThreading {
     // Inner (within-cone) work re-offered to the ambient pool only pays
     // when the cone budget has spare workers beyond its lanes.
     pub(super) inner_parallel: bool,
-    // Workers per lane for split-capable kernels inside a cone (residue
-    // congruences): SDPB-style, a cone budget wider than its lanes shares each
-    // lane's heavy calls among ways = workers / lanes.
-    pub(super) inner_ways: usize,
+    // Ways per lane (and per cone, for the scaling job queue) for
+    // split-capable kernels inside a cone (residue congruences), planned
+    // from the structural costs by `planned_ways`.
+    pub(super) lane_ways: Vec<usize>,
+    pub(super) step_lane_ways: Vec<usize>,
+    pub(super) cone_ways: Vec<usize>,
     // Paired joins of two independent operations (e.g. the two cone
     // Choleskys) need only one stealer, so they activate with any spare
     // cone worker — a weaker condition than `inner_parallel`.
@@ -92,10 +94,11 @@ impl ConeThreading {
         let mut row = 0;
         let mut jobs: Vec<_> = cones
             .iter_mut()
-            .map(|cone| {
+            .zip(&self.cone_ways)
+            .map(|(cone, &ways)| {
                 let rows = row..row + cone.numel();
                 row = rows.end;
-                (cone_cost(cone), cone, rows)
+                (cone_cost(cone), cone, rows, ways)
             })
             .collect();
         jobs.sort_unstable_by_key(|job| job.0);
@@ -128,7 +131,7 @@ impl ConeThreading {
                     let _leave = Leave;
                     let mut ok = true;
                     loop {
-                        let Some((_, cone, rows)) = jobs.lock().unwrap().pop() else {
+                        let Some((_, cone, rows, ways)) = jobs.lock().unwrap().pop() else {
                             break;
                         };
                         let _offer = sdpx_arithmetic::inner_parallel::board::Offer::enter();
@@ -139,7 +142,7 @@ impl ConeThreading {
                             )
                         });
                         let began = std::time::Instant::now();
-                        ok &= crate::algebra::with_split_hint(self.inner_ways, || {
+                        ok &= crate::algebra::with_split_hint(ways, || {
                             cone.update_scaling(&s[rows.clone()], &z[rows], mu, strategy)
                         });
                         slowest.fetch_max(
@@ -278,13 +281,18 @@ impl ConeThreading {
             .min((total / MIN_LANE_WORK).min(usize::MAX as u128) as usize)
             .max(1);
         let lanes = balanced_lanes(cones, &prefix, task_budget.min(cones.len()));
+        let lane_costs = lane_costs(&prefix, &lanes);
         // Any spare worker may steal a heavy cone's inner work (SVD rotation
         // replay rows, reflector columns); the slowest cone otherwise sets
         // the phase (Λ19 spins 0–50: 52 lanes on 64 workers, SVD 200 ms
-        // median, 406 ms max). Inner splits are bitwise neutral.
-        let inner_parallel = cone_workers > lanes.len().max(1);
+        // median, 406 ms max). Inner splits are bitwise neutral. Workers are
+        // also spare in the tail of a phase whose lanes do not pack evenly
+        // (Λ35-rs: 72 equal cones on 64 workers run in two waves, the second
+        // with 8 cones).
+        let spare = cone_workers > lanes.len().max(1) || uneven_tail(&lane_costs, cone_workers);
+        let inner_parallel = spare;
         // Any spare worker can steal the second half of a paired join.
-        let paired = cone_workers > lanes.len().max(1);
+        let paired = spare;
         let sym_step_lanes = {
             // Step-to-boundary bounds are cap-insensitive for symmetric
             // cones (Nonnegative/SOC/PSD/Zero): every cone is evaluated at
@@ -322,7 +330,17 @@ impl ConeThreading {
                     .build()?,
             ),
         };
-        let inner_ways = (cone_workers / lanes.len().max(1)).max(1);
+        let lane_ways = crate::algebra::planned_ways(&lane_costs, cone_workers);
+        let step_lane_ways = if sym_step_lanes.is_empty() {
+            Vec::new()
+        } else {
+            crate::algebra::planned_ways(&lane_costs_of(cones, &sym_step_lanes, true), cone_workers)
+        };
+        let mut cone_ways = vec![1; cones.len()];
+        for (i, lane) in lanes.iter().enumerate() {
+            let end = lanes.get(i + 1).map_or(cones.len(), |l| l.cone_start);
+            cone_ways[lane.cone_start..end].fill(lane_ways[i]);
+        }
         let cone_chunk = if workers > cone_workers {
             cones.len().div_ceil(cone_workers)
         } else {
@@ -336,7 +354,9 @@ impl ConeThreading {
             sym_step_lanes,
             orthant_chunk,
             inner_parallel,
-            inner_ways,
+            lane_ways,
+            step_lane_ways,
+            cone_ways,
             paired,
             slowest_cone: std::sync::atomic::AtomicU64::new(0),
         }))
@@ -539,6 +559,60 @@ fn spread(cpus: Vec<usize>) -> Vec<usize> {
     cpus
 }
 
+/// Structural cost of each lane: the `prefix` sums over its cones.
+fn lane_costs(prefix: &[u128], lanes: &[Lane]) -> Vec<f64> {
+    let n = prefix.len() - 1;
+    lanes
+        .iter()
+        .enumerate()
+        .map(|(i, lane)| {
+            let end = lanes.get(i + 1).map_or(n, |l| l.cone_start);
+            (prefix[end] - prefix[lane.cone_start]) as f64
+        })
+        .collect()
+}
+
+/// Lane costs from the cones (`symmetric_only`: other cones count zero, as
+/// in the step-bound lanes).
+fn lane_costs_of<T: FloatT>(
+    cones: &[SupportedCone<T>],
+    lanes: &[Lane],
+    symmetric_only: bool,
+) -> Vec<f64> {
+    let mut prefix = Vec::with_capacity(cones.len() + 1);
+    prefix.push(0u128);
+    for cone in cones {
+        let cost = if !symmetric_only || (cone.is_symmetric() && cone.numel() > 0) {
+            cone_cost(cone)
+        } else {
+            0
+        };
+        prefix.push(prefix.last().unwrap().saturating_add(cost));
+    }
+    lane_costs(&prefix, lanes)
+}
+
+/// Whether whole lanes leave workers idle at the end of a phase: their
+/// longest-processing-time makespan exceeds the even share by over 10%.
+fn uneven_tail(costs: &[f64], workers: usize) -> bool {
+    let total: f64 = costs.iter().sum();
+    if workers <= 1 || !(total > 0.0) {
+        return false;
+    }
+    let mut busy = vec![0f64; workers];
+    let mut order = costs.to_vec();
+    order.sort_unstable_by(|a, b| b.total_cmp(a));
+    for c in order {
+        let slot = busy
+            .iter_mut()
+            .min_by(|a, b| a.total_cmp(b))
+            .expect("nonempty worker list");
+        *slot += c;
+    }
+    let makespan = busy.into_iter().fold(0f64, f64::max);
+    makespan > 1.1 * total / workers as f64
+}
+
 fn balanced_lanes<T: FloatT>(
     cones: &[SupportedCone<T>],
     prefix: &[u128],
@@ -597,7 +671,7 @@ pub(super) fn apply<T, B, F>(
     lanes: &[Lane],
     inner: bool,
     paired: bool,
-    ways: usize,
+    ways: &[usize],
     buffers: B,
     kernel: &F,
 ) -> bool
@@ -620,7 +694,7 @@ where
             let (current, remaining) = buffers.split(end - row);
             // Do not short circuit: all block tasks finish before reporting
             // failure; the caller then discards the failed scaling phase.
-            success &= crate::algebra::with_split_hint(ways, || kernel(cone, row..end, current));
+            success &= crate::algebra::with_split_hint(ways[0], || kernel(cone, row..end, current));
             buffers = remaining;
             row = end;
         }
@@ -637,7 +711,7 @@ where
                     &lanes[..mid],
                     inner,
                     paired,
-                    ways,
+                    &ways[..mid],
                     left_buffers,
                     kernel,
                 )
@@ -648,7 +722,7 @@ where
                     &lanes[mid..],
                     inner,
                     paired,
-                    ways,
+                    &ways[mid..],
                     right_buffers,
                     kernel,
                 )
@@ -669,7 +743,7 @@ pub(super) fn sym_step_bounds<T: FloatT>(
     lanes: &[Lane],
     inner: bool,
     paired: bool,
-    ways: usize,
+    ways: &[usize],
     dz: &[T],
     ds: &[T],
     z: &[T],
@@ -683,7 +757,7 @@ pub(super) fn sym_step_bounds<T: FloatT>(
         // the ambient pool when spare workers exist.
         let _inner = (inner || paired)
             .then(|| sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired));
-        crate::algebra::with_split_hint(ways, || {
+        crate::algebra::with_split_hint(ways[0], || {
             let mut row = lanes[0].row_start;
             for (cone, bound) in cones.iter_mut().zip(bounds) {
                 let end = row + cone.numel();
@@ -713,7 +787,7 @@ pub(super) fn sym_step_bounds<T: FloatT>(
                     &lanes[..mid],
                     inner,
                     paired,
-                    ways,
+                    &ways[..mid],
                     dz,
                     ds,
                     z,
@@ -729,7 +803,7 @@ pub(super) fn sym_step_bounds<T: FloatT>(
                     &lanes[mid..],
                     inner,
                     paired,
-                    ways,
+                    &ways[mid..],
                     dz,
                     ds,
                     z,
@@ -765,7 +839,7 @@ mod tests {
                 &threading.lanes,
                 false,
                 false,
-                1,
+                &[1; 4],
                 (&mut a[..], &mut b[..]),
                 &|_cone, rows, (a, b)| {
                     assert!(rayon::current_thread_index().is_some());
@@ -791,7 +865,7 @@ pub(super) fn prepare_affine_bounds<T: FloatT>(
     lanes: &[Lane],
     inner: bool,
     paired: bool,
-    ways: usize,
+    ways: &[usize],
     dz: &mut [T],
     ds: &mut [T],
     z: &[T],
@@ -802,7 +876,7 @@ pub(super) fn prepare_affine_bounds<T: FloatT>(
     if lanes.len() <= 1 {
         let _inner = (inner || paired)
             .then(|| sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, paired));
-        crate::algebra::with_split_hint(ways, || {
+        crate::algebra::with_split_hint(ways[0], || {
             let mut row = 0;
             for (cone, bound) in cones.iter_mut().zip(bounds) {
                 let end = row + cone.numel();
@@ -840,7 +914,7 @@ pub(super) fn prepare_affine_bounds<T: FloatT>(
                     &lanes[..mid],
                     inner,
                     paired,
-                    ways,
+                    &ways[..mid],
                     lz,
                     ls,
                     lv,
@@ -856,7 +930,7 @@ pub(super) fn prepare_affine_bounds<T: FloatT>(
                     &lanes[mid..],
                     inner,
                     paired,
-                    ways,
+                    &ways[mid..],
                     rz,
                     rs,
                     rv,
