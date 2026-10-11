@@ -8,6 +8,31 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-12 — L24: refinement stops at the componentwise rounding floor (kept, perf-mc-impl)
+
+- Observed (f63 profile, full-floor traces of Λ35 and Λ27): late corrections keep running after every z row above tol has reached its own rounding floor, while the x rows already meet tol. The z rows cannot go lower, so the corrections only end when the stop ratio stalls. A simulation over the traces predicted −162 of 422 corrections on Λ27 and −170 of 1586 on Λ35.
+- Rejected on the way (local and trace evidence):
+  - An exact-increment correction step lost 4% of corrections on Λ27 and stalled Λ35 at 1e-81.
+  - GMRES continuation of slow stationary contraction gave no acceleration. Its 1 + 9 steps reach the floor that the stationary iteration reaches in 5.
+  - The remaining Λ35 corrections are the productive linear contraction of the x rows (1e4–1e11 per correction, set by the condensed solve's accuracy). They are not floor-bound.
+- Change (`Refinement::at_floor`, condensed `LocalRefinement`): the stationary convergence test also accepts a residual whose x rows meet tol and whose z rows each meet tol or lie within eps·(|G||Z||G| + |A||x| + |b_z|). That is the Arioli–Demmel–Duff componentwise floor, as in LAPACK xGERFS. |A||x| comes from `SampledOperator::block_forward_abs`.
+  - Only sampled PSD blocks have a floor; any other row must meet tol.
+  - Taken above binary64 in a single process, since MPI ranks would have to agree.
+  - The tolerance itself is unchanged; this is the representation-floor stop of plan item 2.
+  - A unit test checks `block_forward_abs` against the materialized |A||x|, and dropping its off-diagonal 1/√2 fails the test.
+- Result (mci64h, f64c on node106 and f64d on node107, against f63 with mci62 on the same nodes). Iteration counts are unchanged, all five audits are accepted (aud64, 225073), and the objectives equal f63's to 38 digits:
+
+  | Case | f63 corrections / s | f64 corrections / s | change |
+  |---|---|---|---|
+  | Λ27 | 422 / 184.1 | 260 / 167.4 | −9.1% |
+  | Λ35 | 1586 / 1276.8 | 1496 / 1259.2 | −1.4% |
+  | Λ27-rs | 32 / 105.2 | 24 / 103.4 | −1.7% |
+  | Λ35-rs | 554 / 809.5 | 554 / 815.1 | +0.7% (noise; same-binary reruns 807.6–809.5) |
+  | Λ19-rs | 0 / 32.9 | 0 / 33.2 | +0.9% (noise) |
+
+  The geometric mean is −2.2%. The floor test costs 3.1 s on Λ35-rs (515 calls, none pass: its corrections are x-driven) and 2.7 s on Λ35.
+- Decision: kept.
+
 ## 2026-10-12 — Job queues of owner kernels sharing one pool skipped jobs (fix kept, perf-mc-impl)
 
 - Observed: the in-process partitioned solver (`--partitions auto`, and a 1-rank MPI run) fails when the threads exceed the owners on a rank.

@@ -529,6 +529,55 @@ fn sampled_adjoint_abs_512() {
     sampled_adjoint_abs_matches_materialized::<Bits512>();
 }
 
+fn block_forward_abs_matches_materialized<T: FloatT>() {
+    // Off-diagonal block rows, off-diagonal basis products and terms that
+    // cancel in the signed product (rows 0 and 2 of A·x are zero) all count.
+    let block = SampledBlock {
+        row_start: 0,
+        column_start: 1,
+        dim: 2,
+        basis_rows: 2,
+        basis_cols: 2,
+        basis: vec![c::<T>(1), c(1), c(1), c(-1)],
+        weights: vec![c(1), c(2), c(-3), c(1), c(1), c(2)],
+    };
+    let rows = block.row_count();
+    let op = SampledOperator::new(
+        CscMatrix::zeros((rows, 1 + block.column_count())),
+        vec![block],
+    )
+    .unwrap();
+    let x = vec![c::<T>(7), c(1), c(1), c(2), c(-1), c(3), c(-3)];
+    let (scale, got) = op.block_forward_abs(0, &x);
+
+    let materialized = op.materialize();
+    let mut expected = vec![T::zero(); rows];
+    for (col, &xc) in x.iter().enumerate() {
+        for idx in materialized.colptr[col]..materialized.colptr[col + 1] {
+            expected[materialized.rowval[idx]] += T::abs(materialized.nzval[idx] * xc);
+        }
+    }
+    assert!(expected.iter().all(|&v| v > T::zero()));
+    for (&actual, &want) in got.iter().zip(&expected) {
+        let actual = scale * T::from_f64(actual).unwrap();
+        let bound = c::<T>(64) * T::from_f64(f64::EPSILON).unwrap() * want;
+        assert!(
+            (actual - want).abs() <= bound,
+            "actual={actual}, expected={want}"
+        );
+    }
+}
+
+#[test]
+fn block_forward_abs_f64() {
+    block_forward_abs_matches_materialized::<f64>();
+}
+
+#[test]
+fn block_forward_abs_512() {
+    block_forward_abs_matches_materialized::<Bits512>();
+}
+
 #[test]
 fn stored_psd_zeros_do_not_invent_primitive_columns() {
     let block = SampledBlock {

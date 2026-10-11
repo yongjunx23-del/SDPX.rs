@@ -1034,6 +1034,50 @@ impl<T: FloatT> SampledOperator<T> {
         }
     }
 
+    /// `Σ_p |A[row,p] x[p]|` over the rows of `block` (from its `row_start`),
+    /// in binary64 units of the returned scale (the block's largest |w·x|
+    /// times its largest |q|²); terms that underflow there drop out.
+    pub(crate) fn block_forward_abs(&self, block: usize, x: &[T]) -> (T, Vec<f64>) {
+        let b = &self.blocks[block];
+        let (h, kmax) = (b.basis_rows, b.basis_cols);
+        let mut acc = vec![0f64; b.row_count()];
+        let wx: Vec<T> = (0..b.column_count())
+            .map(|c| (b.weights[c] * x[b.column_start + c]).abs())
+            .collect();
+        let amax = wx.iter().fold(T::zero(), |m, &v| T::max(m, v));
+        let qmax = b.basis.iter().fold(T::zero(), |m, &v| T::max(m, v.abs()));
+        if kmax == 0 || amax == T::zero() || qmax == T::zero() {
+            return (T::zero(), acc);
+        }
+        let f = |v: T| v.to_f64().unwrap_or(0.0);
+        let a: Vec<f64> = wx.iter().map(|&v| f(v / amax)).collect();
+        let q: Vec<f64> = b.basis.iter().map(|&v| f(v.abs() / qmax)).collect();
+        let mut p = 0;
+        for s in 0..b.dim {
+            for r in 0..=s {
+                for k in 0..kmax {
+                    let ak = a[p + k];
+                    for j in 0..h {
+                        let qj = ak * q[j + k * h];
+                        for i in 0..if r == s { j + 1 } else { h } {
+                            let scale = if r != s {
+                                std::f64::consts::FRAC_1_SQRT_2
+                            } else if i != j {
+                                std::f64::consts::SQRT_2
+                            } else {
+                                1.0
+                            };
+                            acc[triangular_number(s * h + j) + r * h + i] +=
+                                qj * q[i + k * h] * scale;
+                        }
+                    }
+                }
+                p += kmax;
+            }
+        }
+        (amax * qmax * qmax, acc)
+    }
+
     /// Add absolute individual sampled contributions to `out`:
     /// `out[p] += sum_row |A[row,p] * x[row]|`.
     ///

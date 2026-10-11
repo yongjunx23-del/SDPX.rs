@@ -435,6 +435,79 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     }
 }
 
+/// True when every row of `block` above `tol` lies within its componentwise
+/// rounding floor eps·(|G||Z||G| + |A||x| + |b_z|) (Arioli–Demmel–Duff).
+/// Corrections cannot lower such rows: rounding x to working precision moves
+/// A·x by up to eps·|A||x| (Ising: |A||x| ≫ |A·x|), and the correction that
+/// absorbs it in z moves it to the x rows as S·δx. Only sampled PSD blocks
+/// have the floor; other rows must meet `tol` itself.
+fn rows_at_floor<T: FloatT>(block: &Block<T>, e: &[T], z: &[T], b: &[T], x: &[T], tol: T) -> bool {
+    if e.iter().all(|v| v.abs() <= tol) {
+        return true;
+    }
+    let Scaling::Psd(p) = &block.scaling else {
+        return false;
+    };
+    let Some(sampled) = &p.sampled else {
+        return false;
+    };
+    let (ua, ax) = sampled.operator.block_forward_abs(sampled.block, x);
+    // F = |G||Z||G| in binary64 units of gmax²·zmax.
+    let k = p.G.nrows();
+    let gmax =
+        p.G.data()
+            .iter()
+            .fold(T::zero(), |m, &v| T::max(m, v.abs()));
+    let zmax = z.iter().fold(T::zero(), |m, &v| T::max(m, v.abs()));
+    let mut f = vec![0f64; e.len()];
+    if gmax > T::zero() && zmax > T::zero() {
+        let conv = |v: T| v.to_f64().unwrap_or(0.0);
+        let g: Vec<f64> = p.G.data().iter().map(|&v| conv(v.abs() / gmax)).collect();
+        let mut zm = vec![0f64; k * k];
+        let mut idx = 0;
+        for col in 0..k {
+            for row in 0..=col {
+                let v = conv(z[idx].abs() / zmax);
+                let v = if row == col {
+                    v
+                } else {
+                    v * std::f64::consts::FRAC_1_SQRT_2
+                };
+                (zm[row + col * k], zm[col + row * k]) = (v, v);
+                idx += 1;
+            }
+        }
+        let mut t = vec![0f64; k * k];
+        for j in 0..k {
+            for l in 0..k {
+                let zl = zm[l + j * k];
+                for i in 0..k {
+                    t[i + j * k] += g[i + l * k] * zl;
+                }
+            }
+        }
+        let mut idx = 0;
+        for col in 0..k {
+            for row in 0..=col {
+                let s: f64 = (0..k).map(|l| t[row + l * k] * g[l + col * k]).sum();
+                f[idx] = if row == col {
+                    s
+                } else {
+                    s * std::f64::consts::SQRT_2
+                };
+                idx += 1;
+            }
+        }
+    }
+    let ug = gmax * gmax * zmax;
+    e.iter().enumerate().all(|(i, v)| {
+        let v = v.abs();
+        v <= tol
+            || v <= T::epsilon()
+                * (ug * T::from_f64(f[i]).unwrap() + ua * T::from_f64(ax[i]).unwrap() + b[i].abs())
+    })
+}
+
 struct LocalRefinement<'a, T: FloatT> {
     kernel: &'a mut CondensedKKTSolver<T>,
     x: &'a mut Vec<T>,
@@ -477,6 +550,32 @@ impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
     }
     fn restore_product(&mut self) {
         self.kernel.restore_scaled_product(self.x);
+    }
+    fn at_floor(&mut self, candidate: bool, tol: T) -> bool {
+        let n = self.kernel.n;
+        // Binary64 keeps the upstream rule; MPI ranks would need to agree.
+        if T::precision_bits() <= 53
+            || local_world(self.kernel.local_only).is_some()
+            || self.error[..n].norm_inf() > tol
+        {
+            return false;
+        }
+        let timer = crate::receipt::start();
+        let point: &[T] = if candidate { self.candidate } else { self.x };
+        let (x, z) = point.split_at(n);
+        let (e, b) = (&self.error[n..], &self.b[n..]);
+        let offset = self.kernel.blocks.first().map_or(0, |b| b.rows.start);
+        let check = |block: &Block<T>| {
+            let r = block.rows.start - offset..block.rows.end - offset;
+            rows_at_floor(block, &e[r.clone()], &z[r.clone()], &b[r], x, tol)
+        };
+        let blocks = &self.kernel.blocks;
+        let floor = match &self.kernel.pool {
+            Some(pool) => pool.install(|| blocks.par_iter().all(check)),
+            None => blocks.iter().all(check),
+        };
+        crate::receipt::finish("refine.floor", timer);
+        floor
     }
     /// max |e_x|, max |e_z|, and the x-row floor eps·max(|Aᵀ||z| + |b_x|).
     fn trace_parts(&mut self, candidate: bool) -> Option<String> {

@@ -30,6 +30,13 @@ pub(crate) trait Refinement<T: FloatT> {
     fn add_correction(&mut self);
     fn accept_candidate(&mut self);
     fn restore_product(&mut self);
+    /// True when the last residual (of the candidate or of `x`) is converged
+    /// row by row: each row meets `tol` or lies at its own rounding floor,
+    /// where no correction can lower it. Must return the same value on
+    /// every rank, since the caller's agreement carries the decision.
+    fn at_floor(&mut self, _candidate: bool, _tol: T) -> bool {
+        false
+    }
     /// Diagnostic only (`SDPX_TRACE_TAU`): residual parts of the last
     /// evaluated point (implementer-defined), printed after each residual.
     fn trace_parts(&mut self, _candidate: bool) -> Option<String> {
@@ -129,7 +136,7 @@ fn refine_stationary<T: FloatT>(
     }
     // Each residual's finiteness, its acceptance action and the next
     // convergence test share one agreement (see `Refinement::agree_pair`).
-    let mut converged = norme <= tol;
+    let mut converged = norme <= tol || (norme.is_finite() && work.at_floor(false, tol));
     if !work.agree_pair(norme.is_finite(), u32::from(converged)) {
         return false;
     }
@@ -163,7 +170,7 @@ fn refine_stationary<T: FloatT>(
             0
         };
         // Only a continuing step reads the next convergence test.
-        let next = !stop && norme <= tol;
+        let next = !stop && (norme <= tol || (norme.is_finite() && work.at_floor(true, tol)));
         if !work.agree_pair(norme.is_finite(), action + 3 * u32::from(next)) {
             return false;
         }

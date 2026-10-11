@@ -49,11 +49,11 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 
 | Case (64 threads, 768 bits, 1e-42 unless noted) | SDPX | Reference |
 |---|---|---|
-| Λ27 spins 0–50 | 183 it / 258.5 s (1.41 s/it), audited | SDPB 265 it / 375 s (1.41 s/it) |
+| Λ27 spins 0–50 | 183 it / 167.4 s (0.91 s/it), audited (L24, 2026-10-12) | SDPB 265 it / 375 s (1.41 s/it) |
 | spins 0–50 (s50) | 153 it / 153.8 s | SDPB 285 s |
 | Λ19 | 121 it / 71.0 s, audited | — |
 | ising11 (512 bits) | 54 it / 3.44 s | — |
-| Λ35 spins 0–70, 1024 bits | Solved 435 it / 2098.8 s (4.82 s/it, other node), audited (perf-mc-impl mci19; was 683 it / 2426.5 s); 768 bits Solved 691 it / 1886 s, audited | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
+| Λ35 spins 0–70, 1024 bits | Solved 435 it / 1259.2 s (2.89 s/it), audited (L24, 2026-10-12; was 683 it / 2426.5 s); 768 bits Solved 691 it / 1886 s, audited | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
 | Float64 58 cases (t16b = int5 + task 16) | 54 audited solves, 0 Solved-but-fail; wins 19 (1 thr), 12 (16 thr) | MOSEK |
 
 These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5334dd` + FMA, plus task 16).
@@ -200,8 +200,9 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - Then compare Λ35-rs at 1024 bits with the retained no-shift/GMP changes.
    - Gate: audited time at matched precision/settings against SDPB; the task 17 iteration limits above remain.
 2. **Refinement corrections.**
-   - Reprofile after no-shift factors and resampling: older task 15 inputs spent 50% in refined solves, but resampled runs can need no corrections.
-   - Capping corrections or weakening acceptance remains prohibited. Investigate a representation floor only if the updated profile still identifies futile corrections.
+   - The representation-floor stop is kept (L24, journal 2026-10-12): Λ27 −9.1%, Λ35 −1.4%.
+   - The remaining corrections (Λ35 1496, Λ35-rs 554) are the x rows' productive contraction, set by the condensed solve's accuracy.
+   - Capping corrections or weakening acceptance remains prohibited.
 3. **Float64 per-solve overhead (task 13 leads):**
    - Brandy's rational presolve pass costs 35–85 ms, because a budget counted in updates misses the GMP gcd cost.
    - Concurrent small OpenBLAS calls in cone lanes.
