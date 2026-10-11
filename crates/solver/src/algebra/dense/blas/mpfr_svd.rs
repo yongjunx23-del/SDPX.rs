@@ -546,7 +546,22 @@ pub(super) struct InvitWork<const N: usize> {
     du2: Vec<F<N>>,
     dl: Vec<F<N>>,
     swap: Vec<bool>,
+    used: Vec<F<N>>,
 }
+
+/// Right singular vectors by [`normal_vectors`] when the values lie within
+/// a factor two, else by [`inverse_vectors`].
+fn singular_vectors<const N: usize>(
+    d: &[F<N>],
+    e: &[F<N>],
+    s: &[F<N>],
+    n: usize,
+    v: &mut [F<N>],
+    ws: &mut InvitWork<N>,
+) -> bool {
+    normal_vectors(d, e, s, n, v, ws) || inverse_vectors(d, e, s, n, v, ws)
+}
+
 #[derive(Default)]
 struct SvdScratch<const N: usize> {
     d0: Vec<F<N>>,
@@ -562,11 +577,15 @@ struct SvdScratch<const N: usize> {
 /// diagonal, off-diagonal `d1, e1, d2, …, dn`): `T x = σx` for
 /// `x = (v1, u1, v2, u2, …)/√2`. Inverse iteration follows LAPACK `dstein`:
 /// one pivoted LU of `T − σI` per value (tiny pivots raised to `eps·‖T‖`), a
-/// fixed pseudo-random start, Gram–Schmidt against the earlier vectors of
-/// the value's cluster (gaps up to `1e-3·‖T‖`), and one more solve after the
-/// growth test passes. Each vector costs O(n) work instead of replaying
-/// O(n²) rotations over n rows. Returns false, with `v` unspecified, when a
-/// value is zero or a vector does not converge, for the replay fallback.
+/// fixed pseudo-random start, Gram–Schmidt against the earlier vectors whose
+/// shifts lie within `1e-3·‖T‖` of the current one, and one more solve after
+/// the growth test passes. `dstein` orthogonalizes against the whole chain of
+/// values linked by such gaps; vectors further apart than `1e-3·‖T‖` are
+/// already orthogonal to `O(eps·‖T‖/gap)`, the bound it accepts between
+/// chains, so the window keeps that bound with less work. Each vector costs
+/// O(n) work instead of replaying O(n²) rotations over n rows. Returns false,
+/// with `v` unspecified, when a value is zero or a vector does not converge,
+/// for the replay fallback.
 pub(super) fn inverse_vectors<const N: usize>(
     d: &[F<N>],
     e: &[F<N>],
@@ -581,7 +600,7 @@ pub(super) fn inverse_vectors<const N: usize>(
     if n < 2 || s.iter().any(|x| *x == F::zero() || !x.is_finite()) {
         return false;
     }
-    let InvitWork { off, order, xs, dd, du, du2, dl, swap } = ws;
+    let InvitWork { off, order, xs, dd, du, du2, dl, swap, used } = ws;
     off.clear();
     for i in 0..n {
         off.push(d[i]);
@@ -625,18 +644,20 @@ pub(super) fn inverse_vectors<const N: usize>(
     swap.resize(m, false);
     let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
     let (mut group, mut prev) = (0usize, F::zero());
+    used.clear();
     for (j, &p) in order.iter().enumerate() {
         let mut shift = s[p].abs();
         if j > 0 {
-            if shift - prev > ortol {
-                group = j;
-            }
             let pertol = eps * num::<N>(10) * shift;
             if shift - prev < pertol {
                 shift = prev + pertol;
             }
         }
         prev = shift;
+        used.push(shift);
+        while shift - used[group] > ortol {
+            group += 1;
+        }
         // T − shift·I = P·L·U, U with two superdiagonals (LAPACK dgttrf).
         dd.fill(-shift);
         du2.fill(F::zero());
@@ -762,6 +783,222 @@ pub(super) fn inverse_vectors<const N: usize>(
         for c in column.iter_mut() {
             *c *= inv;
         }
+    }
+    true
+}
+
+/// Right singular vectors of the upper bidiagonal `(d, e)` whose values lie
+/// within a factor two (`σmin ≥ σmax/2`), as eigenvectors of the shifted
+/// normal tridiagonal `F = BᵀB − c²I` (`c` the mid value) of order `n`.
+/// Same inverse iteration as [`inverse_vectors`] (pivoted LU, growth test,
+/// Gram–Schmidt within `1e-3·‖F‖`, one extra solve), with the growth test
+/// taken on `F/‖F‖`. Against `‖F‖` the gaps are `c/spread` times wider than
+/// against `‖T‖`, so a nearly centred cone (all values equal to 15 digits)
+/// needs no Gram–Schmidt instead of one cluster of `n`. Within the factor two, forming `BᵀB` keeps the vectors'
+/// error at the bidiagonalization's backward error over the gap, as for the
+/// Golub–Kahan form.
+fn normal_vectors<const N: usize>(
+    d: &[F<N>],
+    e: &[F<N>],
+    s: &[F<N>],
+    n: usize,
+    v: &mut [F<N>],
+    ws: &mut InvitWork<N>,
+) -> bool {
+    const MAXITS: usize = 5;
+    const EXTRA: usize = 1;
+    if n < 2 || s.iter().any(|x| *x == F::zero() || !x.is_finite()) {
+        return false;
+    }
+    let (mut lo, mut hi) = (s[0].abs(), s[0].abs());
+    for x in s {
+        if x.abs() < lo {
+            lo = x.abs();
+        }
+        if x.abs() > hi {
+            hi = x.abs();
+        }
+    }
+    if lo * num::<N>(2) < hi {
+        return false;
+    }
+    let c = (lo + hi) / num::<N>(2);
+    let InvitWork { off, order, xs, dd, du, du2, dl, swap, used } = ws;
+    // off[0..n] the diagonal of F, off[n..2n-1] its off-diagonal.
+    off.clear();
+    for i in 0..n {
+        let below = if i > 0 { e[i - 1] * e[i - 1] } else { F::zero() };
+        off.push((d[i].abs() - c) * (d[i].abs() + c) + below);
+    }
+    for i in 0..n - 1 {
+        off.push(d[i] * e[i]);
+    }
+    let (diag, sub) = off.split_at(n);
+    let mut fnorm = F::zero();
+    for k in 0..n {
+        let below = if k > 0 { sub[k - 1].abs() } else { F::zero() };
+        let above = if k + 1 < n { sub[k].abs() } else { F::zero() };
+        if diag[k].abs() + below + above > fnorm {
+            fnorm = diag[k].abs() + below + above;
+        }
+    }
+    if !fnorm.is_finite() {
+        return false;
+    }
+    if fnorm == F::zero() {
+        // BᵀB = c²I exactly: every orthonormal basis is a set of vectors.
+        identity(v, n);
+        return true;
+    }
+    let eps = F::epsilon();
+    let ortol = fnorm / num::<N>(1000);
+    let tiny = eps * fnorm;
+    let pertol = eps * num::<N>(10) * fnorm;
+    let crit = (<F<N> as num_traits::FromPrimitive>::from_f64(0.1).unwrap() / num::<N>(n)).sqrt();
+    order.clear();
+    order.extend(0..n);
+    order.sort_unstable_by(|&a, &b| {
+        s[a].abs().partial_cmp(&s[b].abs()).unwrap().then(a.cmp(&b))
+    });
+    xs.clear();
+    xs.resize(n * n, F::zero());
+    for buffer in [&mut *dd, &mut *du, &mut *du2, &mut *dl] {
+        buffer.clear();
+        buffer.resize(n, F::zero());
+    }
+    swap.clear();
+    swap.resize(n, false);
+    used.clear();
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    let (mut group, mut prev) = (0usize, F::zero());
+    for (j, &p) in order.iter().enumerate() {
+        let mut shift = (s[p].abs() - c) * (s[p].abs() + c);
+        if j > 0 && shift - prev < pertol {
+            shift = prev + pertol;
+        }
+        prev = shift;
+        used.push(shift);
+        while shift - used[group] > ortol {
+            group += 1;
+        }
+        // F − shift·I = P·L·U, U with two superdiagonals (LAPACK dgttrf).
+        for i in 0..n {
+            dd[i] = diag[i] - shift;
+        }
+        du2.fill(F::zero());
+        du[..n - 1].copy_from_slice(sub);
+        dl[..n - 1].copy_from_slice(sub);
+        for i in 0..n - 1 {
+            if dd[i].abs() >= dl[i].abs() {
+                swap[i] = false;
+                if dd[i] != F::zero() {
+                    let fact = dl[i] / dd[i];
+                    dl[i] = fact;
+                    dd[i + 1] -= fact * du[i];
+                }
+            } else {
+                swap[i] = true;
+                let fact = dd[i] / dl[i];
+                dd[i] = dl[i];
+                dl[i] = fact;
+                let temp = du[i];
+                du[i] = dd[i + 1];
+                dd[i + 1] = temp - fact * dd[i + 1];
+                if i + 2 < n {
+                    du2[i] = du[i + 1];
+                    du[i + 1] = -fact * du[i + 1];
+                }
+            }
+        }
+        for x in dd.iter_mut() {
+            if x.abs() < tiny {
+                *x = if *x < F::zero() { -tiny } else { tiny };
+            }
+        }
+        let last = dd[n - 1].abs();
+        let (done, rest) = xs.split_at_mut(j * n);
+        let x = &mut rest[..n];
+        for xi in x.iter_mut() {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let unit = (seed >> 11) as f64 / (1u64 << 53) as f64;
+            *xi = <F<N> as num_traits::FromPrimitive>::from_f64(2.0 * unit - 1.0).unwrap();
+        }
+        let mut passed = 0;
+        let mut converged = false;
+        for _ in 0..MAXITS {
+            let mut l1 = F::zero();
+            for xi in x.iter() {
+                l1 += xi.abs();
+            }
+            if l1 == F::zero() || !l1.is_finite() {
+                return false;
+            }
+            // dstein's growth test on F/‖F‖: ‖F‖ is far below one when the
+            // values nearly coincide.
+            let grow = if last > tiny { last } else { tiny };
+            let scale = num::<N>(n) * grow / l1;
+            for xi in x.iter_mut() {
+                *xi *= scale;
+            }
+            for i in 0..n - 1 {
+                if swap[i] {
+                    let temp = x[i];
+                    x[i] = x[i + 1];
+                    x[i + 1] = temp - dl[i] * x[i];
+                } else {
+                    x[i + 1] -= dl[i] * x[i];
+                }
+            }
+            x[n - 1] /= dd[n - 1];
+            x[n - 2] = (x[n - 2] - du[n - 2] * x[n - 1]) / dd[n - 2];
+            for i in (0..n - 2).rev() {
+                x[i] = (x[i] - du[i] * x[i + 1] - du2[i] * x[i + 2]) / dd[i];
+            }
+            for q in group..j {
+                let y = &done[q * n..(q + 1) * n];
+                let ndot = -F::dot_fma(x.iter().zip(y));
+                for (xi, &yi) in x.iter_mut().zip(y) {
+                    *xi = yi.mul_add(ndot, *xi);
+                }
+            }
+            let mut big = F::zero();
+            for xi in x.iter() {
+                if !xi.is_finite() {
+                    return false;
+                }
+                if xi.abs() > big {
+                    big = xi.abs();
+                }
+            }
+            if big < crit {
+                continue;
+            }
+            passed += 1;
+            if passed > EXTRA {
+                converged = true;
+                break;
+            }
+        }
+        if !converged {
+            return false;
+        }
+        let total = norm(x);
+        if total == F::zero() || !total.is_finite() {
+            return false;
+        }
+        let mut jmax = 0;
+        for (i, xi) in x.iter().enumerate() {
+            if xi.abs() > x[jmax].abs() {
+                jmax = i;
+            }
+        }
+        let inv = if x[jmax] < F::zero() { -total.recip() } else { total.recip() };
+        for xi in x.iter_mut() {
+            *xi *= inv;
+        }
+        v[p * n..(p + 1) * n].copy_from_slice(x);
     }
     true
 }
@@ -962,7 +1199,7 @@ pub(super) fn svd<'a, const N: usize>(
         crate::receipt::finish("svd.dqds", timer);
         if values {
             let timer = crate::receipt::start();
-            solved = inverse_vectors(&sc.d0, &sc.e0, d, n, v, &mut sc.invit);
+            solved = singular_vectors(&sc.d0, &sc.e0, d, n, v, &mut sc.invit);
             crate::receipt::finish("svd.invit", timer);
         }
         if solved {
@@ -986,7 +1223,7 @@ pub(super) fn svd<'a, const N: usize>(
         let mut replay_v = vr > 0;
         if invit {
             let timer = crate::receipt::start();
-            replay_v = !inverse_vectors(&sc.d0, &sc.e0, d, n, v, &mut sc.invit);
+            replay_v = !singular_vectors(&sc.d0, &sc.e0, d, n, v, &mut sc.invit);
             if replay_v {
                 identity(v, n);
             }
@@ -1266,6 +1503,15 @@ mod invit_tests {
     /// (orthogonality, BᵀB residual / σmax², 1 − |⟨v, v_replay⟩| max) of
     /// inverse-iteration vectors, or None when they fall back.
     fn check<const N: usize>(d: Vec<F<N>>, e: Vec<F<N>>) -> Option<(F<N>, F<N>, F<N>)> {
+        check_with(d, e, false)
+    }
+
+    /// [`check`] of [`normal_vectors`] when `normal`.
+    fn check_with<const N: usize>(
+        d: Vec<F<N>>,
+        e: Vec<F<N>>,
+        normal: bool,
+    ) -> Option<(F<N>, F<N>, F<N>)> {
         let n = d.len();
         let (d0, e0) = (d.clone(), e.clone());
         let (mut dq, mut eq) = (d, e);
@@ -1277,7 +1523,12 @@ mod invit_tests {
         let (mut t, mut sc) = (vec![F::zero(); n * n], vec![F::zero(); 2 * n]);
         replay_rotations(&mut log.v, &mut vref, n, n, &mut t, &mut sc);
         let mut v = vec![F::zero(); n * n];
-        if !inverse_vectors(&d0, &e0, &dq, n, &mut v, &mut Default::default()) {
+        let ok = if normal {
+            normal_vectors(&d0, &e0, &dq, n, &mut v, &mut Default::default())
+        } else {
+            inverse_vectors(&d0, &e0, &dq, n, &mut v, &mut Default::default())
+        };
+        if !ok {
             return None;
         }
         let mut orth = F::zero();
@@ -1310,6 +1561,31 @@ mod invit_tests {
             }
         }
         Some((orth, res, agree))
+    }
+
+    fn normal_cases<const N: usize>() {
+        let eps = F::<N>::epsilon();
+        let tol = eps * f::<N>(1e4);
+        let mut seed = 5u64;
+        // Values within a factor two, well separated against ‖BᵀB − c²I‖.
+        let n = 40;
+        let d: Vec<F<N>> = (0..n).map(|_| f(1.0 + 0.2 * lcg(&mut seed))).collect();
+        let e: Vec<F<N>> = (0..n - 1).map(|_| f(0.15 * lcg(&mut seed))).collect();
+        let (orth, res, agree) = check_with(d, e, true).unwrap();
+        assert!(orth <= tol && res <= tol, "spread: {orth} {res}");
+        assert!(agree <= eps * f::<N>(1e8), "spread agreement: {agree}");
+        // Nearly centred: every value equal to 15 digits.
+        let d: Vec<F<N>> = (0..n).map(|_| f::<N>(1.0) + f::<N>(1e-15) * f::<N>(lcg(&mut seed))).collect();
+        let e: Vec<F<N>> = (0..n - 1).map(|_| f::<N>(1e-15) * f::<N>(lcg(&mut seed))).collect();
+        let (orth, res, _) = check_with(d, e, true).unwrap();
+        assert!(orth <= tol && res <= tol, "centred: {orth} {res}");
+        // Equal values: any orthonormal basis.
+        let (orth, res, _) = check_with(vec![F::<N>::one(); 8], vec![F::<N>::zero(); 7], true).unwrap();
+        assert!(orth <= tol && res <= tol, "equal: {orth} {res}");
+        // Values beyond a factor two are left to the Golub–Kahan form.
+        let d: Vec<F<N>> = (0..n).map(|k| f(1.0 + k as f64)).collect();
+        let e: Vec<F<N>> = (0..n - 1).map(|_| f(0.1)).collect();
+        assert!(check_with(d, e, true).is_none(), "wide spectrum must fall back");
     }
 
     fn cases<const N: usize>() {
@@ -1445,6 +1721,89 @@ mod invit_tests {
         );
     }
 
+    /// `SDPX_INVIT_DUMPS=<dir>`: shifted normal tridiagonal against the
+    /// Golub–Kahan inverse iteration on dumped bidiagonals within a factor two.
+    #[test]
+    #[ignore]
+    fn normal_vectors_dumps() {
+        let Some(dir) = std::env::var_os("SDPX_INVIT_DUMPS") else { return };
+        let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        paths.sort();
+        let (mut tg, mut tn, mut used) = (0.0, 0.0, 0);
+        for path in &paths {
+            let (d, e) = read_dump::<16>(path);
+            let n = d.len();
+            let (mut dq, mut eq) = (d.clone(), e.clone());
+            let mut log = RotationLog::<16>::default();
+            log.keep_v = true;
+            bidiagonal_svd(&mut dq, &mut eq, n, &mut log).unwrap();
+            let mut vref = vec![F::zero(); n * n];
+            identity(&mut vref, n);
+            let (mut t, mut sc) = (vec![F::zero(); n * n], vec![F::zero(); 2 * n]);
+            replay_rotations(&mut log.v, &mut vref, n, n, &mut t, &mut sc);
+            let mut s = d.clone();
+            dqds_values(&mut s, &e, n, &mut Vec::new()).unwrap();
+            let mut vn = vec![F::zero(); n * n];
+            let t0 = std::time::Instant::now();
+            let ok = normal_vectors(&d, &e, &s, n, &mut vn, &mut Default::default());
+            let t_n = t0.elapsed().as_secs_f64() * 1e3;
+            if !ok {
+                continue;
+            }
+            used += 1;
+            let mut vg = vec![F::zero(); n * n];
+            let t0 = std::time::Instant::now();
+            assert!(inverse_vectors(&d, &e, &s, n, &mut vg, &mut Default::default()));
+            let t_g = t0.elapsed().as_secs_f64() * 1e3;
+            tg += t_g;
+            tn += t_n;
+            let metrics = |v: &[F<16>]| {
+                let mut orth = F::<16>::zero();
+                for a in 0..n {
+                    for b in 0..n {
+                        let dot = F::dot_fma(v[a * n..(a + 1) * n].iter().zip(&v[b * n..(b + 1) * n]));
+                        let err = if a == b { (dot - F::one()).abs() } else { dot.abs() };
+                        if err > orth {
+                            orth = err;
+                        }
+                    }
+                }
+                let smax = s.iter().fold(F::zero(), |m, x| if x.abs() > m { x.abs() } else { m });
+                let (mut res, mut agree) = (F::<16>::zero(), F::<16>::zero());
+                for p in 0..n {
+                    let c = &v[p * n..(p + 1) * n];
+                    let w: Vec<F<16>> = (0..n)
+                        .map(|i| d[i] * c[i] + if i + 1 < n { e[i] * c[i + 1] } else { F::zero() })
+                        .collect();
+                    for i in 0..n {
+                        let z = d[i] * w[i] + if i > 0 { e[i - 1] * w[i - 1] } else { F::zero() };
+                        let r = (z - s[p] * s[p] * c[i]).abs() / (smax * smax);
+                        if r > res {
+                            res = r;
+                        }
+                    }
+                    // The replay orders values as QR left them: match by value.
+                    let q = (0..n)
+                        .min_by(|&a, &b| {
+                            (dq[a].abs() - s[p].abs()).abs().partial_cmp(&(dq[b].abs() - s[p].abs()).abs()).unwrap()
+                        })
+                        .unwrap();
+                    let dot = F::dot_fma(c.iter().zip(&vref[q * n..(q + 1) * n])).abs();
+                    if (F::one() - dot).abs() > agree {
+                        agree = (F::one() - dot).abs();
+                    }
+                }
+                (orth.to_f64().unwrap(), res.to_f64().unwrap(), agree.to_f64().unwrap())
+            };
+            let (go, gr, ga) = metrics(&vg);
+            let (no, nr, na) = metrics(&vn);
+            eprintln!(
+                "n {n:3} gk {t_g:6.1} ms orth {go:.1e} res {gr:.1e} agree {ga:.1e} | normal {t_n:6.1} ms orth {no:.1e} res {nr:.1e} agree {na:.1e}"
+            );
+        }
+        eprintln!("{used} of {} within a factor two: gk {tg:.1} ms normal {tn:.1} ms", paths.len());
+    }
+
     #[test]
     #[ignore]
     fn op_costs() {
@@ -1565,10 +1924,12 @@ mod invit_tests {
     #[test]
     fn inverse_vectors_512() {
         cases::<8>();
+        normal_cases::<8>();
     }
 
     #[test]
     fn inverse_vectors_1024() {
         cases::<16>();
+        normal_cases::<16>();
     }
 }

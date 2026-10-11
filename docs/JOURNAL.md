@@ -8,6 +8,53 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-11 — Shifted normal form and windowed Gram–Schmidt for cone SVD vectors kept; compact-WY back-transform rejected (perf-mc-impl)
+
+- Setup: ABBA, 30 iterations per leg, 64 threads; full solves and t17 audits on node104. Phases come from `SDPX_PROFILE=1` receipts.
+- L18, queue log of the scale-cone jobs (ql57, diagnostic only, not kept). 72 cones on 64 workers: the phase wall is the slowest single cone. In the receipts `svdmax` is 0.34 s against a median of 0.175 s. Only a shorter cone shortens the phase.
+- L19, cone SVD vectors (`mpfr_svd.rs`):
+  - Window: inverse iteration orthogonalizes only against earlier vectors whose shifts lie within `1e-3·‖T‖`, not against the whole chain linked by such gaps. Vectors further apart are already orthogonal to `O(eps·‖T‖/gap)`, which is the bound `dstein` accepts between chains.
+  - Normal form: when `σmin ≥ σmax/2`, the vectors come from the shifted normal tridiagonal `BᵀB − c²I` (`c` the mid value) of order n instead of the Golub–Kahan form of order 2n. The gaps relative to `‖F‖` are `c/spread` times wider, so a nearly centred cone needs no Gram–Schmidt. The `dstein` growth test is taken on `F/‖F‖`. Wider spectra and non-convergence fall back to the Golub–Kahan path.
+  - Both change bits.
+  - ABBA: window alone (bd57) Λ35-rs −1.8%; normal alone (bd58) −2.8%. Both together (bd59):
+
+    | Case | A s/it | B s/it | change | scale A → B |
+    |---|---|---|---|---|
+    | Λ35-rs/1024 | 2.033, 2.037 | 1.924, 1.923 | −5.5% | 0.467 → 0.359 |
+    | Λ27-rs/768 | 0.883, 0.886 | 0.843, 0.848 | −4.4% | 0.211 → 0.175 |
+
+  - Full solves (f57) and audits (224981). All eight solves are accepted, and the objectives agree to 38 printed digits.
+
+    | Case | A it / s | B it / s | change |
+    |---|---|---|---|
+    | Λ35-rs | 372 / 897.9 | 372 / 863.0 | −3.9% |
+    | Λ27 | 184 / 203.9 | 183 / 199.5 | −2.2% |
+    | Λ27-rs | 138 / 120.8 | 138 / 117.3 | −2.9% |
+    | Λ19-rs | 89 / 37.3 | 89 / 36.1 | −3.2% |
+
+  - Local gate, ising11 at 1 thread (`head-d795f59` against `l19`): 54 iterations each, audits 2/2 and 2/2, api 9.995 → 9.845 s (−1.5%).
+  - Decision: kept as the default; the switches are removed.
+- L20, compact-WY back-transform (`V −= W·T·(WᵀV)` through four RNS products):
+  - bd60, full load: Λ35-rs 2.097 → 2.105 s/it (+0.4%), Λ27-rs 0.904 → 0.925 (+2.3%).
+  - One-cone kernel benchmark (sbench, n = 63, 64 copies on node101): the reflectors take 59 ms, against 71 ms with WY. A 63³ RNS product takes 8.2 ms alone but 13 ms with 64 copies running.
+  - Decision: rejected; patch `~/.cache/sdpx-e2e/patches/l19-l22-experiments.patch`.
+
+## 2026-10-11 — Queue help and board items in unsplit RNS products rejected; idle-wait livelock (perf-mc-impl)
+
+- Setup: ABBA, 30 iterations per leg, 64 threads. Same binary with a test switch, or two binaries; phases from `SDPX_PROFILE=1` receipts.
+- L16, queue help (mci54, bd54 on node101, `SDPX_TEST_QUEUE_HELP=0` against on):
+  - `run_queue` jobs run under a board offer. An unsplit congruence of at least 2·`WAY_WORK` posts 8-prime groups and CRT tiles as board items.
+  - An item that finds the queue empty helps (`board::help`, then `rayon::yield_now`). Otherwise it blocks on a condvar until a post arrives or the last job ends. Spinning instead had cost ising11 6%.
+  - Bitwise (unit test under three helpers; points identical).
+  - Λ35-rs 1.980 → 1.956 s/it (−1.2%), Λ27-rs 0.860 → 0.856 (−0.5%). Prepare 0.115 → 0.112, recover and residual unchanged.
+- L17, the same board items in the unsplit RNS gemm (mci55 against mci54, bd55 on node104): Λ35-rs 2.020 → 2.030 (+0.5%), Λ27-rs 0.870 → 0.864 (−0.7%). Neutral.
+- Livelock (observed, then confirmed from `eu-stack` of the hung process): bd56 (help on) and a diagnostic run hung at 870% CPU with no progress.
+  - A recover-scaling job was waiting in `chunk_matrix`'s par_iter join.
+  - The thread that stole that join half had, inside a nested join wait, started an unstarted `run_queue` item. That item found the queue empty and waited for the last job, which was the job waiting on that half.
+  - `QUEUE_ITEM` only guards threads that are already queue items. The scale-cone queue avoids the same trap by bounding its help with the last phase's slowest cone.
+  - An idle queue item must never block unless its thread holds no unfinished part of a job. Rayon cannot report that, so a deadlock-free version would spawn short help tasks that never wait.
+- Decision: both rejected (below 2%, and L16 can livelock). Patches are at `~/.cache/sdpx-e2e/patches/l16-l17-queue-help.patch`.
+
 ## 2026-10-11 — Short-group contribution batching kept; blocked arrow LDL and board items rejected (perf-mc-impl)
 
 - Setup: ABBA, 30 iterations per leg, 64 threads, node101 (PBS ABBA cb52, lf52, bd53). Phases from `SDPX_PROFILE=1` receipts, per iteration.

@@ -1239,6 +1239,49 @@ mod f64_eigmin_tests {
     }
 
     #[test]
+    #[ignore]
+    fn scaling_parts() {
+        type T = MpFloat<16>;
+        let n = 63;
+        let mut seed = 9u64;
+        let mut rnd = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let mut gram = |shift: f64| {
+            let a: Vec<f64> = (0..n * n).map(|_| rnd()).collect();
+            let mut v = Vec::new();
+            for j in 0..n {
+                for i in 0..=j {
+                    let mut x: f64 =
+                        (0..n).map(|k| a[i * n + k] * a[j * n + k]).sum::<f64>() / n as f64;
+                    if i == j {
+                        x += shift;
+                    } else {
+                        x *= std::f64::consts::SQRT_2;
+                    }
+                    v.push(<T as num_traits::FromPrimitive>::from_f64(x).unwrap());
+                }
+            }
+            v
+        };
+        let (s, z) = (gram(0.01), gram(0.02));
+        let mut cone = PSDTriangleCone::<T>::new(n);
+        for _ in 0..8 {
+            let t0 = std::time::Instant::now();
+            assert!(cone.update_scaling(
+                &s,
+                &z,
+                <T as num_traits::One>::one(),
+                ScalingStrategy::Dual
+            ));
+            eprintln!("total {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+
+    #[test]
     fn f64_min_eigenvalue_matches_mpfr() {
         check::<MpFloat<8>>();
     }
