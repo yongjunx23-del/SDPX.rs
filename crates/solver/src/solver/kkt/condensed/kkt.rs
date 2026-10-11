@@ -118,6 +118,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
     fn reset_solve(&mut self) {
         self.gmres_continuation = false;
         self.scaled_valid.fill(false);
+        self.preimage_valid.fill(false);
         self.counters = Default::default();
         self.reduced.reset_solve();
     }
@@ -138,6 +139,16 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             })
     }
 
+    fn scaled_preimage(&self, column: usize) -> Option<(&[T], &[bool])> {
+        let m = self.A.m;
+        (*self.preimage_valid.get(column)?).then(|| {
+            (
+                &self.preimages[column * m..(column + 1) * m],
+                &self.preimage_blocks[..],
+            )
+        })
+    }
+
     fn solve_many(
         &mut self,
         n: usize,
@@ -155,6 +166,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         }
         self.scaled_valid.clear();
         self.scaled_valid.resize(cols, false);
+        self.preimage_valid.clear();
+        self.preimage_valid.resize(cols, false);
         self.scaled_solutions
             .resize((cols - 1) * self.A.m, T::zero());
         self.counters.batches += 1;
@@ -240,9 +253,11 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                     }
                 }
             }
+            let corrections = self.counters.outer_refinements;
             flags[c] = local_success(self.local_only, self.recover_rhs(&mut x, rhs))
                 && self.refine_solution(&mut x, rhs, settings);
             if flags[c] {
+                self.keep_preimage(c, corrections);
                 if settings.iterative_refinement_enable {
                     let m = self.A.m;
                     self.scaled_product();
@@ -272,16 +287,20 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         // subsequent calls reuse them without precision conversion.
         self.scaled_valid.clear();
         self.scaled_valid.push(false);
+        self.preimage_valid.clear();
+        self.preimage_valid.push(false);
         self.counters.rhs_applied += 1;
         let b = std::mem::take(&mut self.b);
         let mut x = std::mem::take(&mut self.x);
         let success = (|| {
+            let corrections = self.counters.outer_refinements;
             if !local_success(self.local_only, b.is_finite())
                 || !local_success(self.local_only, self.solve_raw(&mut x, &b, settings))
                 || !self.refine_solution(&mut x, &b, settings)
             {
                 return false;
             }
+            self.keep_preimage(0, corrections);
             if settings.iterative_refinement_enable {
                 self.scaled_product();
                 self.scaled_valid[0] = true;
@@ -316,6 +335,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
 
     fn update_P(&mut self, P: &CscMatrix<T>) {
         self.scaled_valid.fill(false);
+        self.preimage_valid.fill(false);
         // The solver built both patterns; only the values change.
         debug_assert!(
             P.size() == self.P.size() && P.colptr == self.P.colptr && P.rowval == self.P.rowval
@@ -325,6 +345,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
 
     fn update_A(&mut self, A: &CscMatrix<T>) {
         self.scaled_valid.fill(false);
+        self.preimage_valid.fill(false);
         // The eliminated-row plan may cache constant A rows.
         self.eliminated = None;
         debug_assert_eq!(A.size(), self.A.size());
@@ -354,6 +375,44 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
 }
 
 impl<T: FloatT> CondensedKKTSolver<T> {
+    /// Gather column `column`'s recovery pre-images W·z (above binary64,
+    /// single process) when the accepted z is that recovery's: refinement
+    /// made no correction since `corrections`.
+    fn keep_preimage(&mut self, column: usize, corrections: u64) {
+        if T::precision_bits() <= 53
+            || !self.fused_sampled()
+            || self.counters.outer_refinements != corrections
+        {
+            return;
+        }
+        let m = self.A.m;
+        self.preimages
+            .resize(self.preimage_valid.len() * m, T::zero());
+        self.preimage_blocks.resize(self.blocks.len(), false);
+        let offset = self.blocks.first().map_or(0, |b| b.rows.start);
+        let (mut rest, mut at) = (&mut self.preimages[column * m..(column + 1) * m], 0);
+        let mut parts = Vec::with_capacity(self.blocks.len());
+        for (block, keep) in self.blocks.iter().zip(&mut self.preimage_blocks) {
+            let (start, end) = (block.rows.start - offset, block.rows.end - offset);
+            let (_, tail) = std::mem::take(&mut rest).split_at_mut(start - at);
+            let (rows, tail) = tail.split_at_mut(end - start);
+            (rest, at) = (tail, end);
+            *keep = match &block.scaling {
+                Scaling::Psd(p) if p.sampled.is_some() && p.preimage.len() == rows.len() => {
+                    parts.push((rows, &p.preimage[..]));
+                    true
+                }
+                _ => false,
+            };
+        }
+        let copy = |(rows, values): (&mut [T], &[T])| rows.copy_from_slice(values);
+        match &self.pool {
+            Some(pool) => pool.install(|| parts.into_par_iter().for_each(copy)),
+            None => parts.into_iter().for_each(copy),
+        }
+        self.preimage_valid[column] = true;
+    }
+
     fn refine_solution(&mut self, x: &mut Vec<T>, b: &[T], settings: &CoreSettings<T>) -> bool {
         let mut error = std::mem::take(&mut self.error);
         let mut candidate = std::mem::take(&mut self.candidate);
@@ -708,6 +767,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         pool: Option<Arc<rayon::ThreadPool>>,
     ) -> bool {
         self.scaled_valid.fill(false);
+        self.preimage_valid.fill(false);
         assert_eq!(self.blocks.len(), cones.len());
         // Follow this update's actual pool, including removal/replacement.
         self.pool = pool;

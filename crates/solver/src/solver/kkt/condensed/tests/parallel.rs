@@ -894,6 +894,125 @@ fn dominant_sampled_psd_mpfr512() {
     dominant_sampled_psd::<sdpx_arithmetic::Bits512>();
 }
 
+// The fused recovery keeps W·z for the step bounds above binary64: it must
+// match the cones' W·z of each accepted column, and drop out once
+// refinement corrects z (the correction's recovery starts elsewhere).
+fn sampled_preimage_matches_wz<T: FloatT>() {
+    use crate::solver::SampledBlock;
+    let block = SampledBlock {
+        row_start: 0,
+        column_start: 0,
+        dim: 2,
+        basis_rows: 24,
+        basis_cols: 16,
+        basis: (0..384)
+            .map(|i| num::<T>(i % 13 + 1) / num::<T>(32))
+            .collect(),
+        weights: vec![T::one(); 48],
+    };
+    let (rows, n, blocks) = (block.row_count(), block.column_count(), 2);
+    let m = rows * blocks;
+    let operator = Arc::new(
+        SampledOperator::new(
+            CscMatrix::zeros((m, n)),
+            (0..blocks)
+                .map(|i| {
+                    let mut b = block.clone();
+                    b.row_start = i * rows;
+                    b
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let (a, p) = (operator.materialize(), CscMatrix::identity(n));
+    let kinds = vec![SupportedConeT::PSDTriangleConeT(48); blocks];
+    let mut cones = CompositeCone::new(&kinds);
+    let (mut s, mut z) = (vec![T::zero(); m], vec![T::zero(); m]);
+    for range in cones.rng_cones.clone() {
+        // Two different SPD rank-one updates of the identity.
+        let (side, mut row) = (48, range.start);
+        for j in 0..side {
+            for i in 0..=j {
+                let ui = num::<T>(i + 1) / num::<T>(side + 1);
+                let uj = num::<T>(j + 1) / num::<T>(side + 1);
+                let vi = (if i % 2 == 0 { T::one() } else { -T::one() }) / num::<T>(i + 1);
+                let vj = (if j % 2 == 0 { T::one() } else { -T::one() }) / num::<T>(j + 1);
+                if i == j {
+                    s[row] = T::one() + ui + ui * uj;
+                    z[row] = num::<T>(2) + num::<T>(side - i) / num::<T>(side + 1) + vi * vj;
+                } else {
+                    s[row] = T::SQRT_2() * ui * uj;
+                    z[row] = T::SQRT_2() * vi * vj;
+                }
+                row += 1;
+            }
+        }
+    }
+    assert!(cones.update_scaling(&s, &z, T::one(), ScalingStrategy::PrimalDual));
+    let mut settings = CoreSettings::<T> {
+        max_threads: 1,
+        direct_solve_method: "qdldl".into(),
+        iterative_refinement_abstol: T::epsilon() * num::<T>(1024),
+        iterative_refinement_reltol: T::epsilon() * num::<T>(1024),
+        ..CoreSettings::default()
+    };
+    let mut solver = CondensedKKTSolver::new(&p, &a, &kinds, &cones, &settings);
+    solver.set_sampled_operator(Arc::clone(&operator));
+    assert!(solver.update(&cones, &settings));
+    let width = n + m;
+    let rhs: Vec<T> = (0..2 * width)
+        .map(|i| num::<T>(i % 13 + 1) / num::<T>(16))
+        .collect();
+    let mut out = vec![T::zero(); rhs.len()];
+    assert_eq!(
+        solver.solve_many(n, &rhs, &mut out, 2, &settings),
+        vec![true, true]
+    );
+    assert_eq!(KKTSolver::counters(&solver).outer_refinements, 0);
+    for c in 0..2 {
+        let preimage = solver.scaled_preimage(c);
+        if T::precision_bits() <= 53 {
+            assert!(preimage.is_none());
+            continue;
+        }
+        let (preimage, covered) = preimage.expect("fused recovery pre-image");
+        assert_eq!(covered, &[true; 2][..]);
+        let mut wz = vec![T::zero(); m];
+        let zc = &out[c * width + n..(c + 1) * width];
+        let ranges = cones.rng_cones.clone();
+        for (cone, r) in cones.iter_mut().zip(ranges) {
+            let SupportedCone::PSDTriangleCone(k) = cone else {
+                unreachable!()
+            };
+            k.mul_W(
+                MatrixShape::N,
+                &mut wz[r.clone()],
+                &zc[r],
+                T::one(),
+                T::zero(),
+            );
+        }
+        close(preimage, &wz);
+    }
+    // A zero tolerance forces a correction: the pre-image no longer holds.
+    settings.iterative_refinement_abstol = T::zero();
+    settings.iterative_refinement_reltol = T::zero();
+    solver.setrhs(&rhs[..n], &rhs[n..width]);
+    let (x, z) = out[..width].split_at_mut(n);
+    let _ = solver.solve(Some(x), Some(z), &settings);
+    assert!(KKTSolver::counters(&solver).outer_refinements > 0);
+    assert!(solver.scaled_preimage(0).is_none());
+}
+#[test]
+fn sampled_preimage_matches_wz_f64() {
+    sampled_preimage_matches_wz::<f64>();
+}
+#[test]
+fn sampled_preimage_matches_wz_mpfr256() {
+    sampled_preimage_matches_wz::<Bits256>();
+}
+
 #[test]
 fn many_small_sampled_blocks_keep_outer_plan() {
     use crate::solver::SampledBlock;

@@ -143,12 +143,13 @@ The f50 full solves with all of them are audited: Λ35-rs takes 372 iterations i
 Kept since:
 - residue products for short arrow-leaf groups (Λ35-rs −3.8% per iteration, bitwise, peak RSS 5.6 → 7.2 GB);
 - cone SVD vectors from the shifted normal form within a factor two, with windowed Gram–Schmidt (Λ35-rs −5.5% per iteration; full solves −2.2 to −3.9%; audited);
-- step bounds of KKT directions from one congruence, with W⁻ᵀΔs = −WΔz − W⁻ᵀc from the complementarity row (Λ35-rs −3.8% per iteration; full solves −2.2 to −6.0% at unchanged iteration counts; audited).
+- step bounds of KKT directions from one congruence, with W⁻ᵀΔs = −WΔz − W⁻ᵀc from the complementarity row (Λ35-rs −3.8% per iteration; full solves −2.2 to −6.0% at unchanged iteration counts; audited);
+- the combined shift as one exact symmetric square (Λ35-rs −2.7% per iteration), and WΔz from the condensed recovery's pre-image when refinement made no correction (−2.1%; Λ27-rs −3.5%). Together the full solves are −1.9 to −6.2% at unchanged iteration counts, audited.
 Rejected since: residue-major i32 congruence (gains only for n ≥ 96 under full load); reciprocal pivots in inverse iteration (+12%); blocked exact leaf LDL from order 96 (Λ27-rs +2.8%); board items inside cone SVD/Cholesky (−0.7%); queue help with board items in unsplit congruences and gemms (−1.2%, and its idle wait can livelock when a stolen join half starts a queue item); compact-WY V back-transform (+0.4% under full load). Their patches are kept in `~/.cache/sdpx-e2e/patches`.
 
 Next:
 - the solve pipeline: residual 0.246, recover 0.148, prepare 0.113 of 1.85 s per Λ35-rs iteration at mci60 (3.1 solves per iteration, three exact congruences per block and solve);
-- in test: the combined shift as one exact symmetric square (−Δz̃² − λ∘Δz̃, since Δs̃ = −Δz̃ − λ), and WΔz from the condensed recovery's pre-image in place of the step-bound congruence;
+- refinement corrections in late iterations (f63): prepare + recover + residual take 44% of Λ35 (1586 corrections in 435 iterations), 41% of Λ27 and 37% of Λ35-rs. First find which rows exceed the ε^(3/4) tolerance and why, then make the raw solve more accurate or each correction cheaper. The tolerance itself stays;
 - cone kernels under full load (n = 63, 64 copies, per cone): bidiagonalization 85 ms, reflectors 59, R/R⁻¹ 50, inverse iteration 43, Cholesky 24, dqds 19, L2ᵀL1 13 ms. A blocked triangular solve cuts R/R⁻¹ by 10.6 ms (−2.9% of the cone); panel bidiagonalization saves 5 ms. Neither yet reaches 2% of an iteration;
 - Λ35-rs iterations: 169 iterations before the chase restart and about 120 to deflate the restarted primal scale (L1 detection is closed: no general early signal, at most about 25 iterations to gain).
 

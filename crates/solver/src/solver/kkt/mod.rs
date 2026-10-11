@@ -72,6 +72,13 @@ pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
         None
     }
 
+    /// W·z of an accepted solution column on the blocks (in cone order)
+    /// whose recovery formed it, from the recovery's pre-images. None when
+    /// the solver did not form them or a refinement correction changed z.
+    fn scaled_preimage(&self, _column: usize) -> Option<(&[T], &[bool])> {
+        None
+    }
+
     /// Binary64: continue a stationary refinement that stalls above its
     /// tolerance with GMRES-IR for the rest of the solve. The driver asks
     /// for it once a feasibility residual grows; until then the cheaper

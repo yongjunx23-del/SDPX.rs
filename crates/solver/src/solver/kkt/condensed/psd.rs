@@ -925,6 +925,7 @@ impl<T: FloatT> PsdBlock<T> {
             // Only fused sampled recovery needs this workspace. Every other
             // block must not reserve 128*n² unused scalars.
             mat3c: Matrix::zeros((0, 0)),
+            preimage: Vec::new(),
             columns,
             schur_values: Vec::new(),
             schur_columns: Vec::new(),
@@ -1541,6 +1542,10 @@ impl<T: FloatT> PsdBlock<T> {
                 &mut self.rinv_cache,
             );
             mat_to_svec(y, &w.mat3);
+            if T::precision_bits() > 53 {
+                self.preimage.resize(y.len(), T::zero());
+                mat_to_svec(&mut self.preimage, &w.mat1);
+            }
         })
     }
 

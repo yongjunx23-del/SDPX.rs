@@ -28,6 +28,8 @@ pub struct DefaultKKTSystem<T> {
     batch_out: Vec<T>,
     affine_ready: Option<bool>,
     hs2: Vec<T>,
+    // The constant column's W·z pre-images and the blocks they cover.
+    pre2: (Vec<T>, Vec<bool>),
     // Fixed-τ phase: the constant column (−q, b) is not solved and the
     // prepared affine output is batch column 0 instead of 1.
     fixed_tau: bool,
@@ -96,6 +98,7 @@ where
             batch_out: vec![T::zero(); 2 * (n + m)],
             affine_ready: None,
             hs2: Vec::new(),
+            pre2: (Vec::new(), Vec::new()),
             fixed_tau: false,
         }
     }
@@ -176,6 +179,7 @@ where
         if self.fixed_tau {
             // Δτ = 0: only the affine column, prepared as batch column 0.
             self.hs2.clear();
+            self.pre2.0.clear();
             loop {
                 let updated = all_succeeded(self.kktsolver.update(cones, settings.core()));
                 let mut affine_ok = false;
@@ -224,6 +228,7 @@ where
                 let affine_ok = all_succeeded(ok[1]);
                 if constant_ok {
                     copy_scaled(&*self.kktsolver, 0, &mut self.hs2);
+                    copy_preimage(&*self.kktsolver, &mut self.pre2);
                     self.affine_ready = Some(affine_ok);
                 }
             }
@@ -318,6 +323,21 @@ where
         //  cones and Hs = μH(z) for asymmetric cones
         // Cached affine output is batch column 1; a fresh solve is column 0.
         let column = usize::from(prepared.is_some() && !variables.fixed_tau);
+        // W·Δz = W·z1 + Δτ·W·z2 from the recovery pre-images, for the step
+        // bounds (`PSDTriangleCone::kkt_bounds`).
+        let (pre2, blocks2) = (&self.pre2.0, &self.pre2.1);
+        cones.set_scaled_dz(
+            self.kktsolver
+                .scaled_preimage(column)
+                .and_then(|(p1, blocks)| match variables.fixed_tau {
+                    true => Some((p1, None, blocks)),
+                    false => (pre2.len() == p1.len() && blocks2 == blocks).then_some((
+                        p1,
+                        Some((lhs.τ, &pre2[..])),
+                        blocks,
+                    )),
+                }),
+        );
         let hs1 = self
             .kktsolver
             .scaled_solution(column)
@@ -515,6 +535,16 @@ fn copy_scaled<T: FloatT>(solver: &dyn KKTSolver<T>, column: usize, out: &mut Ve
     }
 }
 
+/// The constant column's W·z pre-images (see `KKTSolver::scaled_preimage`).
+fn copy_preimage<T: FloatT>(solver: &dyn KKTSolver<T>, out: &mut (Vec<T>, Vec<bool>)) {
+    out.0.clear();
+    out.1.clear();
+    if let Some((values, blocks)) = solver.scaled_preimage(0) {
+        out.0.extend_from_slice(values);
+        out.1.extend_from_slice(blocks);
+    }
+}
+
 /// True when the initial KKT solve returned a point whose magnitude
 /// dwarfs the problem data by orders of magnitude.  Direct solves on
 /// severely ill-conditioned systems can produce components along
@@ -552,6 +582,7 @@ where
         let is_success = self.kktsolver.solve(Some(x2), Some(z2), settings.core());
 
         copy_scaled(&*self.kktsolver, 0, &mut self.hs2);
+        copy_preimage(&*self.kktsolver, &mut self.pre2);
         is_success
     }
 

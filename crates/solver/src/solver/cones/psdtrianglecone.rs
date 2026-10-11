@@ -17,6 +17,10 @@ pub struct PSDConeData<T> {
     // whether `step_length` bounds a KKT direction from it.
     offset: Vec<T>,
     use_offset: bool,
+    // W·Δz of the direction the KKT system just solved, when its solver
+    // formed it (`KKTSolver::scaled_preimage`); the next bound consumes it.
+    scaled_dz: Vec<T>,
+    has_scaled_dz: bool,
 }
 
 impl<T> PSDConeData<T>
@@ -32,6 +36,8 @@ where
             G: Matrix::zeros((n, n)),
             offset: Vec::new(),
             use_offset: false,
+            scaled_dz: Vec::new(),
+            has_scaled_dz: false,
         }
     }
 }
@@ -152,6 +158,28 @@ where
 
     pub(super) fn use_offset(&mut self, on: bool) {
         self.data.use_offset = on && !self.data.offset.is_empty();
+    }
+
+    /// W·Δz = p1 + τ·p2 of the direction the KKT system just solved, for
+    /// its next prepared affine or KKT bound; None clears it.
+    pub(super) fn set_scaled_dz(&mut self, dz: Option<(&[T], Option<(T, &[T])>)>) {
+        let f = &mut *self.data;
+        f.has_scaled_dz = dz.is_some();
+        if let Some((p1, p2)) = dz {
+            f.scaled_dz.resize(p1.len(), T::zero());
+            match p2 {
+                Some((τ, p2)) => {
+                    for ((d, &a), &b) in f.scaled_dz.iter_mut().zip(p1).zip(p2) {
+                        *d = a + τ * b;
+                    }
+                }
+                None => f.scaled_dz.copy_from_slice(p1),
+            }
+        }
+    }
+
+    fn scaled_dz(&self) -> Option<&[T]> {
+        self.data.has_scaled_dz.then_some(&self.data.scaled_dz[..])
     }
 
     /// `SDPX_DBG_STEPCONE`: (min λᵢ², max λᵢ², Σ λᵢ²) of the NT-scaled point.
@@ -451,17 +479,19 @@ where
         αmax: T,
     ) -> (T, T) {
         if self.data.use_offset {
-            let f = &*self.data;
-            return with_work(self.n, |w: &mut PsdWork<T>| {
+            let (f, scaled) = (&*self.data, self.scaled_dz());
+            let out = with_work(self.n, |w: &mut PsdWork<T>| {
                 let ds = &mut w
                     .second
                     .get_or_insert_with(|| Box::new(StepWorkspace::new(self.n)))
                     .vector;
                 let mut ds = std::mem::take(ds);
-                let out = kkt_bounds(f, dz, &mut ds, Some(&f.offset), αmax, w);
+                let out = kkt_bounds(f, dz, &mut ds, Some(&f.offset), scaled, αmax, w);
                 w.second.as_mut().unwrap().vector = ds;
                 out
             });
+            self.data.has_scaled_dz = false;
+            return out;
         }
         if sdpx_arithmetic::inner_parallel::paired() {
             let (n, f) = (self.n, &*self.data);
@@ -545,12 +575,14 @@ where
 
     pub(crate) fn prepare_affine_bounds(&mut self, dz: &mut [T], ds: &mut [T], αmax: T) -> (T, T) {
         if T::precision_bits() > 53 {
-            let f = &*self.data;
-            return with_work(self.n, |w: &mut PsdWork<T>| {
-                let out = kkt_bounds(f, dz, ds, None, αmax, w);
+            let (f, scaled) = (&*self.data, self.scaled_dz());
+            let out = with_work(self.n, |w: &mut PsdWork<T>| {
+                let out = kkt_bounds(f, dz, ds, None, scaled, αmax, w);
                 dz.copy_from_slice(&w.vector);
                 out
             });
+            self.data.has_scaled_dz = false;
+            return out;
         }
         // The dz (dual, R) and ds (primal, Rinv) bounds are independent.
         // With a second scratch set they can run on two ambient workers;
@@ -933,27 +965,45 @@ where
 /// HₛΔz + Δs = −c gives W⁻ᵀΔs = −WΔz − W⁻ᵀc, where W⁻ᵀc is λ for the
 /// affine c = s and `offset` (λ \ ds) for a combined c = Wᵀ(λ \ ds).
 /// Leaves WΔz in `w.vector` and W⁻ᵀΔs in `ds`. At MPFR precision the
-/// rounding of Δs moves W⁻ᵀΔs by far less than a step bound needs.
+/// rounding of Δs moves W⁻ᵀΔs by far less than a step bound needs. A
+/// `scaled` WΔz from the solver's recovery replaces the congruence: it is
+/// the matrix the recovery Δz = R⁻ᵀ·M·R⁻¹ started from, so it differs from
+/// a recomputed RᵀΔzR only by the rounding of Δz.
 fn kkt_bounds<T: FloatT>(
     f: &PSDConeData<T>,
     dz: &[T],
     ds: &mut [T],
     offset: Option<&[T]>,
+    scaled: Option<&[T]>,
     αmax: T,
     w: &mut PsdWork<T>,
 ) -> (T, T) {
-    let αz = step_component_inner(
-        dz,
-        &f.R,
-        &f.Λisqrt,
-        false,
-        αmax,
-        &mut w.vector,
-        &mut w.mat1,
-        &mut w.mat2,
-        &mut w.svd.Vt,
-        &mut w.eig,
-    );
+    let αz = match scaled {
+        Some(v) => {
+            w.vector.clear();
+            w.vector.extend_from_slice(v);
+            step_length_psd_component(
+                &mut w.mat1,
+                &mut w.eig,
+                &w.vector,
+                &f.Λisqrt,
+                αmax,
+                &mut w.mat2.data,
+            )
+        }
+        None => step_component_inner(
+            dz,
+            &f.R,
+            &f.Λisqrt,
+            false,
+            αmax,
+            &mut w.vector,
+            &mut w.mat1,
+            &mut w.mat2,
+            &mut w.svd.Vt,
+            &mut w.eig,
+        ),
+    };
     for (d, &v) in ds.iter_mut().zip(&w.vector) {
         *d = -v;
     }

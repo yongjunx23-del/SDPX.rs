@@ -403,6 +403,9 @@ struct PsdBlock<T> {
     ginv_cache: ResidueCache,
     // Fused sampled recovery workspace; empty for every other block.
     mat3c: Matrix<T>,
+    // svec of W·z of the last fused recovery above binary64: the matrix its
+    // congruence z = Rinvᵀ·M·Rinv started from.
+    preimage: Vec<T>,
     columns: Vec<Column>,
     schur_values: Vec<T>,
     // Local columns in destination CSC order; built only for pooled publish.
@@ -936,6 +939,11 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     batch_halves: Vec<T>,
     scaled_solutions: Vec<T>,
     scaled_valid: Vec<bool>,
+    // Per column: W·z of the fused sampled PSD blocks (`PsdBlock::preimage`)
+    // when no refinement correction changed z, and the blocks they cover.
+    preimages: Vec<T>,
+    preimage_valid: Vec<bool>,
+    preimage_blocks: Vec<bool>,
     workx: Vec<T>,
     workz: Vec<T>,
     workh: Vec<T>,
@@ -1397,6 +1405,9 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             batch_halves: Vec::new(),
             scaled_solutions: Vec::new(),
             scaled_valid: Vec::new(),
+            preimages: Vec::new(),
+            preimage_valid: Vec::new(),
+            preimage_blocks: Vec::new(),
             workx: vec![T::zero(); n],
             workz: vec![T::zero(); m],
             workh: vec![T::zero(); m],

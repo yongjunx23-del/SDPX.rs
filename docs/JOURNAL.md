@@ -8,6 +8,49 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-11 — Exact combined shift and step bounds from the recovery pre-image kept (perf-mc-impl)
+
+- Setup: ABBA, 30 iterations per leg, 64 threads (bd62 on node106, bd63 on node104). Full solves f63a/f63b on node106/107 with mci62. Audits are aud63 (225022). Phases come from `SDPX_PROFILE=1` receipts.
+- L23, the combined shift as one exact symmetric square (`combined_shift_prepared`):
+  - After the prepared affine bound Δs̃ = −Δz̃ − λ. The corrector term Δs̃ ∘ Δz̃ is therefore −Δz̃² − λ ∘ Δz̃: one exact syrk replaces the rounded syr2k above binary64.
+  - Order-changing. Local ising11 at 1 thread: −1.8% api, audits 2/2.
+  - bd62 (mci60 against mci61):
+
+    | Case | A s/it | B s/it | change | comb A → B |
+    |---|---|---|---|---|
+    | Λ35-rs/1024 | 1.887, 1.899 | 1.847, 1.838 | −2.7% | 0.075 → 0.028 |
+    | Λ27-rs/768 | 0.862, 0.865 | 0.842, 0.850 | −2.0% | 0.029 → 0.016 |
+
+  - Decision: kept.
+- L22 stage 2, WΔz from the condensed recovery (`KKTSolver::scaled_preimage`):
+  - The fused sampled recovery forms Δz = R⁻ᵀ·M·R⁻¹, so M is WΔz up to the rounding of Δz. The solver keeps M per sampled PSD block (`PsdBlock::preimage`). The step bound of that column then reads it instead of recomputing RᵀΔzR.
+  - For the combined direction the KKT system keeps the constant column's pre-image, so WΔz = M₁ + Δτ·M₂.
+  - Taken only above binary64, in a single process, with fused sampled blocks, and when refinement made no correction (a correction changes Δz). Any other case keeps the congruence.
+  - A unit test checks the pre-image against `mul_W` at f64 (None) and MPFR256, and a forced correction clears it. Mutating the pre-image to `mat3` fails the test.
+  - Local ising11 at 1 thread: −1.7% api, audits 2/2.
+  - bd63 (mci61 against mci62):
+
+    | Case | A s/it | B s/it | change | aff/fin A → B |
+    |---|---|---|---|---|
+    | Λ35-rs/1024 | 1.788, 1.794 | 1.757, 1.750 | −2.1% | 0.042 → 0.014 |
+    | Λ27-rs/768 | 0.805, 0.809 | 0.776, 0.782 | −3.5% | 0.028 → 0.010 |
+
+  - Decision: kept.
+- Full solves with both changes (f63 with mci62, two runs each) against f61 (mci60). Iteration counts are unchanged, and all five audits are accepted. The objectives agree with f61 to 38 printed digits.
+
+  | Case | f61 it / s | f63 it / s | change |
+  |---|---|---|---|
+  | Λ35-rs | 372 / 830.9 | 372 / 808.7, 809.5 | −2.6% |
+  | Λ35 | 435 / 1306.8 | 435 / 1287.8, 1276.8 | −1.9% |
+  | Λ27 | 183 / 189.1 | 183 / 183.1, 184.1 | −3.0% |
+  | Λ27-rs | 138 / 110.3 | 138 / 104.0, 105.2 | −5.2% |
+  | Λ19-rs | 89 / 35.3 | 89 / 33.3, 32.9 | −6.2% |
+
+- Full-solve profile (f63, observed): late iterations pay for refinement corrections. Each correction is one more prepare, reduced solve, recovery and residual.
+  - Outer corrections per solve: Λ35 1586 in 435 iterations; Λ27 422 in 183; Λ35-rs 554 in 372; Λ27-rs 32 in 138; Λ19-rs 0.
+  - prepare + recover + residual take 565 of 1270 s on Λ35, 75 of 182 s on Λ27 and 298 of 803 s on Λ35-rs.
+  - The 30-iteration ABBA window has almost none of them. The pre-image also lapses after a correction, so late step bounds cost 0.04 s again.
+
 ## 2026-10-11 — Step bounds from the complementarity row kept; τ-fall chase detection closed (perf-mc-impl)
 
 - Setup: ABBA, 30 iterations per leg, 64 threads, node104 (bd61). Full solves f61a/f61b on node106/107 and t17 audits (225001). Phases come from `SDPX_PROFILE=1` receipts.

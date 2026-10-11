@@ -559,6 +559,30 @@ where
         out
     }
 
+    /// W·Δz = p1 + τ·p2 of the direction the KKT system just solved, on the
+    /// PSD cones its solver formed it for (`blocks`, in cone order); each
+    /// cone's next prepared affine or KKT bound consumes it. None clears.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn set_scaled_dz(&mut self, dz: Option<(&[T], Option<(T, &[T])>, &[bool])>) {
+        let single = self.mpi_world().is_none();
+        let dz = dz.filter(|(_, _, blocks)| single && blocks.len() == self.cones.len());
+        let ranges = &self.rng_cones;
+        let set = |(i, cone): (usize, &mut SupportedCone<T>)| {
+            if let SupportedCone::PSDTriangleCone(c) = cone {
+                let rows = ranges[i].clone();
+                c.set_scaled_dz(dz.filter(|(_, _, blocks)| blocks[i]).map(|(p1, p2, _)| {
+                    (&p1[rows.clone()], p2.map(|(τ, p2)| (τ, &p2[rows.clone()])))
+                }));
+            }
+        };
+        match self.threading.as_ref().filter(|t| t.cone_workers > 1) {
+            Some(t) => t
+                .pool
+                .install(|| self.cones.par_iter_mut().enumerate().for_each(set)),
+            None => self.cones.iter_mut().enumerate().for_each(set),
+        }
+    }
+
     fn use_offsets(&mut self, on: bool) {
         for cone in &mut self.cones {
             if let SupportedCone::PSDTriangleCone(c) = cone {
