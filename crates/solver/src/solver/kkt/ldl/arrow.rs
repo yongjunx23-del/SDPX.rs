@@ -57,9 +57,6 @@ const FACTOR_PANEL: usize = 8;
 /// 170-row border slowed 64-thread iterations by 2.9% and raised RSS 1.7 GB.
 const EXACT_FACTOR_MIN: usize = 256;
 const EXACT_PANEL: usize = 48;
-/// Product work (Σ g·q²) from which a group of fewer leaves than workers
-/// is batched through exact products.
-const SHORT_BATCH_WORK: u128 = 1 << 30;
 /// Estimated workspace of one batch of exact leaf contributions.
 const BATCH_WORK_BYTES: usize = 4 << 30;
 /// Residue-product ways a split exact factor offers to idle workers.
@@ -975,7 +972,10 @@ fn subtract_contributions<T: FloatT>(
     // result storage is proportional to Y. A batch holds at most one leaf
     // per worker; a short batch grants its products the spare workers. Both
     // paths round every entry's exact sum once, so batching never changes
-    // the bits.
+    // the bits. Short groups batch too: on Λ35 (36 leaves of g ≈ 114,
+    // q = 170, 64 threads) residue products cut contribution CPU 2.3× and
+    // iterations 3.8%, for 1.5 GB more peak RSS (5.6 → 7.2 GB; residue
+    // workspace of the concurrent products).
     let width = pool.map_or(1, |p| p.current_num_threads());
     let eligible = |leaf: &Leaf<T>| {
         let (g, q) = (leaf.ids.len(), leaf.coupled.len());
@@ -1017,17 +1017,7 @@ fn subtract_contributions<T: FloatT>(
             product
         };
         for group in leaves.chunk_by(|a, b| eligible(a) == eligible(b)) {
-            // A short group of light products keeps the column path: on Λ35
-            // (36 leaves, Σ g·q² ≈ 2e8) batching saved 0.5% at 64 threads but
-            // its workspace raised peak RSS 4.7 → 6.4 GB; mixed Λ27/1024 at
-            // 128 threads gains 13% from it.
-            let light = group.len() < width
-                && group
-                    .iter()
-                    .map(|l| (l.ids.len() * l.coupled.len() * l.coupled.len()) as u128)
-                    .sum::<u128>()
-                    < SHORT_BATCH_WORK;
-            if !eligible(&group[0]) || light {
+            if !eligible(&group[0]) {
                 // Keep these leaves column-parallel and avoid square result
                 // storage, preserving their position in every entry's sum.
                 subtract_contributions_columns(group, s, t, pool);

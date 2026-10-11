@@ -8,6 +8,28 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-11 — Short-group contribution batching kept; blocked arrow LDL and board items rejected (perf-mc-impl)
+
+- Setup: ABBA, 30 iterations per leg, 64 threads, node101 (PBS ABBA cb52, lf52, bd53). Phases from `SDPX_PROFILE=1` receipts, per iteration.
+- L14, residue products for short leaf groups. Before, a group of fewer leaves than workers with Σ g·q² < 2³⁰ kept column-parallel MPFR dots. On Λ35-rs (36 leaves, g ≈ 96–126, q = 170) that is 6.7 of the 13.3 s refactor per leg. The change removes the light-group exception, so every eligible group batches through exact residue products. The bits are unchanged (each entry's exact sum is rounded once on both paths).
+
+  | Case (cb52, mci52) | A s/it | B s/it | change |
+  |---|---|---|---|
+  | Λ35-rs/1024 | 2.034, 2.048 | 1.963, 1.962 | −3.8% |
+  | Λ27-rs/768 | 0.854, 0.866 | 0.860, 0.864 | +0.2% |
+
+  Points are identical on both cases. On Λ35-rs the contribution drops 0.217 → 0.142 s and the refactor 0.429 → 0.353 s. Peak RSS rises 5.64 → 7.2 GB, from the residue workspace of the concurrent products.
+- Exact blocked leaf LDL from order 96 (lf52, `EXACT_FACTOR_MIN` 256 → 96, on top of L14): Λ35-rs 2.117 → 2.100 s/it (noise), Λ27-rs 0.899 → 0.924 (+2.8%). It changes the bits. Rejected; the 256 floor stays.
+- L15, board items in cone scaling (bd53, mci52 with batching vs mci53):
+  - The idle cone workers already loop on `board::help()`. This change gives them items inside the long cones: bidiagonalization columns, per-column reflector back-transforms, inverse-iteration clusters (largest first), the lower Cholesky trailing update, triangular-solve columns, and the paired factor/R-build joins.
+  - A bitwise unit test covers the SVD, Cholesky and triangular solve under three helpers.
+  - The maxima of the long kernels fall: reflectors 0.133 → 0.059 s, bidiagonalization 0.169 → 0.118 s. The longest inverse iteration (0.27 s, one cluster of 63 equal singular values) stays serial.
+  - Scale wall drops 0.462 → 0.454 s. Λ35-rs goes 1.986 → 1.973 s/it (−0.7%) and Λ27-rs 0.857 → 0.862 (+0.5%), with identical points.
+  - Below the 2% bar, so rejected. The patch is at `~/.cache/sdpx-e2e/patches/l15-board-items.patch`.
+- Inverse iteration against QR plus rotation replay on the 80 Λ35-rs bidiagonal dumps (Mac, one thread, ms): invit 40–86 against QR + replay 95–220 per matrix. The worst invit is 136 ms (one cluster of 63, smin/smax 1.0), against 49 + 151 for QR. Inverse iteration stays.
+- Step lengths: the affine and final passes cost 0.071 + 0.070 s/it. Their 288 congruences RᵀΔR are 79% of the cone W-products. The affine pass reuses its scaled directions in the combined RHS at full precision. Only the final pass could use a cheaper bound, worth under 2%, so it was not pursued.
+- Decision: keep L14 as the default. Next is the condensed solve pipeline: residual 0.251, recover 0.155, prepare 0.117 and trsv 0.058 s/it, 0.58 of 1.97 s.
+
 ## 2026-10-11 — f50 confirmation; residue-major congruence and reciprocal pivots rejected (perf-mc-impl)
 
 - Full solves f50 (mci50 = 9d0e7fa defaults, 64 threads, node104, 224937). Audits 224945 accepted, residuals and objectives equal to f46's:

@@ -140,11 +140,11 @@ Queues, cone SVD and tiled CRT (journal 2026-10-11, perf-mc-impl, now defaults).
 - an output-tiled CRT for the RNS gemm and congruences: −8.4% per iteration, bitwise.
 
 The f50 full solves with all of them are audited: Λ35-rs takes 372 iterations in 900 s (1216 s at mci41, −26%); Λ27 −8.5%, Λ27-rs −5.7%, Λ19-rs −6.6% against f46.
-Rejected since: residue-major i32 congruence (gains only for n ≥ 96 under full load; patch kept in `~/.cache/sdpx-e2e/patches`), reciprocal pivots in inverse iteration (+12%).
+Kept since: residue products for short arrow-leaf groups (Λ35-rs −3.8% per iteration, bitwise, peak RSS 5.6 → 7.2 GB).
+Rejected since: residue-major i32 congruence (gains only for n ≥ 96 under full load); reciprocal pivots in inverse iteration (+12%); blocked exact leaf LDL from order 96 (Λ27-rs +2.8%); board items inside cone SVD/Cholesky (−0.7%). Their patches are kept in `~/.cache/sdpx-e2e/patches`.
 
 Next:
-- a symbol-level profile of the current build (Λ35-rs, 30 iterations) to rank the remaining kernels;
-- the solve pipeline, about 45% of Λ35-rs wall (4.5 passes per iteration; prepare/recover run at 50–52 of 64 busy);
+- the solve pipeline: residual 0.251, recover 0.155, prepare 0.117, trsv 0.058 of 1.97 s per Λ35-rs iteration (3.1 solves per iteration);
 - blocked bidiagonalization and back-transform through the RNS gemm (the cone SVD is still 11% of CPU);
 - Λ35-rs iterations: 169 iterations before the chase restart and about 120 to deflate the restarted primal scale (L1 detection is shelved).
 

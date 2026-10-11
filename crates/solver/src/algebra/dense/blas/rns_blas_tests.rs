@@ -925,3 +925,44 @@ fn crt_tiled_timing() {
         );
     }
 }
+
+#[test]
+#[ignore]
+fn leaf_contribution_timing() {
+    // Arrow leaf contribution YᵀZ (upper), Λ35-rs shapes at 1024 bits.
+    fn run<const N: usize>(q: usize, g: usize) {
+        let mut rng = Lcg(5);
+        let y = random::<N>(&mut rng, g * q, 30);
+        let z = random::<N>(&mut rng, g * q, 30);
+        let reps = 5;
+        let t = std::time::Instant::now();
+        let mut out = vec![F::<N>::zero(); q * (q + 1) / 2];
+        for _ in 0..reps {
+            for c in 0..q {
+                for r in 0..=c {
+                    out[r + c * (c + 1) / 2] = F::dot_fma(
+                        y[r * g..(r + 1) * g].iter().zip(&z[c * g..(c + 1) * g]),
+                    );
+                }
+            }
+        }
+        let exact = t.elapsed().as_secs_f64() / reps as f64;
+        let mut c = vec![F::zero(); q * (q + 1) / 2];
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            assert!(gemm(b'T', b'N', q, q, g, &y, g, &z, g, true, None, &mut c, None));
+        }
+        let blas = t.elapsed().as_secs_f64() / reps as f64;
+        assert_eq!(c, out);
+        eprintln!(
+            "bits={} q={q} g={g}: exactdot {:.1} ms, residue {:.1} ms, x{:.1}",
+            N * 64,
+            exact * 1e3,
+            blas * 1e3,
+            exact / blas
+        );
+    }
+    run::<16>(170, 114);
+    run::<16>(170, 96);
+    run::<12>(170, 114);
+}
