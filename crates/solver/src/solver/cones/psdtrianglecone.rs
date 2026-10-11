@@ -637,7 +637,31 @@ where
     }
 
     pub(super) fn combined_shift_prepared(&mut self, shift: &mut [T], dz: &[T], ds: &[T], σμ: T) {
-        self.circ_op(shift, ds, dz);
+        if T::precision_bits() > 53 {
+            // `kkt_bounds` left ds = −dz − λ, so ds ∘ dz = −dz·dz − λ ∘ dz:
+            // one exact symmetric square instead of a termwise-rounded syr2k.
+            let (n, λ) = (self.n, &self.data.λ);
+            with_work(n, |w: &mut PsdWork<T>| {
+                let (D, X) = (&mut w.mat1, &mut w.mat2);
+                svec_to_mat(D, dz);
+                X.syrk(D, T::one(), T::zero(), MatrixTriangle::Triu);
+                let half: T = (0.5).as_T();
+                let mut idx = 0;
+                for col in 0..n {
+                    for row in 0..=col {
+                        let sq = if row == col {
+                            X[(row, col)]
+                        } else {
+                            X[(row, col)] * T::SQRT_2()
+                        };
+                        shift[idx] = -sq - half * (λ[row] + λ[col]) * dz[idx];
+                        idx += 1;
+                    }
+                }
+            });
+        } else {
+            self.circ_op(shift, ds, dz);
+        }
         self.scaled_unit_shift(shift, -σμ, PrimalOrDualCone::PrimalCone);
     }
 
