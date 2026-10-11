@@ -8,6 +8,98 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-12 — L29: pooled long copies on the solve path (rejected, perf-mc-impl)
+
+- Hypothesis (owner receipts): the condensed `solve_many` and the KKT right-hand-side setup copy whole solution vectors and each block's `mat3c` triangle on the main thread between pooled phases.
+- Change: `copy_slice` (pooled `copy_from_slice` in `VECTOR_CHUNK` pieces) for those copies; per-block pooled save/restore of the `mat3c` halves; one `waxpby` in place of a copy plus `axpby`. Copies are bitwise, so points are identical.
+- Result (mci70 → mci71, points identical in every pair):
+
+  | Case | A s | B s | change |
+  |---|---|---|---|
+  | 4 nodes owner 16×16, Λ35 60 it (225103) | 97.23 / 96.71 | 97.29 / 97.13 | +0.25% |
+  | 1 node plain, Λ35 60 it (225102, node62) | 144.6 / 144.8 | 143.5 / 143.3 | −0.9% |
+  | 1 node plain, Λ35-rs 30 it | 58.6 / 58.7 | 58.2 / 58.7 | −0.4% |
+
+- Decision: rejected (below 2%) and reverted. Patch kept at `~/.cache/sdpx-e2e/patches/l29-pooled-copies.patch`.
+
+## 2026-10-12 — L28: rank-order reduce-scatter for long owner sums (kept, perf-mc-impl)
+
+- Hypothesis (L6 diagnosis): the owner path sums the assembled border (site 103, 14535 entries, ~2 MB at 1024 bits) with an all-gather of every rank's copy and a rank-order fold on every rank. Each rank receives size·len values and folds all of them on one thread.
+- Change:
+  - `World::reduce_sum_slice` (`MPI_Alltoallv`): rank r receives every rank's copy of its own slice `ranges(len, size)[r]` and folds it in rank order, as the all-gather fold does. One all-gather then returns the folded slices.
+  - Each rank receives about 2·len values and adds 1/size of the terms. The sums are bitwise those of the all-gather fold.
+  - `WorldCollective::reduce_sum_in_place` uses it when `len ≥ size`. Metadata and decode status are agreed as in the other collectives.
+- Result (mnab, 225095; Λ35 at 1024 bits, 60 iterations; owner 16×16 on node154/178/59/61):
+  - A mci68: 100.53 and 99.86 s.
+  - B mci69: 97.68 and 97.09 s, i.e. −2.8%.
+  - Points are identical.
+  - Rank 0 receipt, A1 → B1:
+    - `owned.border_assemble` 7.16 → 4.50 s, its serial fold 4.28 → 1.63 s;
+    - `mpi.gather` 3.01 → 1.19 s, plus `mpi.alltoall` 0.38 s;
+    - `kkt update` 46.8 → 44.3 s.
+- Decision: kept.
+
+## 2026-10-12 — L27: worst-fit split hints for the Gram sync jobs (rejected, perf-mc-impl)
+
+- Hypothesis (L6 diagnosis): the queued per-block update (`sync`) runs every block except the dominant one serially inside its job, about 3.3 of 16 threads busy on an owner rank.
+- Change (`CondensedKKTSolver` queued sync): each job runs under `with_split_hint(measured_ways(cost, total/workers))`. The recorded cost becomes seconds × ways, so a split block keeps its ways. The residue products round once, so points are bitwise identical.
+- Result (mci67 → mci68, points identical in every pair):
+
+  | Case | A s | B s | change |
+  |---|---|---|---|
+  | 4 nodes owner 16×16, Λ35 60 it (225093) | 104.67 / 102.60 | 102.73 / 103.36 | −0.6% |
+  | 1 node plain, Λ35 60 it (225094, node62) | 142.8 / 143.0 | 142.4 / 142.4 | −0.35% |
+  | 1 node plain, Λ35-rs 30 it | 58.1 / 58.0 | 58.4 / 58.4 | +0.6% |
+
+- Decision: rejected (below 2%) and reverted. Patch kept at `~/.cache/sdpx-e2e/patches/l27-sync-ways.patch`.
+
+## 2026-10-12 — L26: one-wave leaf column chunks in the arrow panel solve (kept, perf-mc-impl)
+
+- Hypothesis (from the L6 diagnosis): `ArrowLDLSolver::solve_many` split every owned leaf into ⌈workers/leaves⌉ column chunks. On a 16-thread owner with 3 leaves that is 6 chunks each: 18 pieces on 16 workers, so a second wave. It also ignored leaf sizes.
+- Change (`arrow.rs`, `leaf_chunks` / `one_wave_chunks`):
+  - Each leaf gets one chunk. Each further chunk, up to the worker count, goes to the leaf whose piece `g·(g + coupled)/chunks` is largest.
+  - A chunk keeps at least four columns, as before.
+  - The forward and backward passes use the same per-leaf counts.
+  - Columns are independent, so only the timing changes. The unit test `one_wave_chunks_plan` covers the plan.
+- Result (mnab, 225091; Λ35 at 1024 bits, 60 iterations; owner 16×16 on 4 nodes node111/120/59/7):
+  - A mci66c: 103.24 and 103.34 s.
+  - B mci67: 100.41 and 100.90 s, i.e. −2.6%.
+  - Points are identical.
+- Decision: kept.
+
+## 2026-10-12 — L25: LPT-planned ways for arrow residue contributions (rejected, perf-mc-impl)
+
+- Hypothesis: the arrow factor's residue contribution products split each leaf ⌈workers/leaves⌉ ways. On Λ35 that is 36 leaves as 72 pieces on 64 workers, a second wave of 8. Ways from the LPT plan of each leaf's `g·q²` work should fill one wave.
+- Change: `planned_ways` over the leaf costs, passed through `with_split_hint` around each leaf's build. The products round once, so results are bitwise identical.
+- Result (abba, 225086, node62, 64 threads; A mci66 = with L25, B mci66c = without):
+
+  | Case | A s | B s | change |
+  |---|---|---|---|
+  | Λ35, 60 iterations | 144.4 / 144.9 | 143.5 / 143.8 | +0.7% |
+  | Λ35-rs, 30 iterations | 58.7 / 59.2 | 58.6 / 58.6 | +0.6% |
+
+  Points are identical. The A1 summary line is missing (phases.py crashed); its time comes from the run's own stderr.
+- Decision: rejected and reverted (patch kept at `~/.cache/sdpx-e2e/patches/contrib-planned-ways.patch`).
+
+## 2026-10-12 — L6: multi-node layouts after the queue fix (measurement, perf-mc-impl)
+
+- Setup: Λ35 (`inputs/L35-s70`) at 1024 bits, 60 iterations (`settings-t17-60it.json`), binary mci65 = f2232e9 (queue fix, built without the system-GMP feature). Owner layouts use `--partitions auto` (one owner per rank); `o` marks the ordinary MPI path. Times are native seconds (mn6/mn7 logs).
+
+  | Nodes | Layout: s | SDPB s |
+  |---|---|---|
+  | 1 | plain 172.8 (node110); owner 1×64 316.0, 4×16 212.1, 12×5 204.1 | 228 |
+  | 2 | owner 2×64 162.2, 4×32 137.2, 18×7 136.4 | 148 |
+  | 4 | owner 4×64 120.8, 8×32 110.3, 16×16 108.2 (rerun 108.0) | 126 |
+
+- Same node (node59, mn7): plain 151.2, owner 4×16 182.7, ordinary 4×16 232.7, ordinary 16×4 367.8. At 4 nodes the ordinary path takes 207.0 (4×64) and 201.3 s (16×16) against 108.0 s for owner 16×16. The owner path is the multi-node path.
+- Node variance: the same plain binary ran 151.2 (node59), 158.5 (node109) and 172.8 s (node110). Only same-node comparisons are valid.
+- Diagnosis of owner 16×16 at 4 nodes (per-rank receipts, observed):
+  - Rank 0's `kkt update` is 53.1 s at ~6 of 16 threads busy and `kkt solve` 18.4 s at ~5.7; `scale cones` uses 15. Every rank waits 14–21 s at collective entries.
+  - 36 components on 16 ranks: ranks 3, 4, 5 and 15 own 3, the others 2. On the 3-component ranks `owned.factor_response` takes 13.6–14.2 s against 9.1–9.5 s for 1.1× the CPU. The arrow panel solve (border 170 columns) cut each leaf into ⌈16/3⌉ = 6 column chunks, 18 pieces on 16 workers.
+  - The same ranks own the smaller cones, so they wait at the scale-cone agreement (site 480, 4–5.5 s) while the others wait at the factor agreement (site 102, ~4.9 s). The two phases summed are balanced within ~0.3 s, but the global shift needs every rank's assembled diagonal before any factor, so a barrier cannot be dropped there.
+  - The Gram sync runs serially per block except the dominant one (~3.3 of 16 threads).
+- Next: one-wave leaf chunks for the panel solve (L26) and split hints for the sync jobs (L27).
+
 ## 2026-10-12 — L24: refinement stops at the componentwise rounding floor (kept, perf-mc-impl)
 
 - Observed (f63 profile, full-floor traces of Λ35 and Λ27): late corrections keep running after every z row above tol has reached its own rounding floor, while the x rows already meet tol. The z rows cannot go lower, so the corrections only end when the stop ratio stalls. A simulation over the traces predicted −162 of 422 corrections on Λ27 and −170 of 1586 on Λ35.

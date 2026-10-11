@@ -294,6 +294,13 @@ impl<T: Scalar> Collective<T> for WorldCollective {
 
     fn reduce_sum_in_place(&self, site: usize, values: &mut [T]) -> Result<(), CollectiveError> {
         self.handshake(site, Operation::Sum, Some(values.len()), None)?;
+        if values.len() >= self.0.size() {
+            // Every rank folds one slice (same rank order, same sums).
+            self.0.ensure_collective_thread();
+            self.0
+                .reduce_sum_slice(self.0.collective_site(site), values);
+            return Ok(());
+        }
         let all = self.gather(site, values)?;
         Self::fold_sum(&all, values);
         Ok(())

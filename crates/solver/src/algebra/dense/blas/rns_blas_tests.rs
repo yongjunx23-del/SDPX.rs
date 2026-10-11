@@ -778,6 +778,58 @@ fn congruence_way_overhead() {
     bench::<12>(57);
 }
 
+/// Wall time of one split congruence on a pool of `ways` threads (speedup,
+/// not overhead): `SDPX_BENCH_THREADS` lists the thread counts.
+#[test]
+#[ignore]
+fn congruence_way_speedup() {
+    fn bench<const N: usize>(n: usize, threads: &[usize]) {
+        let full = |i: usize, j: usize| {
+            F::<N>::from_usize(i + 1).unwrap() / F::<N>::from_usize(j + 7).unwrap()
+                - F::<N>::from_f64(0.5).unwrap()
+        };
+        let a: Vec<F<N>> = (0..n * n).map(|t| full(t % n, t / n + 3)).collect();
+        let x: Vec<F<N>> = (0..n * n)
+            .map(|t| {
+                let (i, j) = (t % n, t / n);
+                full(i.min(j), i.max(j))
+            })
+            .collect();
+        let mut out = vec![F::<N>::zero(); n * n];
+        let mut base = 0.0;
+        for &ways in threads {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(ways).build().unwrap();
+            let reps = 20;
+            let secs = pool.install(|| {
+                with_split_hint(ways, || {
+                    assert!(congruence::<N>(b'N', n, n, &a, n, &x, n, true, None, &mut out, None));
+                    let t = std::time::Instant::now();
+                    for _ in 0..reps {
+                        congruence::<N>(b'N', n, n, &a, n, &x, n, true, None, &mut out, None);
+                    }
+                    t.elapsed().as_secs_f64() / reps as f64
+                })
+            });
+            if base == 0.0 {
+                base = secs;
+            }
+            println!(
+                "speedup bits {} n {n} threads {ways}: {:.2} ms (x{:.2})",
+                N * 64,
+                secs * 1e3,
+                base / secs
+            );
+        }
+    }
+    let threads: Vec<usize> = std::env::var("SDPX_BENCH_THREADS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|t| t.parse().ok()).collect())
+        .unwrap_or_else(|| vec![1, 2, 4]);
+    for n in [48, 63, 96] {
+        bench::<16>(n, &threads);
+    }
+}
+
 /// The output-tiled CRT reconstructs every output exactly as the streamed
 /// accumulator does: full and partial tiles, contiguous and upper selections.
 #[test]

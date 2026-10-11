@@ -220,7 +220,8 @@ execution plans. The journal preserves all failed evidence and final decisions.
 6. **Multi-node:**
    - (Border distribution closed: the border is 170 rows on Λ35, 2.1% at 4 nodes.)
    - Task 20 already batched refinement agreements; measure remaining collectives before changing them.
-   - The single-process multi-owner path (74.8 vs 44.2 s). That timing and the one-rank-per-node L6 layouts predate the 2026-10-12 queue fix. Owners sharing a pool skipped other owners' queue jobs, so rerun them before choosing an automatic layout.
+   - L6 rerun after the queue fix (journal 2026-10-12): owner layouts beat SDPB at 1, 2 and 4 nodes (Λ35/1024, 60 iterations: 4 nodes 16×16 108 s vs 126 s); the ordinary MPI path does not scale (201 s at 4 nodes). Owner ranks idle: 3-component ranks pay a second wave in the arrow panel solve (L26), Gram sync runs serially per block (L27), and scale-cone vs factor imbalance costs ~5 s at the shift barrier.
+   - Owner follow-ups (journal 2026-10-12): kept L26 one-wave leaf chunks (−2.6%) and L28 rank-order reduce-scatter (−2.8%); rejected L25 planned contribution ways, L27 sync split hints and L29 pooled copies (all under 2%). 4 nodes 16×16 is now 97 s. Per-rank collective waits are 12–21 s spread over ~25 sites; site 100 costs ≤0.8 s, so merging the shift barrier is not worth it. Residual/recover/prepare run at 6–7 of 16 threads on owner ranks.
    - Single-heavy-owner sampled splitting is closed: correct on both MPI gates, but neither improves end-to-end time.
    - Profile prime-group underfill and NUMA residue placement on large calls;
      split complete inner products over output tiles only if they dominate.

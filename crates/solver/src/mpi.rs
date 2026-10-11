@@ -148,6 +148,17 @@ struct Fns {
         c_int,
         MpiComm,
     ) -> c_int,
+    alltoallv: unsafe extern "C" fn(
+        *const c_void,
+        *const c_int,
+        *const c_int,
+        MpiDatatype,
+        *mut c_void,
+        *const c_int,
+        *const c_int,
+        MpiDatatype,
+        MpiComm,
+    ) -> c_int,
     allreduce: unsafe extern "C" fn(
         *const c_void,
         *mut c_void,
@@ -314,6 +325,7 @@ fn load() -> Option<Fns> {
                 comm_free: sym!(lib, "MPI_Comm_free"),
                 allgatherv: sym!(lib, "MPI_Allgatherv"),
                 gatherv: sym!(lib, "MPI_Gatherv"),
+                alltoallv: sym!(lib, "MPI_Alltoallv"),
                 allreduce: sym!(lib, "MPI_Allreduce"),
                 comm_world: handles[0],
                 byte: handles[1],
@@ -1361,6 +1373,192 @@ impl World {
             decode_ok && (rank != root || decoded.len() == out_len),
         );
         (rank == root).then_some(decoded)
+    }
+
+    /// Sum equal-length vectors in rank order, in place on every rank.
+    /// Rank r folds only its slice `ranges(len, size)[r]`: one all-to-all
+    /// brings it every rank's copy of that slice, which it adds in rank order
+    /// exactly as the all-gather fold does, and one all-gather returns the
+    /// folded slices. Each rank receives about 2·len values instead of
+    /// size·len and decodes and adds 1/size of the terms; the sums are
+    /// bitwise those of the all-gather fold.
+    pub(crate) fn reduce_sum_slice<T: Scalar>(&self, site: usize, values: &mut [T]) {
+        self.ensure_live();
+        if site >= NSITES {
+            self.abort("invalid MPI collective site");
+        }
+        let size = self.size as usize;
+        let rank = self.rank as usize;
+        let len = values.len();
+        let ranges = ranges(len, size);
+        let wire_size = T::wire_size();
+        let layout_hash = Self::layout_hash(&ranges, len);
+        let width = wire_size.unwrap_or(0);
+        let own_len = ranges.get(rank).map_or(0, |&(_, length)| length);
+        let mut valid = rank < size
+            && wire_size.is_some_and(|n| n > 0)
+            && T::wire_tag() != 0
+            && layout_hash.is_some();
+        // Every byte count and displacement is bounded by the full payload
+        // (len·width) or the received copies of this rank's slice
+        // (size·own_len·width).
+        let own_bytes = own_len.checked_mul(width).unwrap_or(usize::MAX);
+        let all_bytes = len.checked_mul(width).unwrap_or(usize::MAX);
+        let received_bytes = own_bytes.checked_mul(size).unwrap_or(usize::MAX);
+        if all_bytes > MPI_INT_MAX || received_bytes > MPI_INT_MAX {
+            valid = false;
+        }
+        let mut send_bytes = Vec::new();
+        let mut copies = Vec::new();
+        let mut folded_bytes = Vec::new();
+        if valid {
+            let (bytes, allocated) = Self::try_zeroed(all_bytes);
+            send_bytes = bytes;
+            valid &= allocated;
+        }
+        if valid {
+            let (bytes, allocated) = Self::try_zeroed(received_bytes);
+            copies = bytes;
+            valid &= allocated;
+        }
+        if valid {
+            let (bytes, allocated) = Self::try_zeroed(own_bytes);
+            folded_bytes = bytes;
+            valid &= allocated;
+        }
+        if valid {
+            for (index, value) in values.iter().copied().enumerate() {
+                let begin = index * width;
+                if !value.write_wire(&mut send_bytes[begin..begin + width]) {
+                    valid = false;
+                }
+            }
+        }
+        let mut metadata = [0u8; WIRE_META_BYTES];
+        Self::put_metadata_u64(
+            &mut metadata,
+            0,
+            if valid { WIRE_META_OK } else { WIRE_META_BAD },
+        );
+        Self::put_metadata_u64(
+            &mut metadata,
+            8,
+            wire_size.and_then(|n| u64::try_from(n).ok()).unwrap_or(0),
+        );
+        Self::put_metadata_u64(&mut metadata, 16, T::wire_tag());
+        Self::put_metadata_u64(&mut metadata, 24, u64::try_from(len).unwrap_or(0));
+        Self::put_metadata_u64(&mut metadata, 32, u64::try_from(size).unwrap_or(0));
+        Self::put_metadata_u64(&mut metadata, 40, layout_hash.unwrap_or(0));
+        Self::put_metadata_u64(&mut metadata, 48, u64::try_from(own_len).unwrap_or(0));
+        self.exchange_wire_metadata(site, &metadata);
+        if len == 0 {
+            return;
+        }
+        // The checked metadata proves all counts below fit in c_int.
+        let byte_ranges: Vec<(c_int, c_int)> = ranges
+            .iter()
+            .map(|&(offset, length)| ((offset * width) as c_int, (length * width) as c_int))
+            .collect();
+        let receive_ranges: Vec<(c_int, c_int)> = (0..size)
+            .map(|from| ((from * own_bytes) as c_int, own_bytes as c_int))
+            .collect();
+        self.alltoall_bytes(
+            site,
+            &send_bytes,
+            &byte_ranges,
+            &mut copies,
+            &receive_ranges,
+        );
+
+        let mut decode_ok = true;
+        'fold: for i in 0..own_len {
+            let mut sum = T::zero();
+            for from in 0..size {
+                let begin = from * own_bytes + i * width;
+                let Some(value) = T::read_wire(&copies[begin..begin + width]) else {
+                    decode_ok = false;
+                    break 'fold;
+                };
+                if from == 0 {
+                    sum = value;
+                } else {
+                    sum += value;
+                }
+            }
+            if !sum.write_wire(&mut folded_bytes[i * width..(i + 1) * width]) {
+                decode_ok = false;
+                break;
+            }
+        }
+        // A failed decode still enters the all-gather (with zero-filled
+        // bytes) so no rank leaves a peer inside it; the status exchange
+        // then aborts all ranks together.
+        let mut output_bytes = send_bytes;
+        self.gather_bytes(site, &folded_bytes, &byte_ranges, &mut output_bytes);
+        if decode_ok {
+            for (value, bytes) in values.iter_mut().zip(output_bytes.chunks_exact(width)) {
+                match T::read_wire(bytes) {
+                    Some(decoded) => *value = decoded,
+                    None => {
+                        decode_ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        self.exchange_status(site, decode_ok);
+    }
+
+    /// All-to-all of byte segments on the site's communicator: segment
+    /// `send_ranges[r]` of `send` goes to rank r, and rank r's segment lands
+    /// at `receive_ranges[r]` of `out`. Counts were checked by the caller.
+    fn alltoall_bytes(
+        &self,
+        site: usize,
+        send: &[u8],
+        send_ranges: &[(c_int, c_int)],
+        out: &mut [u8],
+        receive_ranges: &[(c_int, c_int)],
+    ) {
+        let send_counts: Vec<c_int> = send_ranges.iter().map(|&(_, length)| length).collect();
+        let send_displs: Vec<c_int> = send_ranges.iter().map(|&(offset, _)| offset).collect();
+        let receive_counts: Vec<c_int> = receive_ranges.iter().map(|&(_, length)| length).collect();
+        let receive_displs: Vec<c_int> = receive_ranges.iter().map(|&(offset, _)| offset).collect();
+        // OpenMPI reads address 1 (an empty Vec's pointer) as MPI_IN_PLACE.
+        let empty_send = 0u8;
+        let mut empty_receive = 0u8;
+        let send_buffer = if send.is_empty() {
+            &empty_send as *const u8
+        } else {
+            send.as_ptr()
+        };
+        let receive_buffer = if out.is_empty() {
+            &mut empty_receive as *mut u8
+        } else {
+            out.as_mut_ptr()
+        };
+        let t0 = std::time::Instant::now();
+        let rc = unsafe {
+            (self.fns.alltoallv)(
+                send_buffer.cast(),
+                send_counts.as_ptr(),
+                send_displs.as_ptr(),
+                self.fns.byte,
+                receive_buffer.cast(),
+                receive_counts.as_ptr(),
+                receive_displs.as_ptr(),
+                self.fns.byte,
+                self.comms[site],
+            )
+        };
+        let elapsed = t0.elapsed();
+        if crate::receipt::profile_requested() {
+            eprintln!("PHASE mpi.alltoall{site} {elapsed:?}");
+        }
+        crate::receipt::phase_record("mpi.alltoall", elapsed);
+        if rc != MPI_SUCCESS {
+            self.abort("MPI_Alltoallv failed");
+        }
     }
 
     /// Maximum of `v` over all ranks on the world communicator. Order-free

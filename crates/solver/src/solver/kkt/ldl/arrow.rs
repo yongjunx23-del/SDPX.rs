@@ -959,6 +959,40 @@ impl<T: FloatT> Leaf<T> {
 /// serial arithmetic) with no per-leaf barrier. Each term is the dot of a Y
 /// column with the rounded `z_j = y_j ⊙ dinv`, one exact accumulation.
 /// Columns run longest-first: later columns carry more pairs.
+/// Column chunks per leaf for a batched solve of `cols` columns on
+/// `workers`: one wave of pieces, each extra chunk going to the leaf whose
+/// piece (`g·(g + coupled)` work per column) is largest, at least four
+/// columns per chunk. The even `⌈workers/leaves⌉` left an owner's 3 leaves
+/// on 16 workers as 18 pieces, a second wave, and ignored leaf sizes.
+/// Columns are independent, so the chunks change timing only.
+fn leaf_chunks<T: FloatT>(leaves: &[Leaf<T>], workers: usize, cols: usize) -> Vec<usize> {
+    let work: Vec<f64> = leaves
+        .iter()
+        .map(|l| (l.ids.len() * (l.ids.len() + l.coupled.len())) as f64)
+        .collect();
+    one_wave_chunks(&work, workers, (cols / 4).max(1))
+}
+
+/// Chunks per item, at most `cap` each and `workers` in all (at least one
+/// each): every extra chunk goes to the item with the largest piece
+/// `work / chunks`, ties to the earlier item.
+fn one_wave_chunks(work: &[f64], workers: usize, cap: usize) -> Vec<usize> {
+    let mut chunks = vec![1; work.len()];
+    for _ in work.len()..workers {
+        let next = (0..work.len())
+            .filter(|&i| chunks[i] < cap)
+            .max_by(|&a, &b| {
+                let piece = |i: usize| work[i] / chunks[i] as f64;
+                piece(a).total_cmp(&piece(b)).then(b.cmp(&a))
+            });
+        let Some(i) = next else {
+            break;
+        };
+        chunks[i] += 1;
+    }
+    chunks
+}
+
 fn subtract_contributions<T: FloatT>(
     leaves: &[Leaf<T>],
     s: &mut [T],
@@ -2118,21 +2152,23 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
         }
         self.batch_tx.resize(t * cols, T::zero());
         let owned = self.owned_leaves();
-        // Spare threads (more than leaves) split each leaf's columns; keep
-        // at least four columns per chunk.
-        let chunks = self.pool.as_ref().map_or(1, |pool| {
-            pool.current_num_threads()
-                .div_ceil(owned.len().max(1))
-                .min(cols / 4)
-                .max(1)
-        });
+        // Spare threads (more than leaves) split leaves' columns.
+        let chunks = match &self.pool {
+            Some(pool) => leaf_chunks(
+                &self.leaves[owned.clone()],
+                pool.current_num_threads(),
+                cols,
+            ),
+            None => vec![1; owned.len()],
+        };
         let prof = crate::receipt::start();
         if let Some(pool) = &self.pool {
             let split = pool.current_num_threads() > 1;
             pool.install(|| {
                 self.leaves[owned.clone()]
                     .par_iter_mut()
-                    .for_each(|l| l.first_many(b, n, cols, chunks, split))
+                    .zip(&chunks)
+                    .for_each(|(l, &chunks)| l.first_many(b, n, cols, chunks, split))
             });
         } else {
             self.leaves[owned.clone()]
@@ -2245,7 +2281,7 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
             .pool
             .as_ref()
             .is_some_and(|p| p.current_num_threads() > 1);
-        let backward = |(i, leaf): (usize, &mut Leaf<T>)| match panels {
+        let backward = |(i, (leaf, &chunks)): (usize, (&mut Leaf<T>, &usize))| match panels {
             Some(panels) => leaf.second_many_bounds(tx, &panels.y, i, nl, cols, chunks, split),
             None => leaf.second_many(tx, cols, chunks, split),
         };
@@ -2254,12 +2290,14 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
             pool.install(|| {
                 self.leaves[owned.clone()]
                     .par_iter_mut()
+                    .zip(&chunks)
                     .enumerate()
                     .for_each(|(i, leaf)| backward((first + i, leaf)))
             });
         } else {
             self.leaves[owned.clone()]
                 .iter_mut()
+                .zip(&chunks)
                 .enumerate()
                 .for_each(|(i, leaf)| backward((first + i, leaf)));
         }
@@ -2456,6 +2494,18 @@ mod tests {
             pool.install(|| leaf.chunked(&mut pooled, cols, chunks, DenseLeaf::solve_many));
             assert_eq!(serial, pooled);
         }
+    }
+    /// One wave: 3 equal leaves on 16 workers take 16 chunks (not 18),
+    /// larger leaves take more, and the column cap and fewer workers than
+    /// leaves keep the old counts.
+    #[test]
+    fn one_wave_chunks_plan() {
+        assert_eq!(one_wave_chunks(&[1.0; 3], 16, 42), vec![6, 5, 5]);
+        assert_eq!(one_wave_chunks(&[1.0; 2], 16, 42), vec![8, 8]);
+        assert_eq!(one_wave_chunks(&[4.0, 1.0], 10, 42), vec![8, 2]);
+        assert_eq!(one_wave_chunks(&[1.0; 4], 3, 42), vec![1; 4]);
+        assert_eq!(one_wave_chunks(&[1.0], 64, 42), vec![42]);
+        assert_eq!(one_wave_chunks(&[1.0; 2], 16, 3), vec![3, 3]);
     }
     #[test]
     fn chunked_trunk_parity_f64() {
