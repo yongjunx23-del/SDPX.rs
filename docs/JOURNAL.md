@@ -8,6 +8,25 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-12 — Job queues of owner kernels sharing one pool skipped jobs (fix kept, perf-mc-impl)
+
+- Observed: the in-process partitioned solver (`--partitions auto`, and a 1-rank MPI run) fails when the threads exceed the owners on a rank.
+  - Local ising11 at 512 bits, 3 iterations: the run matches the ordinary solver at t ≤ 11 (11 owners).
+  - At t = 12, 16 and 64 it is nondeterministic. Iteration 0 is sometimes wrong (dcost +4.2155e-02 for +5.1220e-02), and the same binary ends NumericalError or MaxIterations on repeats.
+  - Λ35 1×64 also failed on the cluster (mci62). The ordinary solver is deterministic at every thread count.
+- Cause (verified by the fix): `run_queue` and the cone scaling queue (`ParallelCones::update_scaling`) mark a thread running a queue item with one thread-wide flag. An item that starts nested on such a thread returns at once, so a stolen item does not put a whole job on a split job's critical path.
+  - With threads > owners, every owner's cones and condensed kernel share the rank pool, so the queues of different owners run concurrently.
+  - A thread waiting in a join inside owner A's job can steal an item of owner B's queue. That item returned at once and took none of B's jobs; when every item of B started that way, B's jobs never ran. Those jobs are cone scalings and kernel syncs.
+  - The skipped scaling still reported success, so B kept a stale NT scaling.
+  - Introduced by the queues of 1c79b64 and 9d0e7fa (2026-10-09/11).
+- Fix: each flag holds the address of the queue whose item the thread runs. A nested item returns at once only for its own queue, whose outer item still drains it. Items of another queue run normally. The single-process, single-owner path takes the same branches as before.
+- Verification:
+  - Local, HEAD 5fee2f1 + fix (`queue-nested-fix.patch`): ising11 `--partitions auto` at t = 12, 16 and 64, three runs each. All nine iterate traces are bitwise identical to t = 8.
+  - New unit test `test_run_queue_nested_queue_runs_its_jobs`: a one-worker pool runs a queue inside another queue's job and must run all six inner jobs. The old flag ran none of them.
+  - Solver lib tests: 479 passed.
+- Consequence: owner-pool layouts measured before the fix are void, when threads exceed the owners on a rank. This covers the L6 layouts with one rank per node at 64 threads and the single-process multi-owner timing (74.8 vs 44.2 s); rerun them.
+- Tooling note: a local bisect over `git archive` trees in one shared target dir is invalid. Archive mtimes are commit times, older than the last build, so cargo reused stale objects. The arm scripts now extract with `tar -m`.
+
 ## 2026-10-11 — Exact combined shift and step bounds from the recovery pre-image kept (perf-mc-impl)
 
 - Setup: ABBA, 30 iterations per leg, 64 threads (bd62 on node106, bd63 on node104). Full solves f63a/f63b on node106/107 with mci62. Audits are aud63 (225022). Phases come from `SDPX_PROFILE=1` receipts.

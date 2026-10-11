@@ -219,7 +219,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
 6. **Multi-node:**
    - (Border distribution closed: the border is 170 rows on Λ35, 2.1% at 4 nodes.)
    - Task 20 already batched refinement agreements; measure remaining collectives before changing them.
-   - The single-process multi-owner path (74.8 vs 44.2 s).
+   - The single-process multi-owner path (74.8 vs 44.2 s). That timing and the one-rank-per-node L6 layouts predate the 2026-10-12 queue fix. Owners sharing a pool skipped other owners' queue jobs, so rerun them before choosing an automatic layout.
    - Single-heavy-owner sampled splitting is closed: correct on both MPI gates, but neither improves end-to-end time.
    - Profile prime-group underfill and NUMA residue placement on large calls;
      split complete inner products over output tiles only if they dominate.

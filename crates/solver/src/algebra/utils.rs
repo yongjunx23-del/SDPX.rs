@@ -144,8 +144,8 @@ fn test_sortperm_by() {
 }
 
 std::thread_local! {
-    /// Set while this thread runs a top-level item of [`run_queue`].
-    static QUEUE_ITEM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The [`run_queue`] whose item this thread runs (its address), or 0.
+    static QUEUE_ITEM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A queued job: estimated seconds, size (tie break) and the work.
@@ -154,24 +154,30 @@ pub(crate) type Job<'a> = (f64, usize, Box<dyn FnOnce() + Send + 'a>);
 /// Run `jobs` on the current pool as a queue: each of `workers` items takes
 /// the largest remaining job (estimated seconds, then size), so the longest
 /// jobs start first and the shortest fill the tail. An item started nested
-/// (stolen by a thread waiting inside a split job's inner join) returns at
-/// once instead of taking a whole job onto that job's critical path.
+/// in an item of the same queue (stolen by a thread waiting inside a split
+/// job's inner join) returns at once instead of taking a whole job onto
+/// that job's critical path; the outer item still drains the queue. Items
+/// of another queue (owner kernels sharing one pool) run normally, or that
+/// queue's jobs could be left unrun.
 pub(crate) fn run_queue(mut jobs: Vec<Job<'_>>, workers: usize) {
     use rayon::prelude::*;
     // Ascending, so `pop` takes the largest.
     jobs.sort_by(|p, q| p.0.total_cmp(&q.0).then(p.1.cmp(&q.1)));
     let jobs = std::sync::Mutex::new(jobs);
+    let queue = &jobs as *const _ as usize;
     (0..workers.max(1)).into_par_iter().for_each(|_| {
-        if QUEUE_ITEM.with(|c| c.replace(true)) {
+        let outer = QUEUE_ITEM.with(|c| c.get());
+        if outer == queue {
             return;
         }
-        struct Leave;
+        QUEUE_ITEM.with(|c| c.set(queue));
+        struct Leave(usize);
         impl Drop for Leave {
             fn drop(&mut self) {
-                QUEUE_ITEM.with(|c| c.set(false));
+                QUEUE_ITEM.with(|c| c.set(self.0));
             }
         }
-        let _leave = Leave;
+        let _leave = Leave(outer);
         loop {
             let Some((_, _, job)) = jobs.lock().unwrap().pop() else {
                 break;
@@ -179,4 +185,37 @@ pub(crate) fn run_queue(mut jobs: Vec<Job<'_>>, workers: usize) {
             job();
         }
     });
+}
+
+#[test]
+fn test_run_queue_nested_queue_runs_its_jobs() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // One worker: the outer item's thread also runs every inner item, as an
+    // owner kernel's queue does when started inside another owner's job.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let ran = AtomicUsize::new(0);
+    pool.install(|| {
+        let outer: Vec<Job<'_>> = (0..2)
+            .map(|i| {
+                let ran = &ran;
+                let job = move || {
+                    let inner: Vec<Job<'_>> = (0..3)
+                        .map(|j| {
+                            let job = move || {
+                                ran.fetch_add(1, Ordering::Relaxed);
+                            };
+                            (j as f64, j, Box::new(job) as Box<dyn FnOnce() + Send + '_>)
+                        })
+                        .collect();
+                    run_queue(inner, 4);
+                };
+                (i as f64, i, Box::new(job) as Box<dyn FnOnce() + Send + '_>)
+            })
+            .collect();
+        run_queue(outer, 4);
+    });
+    assert_eq!(ran.load(Ordering::Relaxed), 6);
 }

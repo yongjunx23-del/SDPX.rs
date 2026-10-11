@@ -116,22 +116,28 @@ impl ConeThreading {
         // A worker without a queued cone helps the running cones' posted
         // inner items (SVD rotation replay rows), largest post first: the
         // slowest cone otherwise sets the phase alone. A worker item that
-        // starts nested (stolen by a thread blocked in a cone's inner join)
-        // returns at once instead of starting another whole cone.
+        // starts nested in an item of this queue (stolen by a thread blocked
+        // in a cone's inner join) returns at once instead of starting
+        // another whole cone; the outer item still drains the queue. Owner
+        // cone sets share one pool, so an item of another owner's queue
+        // must run, or that owner's cones would keep a stale scaling.
+        let queue = &jobs as *const _ as usize;
         Some(self.pool.install(|| {
             (0..workers)
                 .into_par_iter()
                 .map(|_| {
-                    if SCALING_ITEM.with(|c| c.replace(true)) {
+                    let outer = SCALING_ITEM.with(|c| c.get());
+                    if outer == queue {
                         return true;
                     }
-                    struct Leave;
+                    SCALING_ITEM.with(|c| c.set(queue));
+                    struct Leave(usize);
                     impl Drop for Leave {
                         fn drop(&mut self) {
-                            SCALING_ITEM.with(|c| c.set(false));
+                            SCALING_ITEM.with(|c| c.set(self.0));
                         }
                     }
-                    let _leave = Leave;
+                    let _leave = Leave(outer);
                     let mut ok = true;
                     loop {
                         let Some((_, cone, rows, ways)) = jobs.lock().unwrap().pop() else {
@@ -411,8 +417,9 @@ fn psd_unit<T: FloatT>() -> u128 {
 }
 
 std::thread_local! {
-    /// Set while this thread runs a top-level scaling worker item.
-    static SCALING_ITEM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The scaling queue whose worker item this thread runs (its address),
+    /// or 0.
+    static SCALING_ITEM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Width per useful unit.
