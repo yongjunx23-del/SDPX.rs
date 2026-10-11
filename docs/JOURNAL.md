@@ -8,6 +8,32 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-11 — f50 confirmation; residue-major congruence and reciprocal pivots rejected (perf-mc-impl)
+
+- Full solves f50 (mci50 = 9d0e7fa defaults, 64 threads, node104, 224937). Audits 224945 accepted, residuals and objectives equal to f46's:
+
+  | Case | f46 s | f50 s | change |
+  |---|---|---|---|
+  | Λ35-rs/1024 (372 it) | 1027.0 | 899.9 | −12.4% |
+  | Λ27/768 (184 it) | 219.2 | 200.5 | −8.5% |
+  | Λ27-rs/768 (138 it) | 126.5 | 119.3 | −5.7% |
+  | Λ19-rs/768 (89 it) | 39.6 | 37.0 | −6.6% |
+
+  Λ35-rs against mci41 (1216 s): −26%.
+- f50 Λ35-rs wall split (s): KKT update 470 (factor 164, the 2-RHS solves and refinement ~270, sync 33), scale cones 158, combined KKT solve 135, step lengths 56, residual update 36, combined RHS 27. The condensed solve pipeline (prepare, solve, recover, residual: 1679 passes, 4.5 per iteration) is about 45% of wall.
+- Iteration anatomy of the same run: 0–168 first attempt (gap stalls near 1e-17 from about 140), restart at 169 (τ₀ 2.2e-103, dual kept); 169–290 deflate the primal scale 1e102 → 1 at about one decade per iteration; 290–345 land; 345–372 fixed τ.
+- L13, residue-major congruence (mci51): residues of A and X encoded once by one chunk gemm into i32 stores, per-prime products stored as i32, tiled CRT reads i32. Congruence kernel (cbench, node101, ms, mci50 → mci51):
+
+  | Load | n 48 | n 57 | n 96 | n 160 |
+  |---|---|---|---|---|
+  | 1 copy | 6.49 → 7.12 | 9.74 → 10.67 | 31.1 → 32.5 | 113.9 → 107.5 |
+  | 16 copies, one CCX each | 6.80 → 7.17 | 10.2 → 10.8 | 32.4 → 34.1 | 121.3 → 112.1 |
+  | 64 copies | 10.5 → 10.8 | 17.3 → 16.5 | 73.4 → 51.6 | 264.7 → 173.6 |
+
+  Halving the store pays only for n ≥ 96 under full load; at Λ35's n 48–63 it is +5–10% alone and ±5% loaded, while the congruence family is about 12% of CPU. Rejected; the patch is kept at `~/.cache/sdpx-e2e/patches/l13-residue-major-congruence.patch` for inputs with larger blocks.
+- Inverse iteration with reciprocal pivots (one 1024-bit reciprocal per LU row, multiplications in elimination and solves): 80 Λ35-rs bidiagonal dumps, invit 3.37 → 3.77 s (+12%). A reciprocal plus a multiplication costs more than the division at this width. Rejected.
+- Decision: f50 confirms the 9d0e7fa defaults. Next: a symbol-level profile of the current build (perf record, Λ35-rs 30 iterations) before choosing between the solve pipeline and the blocked cone-SVD back-transform.
+
 ## 2026-10-11 — Job queues, inverse-iteration/dqds cone SVD and tiled CRT (perf-mc-impl)
 
 - Setup: 64 threads, EPYC 7742. ABBA = 30 iterations per leg on Λ35-rs/1024 and Λ27-rs/768, one node per pair. Full solves and audits use `t17aud.pbs`.

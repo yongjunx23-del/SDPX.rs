@@ -127,7 +127,7 @@ Levers L1–L9 and wave balance (journal 2026-10-11, perf-mc-impl, 64 threads, �
   - full Newton step;
   - directed SVD sweep;
   - τ fall-rate chase detection.
-- Next: the solve pipeline (38% of wall); the SVD lever is done (below).
+- Next: the solve pipeline (about 45% of wall at f50); the SVD lever is done (below).
 
 L8, chase restart keeps the side that did not grow (journal 2026-10-11, perf-mc-impl, convergence contract): Λ35-rs/1024 423 → 372 it (1511 → 1195 s); the other Ising inputs are bitwise unchanged. Audit 224854 accepted.
 
@@ -139,12 +139,14 @@ Queues, cone SVD and tiled CRT (journal 2026-10-11, perf-mc-impl, now defaults).
 - dqds values with inverse-iteration vectors for the V-only cone SVD: −4.1% and −3.0%, audited;
 - an output-tiled CRT for the RNS gemm and congruences: −8.4% per iteration, bitwise.
 
-The f46 full solves (without the tiled CRT) are audited: Λ35-rs takes 372 iterations in 1027 s against 1216 s at mci41.
+The f50 full solves with all of them are audited: Λ35-rs takes 372 iterations in 900 s (1216 s at mci41, −26%); Λ27 −8.5%, Λ27-rs −5.7%, Λ19-rs −6.6% against f46.
+Rejected since: residue-major i32 congruence (gains only for n ≥ 96 under full load; patch kept in `~/.cache/sdpx-e2e/patches`), reciprocal pivots in inverse iteration (+12%).
 
 Next:
-- the congruence's per-prime products, now 73–76% of a congruence on EPYC;
-- blocked bidiagonalization and reflectors through the RNS gemm (the cone SVD is still 11% of CPU);
-- the solve pipeline's idle cores (prepare/recover run at 45–49 of 64 busy).
+- a symbol-level profile of the current build (Λ35-rs, 30 iterations) to rank the remaining kernels;
+- the solve pipeline, about 45% of Λ35-rs wall (4.5 passes per iteration; prepare/recover run at 50–52 of 64 busy);
+- blocked bidiagonalization and back-transform through the RNS gemm (the cone SVD is still 11% of CPU);
+- Λ35-rs iterations: 169 iterations before the chase restart and about 120 to deflate the restarted primal scale (L1 detection is shelved).
 
 Step-length stop (journal 2026-10-10, perf-mc-impl, convergence contract): only a zero step ends a solve; an unconverged end reports its best iterate; the exp/pow backtracking floor is eps^(1/4) in MPFR. Goldstone unitarity K4 case: InsufficientProgress/141 at gap 6.5e-6 → gap 4.5e-12 at 300; Float64 46/46 and csdr3 unchanged. Not merged.
 
