@@ -535,6 +535,237 @@ fn bidiagonal_svd<const N: usize>(
     }
     Err(1)
 }
+/// Reused buffers of [`inverse_vectors`] and the dqds/inverse-iteration SVD.
+#[derive(Default)]
+pub(super) struct InvitWork<const N: usize> {
+    off: Vec<F<N>>,
+    order: Vec<usize>,
+    xs: Vec<F<N>>,
+    dd: Vec<F<N>>,
+    du: Vec<F<N>>,
+    du2: Vec<F<N>>,
+    dl: Vec<F<N>>,
+    swap: Vec<bool>,
+}
+#[derive(Default)]
+struct SvdScratch<const N: usize> {
+    d0: Vec<F<N>>,
+    e0: Vec<F<N>>,
+    qd: Vec<F<N>>,
+    invit: InvitWork<N>,
+}
+
+/// Right singular vectors of the upper bidiagonal `(d, e)` (taken before the
+/// QR iteration) for the singular values `|s[p]|`, written to column `p` of
+/// `v` (`n`×`n`, column-major). They are the odd-position halves of the
+/// eigenvectors of the Golub–Kahan tridiagonal `T` of order `2n` (zero
+/// diagonal, off-diagonal `d1, e1, d2, …, dn`): `T x = σx` for
+/// `x = (v1, u1, v2, u2, …)/√2`. Inverse iteration follows LAPACK `dstein`:
+/// one pivoted LU of `T − σI` per value (tiny pivots raised to `eps·‖T‖`), a
+/// fixed pseudo-random start, Gram–Schmidt against the earlier vectors of
+/// the value's cluster (gaps up to `1e-3·‖T‖`), and one more solve after the
+/// growth test passes. Each vector costs O(n) work instead of replaying
+/// O(n²) rotations over n rows. Returns false, with `v` unspecified, when a
+/// value is zero or a vector does not converge, for the replay fallback.
+pub(super) fn inverse_vectors<const N: usize>(
+    d: &[F<N>],
+    e: &[F<N>],
+    s: &[F<N>],
+    n: usize,
+    v: &mut [F<N>],
+    ws: &mut InvitWork<N>,
+) -> bool {
+    const MAXITS: usize = 5;
+    const EXTRA: usize = 1;
+    let m = 2 * n;
+    if n < 2 || s.iter().any(|x| *x == F::zero() || !x.is_finite()) {
+        return false;
+    }
+    let InvitWork { off, order, xs, dd, du, du2, dl, swap } = ws;
+    off.clear();
+    for i in 0..n {
+        off.push(d[i]);
+        if i + 1 < n {
+            off.push(e[i]);
+        }
+    }
+    let mut tnorm = F::zero();
+    for k in 0..m {
+        let below = if k > 0 { off[k - 1].abs() } else { F::zero() };
+        let above = if k + 1 < m { off[k].abs() } else { F::zero() };
+        if below + above > tnorm {
+            tnorm = below + above;
+        }
+    }
+    if tnorm == F::zero() || !tnorm.is_finite() {
+        return false;
+    }
+    let eps = F::epsilon();
+    // A vector's error is about eps·‖T‖/gap, the QR replay's eps·σ/gap: keep
+    // the replay where that loses more than a quarter of the digits.
+    let floor = eps.sqrt().sqrt() * tnorm;
+    if s.iter().any(|x| x.abs() < floor) {
+        return false;
+    }
+    let ortol = tnorm / num::<N>(1000);
+    let tiny = eps * tnorm;
+    let crit = (<F<N> as num_traits::FromPrimitive>::from_f64(0.1).unwrap() / num::<N>(m)).sqrt();
+    order.clear();
+    order.extend(0..n);
+    order.sort_unstable_by(|&a, &b| {
+        s[a].abs().partial_cmp(&s[b].abs()).unwrap().then(a.cmp(&b))
+    });
+    xs.clear();
+    xs.resize(m * n, F::zero());
+    for buffer in [&mut *dd, &mut *du, &mut *du2, &mut *dl] {
+        buffer.clear();
+        buffer.resize(m, F::zero());
+    }
+    swap.clear();
+    swap.resize(m, false);
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    let (mut group, mut prev) = (0usize, F::zero());
+    for (j, &p) in order.iter().enumerate() {
+        let mut shift = s[p].abs();
+        if j > 0 {
+            if shift - prev > ortol {
+                group = j;
+            }
+            let pertol = eps * num::<N>(10) * shift;
+            if shift - prev < pertol {
+                shift = prev + pertol;
+            }
+        }
+        prev = shift;
+        // T − shift·I = P·L·U, U with two superdiagonals (LAPACK dgttrf).
+        dd.fill(-shift);
+        du2.fill(F::zero());
+        du[..m - 1].copy_from_slice(&off);
+        dl[..m - 1].copy_from_slice(&off);
+        for i in 0..m - 1 {
+            if dd[i].abs() >= dl[i].abs() {
+                swap[i] = false;
+                if dd[i] != F::zero() {
+                    let fact = dl[i] / dd[i];
+                    dl[i] = fact;
+                    dd[i + 1] -= fact * du[i];
+                }
+            } else {
+                swap[i] = true;
+                let fact = dd[i] / dl[i];
+                dd[i] = dl[i];
+                dl[i] = fact;
+                let temp = du[i];
+                du[i] = dd[i + 1];
+                dd[i + 1] = temp - fact * dd[i + 1];
+                if i + 2 < m {
+                    du2[i] = du[i + 1];
+                    du[i + 1] = -fact * du[i + 1];
+                }
+            }
+        }
+        for x in dd.iter_mut() {
+            if x.abs() < tiny {
+                *x = if *x < F::zero() { -tiny } else { tiny };
+            }
+        }
+        let last = dd[m - 1].abs();
+        let (done, rest) = xs.split_at_mut(j * m);
+        let x = &mut rest[..m];
+        for xi in x.iter_mut() {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let unit = (seed >> 11) as f64 / (1u64 << 53) as f64;
+            *xi = <F<N> as num_traits::FromPrimitive>::from_f64(2.0 * unit - 1.0).unwrap();
+        }
+        let mut passed = 0;
+        let mut converged = false;
+        for _ in 0..MAXITS {
+            let mut l1 = F::zero();
+            for xi in x.iter() {
+                l1 += xi.abs();
+            }
+            if l1 == F::zero() || !l1.is_finite() {
+                return false;
+            }
+            let grow = if last > eps { last } else { eps };
+            let scale = num::<N>(m) * tnorm * grow / l1;
+            for xi in x.iter_mut() {
+                *xi *= scale;
+            }
+            for i in 0..m - 1 {
+                if swap[i] {
+                    let temp = x[i];
+                    x[i] = x[i + 1];
+                    x[i + 1] = temp - dl[i] * x[i];
+                } else {
+                    x[i + 1] -= dl[i] * x[i];
+                }
+            }
+            x[m - 1] /= dd[m - 1];
+            x[m - 2] = (x[m - 2] - du[m - 2] * x[m - 1]) / dd[m - 2];
+            for i in (0..m - 2).rev() {
+                x[i] = (x[i] - du[i] * x[i + 1] - du2[i] * x[i + 2]) / dd[i];
+            }
+            for q in group..j {
+                let y = &done[q * m..(q + 1) * m];
+                let ndot = -F::dot_fma(x.iter().zip(y));
+                for (xi, &yi) in x.iter_mut().zip(y) {
+                    *xi = yi.mul_add(ndot, *xi);
+                }
+            }
+            let mut big = F::zero();
+            for xi in x.iter() {
+                if !xi.is_finite() {
+                    return false;
+                }
+                if xi.abs() > big {
+                    big = xi.abs();
+                }
+            }
+            if big < crit {
+                continue;
+            }
+            passed += 1;
+            if passed > EXTRA {
+                converged = true;
+                break;
+            }
+        }
+        if !converged {
+            return false;
+        }
+        let total = norm(x);
+        if total == F::zero() || !total.is_finite() {
+            return false;
+        }
+        let mut jmax = 0;
+        for (i, xi) in x.iter().enumerate() {
+            if xi.abs() > x[jmax].abs() {
+                jmax = i;
+            }
+        }
+        let inv = if x[jmax] < F::zero() { -total.recip() } else { total.recip() };
+        for xi in x.iter_mut() {
+            *xi *= inv;
+        }
+        let column = &mut v[p * n..(p + 1) * n];
+        for (i, c) in column.iter_mut().enumerate() {
+            *c = x[2 * i];
+        }
+        let half = norm(column);
+        if half == F::zero() || !half.is_finite() {
+            return false;
+        }
+        let inv = half.recip();
+        for c in column.iter_mut() {
+            *c *= inv;
+        }
+    }
+    true
+}
+
 // Packed Householder reconstruction, applied backwards as in SDPX's upstream
 // reflector routines. Initial identity columns also supply all null vectors.
 pub(super) fn apply_reflectors<const N: usize>(
@@ -714,6 +945,36 @@ pub(super) fn svd<'a, const N: usize>(
     }
     // The bidiagonal QR never reads U or V: log its rotations, then replay
     // them on U and V (see `replay_rotations`).
+    let invit = vr > 0 && n >= 2;
+    crate::algebra::scratch::with_scratch(|sc: &mut SvdScratch<N>| {
+    if invit {
+        sc.d0.clear();
+        sc.d0.extend_from_slice(d);
+        sc.e0.clear();
+        sc.e0.extend_from_slice(e);
+    }
+    // Without U, dqds values and inverse-iteration vectors need no
+    // rotations; any failure restores the bidiagonal for the QR below.
+    let mut solved = false;
+    if invit && uc == 0 {
+        let timer = crate::receipt::start();
+        let values = dqds_values(d, &sc.e0, n, &mut sc.qd).is_ok();
+        crate::receipt::finish("svd.dqds", timer);
+        if values {
+            let timer = crate::receipt::start();
+            solved = inverse_vectors(&sc.d0, &sc.e0, d, n, v, &mut sc.invit);
+            crate::receipt::finish("svd.invit", timer);
+        }
+        if solved {
+            e.fill(F::zero());
+        } else {
+            d.copy_from_slice(&sc.d0);
+            identity(v, n);
+        }
+    }
+    if solved {
+        return Ok(());
+    }
     crate::algebra::scratch::with_scratch(|log: &mut RotationLog<N>| {
         log.u.clear();
         log.v.clear();
@@ -722,15 +983,25 @@ pub(super) fn svd<'a, const N: usize>(
         let timer = crate::receipt::start();
         bidiagonal_svd(d, e, n, log)?;
         crate::receipt::finish("svd.qr", timer);
+        let mut replay_v = vr > 0;
+        if invit {
+            let timer = crate::receipt::start();
+            replay_v = !inverse_vectors(&sc.d0, &sc.e0, d, n, v, &mut sc.invit);
+            if replay_v {
+                identity(v, n);
+            }
+            crate::receipt::finish("svd.invit", timer);
+        }
         let timer = crate::receipt::start();
         // Output ordering runs after reflector reconstruction, so its buffers
         // can hold the row-major replay without another dense allocation.
         replay_rotations(&mut log.u, u, m, uc, sorted_u, scratch);
-        if vr > 0 {
+        if replay_v {
             replay_rotations(&mut log.v, v, n, n, vt, scratch);
         }
         crate::receipt::finish("svd.replay", timer);
         Ok::<(), i32>(())
+    })
     })?;
     let timer = crate::receipt::start();
     apply_reflectors(b, m, n, left, right, u, uc, v);
@@ -977,5 +1248,327 @@ impl<const N: usize> XgesddScalar for F<N> {
         } else if *info == -2 {
             *info = -1;
         }
+    }
+}
+
+#[cfg(test)]
+mod invit_tests {
+    use super::*;
+
+    fn lcg(seed: &mut u64) -> f64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*seed >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn f<const N: usize>(x: f64) -> F<N> {
+        <F<N> as num_traits::FromPrimitive>::from_f64(x).unwrap()
+    }
+
+    /// (orthogonality, BᵀB residual / σmax², 1 − |⟨v, v_replay⟩| max) of
+    /// inverse-iteration vectors, or None when they fall back.
+    fn check<const N: usize>(d: Vec<F<N>>, e: Vec<F<N>>) -> Option<(F<N>, F<N>, F<N>)> {
+        let n = d.len();
+        let (d0, e0) = (d.clone(), e.clone());
+        let (mut dq, mut eq) = (d, e);
+        let mut log = RotationLog::<N>::default();
+        log.keep_v = true;
+        bidiagonal_svd(&mut dq, &mut eq, n, &mut log).unwrap();
+        let mut vref = vec![F::zero(); n * n];
+        identity(&mut vref, n);
+        let (mut t, mut sc) = (vec![F::zero(); n * n], vec![F::zero(); 2 * n]);
+        replay_rotations(&mut log.v, &mut vref, n, n, &mut t, &mut sc);
+        let mut v = vec![F::zero(); n * n];
+        if !inverse_vectors(&d0, &e0, &dq, n, &mut v, &mut Default::default()) {
+            return None;
+        }
+        let mut orth = F::zero();
+        for a in 0..n {
+            for b in 0..n {
+                let dot = F::dot_fma(v[a * n..(a + 1) * n].iter().zip(&v[b * n..(b + 1) * n]));
+                let err = if a == b { (dot - F::one()).abs() } else { dot.abs() };
+                if err > orth {
+                    orth = err;
+                }
+            }
+        }
+        let smax = dq.iter().fold(F::zero(), |m, x| if x.abs() > m { x.abs() } else { m });
+        let (mut res, mut agree) = (F::zero(), F::zero());
+        for p in 0..n {
+            let c = &v[p * n..(p + 1) * n];
+            let w: Vec<F<N>> = (0..n)
+                .map(|i| d0[i] * c[i] + if i + 1 < n { e0[i] * c[i + 1] } else { F::zero() })
+                .collect();
+            for i in 0..n {
+                let z = d0[i] * w[i] + if i > 0 { e0[i - 1] * w[i - 1] } else { F::zero() };
+                let r = (z - dq[p] * dq[p] * c[i]).abs() / (smax * smax);
+                if r > res {
+                    res = r;
+                }
+            }
+            let dot = F::dot_fma(c.iter().zip(&vref[p * n..(p + 1) * n])).abs();
+            if (F::one() - dot).abs() > agree {
+                agree = (F::one() - dot).abs();
+            }
+        }
+        Some((orth, res, agree))
+    }
+
+    fn cases<const N: usize>() {
+        let eps = F::<N>::epsilon();
+        let tol = eps * f::<N>(1e4);
+        let mut seed = 7u64;
+        // Random: well separated values, vectors match the replay.
+        let n = 40;
+        let d: Vec<F<N>> = (0..n).map(|_| f(0.1 + 0.9 * lcg(&mut seed))).collect();
+        let e: Vec<F<N>> = (0..n - 1).map(|_| f(0.1 + 0.9 * lcg(&mut seed))).collect();
+        let (orth, res, agree) = check(d, e).unwrap();
+        assert!(orth <= tol && res <= tol, "random: {orth} {res}");
+        assert!(agree <= eps * f::<N>(1e8), "random agreement: {agree}");
+        // Clustered: values within 1e-30 of each other share one cluster.
+        let d: Vec<F<N>> = (0..30).map(|k| F::one() + f::<N>(1e-30) * f::<N>(k as f64)).collect();
+        let e: Vec<F<N>> = (0..29).map(|_| f(1e-20)).collect();
+        let (orth, res, _) = check(d, e).unwrap();
+        assert!(orth <= tol && res <= tol, "clustered: {orth} {res}");
+        // Exactly repeated values: two identical blocks split by e = 0.
+        let half: Vec<f64> = (0..10).map(|_| 0.2 + 0.8 * lcg(&mut seed)).collect();
+        let off: Vec<f64> = (0..9).map(|_| 0.2 + 0.8 * lcg(&mut seed)).collect();
+        let d: Vec<F<N>> = half.iter().chain(&half).map(|&x| f(x)).collect();
+        let mut e: Vec<F<N>> = off.iter().map(|&x| f(x)).collect();
+        e.push(F::zero());
+        e.extend(off.iter().map(|&x| f::<N>(x)));
+        let (orth, res, _) = check(d, e).unwrap();
+        assert!(orth <= tol && res <= tol, "repeated: {orth} {res}");
+        // Mild grading stays on inverse iteration; extreme grading falls back.
+        let d: Vec<F<N>> = (0..20).map(|k| f(0.5f64.powi(k))).collect();
+        let e: Vec<F<N>> = (0..19).map(|k| f(0.5f64.powi(k + 1))).collect();
+        let (orth, res, _) = check(d, e).unwrap();
+        assert!(orth <= tol * f::<N>(1e6) && res <= tol, "graded: {orth} {res}");
+        let d: Vec<F<N>> = (0..20).map(|k| f(1e-30f64.powi(k))).collect();
+        let e: Vec<F<N>> = (0..19).map(|k| f(1e-30f64.powi(k + 1))).collect();
+        assert!(check(d, e).is_none(), "extreme grading must fall back");
+    }
+
+    /// Timing probe: `cargo test --release ... invit_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn invit_timing() {
+        let mut seed = 11u64;
+        for n in [16usize, 32, 60] {
+            let d: Vec<F<16>> = (0..n).map(|_| f(0.1 + 0.9 * lcg(&mut seed))).collect();
+            let e: Vec<F<16>> = (0..n - 1).map(|_| f(0.1 + 0.9 * lcg(&mut seed))).collect();
+            let (mut dq, mut eq) = (d.clone(), e.clone());
+            let mut log = RotationLog::<16>::default();
+            log.keep_v = true;
+            let t0 = std::time::Instant::now();
+            bidiagonal_svd(&mut dq, &mut eq, n, &mut log).unwrap();
+            let qr = t0.elapsed();
+            let rotations = log.v.len();
+            let mut vref = vec![F::zero(); n * n];
+            identity(&mut vref, n);
+            let (mut t, mut sc) = (vec![F::zero(); n * n], vec![F::zero(); 2 * n]);
+            let t0 = std::time::Instant::now();
+            replay_rotations(&mut log.v, &mut vref, n, n, &mut t, &mut sc);
+            let replay = t0.elapsed();
+            let mut v = vec![F::zero(); n * n];
+            let t0 = std::time::Instant::now();
+            assert!(inverse_vectors(&d, &e, &dq, n, &mut v, &mut Default::default()));
+            let invit = t0.elapsed();
+            eprintln!("n {n} rotations {rotations} qr {qr:?} replay {replay:?} invit {invit:?}");
+        }
+    }
+
+    fn read_dump<const N: usize>(path: &std::path::Path) -> (Vec<F<N>>, Vec<F<N>>) {
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut lines = text.lines();
+        let mut head = lines.next().unwrap().split_whitespace();
+        let n: usize = head.next().unwrap().parse().unwrap();
+        assert_eq!(head.next().unwrap().parse::<usize>().unwrap(), N);
+        let values: Vec<F<N>> = lines
+            .map(|line| {
+                let mut f = line.split_whitespace();
+                let kind = f.next().unwrap().parse().unwrap();
+                let exponent = f.next().unwrap().parse().unwrap();
+                let mut limbs = [0u64; N];
+                for l in &mut limbs {
+                    *l = u64::from_str_radix(f.next().unwrap(), 16).unwrap();
+                }
+                F::<N>::exact_decode(kind, exponent, limbs)
+            })
+            .collect();
+        (values[..n].to_vec(), values[n..2 * n - 1].to_vec())
+    }
+
+    /// Dumped IPM bidiagonals (`SDPX_INVIT_DUMPS=<dir>` of 1024-bit
+    /// `bidiag-*.txt`): QR, replay and inverse-iteration times, fallbacks,
+    /// and the worst orthogonality, residual and replay agreement.
+    #[test]
+    #[ignore]
+    fn invit_dumps() {
+        let Some(dir) = std::env::var_os("SDPX_INVIT_DUMPS") else { return };
+        let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        paths.sort();
+        let (mut tq, mut tr, mut ti) = (0.0, 0.0, 0.0);
+        let (mut fallbacks, mut worst) = (0, (F::<16>::zero(), F::<16>::zero(), F::<16>::zero()));
+        for path in &paths {
+            let (d, e) = read_dump::<16>(path);
+            let n = d.len();
+            let (mut dq, mut eq) = (d.clone(), e.clone());
+            let mut log = RotationLog::<16>::default();
+            log.keep_v = true;
+            let t0 = std::time::Instant::now();
+            bidiagonal_svd(&mut dq, &mut eq, n, &mut log).unwrap();
+            tq += t0.elapsed().as_secs_f64();
+            let mut vref = vec![F::zero(); n * n];
+            identity(&mut vref, n);
+            let (mut t, mut sc) = (vec![F::zero(); n * n], vec![F::zero(); 2 * n]);
+            let t0 = std::time::Instant::now();
+            replay_rotations(&mut log.v, &mut vref, n, n, &mut t, &mut sc);
+            tr += t0.elapsed().as_secs_f64();
+            let mut v = vec![F::zero(); n * n];
+            let t0 = std::time::Instant::now();
+            let ok = inverse_vectors(&d, &e, &dq, n, &mut v, &mut Default::default());
+            ti += t0.elapsed().as_secs_f64();
+            if !ok {
+                fallbacks += 1;
+                continue;
+            }
+            let (o, r, a) = check(d, e).unwrap();
+            if o > worst.0 { worst.0 = o; }
+            if r > worst.1 { worst.1 = r; }
+            if a > worst.2 { worst.2 = a; }
+        }
+        eprintln!(
+            "{} dumps qr {tq:.3}s replay {tr:.3}s invit {ti:.3}s fallbacks {fallbacks} orth {:.2e} res {:.2e} agree {:.2e}",
+            paths.len(),
+            worst.0.to_f64().unwrap(),
+            worst.1.to_f64().unwrap(),
+            worst.2.to_f64().unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn op_costs() {
+        let mut seed = 3u64;
+        let xs: Vec<F<16>> = (0..4096).map(|_| f(0.5 + lcg(&mut seed))).collect();
+        let reps = 50;
+        macro_rules! time {
+            ($name:expr, $body:expr) => {{
+                let t0 = std::time::Instant::now();
+                let mut acc = F::<16>::zero();
+                for _ in 0..reps {
+                    for i in 0..xs.len() - 1 {
+                        let (a, b) = (xs[i], xs[i + 1]);
+                        acc += $body(a, b);
+                    }
+                }
+                let ns = t0.elapsed().as_nanos() as f64 / (reps * (xs.len() - 1)) as f64;
+                eprintln!("{:8} {ns:7.1} ns {}", $name, acc.to_f64().unwrap() > 0.0);
+            }};
+        }
+        time!("add", |a: F<16>, b: F<16>| a + b);
+        time!("mul", |a: F<16>, b: F<16>| a * b);
+        time!("div", |a: F<16>, b: F<16>| a / b);
+        time!("sqrt", |a: F<16>, _b: F<16>| a.sqrt());
+        time!("hypot", |a: F<16>, b: F<16>| a.hypot(b));
+        time!("fma", |a: F<16>, b: F<16>| a.mul_add(b, a));
+        time!("recip", |a: F<16>, _b: F<16>| a.recip());
+    }
+
+    /// Largest relative difference between dqds and QR singular values.
+    fn dqds_vs_qr<const N: usize>(d: &[F<N>], e: &[F<N>]) -> F<N> {
+        let n = d.len();
+        let (mut dq, mut eq) = (d.to_vec(), e.to_vec());
+        bidiagonal_svd(&mut dq, &mut eq, n, &mut RotationLog::<N>::default()).unwrap();
+        let mut qr: Vec<F<N>> = dq.iter().map(|x| x.abs()).collect();
+        qr.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        let mut dd = d.to_vec();
+        dqds_values(&mut dd, e, n, &mut Vec::new()).unwrap();
+        let mut worst = F::zero();
+        for (a, b) in dd.iter().zip(&qr) {
+            let r = (*a - *b).abs() / b.abs();
+            if r > worst {
+                worst = r;
+            }
+        }
+        worst
+    }
+
+    fn dqds_cases<const N: usize>() {
+        let eps = F::<N>::epsilon();
+        let mut seed = 5u64;
+        for n in [3usize, 4, 5, 9, 40] {
+            let d: Vec<F<N>> = (0..n).map(|_| f(0.1 + 0.9 * lcg(&mut seed))).collect();
+            let e: Vec<F<N>> = (0..n - 1).map(|_| f(0.1 + 0.9 * lcg(&mut seed))).collect();
+            let r = dqds_vs_qr(&d, &e);
+            assert!(r <= eps * f::<N>(1e3), "random n {n}: {r}");
+        }
+        // Graded: relative accuracy for tiny singular values.
+        let d: Vec<F<N>> = (0..20).map(|k| f(1e-15f64.powi(k))).collect();
+        let e: Vec<F<N>> = (0..19).map(|k| f(1e-15f64.powi(k + 1))).collect();
+        let r = dqds_vs_qr(&d, &e);
+        assert!(r <= eps * f::<N>(1e4), "graded: {r}");
+        // Splits, a zero diagonal and a 2×2.
+        let mut d: Vec<F<N>> = (0..12).map(|_| f(0.2 + lcg(&mut seed))).collect();
+        let mut e: Vec<F<N>> = (0..11).map(|_| f(0.2 + lcg(&mut seed))).collect();
+        e[4] = F::zero();
+        let r = dqds_vs_qr(&d, &e);
+        assert!(r <= eps * f::<N>(1e3), "split: {r}");
+        d[7] = F::zero();
+        let mut dd = d.clone();
+        dqds_values(&mut dd, &e, 12, &mut Vec::new()).unwrap();
+        assert!(dd[11] == F::zero() || dd[11] <= eps, "zero diagonal: {}", dd[11]);
+        let r = dqds_vs_qr(&[f::<N>(3.0), f(0.5)], &[f::<N>(2.0)]);
+        assert!(r <= eps * f::<N>(10.0), "2x2: {r}");
+    }
+
+    #[test]
+    fn dqds_values_512() {
+        dqds_cases::<8>();
+    }
+
+    #[test]
+    fn dqds_values_1024() {
+        dqds_cases::<16>();
+    }
+
+    /// `SDPX_INVIT_DUMPS=<dir>`: dqds against QR on dumped bidiagonals.
+    #[test]
+    #[ignore]
+    fn dqds_dumps() {
+        let Some(dir) = std::env::var_os("SDPX_INVIT_DUMPS") else { return };
+        let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        paths.sort();
+        let (mut tq, mut tdq, mut worst) = (0.0, 0.0, F::<16>::zero());
+        for path in &paths {
+            let (d, e) = read_dump::<16>(path);
+            let n = d.len();
+            let (mut dq, mut eq) = (d.clone(), e.clone());
+            let t0 = std::time::Instant::now();
+            bidiagonal_svd(&mut dq, &mut eq, n, &mut RotationLog::<16>::default()).unwrap();
+            tq += t0.elapsed().as_secs_f64();
+            let mut dd = d.clone();
+            let t0 = std::time::Instant::now();
+            dqds_values(&mut dd, &e, n, &mut Vec::new()).unwrap();
+            tdq += t0.elapsed().as_secs_f64();
+            let r = dqds_vs_qr(&d, &e);
+            if r > worst {
+                worst = r;
+            }
+        }
+        eprintln!(
+            "{} dumps qr {tq:.3}s dqds {tdq:.3}s worst relative {:.2e}",
+            paths.len(),
+            worst.to_f64().unwrap()
+        );
+    }
+
+    #[test]
+    fn inverse_vectors_512() {
+        cases::<8>();
+    }
+
+    #[test]
+    fn inverse_vectors_1024() {
+        cases::<16>();
     }
 }

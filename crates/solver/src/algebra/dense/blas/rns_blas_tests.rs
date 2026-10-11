@@ -777,3 +777,151 @@ fn congruence_way_overhead() {
     bench::<8>(57);
     bench::<12>(57);
 }
+
+/// The output-tiled CRT reconstructs every output exactly as the streamed
+/// accumulator does: full and partial tiles, contiguous and upper selections.
+#[test]
+fn crt_tiled_matches_streamed() {
+    let mut rng = Lcg(0x5eed);
+    for (k, needed, m, upper) in [(57, 3300.0, 57, true), (8, 700.0, 13, false), (300, 5200.0, 9, true)] {
+        let plan = Plan::new(k, needed).unwrap();
+        let (count, outputs) = (plan.count(), m * m);
+        let prod: Vec<f64> = (0..count * outputs)
+            .map(|t| {
+                let p = plan.primes[t / outputs];
+                symmetric((rng.next() * p as f64) as u64 % p, p)
+            })
+            .collect();
+        let selected = selection(m, m, upper);
+        let n = if upper { selected.len() } else { outputs };
+        let mut streamed = vec![F::<16>::zero(); outputs];
+        let mut acc = CrtAccumulator::new(&plan, n, &selected);
+        for q0 in (0..count).step_by(STREAM_GROUP) {
+            let q1 = (q0 + STREAM_GROUP).min(count);
+            let mut group = prod[q0 * outputs..q1 * outputs].to_vec();
+            acc.add(&plan, q0, q1, &mut group, outputs, &Split::Serial);
+        }
+        assert!(acc.finish(&plan, -37, &mut streamed, &Split::Serial));
+        let mut tiled = vec![F::<16>::zero(); outputs];
+        let total = if upper { selected.len() } else { outputs };
+        let cells: Vec<std::sync::Mutex<F<16>>> = (0..outputs).map(|_| Default::default()).collect();
+        let write = |i: usize, v: F<16>| {
+            *cells[if upper { selected[i] } else { i }].lock().unwrap() = v;
+        };
+        assert!(crt_tiled(&plan, &prod, outputs, &selected, 0..total, -37, &write));
+        for (dst, cell) in tiled.iter_mut().zip(cells) {
+            *dst = cell.into_inner().unwrap();
+        }
+        assert!(streamed.iter().zip(&tiled).all(|(a, b)| a.exact_encode() == b.exact_encode()));
+        assert!(tiled.iter().any(|v| !v.is_zero()));
+    }
+}
+
+/// Cost split of one tiled CRT: residue products, digit `dgemm` and
+/// pack/round, for a congruence-sized output set.
+/// `cargo test --release … crt_tiled_timing -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn crt_tiled_timing() {
+    let mut rng = Lcg(7);
+    for (k, needed, m) in [(57usize, 3100.0, 57usize), (96, 3120.0, 96)] {
+        let plan = Plan::new(k, needed).unwrap();
+        let (count, outputs) = (plan.count(), m * m);
+        let prod: Vec<f64> = (0..count * outputs)
+            .map(|t| {
+                let p = plan.primes[t / outputs];
+                symmetric((rng.next() * p as f64) as u64 % p, p)
+            })
+            .collect();
+        let selected = selection(m, m, true);
+        let crt = crt_constants(&plan);
+        let reps = 20;
+        let sink = std::sync::Mutex::new(0usize);
+        let write = |_: usize, v: F<16>| {
+            if v.is_zero() {
+                *sink.lock().unwrap() += 1;
+            }
+        };
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            assert!(crt_tiled(&plan, &prod, outputs, &selected, 0..selected.len(), 0, &write));
+        }
+        let total = t.elapsed().as_secs_f64() / reps as f64;
+        // The digit dgemm alone, at the same tile shape.
+        let (kp, rows, chunks) = (count, count + 1, crt.chunks);
+        let local = vec![1.0f64; CRT_TILE * rows];
+        let mut y = vec![0.0f64; CRT_TILE * chunks];
+        let (t_, table) = (CRT_TILE, &crt.table);
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            for _ in (0..selected.len()).step_by(CRT_TILE) {
+                int_gemm(b'T', b'T', chunks, t_, rows, table, rows, &local, t_, &mut y, chunks);
+            }
+        }
+        let dgemm = t.elapsed().as_secs_f64() / reps as f64;
+        // The residue gather and scaling alone, same tiles.
+        let mut local = vec![0.0f64; CRT_TILE * kp];
+        let mut frac = vec![0.0f64; CRT_TILE];
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            for t0 in (0..selected.len()).step_by(CRT_TILE) {
+                let tt = (selected.len() - t0).min(CRT_TILE);
+                frac[..tt].fill(0.0);
+                for q in 0..kp {
+                    let (p, pinv, u) = (plan.p[q], plan.pinv[q], crt.u[q]);
+                    let row = &prod[q * outputs..(q + 1) * outputs];
+                    let dst = &mut local[q * tt..(q + 1) * tt];
+                    for (d, &r) in dst.iter_mut().zip(&selected[t0..t0 + tt]) {
+                        *d = row[r];
+                    }
+                    for (d, f) in dst.iter_mut().zip(&mut frac[..tt]) {
+                        let v = residue_product(*d, u, p, pinv);
+                        *d = v;
+                        *f += v * pinv;
+                    }
+                }
+            }
+        }
+        let residues = t.elapsed().as_secs_f64() / reps as f64;
+        println!("  residues {:.2} ms ({} sink)", residues * 1e3, frac[0] + local[7]);
+        // pack and rounding alone, on realistic digit sums.
+        let mut digits: Vec<Vec<f64>> = Vec::new();
+        for i in 0..selected.len().min(256) {
+            let mut acc = vec![0.0f64; chunks];
+            for (q, &r) in prod.iter().skip(selected[i]).step_by(outputs).enumerate() {
+                let v = residue_product(r, crt.u[q], plan.p[q], plan.pinv[q]);
+                for (l, a) in acc.iter_mut().enumerate() {
+                    *a += v * crt.table[q + l * rows];
+                }
+            }
+            digits.push(acc);
+        }
+        let mut mag = Vec::new();
+        let (mut packs, mut rounds) = (0.0, 0.0);
+        let mut nonzero = 0usize;
+        for _ in 0..reps {
+            for d in &digits {
+                let t = std::time::Instant::now();
+                let neg = pack(d.iter().copied(), crt.width, chunks, &mut mag).unwrap();
+                packs += t.elapsed().as_secs_f64();
+                let t = std::time::Instant::now();
+                let v = F::<16>::from_scaled_integer(neg, &mag, 0);
+                rounds += t.elapsed().as_secs_f64();
+                nonzero += (!v.is_zero()) as usize;
+            }
+        }
+        let per = (reps * digits.len()) as f64;
+        println!(
+            "  per output: pack {:.0} ns, round {:.0} ns ({} limbs, {nonzero} nonzero)",
+            packs / per * 1e9,
+            rounds / per * 1e9,
+            mag.len()
+        );
+        println!(
+            "m {m} primes {count} chunks {chunks} outputs {}: crt {:.2} ms, digit dgemm {:.2} ms",
+            selected.len(),
+            total * 1e3,
+            dgemm * 1e3
+        );
+    }
+}

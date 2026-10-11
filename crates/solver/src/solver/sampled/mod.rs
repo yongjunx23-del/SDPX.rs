@@ -939,14 +939,97 @@ impl<T: FloatT> SampledOperator<T> {
             }
             return;
         }
-        // Descriptor order is authoritative even for unsorted rows and shared
-        // variable ranges. Assigning terms avoids an extra rounded addition.
+        self.add_block_adjoints(y, work);
+    }
+
+    /// Add the blocks' adjoint terms to `y` in descriptor order, which is
+    /// authoritative even for unsorted rows and shared variable ranges.
+    pub(crate) fn add_block_adjoints(&self, y: &mut [T], work: &SampledWorkspace<T>) {
         for (b, w) in self.blocks.iter().zip(&work.blocks) {
             if b.basis_cols == 0 {
                 continue;
             }
             for (i, term) in w.adjoint.iter().enumerate() {
                 y[b.column_start + i] += *term;
+            }
+        }
+    }
+
+    /// The sampled halves of a pooled residual's two products as one job per
+    /// block, for the caller's queue: job `i` evaluates block `i`'s adjoint
+    /// terms of `adjoint_alpha·Aᵀz` (added to `y` afterwards by
+    /// [`Self::add_block_adjoints`]), adds its terms of `forward_alpha·Ax` to
+    /// its own rows of `ez` and, with `abs`, evaluates its absolute adjoint
+    /// terms `|A|ᵀ|z|` (added by [`Self::add_block_adjoint_abs`]). Each
+    /// block's arithmetic is that of `adjoint_blocks_with_pool`,
+    /// `forward_blocks_with_pool` and `add_adjoint_abs`; jobs carry their last
+    /// measured seconds and row count for ordering. `None` where those take
+    /// another path (MPI, unordered rows, serial pool).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn block_product_jobs<'a>(
+        &'a self,
+        ez: &'a mut [T],
+        x: &'a [T],
+        z: &'a [T],
+        adjoint_alpha: T,
+        forward_alpha: T,
+        abs: bool,
+        work: &'a mut SampledWorkspace<T>,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) -> Option<Vec<crate::algebra::Job<'a>>> {
+        if !self.ordered_rows
+            || adjoint_alpha == T::zero()
+            || forward_alpha == T::zero()
+            || !self.pooled_halves_apply(work, pool)
+        {
+            return None;
+        }
+        let chunks = block_chunks(&self.blocks, pool);
+        assign_block_ways(&mut work.blocks, 1, pool?.current_num_threads());
+        let mut jobs = Vec::with_capacity(self.blocks.len());
+        let mut rest = ez;
+        let mut at = 0;
+        for (b, w) in self.blocks.iter().zip(work.blocks.iter_mut()) {
+            if b.basis_cols == 0 {
+                continue;
+            }
+            let tail = std::mem::take(&mut rest).split_at_mut(b.row_start - at).1;
+            let (rows, tail) = tail.split_at_mut(b.row_count());
+            rest = tail;
+            at = b.row_start + b.row_count();
+            let (seconds, len) = (w.residual_cost, rows.len());
+            let job = move || {
+                let start = std::time::Instant::now();
+                let ways = w.ways[1];
+                with_split_hint(ways, || {
+                    adjoint_leaf(b, w, block_rows(b, z), adjoint_alpha, chunks)
+                });
+                // Work, not wall time, so a split block keeps its ways.
+                w.cost[1] = start.elapsed().as_secs_f64() * ways as f64;
+                forward_leaf(b, w, rows, x, forward_alpha, chunks);
+                if abs {
+                    w.adjoint_abs.resize(b.column_count(), T::zero());
+                    w.adjoint_abs.fill(T::zero());
+                    w.adjoint_abs_terms(b, z);
+                }
+                w.residual_cost = start.elapsed().as_secs_f64();
+            };
+            jobs.push((seconds, len, Box::new(job) as Box<dyn FnOnce() + Send + 'a>));
+        }
+        Some(jobs)
+    }
+
+    /// Add the absolute adjoint terms that [`Self::block_product_jobs`]
+    /// evaluated (`abs`) to `out` in descriptor order, as `add_adjoint_abs`
+    /// does. Blocks without basis columns contribute only zeros to the
+    /// nonnegative sums, so skipping them leaves every value unchanged.
+    pub(crate) fn add_block_adjoint_abs(&self, out: &mut [T], work: &SampledWorkspace<T>) {
+        for (b, w) in self.blocks.iter().zip(&work.blocks) {
+            if b.basis_cols == 0 {
+                continue;
+            }
+            for (i, &term) in w.adjoint_abs.iter().enumerate() {
+                out[b.column_start + i] += term;
             }
         }
     }
@@ -1063,6 +1146,9 @@ struct SampledBlockWorkspace<T> {
     /// (measured load balancing, see `assign_block_ways`).
     cost: [f64; 2],
     ways: [usize; 2],
+    /// Last measured seconds of this block's residual job (adjoint then
+    /// forward, [`SampledOperator::block_product_jobs`]).
+    residual_cost: f64,
     // Lazy contribution storage: validated disjoint row ranges bound all
     // forward slices by m; adjoint slices total the primitive column counts.
     forward: Vec<T>,
@@ -1521,6 +1607,7 @@ impl<T: FloatT> SampledWorkspace<T> {
                         q_fwd_cache: None,
                         q_adj_cache: None,
                         cost: [0.0; 2],
+                        residual_cost: 0.0,
                         ways: [1; 2],
                     }
                 })

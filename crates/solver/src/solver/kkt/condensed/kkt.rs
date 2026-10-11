@@ -852,36 +852,31 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             })
             .unwrap_or(0..self.blocks.len());
         let owned = |i: usize| owned_range.contains(&i);
-        let valid = if inner_sampled.is_some() {
-            if let Some(pool) = &self.pool {
-                // Block-level parallelism is safe here: only the dominant
-                // block consumes inner pool lanes, the others update
-                // serially inside their own outer task.
-                pool.install(|| {
-                    self.blocks
-                        .par_iter_mut()
-                        .zip(cones.iter().as_slice().par_iter())
-                        .enumerate()
-                        .map(|(i, (b, c))| sync((b, c, owned(i))))
-                        .reduce(|| true, |a, b| a & b)
+        let valid = if let Some(pool) = &self.pool {
+            // Queued: the longest updates (last measured) start first. Only
+            // the dominant block (`inner_sampled`) uses inner pool lanes; the
+            // others update serially inside their own job.
+            let mut ok = vec![true; self.blocks.len()];
+            let workers = pool.current_num_threads();
+            let jobs = self
+                .blocks
+                .iter_mut()
+                .zip(cones.iter())
+                .zip(ok.iter_mut())
+                .enumerate()
+                .map(|(i, ((b, c), ok))| {
+                    let (seconds, len) = (b.sync_cost, b.rows.len());
+                    let (sync, owned) = (&sync, &owned);
+                    let job = move || {
+                        let start = std::time::Instant::now();
+                        *ok = sync((&mut *b, c, owned(i)));
+                        b.sync_cost = start.elapsed().as_secs_f64();
+                    };
+                    (seconds, len, Box::new(job) as Box<dyn FnOnce() + Send + '_>)
                 })
-            } else {
-                self.blocks
-                    .iter_mut()
-                    .zip(cones.iter())
-                    .enumerate()
-                    .map(|(i, (b, c))| sync((b, c, owned(i))))
-                    .fold(true, |a, b| a & b)
-            }
-        } else if let Some(pool) = &self.pool {
-            pool.install(|| {
-                self.blocks
-                    .par_iter_mut()
-                    .zip(cones.iter().as_slice().par_iter())
-                    .enumerate()
-                    .map(|(i, (b, c))| sync((b, c, owned(i))))
-                    .reduce(|| true, |a, b| a & b)
-            })
+                .collect();
+            pool.install(|| crate::algebra::run_queue(jobs, workers));
+            ok.iter().all(|&v| v)
         } else {
             self.blocks
                 .iter_mut()

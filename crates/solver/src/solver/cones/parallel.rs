@@ -29,6 +29,9 @@ pub(super) struct ConeThreading {
     // Slowest cone of the last scaling phase (ns): how long idle workers
     // wait for inner items to be posted (see `update_scaling`).
     pub(super) slowest_cone: std::sync::atomic::AtomicU64,
+    // Last measured seconds (f64 bits) of each step lane in the queued
+    // affine [0] and combined [1] step bounds.
+    pub(super) step_costs: [Vec<std::sync::atomic::AtomicU64>; 2],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -346,6 +349,7 @@ impl ConeThreading {
         } else {
             1
         };
+        let step_lanes = sym_step_lanes.len();
         Ok(Some(Self {
             pool,
             cone_workers,
@@ -359,6 +363,9 @@ impl ConeThreading {
             cone_ways,
             paired,
             slowest_cone: std::sync::atomic::AtomicU64::new(0),
+            step_costs: std::array::from_fn(|_| {
+                (0..step_lanes).map(|_| Default::default()).collect()
+            }),
         }))
     }
 }
@@ -814,6 +821,134 @@ pub(super) fn sym_step_bounds<T: FloatT>(
             },
         );
     }
+}
+
+/// `(cones, rows)` of each lane of a top-level lane list over `cones` cones
+/// and `rows` rows.
+fn lane_extents(lanes: &[Lane], cones: usize, rows: usize) -> Vec<(usize, usize)> {
+    lanes
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let (c, r) = lanes
+                .get(i + 1)
+                .map_or((cones, rows), |n| (n.cone_start, n.row_start));
+            (c - l.cone_start, r - l.row_start)
+        })
+        .collect()
+}
+
+/// A lane run on its own sub-slices.
+const LEAF: [Lane; 1] = [Lane {
+    cone_start: 0,
+    row_start: 0,
+}];
+
+fn seconds(cost: &std::sync::atomic::AtomicU64) -> f64 {
+    f64::from_bits(cost.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn record(cost: &std::sync::atomic::AtomicU64, start: std::time::Instant) {
+    let elapsed = start.elapsed().as_secs_f64().to_bits();
+    cost.store(elapsed, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`sym_step_bounds`] as one queued job per lane ([`crate::algebra::run_queue`]),
+/// the longest last measured lane first. Each job runs that lane's leaf on
+/// its own rows, so every bound is the one the join tree computes.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn queued_sym_step_bounds<T: FloatT>(
+    cones: &mut [SupportedCone<T>],
+    bounds: &mut [(T, T)],
+    lanes: &[Lane],
+    inner: bool,
+    paired: bool,
+    ways: &[usize],
+    costs: &[std::sync::atomic::AtomicU64],
+    workers: usize,
+    dz: &[T],
+    ds: &[T],
+    z: &[T],
+    s: &[T],
+    settings: &CoreSettings<T>,
+    alpha: T,
+) {
+    let extents = lane_extents(lanes, cones.len(), dz.len());
+    let (mut cones, mut bounds, mut row) = (cones, bounds, 0);
+    let mut jobs = Vec::with_capacity(lanes.len());
+    for (i, &(count, len)) in extents.iter().enumerate() {
+        let (c, rest) = std::mem::take(&mut cones).split_at_mut(count);
+        cones = rest;
+        let (b, rest) = std::mem::take(&mut bounds).split_at_mut(count);
+        bounds = rest;
+        let r = row..row + len;
+        row += len;
+        let (dz, ds, z, s) = (&dz[r.clone()], &ds[r.clone()], &z[r.clone()], &s[r]);
+        let (way, cost) = (&ways[i..=i], &costs[i]);
+        let job = move || {
+            let start = std::time::Instant::now();
+            sym_step_bounds(
+                c, b, &LEAF, inner, paired, way, dz, ds, z, s, settings, alpha,
+            );
+            record(cost, start);
+        };
+        jobs.push((
+            seconds(cost),
+            len,
+            Box::new(job) as Box<dyn FnOnce() + Send + '_>,
+        ));
+    }
+    crate::algebra::run_queue(jobs, workers);
+}
+
+/// [`prepare_affine_bounds`] as one queued job per lane, as
+/// [`queued_sym_step_bounds`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn queued_affine_bounds<T: FloatT>(
+    cones: &mut [SupportedCone<T>],
+    bounds: &mut [(T, T)],
+    lanes: &[Lane],
+    inner: bool,
+    paired: bool,
+    ways: &[usize],
+    costs: &[std::sync::atomic::AtomicU64],
+    workers: usize,
+    dz: &mut [T],
+    ds: &mut [T],
+    z: &[T],
+    s: &[T],
+    settings: &CoreSettings<T>,
+    alpha: T,
+) {
+    let extents = lane_extents(lanes, cones.len(), dz.len());
+    let (mut cones, mut bounds, mut dz, mut ds, mut row) = (cones, bounds, dz, ds, 0);
+    let mut jobs = Vec::with_capacity(lanes.len());
+    for (i, &(count, len)) in extents.iter().enumerate() {
+        let (c, rest) = std::mem::take(&mut cones).split_at_mut(count);
+        cones = rest;
+        let (b, rest) = std::mem::take(&mut bounds).split_at_mut(count);
+        bounds = rest;
+        let (lz, rest) = std::mem::take(&mut dz).split_at_mut(len);
+        dz = rest;
+        let (ls, rest) = std::mem::take(&mut ds).split_at_mut(len);
+        ds = rest;
+        let (z, s) = (&z[row..row + len], &s[row..row + len]);
+        row += len;
+        let (way, cost) = (&ways[i..=i], &costs[i]);
+        let job = move || {
+            let start = std::time::Instant::now();
+            prepare_affine_bounds(
+                c, b, &LEAF, inner, paired, way, lz, ls, z, s, settings, alpha,
+            );
+            record(cost, start);
+        };
+        jobs.push((
+            seconds(cost),
+            len,
+            Box::new(job) as Box<dyn FnOnce() + Send + '_>,
+        ));
+    }
+    crate::algebra::run_queue(jobs, workers);
 }
 
 #[cfg(test)]

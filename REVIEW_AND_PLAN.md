@@ -127,11 +127,24 @@ Levers L1–L9 and wave balance (journal 2026-10-11, perf-mc-impl, 64 threads, �
   - full Newton step;
   - directed SVD sweep;
   - τ fall-rate chase detection.
-- Next: the solve pipeline (38% of wall) and a divide-and-conquer SVD (about −4%).
+- Next: the solve pipeline (38% of wall); the SVD lever is done (below).
 
 L8, chase restart keeps the side that did not grow (journal 2026-10-11, perf-mc-impl, convergence contract): Λ35-rs/1024 423 → 372 it (1511 → 1195 s); the other Ising inputs are bitwise unchanged. Audit 224854 accepted.
 
 Step limits L10/L11 (journal 2026-10-11): the steady phase is limited by primal centrality in the largest cones (α_aff 0.65, step 0.90). MPFR curve search and split steps were rejected; split steps diverge on Λ27. The MPFR PSD Gondzio corrector cuts iterations 15–17% but costs 3–14% more time, so it was also rejected. Diagnostic: `SDPX_DBG_STEPCONE`. Next: cheaper KKT solves (the solve pipeline is 1.4 of 3.19 s per Λ35-rs iteration, 41–48 of 64 cores busy), which would also make the corrector pay.
+
+Queues, cone SVD and tiled CRT (journal 2026-10-11, perf-mc-impl, now defaults). Each change is measured on Λ35-rs, 64 threads:
+- largest-first job queues for the KKT block passes, residual products and step bounds: −6.2%, bitwise;
+- queued border contributions: −2.6%, bitwise;
+- dqds values with inverse-iteration vectors for the V-only cone SVD: −4.1% and −3.0%, audited;
+- an output-tiled CRT for the RNS gemm and congruences: −8.4% per iteration, bitwise.
+
+The f46 full solves (without the tiled CRT) are audited: Λ35-rs takes 372 iterations in 1027 s against 1216 s at mci41.
+
+Next:
+- the congruence's per-prime products, now 73–76% of a congruence on EPYC;
+- blocked bidiagonalization and reflectors through the RNS gemm (the cone SVD is still 11% of CPU);
+- the solve pipeline's idle cores (prepare/recover run at 45–49 of 64 busy).
 
 Step-length stop (journal 2026-10-10, perf-mc-impl, convergence contract): only a zero step ends a solve; an unconverged end reports its best iterate; the exp/pow backtracking floor is eps^(1/4) in MPFR. Goldstone unitarity K4 case: InsufficientProgress/141 at gap 6.5e-6 → gap 4.5e-12 at 300; Float64 46/46 and csdr3 unchanged. Not merged.
 
@@ -193,7 +206,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - Resolve large's failure after reduction without changing acceptance rules. Its auto form is augmented, so a positive Schur separator needs a separate relevant gate before integration.
    - Large reduction removes 74 empty and 609 equality-only columns; recovery remains mandatory.
 5. **MPFR cone scaling:**
-   - The largest-cone SVD sets the wall; replay is still 44% of SVD CPU.
+   - The V-only SVD takes dqds values and inverse-iteration vectors (QR and replay only on fallback). Its CPU splits into inverse iteration 35%, bidiagonalization 32%, reflectors 22% and dqds 11%. `scale cones` runs 63 of 64 cores busy, so its wall follows total SVD work.
    - Rayon idle stealing is about 8% of cycles.
    - Per-component pipelines for leaf sweeps and the border factor (order-changing; audit gate).
 6. **Multi-node:**

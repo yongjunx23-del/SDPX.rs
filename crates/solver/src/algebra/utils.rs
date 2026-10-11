@@ -142,3 +142,41 @@ fn test_sortperm_by() {
         assert_eq!(p[i], ptarg[i]);
     }
 }
+
+std::thread_local! {
+    /// Set while this thread runs a top-level item of [`run_queue`].
+    static QUEUE_ITEM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A queued job: estimated seconds, size (tie break) and the work.
+pub(crate) type Job<'a> = (f64, usize, Box<dyn FnOnce() + Send + 'a>);
+
+/// Run `jobs` on the current pool as a queue: each of `workers` items takes
+/// the largest remaining job (estimated seconds, then size), so the longest
+/// jobs start first and the shortest fill the tail. An item started nested
+/// (stolen by a thread waiting inside a split job's inner join) returns at
+/// once instead of taking a whole job onto that job's critical path.
+pub(crate) fn run_queue(mut jobs: Vec<Job<'_>>, workers: usize) {
+    use rayon::prelude::*;
+    // Ascending, so `pop` takes the largest.
+    jobs.sort_by(|p, q| p.0.total_cmp(&q.0).then(p.1.cmp(&q.1)));
+    let jobs = std::sync::Mutex::new(jobs);
+    (0..workers.max(1)).into_par_iter().for_each(|_| {
+        if QUEUE_ITEM.with(|c| c.replace(true)) {
+            return;
+        }
+        struct Leave;
+        impl Drop for Leave {
+            fn drop(&mut self) {
+                QUEUE_ITEM.with(|c| c.set(false));
+            }
+        }
+        let _leave = Leave;
+        loop {
+            let Some((_, _, job)) = jobs.lock().unwrap().pop() else {
+                break;
+            };
+            job();
+        }
+    });
+}

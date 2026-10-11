@@ -490,7 +490,7 @@ fn adjoint_level_chunks<T: FloatT>(
 // Row ranges were checked disjoint at construction. Preserve each row's
 // arithmetic order while allowing independent blocks to update in parallel.
 /// `y_slice += alpha·A_b·x` over block `b`'s own rows: the pooled forward leaf.
-fn forward_leaf<T: FloatT>(
+pub(super) fn forward_leaf<T: FloatT>(
     b: &SampledBlock<T>,
     w: &mut SampledBlockWorkspace<T>,
     y_slice: &mut [T],

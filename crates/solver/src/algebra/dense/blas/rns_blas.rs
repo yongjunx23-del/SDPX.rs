@@ -1175,8 +1175,7 @@ struct CrtAccumulator<'a> {
 
 impl<'a> CrtAccumulator<'a> {
     fn new(plan: &Plan, n: usize, selected: &'a [usize]) -> Self {
-        static CRT: OnceLock<Mutex<HashMap<(u32, usize), Arc<Crt>>>> = OnceLock::new();
-        let crt = cached(&CRT, (plan.bits, plan.count()), || crt(plan));
+        let crt = crt_constants(plan);
         let y = take_buffer(n * crt.chunks);
         Self {
             crt,
@@ -1469,6 +1468,115 @@ impl CacheBytes for Crt {
     }
 }
 
+/// The shared [`Crt`] constants of `plan`'s primes.
+fn crt_constants(plan: &Plan) -> Arc<Crt> {
+    static CRT: OnceLock<Mutex<HashMap<(u32, usize), Arc<Crt>>>> = OnceLock::new();
+    cached(&CRT, (plan.bits, plan.count()), || crt(plan))
+}
+
+/// Outputs reconstructed together by [`crt_tiled`]: their digit sums
+/// (`CRT_TILE × chunks`, about 90 KiB at 1024 bits) stay in a core's L2.
+const CRT_TILE: usize = 64;
+
+/// CRT of every prime's reduced product at once: `prod[q·stride + r]` holds
+/// prime `q`'s residue of output `i`, read at `r = read[i]` (or `r = i` when
+/// `read` is empty), for `i` in `outputs`; `write(i, value)` receives each
+/// rounded output. Outputs go in tiles of [`CRT_TILE`], each one `dgemm` over
+/// all primes plus the `-round(frac)·M` row, so the digit sums are written
+/// once instead of being re-streamed once per prime group. The digit sums are
+/// exact integers in any order (`crt`'s width bound covers all `K+1` rows),
+/// and `frac` is summed in prime order, so every value equals
+/// [`CrtAccumulator`]'s bitwise.
+fn crt_tiled<const N: usize>(
+    plan: &Plan,
+    prod: &[f64],
+    stride: usize,
+    read: &[usize],
+    outputs: std::ops::Range<usize>,
+    scale: i64,
+    write: &(impl Fn(usize, F<N>) + Sync),
+) -> bool {
+    let crt = crt_constants(plan);
+    let (kp, rows, chunks) = (plan.count(), plan.count() + 1, crt.chunks);
+    let mut local = take_buffer(CRT_TILE * rows);
+    let mut y = take_buffer(CRT_TILE * chunks);
+    let mut frac = take_buffer(CRT_TILE);
+    let mut mag = Vec::new();
+    let mut ok = true;
+    'tiles: for t0 in outputs.clone().step_by(CRT_TILE) {
+        let t = (outputs.end - t0).min(CRT_TILE);
+        frac[..t].fill(0.0);
+        for q in 0..kp {
+            let (p, pinv, u) = (plan.p[q], plan.pinv[q], crt.u[q]);
+            let row = &prod[q * stride..(q + 1) * stride];
+            let dst = &mut local[q * t..(q + 1) * t];
+            // Gather first: the contiguous update below then vectorizes.
+            if read.is_empty() {
+                dst.copy_from_slice(&row[t0..t0 + t]);
+            } else {
+                for (d, &r) in dst.iter_mut().zip(&read[t0..t0 + t]) {
+                    *d = row[r];
+                }
+            }
+            for (d, f) in dst.iter_mut().zip(&mut frac[..t]) {
+                let v = residue_product(*d, u, p, pinv);
+                *d = v;
+                *f += v * pinv;
+            }
+        }
+        for (d, f) in local[kp * t..rows * t].iter_mut().zip(&frac[..t]) {
+            *d = -f.round();
+        }
+        // Digits come out per output (`chunks × t`), contiguous for `pack`.
+        int_gemm(b'T', b'T', chunks, t, rows, &crt.table, rows, &local, t, &mut y, chunks);
+        for i in 0..t {
+            let digits = y[i * chunks..(i + 1) * chunks].iter().copied();
+            let value = match pack(digits, crt.width, chunks, &mut mag) {
+                Some(_) if mag.is_empty() => F::zero(),
+                Some(negative) => F::from_scaled_integer(negative, &mag, scale),
+                None => {
+                    ok = false;
+                    break 'tiles;
+                }
+            };
+            write(t0 + i, value);
+        }
+    }
+    for v in [local, y, frac] {
+        release_buffer(v);
+    }
+    ok
+}
+
+/// [`crt_tiled`] over outputs `0..total`, whole tiles shared over the
+/// split's ways.
+#[allow(clippy::too_many_arguments)]
+fn crt_tiled_split<const N: usize>(
+    plan: &Plan,
+    prod: &[f64],
+    stride: usize,
+    read: &[usize],
+    total: usize,
+    scale: i64,
+    split: &Split<'_>,
+    write: &(impl Fn(usize, F<N>) + Sync),
+) -> bool {
+    let tiles = total.div_ceil(CRT_TILE);
+    let ways = split_ways(split).min(tiles).max(1);
+    if ways == 1 {
+        return crt_tiled(plan, prod, stride, read, 0..total, scale, write);
+    }
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    run_ways(split, ways, |w| {
+        let (t0, t1) = (w * tiles / ways, (w + 1) * tiles / ways);
+        let range = t0 * CRT_TILE..(t1 * CRT_TILE).min(total);
+        if !crt_tiled(plan, prod, stride, read, range, scale, write) {
+            failed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    !failed.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn crt(plan: &Plan) -> Crt {
     let kp = plan.count();
     let mut modulus = vec![1u64];
@@ -1712,40 +1820,49 @@ pub(super) fn gemm<const N: usize>(
     } else {
         STREAM_GROUP
     };
-    let group = |acc: &mut CrtAccumulator, q0, q1, s: &mut Scratch, split: &Split<'_>| {
+    let timer = (split_ways(&split) > 1)
+        .then(crate::receipt::start)
+        .flatten();
+    // Every prime's products, then one output-tiled reconstruction.
+    let count = plan.count();
+    let mut prod = take_buffer(count * outputs);
+    let mut s = Scratch::default();
+    for q0 in (0..count).step_by(group_cap) {
+        let q1 = (q0 + group_cap).min(count);
         ca.residues(&plan, q0, q1, &mut s.a);
         if let Some(cb) = &cb {
             cb.residues(&plan, q0, q1, &mut s.b);
         }
-        s.prod.clear();
-        s.prod.resize((q1 - q0) * outputs, 0.0);
+        let (sa, sb) = (&s.a, &s.b);
         let product = |qi, prod: &mut [f64], t: &mut Vec<f64>| {
             shape.prime_product(
                 &plan,
                 q0 + qi,
-                &s.a[qi * len_a..(qi + 1) * len_a],
+                &sa[qi * len_a..(qi + 1) * len_a],
                 if same_operand {
-                    &s.a[qi * len_a..(qi + 1) * len_a]
+                    &sa[qi * len_a..(qi + 1) * len_a]
                 } else {
-                    &s.b[qi * len_b..(qi + 1) * len_b]
+                    &sb[qi * len_b..(qi + 1) * len_b]
                 },
                 prod,
                 t,
                 upper_only,
             );
         };
-        prime_products(split, outputs, &mut s.prod, &mut s.t, product);
-        acc.add(&plan, q0, q1, &mut s.prod, outputs, split);
-    };
-    let timer = (split_ways(&split) > 1)
-        .then(crate::receipt::start)
-        .flatten();
-    let mut acc = stream_products(&plan, &split, outputs, &[], group_cap, group);
-    crate::receipt::finish("rns.gemm.shared_crt", timer);
-    if upper_only && !packed_output {
-        acc.selected = &selected;
+        let group = &mut prod[q0 * outputs..q1 * outputs];
+        prime_products(&split, outputs, group, &mut s.t, product);
     }
-    acc.finish(&plan, lo_a + lo_b, out, &split)
+    let optr = SendValues(out.as_mut_ptr());
+    let write = |i: usize, v: F<N>| {
+        let o = if selected.is_empty() { i } else { selected[i] };
+        // SAFETY: every output index is written by exactly one tile.
+        unsafe { *optr.get().add(o) = v };
+    };
+    let scale = lo_a + lo_b;
+    let ok = crt_tiled_split(&plan, &prod, outputs, &[], outputs, scale, &split, &write);
+    release_buffer(prod);
+    crate::receipt::finish("rns.gemm.shared_crt", timer);
+    ok
 }
 
 fn spread_probe() -> bool {
@@ -2557,31 +2674,38 @@ pub(super) fn congruence<const N: usize>(
     let timer = (split_ways(&split) > 1)
         .then(crate::receipt::start)
         .flatten();
-    let acc = stream_products(
-        &plan,
-        &split,
-        if upper_only { selected.len() } else { outputs },
-        &selected,
-        STREAM_GROUP,
-        |acc, q0, q1, s, split| {
-            ca.residues(&plan, q0, q1, &mut s.a);
-            group_residues(cx.view(), &plan, q0, q1, &mut s.b);
-            s.prod.clear();
-            s.prod.resize((q1 - q0) * outputs, 0.0);
-            prime_products(split, outputs, &mut s.prod, &mut s.t, |qi, prod, t| {
-                prime(
-                    q0 + qi,
-                    &s.a[qi * len_a..(qi + 1) * len_a],
-                    &s.b[qi * len_x..(qi + 1) * len_x],
-                    prod,
-                    t,
-                );
-            });
-            acc.add(&plan, q0, q1, &mut s.prod, outputs, split);
-        },
-    );
+    // Every prime's products, then one output-tiled reconstruction.
+    let count = plan.count();
+    let mut prod = take_buffer(count * outputs);
+    let mut s = Scratch::default();
+    for q0 in (0..count).step_by(STREAM_GROUP) {
+        let q1 = (q0 + STREAM_GROUP).min(count);
+        ca.residues(&plan, q0, q1, &mut s.a);
+        group_residues(cx.view(), &plan, q0, q1, &mut s.b);
+        let (a, b) = (&s.a, &s.b);
+        let group = &mut prod[q0 * outputs..q1 * outputs];
+        prime_products(&split, outputs, group, &mut s.t, |qi, prod, t| {
+            prime(
+                q0 + qi,
+                &a[qi * len_a..(qi + 1) * len_a],
+                &b[qi * len_x..(qi + 1) * len_x],
+                prod,
+                t,
+            );
+        });
+    }
+    let optr = SendValues(out.as_mut_ptr());
+    let total = if selected.is_empty() { outputs } else { selected.len() };
+    let write = |i: usize, v: F<N>| {
+        let o = if selected.is_empty() { i } else { selected[i] };
+        // SAFETY: every output index is written by exactly one tile.
+        unsafe { *optr.get().add(o) = v };
+    };
+    let scale = 2 * lo_a + lo_x;
+    let ok = crt_tiled_split(&plan, &prod, outputs, &selected, total, scale, &split, &write);
+    release_buffer(prod);
     crate::receipt::finish("rns.congruence.shared_crt", timer);
-    acc.finish(&plan, 2 * lo_a + lo_x, out, &split)
+    ok
 }
 
 /// Fewest output columns one way of a split congruence computes.
@@ -2639,7 +2763,8 @@ struct CongruenceShape {
 
 /// `C = op(A)·X·op(A)ᵀ` split in two phases for products whose per-prime
 /// outputs fit the ways' scratch: prime groups first (full-size per-prime
-/// GEMMs, as in the unsplit product), then output columns for the CRT. Narrow
+/// GEMMs, as in the unsplit product), then output columns for the tiled CRT
+/// ([`crt_tiled`]). Narrow
 /// column panels left the 53 x 53 GEMMs of a sampled Ising cone 3x slower
 /// summed over 4 ways on EPYC. Each output's residues, CRT digits and rounding
 /// are those of the unsplit product, so the result is bitwise identical.
@@ -2720,28 +2845,12 @@ fn congruence_prime_groups<const N: usize>(
         let selected: Vec<usize> = (j0..j1)
             .flat_map(|j| (0..if upper_only { j + 1 } else { m }).map(move |i| i + j * m))
             .collect();
-        let n = selected.len();
-        let mut acc = CrtAccumulator::new(plan, n, &[]);
-        let mut local = take_buffer(STREAM_GROUP * n);
-        for q0 in (0..count).step_by(STREAM_GROUP) {
-            let q1 = (q0 + STREAM_GROUP).min(count);
-            for q in q0..q1 {
-                let row = &products_ref[q * outputs..(q + 1) * outputs];
-                for (dst, &o) in local[(q - q0) * n..(q - q0 + 1) * n].iter_mut().zip(&selected) {
-                    *dst = row[o];
-                }
-            }
-            acc.add(plan, q0, q1, &mut local, n, &Split::Serial);
-        }
-        release_buffer(local);
-        let mut values = vec![F::<N>::zero(); n];
-        if !acc.finish(plan, scale, &mut values, &Split::Serial) {
-            failed.store(true, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-        for (&o, value) in selected.iter().zip(values) {
+        let write = |i: usize, value: F<N>| {
             // SAFETY: column ranges, hence output positions, are disjoint across ways.
-            unsafe { *optr.get().add(o) = value };
+            unsafe { *optr.get().add(selected[i]) = value };
+        };
+        if !crt_tiled(plan, products_ref, outputs, &selected, 0..selected.len(), scale, &write) {
+            failed.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     };
     run_ways(split, bounds.len() - 1, part);

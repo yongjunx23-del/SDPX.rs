@@ -951,10 +951,13 @@ impl<const N: usize> XgesvScalar for F<N> {
 
 #[path = "mpfr_eigen.rs"]
 mod eigen;
+#[path = "mpfr_dqds.rs"]
+mod dqds;
 #[path = "mpfr_svd.rs"]
 mod svd;
 #[cfg(test)]
 use eigen::*;
+use dqds::*;
 use svd::*;
 
 #[cfg(test)]

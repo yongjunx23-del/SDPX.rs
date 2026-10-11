@@ -498,13 +498,15 @@ where
                 if αmax.is_finite() && αmax > T::zero() && threading.sym_step_lanes.len() > 1 {
                     self.sym_step_bounds.resize(self.cones.len(), (αmax, αmax));
                     threading.pool.install(|| {
-                        cone_parallel::prepare_affine_bounds(
+                        cone_parallel::queued_affine_bounds(
                             &mut self.cones,
                             &mut self.sym_step_bounds,
                             &threading.sym_step_lanes,
                             threading.inner_parallel,
                             threading.paired,
                             &threading.step_lane_ways,
+                            &threading.step_costs[0],
+                            threading.cone_workers,
                             dz,
                             ds,
                             z,
@@ -1509,13 +1511,15 @@ where
             {
                 self.sym_step_bounds.resize(self.cones.len(), (αmax, αmax));
                 threading.pool.install(|| {
-                    cone_parallel::sym_step_bounds(
+                    cone_parallel::queued_sym_step_bounds(
                         &mut self.cones,
                         &mut self.sym_step_bounds,
                         &threading.sym_step_lanes,
                         threading.inner_parallel,
                         threading.paired,
                         &threading.step_lane_ways,
+                        &threading.step_costs[1],
+                        threading.cone_workers,
                         dz,
                         ds,
                         z,

@@ -172,7 +172,7 @@ pub(super) fn apply_block<T: FloatT>(
     }
 }
 
-fn action_index<T>(action: &ScalingAction<'_, T>) -> usize {
+pub(super) fn action_index<T>(action: &ScalingAction<'_, T>) -> usize {
     match action {
         ScalingAction::Condense => 0,
         ScalingAction::Recover(_) => 1,
@@ -186,8 +186,10 @@ fn action_index<T>(action: &ScalingAction<'_, T>) -> usize {
 /// serial. Costs are data dependent (prime counts follow exponent spreads),
 /// so they are measured rather than modelled; the first call keeps 1 way.
 /// Granting ways to fill a wave's idle tail (`planned_ways`) measured slower
-/// here (Λ35-rs at 64 threads: prepare/recover/residual +5–10%, 2026-10-10).
-fn assign_ways<T>(blocks: &mut [Block<T>], action: usize, workers: usize) {
+/// here (Λ35-rs at 64 threads: prepare/recover/residual +5–10%, 2026-10-10),
+/// and SDPB-style worst-fit within the worker count (spare workers to the
+/// largest cost per way) was neutral (Λ27-rs/Λ19-rs ±0.7%, 2026-10-11).
+pub(super) fn assign_ways<T>(blocks: &mut [Block<T>], action: usize, workers: usize) {
     let total: f64 = blocks.iter().map(|b| b.cost[action]).sum();
     if workers <= 1 || total <= 0.0 {
         return;
@@ -363,7 +365,13 @@ pub(super) fn apply_block_pool_with_world<T: FloatT>(
                 action_index(&action),
                 workers.min(pool.current_num_threads()),
             );
-            pool.install(|| split_scaling(blocks, y, x, action, lanes, gemm));
+            // Queued: the longest blocks (last measured) start first and
+            // the shortest fill the tail.
+            let workers = workers.min(pool.current_num_threads());
+            pool.install(|| {
+                let jobs = scaling_jobs(blocks, y, x, action, gemm);
+                crate::algebra::run_queue(jobs, workers)
+            });
             return;
         }
     }
@@ -472,6 +480,41 @@ pub(super) fn split_scaling<T: FloatT>(
         || split_scaling(left, yl, xl, action, &lanes[..mid], gemm),
         || split_scaling(right, yr, xr, action, &lanes[mid..], gemm),
     );
+}
+
+/// One pooled scaling pass as jobs for [`run_queue`], one per block, each
+/// estimated by its last measured wall time. Each job zeroes and fills its
+/// own rows (rows between blocks are zeroed here), so no serial pass touches
+/// the whole vector; the per-block arithmetic is that of [`apply_blocks`].
+pub(super) fn scaling_jobs<'a, T: FloatT>(
+    blocks: &'a mut [Block<T>],
+    y: &'a mut [T],
+    x: &'a [T],
+    action: ScalingAction<'a, T>,
+    gemm: Option<(&'a rayon::ThreadPool, usize)>,
+) -> Vec<crate::algebra::Job<'a>> {
+    let a = action_index(&action);
+    let offset = blocks.first().map_or(0, |b| b.rows.start);
+    let mut jobs = Vec::with_capacity(blocks.len());
+    let mut rest = y;
+    let mut at = offset;
+    for block in blocks.iter_mut() {
+        let (gap, tail) = std::mem::take(&mut rest).split_at_mut(block.rows.start - at);
+        gap.fill(T::zero());
+        let (rows, tail) = tail.split_at_mut(block.rows.len());
+        rest = tail;
+        at = block.rows.end;
+        let xs = &x[block.rows.start - offset..block.rows.end - offset];
+        let seconds = block.cost[a] / block.ways[a].max(1) as f64;
+        let len = rows.len();
+        let job = move || {
+            rows.fill(T::zero());
+            apply_block(block, rows, xs, action, gemm);
+        };
+        jobs.push((seconds, len, Box::new(job) as Box<dyn FnOnce() + Send + 'a>));
+    }
+    rest.fill(T::zero());
+    jobs
 }
 
 pub(super) fn sparse_schur_value<T: FloatT>(

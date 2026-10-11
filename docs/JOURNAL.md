@@ -8,6 +8,51 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-11 — Job queues, inverse-iteration/dqds cone SVD and tiled CRT (perf-mc-impl)
+
+- Setup: 64 threads, EPYC 7742. ABBA = 30 iterations per leg on Λ35-rs/1024 and Λ27-rs/768, one node per pair. Full solves and audits use `t17aud.pbs`.
+- Job queue (`run_queue`): each pooled pass takes the largest remaining job by last measured time. It covers the KKT block update (`sync`), the scaling passes, the IPM and KKT residual products (sampled blocks and scaling blocks in one queue) and the cone step bounds. Each output keeps its operation order.
+  - Full solves s41/t41 (mci41, base → queued): Λ35-rs 1223/1209 → 1142/1140 s (−6.2%); Λ27 239/235 → 229/229 (−3.2%); Λ19-rs 42.7/42.0 → 41.5/41.1 (−2.5%).
+  - Points are bitwise identical.
+- Offered ways (a long queued job splits its products for idle workers; of43, 4 ABBAs) — rejected:
+  - ways 8, θ 0.75: ±0.1%.
+  - ways 4, θ 1.0: Λ35-rs −1.4%, Λ27-rs −3.9% (noisy).
+  - ways 8: Λ27-rs +9.4%.
+  - ways 3: Λ27-rs +6.4%.
+- Contribution queue: the arrow border's column contributions become LPT jobs, and long columns split into row ranges (c44). Λ35-rs 2.455 → 2.391 s/it (−2.6%), Λ27-rs −1.1%; bitwise.
+- Cone SVD, V-only (cone scaling): the singular values come from dqds (LAPACK `dlasq` port, `mpfr_dqds.rs`). V comes from inverse iteration on the Golub–Kahan tridiagonal (dstein-style: one pivoted LU per value, Gram–Schmidt within 1e-3 clusters, one extra solve). Any failure falls back to the logged QR and replay.
+  - Inverse iteration (sv45): Λ35-rs 2.571 → 2.466 s/it (−4.1%).
+  - dqds on top (dq46): Λ35-rs 2.309 → 2.239 (−3.0%), Λ27-rs 0.927 → 0.896 (−3.4%).
+  - On 1024-bit IPM dumps the vectors match the QR replay. Dropping the extra solve (EXTRA = 0) lost orthogonality. Skipping the first Gram–Schmidt saved 25% of inverse-iteration time, about 0.8% end to end, so it was not pursued.
+  - The 30-iteration points are bitwise identical. Later iterates differ in low-order bits; iteration counts and objectives are unchanged.
+- Tiled CRT (`crt_tiled`): all primes' products are kept, then reconstructed in tiles of 64 outputs. Each tile is one dgemm over every prime plus the `−round(frac)·M` row, and the digits come out per output for `pack`.
+  - Every digit sum is an exact integer in any order (the width bound covers K+1 rows), and `frac` is summed in prime order, so values equal the streamed accumulator's bitwise (unit test `crt_tiled_matches_streamed`).
+  - Replaces the streamed accumulator in the RNS gemm and both congruence paths. The column-split congruence and the smaller kernels keep the accumulator.
+  - Congruence kernel at 1024 bits (n 57/96/160, ms):
+
+    | Load | streamed | tiled |
+    |---|---|---|
+    | 1 copy | 11.1 / 35.7 / 128.7 | 9.7 / 31.1 / 114.4 |
+    | 64 copies on one socket | 23.6 / 121.3 / 424.7 | 17.5 / 74.2 / 270.1 |
+
+    The streamed version slowed 2.1–3.4× under load (memory traffic).
+  - ABBA ct49: Λ35-rs 2.298 → 2.105 s/it (**−8.4%**; `sync` 0.164 → 0.091, residual 0.306 → 0.260); Λ27-rs 0.915 → 0.881 (−3.7%). Points bitwise identical.
+- Full solves f46 (mci46: queue, contribution queue, inverse iteration, dqds; 224910). Audits 224922 accepted; residuals equal f45's to 3 digits.
+
+  | Case | iterations / s | audit primal / dual / gap |
+  |---|---|---|
+  | Λ35-rs/1024 | 372 / 1027.0 (mci41 base 1216) | 3.2e-130 / 1.2e-142 / 4.0e-43 |
+  | Λ27-rs/768 | 138 / 126.5 | gap 6.4e-43 |
+  | Λ27/768 | 184 / 219.2 | gap 2.5e-59 |
+  | Λ19-rs/768 | 89 / 39.6 | gap 1.4e-52 |
+
+  The tiled CRT adds −8.4% per iteration on top: Λ35-rs is projected at about −23% against mci41 (full solve not yet rerun).
+- Recorded, not pursued:
+  - Partial CRT: on Λ19/768 nearly all CRT outputs lie 64–380 bits below the modulus, so a top-down partial CRT with a rounding-interval check could skip about half the digits. On EPYC the CRT is now 24–27% of a congruence (digit dgemm 51%, pack 25%), so the estimate is below 2% end to end.
+  - L1 window-ratio chase detection did not separate chasing from non-chasing starts.
+- Decision: queue, contribution queue, inverse iteration, dqds and tiled CRT are the defaults. The test switches, offered ways and lane diagnostics are removed.
+- Remaining cone-SVD cost on Λ35-rs (thread-s per iteration): inverse iteration 5.6, bidiagonalization 5.1, reflectors 3.5, dqds 1.8 (11% of CPU).
+
 ## 2026-10-11 — L10/L11: what limits the step on the Ising inputs (perf-mc-impl)
 
 - Diagnostic `SDPX_DBG_STEPCONE` (kept, env-gated): per iteration the affine step and σ, the three PSD cones with the smallest step bound (dual `bz`, primal `bs`) and the λ²/μ spread. mci34, 64 threads, node101/104/106/107.

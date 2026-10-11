@@ -905,6 +905,9 @@ struct Block<T> {
     cost: [f64; 3],
     /// Workers granted to this block for the next call of each action.
     ways: [usize; 3],
+    /// Last measured seconds of this block's update (`sync`), for ordering
+    /// the queued update pass.
+    sync_cost: f64,
 }
 
 pub(crate) struct CondensedKKTSolver<T: FloatT> {
@@ -1208,6 +1211,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 scaling,
                 cost: [0.0; 3],
                 ways: [1; 3],
+                sync_cost: 0.0,
             });
         }
         let mut colptr = vec![0];
@@ -2230,6 +2234,36 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 "sampled.linear.fwd",
             );
         }
+        // Queued: the residual's per-block sampled products and scaling
+        // blocks form one job queue, so the longest jobs of both start first
+        // and neither pass waits on the other's tail. Every output keeps its
+        // operation order (the adjoint terms are added in block order after
+        // the queue).
+        let mut queued = false;
+        if split && aligned.is_none() && scaling_lanes.len() > 1 {
+            let pool = pool.as_ref().unwrap();
+            let (operator, work) = sampled.as_mut().unwrap();
+            let __t = std::time::Instant::now();
+            let (one, pooled) = (-T::one(), Some(pool));
+            queued = match operator.block_product_jobs(ez, x, z, one, one, false, work, pooled) {
+                Some(mut jobs) => {
+                    let action = ScalingAction::Apply(false);
+                    let workers = (*scaling_workers).min(pool.current_num_threads());
+                    assign_ways(blocks, action_index(&action), workers);
+                    let gemm = Some((pool.as_ref(), (*scaling_tiles).max(1)));
+                    pool.install(|| {
+                        jobs.extend(scaling_jobs(blocks, workh, z, action, gemm));
+                        crate::algebra::run_queue(jobs, workers);
+                    });
+                    true
+                }
+                None => false,
+            };
+            if queued {
+                operator.add_block_adjoints(ex, work);
+                crate::receipt::phase("residual.queue", __t.elapsed());
+            }
+        }
         let mut products = || {
             if split {
                 let (operator, work) = sampled.as_mut().unwrap();
@@ -2334,11 +2368,13 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             }
             crate::receipt::phase("residual.scale", __t.elapsed());
         };
-        if let Some(pool) = pool.as_ref().filter(|_| scaling_lanes.len() > 1) {
-            pool.install(|| rayon::join(products, scaling));
-        } else {
-            products();
-            scaling();
+        if !queued {
+            if let Some(pool) = pool.as_ref().filter(|_| scaling_lanes.len() > 1) {
+                pool.install(|| rayon::join(products, scaling));
+            } else {
+                products();
+                scaling();
+            }
         }
         crate::algebra::add_assign(ez, &self.workh);
         if let (Some(w), Some(((y0, y1), ranges))) = (aligned, rows) {

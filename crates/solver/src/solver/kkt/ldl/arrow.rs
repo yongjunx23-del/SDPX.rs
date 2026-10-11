@@ -1110,6 +1110,9 @@ fn subtract_contributions_columns<T: FloatT>(
             }
         }
     };
+    if let Some(pool) = pool.filter(|p| t > 1 && p.current_num_threads() > 1) {
+        return queued_contribution_columns(leaves, s, t, pool);
+    }
     let mut cols: Vec<(usize, &mut [T])> = s.chunks_mut(t).enumerate().collect();
     match pool {
         Some(pool) if t > 1 => {
@@ -1122,6 +1125,63 @@ fn subtract_contributions_columns<T: FloatT>(
         }
         _ => cols.into_iter().for_each(|(j, col)| column(j, col)),
     }
+}
+
+/// [`subtract_contributions_columns`] as largest-first queue jobs: each
+/// column's exact dot count is known, so the queue packs them in LPT order,
+/// and a column above an eighth of a worker's share splits into row ranges.
+/// Every entry still subtracts its leaves in order, so the bits are those of
+/// the column path.
+fn queued_contribution_columns<T: FloatT>(
+    leaves: &[Leaf<T>],
+    s: &mut [T],
+    t: usize,
+    pool: &rayon::ThreadPool,
+) {
+    let workers = pool.current_num_threads();
+    // Dot terms of column j: Σ over coupling leaves of (rows ≤ j)·g.
+    let work: Vec<usize> = (0..t)
+        .map(|j| {
+            leaves
+                .iter()
+                .filter(|l| l.couples[j])
+                .map(|l| (l.coupled.partition_point(|&i| i <= j) + 1) * l.ids.len())
+                .sum()
+        })
+        .collect();
+    let grain = (work.iter().sum::<usize>() / (8 * workers)).max(1);
+    let mut jobs: Vec<crate::algebra::Job<'_>> = Vec::new();
+    for (j, col) in s.chunks_mut(t).enumerate() {
+        if work[j] == 0 {
+            continue;
+        }
+        let pieces = work[j].div_ceil(grain).clamp(1, j + 1);
+        let rows = (j + 1).div_ceil(pieces);
+        for (p, part) in col[..=j].chunks_mut(rows).enumerate() {
+            let (r0, len) = (p * rows, part.len());
+            let r1 = r0 + len;
+            let est = (work[j] * len) as f64 / (j + 1) as f64;
+            let job = move || {
+                for leaf in leaves.iter().filter(|l| l.couples[j]) {
+                    let coupled = &leaf.coupled;
+                    let c = coupled.binary_search(&j).unwrap();
+                    let lo = coupled.partition_point(|&i| i < r0);
+                    let hi = coupled[..=c].partition_point(|&i| i < r1);
+                    if lo >= hi {
+                        continue;
+                    }
+                    let g = leaf.ids.len();
+                    let (y, dinv) = (&leaf.y, &leaf.factor.dinv);
+                    let z: Vec<T> = (0..g).map(|k| y[k + j * g] * dinv[k]).collect();
+                    for &i in &coupled[lo..hi] {
+                        part[i - r0] -= T::dot_fma(y[i * g..(i + 1) * g].iter().zip(&z));
+                    }
+                }
+            };
+            jobs.push((est, j, Box::new(job)));
+        }
+    }
+    pool.install(|| crate::algebra::run_queue(jobs, workers));
 }
 
 /// Generic leaves shared over MPI ranks. Each rank factors and solves one

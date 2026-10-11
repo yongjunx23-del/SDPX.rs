@@ -174,10 +174,13 @@ where
     /// by its positive unscaling factor would multiply both numerator and
     /// denominator equally, so this ratio is identical in original
     /// coordinates after `tau` recovery.
+    /// `abs_ready`: the sampled absolute adjoint terms were already
+    /// evaluated into the workspace (`block_product_jobs`).
     fn componentwise_dual_error(
         &mut self,
         variables: &DefaultVariables<T>,
         data: &DefaultProblemData<T>,
+        abs_ready: bool,
     ) -> T {
         let mut work = vec![T::zero(); data.n];
 
@@ -237,12 +240,16 @@ where
             let sampled_workspace = self
                 .sampled_workspace
                 .get_or_insert_with(|| SampledWorkspace::new(operator));
-            operator.add_adjoint_abs(
-                &mut work,
-                &variables.z,
-                sampled_workspace,
-                self.sampled_pool.as_ref(),
-            );
+            if abs_ready {
+                operator.add_block_adjoint_abs(&mut work, sampled_workspace);
+            } else {
+                operator.add_adjoint_abs(
+                    &mut work,
+                    &variables.z,
+                    sampled_workspace,
+                    self.sampled_pool.as_ref(),
+                );
+            }
             crate::receipt::finish("ipm_residual.adjoint_abs", timer);
         }
 
@@ -320,9 +327,6 @@ impl<T: FloatT> DefaultResiduals<T> {
                 left.dot(&variables.z)
             }
         };
-        let bz = row_dot(&data.b);
-        let sz = row_dot(&variables.s);
-
         //Px = P*x, P treated as symmetric
         let symP = data.P.sym_up();
         symP.symv(&mut self.Px, &variables.x, T::one(), T::zero());
@@ -336,31 +340,94 @@ impl<T: FloatT> DefaultResiduals<T> {
         //rx_inf .= -data.A'* variables.z
         //Same as:  residuals.rz_inf .=  data.A * variables.x + variables.s
         self.rz_inf.copy_from(&variables.s);
-        if let Some(operator) = &data.sampled {
+        let mut abs_ready = false;
+        let (bz, sz) = if let Some(operator) = &data.sampled {
             let timer = crate::receipt::start();
             let work = self
                 .sampled_workspace
                 .get_or_insert_with(|| SampledWorkspace::new(operator));
-            operator.apply_transpose_with_pool(
-                &mut self.rx_inf,
-                &variables.z,
-                -T::one(),
-                T::zero(),
-                work,
-                self.sampled_pool.as_ref(),
-            );
-            operator.apply_with_pool(
-                &mut self.rz_inf,
-                &variables.x,
-                T::one(),
-                T::one(),
-                work,
-                self.sampled_pool.as_ref(),
-            );
+            let (rx_inf, rz_inf, pool) = (&mut self.rx_inf, &mut self.rz_inf, &self.sampled_pool);
+            let (x, z, one) = (&variables.x, &variables.z, T::one());
+            let queue = pool.as_ref().filter(|p| {
+                counted_rows.is_none()
+                    && p.current_num_threads() > 2
+                    && operator.pooled_halves_apply(work, Some(p))
+            });
+            let dots = if let Some(pool) = queue {
+                // Queued: the linear halves first, then one job per block
+                // (adjoint, forward and, if enabled, the absolute adjoint
+                // terms) and the two dots; each output keeps its order.
+                let pooled = Some(pool);
+                let site = ("sampled.linear.adj", "sampled.linear.fwd");
+                work.linear_product_in_pool(
+                    operator,
+                    true,
+                    rx_inf,
+                    z,
+                    -one,
+                    T::zero(),
+                    pooled,
+                    site.0,
+                );
+                work.linear_product_in_pool(operator, false, rz_inf, x, one, one, pooled, site.1);
+                let abs = data.componentwise_enabled;
+                let (mut bz, mut sz) = (T::zero(), T::zero());
+                let queued =
+                    match operator.block_product_jobs(rz_inf, x, z, -one, one, abs, work, pooled) {
+                        Some(mut jobs) => {
+                            let m = data.b.len();
+                            // Unmeasured and short: start them first.
+                            jobs.push((f64::INFINITY, m, Box::new(|| bz = row_dot(&data.b))));
+                            jobs.push((f64::INFINITY, m, Box::new(|| sz = row_dot(&variables.s))));
+                            let workers = pool.current_num_threads();
+                            pool.install(|| crate::algebra::run_queue(jobs, workers));
+                            true
+                        }
+                        None => false,
+                    };
+                if queued {
+                    abs_ready = abs;
+                } else {
+                    operator.adjoint_blocks_with_pool(rx_inf, z, -one, work, pooled);
+                    operator.forward_blocks_with_pool(rz_inf, x, one, work, pooled);
+                    (bz, sz) = (row_dot(&data.b), row_dot(&variables.s));
+                }
+                operator.add_block_adjoints(rx_inf, work);
+                (bz, sz)
+            } else {
+                let mut products = || {
+                    operator.apply_transpose_with_pool(
+                        rx_inf,
+                        z,
+                        -one,
+                        T::zero(),
+                        work,
+                        pool.as_ref(),
+                    );
+                    operator.apply_with_pool(rz_inf, x, one, one, work, pool.as_ref());
+                };
+                // The two row-length dots are serial MPFR reductions independent
+                // of the products: run each whole, in order, beside them.
+                match pool.as_ref() {
+                    Some(pool) if counted_rows.is_none() && pool.current_num_threads() > 2 => pool
+                        .install(|| {
+                            rayon::join(products, || {
+                                rayon::join(|| row_dot(&data.b), || row_dot(&variables.s))
+                            })
+                            .1
+                        }),
+                    _ => {
+                        products();
+                        (row_dot(&data.b), row_dot(&variables.s))
+                    }
+                }
+            };
             crate::receipt::finish("ipm_residual.products", timer);
+            dots
         } else {
             self.ordinary_products(variables, data);
-        }
+            (row_dot(&data.b), row_dot(&variables.s))
+        };
 
         //complete the residuals
         //rx = rx_inf - Px - qτ
@@ -369,7 +436,7 @@ impl<T: FloatT> DefaultResiduals<T> {
 
         self.dual_componentwise = data
             .componentwise_enabled
-            .then(|| self.componentwise_dual_error(variables, data));
+            .then(|| self.componentwise_dual_error(variables, data, abs_ready));
 
         // rz = rz_inf - bτ
         self.rz
