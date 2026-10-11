@@ -255,36 +255,16 @@ where
         settings: &DefaultSettings<T>,
         step_direction: StepDirection,
     ) -> T {
-        let ατ = {
-            if step.τ < T::zero() {
-                -self.τ / step.τ
-            } else {
-                T::max_value()
-            }
-        };
+        self.step_length_in(step, cones, settings, step_direction, false)
+    }
 
-        let ακ = {
-            if step.κ < T::zero() {
-                -self.κ / step.κ
-            } else {
-                T::max_value()
-            }
-        };
-
-        let α = [ατ, ακ, T::one()].minimum();
-        let (αz, αs) = cones.step_length(&step.z, &step.s, &self.z, &self.s, settings.core(), α);
-
-        // itself only allows for a single maximum value.
-        // To enable split lengths, we need to also pass a
-        // tuple of limits to the step_length function of
-        // every cone
-        let mut α = T::min(αz, αs);
-
-        if step_direction == StepDirection::Combined {
-            α *= settings.core().max_step_fraction;
-        }
-
-        α
+    fn calc_kkt_step_length(
+        &self,
+        step: &Self,
+        cones: &mut CompositeCone<T>,
+        settings: &DefaultSettings<T>,
+    ) -> T {
+        self.step_length_in(step, cones, settings, StepDirection::Combined, true)
     }
 
     fn add_step(&mut self, step: &Self, α: T) {
@@ -599,6 +579,51 @@ where
 }
 
 impl<T: FloatT> DefaultVariables<T> {
+    /// `kkt`: `step` is the combined direction the KKT system just solved.
+    fn step_length_in(
+        &self,
+        step: &Self,
+        cones: &mut CompositeCone<T>,
+        settings: &DefaultSettings<T>,
+        step_direction: StepDirection,
+        kkt: bool,
+    ) -> T {
+        let ατ = {
+            if step.τ < T::zero() {
+                -self.τ / step.τ
+            } else {
+                T::max_value()
+            }
+        };
+
+        let ακ = {
+            if step.κ < T::zero() {
+                -self.κ / step.κ
+            } else {
+                T::max_value()
+            }
+        };
+
+        let α = [ατ, ακ, T::one()].minimum();
+        let (αz, αs) = if kkt {
+            cones.kkt_step_length(&step.z, &step.s, &self.z, &self.s, settings.core(), α)
+        } else {
+            cones.step_length(&step.z, &step.s, &self.z, &self.s, settings.core(), α)
+        };
+
+        // itself only allows for a single maximum value.
+        // To enable split lengths, we need to also pass a
+        // tuple of limits to the step_length function of
+        // every cone
+        let mut α = T::min(αz, αs);
+
+        if step_direction == StepDirection::Combined {
+            α *= settings.core().max_step_fraction;
+        }
+
+        α
+    }
+
     fn combined_rhs_impl(
         &mut self,
         residuals: &DefaultResiduals<T>,

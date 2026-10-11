@@ -8,6 +8,39 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-11 — Step bounds from the complementarity row kept; τ-fall chase detection closed (perf-mc-impl)
+
+- Setup: ABBA, 30 iterations per leg, 64 threads, node104 (bd61). Full solves f61a/f61b on node106/107 and t17 audits (225001). Phases come from `SDPX_PROFILE=1` receipts.
+- L22, step bounds of a KKT direction from one congruence (`PSDTriangleCone::kkt_bounds`):
+  - Each PSD bound used to scale both directions, WΔz with R and W⁻ᵀΔs with R⁻¹: two n³ congruences per cone, for the affine and for the final step.
+  - Above binary64 Δs is taken from the complementarity row HₛΔz + Δs = −c, which gives W⁻ᵀΔs = −WΔz − W⁻ᵀc. For the affine c = s, so W⁻ᵀc = λ. For the combined direction c = Wᵀ(λ \ ds), and `Δs_from_Δz_offset` keeps λ \ ds.
+  - Only the final step of the solved combined direction takes this path (`calc_kkt_step_length`). Curve-search trials and correctors keep both congruences.
+  - Binary64 is unchanged, since its retained rows take Δs from the linear row.
+  - The change is order-changing; the rounding of Δs moves W⁻ᵀΔs far below what a step bound resolves. Unit tests check the KKT direction against the two-congruence bound, and both λ mutations fail them.
+  - Local gate, ising11 at 1 thread (`l19` against `l22`): 54 iterations each, audits 2/2 and 2/2, api 9.835 → 9.350 s (−4.9%).
+  - bd61 (mci59 with its L19 switches against mci60):
+
+    | Case | A s/it | B s/it | change | aff/fin A → B |
+    |---|---|---|---|---|
+    | Λ35-rs/1024 | 1.931, 1.922 | 1.862, 1.845 | −3.8% | 0.074 → 0.044 |
+    | Λ27-rs/768 | 0.842, 0.848 | 0.825, 0.836 | −1.7% | 0.035 → 0.028 |
+
+  - Full solves (f61, mci60) against f57-b. Iteration counts are unchanged. All five audits are accepted, and the objectives agree with f57 to 38 printed digits.
+
+    | Case | f57-b it / s | f61 it / s | change |
+    |---|---|---|---|
+    | Λ35-rs | 372 / 863.0 | 372 / 830.9 | −3.7% |
+    | Λ27 | 183 / 199.5 | 183 / 189.1 | −5.2% |
+    | Λ27-rs | 138 / 117.3 | 138 / 110.3 | −6.0% |
+    | Λ19-rs | 89 / 36.1 | 89 / 35.3 | −2.2% |
+    | Λ35 | — | 435 / 1306.8 | (no current baseline) |
+
+  - Decision: kept as the default.
+- L1, earlier detection of the τ chase on Λ35-rs: closed.
+  - While τ falls (iterations 114–149) the gap still improves tenfold about every 5 iterations, so a stall test cannot see the chase.
+  - The ratios overlap: the healthy Λ27 shows τ ÷1060 with s ×1600, and Λ27-rs τ ÷150 with s ×1200.
+  - No general early signal separates the cases, and the best case would save at most about 25 of 372 iterations.
+
 ## 2026-10-11 — Shifted normal form and windowed Gram–Schmidt for cone SVD vectors kept; compact-WY back-transform rejected (perf-mc-impl)
 
 - Setup: ABBA, 30 iterations per leg, 64 threads; full solves and t17 audits on node104. Phases come from `SDPX_PROFILE=1` receipts.

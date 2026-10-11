@@ -13,6 +13,10 @@ pub struct PSDConeData<T> {
     // G = R R^T, with an authoritative upper triangle. The p-by-p
     // Hessian is generated only into an augmented KKT caller's packed block.
     G: Matrix<T>,
+    // W⁻ᵀc = λ \ ds of the latest combined offset c = Wᵀ(λ \ ds), and
+    // whether `step_length` bounds a KKT direction from it.
+    offset: Vec<T>,
+    use_offset: bool,
 }
 
 impl<T> PSDConeData<T>
@@ -26,6 +30,8 @@ where
             R: Matrix::zeros((n, n)),
             Rinv: Matrix::zeros((n, n)),
             G: Matrix::zeros((n, n)),
+            offset: Vec::new(),
+            use_offset: false,
         }
     }
 }
@@ -142,6 +148,10 @@ where
 
     pub(crate) fn scaling_R(&self) -> &Matrix<T> {
         &self.data.R
+    }
+
+    pub(super) fn use_offset(&mut self, on: bool) {
+        self.data.use_offset = on && !self.data.offset.is_empty();
     }
 
     /// `SDPX_DBG_STEPCONE`: (min λᵢ², max λᵢ², Σ λᵢ²) of the NT-scaled point.
@@ -424,6 +434,11 @@ where
 
     fn Δs_from_Δz_offset(&mut self, out: &mut [T], ds: &[T], work: &mut [T], _z: &[T]) {
         self._Δs_from_Δz_offset_symmetric(out, ds, work);
+        if T::precision_bits() > 53 {
+            // `work` holds λ \ ds = W⁻ᵀ·out.
+            self.data.offset.resize(work.len(), T::zero());
+            self.data.offset.copy_from_slice(work);
+        }
     }
 
     fn step_length(
@@ -435,6 +450,19 @@ where
         _settings: &CoreSettings<T>,
         αmax: T,
     ) -> (T, T) {
+        if self.data.use_offset {
+            let f = &*self.data;
+            return with_work(self.n, |w: &mut PsdWork<T>| {
+                let ds = &mut w
+                    .second
+                    .get_or_insert_with(|| Box::new(StepWorkspace::new(self.n)))
+                    .vector;
+                let mut ds = std::mem::take(ds);
+                let out = kkt_bounds(f, dz, &mut ds, Some(&f.offset), αmax, w);
+                w.second.as_mut().unwrap().vector = ds;
+                out
+            });
+        }
         if sdpx_arithmetic::inner_parallel::paired() {
             let (n, f) = (self.n, &*self.data);
             with_work(n, |w: &mut PsdWork<T>| {
@@ -516,6 +544,14 @@ where
     }
 
     pub(crate) fn prepare_affine_bounds(&mut self, dz: &mut [T], ds: &mut [T], αmax: T) -> (T, T) {
+        if T::precision_bits() > 53 {
+            let f = &*self.data;
+            return with_work(self.n, |w: &mut PsdWork<T>| {
+                let out = kkt_bounds(f, dz, ds, None, αmax, w);
+                dz.copy_from_slice(&w.vector);
+                out
+            });
+        }
         // The dz (dual, R) and ds (primal, Rinv) bounds are independent.
         // With a second scratch set they can run on two ambient workers;
         // without one they fold serially, bitwise identical either way.
@@ -868,6 +904,53 @@ where
 //-----------------------------------------
 // internal operations for SDP cones
 // ----------------------------------------
+
+/// Bounds of a KKT direction from one congruence. Its complementarity row
+/// HₛΔz + Δs = −c gives W⁻ᵀΔs = −WΔz − W⁻ᵀc, where W⁻ᵀc is λ for the
+/// affine c = s and `offset` (λ \ ds) for a combined c = Wᵀ(λ \ ds).
+/// Leaves WΔz in `w.vector` and W⁻ᵀΔs in `ds`. At MPFR precision the
+/// rounding of Δs moves W⁻ᵀΔs by far less than a step bound needs.
+fn kkt_bounds<T: FloatT>(
+    f: &PSDConeData<T>,
+    dz: &[T],
+    ds: &mut [T],
+    offset: Option<&[T]>,
+    αmax: T,
+    w: &mut PsdWork<T>,
+) -> (T, T) {
+    let αz = step_component_inner(
+        dz,
+        &f.R,
+        &f.Λisqrt,
+        false,
+        αmax,
+        &mut w.vector,
+        &mut w.mat1,
+        &mut w.mat2,
+        &mut w.svd.Vt,
+        &mut w.eig,
+    );
+    for (d, &v) in ds.iter_mut().zip(&w.vector) {
+        *d = -v;
+    }
+    match offset {
+        Some(c) => ds.iter_mut().zip(c).for_each(|(d, &c)| *d -= c),
+        None => {
+            for (k, &l) in f.λ.iter().enumerate() {
+                ds[triangular_index(k)] -= l;
+            }
+        }
+    }
+    let αs = step_length_psd_component(
+        &mut w.mat1,
+        &mut w.eig,
+        ds,
+        &f.Λisqrt,
+        αmax,
+        &mut w.mat2.data,
+    );
+    (αz, αs)
+}
 
 fn step_component_inner<T>(
     direction: &[T],

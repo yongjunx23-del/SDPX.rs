@@ -142,13 +142,15 @@ Queues, cone SVD and tiled CRT (journal 2026-10-11, perf-mc-impl, now defaults).
 The f50 full solves with all of them are audited: Λ35-rs takes 372 iterations in 900 s (1216 s at mci41, −26%); Λ27 −8.5%, Λ27-rs −5.7%, Λ19-rs −6.6% against f46.
 Kept since:
 - residue products for short arrow-leaf groups (Λ35-rs −3.8% per iteration, bitwise, peak RSS 5.6 → 7.2 GB);
-- cone SVD vectors from the shifted normal form within a factor two, with windowed Gram–Schmidt (Λ35-rs −5.5% per iteration; full solves −2.2 to −3.9%; audited).
+- cone SVD vectors from the shifted normal form within a factor two, with windowed Gram–Schmidt (Λ35-rs −5.5% per iteration; full solves −2.2 to −3.9%; audited);
+- step bounds of KKT directions from one congruence, with W⁻ᵀΔs = −WΔz − W⁻ᵀc from the complementarity row (Λ35-rs −3.8% per iteration; full solves −2.2 to −6.0% at unchanged iteration counts; audited).
 Rejected since: residue-major i32 congruence (gains only for n ≥ 96 under full load); reciprocal pivots in inverse iteration (+12%); blocked exact leaf LDL from order 96 (Λ27-rs +2.8%); board items inside cone SVD/Cholesky (−0.7%); queue help with board items in unsplit congruences and gemms (−1.2%, and its idle wait can livelock when a stolen join half starts a queue item); compact-WY V back-transform (+0.4% under full load). Their patches are kept in `~/.cache/sdpx-e2e/patches`.
 
 Next:
-- the solve pipeline: residual 0.251, recover 0.155, prepare 0.117, trsv 0.058 of 1.97 s per Λ35-rs iteration (3.1 solves per iteration);
+- the solve pipeline: residual 0.246, recover 0.148, prepare 0.113 of 1.85 s per Λ35-rs iteration at mci60 (3.1 solves per iteration, three exact congruences per block and solve);
+- in test: the combined shift as one exact symmetric square (−Δz̃² − λ∘Δz̃, since Δs̃ = −Δz̃ − λ), and WΔz from the condensed recovery's pre-image in place of the step-bound congruence;
 - cone kernels under full load (n = 63, 64 copies, per cone): bidiagonalization 85 ms, reflectors 59, R/R⁻¹ 50, inverse iteration 43, Cholesky 24, dqds 19, L2ᵀL1 13 ms. A blocked triangular solve cuts R/R⁻¹ by 10.6 ms (−2.9% of the cone); panel bidiagonalization saves 5 ms. Neither yet reaches 2% of an iteration;
-- Λ35-rs iterations: 169 iterations before the chase restart and about 120 to deflate the restarted primal scale (L1 detection is shelved).
+- Λ35-rs iterations: 169 iterations before the chase restart and about 120 to deflate the restarted primal scale (L1 detection is closed: no general early signal, at most about 25 iterations to gain).
 
 Step-length stop (journal 2026-10-10, perf-mc-impl, convergence contract): only a zero step ends a solve; an unconverged end reports its best iterate; the exp/pow backtracking floor is eps^(1/4) in MPFR. Goldstone unitarity K4 case: InsufficientProgress/141 at gap 6.5e-6 → gap 4.5e-12 at 300; Float64 46/46 and csdr3 unchanged. Not merged.
 

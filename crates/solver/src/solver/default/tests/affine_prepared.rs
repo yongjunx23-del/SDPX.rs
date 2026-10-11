@@ -63,7 +63,30 @@ fn fixture<T: FloatT>(
     }
     // An early non-PSD bound must not cause later PSD consumption to be skipped.
     step.z[1] = -T::from_usize(100).unwrap();
+    // An affine KKT direction: HₛΔz + Δs = −s, which MPFR PSD bounds use.
+    let mut work = vec![T::zero(); v.s.len()];
+    cones.mul_Hs(&mut step.s, &step.z, &mut work);
+    for (d, &s) in step.s.iter_mut().zip(&v.s) {
+        *d = -(*d + s);
+    }
     (cones, v, step)
+}
+/// Bitwise at binary64; MPFR PSD bounds take W⁻ᵀΔs from the KKT row, which
+/// differs from the congruence of the rounded Δs only by rounding.
+fn close<T: FloatT>(a: &[T], b: &[T]) {
+    if T::precision_bits() <= 53 {
+        return equal(a, b);
+    }
+    assert_eq!(a.len(), b.len());
+    let tol = T::epsilon().sqrt();
+    for (i, (a, b)) in a.iter().zip(b).enumerate() {
+        let ok = *a == *b
+            || (a.is_nan() && b.is_nan())
+            || (*a - *b).abs() <= tol * (T::one() + a.abs().max(b.abs()));
+        if !ok {
+            panic!("close mismatch at index {i}: a={a:?} b={b:?}");
+        }
+    }
 }
 fn check<T: FloatT>() {
     let settings = DefaultSettings::<T>::default();
@@ -80,15 +103,36 @@ fn check<T: FloatT>() {
             equal(&dr.s, &saved_s);
             let b =
                 prep.prepare_affine_bounds(&mut dp.z, &mut dp.s, &v.z, &v.s, settings.core(), cap);
-            equal(&[a.0, a.1], &[b.0, b.1]);
+            close(&[a.0, a.1], &[b.0, b.1]);
             let mut sr = vec![T::zero(); v.s.len()];
             let mut sp = sr.clone();
             raw.combined_ds_shift(&mut sr, &mut dr.z, &mut dr.s, T::one());
             prep.combined_shift_impl(&mut sp, &mut dp.z, &mut dp.s, T::one(), true);
-            equal(&sr, &sp);
+            close(&sr, &sp);
             equal(&dr.z, &dp.z);
-            equal(&dr.s, &dp.s);
+            close(&dr.s, &dp.s);
         }
+        // A combined KKT direction: HₛΔz + Δs = −c with c = Wᵀ(λ \ ds).
+        let (mut raw, v, mut d) = fixture::<T>(threads, false);
+        // Only the PSD rows (from 6) bound this direction.
+        d.z[..6].fill(T::zero());
+        let shift: Vec<T> = (0..v.s.len())
+            .map(|i| T::from_usize(i % 3 + 1).unwrap() / T::from_usize(4).unwrap())
+            .collect();
+        let mut c = vec![T::zero(); v.s.len()];
+        let mut work = c.clone();
+        raw.Δs_from_Δz_offset(&mut c, &shift, &mut work, &v.z);
+        let mut ds = c.clone();
+        raw.mul_Hs(&mut ds, &d.z, &mut work);
+        for (x, &c) in ds.iter_mut().zip(&c) {
+            *x = -(*x + c);
+        }
+        ds[..6].fill(T::zero());
+        let cap = T::from_usize(1 << 20).unwrap();
+        let a = raw.step_length(&d.z, &ds, &v.z, &v.s, settings.core(), cap);
+        let b = raw.kkt_step_length(&d.z, &ds, &v.z, &v.s, settings.core(), cap);
+        assert!(a.0 < cap && a.1 < cap);
+        close(&[a.0, a.1], &[b.0, b.1]);
         let (mut raw, v, mut dr) = fixture::<T>(threads, true);
         let (mut prep, _, mut dp) = fixture::<T>(threads, true);
         let residuals = DefaultResiduals::new(v.x.len(), v.s.len());
@@ -98,7 +142,7 @@ fn check<T: FloatT>() {
         rp.affine_step_rhs(&residuals, &v, &prep);
         let a = v.calc_step_length(&dr, &mut raw, &settings, StepDirection::Affine);
         let b = v.prepare_affine_step_length(&mut dp, &mut prep, &settings);
-        equal(&[a], &[b]);
+        close(&[a], &[b]);
         rr.combined_step_rhs(
             &residuals,
             &v,
@@ -111,10 +155,10 @@ fn check<T: FloatT>() {
         rp.combined_step_rhs_prepared(&residuals, &v, &mut prep, &mut dp, T::one(), T::one());
         equal(&rr.x, &rp.x);
         equal(&rr.z, &rp.z);
-        equal(&rr.s, &rp.s);
+        close(&rr.s, &rp.s);
         equal(&[rr.τ, rr.κ], &[rp.τ, rp.κ]);
         equal(&dr.z, &dp.z);
-        equal(&dr.s, &dp.s);
+        close(&dr.s, &dp.s);
     }
 }
 #[test]

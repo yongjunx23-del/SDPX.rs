@@ -540,6 +540,33 @@ where
         self.step_length(dz, ds, z, s, settings, αmax)
     }
 
+    /// [`Cone::step_length`] of the combined direction the KKT system just
+    /// solved: at MPFR precision its PSD cones take W⁻ᵀΔs from the
+    /// complementarity row (see `PSDTriangleCone::kkt_bounds`).
+    pub(crate) fn kkt_step_length(
+        &mut self,
+        dz: &[T],
+        ds: &[T],
+        z: &[T],
+        s: &[T],
+        settings: &CoreSettings<T>,
+        αmax: T,
+    ) -> (T, T) {
+        let on = T::precision_bits() > 53 && self.mpi_world().is_none();
+        self.use_offsets(on);
+        let out = self.step_length(dz, ds, z, s, settings, αmax);
+        self.use_offsets(false);
+        out
+    }
+
+    fn use_offsets(&mut self, on: bool) {
+        for cone in &mut self.cones {
+            if let SupportedCone::PSDTriangleCone(c) = cone {
+                c.use_offset(on);
+            }
+        }
+    }
+
     /// Configure the reusable cone worker pool. Zero chooses the available
     /// CPU budget; one and structurally small workloads keep the serial path.
     /// Native BLAS must use one thread when cone workers execute PSD kernels.

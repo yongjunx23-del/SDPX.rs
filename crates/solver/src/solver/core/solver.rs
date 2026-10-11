@@ -1169,12 +1169,17 @@ mod internal {
             scaling: ScalingStrategy,
         ) -> T {
             //step length to stay within the cones
-            let mut α = self.variables.calc_step_length(
-                &self.step_lhs,
-                &mut self.cones,
-                &self.settings,
-                step_direction,
-            );
+            let mut α = if step_direction == StepDirection::Combined {
+                self.variables
+                    .calc_kkt_step_length(&self.step_lhs, &mut self.cones, &self.settings)
+            } else {
+                self.variables.calc_step_length(
+                    &self.step_lhs,
+                    &mut self.cones,
+                    &self.settings,
+                    step_direction,
+                )
+            };
 
             // additional barrier function limits for asymmetric cones
             if !self.cones.all_symmetric()

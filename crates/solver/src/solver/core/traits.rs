@@ -147,6 +147,11 @@ pub trait Variables<T: FloatT> {
         step_direction: StepDirection,
     ) -> T;
 
+    /// Step length of the combined direction the KKT system just solved.
+    fn calc_kkt_step_length(&self, step: &Self, cones: &mut Self::C, settings: &Self::SE) -> T {
+        self.calc_step_length(step, cones, settings, StepDirection::Combined)
+    }
+
     /// Prepare an affine direction for the immediately following prepared RHS.
     fn prepare_affine_step_length(
         &self,
