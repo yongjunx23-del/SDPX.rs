@@ -216,7 +216,26 @@ impl Drop for BufferPool {
 /// fresh large allocations (page faults, `mmap`/`munmap`) that stop a
 /// block's kernels scaling across threads. Contents never carry over.
 fn take_buffer(len: usize) -> Vec<f64> {
-    let mut v = BUFFERS
+    let mut v = pooled_buffer(len);
+    v.clear();
+    v.resize(len, 0.0);
+    v
+}
+
+/// [`take_buffer`] for scratch whose every entry is written before it is
+/// read: a reused buffer keeps its old entries instead of being zeroed again.
+fn take_scratch(len: usize) -> Vec<f64> {
+    let mut v = pooled_buffer(len);
+    if v.capacity() < len {
+        // Growth would copy the stale entries.
+        v.clear();
+    }
+    v.resize(len, 0.0);
+    v
+}
+
+fn pooled_buffer(len: usize) -> Vec<f64> {
+    BUFFERS
         .with(|b| {
             let mut pool = b.borrow_mut();
             let b = &mut pool.0;
@@ -229,10 +248,7 @@ fn take_buffer(len: usize) -> Vec<f64> {
             POOLED_TOTAL.fetch_sub(v.capacity(), std::sync::atomic::Ordering::Relaxed);
             Some(v)
         })
-        .unwrap_or_default();
-    v.clear();
-    v.resize(len, 0.0);
-    v
+        .unwrap_or_default()
 }
 
 fn release_buffer(v: Vec<f64>) {
@@ -719,9 +735,27 @@ fn fill_chunk<const N: usize>(value: &F<N>, row: &mut [f64], lo: i64, width: u32
     let j1 = ((delta + F::<N>::PRECISION_BITS as i64) as usize)
         .div_ceil(width as usize)
         .min(row.len());
-    for (j, slot) in row.iter_mut().enumerate().take(j1).skip(j0) {
-        let bits = bits_at(limbs, width as i64 * j as i64 - delta, width) as f64;
-        *slot = if negative { -bits } else { bits };
+    if j0 >= j1 {
+        return;
+    }
+    let sign = if negative { -1.0 } else { 1.0 };
+    let mut j = j0;
+    // Only the first chunk can start below bit 0.
+    if width as i64 * (j as i64) < delta {
+        row[j] = sign * bits_at(limbs, width as i64 * j as i64 - delta, width) as f64;
+        j += 1;
+    }
+    // Later chunks start at bit s < P, so limb s/64 exists.
+    let mask = (1u64 << width) - 1;
+    let mut s = width as usize * j - delta as usize;
+    for slot in &mut row[j..j1] {
+        let (li, off) = (s / 64, s % 64);
+        let mut x = limbs[li] >> off;
+        if off != 0 && li + 1 < N {
+            x |= limbs[li + 1] << (64 - off);
+        }
+        *slot = sign * (x & mask) as f64;
+        s += width as usize;
     }
 }
 
@@ -1498,9 +1532,9 @@ fn crt_tiled<const N: usize>(
 ) -> bool {
     let crt = crt_constants(plan);
     let (kp, rows, chunks) = (plan.count(), plan.count() + 1, crt.chunks);
-    let mut local = take_buffer(CRT_TILE * rows);
-    let mut y = take_buffer(CRT_TILE * chunks);
-    let mut frac = take_buffer(CRT_TILE);
+    let mut local = take_scratch(CRT_TILE * rows);
+    let mut y = take_scratch(CRT_TILE * chunks);
+    let mut frac = take_scratch(CRT_TILE);
     let mut mag = Vec::new();
     let mut ok = true;
     'tiles: for t0 in outputs.clone().step_by(CRT_TILE) {
@@ -1825,7 +1859,7 @@ pub(super) fn gemm<const N: usize>(
         .flatten();
     // Every prime's products, then one output-tiled reconstruction.
     let count = plan.count();
-    let mut prod = take_buffer(count * outputs);
+    let mut prod = take_scratch(count * outputs);
     let mut s = Scratch::default();
     for q0 in (0..count).step_by(group_cap) {
         let q1 = (q0 + group_cap).min(count);
@@ -2289,7 +2323,7 @@ pub(super) fn diag_congruence<const N: usize>(
         }
     };
     let count = plan.count();
-    let mut dres = take_buffer(count * k);
+    let mut dres = take_scratch(count * k);
     group_residues(
         chunk_matrix(dv, lo_d, dd, &plan, &split).view(),
         &plan,
@@ -2311,9 +2345,9 @@ pub(super) fn diag_congruence<const N: usize>(
     let parts: Vec<Mutex<Vec<f64>>> = (0..ways).map(|_| Mutex::new(Vec::new())).collect();
     run_ways(&split, ways, |w| {
         let mut part = take_buffer(count * outputs);
-        let (mut ab, mut cb) = (take_buffer(rows_per * m), take_buffer(rows_per * m));
+        let (mut ab, mut cb) = (take_scratch(rows_per * m), take_scratch(rows_per * m));
         let tile = if upper_only { 32 } else { m };
-        let mut u = take_buffer(m * tile.min(m));
+        let mut u = take_scratch(m * tile.min(m));
         for b in (w..blocks).step_by(ways) {
             let (r0, rows) = (b * rows_per, rows_per.min(k - b * rows_per));
             for q in 0..count {
@@ -2676,7 +2710,7 @@ pub(super) fn congruence<const N: usize>(
         .flatten();
     // Every prime's products, then one output-tiled reconstruction.
     let count = plan.count();
-    let mut prod = take_buffer(count * outputs);
+    let mut prod = take_scratch(count * outputs);
     let mut s = Scratch::default();
     for q0 in (0..count).step_by(STREAM_GROUP) {
         let q1 = (q0 + STREAM_GROUP).min(count);
@@ -2793,11 +2827,11 @@ fn congruence_prime_groups<const N: usize>(
     let count = plan.count();
     let outputs = m * m;
     let tb = if ta_n { b'T' } else { b'N' };
-    let mut prod = take_buffer(count * outputs);
+    let mut prod = take_scratch(count * outputs);
     let per = count.div_ceil(ways);
     let products = |(w, chunk): (usize, &mut [f64])| {
         let (q0, q1) = (w * per, (w * per + per).min(count));
-        let (mut a, mut x, mut t) = (take_buffer(0), take_buffer(0), take_buffer(k * m));
+        let (mut a, mut x, mut t) = (take_buffer(0), take_buffer(0), take_scratch(k * m));
         ca.residues(plan, q0, q1, &mut a);
         group_residues(cx.view(), plan, q0, q1, &mut x);
         for q in q0..q1 {
@@ -2887,8 +2921,8 @@ fn congruence_columns<const N: usize>(
         upper_only,
     } = shape;
     let count = plan.count();
-    let mut ares = take_buffer(count * len_a);
-    let mut xres = take_buffer(count * len_x);
+    let mut ares = take_scratch(count * len_a);
+    let mut xres = take_scratch(count * len_x);
     let per = count.div_ceil(ways);
     let mut fill = || {
         ares.par_chunks_mut(per * len_a)
@@ -2941,8 +2975,8 @@ fn congruence_columns<const N: usize>(
         // Rows j0.. of op(A) (A itself when ta = 'N', else its columns).
         let a_cols = if ta_n { j0 } else { j0 * lda };
         let group = stream_group_cap(outputs);
-        let mut prod = take_buffer(group * outputs);
-        let mut t = take_buffer(k * width);
+        let mut prod = take_scratch(group * outputs);
+        let mut t = take_scratch(k * width);
         for q0 in (0..count).step_by(group) {
             let q1 = (q0 + group).min(count);
             for q in q0..q1 {
