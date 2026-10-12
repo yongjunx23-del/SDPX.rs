@@ -8,6 +8,50 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-12 — L43: refinement floor for retained rows (kept); L44: MPFR PSD corrector (rejected) (perf-mc-impl)
+
+- L43, observed (trace on plain Λ35-rs): after one correction the sampled PSD rows pass their L24 floor. The retained zero-cone rows, near eps·|A_r||x| (~1e-208), were the only rows that forced the stall-confirming corrections, 176 of 589.
+- L43 change (`eb78199`, mci89 against mci88):
+  - Zero-cone rows get a floor in `rows_at_floor`: eps·(Σ|A_r||x| + |b_r|). |A| of the ordinary rows is cached in binary64 units of its largest entry (built on first use, cleared by `update_A`).
+  - The owner path gets its own `OwnedRefinement::at_floor`. Each owner's rows go through its kernel. The border rows are checked against the |A_r||x| sums reduced over owners (tags 704/705), on every rank in lockstep.
+  - Acceptance tolerances are unchanged.
+- L43 results (iterations and objectives unchanged; audits 225270 and 225271 accepted all four B points):
+
+  | Run | Case | A s | B s | change | outer refinements |
+  |---|---|---|---|---|---|
+  | plain, 64 threads (225262, node3) | Λ35-rs | 789.5, 793.5 | 758.3, 757.1 | −4.3% | 554 → 388 |
+  | plain, 64 threads (225262, node3) | Λ27 | 170.8, 175.6 | 173.4, 173.6 | ±0 | 260 → 260 (points identical) |
+  | 4 nodes 16×16 (225261) | Λ35-rs | 519.2, 493.4 | 494.0, 485.4 | −3.3% | 907 → 754 |
+  | 4 nodes 16×16 (225261) | Λ27 | 118.2, 118.8 | 108.4, 108.4 | −8.5% | 759 → 577 |
+  | 4 nodes 16×16 (225261) | Λ27-rs | 68.4, 68.4 | 67.7, 67.9 | −0.9% | 47 → 38 |
+
+- L43 decision: kept.
+- L44, hypothesis: L11 measured the MPFR Gondzio corrector at −15–17% iterations but +3–14% time. The solve and step costs have fallen since (L22, L24, L43), and neither Λ35-rs nor the owner path had been measured.
+- L44 test switch (`SDPX_TEST_PSD_CORRECTOR`, mci90; one binary with and without the switch):
+  - V is formed in binary64 in units of σμ from the scaled trial point diag(λ) + αW⁻ᵀΔs, diag(λ) + αWΔz.
+  - The corrected direction is bounded by the KKT step length.
+  - The owner path gets `has_correctable` and `centrality_correction`.
+- L44 results (s; objectives equal):
+
+  | Run | Case | off: it / s | on: it / s | change |
+  |---|---|---|---|---|
+  | plain, 64 threads | Λ35-rs (node101) | 372 / 747.1 | 326 / 802.8 | +7.5% |
+  | plain, 64 threads | Λ27 (node104) | 183 / 175.7 | 157 / 185.6 | +5.6% |
+  | plain, 64 threads | Λ27-rs (node104) | 138 / 108.1 | 115 / 110.5 | +2.2% |
+  | 4 nodes (225269) | Λ35-rs | 372 / 469.6 | 326 / 496.7 | +5.8% |
+  | 4 nodes (225269) | Λ27 | 183 / 107.5 | 157 / 112.0 | +4.2% |
+  | 4 nodes (225269) | Λ27-rs | 138 / 67.1 | 115 / 66.8 | −0.4% |
+
+  - ising11/512 locally: 54 → 46 iterations at equal time; audit passes.
+- L44, per-call costs:
+  - Plain Λ27: 154 calls, 111 accepted. Each call costs a 0.177 s solve, a 0.040 s right-hand side and a 0.021 s step bound. `cone_wprod` rises from 24.5k to 51.9k W-products, about 178 per call.
+  - 4-node Λ35-rs: 342 calls, 226 accepted. Each call costs a 0.184 s solve, a 0.026 s right-hand side and a 0.036 s step bound.
+  - The corrector solve costs one full combined solve. To pay, a call would have to cost under about 0.16 s.
+- L44 decision: rejected. The patch is at `~/.cache/sdpx-e2e/patches/l44-mpfr-psd-corrector.patch`. The corrector needs a solve pipeline at about half its current cost first.
+- Profile after L43 (plain Λ35-rs, 2.02 s/it):
+  - The solve pipeline (pair and combined solves with refinement) takes about 0.98 s: residual 0.33, recover 0.21, prepare 0.17, trsv 0.07 and ir 0.06 s per iteration.
+  - The factorization (`refactor`: leaves 0.18, contributions 0.16) takes 0.38 s, cone scaling 0.355 s, and Gram sync 0.09 s.
+
 ## 2026-10-12 — L42: owner unit start τ (kept, perf-mc-impl)
 
 - Observed (startstats 225239, Λ27, `max_iter` 1): both paths reject the KKT start (‖x‖∞ 4.3e69) and fall back to the unit start. Plain starts it at τ₀ = 1/max d = 1.328e-28 (max d = 7.531e27). The owner data had no `unit_start_tau`, so it started at τ₀ = 1, chased τ at iteration 50 and finished in 223 iterations against plain's 183.

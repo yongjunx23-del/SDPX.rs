@@ -237,7 +237,9 @@ execution plans. The journal preserves all failed evidence and final decisions.
      - Kept L39: the owner path runs the core τ policy (chase restart, fixed-τ phase, best iterate). 4-node full solves: Λ35-rs 602 → 372 iterations (−42%), Λ27 379 → 223 (−43%), audited.
      - Rejected L40: owner KKT step bounds from recovery pre-images (−1.0% / −1.4%).
      - Kept L42: the owner path starts the rejected-KKT fallback at plain's τ₀ = 1/max d. Λ27 223 → 183 iterations (−20% on 4 nodes), audited.
-     - Open, L43: stall-confirming refinement corrections. On plain Λ35-rs, 176 of 589 corrections only confirm a stall (constant column after the τ restart). The owner path has no floor test at all.
+     - Kept L43 (`eb78199`): a refinement floor for retained zero-cone rows, eps·(Σ|A_r||x| + |b_r|), on the plain and owner paths. Plain Λ35-rs −4.3%; 4-node Λ35-rs −3.3%, Λ27 −8.5%. Audited.
+     - Rejected L44: the MPFR PSD Gondzio corrector. It saves 12–17% of iterations, but every call costs one combined solve, so plain is +2–8% and owner −0.4…+5.8%. Revisit only after the solve pipeline costs about half as much.
+     - Next: the condensed solve pipeline. On plain Λ35-rs it takes about 0.98 of 2.02 s/it: residual 0.33, recover 0.21, prepare 0.17.
    - Single-heavy-owner sampled splitting is closed: correct on both MPI gates, but neither improves end-to-end time.
    - Profile prime-group underfill and NUMA residue placement on large calls;
      split complete inner products over output tiles only if they dominate.
