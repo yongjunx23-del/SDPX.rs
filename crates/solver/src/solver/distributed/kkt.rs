@@ -285,6 +285,9 @@ pub(crate) struct OwnedKkt<T: FloatT> {
     fused_interior: Vec<Vec<T>>,
     fused_border_rhs: Vec<T>,
     fused_ready: bool,
+    /// Column of the next solve left without original-level refinement
+    /// (`skip_refinement`).
+    unrefined: Option<usize>,
 }
 
 impl<T: FloatT> OwnedKkt<T> {
@@ -442,6 +445,7 @@ impl<T: FloatT> OwnedKkt<T> {
             fused_interior: Vec::new(),
             fused_border_rhs: Vec::new(),
             fused_ready: false,
+            unrefined: None,
         }
     }
 
@@ -722,18 +726,23 @@ impl<T: FloatT> OwnedKkt<T> {
             .collective
             .all_true(249, self.fill_work_rhs(&mut work, rhs, rhs_border))
             .unwrap_or(false);
+        let unrefined = self.take_unrefined(settings) == Some(0);
         let success = input_ok
             && self.solve_original(&mut work.x, &work.b, settings)
-            && refine(
-                &mut OwnedRefinement {
-                    solver: self,
-                    work: &mut work,
-                    reduced: false,
-                    basis: Vec::new(),
-                    directions: Vec::new(),
-                },
-                settings,
-            );
+            && if unrefined {
+                self.scale_unrefined(&work.x)
+            } else {
+                refine(
+                    &mut OwnedRefinement {
+                        solver: self,
+                        work: &mut work,
+                        reduced: false,
+                        basis: Vec::new(),
+                        directions: Vec::new(),
+                    },
+                    settings,
+                )
+            };
         let success = self.collective.all_true(250, success).unwrap_or(false);
         if success {
             for ((local, x), out) in self.locals.iter().zip(&work.x.blocks).zip(out) {
@@ -838,20 +847,25 @@ impl<T: FloatT> OwnedKkt<T> {
         // as the scalar correction workspace required by the shared original
         // refinement helper, leaving only one extra persistent Work value.
         self.inner = Some(inner1);
+        let unrefined = self.take_unrefined(settings);
         for c in 0..2 {
             if !flags[c] {
                 continue;
             }
-            flags[c] = refine(
-                &mut OwnedRefinement {
-                    solver: self,
-                    work: if c == 0 { &mut outer0 } else { &mut outer1 },
-                    reduced: false,
-                    basis: Vec::new(),
-                    directions: Vec::new(),
-                },
-                settings,
-            );
+            flags[c] = if unrefined == Some(c) {
+                self.scale_unrefined(if c == 0 { &outer0.x } else { &outer1.x })
+            } else {
+                refine(
+                    &mut OwnedRefinement {
+                        solver: self,
+                        work: if c == 0 { &mut outer0 } else { &mut outer1 },
+                        reduced: false,
+                        basis: Vec::new(),
+                        directions: Vec::new(),
+                    },
+                    settings,
+                )
+            };
             flags[c] = self.collective.all_true(280 + c, flags[c]).unwrap_or(false);
             if flags[c] {
                 for ((local, x), output) in self
@@ -889,6 +903,27 @@ impl<T: FloatT> OwnedKkt<T> {
         self.batch_inner = Some(inner0);
         self.batch_outer = Some(outer1);
         flags
+    }
+
+    /// Leave column `column` of the next solve without original-level
+    /// refinement (the affine predictor; see the condensed kernel).
+    pub(crate) fn skip_refinement(&mut self, column: usize) {
+        self.unrefined = Some(column);
+    }
+
+    fn take_unrefined(&mut self, settings: &CoreSettings<T>) -> Option<usize> {
+        self.unrefined
+            .take()
+            .filter(|_| T::precision_bits() > 53 && settings.iterative_refinement_enable)
+    }
+
+    /// Each owner's Hs·z of an unrefined solution, as its residual would
+    /// leave it for `scaled_product`.
+    fn scale_unrefined(&mut self, x: &Point<T>) -> bool {
+        for (local, x) in self.locals.iter_mut().zip(&x.blocks) {
+            local.kernel.restore_scaled_product(x);
+        }
+        x.norm().is_finite()
     }
 
     fn copy_products_to(&self, out: &mut [Vec<T>]) {

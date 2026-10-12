@@ -1,7 +1,7 @@
 //! Embedding direction assembly for local storage; scalar formulas and matrix
 //! operations are shared with the default KKT implementation.
 use super::*;
-use crate::solver::default::{hsd_tau, hsd_terms};
+use crate::solver::default::{hsd_tau, hsd_terms, refine_predictor};
 use crate::solver::distributed::OwnedKkt;
 use crate::solver::{
     core::{traits::KKTSystem, StepDirection},
@@ -257,6 +257,9 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
                         *out = s - z;
                     }
                     self.work.sync_border();
+                    if !refine_predictor() {
+                        self.kernel.skip_refinement(0);
+                    }
                     let ok = self.kernel.solve_blocks_with_border(
                         &self.work.blocks,
                         &mut self.varying.blocks,
@@ -319,6 +322,9 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
                 }
                 self.constant_work.sync_border();
                 self.work.sync_border();
+                if !refine_predictor() {
+                    self.kernel.skip_refinement(1);
+                }
                 let ok = self.kernel.solve_blocks_pair_with_border(
                     [&self.constant_work.blocks, &self.work.blocks],
                     [&mut self.constant.blocks, &mut self.varying.blocks],

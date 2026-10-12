@@ -173,7 +173,7 @@ where
     }
 
     fn set_prepared_affine(&mut self, prepared: bool) {
-        self.prepared_affine = prepared;
+        self.prepared_affine = prepared && !full_affine_hs();
     }
 
     fn update_affine(
@@ -481,8 +481,15 @@ impl<T: FloatT> HsdTerms<T> {
         self.quad2 += rhs.quad2;
     }
 }
+/// Test switch `SDPX_TEST_AFFINE_HS=1`: form the affine column's PSD Hs·z
+/// even when the prepared step bounds do not read it.
+fn full_affine_hs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SDPX_TEST_AFFINE_HS").is_some_and(|v| v != "0"))
+}
+
 /// Test switch `SDPX_REFINE_PREDICTOR=1`: refine the affine column too.
-fn refine_predictor() -> bool {
+pub(crate) fn refine_predictor() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SDPX_REFINE_PREDICTOR").is_some_and(|v| v != "0"))
 }
