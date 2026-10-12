@@ -113,6 +113,15 @@ impl ConeThreading {
             self.slowest_cone.load(std::sync::atomic::Ordering::Relaxed),
         );
         let slowest = std::sync::atomic::AtomicU64::new(0);
+        // With more workers than cones (owner ranks: a few cones per
+        // component), idle helpers also run pending pool tasks: the running
+        // cones' inner splits and other owners' queue items wait in Rayon
+        // deques, which a spinning worker never steals from. With at least
+        // one cone per worker the idle tail is short, and a stolen split
+        // half leaves its cone's thread stealing other cones' pieces while
+        // it waits (Λ35 plain, 72 cones on 64 workers: scale cones
+        // 0.337 → 0.375 s/it), so those helpers only spin.
+        let steal = workers > total;
         // A worker without a queued cone helps the running cones' posted
         // inner items (SVD rotation replay rows), largest post first: the
         // slowest cone otherwise sets the phase alone. A worker item that
@@ -174,7 +183,9 @@ impl ConeThreading {
                         {
                             break;
                         }
-                        std::hint::spin_loop();
+                        if !(steal && matches!(rayon::yield_now(), Some(rayon::Yield::Executed))) {
+                            std::hint::spin_loop();
+                        }
                     }
                     ok
                 })

@@ -8,6 +8,112 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-12 — L33: idle cone-queue helpers run pending pool tasks when workers outnumber cones (kept, perf-mc-impl)
+
+- Hypothesis (L30/L31 diagnosis): an owner rank scales 4–5 cones on 16 workers. Workers left without a cone spin on `board::help()` until every cone is done. The running cones' inner Rayon splits and the other components' queue items sit in Rayon deques, and a spinning worker never steals from them.
+- Change: between board posts, the helper calls `rayon::yield_now()` and spins only when nothing ran.
+- Result, unconditional (mci71 → mci74, points identical in every pair):
+
+  | Case | A s | B s | change |
+  |---|---|---|---|
+  | 4 nodes owner 16×16, Λ35 60 it (225118) | 99.09 / 99.11 | 96.77 / 96.98 | −2.25% |
+  | 1 node plain, Λ35 60 it (225127, node138) | 142.0 / 143.4 | 145.5 / 145.9 | +2.1% |
+  | 1 node plain, Λ35-rs 30 it | 58.2 / 58.4 | 58.9 / 59.0 | +1.1% |
+
+  - Plain regressed in `scale cones`, 0.337 → 0.375 s/it.
+  - Hypothesis: with 72 cones on 64 workers, a helper steals a split half from a running cone. That cone's thread then steals other cones' pieces while it waits, which lengthens the slowest cone.
+- Change, final (L33b): steal only when the queue has more workers than cones (`workers > total`); otherwise spin as before. Plain Λ35 has 72 cones on 64 workers and keeps the old path.
+- Result, L33b (mci71 → mci76, points identical in every pair):
+
+  | Case | A s | B s | change |
+  |---|---|---|---|
+  | 4 nodes owner 16×16, Λ35 60 it (225132) | 98.87 / 98.61 | 96.43 / 96.26 | −2.4% |
+  | 1 node plain, Λ35 60 it (225134, node62) | 143.1 / 143.8 | 145.2 / 143.2 | +0.5% (path unchanged) |
+  | 1 node plain, Λ35-rs 30 it | 58.3 / 58.1 | 58.3 / 57.9 | −0.2% |
+
+  - Plain `scale cones` is 0.338 vs 0.336 s/it, so the B1 outlier is noise.
+- mci71 still carries the rejected L29 copies. The hunk is independent of them and applies unchanged to the branch.
+- Decision: L33b kept. Patches are at `~/.cache/sdpx-e2e/patches/l33b-help-yield-spare.patch` (kept) and `l33-help-yield.patch` (unconditional).
+
+## 2026-10-12 — L34: split congruences on cluster nodes are clock-bound (diagnosis)
+
+- Observed: the ignored bench `congruence_way_speedup` (1024 bits) on EPYC 7742 nodes, pinned to 16 cores of one NUMA node:
+  - 2 threads ×0.84–1.79 and 16 threads ×1.9–3.6. Repeats differ by up to 2×.
+  - The same bench on the Mac gives ×2.08 at 2 threads and ×3.4 at 4.
+- Ruled out (observed):
+  - SMT: nodes have 2×64 cores, one thread per core, 8 NUMA nodes of 16.
+  - Wake-up latency: a condvar wake takes 5–8 µs median (probe `mc/wake`). There is no cpuidle driver.
+  - OS noise on 16 busy cores: under 0.1% lost (probe `mc/noise`). With 64 busy cores, the daemons (oMgcd_client, snmpd, cron monitor) cost up to 6% on some cores, with stalls up to 60 ms.
+- Cause (verified):
+  - The node governor is `conservative`: 20 ms sampling, up at 80%, 5% steps, P-states 1.5/2.0/2.25 GHz plus boost.
+  - Idle cores sit at 1.5 GHz. A helper that is busy only during short split regions never ramps up.
+  - perf: one thread runs at 3.0 GHz; 16 threads average 1.8 GHz.
+  - With a `SCHED_IDLE` spinner pinned to each of the 16 cores (`mc/freq.pbs`), all cores read 2250 MHz:
+
+    | n | threads | cold ms | spinners ms |
+    |---|---|---|---|
+    | 48 | 8 | 2.70 / 2.70 | 1.81 / 1.82 |
+    | 63 | 4 | 8.43 / 6.61 | 4.34 / 4.53 |
+    | 63 | 8 | 5.23 / 4.39 | 3.22 / 3.16 |
+    | 96 | 16 | 8.25 / 8.97 | 8.52 / 7.06 |
+
+    The single-thread times do not change.
+- Full solve, environment only (`mc/mnspin.pbs`, 225126; same mci71 binary; B legs with `mc/spin` on all 64 allocated cores of every node):
+  - 4 nodes owner 16×16 Λ35: A 96.98 / 96.71 s, B 93.71 / 93.40 s, −3.4%. Points identical.
+  - Rank 0's own kernels got slightly slower: prime-group congruences 14.85 → 16.61 s, recover 7.02 → 7.73 s.
+  - Rank 0's allreduce wait fell 14.32 → 9.54 s: the slower ranks gained.
+- Next: L35 makes this an in-solver mechanism: one `SCHED_IDLE` keeper per allocated CPU.
+
+## 2026-10-12 — L31: independent inverse-iteration chains as items in the cone SVD (rejected, perf-mc-impl)
+
+- Hypothesis: `svd.invit` (3.8 s on owner rank 0; 0.018 s median) runs its vectors one after another. Vectors outside a shared cluster form independent chains, and the chains could run as items.
+- Change:
+  - `mpfr_svd.rs` now has one `Sweep` kernel, shared by the TGK and shifted-normal paths (dgttrf LU, growth test, at most 5 iterations plus 1 extra, windowed Gram–Schmidt).
+  - Chains start at each group leader and run longest first. They take ambient tasks under the inner gate, else board items, else run serially.
+  - The vectors are bitwise those of the serial sweep: ignored test `invit_digest` over 80 dumped bidiagonals gives digest `823750ceca56300a`, both serially and with 3 board helpers.
+- Result (mci72 → mci73, on top of L30, points identical in every pair):
+
+  | Case | A s | B s | change |
+  |---|---|---|---|
+  | 4 nodes owner 16×16, Λ35 60 it (225115) | 97.30 / 96.72 | 97.11 / 96.46 | −0.2% |
+  | 1 node plain, Λ35 60 it (225116, node62) | 143.6 / 143.3 | 143.8 / 144.3 | +0.4% |
+  | 1 node plain, Λ35-rs 30 it | 58.3 | 58.3 / 58.1 | −0.2% |
+
+- Decision: rejected (below 2%). On owner ranks, inverse iteration is about 4% of the cone time, and its items reach the same spinning helpers as L30's. Patch kept at `~/.cache/sdpx-e2e/patches/l31-invit-chains.patch`.
+
+## 2026-10-12 — L30: board items in the cone kernels, L15 ported (rejected, perf-mc-impl)
+
+- Hypothesis (L6/L28 owner receipts): an owner rank scales 4–5 cones on 16 threads, so `scale cones` (15.7 s on rank 0) is about one slowest cone. Board items in the cone kernels would let the idle queue workers help it.
+- Change (L15 without the inverse-iteration hunks):
+  - `split_units` covers the bidiagonalization column updates and row dots, the reflector back-transform (each column applies every reflector), the trsm columns and the potrf trailing update. It takes ambient tasks under the inner gate, else board tiles while offered, else runs serially.
+  - `join_offered` covers the S/Z Cholesky pair and the R/R⁻¹ build.
+  - `board::help` uses `try_lock`.
+  - Every route gives the same bits (unit test `board_items_keep_bits`).
+- Result (mci71 → mci72, points identical in every pair):
+
+  | Case | A s | B s | change |
+  |---|---|---|---|
+  | 4 nodes owner 16×16, Λ35 60 it (225110) | 97.42 / 97.14 | 96.91 / 96.79 | −0.4% |
+  | 1 node plain, Λ35 60 it (225111, node62) | 143.5 / 143.7 | 143.5 / 143.4 | −0.1% |
+  | 1 node plain, Λ35-rs 30 it | 57.9 / 58.1 | 58.2 / 58.4 | +0.5% |
+
+- Rank 0 receipts, A1 → B1 (observed): `svd.bidiagonalize` median 0.073 → 0.073 s; `scale cones` 15.73 → 15.60 s. The owner cone kernels did not get faster.
+- Diagnosis: owner lanes have spare workers, so the inner gate is open and the kernels take the Rayon route. The queue's idle workers spin in the `board::help` loop and never steal Rayon tasks, so the split pieces run on the lane thread. Verified only through the unchanged median; L33 tests it directly.
+- Decision: rejected (below 2%). Patch kept at `~/.cache/sdpx-e2e/patches/l30-cone-board-items.patch`.
+
+## 2026-10-12 — L32: component-matched owner layouts at 4 nodes (measurement, perf-mc-impl)
+
+- Question: Λ35 has 36 independent owner components. 16×16 gives ranks 2 or 3 of them. Do layouts with equal shares per rank beat it, as they did on Λ19 (2026-10-08)?
+- Setup: mnab 225105; Λ35 at 1024 bits, 60 iterations, `--partitions auto`, binary mci71 for every run, node154/178/59/61. Two runs each, in one job.
+
+  | Layout | Components per rank | s |
+  |---|---|---|
+  | 12×21 | 3 | 96.03 / 96.39 |
+  | 16×16 | 2–3 | 97.34 / 97.05 |
+  | 36×7 | 1 | 104.06 / 103.86 |
+
+- Conclusion: 12×21 is 1.0% faster than 16×16, inside the 2% bar, and 36×7 is 7% slower (observed). Since L26, uneven shares cost little. For 36×7 the hypothesis, not yet checked against receipts, is that replicated border work and 36-rank collectives outweigh the balance. 16×16 stays the 4-node layout; no rule change.
+
 ## 2026-10-12 — L29: pooled long copies on the solve path (rejected, perf-mc-impl)
 
 - Hypothesis (owner receipts): the condensed `solve_many` and the KKT right-hand-side setup copy whole solution vectors and each block's `mat3c` triangle on the main thread between pooled phases.
