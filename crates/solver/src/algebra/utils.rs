@@ -187,6 +187,35 @@ pub(crate) fn run_queue(mut jobs: Vec<Job<'_>>, workers: usize) {
     });
 }
 
+/// Independent jobs that another phase's idle workers take, largest first
+/// (as [`run_queue`] orders them); [`TailJobs::finish`] runs any left over.
+pub(crate) struct TailJobs<'a> {
+    jobs: std::sync::Mutex<Vec<Job<'a>>>,
+}
+
+impl<'a> TailJobs<'a> {
+    pub(crate) fn new(mut jobs: Vec<Job<'a>>) -> Self {
+        jobs.sort_by(|p, q| p.0.total_cmp(&q.0).then(p.1.cmp(&q.1)));
+        Self {
+            jobs: std::sync::Mutex::new(jobs),
+        }
+    }
+
+    /// Run the largest remaining job; false when none is left.
+    pub(crate) fn run_one(&self) -> bool {
+        let job = self.jobs.lock().unwrap().pop();
+        job.map(|(_, _, job)| job()).is_some()
+    }
+
+    /// Run the remaining jobs as a queue on the current pool.
+    pub(crate) fn finish(self, workers: usize) {
+        let jobs = self.jobs.into_inner().unwrap();
+        if !jobs.is_empty() {
+            run_queue(jobs, workers);
+        }
+    }
+}
+
 #[test]
 fn test_run_queue_nested_queue_runs_its_jobs() {
     use std::sync::atomic::{AtomicUsize, Ordering};

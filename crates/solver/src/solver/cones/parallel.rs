@@ -84,6 +84,7 @@ impl ConeThreading {
         z: &[T],
         mu: T,
         strategy: ScalingStrategy,
+        tail: Option<&crate::algebra::TailJobs<'_>>,
     ) -> Option<bool> {
         let workers = self.pool.current_num_threads();
         if T::precision_bits() <= 64
@@ -170,12 +171,16 @@ impl ConeThreading {
                         done.fetch_add(1, std::sync::atomic::Ordering::Release);
                     }
                     // Out of cones: help the running cones' posted items (SVD
-                    // replays start late in a cone) until all are scaled, but
-                    // never past the last phase's slowest cone: a thread that
-                    // stole this item while blocked inside a cone would
-                    // otherwise wait for that cone forever.
+                    // replays start late in a cone), else run the caller's
+                    // tail jobs, until all are scaled, but never past the
+                    // last phase's slowest cone: a thread that stole this
+                    // item while blocked inside a cone would otherwise wait
+                    // for that cone forever.
                     loop {
                         if sdpx_arithmetic::inner_parallel::board::help() {
+                            continue;
+                        }
+                        if tail.is_some_and(|tail| tail.run_one()) {
                             continue;
                         }
                         if done.load(std::sync::atomic::Ordering::Acquire) == total

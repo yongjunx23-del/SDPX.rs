@@ -513,6 +513,16 @@ where
         cones.update_scaling(&self.s, &self.z, μ, scaling_strategy)
     }
 
+    fn scale_cones_with_tail(
+        &self,
+        cones: &mut CompositeCone<T>,
+        μ: T,
+        scaling_strategy: ScalingStrategy,
+        tail: Vec<crate::algebra::Job<'_>>,
+    ) -> bool {
+        cones.update_scaling_with_tail(&self.s, &self.z, μ, scaling_strategy, tail)
+    }
+
     fn barrier(&self, step: &Self, α: T, cones: &mut CompositeCone<T>) -> T {
         let central_coef = (cones.degree() + 1).as_T();
 

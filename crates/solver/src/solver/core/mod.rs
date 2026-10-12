@@ -13,6 +13,13 @@ pub use solver::*;
 
 /// Test only: `SDPX_TEST_SPLIT_STEP` set gives the fixed-τ phase separate
 /// primal and dual step lengths. It diverges on Λ27 (journal 2026-10-11).
+/// Overlap of the residual update with the next cone scaling (see
+/// `Solver::evaluate`); `SDPX_SCALE_OVERLAP=0` turns it off.
+pub(crate) fn scale_overlap() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("SDPX_SCALE_OVERLAP").is_none_or(|v| v != "0"))
+}
+
 pub(crate) fn test_split_step() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("SDPX_TEST_SPLIT_STEP").is_some())

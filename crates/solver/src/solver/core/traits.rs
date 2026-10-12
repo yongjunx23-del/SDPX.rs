@@ -286,6 +286,22 @@ pub trait Variables<T: FloatT> {
     /// Apply NT scaling to a collection of cones
     fn scale_cones(&self, cones: &mut Self::C, μ: T, scaling_strategy: ScalingStrategy) -> bool;
 
+    /// [`Variables::scale_cones`] that also runs the independent `tail` jobs,
+    /// on the scaling's idle workers where the cones support it; all have
+    /// run when it returns.
+    fn scale_cones_with_tail(
+        &self,
+        cones: &mut Self::C,
+        μ: T,
+        scaling_strategy: ScalingStrategy,
+        tail: Vec<crate::algebra::Job<'_>>,
+    ) -> bool {
+        for (_, _, job) in tail {
+            job();
+        }
+        self.scale_cones(cones, μ, scaling_strategy)
+    }
+
     /// Compute the barrier function
     fn barrier(&self, step: &Self, α: T, cones: &mut Self::C) -> T;
 }
@@ -309,6 +325,19 @@ pub trait Residuals<T: FloatT> {
         _pool: Option<std::sync::Arc<rayon::ThreadPool>>,
     ) {
         self.update(variables, data);
+    }
+
+    /// [`Residuals::update_with_pool`] that may hand its queued product jobs
+    /// to `run`, which must run them all before it returns, so the caller can
+    /// overlap them with other work. Same values.
+    fn update_with_runner(
+        &mut self,
+        variables: &Self::V,
+        data: &Self::D,
+        pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+        _run: &mut dyn FnMut(Vec<crate::algebra::Job<'_>>),
+    ) {
+        self.update_with_pool(variables, data, pool);
     }
 }
 

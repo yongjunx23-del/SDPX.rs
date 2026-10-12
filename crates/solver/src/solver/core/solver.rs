@@ -161,6 +161,9 @@ where
     /// The iterate with the smallest tolerance multiple so far, reported
     /// when the solve ends unconverged.
     pub(crate) best: Option<(T, V)>,
+    /// The scaling of the current iterate, formed during its residual update
+    /// (`evaluate`), with its success and strategy, for the next `scale`.
+    pub(crate) prescaled: Option<(bool, ScalingStrategy)>,
     pub(crate) phantom: std::marker::PhantomData<T>,
 }
 
@@ -667,8 +670,32 @@ mod internal {
         }
 
         fn evaluate(&mut self, state: &mut IterationState<T>, timers: &Timers) {
+            // Symmetric cone scalings do not depend on μ: the iterate's
+            // scaling starts with its residual products, which the scaling's
+            // idle workers run (the slowest cones set that phase alone).
+            // Nothing before `scale` changes s or z without leaving the loop.
+            // One process only: MPI ranks keep their collectives in order.
+            self.prescaled = None;
+            let pool = self.cones.worker_pool();
             timeit! {"residual update"; {
-            self.residuals.update_with_pool(&self.variables, &self.data, self.cones.worker_pool());
+            if self.cones.all_symmetric()
+                && crate::solver::core::scale_overlap()
+                && crate::mpi::World::get().is_none()
+            {
+                let (variables, cones, prescaled) =
+                    (&self.variables, &mut self.cones, &mut self.prescaled);
+                let scaling = state.scaling;
+                let μ = state.μ;
+                self.residuals.update_with_runner(variables, &self.data, pool, &mut |jobs| {
+                    let ok;
+                    timeit! {"scale cones"; {
+                    ok = variables.scale_cones_with_tail(cones, μ, scaling, jobs);
+                    }}
+                    *prescaled = Some((ok, scaling));
+                });
+            } else {
+                self.residuals.update_with_pool(&self.variables, &self.data, pool);
+            }
             }}
             timeit! {"mu+info"; {
             state.μ = self.variables.calc_mu(&self.residuals, &self.cones);
@@ -769,9 +796,14 @@ mod internal {
 
         fn scale(&mut self, state: &IterationState<T>) -> bool {
             let is_scaling_success;
-            timeit! {"scale cones"; {
-                is_scaling_success = self.variables.scale_cones(&mut self.cones, state.μ, state.scaling);
-            }}
+            match self.prescaled.take().filter(|&(_, s)| s == state.scaling) {
+                Some((ok, _)) => is_scaling_success = ok,
+                None => {
+                    timeit! {"scale cones"; {
+                        is_scaling_success = self.variables.scale_cones(&mut self.cones, state.μ, state.scaling);
+                    }}
+                }
+            }
             let is_scaling_success = crate::mpi::all_succeeded(is_scaling_success);
             match self
                 .strategy_checkpoint_is_scaling_success(is_scaling_success, state.scaling)
@@ -1225,6 +1257,7 @@ mod internal {
                 // involves actual degradation of results
                 self.info
                     .reset_to_prev_iterate(&mut self.variables, &self.prev_vars);
+                self.prescaled = None;
 
                 // If problem is asymmetric, we can try to continue with the dual-only strategy
                 if !self.cones.all_symmetric() && (scaling == ScalingStrategy::PrimalDual) {

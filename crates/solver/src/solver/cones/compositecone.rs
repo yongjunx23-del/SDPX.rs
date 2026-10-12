@@ -802,6 +802,42 @@ where
     /// range (the expensive SVD/W work), non-PSD cones still update on all
     /// ranks, then the packed `[R, Rinv, λ]` states are gathered in block
     /// order so every rank reconstructs the bitwise-serial cone state.
+    /// `update_scaling` whose idle cone-queue workers also run `tail`; every
+    /// tail job has run when it returns. Without the cone queue (MPI shards,
+    /// binary64, no PSD cone or one worker) the tail runs first.
+    pub(crate) fn update_scaling_with_tail(
+        &mut self,
+        s: &[T],
+        z: &[T],
+        μ: T,
+        scaling_strategy: ScalingStrategy,
+        tail: Vec<crate::algebra::Job<'_>>,
+    ) -> bool {
+        let tail = crate::algebra::TailJobs::new(tail);
+        if self.mpi_world().is_none() {
+            if let Some(threading) = self.threading.as_ref().filter(|t| t.cone_workers > 1) {
+                let queued = threading.update_scaling(
+                    &mut self.cones,
+                    s,
+                    z,
+                    μ,
+                    scaling_strategy,
+                    Some(&tail),
+                );
+                if let Some(ok) = queued {
+                    let workers = threading.pool.current_num_threads();
+                    threading.pool.install(|| tail.finish(workers));
+                    return ok;
+                }
+            }
+        }
+        match self.thread_pool() {
+            Some(pool) => pool.install(|| tail.finish(pool.current_num_threads())),
+            None => tail.finish(1),
+        }
+        self.update_scaling(s, z, μ, scaling_strategy)
+    }
+
     fn update_scaling_sharded(
         &mut self,
         world: crate::mpi::World,
@@ -1380,7 +1416,8 @@ where
             return self.update_scaling_sharded(world, s, z, μ, scaling_strategy);
         }
         if let Some(threading) = self.threading.as_ref().filter(|t| t.cone_workers > 1) {
-            if let Some(ok) = threading.update_scaling(&mut self.cones, s, z, μ, scaling_strategy)
+            if let Some(ok) =
+                threading.update_scaling(&mut self.cones, s, z, μ, scaling_strategy, None)
             {
                 return ok;
             }

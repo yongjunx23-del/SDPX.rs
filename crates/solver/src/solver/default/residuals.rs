@@ -306,6 +306,19 @@ where
     fn update(&mut self, variables: &DefaultVariables<T>, data: &DefaultProblemData<T>) {
         self.update_counted(variables, data, None);
     }
+
+    fn update_with_runner(
+        &mut self,
+        variables: &DefaultVariables<T>,
+        data: &DefaultProblemData<T>,
+        pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+        run: &mut dyn FnMut(Vec<crate::algebra::Job<'_>>),
+    ) {
+        self.sampled_pool = pool.clone();
+        self.prepare_sparse(data, pool);
+        self.update_counted_with(variables, data, None, Some(run));
+        self.sampled_pool = None;
+    }
 }
 
 impl<T: FloatT> DefaultResiduals<T> {
@@ -316,6 +329,18 @@ impl<T: FloatT> DefaultResiduals<T> {
         variables: &DefaultVariables<T>,
         data: &DefaultProblemData<T>,
         counted_rows: Option<&[usize]>,
+    ) {
+        self.update_counted_with(variables, data, counted_rows, None);
+    }
+
+    /// `update_counted` whose queued block products go to `run` when given
+    /// (see `Residuals::update_with_runner`).
+    fn update_counted_with(
+        &mut self,
+        variables: &DefaultVariables<T>,
+        data: &DefaultProblemData<T>,
+        counted_rows: Option<&[usize]>,
+        mut run: Option<&mut dyn FnMut(Vec<crate::algebra::Job<'_>>)>,
     ) {
         // various products used multiple times
         let qx = data.q.dot(&variables.x);
@@ -379,8 +404,13 @@ impl<T: FloatT> DefaultResiduals<T> {
                             // Unmeasured and short: start them first.
                             jobs.push((f64::INFINITY, m, Box::new(|| bz = row_dot(&data.b))));
                             jobs.push((f64::INFINITY, m, Box::new(|| sz = row_dot(&variables.s))));
-                            let workers = pool.current_num_threads();
-                            pool.install(|| crate::algebra::run_queue(jobs, workers));
+                            match run.as_mut() {
+                                Some(run) => run(jobs),
+                                None => {
+                                    let workers = pool.current_num_threads();
+                                    pool.install(|| crate::algebra::run_queue(jobs, workers));
+                                }
+                            }
                             true
                         }
                         None => false,
