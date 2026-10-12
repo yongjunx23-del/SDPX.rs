@@ -99,6 +99,10 @@ pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
         }
     }
 
+    /// Leave column `column` of the next `solve_many` unrefined (the affine
+    /// predictor). Solvers that ignore it refine every column.
+    fn skip_refinement(&mut self, _column: usize) {}
+
     /// Binary64: continue a stationary refinement that stalls above its
     /// tolerance with GMRES-IR for the rest of the solve. The driver asks
     /// for it once a feasibility residual grows; until then the cheaper

@@ -934,6 +934,8 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     candidate: Vec<T>,
     /// Continue stalled outer refinements with GMRES-IR (`refine_further`).
     gmres_continuation: bool,
+    /// `solve_many` column left unrefined (`skip_refinement`).
+    unrefined: Option<usize>,
     batch_rhs: Vec<T>,
     batch_out: Vec<T>,
     batch_mats: Vec<Matrix<T>>,
@@ -1403,6 +1405,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             error: vec![T::zero(); n + m],
             candidate: vec![T::zero(); n + m],
             gmres_continuation: false,
+            unrefined: None,
             batch_rhs: Vec::new(),
             batch_out: Vec::new(),
             batch_mats: Vec::new(),

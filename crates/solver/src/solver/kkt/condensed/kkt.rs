@@ -189,6 +189,15 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         self.preimage_valid.resize(cols, false);
         self.scaled_solutions
             .resize((cols - 1) * self.A.m, T::zero());
+        // The affine predictor only sets σ and the second-order term of the
+        // combined right-hand side, which is refined in full. Above binary64
+        // its first solve is accurate far beyond that (Λ35-rs: within 2e-230
+        // of its right-hand side, about tenfold over the refinement tolerance
+        // in 69 of 372 iterations); its residual and corrections cost about
+        // 0.08 s of a 1.95 s iteration.
+        let unrefined = self.unrefined.take().filter(|_| {
+            T::precision_bits() > 53 && self.fused_sampled() && settings.iterative_refinement_enable
+        });
         self.counters.batches += 1;
         self.counters.rhs_applied += cols as u64;
         let reduced_width = n + self.retained_rows.len();
@@ -238,7 +247,11 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             self.swap_rhs_mats(&mut saved[c * per_column..(c + 1) * per_column]);
             let corrections = self.counters.outer_refinements;
             flags[c] = local_success(self.local_only, self.recover_rhs(&mut x, rhs))
-                && self.refine_solution(&mut x, rhs, settings);
+                && if unrefined == Some(c) {
+                    self.scale_solution(&x)
+                } else {
+                    self.refine_solution(&mut x, rhs, settings)
+                };
             if flags[c] {
                 self.keep_preimage(c, corrections);
                 if settings.iterative_refinement_enable {
@@ -306,6 +319,10 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
 
     fn escalate_regularization(&mut self) -> bool {
         self.reduced.escalate_regularization()
+    }
+
+    fn skip_refinement(&mut self, column: usize) {
+        self.unrefined = Some(column);
     }
 
     fn retained_rows(&self) -> Option<&[usize]> {
@@ -398,6 +415,24 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             None => parts.into_iter().for_each(copy),
         }
         self.preimage_valid[column] = true;
+    }
+
+    /// `workh = Hs·z` of an unrefined solution, as its residual would leave
+    /// it for `scaled_product`.
+    fn scale_solution(&mut self, x: &[T]) -> bool {
+        apply_scaling_pool_with_world(
+            None,
+            &self.pool,
+            &self.scaling_lanes,
+            self.scaling_tiles,
+            self.scaling_workers,
+            &mut self.blocks,
+            &mut self.workh,
+            &x[self.n..],
+            false,
+        );
+        self.workh_partial = false;
+        x.is_finite() && self.workh.is_finite()
     }
 
     fn refine_solution(&mut self, x: &mut Vec<T>, b: &[T], settings: &CoreSettings<T>) -> bool {

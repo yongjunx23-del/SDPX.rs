@@ -193,6 +193,9 @@ where
                     let (rhs_x, rhs_z) = self.batch_rhs[width..].split_at_mut(n);
                     rhs_x.copy_from_slice(&rhs.x);
                     rhs_z.waxpby(T::one(), &variables.s, -T::one(), &rhs.z);
+                    if !refine_predictor() {
+                        self.kktsolver.skip_refinement(0);
+                    }
                     let ok = self.kktsolver.solve_many(
                         n,
                         &self.batch_rhs[width..],
@@ -223,6 +226,9 @@ where
                 self.batch_rhs[n..width].copy_from_slice(&data.b);
                 self.batch_rhs[width..width + n].copy_from_slice(&rhs.x);
                 self.batch_rhs[width + n..].waxpby(T::one(), &variables.s, -T::one(), &rhs.z);
+                if !refine_predictor() {
+                    self.kktsolver.skip_refinement(1);
+                }
                 let ok = self.kktsolver.solve_many(
                     n,
                     &self.batch_rhs,
@@ -468,6 +474,12 @@ impl<T: FloatT> HsdTerms<T> {
         self.quad2 += rhs.quad2;
     }
 }
+/// Test switch `SDPX_REFINE_PREDICTOR=1`: refine the affine column too.
+fn refine_predictor() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SDPX_REFINE_PREDICTOR").is_some_and(|v| v != "0"))
+}
+
 pub(crate) fn hsd_terms<T: FloatT>(
     xi: &mut [T],
     x: &[T],
