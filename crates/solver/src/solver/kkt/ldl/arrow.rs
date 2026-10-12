@@ -1341,6 +1341,47 @@ pub struct ArrowLDLSolver<T: FloatT> {
     #[cfg(feature = "faer-sparse")]
     bound_panels: Option<local_bounds::BoundPanels>,
     ranks: Option<LeafRanks>,
+    value_plan: Option<ValuePlan>,
+}
+
+/// Entries from which `update_values` routes through a [`ValuePlan`].
+const VALUE_PLAN_MIN: usize = 1 << 15;
+
+/// The routing of one `update_values` index map. The KKT maps are fixed, so
+/// the column search and owner lookup run once; leaf entries are then written
+/// per leaf in parallel, and trunk and bound-panel entries (`rest`, positions
+/// in `index`) keep the serial route. Every entry gets the same value as in
+/// the serial route.
+struct ValuePlan {
+    index: Vec<usize>,
+    panels: bool,
+    leaves: Vec<Vec<(u32, LeafSlot)>>,
+    rest: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum LeafSlot {
+    /// `h[.0]`, mirrored to `h[.1]`.
+    H(usize, usize),
+    /// `raw_coupling(row, col)`.
+    Coupling(usize, usize),
+}
+
+/// The column of CSC `position`, searched from column `j`. Index maps are
+/// mostly increasing: step forward a few columns before falling back to a
+/// binary search.
+fn column_of(colptr: &[usize], mut j: usize, position: usize) -> usize {
+    if position < colptr[j] || position >= colptr[j + 1] {
+        let mut steps = 0;
+        while position >= colptr[j + 1] && steps < 4 && j + 2 < colptr.len() {
+            j += 1;
+            steps += 1;
+        }
+        if position < colptr[j] || position >= colptr[j + 1] {
+            j = colptr.partition_point(|&p| p <= position) - 1;
+        }
+    }
+    j
 }
 
 impl<T: FloatT> ArrowLDLSolver<T> {
@@ -1642,6 +1683,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 None
             },
             ranks: None,
+            value_plan: None,
         };
         #[cfg(feature = "faer-sparse")]
         if let Some(panels) = solver.bound_panels.as_mut() {
@@ -1699,18 +1741,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let t = self.trunk.len();
         let mut bounds_y_dirty = false;
         for (q, position) in positions.into_iter().enumerate() {
-            // Index maps are mostly increasing: step forward a few columns
-            // before falling back to a binary search.
-            if position < self.colptr[j] || position >= self.colptr[j + 1] {
-                let mut steps = 0;
-                while position >= self.colptr[j + 1] && steps < 4 && j + 2 < self.colptr.len() {
-                    j += 1;
-                    steps += 1;
-                }
-                if position < self.colptr[j] || position >= self.colptr[j + 1] {
-                    j = self.colptr.partition_point(|&p| p <= position) - 1;
-                }
-            }
+            j = column_of(&self.colptr, j, position);
             let i = self.rowval[position];
             let (li, lj) = (self.local[i], self.local[j]);
             match (self.owner[i], self.owner[j]) {
@@ -1753,6 +1784,47 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 panels.y_residues = ResidueCache::default();
             }
         }
+    }
+
+    /// Route a fixed index map once (see [`ValuePlan`]); `None` when the
+    /// positions do not fit the compact plan.
+    fn value_plan(&self, index: &[usize]) -> Option<ValuePlan> {
+        if index.len() > u32::MAX as usize {
+            return None;
+        }
+        let mut panels = self.exact_bound_panels.is_some();
+        #[cfg(feature = "faer-sparse")]
+        {
+            panels |= self.bound_panels.is_some();
+        }
+        let mut leaves = vec![Vec::new(); self.leaves.len()];
+        let mut rest = Vec::new();
+        let mut j = 0;
+        for (q, &position) in index.iter().enumerate() {
+            j = column_of(&self.colptr, j, position);
+            let i = self.rowval[position];
+            let (li, lj) = (self.local[i], self.local[j]);
+            let slot = match (self.owner[i], self.owner[j]) {
+                (x, y) if x == usize::MAX && y == usize::MAX => None,
+                (x, y) if x != usize::MAX && y != usize::MAX => {
+                    let g = self.leaves[x].ids.len();
+                    Some((x, LeafSlot::H(li + lj * g, lj + li * g)))
+                }
+                _ if panels => None,
+                (x, _) if x != usize::MAX => Some((x, LeafSlot::Coupling(li, lj))),
+                (_, y) => Some((y, LeafSlot::Coupling(lj, li))),
+            };
+            match slot {
+                Some((leaf, slot)) => leaves[leaf].push((q as u32, slot)),
+                None => rest.push(q),
+            }
+        }
+        Some(ValuePlan {
+            index: index.to_vec(),
+            panels,
+            leaves,
+            rest,
+        })
     }
 
     /// The existing QDLDL fallback needs a CSC input. Reconstruct it only
@@ -2168,9 +2240,57 @@ impl<T: FloatT> HasLinearSolverInfo for ArrowLDLSolver<T> {
 
 impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
     fn update_values(&mut self, index: &[usize], values: &[T]) {
-        self.update_entries(index.iter().copied().take(values.len()), |q, value| {
-            *value = values[q];
+        let index = &index[..index.len().min(values.len())];
+        let pool = self.pool.clone().filter(|p| {
+            p.current_num_threads() > 1 && self.leaves.len() > 1 && index.len() >= VALUE_PLAN_MIN
         });
+        let Some(pool) = pool else {
+            self.update_entries(index.iter().copied(), |q, value| *value = values[q]);
+            return;
+        };
+        let mut panels = self.exact_bound_panels.is_some();
+        #[cfg(feature = "faer-sparse")]
+        {
+            panels |= self.bound_panels.is_some();
+        }
+        let cached = self.value_plan.take().filter(|plan| {
+            plan.panels == panels
+                && plan.index.len() == index.len()
+                && pool.install(|| {
+                    plan.index
+                        .par_chunks(VALUE_PLAN_MIN)
+                        .zip(index.par_chunks(VALUE_PLAN_MIN))
+                        .all(|(a, b)| a == b)
+                })
+        });
+        let Some(plan) = cached.or_else(|| self.value_plan(index)) else {
+            self.update_entries(index.iter().copied(), |q, value| *value = values[q]);
+            return;
+        };
+        // Each leaf takes its entries in index order, so a repeated position
+        // keeps its last value as in the serial route.
+        pool.install(|| {
+            self.leaves
+                .par_iter_mut()
+                .zip(&plan.leaves)
+                .for_each(|(leaf, slots)| {
+                    for &(q, slot) in slots {
+                        let value = values[q as usize];
+                        match slot {
+                            LeafSlot::H(at, mirror) => {
+                                leaf.h[at] = value;
+                                leaf.h[mirror] = value;
+                            }
+                            LeafSlot::Coupling(row, col) => *leaf.raw_coupling(row, col) = value,
+                        }
+                    }
+                })
+        });
+        let rest = &plan.rest;
+        self.update_entries(rest.iter().map(|&q| index[q]), |k, value| {
+            *value = values[rest[k]];
+        });
+        self.value_plan = Some(plan);
     }
 
     fn scale_values(&mut self, index: &[usize], scale: T) {

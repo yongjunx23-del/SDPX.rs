@@ -204,6 +204,20 @@ pub trait Variables<T: FloatT> {
         self.add_step(step_lhs, α);
     }
 
+    /// Save the current point into `prev`, then step: the values of
+    /// `prev.copy_from(self)` followed by [`Variables::add_step_with_pool`].
+    /// Implementations may swap buffers in place of the copy.
+    fn advance_from(
+        &mut self,
+        prev: &mut Self,
+        step_lhs: &Self,
+        α: T,
+        pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    ) {
+        prev.copy_from(self);
+        self.add_step_with_pool(step_lhs, α, pool);
+    }
+
     /// Bring the variables into the interior of the cone constraints.
     fn symmetric_initialization(&mut self, cones: &mut Self::C);
 
@@ -440,6 +454,9 @@ where
 
     /// save a prior iterate
     fn save_prev_iterate(&mut self, variables: &Self::V, prev_variables: &mut Self::V);
+    /// Save a prior iterate's scalars only; the caller keeps the variables
+    /// (see [`Variables::advance_from`]).
+    fn save_prev_scalars(&mut self);
     /// restore a prior iterate
     fn reset_to_prev_iterate(&mut self, variables: &mut Self::V, prev_variables: &Self::V);
 

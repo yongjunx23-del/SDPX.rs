@@ -33,6 +33,8 @@ pub struct DefaultKKTSystem<T> {
     // Fixed-τ phase: the constant column (−q, b) is not solved and the
     // prepared affine output is batch column 0 instead of 1.
     fixed_tau: bool,
+    // The constant column's HSD terms, kept until the next factorization.
+    const_terms: Option<HsdTerms<T>>,
 }
 
 impl<T> DefaultKKTSystem<T>
@@ -100,6 +102,7 @@ where
             hs2: Vec::new(),
             pre2: (Vec::new(), Vec::new()),
             fixed_tau: false,
+            const_terms: None,
         }
     }
 }
@@ -132,6 +135,7 @@ where
     fn reset_solve(&mut self) {
         self.kktsolver.reset_solve();
         self.affine_ready = None;
+        self.const_terms = None;
     }
 
     fn refine_further(&mut self) {
@@ -145,6 +149,7 @@ where
         settings: &DefaultSettings<T>,
     ) -> bool {
         self.affine_ready = None;
+        self.const_terms = None;
         // Update the linear solver with new cones and solve for the constant
         // terms.  On failure escalate the static regularization and retry:
         // unpivoted elimination can overflow pivots on degenerate quasidef
@@ -173,6 +178,7 @@ where
         settings: &DefaultSettings<T>,
     ) -> bool {
         self.affine_ready = None;
+        self.const_terms = None;
         let (n, m) = (data.n, data.m);
         let width = n + m;
         self.fixed_tau = variables.fixed_tau;
@@ -227,8 +233,8 @@ where
                 constant_ok = all_succeeded(ok[0]);
                 let affine_ok = all_succeeded(ok[1]);
                 if constant_ok {
-                    copy_scaled(&*self.kktsolver, 0, &mut self.hs2);
-                    copy_preimage(&*self.kktsolver, &mut self.pre2);
+                    take_scaled(&mut *self.kktsolver, 0, &mut self.hs2);
+                    self.kktsolver.take_scaled_preimage(0, &mut self.pre2);
                     self.affine_ready = Some(affine_ok);
                 }
             }
@@ -276,17 +282,9 @@ where
             }
         }
 
-        match step_direction {
-            StepDirection::Affine => {
-                workz.waxpby(T::one(), Δs_const_term, -T::one(), &rhs.z);
-            }
-            StepDirection::Combined => {
-                workz.copy_from_slice(&rhs.z);
-                for (v, &c) in workz.iter_mut().zip(Δs_const_term.iter()) {
-                    *v = c - *v;
-                }
-            }
-        }
+        // c − z: the ±1 products are exact, so this rounds as the
+        // subtraction does.
+        workz.waxpby(T::one(), Δs_const_term, -T::one(), &rhs.z);
 
         // ---------------------------------------------------
         // this solves the variable part of reduced KKT system
@@ -310,7 +308,17 @@ where
             lhs.x.copy_from(x1);
             lhs.z.copy_from(z1);
         } else {
-            let terms = hsd_terms(workx, &variables.x, variables.τ, data, x1, z1, x2, z2);
+            let pool = crate::solver::core::traits::ConeCollection::worker_pool(&*cones);
+            let constant = &mut self.const_terms;
+            let terms = hsd_terms_reusing(
+                workx,
+                &variables.x,
+                variables.τ,
+                data,
+                (x1, z1, x2, z2),
+                constant,
+                pool.as_deref(),
+            );
             trace_dtau(&terms, rhs.τ, rhs.κ, variables.τ, variables.κ);
             lhs.τ = hsd_tau(terms, rhs.τ, rhs.κ, variables.τ, variables.κ);
             lhs.x.waxpby(T::one(), x1, lhs.τ, x2);
@@ -485,6 +493,49 @@ pub(crate) fn hsd_terms<T: FloatT>(
         quad2: data.P.sym_up().quad_form(x2, x2),
     }
 }
+/// [`hsd_terms`] for the default system. The constant column's terms (q2,
+/// b2, delta, quad2) depend on x, τ and that column only, so later directions
+/// after the same factorization reuse them; a fresh evaluation runs its two
+/// long dots side by side on `pool`, each in its serial order. Same values.
+fn hsd_terms_reusing<T: FloatT>(
+    xi: &mut [T],
+    x: &[T],
+    tau: T,
+    data: &DefaultProblemData<T>,
+    (x1, z1, x2, z2): (&[T], &[T], &[T], &[T]),
+    constant: &mut Option<HsdTerms<T>>,
+    pool: Option<&rayon::ThreadPool>,
+) -> HsdTerms<T> {
+    xi.axpby(T::recip(tau), x, T::zero());
+    let q1 = data.q.dot(x1);
+    let quad1 = data.P.sym_up().quad_form(xi, x1);
+    xi.axpby(-T::one(), x2, T::one());
+    let b = &data.b[..];
+    let (b1, mut terms) = match *constant {
+        Some(terms) => (b.dot(z1), terms),
+        None => {
+            let dots = || rayon::join(|| b.dot(z1), || b.dot(z2));
+            let (b1, b2) = match pool {
+                Some(pool) => pool.install(dots),
+                None => (b.dot(z1), b.dot(z2)),
+            };
+            let terms = HsdTerms {
+                q1,
+                b1,
+                quad1,
+                q2: data.q.dot(x2),
+                b2,
+                delta: data.P.sym_up().quad_form(xi, xi),
+                quad2: data.P.sym_up().quad_form(x2, x2),
+            };
+            *constant = Some(terms);
+            (b1, terms)
+        }
+    };
+    (terms.q1, terms.b1, terms.quad1) = (q1, b1, quad1);
+    terms
+}
+
 /// Diagnostic only (`SDPX_TRACE_TAU`): the Δτ numerator and denominator and
 /// their cancellation (sum of absolute terms over the absolute sum).
 fn trace_dtau<T: FloatT>(v: &HsdTerms<T>, rt: T, rk: T, tau: T, kappa: T) {
@@ -523,25 +574,11 @@ pub(crate) fn hsd_tau<T: FloatT>(v: HsdTerms<T>, rt: T, rk: T, tau: T, kappa: T)
 /// in binary64 with a squared `G = WᵀW`, enough to corrupt `Δs`. At MPFR
 /// precision it is negligible, and the reuse saves a full-precision product
 /// per block; in binary64 `mul_Hs` is cheap.
-fn copy_scaled<T: FloatT>(solver: &dyn KKTSolver<T>, column: usize, out: &mut Vec<T>) {
-    if let Some(value) = solver
-        .scaled_solution(column)
-        .filter(|_| T::precision_bits() > 53)
-    {
-        out.resize(value.len(), T::zero());
-        out.copy_from_slice(value);
+fn take_scaled<T: FloatT>(solver: &mut dyn KKTSolver<T>, column: usize, out: &mut Vec<T>) {
+    if T::precision_bits() > 53 {
+        solver.take_scaled_solution(column, out);
     } else {
         out.clear();
-    }
-}
-
-/// The constant column's W·z pre-images (see `KKTSolver::scaled_preimage`).
-fn copy_preimage<T: FloatT>(solver: &dyn KKTSolver<T>, out: &mut (Vec<T>, Vec<bool>)) {
-    out.0.clear();
-    out.1.clear();
-    if let Some((values, blocks)) = solver.scaled_preimage(0) {
-        out.0.extend_from_slice(values);
-        out.1.extend_from_slice(blocks);
     }
 }
 
@@ -573,6 +610,7 @@ where
         data: &DefaultProblemData<T>,
         settings: &DefaultSettings<T>,
     ) -> bool {
+        self.const_terms = None;
         let workx = &mut self.workx;
         let workz = &mut self.batch_rhs[2 * data.n + data.m..];
         workx.axpby(-T::one(), &data.q, T::zero()); //workx .= -q
@@ -581,18 +619,20 @@ where
         let (x2, z2) = self.batch_out[..data.n + data.m].split_at_mut(data.n);
         let is_success = self.kktsolver.solve(Some(x2), Some(z2), settings.core());
 
-        copy_scaled(&*self.kktsolver, 0, &mut self.hs2);
-        copy_preimage(&*self.kktsolver, &mut self.pre2);
+        take_scaled(&mut *self.kktsolver, 0, &mut self.hs2);
+        self.kktsolver.take_scaled_preimage(0, &mut self.pre2);
         is_success
     }
 
     pub(crate) fn update_P(&mut self, P: &CscMatrix<T>) {
         self.affine_ready = None;
+        self.const_terms = None;
         self.kktsolver.update_P(P);
     }
 
     pub(crate) fn update_A(&mut self, A: &CscMatrix<T>) {
         self.affine_ready = None;
+        self.const_terms = None;
         self.kktsolver.update_A(A);
     }
 }

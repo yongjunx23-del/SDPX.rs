@@ -140,13 +140,32 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
     }
 
     fn scaled_preimage(&self, column: usize) -> Option<(&[T], &[bool])> {
-        let m = self.A.m;
-        (*self.preimage_valid.get(column)?).then(|| {
-            (
-                &self.preimages[column * m..(column + 1) * m],
-                &self.preimage_blocks[..],
-            )
-        })
+        (*self.preimage_valid.get(column)?)
+            .then(|| (&self.preimages[column][..], &self.preimage_blocks[..]))
+    }
+
+    fn take_scaled_solution(&mut self, column: usize, out: &mut Vec<T>) {
+        // Of two columns, the first is the whole of `scaled_solutions`.
+        if self.scaled_valid.len() == 2 && column == 0 && self.scaled_valid[0] {
+            std::mem::swap(&mut self.scaled_solutions, out);
+            self.scaled_valid[0] = false;
+            return;
+        }
+        out.clear();
+        if let Some(values) = self.scaled_solution(column) {
+            out.extend_from_slice(values);
+        }
+    }
+
+    fn take_scaled_preimage(&mut self, column: usize, out: &mut (Vec<T>, Vec<bool>)) {
+        out.1.clear();
+        if self.preimage_valid.get(column).copied().unwrap_or(false) {
+            std::mem::swap(&mut self.preimages[column], &mut out.0);
+            out.1.extend_from_slice(&self.preimage_blocks);
+            self.preimage_valid[column] = false;
+        } else {
+            out.0.clear();
+        }
     }
 
     fn solve_many(
@@ -173,23 +192,20 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         self.counters.batches += 1;
         self.counters.rhs_applied += cols as u64;
         let reduced_width = n + self.retained_rows.len();
-        let half_width: usize = if self.fused_sampled() {
+        let per_column: usize = if self.fused_sampled() {
             self.blocks
                 .iter()
-                .map(|b| match &b.scaling {
-                    Scaling::Psd(p) if p.sampled.is_some() => triangular_number(p.mat3c.nrows()),
-                    _ => 0,
-                })
-                .sum()
+                .filter(|b| matches!(&b.scaling, Scaling::Psd(p) if p.sampled.is_some()))
+                .count()
         } else {
             0
         };
         let mut b = std::mem::take(&mut self.batch_rhs);
         let mut reduced_out = std::mem::take(&mut self.batch_out);
-        let mut halves = std::mem::take(&mut self.batch_halves);
+        let mut saved = std::mem::take(&mut self.batch_mats);
         b.resize(cols * reduced_width, T::zero());
         reduced_out.resize(b.len(), T::zero());
-        halves.resize(cols * half_width, T::zero());
+        saved.resize_with(cols * per_column, || Matrix::zeros((0, 0)));
         let valid: Vec<bool> = rhs
             .chunks(width)
             .map(|b| local_success(self.local_only, b.is_finite()))
@@ -203,23 +219,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             self.prepare_rhs(&rhs[c * width..(c + 1) * width]);
             dest[..n].copy_from_slice(&self.workx);
             dest[n..].copy_from_slice(&self.retained_rhs);
-            let mut offset = c * half_width;
-            if half_width != 0 {
-                for block in &self.blocks {
-                    if let Scaling::Psd(p) = &block.scaling {
-                        if p.sampled.is_some() {
-                            // Congruences mirror their upper triangle exactly;
-                            // keep one copy of each value between RHS columns.
-                            let side = p.mat3c.nrows();
-                            for j in 0..side {
-                                let values = &p.mat3c.data()[j * side..j * side + j + 1];
-                                halves[offset..offset + values.len()].copy_from_slice(values);
-                                offset += values.len();
-                            }
-                        }
-                    }
-                }
-            }
+            // Keep this column's condensed blocks until its recovery.
+            self.swap_rhs_mats(&mut saved[c * per_column..(c + 1) * per_column]);
         }
         let mut flags = self
             .reduced
@@ -234,25 +235,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             let r = &reduced_out[c * reduced_width..(c + 1) * reduced_width];
             x[..n].copy_from_slice(&r[..n]);
             self.retained_rhs.copy_from_slice(&r[n..]);
-            let mut offset = c * half_width;
-            if half_width != 0 {
-                for block in &mut self.blocks {
-                    if let Scaling::Psd(p) = &mut block.scaling {
-                        if p.sampled.is_some() {
-                            let side = p.mat3c.nrows();
-                            for j in 0..side {
-                                let saved = &halves[offset..offset + j + 1];
-                                p.mat3c.data_mut()[j * side..j * side + j + 1]
-                                    .copy_from_slice(saved);
-                                for (i, &value) in saved[..j].iter().enumerate() {
-                                    p.mat3c[(j, i)] = value;
-                                }
-                                offset += j + 1;
-                            }
-                        }
-                    }
-                }
-            }
+            self.swap_rhs_mats(&mut saved[c * per_column..(c + 1) * per_column]);
             let corrections = self.counters.outer_refinements;
             flags[c] = local_success(self.local_only, self.recover_rhs(&mut x, rhs))
                 && self.refine_solution(&mut x, rhs, settings);
@@ -272,7 +255,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         self.x = x;
         self.batch_rhs = b;
         self.batch_out = reduced_out;
-        self.batch_halves = halves;
+        self.batch_mats = saved;
         flags
     }
 
@@ -387,11 +370,14 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             return;
         }
         let m = self.A.m;
-        self.preimages
-            .resize(self.preimage_valid.len() * m, T::zero());
+        if self.preimages.len() < self.preimage_valid.len() {
+            self.preimages
+                .resize_with(self.preimage_valid.len(), Vec::new);
+        }
+        self.preimages[column].resize(m, T::zero());
         self.preimage_blocks.resize(self.blocks.len(), false);
         let offset = self.blocks.first().map_or(0, |b| b.rows.start);
-        let (mut rest, mut at) = (&mut self.preimages[column * m..(column + 1) * m], 0);
+        let (mut rest, mut at) = (&mut self.preimages[column][..], 0);
         let mut parts = Vec::with_capacity(self.blocks.len());
         for (block, keep) in self.blocks.iter().zip(&mut self.preimage_blocks) {
             let (start, end) = (block.rows.start - offset, block.rows.end - offset);

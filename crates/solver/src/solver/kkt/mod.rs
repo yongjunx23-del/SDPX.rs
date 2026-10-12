@@ -79,6 +79,26 @@ pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
         None
     }
 
+    /// Move `scaled_solution(column)` into `out` (empty when None). The
+    /// solver may give up the column, so call it after the column's last use.
+    fn take_scaled_solution(&mut self, column: usize, out: &mut Vec<T>) {
+        out.clear();
+        if let Some(values) = self.scaled_solution(column) {
+            out.extend_from_slice(values);
+        }
+    }
+
+    /// Move `scaled_preimage(column)` into `out` (empty when None), as
+    /// [`KKTSolver::take_scaled_solution`].
+    fn take_scaled_preimage(&mut self, column: usize, out: &mut (Vec<T>, Vec<bool>)) {
+        out.0.clear();
+        out.1.clear();
+        if let Some((values, blocks)) = self.scaled_preimage(column) {
+            out.0.extend_from_slice(values);
+            out.1.extend_from_slice(blocks);
+        }
+    }
+
     /// Binary64: continue a stationary refinement that stalls above its
     /// tolerance with GMRES-IR for the rest of the solve. The driver asks
     /// for it once a feasibility residual grows; until then the cheaper

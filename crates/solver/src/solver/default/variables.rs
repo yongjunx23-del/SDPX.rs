@@ -314,6 +314,54 @@ where
         self.κ += α * step.κ;
     }
 
+    fn advance_from(
+        &mut self,
+        prev: &mut Self,
+        step: &Self,
+        α: T,
+        pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    ) {
+        let same = |a: &[T], b: &[T]| a.len() == b.len();
+        let shaped = same(&self.x, &prev.x) && same(&self.s, &prev.s) && same(&self.z, &prev.z);
+        let Some(pool) = pool.as_ref().filter(|_| shaped) else {
+            prev.copy_from(self);
+            self.add_step_with_pool(step, α, pool);
+            return;
+        };
+        // The current buffers become the previous iterate, and the step is
+        // written into the other ones with `add_step`'s expression.
+        std::mem::swap(&mut self.x, &mut prev.x);
+        std::mem::swap(&mut self.s, &mut prev.s);
+        std::mem::swap(&mut self.z, &mut prev.z);
+        (prev.τ, prev.κ) = (self.τ, self.κ);
+        const CHUNK: usize = 2048;
+        fn par_step<T: FloatT>(w: &mut [T], a: T, x: &[T], y: &[T]) {
+            let b = T::one();
+            w.par_chunks_mut(CHUNK)
+                .zip(x.par_chunks(CHUNK))
+                .zip(y.par_chunks(CHUNK))
+                .for_each(|((w, x), y)| {
+                    for ((w, x), y) in w.iter_mut().zip(x).zip(y) {
+                        *w = a * (*x) + b * (*y);
+                    }
+                });
+        }
+        let (x, s, z) = (&mut self.x, &mut self.s, &mut self.z);
+        pool.install(|| {
+            rayon::join(
+                || par_step(x, α, &step.x, &prev.x),
+                || {
+                    rayon::join(
+                        || par_step(s, α, &step.s, &prev.s),
+                        || par_step(z, α, &step.z, &prev.z),
+                    )
+                },
+            );
+        });
+        self.τ += α * step.τ;
+        self.κ += α * step.κ;
+    }
+
     fn symmetric_initialization(&mut self, cones: &mut CompositeCone<T>) {
         _shift_to_cone_interior(&mut self.s, cones, PrimalOrDualCone::PrimalCone);
         _shift_to_cone_interior(&mut self.z, cones, PrimalOrDualCone::DualCone);

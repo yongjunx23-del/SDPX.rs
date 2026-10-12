@@ -433,6 +433,10 @@ impl<T: FloatT> Info<T> for OwnedInfo<T> {
         prev_variables.border_s.copy_from_slice(&variables.border_s);
     }
 
+    fn save_prev_scalars(&mut self) {
+        self.0.save_prev_scalars();
+    }
+
     fn reset_to_prev_iterate(
         &mut self,
         variables: &mut OwnedVariables<T>,

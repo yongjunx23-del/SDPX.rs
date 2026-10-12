@@ -409,8 +409,9 @@ where
                 Flow::Retry => continue,
                 Flow::Stop => break,
             }
-            // Keep the previous iterate in case the next one is a dud.
-            self.info.save_prev_iterate(&self.variables, &mut self.prev_vars);
+            // Keep the previous iterate in case the next one is a dud
+            // (the variables are kept by `advance_from` below).
+            self.info.save_prev_scalars();
             if let Some(m) = self.tolerance_multiple() {
                 if crate::mpi::agreed_branch(self.best.as_ref().map_or(true, |(b, _)| m < *b)) {
                     let best = self.best.get_or_insert_with(|| (m, self.variables.new_like()));
@@ -419,8 +420,12 @@ where
                 }
             }
             timeit! {"iterate update"; {
-            self.variables
-                .add_step_with_pool(&self.step_lhs, state.α, self.cones.worker_pool());
+            self.variables.advance_from(
+                &mut self.prev_vars,
+                &self.step_lhs,
+                state.α,
+                self.cones.worker_pool(),
+            );
             }}
         }
         // A large starting scale overshoots on some problems: restart with

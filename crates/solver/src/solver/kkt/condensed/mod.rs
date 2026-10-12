@@ -936,12 +936,12 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     gmres_continuation: bool,
     batch_rhs: Vec<T>,
     batch_out: Vec<T>,
-    batch_halves: Vec<T>,
+    batch_mats: Vec<Matrix<T>>,
     scaled_solutions: Vec<T>,
     scaled_valid: Vec<bool>,
     // Per column: W·z of the fused sampled PSD blocks (`PsdBlock::preimage`)
     // when no refinement correction changed z, and the blocks they cover.
-    preimages: Vec<T>,
+    preimages: Vec<Vec<T>>,
     preimage_valid: Vec<bool>,
     preimage_blocks: Vec<bool>,
     workx: Vec<T>,
@@ -1405,7 +1405,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             gmres_continuation: false,
             batch_rhs: Vec::new(),
             batch_out: Vec::new(),
-            batch_halves: Vec::new(),
+            batch_mats: Vec::new(),
             scaled_solutions: Vec::new(),
             scaled_valid: Vec::new(),
             preimages: Vec::new(),
@@ -1875,6 +1875,27 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             if let Scaling::Psd(p) = &block.scaling {
                 if p.sampled.is_some() {
                     out.extend_from_slice(p.mat3c.data());
+                }
+            }
+        }
+    }
+
+    /// Exchange the fused sampled blocks' condensed right-hand sides (`mat3c`,
+    /// written whole by `prepare_rhs` and read by `recover_rhs`) with `mats`,
+    /// so a batch keeps each column's blocks without copying them.
+    pub(super) fn swap_rhs_mats(&mut self, mats: &mut [Matrix<T>]) {
+        if mats.is_empty() {
+            return;
+        }
+        let mut mats = mats.iter_mut();
+        for block in &mut self.blocks {
+            if let Scaling::Psd(p) = &mut block.scaling {
+                if p.sampled.is_some() {
+                    let other = mats.next().unwrap();
+                    if other.size() != p.mat3c.size() {
+                        *other = Matrix::zeros(p.mat3c.size());
+                    }
+                    std::mem::swap(&mut p.mat3c, other);
                 }
             }
         }

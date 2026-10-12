@@ -324,6 +324,11 @@ where
     }
 
     fn save_prev_iterate(&mut self, variables: &Self::V, prev_variables: &mut Self::V) {
+        self.save_prev_scalars();
+        prev_variables.copy_from(variables);
+    }
+
+    fn save_prev_scalars(&mut self) {
         self.prev_cost_primal = self.cost_primal;
         self.prev_cost_dual = self.cost_dual;
         self.prev_res_primal = self.res_primal;
@@ -332,8 +337,6 @@ where
         self.prev_res_dual_qnorm = self.res_dual_qnorm;
         self.prev_gap_abs = self.gap_abs;
         self.prev_gap_rel = self.gap_rel;
-
-        prev_variables.copy_from(variables);
     }
 
     fn reset_to_prev_iterate(&mut self, variables: &mut Self::V, prev_variables: &Self::V) {
