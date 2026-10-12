@@ -222,6 +222,13 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - Task 20 already batched refinement agreements; measure remaining collectives before changing them.
    - L6 rerun after the queue fix (journal 2026-10-12): owner layouts beat SDPB at 1, 2 and 4 nodes (Λ35/1024, 60 iterations: 4 nodes 16×16 108 s vs 126 s); the ordinary MPI path does not scale (201 s at 4 nodes). Owner ranks idle: 3-component ranks pay a second wave in the arrow panel solve (L26), Gram sync runs serially per block (L27), and scale-cone vs factor imbalance costs ~5 s at the shift barrier.
    - Owner follow-ups (journal 2026-10-12): kept L26 one-wave leaf chunks (−2.6%) and L28 rank-order reduce-scatter (−2.8%); rejected L25 planned contribution ways, L27 sync split hints and L29 pooled copies (all under 2%). 4 nodes 16×16 is now 97 s. Per-rank collective waits are 12–21 s spread over ~25 sites; site 100 costs ≤0.8 s, so merging the shift barrier is not worth it. Residual/recover/prepare run at 6–7 of 16 threads on owner ranks.
+   - Owner follow-ups 2 (journal 2026-10-12):
+     - Kept L33b, cone-queue helpers that run pending pool tasks when the rank has more workers than cones (−2.4%).
+     - Kept L35, `SCHED_IDLE` core keepers on by default for multi-rank runs under a load-following governor: 95.10 → 87.50 s at 4 nodes 16×16 without receipts. One busy process loses 2% with keepers, hence the multi-rank default.
+     - Rejected: L30 board items in cone kernels, L31 inverse-iteration chains, the MWAITX keeper variant (plain +6.5%) and the 12×21 / 36×7 layouts (L32).
+     - Remaining on the critical rank: ~110 allreduces per iteration, 6.7 s total. The per-site minimum over ranks sums to ~2.8 s (communication floor); the rest is phase-to-phase imbalance, so removing every barrier (L4) is worth at most ~3%.
+     - `scale cones` is set by the largest cone's serial MPFR SVD (~150 ms per cone per iteration).
+     - Plain A legs differ 4% between nodes: compare within a node only.
    - Single-heavy-owner sampled splitting is closed: correct on both MPI gates, but neither improves end-to-end time.
    - Profile prime-group underfill and NUMA residue placement on large calls;
      split complete inner products over output tiles only if they dominate.

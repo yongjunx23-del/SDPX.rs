@@ -39,6 +39,14 @@ solve 2.02 s/50 it (objective error 4.5e-7) → 9 ms/0 it (6.6e-14), whole CLI
 
 ### Performance
 
+- MPI owner path on Linux: `sdpx` keeps each rank's allocated cores clocked
+  with one `SCHED_IDLE` keeper thread per CPU when the frequency governor
+  follows load. Under `conservative`, cores that serve short parallel regions
+  sat at 1.5 instead of 2.25 GHz. Multi-rank runs only (`SDPX_KEEP_CORES=0`
+  disables, `1` forces): one busy 64-thread process ran 2.0% slower with
+  keepers. Λ35 at 1024 bits, 60 it, 4 nodes × 16 ranks × 16 threads, points
+  identical: 95.10 → 87.50 s. Idle cone-queue workers also run pending pool
+  tasks when an owner rank has more workers than cones (98.74 → 96.35 s).
 - Upper-only exact congruences compute their second residue product on the
   upper block triangle (16-column panels), about half its flops; every kept
   entry is the same exact integer, so results are bitwise identical.

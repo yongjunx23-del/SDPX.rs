@@ -30,7 +30,7 @@ polynomial coefficients; only the replacement sampling metadata is owned.
 
 | Module | Responsibility |
 |---|---|
-| `solver/core` | HSD predictor/corrector loop and the traits it drives (data, variables, residuals, KKT, info, solution); callbacks and checkpoints. |
+| `solver/core` | HSD predictor/corrector loop and the traits it drives (data, variables, residuals, KKT, info, solution); callbacks, checkpoints and the CLI's idle-priority core keepers. |
 | `solver/default` | The standard problem: `PreparedProblem` setup, Ruiz equilibration, presolve, settings, convergence tests, JSON I/O, data updates. |
 | `solver/cones` | Zero, nonnegative, SOC, exponential, power, generalized power and PSD-triangle cones; the composite cone and its worker pool. |
 | `solver/kkt` | Augmented (`direct`) and condensed formulations, LDL backends (`ldl`) and iterative refinement. |

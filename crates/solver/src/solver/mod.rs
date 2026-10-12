@@ -13,6 +13,7 @@ pub(crate) mod chordal;
 
 pub use crate::solver::cones::{SupportedConeT, SupportedConeT::*};
 pub use crate::solver::core::traits;
+pub use crate::solver::core::CoreKeepers;
 pub use crate::solver::core::CoreSettings;
 #[cfg(feature = "serde")]
 pub use crate::solver::core::SolverJSONReadWrite;

@@ -28,6 +28,9 @@ With MPI, --partitions auto or a count equal to the world size enables one\n\
 owner per rank; the default without --partitions keeps the ordinary MPI path.\n\
 --cost-history-in and --cost-history-out are supported for partitioned MPI\n\
 solves; export gathers owner timings to rank zero.\n\
+On Linux, multi-rank runs keep their allocated cores clocked with idle-priority\n\
+threads under a load-following frequency governor; SDPX_KEEP_CORES=0 disables\n\
+them and SDPX_KEEP_CORES=1 forces them.\n\
 --checkpoint writes the accepted iterate every N (default 10) iterations;\n\
 --restart starts from such a file: an exact continuation for the same input,\n\
 or a hot start for a nearby input with the same structure and precision\n\
@@ -565,6 +568,8 @@ with_frontend_precisions!(precision_runner);
 fn main() -> ExitCode {
     tune_allocator();
     let mpi = MpiContext::initialize();
+    // Before any worker pool or affinity narrowing: one per allocated CPU.
+    let _keepers = sdpx_solver::solver::CoreKeepers::for_world(mpi.size());
     if mpi.size() > 1 {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {

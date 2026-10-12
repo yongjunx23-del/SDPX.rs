@@ -4,8 +4,10 @@ pub mod callbacks;
 pub(crate) mod checkpoint;
 pub mod traits;
 
+mod keepers;
 mod settings;
 mod solver;
+pub use keepers::CoreKeepers;
 pub use settings::*;
 pub use solver::*;
 

@@ -73,6 +73,13 @@ nonfinite values and nonpositive homogenization or scaling factors.
 `SDPX_RECEIPT=FILE` records phase timings and peak RSS. Run each executable
 with `--help` for its full argument list, including MPI partitioning.
 
+On Linux, an MPI run with more than one rank starts one idle-priority keeper
+thread per allocated CPU when the frequency governor follows load
+(`conservative`, `ondemand`, `schedutil`). The keepers hold the cores at full
+clock between short parallel regions and yield to any solver thread.
+`SDPX_KEEP_CORES=0` turns them off, and any other value starts them for a
+single process too. While keepers run, receipts record wall times only.
+
 ## Reducing explicit SDP inputs
 
 For Float64 equality/PSD models such as SU(2), reduce the input before

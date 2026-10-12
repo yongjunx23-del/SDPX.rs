@@ -8,6 +8,47 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-12 — L35: idle-priority core keepers for multi-rank runs (kept, perf-mc-impl)
+
+- Hypothesis (L34): under the `conservative` governor, the cores of an owner rank that serve short regions stay at 1.5 GHz. An in-solver `SCHED_IDLE` spinner per allocated CPU would hold them at 2.25 GHz and yield to every solver thread.
+- Change:
+  - `solver/core/keepers.rs`: `CoreKeepers::for_world(ranks)` starts one keeper per CPU of the affinity mask. Each keeper pins itself, switches to `SCHED_IDLE` (and quits if either step fails), then spins on `PAUSE` until it is dropped.
+  - The CLI starts keepers after MPI init. They are on by default when `ranks > 1` and the first CPU's governor is `conservative`, `ondemand` or `schedutil`. `SDPX_KEEP_CORES=0` disables them; any other value forces them.
+  - While keepers run, receipts turn CPU clocks off (`cpu_clocks: false`). Otherwise the keepers' spinning counts as solver CPU time, and every process-clock read sums threads that are running on every core.
+- Result, 4 nodes owner 16×16, Λ35 1024 bits, 60 it (points identical in every pair):
+
+  | Binary, receipts | job | keepers off s | keepers on s | change |
+  |---|---|---|---|---|
+  | mci77 (mci71 + L35), receipts on | 225133 | 96.64 / 97.04 | 91.4 / 91.5 | −5.6% |
+  | mci78 (branch + L33b + L35), receipts off | 225142 | 95.5 / 94.69 | 87.62 / 87.38 | −8.0% |
+
+  - Rank-mean phases (225133, A1 → B1):
+    - `mpi.allreduce` 14.24 → 10.41 s; the slower ranks gained.
+    - `residual update` 5.17 → 4.32 s, `final step len` 2.32 → 1.93 s, `owned.local_assemble` 4.09 → 3.68 s.
+    - The fine RNS timers rose 10–19%, from process-clock reads that walk the 16 running keepers. mci78 removes that.
+- Result, 1 node plain, 64 threads (points identical):
+
+  | Case | job | off s | on s | change |
+  |---|---|---|---|---|
+  | Λ35 60 it, receipts + profile (node138) | 225135 | 142.9 / 143.7 | 149.3 / 149.1 | +4.1% |
+  | Λ35-rs 30 it, same job | 225135 | 57.9 / 57.7 | 60.5 / 60.7 | +4.8% |
+  | Λ35 60 it, no receipts (node7) | 225139 | 138.92 / 139.90 | 142.40 / 141.92 | +2.0% |
+
+  - Spinners outside the process (`mc/abspin.pbs`, mci71, node33/node190):
+    - +1.6% when they never yield (225137);
+    - +1.7% with `sched_yield` every 50 µs (225138).
+  - One busy pool gains no clock and pays for the keepers. The cause (boost headroom, or a Rayon worker's `sched_yield` handing its core to a keeper until the next tick) is not isolated.
+- Variant rejected (mci79): keepers wait in C1 with AMD user-mode `MONITORX`/`MWAITX` (CPUID bit set on the 7742 nodes).
+  - Probe 225143: 16 idle cores read 1500 MHz with no keepers and 2250 MHz with either PAUSE or MWAITX keepers.
+  - Owner: 95.21 / 94.74 → 87.9 / 87.86 s, −7.5% (225144).
+  - Plain, no receipts: 144.51 / 145.15 → 153.38 / 155.10 s, +6.5% (225145, node10).
+- Plain A legs differ 4% between node7 and node10 for the same binary, so only within-node pairs are compared.
+- Policy check (mci80 = the committed tree, `mc/kcheck.pbs` 225147, node9, `conservative`). Receipts report `cpu_clocks: false` only while keepers run:
+  - 2 ranks, unset: keepers on; 2 ranks, `=0`: off.
+  - 1 process, unset: off; 1 process, `=1`: on.
+  - Linux lib tests: 484 passed.
+- Decision: kept, with the multi-rank default. Patches are at `~/.cache/sdpx-e2e/patches/l35-core-keepers.patch` (opt-in first version) and the branch commit.
+
 ## 2026-10-12 — L33: idle cone-queue helpers run pending pool tasks when workers outnumber cones (kept, perf-mc-impl)
 
 - Hypothesis (L30/L31 diagnosis): an owner rank scales 4–5 cones on 16 workers. Workers left without a cone spin on `board::help()` until every cone is done. The running cones' inner Rayon splits and the other components' queue items sit in Rayon deques, and a spinning worker never steals from them.

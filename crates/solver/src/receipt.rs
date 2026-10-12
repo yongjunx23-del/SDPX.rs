@@ -66,6 +66,17 @@ fn receipts_requested() -> bool {
 /// wall phases only (`cpu_clocks: false`).
 static CPU_CLOCKS: AtomicBool = AtomicBool::new(true);
 
+/// Set while idle-priority core keepers run in this process: their spinning
+/// would count as solver CPU time, and every process-clock read would sum
+/// threads running on all of the process's cores, so receipts started
+/// meanwhile record wall phases only.
+static KEEPERS: AtomicBool = AtomicBool::new(false);
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn set_keepers(active: bool) {
+    KEEPERS.store(active, Ordering::Relaxed);
+}
+
 fn cpu_clocks() -> bool {
     receipts_requested() && CPU_CLOCKS.load(Ordering::Relaxed)
 }
@@ -402,7 +413,10 @@ impl Scope {
         // Keep the outer lock while temporarily replacing its observations.
         let outer = guard.is_none().then_some(Snapshot::take());
         RECORDING_OWNED.set(true);
-        CPU_CLOCKS.store(process_threads().is_none_or(|n| n > 1), Ordering::Relaxed);
+        CPU_CLOCKS.store(
+            !KEEPERS.load(Ordering::Relaxed) && process_threads().is_none_or(|n| n > 1),
+            Ordering::Relaxed,
+        );
         if solve {
             COMPLETED.with(|c| *c.borrow_mut() = Snapshot::default());
         }
