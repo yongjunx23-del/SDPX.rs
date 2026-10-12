@@ -8,6 +8,19 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-12 — L42: owner unit start τ (kept, perf-mc-impl)
+
+- Observed (startstats 225239, Λ27, `max_iter` 1): both paths reject the KKT start (‖x‖∞ 4.3e69) and fall back to the unit start. Plain starts it at τ₀ = 1/max d = 1.328e-28 (max d = 7.531e27). The owner data had no `unit_start_tau`, so it started at τ₀ = 1, chased τ at iteration 50 and finished in 223 iterations against plain's 183.
+- Change: `OwnedData::unit_start_tau` takes the largest column scale over the owners' blocks and agrees on the global maximum (`max_all_f64`), as the replicated plain data already did. The shared rule is the new `default::unit_start_tau`.
+- Result, mci87 against mci84 (L39), objectives equal to all printed digits:
+  - 4 nodes 16×16 (225247):
+    - Λ27: 223 → 183 iterations, 148.8 → 119.2 s (−20%).
+    - Λ35-rs: 372 / 494.1 s (493.0 before); its start is accepted.
+    - Λ27-rs: 138 iterations / 68.6 s.
+  - One node, `--partitions 4` (225248): Λ27 223 → 183 iterations, 325.5 → 257.5 s (−21%).
+  - All four points pass the original-coordinate audit (aud87 225249).
+- Decision: kept.
+
 ## 2026-10-12 — L39: τ policy on the owner path (kept); L40: owner KKT step bounds (rejected)
 
 - Observed: owner full solves took more iterations than plain (Λ35-rs 602 vs 372, Λ27 372–379 vs 183). The owner variables and info lacked the core τ hooks, so the τ chase restart, the fixed-τ end phase and the best-iterate test never ran there.

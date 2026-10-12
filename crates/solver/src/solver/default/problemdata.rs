@@ -464,6 +464,18 @@ where
     }
 }
 
+/// [`ProblemData::unit_start_tau`] from the largest column scale `dmax` this
+/// process holds: replicated ranks and column owners agree on the global one.
+pub(crate) fn unit_start_tau<T: FloatT>(dmax: T) -> T {
+    let global = crate::mpi::max_all_f64(dmax.to_f64().unwrap_or(f64::INFINITY));
+    let dmax = if global.is_finite() {
+        T::from_f64(global).unwrap()
+    } else {
+        dmax
+    };
+    T::min(T::one(), T::recip(dmax))
+}
+
 impl<T> ProblemData<T> for DefaultProblemData<T>
 where
     T: FloatT,
@@ -502,15 +514,9 @@ where
     /// τ 5.5e-29; Λ19 6.1e25; ising11 2.2). Overshooting the solution scale
     /// costs about one iteration per decade, undershooting about ten.
     fn unit_start_tau(&self) -> Option<T> {
-        let dmax = self.equilibration.d.iter().copied().fold(T::one(), T::max);
-        // Replicated ranks agree on one start.
-        let global = crate::mpi::max_all_f64(dmax.to_f64().unwrap_or(f64::INFINITY));
-        let dmax = if global.is_finite() {
-            T::from_f64(global).unwrap()
-        } else {
-            dmax
-        };
-        Some(T::min(T::one(), T::recip(dmax)))
+        Some(unit_start_tau(
+            self.equilibration.d.iter().copied().fold(T::one(), T::max),
+        ))
     }
 
     fn equilibrate(&mut self, cones: &CompositeCone<T>, settings: &DefaultSettings<T>) {

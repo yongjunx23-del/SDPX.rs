@@ -7,6 +7,7 @@ use crate::solver::core::{
     traits::{Info, InfoPrint, ProblemData, Residuals, Solution, Variables},
     SolverStatus,
 };
+use crate::solver::default::unit_start_tau;
 use crate::timers::Timers;
 
 impl<T: FloatT> ProblemData<T> for OwnedData<T> {
@@ -18,6 +19,15 @@ impl<T: FloatT> ProblemData<T> for OwnedData<T> {
     /// blocks already carry the equilibrated coefficients, so running Ruiz a
     /// second time would change the problem seen by the local KKT systems.
     fn equilibrate(&mut self, _cones: &OwnedCones<T>, _settings: &DefaultSettings<T>) {}
+
+    /// The default start over the owners' columns; every rank reaches it.
+    fn unit_start_tau(&self) -> Option<T> {
+        let d = self
+            .blocks
+            .iter()
+            .flat_map(|b| b.equilibration.d.iter().copied());
+        Some(unit_start_tau(d.fold(T::one(), T::max)))
+    }
 }
 
 impl<T: FloatT> OwnedResiduals<T> {

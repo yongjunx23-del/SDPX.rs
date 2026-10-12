@@ -236,7 +236,8 @@ execution plans. The journal preserves all failed evidence and final decisions.
      - Open, L41: in-process `--partitions` runs show multi-second stalls in scale cones (RNS gemm CRT maxima of 8–15 s). MPI ranks do not.
      - Kept L39: the owner path runs the core τ policy (chase restart, fixed-τ phase, best iterate). 4-node full solves: Λ35-rs 602 → 372 iterations (−42%), Λ27 379 → 223 (−43%), audited.
      - Rejected L40: owner KKT step bounds from recovery pre-images (−1.0% / −1.4%).
-     - Next: L42, the owner's unit start τ (Λ27 223 → ~183 iterations).
+     - Kept L42: the owner path starts the rejected-KKT fallback at plain's τ₀ = 1/max d. Λ27 223 → 183 iterations (−20% on 4 nodes), audited.
+     - Open, L43: stall-confirming refinement corrections. On plain Λ35-rs, 176 of 589 corrections only confirm a stall (constant column after the τ restart). The owner path has no floor test at all.
    - Single-heavy-owner sampled splitting is closed: correct on both MPI gates, but neither improves end-to-end time.
    - Profile prime-group underfill and NUMA residue placement on large calls;
      split complete inner products over output tiles only if they dominate.
