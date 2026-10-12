@@ -450,6 +450,24 @@ impl<T: FloatT> Info<T> for OwnedInfo<T> {
         self.0.get_status()
     }
 
+    // `update` fills these from the globally reduced summary, so every rank
+    // sees the same values and takes the same τ decisions.
+    fn gap_rel(&self) -> Option<T> {
+        self.0.gap_rel()
+    }
+
+    fn gap_abs(&self) -> Option<T> {
+        self.0.gap_abs()
+    }
+
+    fn residual_max(&self) -> Option<T> {
+        self.0.residual_max()
+    }
+
+    fn residual_norms(&self) -> Option<(T, T)> {
+        self.0.residual_norms()
+    }
+
     fn set_status(&mut self, status: SolverStatus) {
         self.0.set_status(status);
     }

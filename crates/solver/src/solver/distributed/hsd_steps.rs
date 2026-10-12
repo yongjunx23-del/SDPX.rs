@@ -24,6 +24,7 @@ impl<T: FloatT> OwnedVariables<T> {
             collective: Arc::clone(&data.collective),
             tau: T::one(),
             kappa: T::one(),
+            fixed_tau: false,
             border_z: vec![T::zero(); data.layout.border_rows.len()],
             border_s: vec![T::zero(); data.layout.border_rows.len()],
         }
@@ -204,6 +205,9 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
             .expect("residuals must be updated before mu")
             .products
             .sz;
+        if self.fixed_tau {
+            return sz / T::from_usize(c.degree.max(1)).unwrap();
+        }
         (sz + self.tau() * self.kappa()) / T::from_usize(c.degree + 1).unwrap()
     }
     fn affine_step_rhs(&mut self, r: &Self::R, v: &Self, c: &Self::C) {
@@ -473,6 +477,19 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         if dual { &mut self.border_z } else { &mut self.border_s }.scale(tau);
         self.kappa = T::one();
     }
+    fn tau(&self) -> Option<T> {
+        Some(self.tau)
+    }
+    fn freeze_tau(&mut self) -> bool {
+        self.fixed_tau = true;
+        for v in &mut self.blocks {
+            v.fixed_tau = true;
+        }
+        true
+    }
+    fn tau_frozen(&self) -> bool {
+        self.fixed_tau
+    }
     fn new_like(&self) -> Self {
         Self {
             blocks: self.blocks.iter().map(|v| v.new_like()).collect(),
@@ -482,6 +499,7 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
             collective: Arc::clone(&self.collective),
             tau: self.tau,
             kappa: self.kappa,
+            fixed_tau: false,
             border_z: self.border_z.clone(),
             border_s: self.border_s.clone(),
         }
@@ -558,6 +576,9 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         self.collective.all_true(480, local_ok).unwrap_or(false)
     }
     fn taukappa_backtrack(&self, step: &Self, alpha: T, beta: T, shrink: T, cones: &Self::C) -> T {
+        if self.fixed_tau {
+            return alpha;
+        }
         // Global coefficients of s(α)ᵀz(α) = sz + α·lin + α²·quad over the
         // owned cones (the same rows as `barrier`), one reduction.
         let mut c = [T::zero(); 3];

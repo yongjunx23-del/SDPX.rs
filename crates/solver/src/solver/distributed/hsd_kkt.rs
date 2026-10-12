@@ -17,6 +17,8 @@ pub(crate) struct OwnedKktSystem<T: FloatT> {
     hs_constant: Vec<Vec<T>>,
     hs_varying: Vec<Vec<T>>,
     affine_ready: Option<bool>,
+    /// The iterate's fixed-τ phase, as of the last `update_affine`.
+    fixed_tau: bool,
     pool: Option<Arc<rayon::ThreadPool>>,
     collective: Arc<dyn crate::solver::distributed::collective::Collective<T>>,
 }
@@ -44,6 +46,7 @@ impl<T: FloatT> OwnedKktSystem<T> {
             hs_constant: data.blocks.iter().map(|_| Vec::new()).collect(),
             hs_varying: data.blocks.iter().map(|_| Vec::new()).collect(),
             affine_ready: None,
+            fixed_tau: false,
             pool: cones.pool.clone(),
             collective,
         }
@@ -91,6 +94,81 @@ impl<T: FloatT> OwnedKktSystem<T> {
         Self::copy_products(&self.kernel, &mut self.hs_constant);
         ok
     }
+    /// Δτ and Δκ from the two KKT solutions (one global reduction).
+    fn homogeneous_step(
+        &mut self,
+        rhs: &OwnedVariables<T>,
+        data: &OwnedData<T>,
+        variables: &OwnedVariables<T>,
+    ) -> (T, T) {
+        let mut terms = None;
+        for i in 0..data.blocks.len() {
+            let first = &self.varying.blocks[i];
+            let second = &self.constant.blocks[i];
+            let local = hsd_terms(
+                &mut self.work.blocks[i].x,
+                &variables.blocks[i].x,
+                variables.tau(),
+                &data.blocks[i],
+                &first.x,
+                &first.z,
+                &second.x,
+                &second.z,
+            );
+            if let Some(ref mut total) = terms {
+                crate::solver::default::HsdTerms::add(total, local);
+            } else {
+                terms = Some(local);
+            }
+        }
+        let mut terms = terms.unwrap_or(crate::solver::default::HsdTerms {
+            q1: T::zero(),
+            b1: T::zero(),
+            quad1: T::zero(),
+            q2: T::zero(),
+            b2: T::zero(),
+            delta: T::zero(),
+            quad2: T::zero(),
+        });
+        if self.collective.rank() == 0 && !data.owner_ids.contains(&0) {
+            terms.b1 += data.border_b.dot(&self.varying.border_z);
+            terms.b2 += data.border_b.dot(&self.constant.border_z);
+        }
+        let mut values = [
+            terms.q1,
+            terms.b1,
+            terms.quad1,
+            terms.q2,
+            terms.b2,
+            terms.delta,
+            terms.quad2,
+        ];
+        if self
+            .collective
+            .reduce_sum_in_place(350, &mut values)
+            .is_err()
+        {
+            values.fill(T::nan());
+        }
+        let terms = crate::solver::default::HsdTerms {
+            q1: values[0],
+            b1: values[1],
+            quad1: values[2],
+            q2: values[3],
+            b2: values[4],
+            delta: values[5],
+            quad2: values[6],
+        };
+        let dtau = hsd_tau(
+            terms,
+            rhs.tau,
+            rhs.kappa,
+            variables.tau(),
+            variables.kappa(),
+        );
+        let dkappa = -(rhs.kappa + variables.kappa() * dtau) / variables.tau();
+        (dtau, dkappa)
+    }
 }
 impl<T: FloatT> HasLinearSolverInfo for OwnedKktSystem<T> {
     fn linear_solver_info(&self) -> LinearSolverInfo {
@@ -115,7 +193,7 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
         self.affine_ready = None;
         loop {
             let local_ok = self.kernel.update_local(&cones.blocks, settings.core())
-                && self.constant_rhs(data, settings);
+                && (self.fixed_tau || self.constant_rhs(data, settings));
             // Keep retries collective: a local factor failure must not let a
             // successful rank skip the boost stream while peers enter it.
             let ok = self.collective.all_true(304, local_ok).unwrap_or(false);
@@ -152,6 +230,64 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
             w.x.copy_from_slice(&r.x);
             w.z.waxpby(T::one(), &v.s, -T::one(), &r.z);
         };
+        self.fixed_tau = variables.fixed_tau;
+        if self.fixed_tau {
+            // Δτ = 0: only the affine column. With no constant column, an
+            // affine failure is the factor failure and takes the retry path.
+            loop {
+                self.affine_ready = None;
+                let updated_local = self.kernel.update_local(&cones.blocks, settings.core());
+                let updated = self
+                    .collective
+                    .all_true(299, updated_local)
+                    .unwrap_or(false);
+                let affine_ok = if updated {
+                    for_blocks!(
+                        cones.pool.as_ref(),
+                        (&mut self.work.blocks, &rhs.blocks, &variables.blocks),
+                        fill_affine
+                    );
+                    for ((out, &s), &z) in self
+                        .work
+                        .border_z
+                        .iter_mut()
+                        .zip(&variables.border_s)
+                        .zip(&rhs.border_z)
+                    {
+                        *out = s - z;
+                    }
+                    self.work.sync_border();
+                    let ok = self.kernel.solve_blocks_with_border(
+                        &self.work.blocks,
+                        &mut self.varying.blocks,
+                        Some(&self.work.border_z),
+                        settings.core(),
+                    );
+                    Self::copy_products(&self.kernel, &mut self.hs_varying);
+                    if ok {
+                        self.varying
+                            .border_z
+                            .copy_from_slice(self.kernel.last_border());
+                        self.varying.sync_border();
+                    }
+                    self.collective.all_true(302, ok).unwrap_or(false)
+                } else {
+                    self.collective.all_true(302, false).unwrap_or(false)
+                };
+                if affine_ok {
+                    self.affine_ready = Some(true);
+                    return true;
+                }
+                if !settings.core().static_regularization_enable
+                    || !self
+                        .collective
+                        .all_true(303, self.kernel.escalate_regularization())
+                        .unwrap_or(false)
+                {
+                    return false;
+                }
+            }
+        }
         loop {
             self.affine_ready = None;
             let updated_local = self.kernel.update_local(&cones.blocks, settings.core());
@@ -335,72 +471,12 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
                 .copy_from_slice(self.kernel.last_border());
             self.varying.sync_border();
         }
-        let mut terms = None;
-        for i in 0..data.blocks.len() {
-            let first = &self.varying.blocks[i];
-            let second = &self.constant.blocks[i];
-            let local = hsd_terms(
-                &mut self.work.blocks[i].x,
-                &variables.blocks[i].x,
-                variables.tau(),
-                &data.blocks[i],
-                &first.x,
-                &first.z,
-                &second.x,
-                &second.z,
-            );
-            if let Some(ref mut total) = terms {
-                crate::solver::default::HsdTerms::add(total, local);
-            } else {
-                terms = Some(local);
-            }
-        }
-        let mut terms = terms.unwrap_or(crate::solver::default::HsdTerms {
-            q1: T::zero(),
-            b1: T::zero(),
-            quad1: T::zero(),
-            q2: T::zero(),
-            b2: T::zero(),
-            delta: T::zero(),
-            quad2: T::zero(),
-        });
-        if self.collective.rank() == 0 && !data.owner_ids.contains(&0) {
-            terms.b1 += data.border_b.dot(&self.varying.border_z);
-            terms.b2 += data.border_b.dot(&self.constant.border_z);
-        }
-        let mut values = [
-            terms.q1,
-            terms.b1,
-            terms.quad1,
-            terms.q2,
-            terms.b2,
-            terms.delta,
-            terms.quad2,
-        ];
-        if self
-            .collective
-            .reduce_sum_in_place(350, &mut values)
-            .is_err()
-        {
-            values.fill(T::nan());
-        }
-        let terms = crate::solver::default::HsdTerms {
-            q1: values[0],
-            b1: values[1],
-            quad1: values[2],
-            q2: values[3],
-            b2: values[4],
-            delta: values[5],
-            quad2: values[6],
+        let fixed = variables.fixed_tau;
+        let (dtau, dkappa) = if fixed {
+            (T::zero(), T::zero())
+        } else {
+            self.homogeneous_step(rhs, data, variables)
         };
-        let dtau = hsd_tau(
-            terms,
-            rhs.tau,
-            rhs.kappa,
-            variables.tau(),
-            variables.kappa(),
-        );
-        let dkappa = -(rhs.kappa + variables.kappa() * dtau) / variables.tau();
         lhs.tau = dtau;
         lhs.kappa = dkappa;
         let (varying, constant, hs_constant, hs_varying, offset) = (
@@ -419,12 +495,23 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
             let second = &constant.blocks[i];
             l.τ = dtau;
             l.κ = dkappa;
-            l.x.waxpby(T::one(), &first.x, dtau, &second.x);
-            l.z.waxpby(T::one(), &first.z, dtau, &second.z);
-            if hs_constant[i].len() == d.m && hs_varying[i].len() == d.m {
-                l.s.waxpby(T::one(), &hs_varying[i], dtau, &hs_constant[i]);
+            if fixed {
+                // The constant column is not solved in this phase.
+                l.x.copy_from_slice(&first.x);
+                l.z.copy_from_slice(&first.z);
+                if hs_varying[i].len() == d.m {
+                    l.s.copy_from_slice(&hs_varying[i]);
+                } else {
+                    cone.mul_Hs(&mut l.s, &l.z, &mut work.z);
+                }
             } else {
-                cone.mul_Hs(&mut l.s, &l.z, &mut work.z);
+                l.x.waxpby(T::one(), &first.x, dtau, &second.x);
+                l.z.waxpby(T::one(), &first.z, dtau, &second.z);
+                if hs_constant[i].len() == d.m && hs_varying[i].len() == d.m {
+                    l.s.waxpby(T::one(), &hs_varying[i], dtau, &hs_constant[i]);
+                } else {
+                    cone.mul_Hs(&mut l.s, &l.z, &mut work.z);
+                }
             }
             l.s.axpby(-T::one(), &offset[i].s, -T::one());
         };
@@ -439,13 +526,17 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
             ),
             |(i, l, work, cone)| recover(i, l, work, cone)
         );
-        for ((out, &varying), &constant) in lhs
-            .border_z
-            .iter_mut()
-            .zip(&self.varying.border_z)
-            .zip(&self.constant.border_z)
-        {
-            *out = varying + dtau * constant;
+        if fixed {
+            lhs.border_z.copy_from_slice(&self.varying.border_z);
+        } else {
+            for ((out, &varying), &constant) in lhs
+                .border_z
+                .iter_mut()
+                .zip(&self.varying.border_z)
+                .zip(&self.constant.border_z)
+            {
+                *out = varying + dtau * constant;
+            }
         }
         lhs.sync_border();
         let local_finite = lhs.tau.is_finite()

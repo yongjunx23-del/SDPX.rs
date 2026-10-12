@@ -8,6 +8,30 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-12 — L39: τ policy on the owner path (kept); L40: owner KKT step bounds (rejected)
+
+- Observed: owner full solves took more iterations than plain (Λ35-rs 602 vs 372, Λ27 372–379 vs 183). The owner variables and info lacked the core τ hooks, so the τ chase restart, the fixed-τ end phase and the best-iterate test never ran there.
+- L39 change:
+  - `OwnedVariables` now has `tau`, `freeze_tau` / `tau_frozen` (a `fixed_tau` flag on the iterate only), the fixed-τ `calc_mu` (μ over the cones) and a no-op `taukappa_backtrack` while τ is fixed.
+  - `OwnedInfo` gets `gap_rel`, `gap_abs`, `residual_max` and `residual_norms` from the globally reduced summary, so every rank takes the same τ decision.
+  - `OwnedKktSystem` in the fixed-τ phase: `update` skips the constant column, `update_affine` solves the affine column alone, and `solve` sets Δτ = Δκ = 0, taking Δs from the varying column's products.
+- Local check: ising11/512 owner (`--partitions 2`) enters the fixed-τ phase at iteration 30 like plain. Its trace matches plain in the printed digits (54 iterations, same objective). Distributed lib tests pass.
+- Results (objectives equal to all printed digits):
+  - 4 nodes 16×16 MPI (225223), mci84 vs mci83:
+    - Λ35-rs: 602 → 372 iterations, 851.9 → 493.0 s (−42%).
+    - Λ27: 379 → 223 iterations, 260.1 → 148.8 s (−43%).
+  - One node, `--partitions 4` (f84 on node26, against f83b on node42):
+    - Λ35-rs: 602 → 372 iterations, 5180.7 → 2488.8 s.
+    - Λ27: 378 → 223 iterations, 608.9 → 325.5 s.
+    - Λ27-rs: 137 → 138 iterations. Λ19-rs: 89 → 89 iterations.
+  - All four f84 points pass the original-coordinate audit (225241).
+- Λ27 still takes 223 iterations against plain's 183. Its KKT start is rejected in both paths (‖x‖∞ 4.3e69), but the owner data lacked `unit_start_tau`, so the owner restarts from τ₀ = 1 and chases at iteration 50 (L42).
+- L40, rejected: owner `calc_kkt_step_length` with the PSD bounds' offset Δs and W·Δz recovery pre-images. Each local kernel's pre-images are snapshotted per column and kept when the original refinement made no correction. On ising11 the pre-images served 50 of 54 iterations (88 extra W-products over plain instead of 1188).
+  - ABBA mci85 vs mci84, Λ35 1024 bits, 60 it:
+    - 4 nodes 16×16 (225242): A 89.78 / 89.56 s, B 88.8 / 88.77 (−1.0%).
+    - 1 node 4×16 (225237): A 161.54 / 160.9, B 159.03 / 158.87 (−1.4%).
+  - Under 2%: reverted (patch `l40-owner-kkt-step-rejected.diff`).
+
 ## 2026-10-12 — L37: owner coupling response by exact-dot rows (L37b kept, perf-mc-impl)
 
 - Hypothesis (L36): `owned.factor_response` (7.3 s per 60 it) solves the 170 border coupling columns through the leaves' lane panels once per factorization; a cheaper exact form of `K⁻¹Cᵀ` cuts the owner factor phase.

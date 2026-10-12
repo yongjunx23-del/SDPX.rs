@@ -46,6 +46,8 @@ pub(crate) struct OwnedVariables<T: FloatT> {
     /// block zero as a scalar source.
     pub tau: T,
     pub kappa: T,
+    /// The fixed-τ end phase (`Δτ = Δκ = 0`); set on the iterate only.
+    pub fixed_tau: bool,
     pub border_z: Vec<T>,
     pub border_s: Vec<T>,
 }
@@ -336,6 +338,7 @@ impl<T: FloatT> OwnedSolver<T> {
             collective: Arc::clone(&collective),
             tau: T::one(),
             kappa: T::one(),
+            fixed_tau: false,
             border_z: vec![T::zero(); layout.border_rows.len()],
             border_s: vec![T::zero(); layout.border_rows.len()],
         };

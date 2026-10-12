@@ -25,6 +25,7 @@ fn from_full<T: FloatT>(
         collective: Arc::new(crate::solver::distributed::collective::SerialCollective),
         tau: full.τ,
         kappa: full.κ,
+        fixed_tau: full.fixed_tau,
         border_z: vec![T::zero(); layout.border_rows.len()],
         border_s: vec![T::zero(); layout.border_rows.len()],
         blocks: layout
