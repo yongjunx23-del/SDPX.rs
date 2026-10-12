@@ -39,7 +39,7 @@ pub(crate) trait Refinement<T: FloatT> {
     }
     /// Diagnostic only (`SDPX_TRACE_TAU`): residual parts of the last
     /// evaluated point (implementer-defined), printed after each residual.
-    fn trace_parts(&mut self, _candidate: bool) -> Option<String> {
+    fn trace_parts(&mut self, _candidate: bool, _tol: T) -> Option<String> {
         None
     }
 
@@ -126,7 +126,7 @@ fn refine_stationary<T: FloatT>(
     let tol = settings.iterative_refinement_abstol + settings.iterative_refinement_reltol * normb;
     let mut norme = work.residual(false, true);
     if parts {
-        if let Some(s) = work.trace_parts(false) {
+        if let Some(s) = work.trace_parts(false, tol) {
             eprintln!("refine-parts 0 {:.3e} {:.3e} {s}", normb, norme);
         }
     }
@@ -153,7 +153,7 @@ fn refine_stationary<T: FloatT>(
         work.add_correction();
         norme = work.residual(true, false);
         if parts {
-            if let Some(s) = work.trace_parts(true) {
+            if let Some(s) = work.trace_parts(true, tol) {
                 eprintln!("refine-parts {} {:.3e} {:.3e} {s}", stats[3], normb, norme);
             }
         }

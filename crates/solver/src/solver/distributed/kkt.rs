@@ -1643,6 +1643,45 @@ impl<T: FloatT> Refinement<T> for OwnedRefinement<'_, T> {
             }
         }
     }
+    /// Original level only: each owner's rows by its kernel's floor test, and
+    /// the border (equality) rows against eps·(Σ_owners |A_r||x| + |b_r|).
+    /// Called on every rank alike: the residual norm and the border are
+    /// replicated, so the collectives below run in lockstep.
+    fn at_floor(&mut self, candidate: bool, tol: T) -> bool {
+        if self.reduced || T::precision_bits() <= 53 {
+            return false;
+        }
+        let point = if candidate {
+            &self.work.candidate
+        } else {
+            &self.work.x
+        };
+        let (e, b) = (&self.work.error, &self.work.b);
+        let border = e.border.iter().any(|v| v.abs() > tol);
+        let mut abs = vec![T::zero(); if border { e.border.len() } else { 0 }];
+        let mut ok = true;
+        for (i, local) in self.solver.locals.iter().enumerate() {
+            let x = &point.blocks[i];
+            ok = ok && local.kernel.at_floor(&e.blocks[i], x, &b.blocks[i], tol);
+            if border && ok {
+                let (scale, acc) = local.kernel.linear_abs_product(&x[..local.n]);
+                for (j, &r) in local.border_rows.iter().enumerate() {
+                    abs[j] += scale * T::from_f64(acc[r]).unwrap();
+                }
+            }
+        }
+        if border {
+            let summed = self.solver.collective.reduce_sum_in_place(704, &mut abs);
+            let mut rows = e.border.iter().zip(&abs).zip(&b.border);
+            ok = summed.is_ok()
+                && ok
+                && rows.all(|((v, &a), r)| {
+                    let v = v.abs();
+                    v <= tol || v <= T::epsilon() * (a + r.abs())
+                });
+        }
+        self.solver.collective.all_true(705, ok).unwrap_or(false)
+    }
     // Blocks are rank-owned and summed over ranks; the border is replicated
     // (identical on every rank after each residual) and counted once.
     // Only the reduced level: an original-level correction is a complete

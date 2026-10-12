@@ -952,6 +952,9 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     // Rows holding sampled linear entries outside zero blocks (cached):
     // the aligned prepare republishes their scaled values.
     linear_scaled_rows: Option<Vec<usize>>,
+    // |A| of the ordinary (non-sampled) rows in binary64 units of its largest
+    // entry, for the zero-cone rounding floor (`at_floor`); built on first use.
+    linear_abs: std::sync::OnceLock<(T, Vec<f64>)>,
     retained_rhs: Vec<T>,
     local_only: bool,
     pool: Option<Arc<rayon::ThreadPool>>,
@@ -1413,6 +1416,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             workh: vec![T::zero(); m],
             workh_partial: false,
             linear_scaled_rows: None,
+            linear_abs: Default::default(),
             retained_rhs: vec![T::zero(); nr],
             pool,
             parallel_assembly,

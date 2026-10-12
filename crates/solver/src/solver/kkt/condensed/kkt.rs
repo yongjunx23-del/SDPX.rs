@@ -348,6 +348,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         self.preimage_valid.fill(false);
         // The eliminated-row plan may cache constant A rows.
         self.eliminated = None;
+        self.linear_abs.take();
         debug_assert_eq!(A.size(), self.A.size());
         // An empty copy means only the sampled factors define these rows.
         if !self.A.nzval.is_empty() {
@@ -440,72 +441,195 @@ impl<T: FloatT> CondensedKKTSolver<T> {
 /// Corrections cannot lower such rows: rounding x to working precision moves
 /// A·x by up to eps·|A||x| (Ising: |A||x| ≫ |A·x|), and the correction that
 /// absorbs it in z moves it to the x rows as S·δx. Only sampled PSD blocks
-/// have the floor; other rows must meet `tol` itself.
-fn rows_at_floor<T: FloatT>(block: &Block<T>, e: &[T], z: &[T], b: &[T], x: &[T], tol: T) -> bool {
+/// and zero-cone rows (no G; `linear` gives their |A||x|) have the floor;
+/// other rows must meet `tol` itself.
+fn rows_at_floor<'a, T: FloatT>(
+    block: &Block<T>,
+    e: &[T],
+    z: &[T],
+    b: &[T],
+    x: &[T],
+    tol: T,
+    linear: impl FnOnce() -> (T, &'a [f64]),
+) -> bool {
     if e.iter().all(|v| v.abs() <= tol) {
         return true;
     }
-    let Scaling::Psd(p) = &block.scaling else {
+    let Some(floor) = RowFloor::new(block, z, x, linear) else {
         return false;
     };
-    let Some(sampled) = &p.sampled else {
-        return false;
-    };
-    let (ua, ax) = sampled.operator.block_forward_abs(sampled.block, x);
-    // F = |G||Z||G| in binary64 units of gmax²·zmax.
-    let k = p.G.nrows();
-    let gmax =
-        p.G.data()
-            .iter()
-            .fold(T::zero(), |m, &v| T::max(m, v.abs()));
-    let zmax = z.iter().fold(T::zero(), |m, &v| T::max(m, v.abs()));
-    let mut f = vec![0f64; e.len()];
-    if gmax > T::zero() && zmax > T::zero() {
-        let conv = |v: T| v.to_f64().unwrap_or(0.0);
-        let g: Vec<f64> = p.G.data().iter().map(|&v| conv(v.abs() / gmax)).collect();
-        let mut zm = vec![0f64; k * k];
-        let mut idx = 0;
-        for col in 0..k {
-            for row in 0..=col {
-                let v = conv(z[idx].abs() / zmax);
-                let v = if row == col {
-                    v
-                } else {
-                    v * std::f64::consts::FRAC_1_SQRT_2
-                };
-                (zm[row + col * k], zm[col + row * k]) = (v, v);
-                idx += 1;
+    e.iter().enumerate().all(|(i, v)| {
+        let v = v.abs();
+        v <= tol || v <= floor.at(i, b)
+    })
+}
+
+/// The componentwise floor of a sampled PSD or zero block's rows
+/// ([`rows_at_floor`]).
+struct RowFloor<T> {
+    ug: T,
+    ua: T,
+    f: Vec<f64>,
+    ax: Vec<f64>,
+}
+
+impl<T: FloatT> RowFloor<T> {
+    /// `None` for blocks without a floor (all but sampled PSD and zero
+    /// blocks); `linear` runs for zero blocks only.
+    fn new<'a>(
+        block: &Block<T>,
+        z: &[T],
+        x: &[T],
+        linear: impl FnOnce() -> (T, &'a [f64]),
+    ) -> Option<Self> {
+        let p = match &block.scaling {
+            Scaling::Psd(p) => p,
+            Scaling::Zero => {
+                let (ua, ax) = linear();
+                let (f, ax) = (vec![0f64; ax.len()], ax.to_vec());
+                return Some(Self {
+                    ug: T::zero(),
+                    ua,
+                    f,
+                    ax,
+                });
             }
-        }
-        let mut t = vec![0f64; k * k];
-        for j in 0..k {
-            for l in 0..k {
-                let zl = zm[l + j * k];
-                for i in 0..k {
-                    t[i + j * k] += g[i + l * k] * zl;
+            _ => return None,
+        };
+        let sampled = p.sampled.as_ref()?;
+        let (ua, ax) = sampled.operator.block_forward_abs(sampled.block, x);
+        // F = |G||Z||G| in binary64 units of gmax²·zmax.
+        let k = p.G.nrows();
+        let gmax =
+            p.G.data()
+                .iter()
+                .fold(T::zero(), |m, &v| T::max(m, v.abs()));
+        let zmax = z.iter().fold(T::zero(), |m, &v| T::max(m, v.abs()));
+        let mut f = vec![0f64; z.len()];
+        if gmax > T::zero() && zmax > T::zero() {
+            let conv = |v: T| v.to_f64().unwrap_or(0.0);
+            let g: Vec<f64> = p.G.data().iter().map(|&v| conv(v.abs() / gmax)).collect();
+            let mut zm = vec![0f64; k * k];
+            let mut idx = 0;
+            for col in 0..k {
+                for row in 0..=col {
+                    let v = conv(z[idx].abs() / zmax);
+                    let v = if row == col {
+                        v
+                    } else {
+                        v * std::f64::consts::FRAC_1_SQRT_2
+                    };
+                    (zm[row + col * k], zm[col + row * k]) = (v, v);
+                    idx += 1;
+                }
+            }
+            let mut t = vec![0f64; k * k];
+            for j in 0..k {
+                for l in 0..k {
+                    let zl = zm[l + j * k];
+                    for i in 0..k {
+                        t[i + j * k] += g[i + l * k] * zl;
+                    }
+                }
+            }
+            let mut idx = 0;
+            for col in 0..k {
+                for row in 0..=col {
+                    let s: f64 = (0..k).map(|l| t[row + l * k] * g[l + col * k]).sum();
+                    f[idx] = if row == col {
+                        s
+                    } else {
+                        s * std::f64::consts::SQRT_2
+                    };
+                    idx += 1;
                 }
             }
         }
-        let mut idx = 0;
-        for col in 0..k {
-            for row in 0..=col {
-                let s: f64 = (0..k).map(|l| t[row + l * k] * g[l + col * k]).sum();
-                f[idx] = if row == col {
-                    s
-                } else {
-                    s * std::f64::consts::SQRT_2
-                };
-                idx += 1;
-            }
+        let ug = gmax * gmax * zmax;
+        Some(Self { ug, ua, f, ax })
+    }
+
+    /// eps·(|G||Z||G| + |A||x| + |b_z|) of row `i`.
+    fn at(&self, i: usize, b: &[T]) -> T {
+        T::epsilon()
+            * (self.ug * T::from_f64(self.f[i]).unwrap()
+                + self.ua * T::from_f64(self.ax[i]).unwrap()
+                + b[i].abs())
+    }
+}
+
+/// `Σ_p |A[r,p] x[p]|` for every row r of `a`, in binary64 units of the
+/// returned scale; terms that underflow there drop out. `abs` caches |A| in
+/// units of its largest entry.
+fn abs_product<T: FloatT>(
+    a: &CscMatrix<T>,
+    abs: &std::sync::OnceLock<(T, Vec<f64>)>,
+    x: &[T],
+) -> (T, Vec<f64>) {
+    let (amax, abs) = abs.get_or_init(|| {
+        let amax = a.nzval.iter().fold(T::zero(), |m, &v| T::max(m, v.abs()));
+        let unit = |v: T| (v.abs() / amax).to_f64().unwrap_or(0.0);
+        let abs = if amax > T::zero() {
+            a.nzval.iter().map(|&v| unit(v)).collect()
+        } else {
+            Vec::new()
+        };
+        (amax, abs)
+    });
+    let mut acc = vec![0f64; a.m];
+    let xmax = x.iter().fold(T::zero(), |m, &v| T::max(m, v.abs()));
+    if *amax == T::zero() || xmax == T::zero() {
+        return (T::zero(), acc);
+    }
+    for (col, &v) in x.iter().enumerate() {
+        let v = (v.abs() / xmax).to_f64().unwrap_or(0.0);
+        for p in a.colptr[col]..a.colptr[col + 1] {
+            acc[a.rowval[p]] += abs[p] * v;
         }
     }
-    let ug = gmax * gmax * zmax;
-    e.iter().enumerate().all(|(i, v)| {
-        let v = v.abs();
-        v <= tol
-            || v <= T::epsilon()
-                * (ug * T::from_f64(f[i]).unwrap() + ua * T::from_f64(ax[i]).unwrap() + b[i].abs())
-    })
+    (*amax * xmax, acc)
+}
+
+impl<T: FloatT> CondensedKKTSolver<T> {
+    /// `Σ_p |A[r,p] x[p]|` of the ordinary (non-sampled) rows ([`abs_product`]).
+    pub(crate) fn linear_abs_product(&self, x: &[T]) -> (T, Vec<f64>) {
+        abs_product(self.linear_rows(), &self.linear_abs, x)
+    }
+    fn linear_rows(&self) -> &CscMatrix<T> {
+        self.sampled.as_ref().map_or(&self.A, |(op, _)| op.linear())
+    }
+
+    /// Whether the original residual `error` of `point` for `rhs` is at its
+    /// rounding floor: the x rows meet `tol` and every eliminated block's
+    /// rows pass [`rows_at_floor`]. Local to this kernel's rows.
+    pub(crate) fn at_floor(&self, error: &[T], point: &[T], rhs: &[T], tol: T) -> bool {
+        let n = self.n;
+        if error[..n].norm_inf() > tol {
+            return false;
+        }
+        let timer = crate::receipt::start();
+        let (x, z) = point.split_at(n);
+        let (e, b) = (&error[n..], &rhs[n..]);
+        let offset = self.blocks.first().map_or(0, |b| b.rows.start);
+        let (a, abs) = (self.linear_rows(), &self.linear_abs);
+        let linear = std::sync::OnceLock::new();
+        let check = |block: &Block<T>| {
+            let r = block.rows.start - offset..block.rows.end - offset;
+            let zero = || {
+                let (scale, acc) = linear.get_or_init(|| abs_product(a, abs, x));
+                (*scale, &acc[r.clone()])
+            };
+            let (e, z, b) = (&e[r.clone()], &z[r.clone()], &b[r.clone()]);
+            rows_at_floor(block, e, z, b, x, tol, zero)
+        };
+        let blocks = &self.blocks;
+        let floor = match &self.pool {
+            Some(pool) => pool.install(|| blocks.par_iter().all(check)),
+            None => blocks.iter().all(check),
+        };
+        crate::receipt::finish("refine.floor", timer);
+        floor
+    }
 }
 
 struct LocalRefinement<'a, T: FloatT> {
@@ -552,33 +676,17 @@ impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
         self.kernel.restore_scaled_product(self.x);
     }
     fn at_floor(&mut self, candidate: bool, tol: T) -> bool {
-        let n = self.kernel.n;
         // Binary64 keeps the upstream rule; MPI ranks would need to agree.
-        if T::precision_bits() <= 53
-            || local_world(self.kernel.local_only).is_some()
-            || self.error[..n].norm_inf() > tol
-        {
+        if T::precision_bits() <= 53 || local_world(self.kernel.local_only).is_some() {
             return false;
         }
-        let timer = crate::receipt::start();
         let point: &[T] = if candidate { self.candidate } else { self.x };
-        let (x, z) = point.split_at(n);
-        let (e, b) = (&self.error[n..], &self.b[n..]);
-        let offset = self.kernel.blocks.first().map_or(0, |b| b.rows.start);
-        let check = |block: &Block<T>| {
-            let r = block.rows.start - offset..block.rows.end - offset;
-            rows_at_floor(block, &e[r.clone()], &z[r.clone()], &b[r], x, tol)
-        };
-        let blocks = &self.kernel.blocks;
-        let floor = match &self.kernel.pool {
-            Some(pool) => pool.install(|| blocks.par_iter().all(check)),
-            None => blocks.iter().all(check),
-        };
-        crate::receipt::finish("refine.floor", timer);
-        floor
+        self.kernel.at_floor(self.error, point, self.b, tol)
     }
-    /// max |e_x|, max |e_z|, and the x-row floor eps·max(|Aᵀ||z| + |b_x|).
-    fn trace_parts(&mut self, candidate: bool) -> Option<String> {
+    /// max |e_x|, max |e_z|, the x-row floor eps·max(|Aᵀ||z| + |b_x|), and
+    /// the z rows above `tol` against [`rows_at_floor`]: the largest |e| in
+    /// blocks without a floor, the largest |e|/floor and the rows over it.
+    fn trace_parts(&mut self, candidate: bool, tol: T) -> Option<String> {
         let n = self.kernel.n;
         let point: &[T] = if candidate { self.candidate } else { self.x };
         let (ex, ez) = self.error.split_at(n);
@@ -598,12 +706,43 @@ impl<T: FloatT> Refinement<T> for LocalRefinement<'_, T> {
             .retained_rows
             .iter()
             .fold(T::zero(), |m, &r| T::max(m, ez[r].abs()));
+        let (x, z) = point.split_at(n);
+        let b = &self.b[n..];
+        let offset = self.kernel.blocks.first().map_or(0, |b| b.rows.start);
+        let (mut hard, mut ratio, mut over) = (T::zero(), T::zero(), 0usize);
+        let linear = std::sync::OnceLock::new();
+        for block in &self.kernel.blocks {
+            let r = block.rows.start - offset..block.rows.end - offset;
+            let e = &ez[r.clone()];
+            if e.iter().all(|v| v.abs() <= tol) {
+                continue;
+            }
+            let zero = || {
+                let (scale, acc) = linear.get_or_init(|| self.kernel.linear_abs_product(x));
+                (*scale, &acc[r.clone()])
+            };
+            let Some(rows) = RowFloor::new(block, &z[r.clone()], x, zero) else {
+                hard = e.iter().fold(hard, |m, v| T::max(m, v.abs()));
+                continue;
+            };
+            for (i, v) in e.iter().enumerate() {
+                let v = v.abs();
+                if v > tol {
+                    let q = v / rows.at(i, &b[r.clone()]);
+                    over += usize::from(!(q <= T::one()));
+                    ratio = T::max(ratio, q);
+                }
+            }
+        }
         Some(format!(
-            "ex {:.3e} ez {:.3e} floor_x {:.3e} ret {:.3e}",
+            "ex {:.3e} ez {:.3e} floor_x {:.3e} ret {:.3e} hard {:.3e} ratio {:.3e} over {}",
             ex.norm_inf(),
             ez.norm_inf(),
             floor,
-            retained
+            retained,
+            hard,
+            ratio,
+            over
         ))
     }
     // Each correction here runs a complete refined reduced solve: GMRES-IR
