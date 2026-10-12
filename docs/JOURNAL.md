@@ -8,6 +8,75 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-13 — L47: pair right-hand sides beside the arrow factor (rejected); L48: Gram sync behind each cone's scaling (rejected); L49: refinement after L43 (diagnosis) (perf-mc-impl)
+
+- L47, hypothesis: the pair's condensed right-hand sides (`prepare_rhs` of the affine and constant columns) depend only on the new scaling, so they can run on workers left idle by the arrow factor.
+  - Change: test switch `SDPX_PREPARE_OVERLAP` (mci93).
+  - Result (same binary off/on, plain 64 threads; A = off):
+
+    | Run | Case | A s | B s | change |
+    |---|---|---|---|---|
+    | 225295 (node104) | Λ35-rs | 731.1, 743.9 | 733.9, 732.1 | −0.6% |
+    | 225296 (node107) | Λ27 | 159.8, 164.1 | 161.5, 162.6 | +0.1% |
+
+  - Decision: rejected. The patch is at `~/.cache/sdpx-e2e/patches/l47-prepare-beside-factor.patch`.
+- L48, hypothesis: a cone's Gram sync can start as soon as that cone is scaled. Pushing it as a follower job into the scaling queue's tail would take the 0.09 s/it sync off the KKT update.
+  - Change: test switch `SDPX_PRESYNC` (mci94, on top of L47).
+  - Result (same binary off/on, plain 64 threads; A = off):
+
+    | Run | Case | A s | B s | change |
+    |---|---|---|---|---|
+    | 225300 (node103) | Λ35-rs | 736.1, 745.9 | 727.1, 726.8 | −1.9% |
+    | 225301 (node106) | Λ27 | 166.1, 167.8 | 168.1, 167.5 | +0.5% |
+
+  - Observed: the work only moves between phases. The scale phase is already saturated, and absorbing the sync makes it longer.
+    - Λ35-rs: scale +0.06 s/it (0.37 → 0.43), KKT update −0.09 s/it.
+    - Λ27: scale +0.042 s/it, KKT update −0.042 s/it.
+  - Decision: rejected. The patch is at `~/.cache/sdpx-e2e/patches/l48-presync-head.patch`, relative to `3e742a2`.
+- L49, trace after L43 (tr95, plain Λ35-rs, 372 iterations; trace overhead, 976 s):
+  - Each iteration refines three columns: the constant column (−q, b) of the pair, the affine column, and the combined column. In total that is 344 corrections over 372 iterations.
+  - The constant column takes 206 of them, nearly every iteration from about 134 on.
+    - Its first solve sits 1e67–1e83 above the componentwise floor on 7.8e4 rows.
+    - One correction brings it to 0.45× the floor, so the correction is required, not futile.
+    - The cancellation is in the recovery W⁻¹(AΔx − b)W⁻¹, about eps·cond(W)·|b|.
+  - The affine and combined columns take 69 corrections each, also one per column, from 1e78 above the floor down to it.
+  - No second correction gains nothing any more; L43 removed those.
+  - Per-iteration solve work: residual 0.34 s (4.1 calls), recover 0.22, prepare 0.19, trsv and ir 0.14. Corrections cost about 0.2 s each, about 9% of the solve.
+  - Step lengths: the landing (iterations 289–344, gap 0.5 → 1e-14) takes steps of 0.05–0.78 at about 0.3 decades of μ per iteration. The fixed-τ phase enters at 345, once three steps reach 0.8. τ is flat within 10% from about 318 and the gap reaches 1e-8 at 328. The steady and final phases run at about 1 decade per iteration.
+
+## 2026-10-12 — L45: main-thread serial work (kept); L46: residual products beside cone scaling (kept) (perf-mc-impl)
+
+- L45, observed (receipts after L43, plain Λ35-rs): the main thread copied whole buffers between phases. These were the per-column condensed sampled blocks in `solve_many`, the pair's scaled solution and pre-image, and the previous iterate. It also recomputed the constant column's HSD terms for the combined solve and wrote the arrow leaf values serially.
+- L45 change (`b1bc758`, mci91 against mci89):
+  - Buffers that are overwritten whole are swapped, not copied.
+  - `Variables::advance_from` steps the new iterate from the swapped previous one on the pool.
+  - The constant column's HSD terms are cached between the affine and combined solves.
+  - Arrow leaf values are written in parallel through a cached per-leaf plan.
+- L45 results (plain, 64 threads, points bitwise identical):
+
+  | Case | Node | A s | B s | change |
+  |---|---|---|---|---|
+  | Λ35-rs | node101 | 752.3, 753.3 | 735.5, 734.4 | −2.3% |
+  | Λ27 | node104 | 175.7, 178.7 | 175.5, 174.3 | −0.8% |
+
+- L45 decision: kept.
+- L46, hypothesis: symmetric cone scalings do not depend on μ. The scale phase is set by the slowest cone SVD (`svdmax` 0.33 s against a median of 0.165 s on 72 cones and 64 workers), so its workers idle while the residual update's block products (0.092 s/it) wait for it.
+- L46 change (`3e742a2`):
+  - A single-process solve scales the cones of each new iterate inside its residual update.
+  - The residual's queued block-product jobs become tail jobs (`TailJobs`) of the cone queue. Workers that run out of cones take them after the posted board items.
+  - `scale()` uses that scaling when the strategy is unchanged. `reset_to_prev_iterate` and MPI runs do not use it.
+  - Test switch: `SDPX_SCALE_OVERLAP=0`.
+- L46 results (same binary mci92 off/on, plain 64 threads, points bitwise identical):
+
+  | Run | Case | off s | on s | change |
+  |---|---|---|---|---|
+  | 225280 (node106) | Λ35-rs | 813.6, 787.9 | 767.1, 778.0 | −3.5% (A1 noisy) |
+  | 225285 (node101, rerun) | Λ35-rs | 732.5, 737.8 | 711.9, 714.2 | −3.0% |
+  | 225281 (node107) | Λ27 | 165.3, 168.4 | 158.1, 160.2 | −4.6% |
+
+  - The residual and scaling together drop from 0.446 to 0.386 s/it on Λ35-rs. `scale cones` itself rises from 0.350 to 0.360 s/it.
+- L46 decision: kept.
+
 ## 2026-10-12 — L43: refinement floor for retained rows (kept); L44: MPFR PSD corrector (rejected) (perf-mc-impl)
 
 - L43, observed (trace on plain Λ35-rs): after one correction the sampled PSD rows pass their L24 floor. The retained zero-cone rows, near eps·|A_r||x| (~1e-208), were the only rows that forced the stall-confirming corrections, 176 of 589.
