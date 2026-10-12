@@ -229,6 +229,11 @@ execution plans. The journal preserves all failed evidence and final decisions.
      - Remaining on the critical rank: ~110 allreduces per iteration, 6.7 s total. The per-site minimum over ranks sums to ~2.8 s (communication floor); the rest is phase-to-phase imbalance, so removing every barrier (L4) is worth at most ~3%.
      - `scale cones` is set by the largest cone's serial MPFR SVD (~150 ms per cone per iteration).
      - Plain A legs differ 4% between nodes: compare within a node only.
+   - Owner follow-ups 3 (journal 2026-10-12):
+     - Kept L37b: the owner coupling panel `K⁻¹Cᵀ` is solved by exact-dot rows (4 nodes −3.0%, 1 node 4×16 −7.6%); full solves audited.
+     - Rejected L37: the border Schur complement by residue GEMM (+10%).
+     - Lockstep pair refinement deferred (≤8%).
+     - Open, L41: in-process `--partitions` runs show multi-second stalls in scale cones (RNS gemm CRT maxima of 8–15 s). MPI ranks do not.
    - Single-heavy-owner sampled splitting is closed: correct on both MPI gates, but neither improves end-to-end time.
    - Profile prime-group underfill and NUMA residue placement on large calls;
      split complete inner products over output tiles only if they dominate.

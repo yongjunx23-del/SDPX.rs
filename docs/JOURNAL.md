@@ -8,6 +8,34 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-12 — L37: owner coupling response by exact-dot rows (L37b kept, perf-mc-impl)
+
+- Hypothesis (L36): `owned.factor_response` (7.3 s per 60 it) solves the 170 border coupling columns through the leaves' lane panels once per factorization; a cheaper exact form of `K⁻¹Cᵀ` cuts the owner factor phase.
+- L37, rejected: border Schur `C K⁻¹ Cᵀ` from the leaf factors by residue GEMM (patch `l37-border-schur-rejected.patch`). Λ35 1024 bits, 60 it, A = mci80:
+  - 4 nodes 16×16 (225155): A 90.3 / 90.01 s, B 99.49 / 99.29 (+10%).
+  - 1 node 4×16 (225156): A 168.33 / 168.45, B 181.76 / 182.15 (+8%).
+- L37b, kept: `ArrowLDL::solve_coupling_panel` solves the coupling panel of a trunk-free arrow (above 64 bits) column by column with exact-dot rows. Every forward and backward entry is one exact dot rounded once (`backward_staged` keeps solved entries negated so each staged column is contiguous). Never less accurate than the FMA lane chains; thread-count invariant; not bitwise equal. Other panels keep `solve_many`.
+  - ABBA, mci83 vs mci80, Λ35 1024 bits, 60 it (points differ, as expected):
+    - 4 nodes 16×16 (225169): A 90.0 / 89.83 s, B 87.1 / 87.27 (−3.0%).
+    - 1 node 4×16 (225170): A 168.38 / 168.49, B 155.7 / 155.68 (−7.6%).
+  - Full solves, `--partitions 4` on one node (f83b, node42), all accepted by the original-coordinate audit (225224): Λ19-rs 89 it 47.8 s, Λ27-rs 137 it 171.9 s, Λ27 378 it 608.9 s, Λ35-rs 602 it 5180.7 s. The mci80 references (f82a, node30, audits 225175) are 89 / 46.4, 137 / 168.4, 372 / 583.3, 602 / 3566.9.
+  - The Λ35-rs gap is not L37b. Its `kkt update` CPU fell (57.5k → 56.0k s). All the growth is in `scale cones` stragglers: `svd.reflectors` and `rns.gemm.shared_crt` per-call maxima of 7.8 s (f82a) and 15 s (f83b) against 0.037 / 0.008 s medians. Per-call medians are equal, and 4-node MPI receipts show no such stalls (max 0.25 s). Tracked as L41.
+- Threads per rank (L38 probe 225167, mci80, 4 nodes 16 ranks): 16 threads 87.98 s, 8 threads 99.39, 4 threads 151.13. Owner ranks still scale with threads; no single serial phase dominates.
+
+## 2026-10-12 — L36: owner solve parts, and layouts with keepers on (diagnosis)
+
+- Layouts re-checked with keepers on (mci80, Λ35 1024 bits, 60 it; points identical in every pair):
+  - 4 nodes (225148, node26/30/42/43): 16×16 88.38 / 88.24 s, 18×12 89.1 / 88.65, 12×21 89.89 / 89.32, 36×7 98.27 / 97.35. 16×16 stays the default.
+  - 1 node (225149, node45): plain 64 threads 141.7 / 141.19 s, owner 4×16 168.63 / 168.64, 8×8 166.39 / 166.49. Plain stays best on one node.
+- Owner profile (mci81 = mci80 + diagnostic timers, 225151, node10/48/59/61, 90.1 s; rank 0 of 80.9 s timed):
+  - The predictor `pair` takes 23.2 s over 60 calls: original-level refinement 10.6, recovery 4.3, panel 3.6, reduced refinement 2.6, preparation 2.1.
+  - `single` takes 15.6 s over 63 calls: original-level refinement 9.5, first solve 5.9.
+  - Original residuals take 12.6 s over 264 calls (one per column solve plus one per correction); 81 original corrections take 6.5 s.
+  - `owned.factor_response` takes 7.3 s and `owned.border_assemble` 4.6 s. The assembly forms every `C K⁻¹ Cᵀ` entry from the 170 response columns.
+  - The cone-scaling products of `prepare_rhs`, `recover_rhs` and `residual` take 5.3 + 7.9 + 11.1 s.
+- Lockstep pair refinement (one prepare/recover/residual for both pair columns): it saves at most the per-call overhead of half the pair's scaling calls. That is ≤8% by the timers above, and it needs a two-column refine loop through `OwnedRefinement`. Deferred.
+- Next: form `C K⁻¹ Cᵀ` from the leaf factors (L37).
+
 ## 2026-10-12 — L35: idle-priority core keepers for multi-rank runs (kept, perf-mc-impl)
 
 - Hypothesis (L34): under the `conservative` governor, the cores of an owner rank that serve short regions stay at 1.5 GHz. An in-solver `SCHED_IDLE` spinner per allocated CPU would hold them at 2.25 GHz and yield to every solver thread.

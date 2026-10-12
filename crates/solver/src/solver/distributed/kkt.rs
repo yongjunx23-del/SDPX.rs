@@ -573,9 +573,11 @@ impl<T: FloatT> OwnedKkt<T> {
                             local.coupling.nzval[p];
                     }
                 }
-                local
-                    .kernel
-                    .solve_interior_panel(&local.coupling_rhs, &mut local.response, border)
+                local.kernel.solve_interior_coupling(
+                    &local.coupling_rhs,
+                    &mut local.response,
+                    border,
+                )
             };
             if let Some(started) = started {
                 local.factor_response_ns += elapsed_ns(started);

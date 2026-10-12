@@ -562,6 +562,16 @@ where
     /// solve/batch counters but deliberately does not count caller RHS
     /// applications and performs no local iterative refinement.
     pub(crate) fn solve_factor_panel(&mut self, rhs: &[T], out: &mut [T], cols: usize) -> bool {
+        self.solve_panel(rhs, out, cols, false)
+    }
+
+    /// [`Self::solve_factor_panel`] for a coupling panel solved once per
+    /// factorization ([`DirectLDLSolver::solve_coupling_panel`]).
+    pub(crate) fn solve_coupling_panel(&mut self, rhs: &[T], out: &mut [T], cols: usize) -> bool {
+        self.solve_panel(rhs, out, cols, true)
+    }
+
+    fn solve_panel(&mut self, rhs: &[T], out: &mut [T], cols: usize, coupling: bool) -> bool {
         let full = self.factor_dimension();
         assert_eq!(rhs.len(), cols * full);
         assert_eq!(out.len(), rhs.len());
@@ -576,8 +586,13 @@ where
         batch_rhs.copy_from_slice(rhs);
 
         let timer = crate::receipt::start();
-        self.ldlsolver
-            .solve_many(&self.KKT, &mut batch_out, &mut batch_rhs, cols);
+        if coupling {
+            self.ldlsolver
+                .solve_coupling_panel(&self.KKT, &mut batch_out, &mut batch_rhs, cols);
+        } else {
+            self.ldlsolver
+                .solve_many(&self.KKT, &mut batch_out, &mut batch_rhs, cols);
+        }
         crate::receipt::finish("trsv", timer);
         self.counters.batches += 1;
         self.counters.linear_solves += cols as u64;

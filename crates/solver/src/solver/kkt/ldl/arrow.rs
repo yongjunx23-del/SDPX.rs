@@ -449,6 +449,22 @@ impl<T: FloatT> DenseLeaf<T> {
         }
     }
 
+    /// [`Self::backward`] after [`Self::stage_rows`]`(0)`: each entry is
+    /// `x[i] - Σ_{k>i} L_ki x_k` as one exact dot rounded once. Column `i`
+    /// from its staged unit diagonal is contiguous, so solved entries are
+    /// kept negated (exactly) and negated back at the end. Never less
+    /// accurate than the FMA chain, but not bitwise equal to it.
+    fn backward_staged(&self, x: &mut [T]) {
+        let n = self.n;
+        for i in (0..n).rev() {
+            let v = T::dot_slices(&self.l[i * n + i..(i + 1) * n], &x[i..]);
+            x[i] = -v;
+        }
+        for v in x.iter_mut() {
+            *v = -*v;
+        }
+    }
+
     /// [`Self::backward`] split over the ambient pool: the bottom row block
     /// finishes serially, then every earlier row applies that block's columns
     /// in parallel. A row sums its terms block by block from the bottom,
@@ -1796,6 +1812,59 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         )
     }
 
+    /// `x = K⁻¹b` for a trunk-free arrow (`K` block diagonal over its
+    /// leaves), column by column with exact-dot rows: every forward and
+    /// backward entry is one exact dot rounded once. Never less accurate than
+    /// the lane panel's FMA chains, but not bitwise equal to them. Columns of
+    /// every leaf run in parallel, each in the same order for any pool, so
+    /// the bits do not depend on the thread count. Each column reads the
+    /// whole factor, yet on the Λ35 owners' 170-column border panel at 1024
+    /// bits this took 1.5–1.7× less time than the lane sweeps.
+    fn solve_rows_panel(&mut self, x: &mut [T], b: &[T], cols: usize) {
+        let n = self.n;
+        assert_eq!(x.len(), n * cols);
+        assert_eq!(b.len(), x.len());
+        let parallel = self.pool.is_some();
+        let solve = |leaf: &mut Leaf<T>| {
+            let g = leaf.ids.len();
+            if g == 0 {
+                return;
+            }
+            leaf.factor.stage_rows(0);
+            leaf.batch_w.resize(g * cols, T::zero());
+            for (c, column) in leaf.batch_w.chunks_mut(g).enumerate() {
+                for (v, &id) in column.iter_mut().zip(&leaf.ids) {
+                    *v = b[c * n + id];
+                }
+            }
+            let factor = &leaf.factor;
+            let column = |w: &mut [T]| {
+                factor.forward_suffix_rows(w, 0);
+                for (v, &d) in w.iter_mut().zip(&factor.dinv) {
+                    *v *= d;
+                }
+                factor.backward_staged(w);
+            };
+            if parallel {
+                leaf.batch_w.par_chunks_mut(g).for_each(column);
+            } else {
+                leaf.batch_w.chunks_mut(g).for_each(column);
+            }
+        };
+        match &self.pool {
+            Some(pool) => pool.install(|| self.leaves.par_iter_mut().for_each(solve)),
+            None => self.leaves.iter_mut().for_each(solve),
+        }
+        for leaf in self.leaves.iter().filter(|leaf| !leaf.ids.is_empty()) {
+            let g = leaf.ids.len();
+            for (c, column) in leaf.batch_w.chunks(g).enumerate().take(cols) {
+                for (&v, &id) in column.iter().zip(&leaf.ids) {
+                    x[c * n + id] = v;
+                }
+            }
+        }
+    }
+
     fn owned_leaves(&self) -> std::ops::Range<usize> {
         self.ranks
             .as_ref()
@@ -2332,6 +2401,29 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
         }
     }
 
+    fn solve_coupling_panel(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T], cols: usize) {
+        #[cfg(feature = "faer-sparse")]
+        let bounds = self.bound_panels.is_some();
+        #[cfg(not(feature = "faer-sparse"))]
+        let bounds = false;
+        // Trunk-free generic leaves at exactly accumulated precisions only.
+        if !self.use_arrow
+            || bounds
+            || !self.trunk.is_empty()
+            || self.ranks.is_some()
+            || self.local_structure.is_some()
+            || self.exact_bound_panels.is_some()
+            || T::precision_bits() <= 64
+            || self.leaves.iter().any(|leaf| leaf.signs.is_empty())
+        {
+            self.solve_many(kkt, x, b, cols);
+            return;
+        }
+        let prof = crate::receipt::start();
+        self.solve_rows_panel(x, b, cols);
+        crate::receipt::finish("many.rows", prof);
+    }
+
     fn solve(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T]) {
         if !self.use_arrow {
             self.fallback.as_mut().unwrap().solve(kkt, x, b);
@@ -2701,6 +2793,66 @@ mod tests {
     #[test]
     fn arrow_batch_512() {
         batch_parity::<sdpx_arithmetic::Bits512>();
+    }
+
+    /// Trunk-free arrow: the coupling panel matches the lane panel to working
+    /// accuracy and is bitwise the same for every pool (f64: the lane panel).
+    fn coupling_panel<T: FloatT>(cols: usize) {
+        let sizes = [30usize, 41, 25];
+        let n: usize = sizes.iter().sum();
+        let (mut colptr, mut rowval, mut nzval) = (vec![0usize], Vec::new(), Vec::new());
+        let mut start = 0;
+        for &g in &sizes {
+            for j in start..start + g {
+                for i in start..=j {
+                    rowval.push(i);
+                    nzval.push(if i == j {
+                        T::from_f64(2.0 * g as f64 + (i % 5) as f64).unwrap()
+                    } else {
+                        T::from_f64(((i * 7 + j * 3) % 11) as f64 / 11.0 - 0.45).unwrap()
+                    });
+                }
+                colptr.push(rowval.len());
+            }
+            start += g;
+        }
+        let k = CscMatrix::new(n, n, colptr, rowval, nzval);
+        let signs = vec![1i8; n];
+        let mut solver =
+            ArrowLDLSolver::try_new(&k, &signs, &CoreSettings::<T>::default()).unwrap();
+        assert!(solver.refactor(&k) && solver.use_arrow && solver.trunk.is_empty());
+        let b: Vec<T> = (0..n * cols)
+            .map(|e| T::from_f64(((e * 13) % 17) as f64 / 17.0 - 0.3).unwrap())
+            .collect();
+        let mut lanes = vec![T::zero(); b.len()];
+        solver.solve_many(&k, &mut lanes, &mut b.clone(), cols);
+        let mut serial = vec![T::zero(); b.len()];
+        solver.solve_coupling_panel(&k, &mut serial, &mut b.clone(), cols);
+        let exact = T::precision_bits() <= 64;
+        let tol = T::from_f64(if exact { 0.0 } else { 1e-60 }).unwrap();
+        for (a, l) in serial.iter().zip(&lanes) {
+            assert!((*a - *l).abs() <= tol);
+        }
+        for threads in [2, 4] {
+            solver.set_pool(Some(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap(),
+            )));
+            assert!(solver.refactor(&k));
+            let mut pooled = vec![T::zero(); b.len()];
+            solver.solve_coupling_panel(&k, &mut pooled, &mut b.clone(), cols);
+            assert_eq!(pooled, serial);
+        }
+    }
+    #[test]
+    fn arrow_coupling_panel() {
+        for cols in [1, 7, 26] {
+            coupling_panel::<f64>(cols);
+            coupling_panel::<sdpx_arithmetic::Bits256>(cols);
+            coupling_panel::<sdpx_arithmetic::Bits512>(cols);
+        }
     }
 
     /// K = [H1 . . B1; . H2 . B2; . . H3 B3; B1' B2' B3' C] with three

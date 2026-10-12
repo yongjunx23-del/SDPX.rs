@@ -23,6 +23,12 @@ pub trait DirectLDLSolver<T: FloatT>: HasLinearSolverInfo {
             self.solve(kkt, x, b);
         }
     }
+    /// [`Self::solve_many`] for a coupling panel solved once per
+    /// factorization. Backends may use a different, never less accurate
+    /// accumulation order for it; the default is `solve_many`.
+    fn solve_coupling_panel(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T], ncols: usize) {
+        self.solve_many(kkt, x, b, ncols);
+    }
     /// Optional structure-aware residual against the complete unshifted KKT.
     fn residual(&self, _kkt: &CscMatrix<T>, _out: &mut [T], _rhs: &[T], _point: &[T]) -> Option<T> {
         None

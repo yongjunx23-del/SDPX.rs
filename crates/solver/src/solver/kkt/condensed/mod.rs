@@ -1837,6 +1837,17 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         self.reduced.solve_factor_panel(rhs, out, cols)
     }
 
+    /// [`Self::solve_interior_panel`] for the border coupling columns, solved
+    /// once per factorization.
+    pub(crate) fn solve_interior_coupling(
+        &mut self,
+        rhs: &[T],
+        out: &mut [T],
+        cols: usize,
+    ) -> bool {
+        self.reduced.solve_coupling_panel(rhs, out, cols)
+    }
+
     pub(crate) fn interior_residual(&self, out: &mut [T], rhs: &[T], point: &[T]) -> T {
         self.reduced.residual_full(out, rhs, point)
     }
