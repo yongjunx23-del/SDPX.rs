@@ -375,6 +375,11 @@ pub trait KKTSystem<T: FloatT>: crate::solver::kkt::HasLinearSolverInfo {
         self.update(data, cones, settings)
     }
 
+    /// Whether the next affine step takes prepared cone bounds (iterations
+    /// after the first), which above binary64 rebuild the PSD rows of Δs
+    /// from W·Δz.
+    fn set_prepared_affine(&mut self, _prepared: bool) {}
+
     /// Solve the KKT system for the given RHS.
     #[allow(clippy::too_many_arguments)]
     fn solve(

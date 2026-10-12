@@ -247,8 +247,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             self.swap_rhs_mats(&mut saved[c * per_column..(c + 1) * per_column]);
             let corrections = self.counters.outer_refinements;
             flags[c] = local_success(self.local_only, self.recover_rhs(&mut x, rhs))
-                && if unrefined == Some(c) {
-                    self.scale_solution(&x)
+                && if let Some((_, prepared)) = unrefined.filter(|&(u, _)| u == c) {
+                    self.scale_solution(&x, prepared)
                 } else {
                     self.refine_solution(&mut x, rhs, settings)
                 };
@@ -321,8 +321,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         self.reduced.escalate_regularization()
     }
 
-    fn skip_refinement(&mut self, column: usize) {
-        self.unrefined = Some(column);
+    fn skip_refinement(&mut self, column: usize, prepared: bool) {
+        self.unrefined = Some((column, prepared));
     }
 
     fn retained_rows(&self) -> Option<&[usize]> {
@@ -418,19 +418,35 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     }
 
     /// `workh = Hs·z` of an unrefined solution, as its residual would leave
-    /// it for `scaled_product`.
-    fn scale_solution(&mut self, x: &[T]) -> bool {
-        apply_scaling_pool_with_world(
-            None,
-            &self.pool,
-            &self.scaling_lanes,
-            self.scaling_tiles,
-            self.scaling_workers,
-            &mut self.blocks,
-            &mut self.workh,
-            &x[self.n..],
-            false,
-        );
+    /// it for `scaled_product`. With `prepared` step bounds the PSD rows stay
+    /// zero: the bounds rebuild those rows of Δs from W·Δz (`kkt_bounds`) and
+    /// never read their Hs·z, a congruence per block (about 0.04 s per
+    /// Λ35-rs iteration).
+    fn scale_solution(&mut self, x: &[T], prepared: bool) -> bool {
+        let z = &x[self.n..];
+        if prepared {
+            self.workh.fill(T::zero());
+            let offset = self.blocks.first().map_or(0, |b| b.rows.start);
+            for block in self.blocks.iter_mut() {
+                if !matches!(block.scaling, Scaling::Psd(_)) {
+                    let rows = block.rows.start - offset..block.rows.end - offset;
+                    let y = &mut self.workh[rows.clone()];
+                    apply_block(block, y, &z[rows], ScalingAction::Apply(false), None);
+                }
+            }
+        } else {
+            apply_scaling_pool_with_world(
+                None,
+                &self.pool,
+                &self.scaling_lanes,
+                self.scaling_tiles,
+                self.scaling_workers,
+                &mut self.blocks,
+                &mut self.workh,
+                z,
+                false,
+            );
+        }
         self.workh_partial = false;
         x.is_finite() && self.workh.is_finite()
     }

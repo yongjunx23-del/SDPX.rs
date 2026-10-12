@@ -100,8 +100,9 @@ pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
     }
 
     /// Leave column `column` of the next `solve_many` unrefined (the affine
-    /// predictor). Solvers that ignore it refine every column.
-    fn skip_refinement(&mut self, _column: usize) {}
+    /// predictor). Solvers that ignore it refine every column. `prepared`:
+    /// its step bounds take PSD rows of Δs from W·Δz, not from Hs·Δz.
+    fn skip_refinement(&mut self, _column: usize, _prepared: bool) {}
 
     /// Binary64: continue a stationary refinement that stalls above its
     /// tolerance with GMRES-IR for the rest of the solve. The driver asks

@@ -35,6 +35,8 @@ pub struct DefaultKKTSystem<T> {
     fixed_tau: bool,
     // The constant column's HSD terms, kept until the next factorization.
     const_terms: Option<HsdTerms<T>>,
+    // The next affine step takes prepared cone bounds.
+    prepared_affine: bool,
 }
 
 impl<T> DefaultKKTSystem<T>
@@ -103,6 +105,7 @@ where
             pre2: (Vec::new(), Vec::new()),
             fixed_tau: false,
             const_terms: None,
+            prepared_affine: false,
         }
     }
 }
@@ -169,6 +172,10 @@ where
         }
     }
 
+    fn set_prepared_affine(&mut self, prepared: bool) {
+        self.prepared_affine = prepared;
+    }
+
     fn update_affine(
         &mut self,
         data: &DefaultProblemData<T>,
@@ -194,7 +201,7 @@ where
                     rhs_x.copy_from_slice(&rhs.x);
                     rhs_z.waxpby(T::one(), &variables.s, -T::one(), &rhs.z);
                     if !refine_predictor() {
-                        self.kktsolver.skip_refinement(0);
+                        self.kktsolver.skip_refinement(0, self.prepared_affine);
                     }
                     let ok = self.kktsolver.solve_many(
                         n,
@@ -227,7 +234,7 @@ where
                 self.batch_rhs[width..width + n].copy_from_slice(&rhs.x);
                 self.batch_rhs[width + n..].waxpby(T::one(), &variables.s, -T::one(), &rhs.z);
                 if !refine_predictor() {
-                    self.kktsolver.skip_refinement(1);
+                    self.kktsolver.skip_refinement(1, self.prepared_affine);
                 }
                 let ok = self.kktsolver.solve_many(
                     n,

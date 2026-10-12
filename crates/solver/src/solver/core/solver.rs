@@ -823,6 +823,8 @@ mod internal {
                 .affine_step_rhs(&self.residuals, &self.variables, &self.cones);
             }}
             let mut ok: bool;
+            // Matches the prepared affine step length below.
+            self.kktsystem.set_prepared_affine(state.iter > 1);
             timeit! {"kkt update"; {
                 ok = self.kktsystem.update_affine(&self.data, &self.cones, &self.step_rhs, &self.variables, &self.settings);
             }}
