@@ -95,7 +95,7 @@ fn fresh_solves_thaw_previous_fixed_tau_phase() {
     type T = MpFloat<2>;
     let fixture = problem::<T>(1);
     let mut config = settings::<T>();
-    config.initial_tau = T::one() / n(4);
+    config.initial_tau = n::<T>(1) / n(4);
     let mut plain = DefaultSolver::new(
         &fixture.p,
         &fixture.q,
