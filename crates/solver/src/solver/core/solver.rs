@@ -1247,7 +1247,7 @@ mod internal {
             };
 
             // additional barrier function limits for asymmetric cones
-            if !self.cones.all_symmetric()
+            if self.cones.barrier_backtrack()
                 && step_direction == StepDirection::Combined
                 && scaling == ScalingStrategy::Dual
             {

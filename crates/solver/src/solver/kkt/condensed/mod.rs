@@ -260,6 +260,9 @@ pub(crate) fn prefer_condensed<T: FloatT>(
                 factor_cells += 7 * (c.n as u128).pow(2);
             }
             SupportedCone::NonnegativeCone(_) => {}
+            // Both forms hold these rows alike (−D and N⁻¹A, factored before
+            // the variables), so they do not decide the form.
+            SupportedCone::OpRelEntropyCone(_) => {}
             _ => {
                 retained = retained.saturating_add(cone.numel());
                 // Match the existing SOC/GenPower sparse expansion sizes.
@@ -890,6 +893,9 @@ enum Scaling<T> {
         rows: Vec<Vec<(usize, usize)>>,
     },
     Dense3([T; 6]),
+    /// A retained operator relative entropy cone: a copy of its factored
+    /// scaling for products with Hs (the reduced solver reads the cone).
+    Ore(Box<OpRelEntropyCone<T>>),
     GenPower {
         p: Vec<T>,
         q: Vec<T>,
@@ -1211,6 +1217,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 SupportedCone::ExponentialCone(_) | SupportedCone::PowerCone(_) => {
                     Scaling::Dense3([T::zero(); 6])
                 }
+                SupportedCone::OpRelEntropyCone(c) => Scaling::Ore(Box::new(c.clone())),
                 SupportedCone::GenPowerCone(c) => Scaling::GenPower {
                     p: c.data.p.clone(),
                     q: c.data.q.clone(),

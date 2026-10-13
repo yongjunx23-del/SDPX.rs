@@ -26,9 +26,12 @@ typedef struct sdpx_handle sdpx_handle;
 typedef struct { uint32_t kind; uint32_t reserved; uint64_t count; const double *f64; const char *const *decimal; } sdpx_scalars; /* kind 0=f64, 1=decimal */
 typedef struct { uint64_t rows, cols, nnz; const uint64_t *colptr, *rowval; sdpx_scalars values; } sdpx_csc;
 /* kind 0 zero,1 nonnegative,2 SOC,3 PSD triangle,4 exponential,5 power,
- * 6 generalized power. dim is row count except PSD matrix order and GENPOW
- * right-hand Euclidean dimension. POW has one alpha, GENPOW has alpha vector.
- * PSD entries use upper triangular column order, sqrt(2) off-diagonal scaling. */
+ * 6 generalized power, 7 operator relative entropy. dim is row count except
+ * PSD and operator relative entropy matrix order and GENPOW right-hand
+ * Euclidean dimension. POW has one alpha, GENPOW has alpha vector.
+ * PSD entries use upper triangular column order, sqrt(2) off-diagonal scaling.
+ * Operator relative entropy stacks (T, X, Y) in that form:
+ * T >= -X^1/2 log(X^-1/2 Y X^-1/2) X^1/2 with X, Y > 0. */
 typedef struct { uint32_t kind, reserved; uint64_t dim; sdpx_scalars alpha; } sdpx_cone;
 /* Factor-authoritative PSD block: starts are zero based; basis is column major.
  * There are dim*(dim+1)/2*basis_cols consecutive variables, with primitive

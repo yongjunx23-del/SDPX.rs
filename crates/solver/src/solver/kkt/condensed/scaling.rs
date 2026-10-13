@@ -135,6 +135,7 @@ pub(super) fn apply_block<T: FloatT>(
                 y.axpby(c, w, T::one());
                 y.scale(*eta * *eta);
             }
+            Scaling::Ore(c) => c.mul_Hs(y, x, &mut []),
             Scaling::Dense3(h) => {
                 let mut p = 0;
                 for j in 0..3 {

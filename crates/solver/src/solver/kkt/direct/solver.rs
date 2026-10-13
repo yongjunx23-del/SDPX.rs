@@ -54,6 +54,61 @@ impl<T: FloatT> DirectLDLSolver<T> for EmptyDirectLDLSolver {
     }
 }
 
+/// Rows of one operator relative entropy cone. The KKT holds them in the
+/// cone's eigen row coordinates (`OpRelEntropyRows`): N⁻¹A with −D on the
+/// diagonal; right-hand sides map by N⁻¹ and solutions back by N⁻ᵀ.
+struct OreRows<T> {
+    cone: usize,
+    rows: std::ops::Range<usize>,
+    cols: Vec<usize>,
+    /// A on rows × cols (dense, column-major) and the KKT positions
+    a: Vec<T>,
+    pos: Vec<usize>,
+    t: OpRelEntropyRows<T>,
+}
+
+/// A with each operator relative entropy cone's rows dense over the columns
+/// touching them, each A entry's position in it, and the cones' rows.
+#[allow(clippy::type_complexity)]
+fn ore_pattern<T: FloatT>(
+    A: &CscMatrix<T>,
+    cones: &CompositeCone<T>,
+) -> Option<(CscMatrix<T>, Vec<usize>, Vec<(usize, std::ops::Range<usize>)>)> {
+    let blocks: Vec<_> = cones
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| matches!(c, SupportedCone::OpRelEntropyCone(_)))
+        .map(|(i, _)| (i, cones.rng_cones[i].clone()))
+        .collect();
+    if blocks.is_empty() {
+        return None;
+    }
+    let (mut colptr, mut rowval, mut nzval) = (vec![0], Vec::new(), Vec::new());
+    let mut index = vec![0; A.nnz()];
+    for col in 0..A.n {
+        let span = A.colptr[col]..A.colptr[col + 1];
+        let have = &A.rowval[span.clone()];
+        let mut entries: Vec<(usize, T, Option<usize>)> =
+            span.map(|p| (A.rowval[p], A.nzval[p], Some(p))).collect();
+        for (_, rows) in &blocks {
+            if have.iter().any(|r| rows.contains(r)) {
+                let missing = rows.clone().filter(|r| have.binary_search(r).is_err());
+                entries.extend(missing.map(|r| (r, T::zero(), None)));
+            }
+        }
+        entries.sort_unstable_by_key(|e| e.0);
+        for (r, v, p) in entries {
+            if let Some(p) = p {
+                index[p] = rowval.len();
+            }
+            rowval.push(r);
+            nzval.push(v);
+        }
+        colptr.push(rowval.len());
+    }
+    Some((CscMatrix::new(A.m, A.n, colptr, rowval, nzval), index, blocks))
+}
+
 pub struct DirectLDLKKTSolver<T> {
     // problem dimensions
     m: usize,
@@ -109,6 +164,9 @@ pub struct DirectLDLKKTSolver<T> {
     /// between them and gathered (each row is rounded once, so the result
     /// does not depend on the split).
     residual_world: Option<crate::mpi::World>,
+    ore: Vec<OreRows<T>>,
+    /// Position of each A entry in the KKT's A pattern (with `ore`).
+    a_index: Vec<usize>,
 }
 
 impl<T> DirectLDLKKTSolver<T>
@@ -128,7 +186,27 @@ where
         let (kktshape, ldl_ctor) = T::get_ldlsolver_config(settings);
 
         //construct a KKT matrix of the right shape
+        let ore = ore_pattern(A, cones);
+        let A = ore.as_ref().map_or(A, |(a, _, _)| a);
         let (KKT, map) = assemble_kkt_matrix(P, A, cones, kktshape);
+        let (ore, a_index) = match ore {
+            None => (Vec::new(), Vec::new()),
+            Some((ref ak, ref index, ref blocks)) => {
+                let rows = blocks.iter().map(|(cone, rows)| {
+                    let (mut cols, mut a, mut pos) = (Vec::new(), Vec::new(), Vec::new());
+                    for col in 0..ak.n {
+                        let span = ak.colptr[col]..ak.colptr[col + 1];
+                        if let Some(p) = span.clone().find(|&p| rows.contains(&ak.rowval[p])) {
+                            cols.push(col);
+                            a.extend_from_slice(&ak.nzval[p..p + rows.len()]);
+                            pos.extend_from_slice(&map.A[p..p + rows.len()]);
+                        }
+                    }
+                    OreRows { cone: *cone, rows: rows.clone(), cols, a, pos, t: Default::default() }
+                });
+                (rows.collect(), index.clone())
+            }
+        };
         debug_assert!(
             kktshape != MatrixTriangle::Triu
                 || P.count_diagonal_entries(MatrixTriangle::Triu) != n
@@ -163,6 +241,19 @@ where
         // One AMD ordering of the KKT pattern serves both the bound
         // elimination's cost test and the sparse factor chosen after it.
         let mut amd = std::cell::OnceCell::new();
+        if !ore.is_empty() {
+            // Operator relative entropy rows: every cone row is eliminated
+            // before x (AMD order kept within each group). With P = 0 and no
+            // MPFR shift, an x pivot taken before all of its cone rows can be
+            // tiny (one_matrix_L8 at 128 bits: x = 1e35 after one step);
+            // z-first leaves −D per cone and then the SPD Schur AᵀHs⁻¹A.
+            let (order, _, info) = crate::qdldl::get_amd_ordering(&KKT, 1.5);
+            let perm: Vec<usize> =
+                order.iter().filter(|&&k| k >= n).chain(order.iter().filter(|&&k| k < n)).copied().collect();
+            let mut iperm = vec![0; perm.len()];
+            perm.iter().enumerate().for_each(|(i, &k)| iperm[k] = i);
+            let _ = amd.set((perm, iperm, info));
+        }
         let mut ldlsolver = if KKT.n == 0 {
             Box::new(EmptyDirectLDLSolver) as BoxedDirectLDLSolver<T>
         } else if settings.direct_solve_method == "auto" {
@@ -187,7 +278,7 @@ where
             .map(|solver| Box::new(solver) as BoxedDirectLDLSolver<T>)
             .unwrap_or_else(|| ldl_ctor(&KKT, &dsigns, settings, amd.take()))
         } else {
-            ldl_ctor(&KKT, &dsigns, settings, None)
+            ldl_ctor(&KKT, &dsigns, settings, amd.take())
         };
         ldlsolver.set_pool(cones.thread_pool());
 
@@ -220,6 +311,8 @@ where
             abs_kkt: None,
             residual_world: None,
             residual_pool: None,
+            ore,
+            a_index,
         }
     }
 }
@@ -259,6 +352,9 @@ where
         self.b[0..n].copy_from(rhsx);
         self.b[n..(n + m)].copy_from(rhsz);
         self.b[n + m..(n + m + p)].fill(T::zero());
+        for o in &self.ore {
+            o.t.to_eigen(&mut self.b[n + o.rows.start..n + o.rows.end]);
+        }
     }
 
     fn solve(
@@ -309,20 +405,24 @@ where
         let mut x = std::mem::take(&mut self.batch_out);
         b.resize(cols * full, T::zero());
         x.resize(cols * full, T::zero());
-        for c in 0..cols {
-            b[c * full..c * full + width].copy_from_slice(&rhs[c * width..(c + 1) * width]);
-            b[c * full + width..(c + 1) * full].fill(T::zero());
-        }
+        let fill = |b: &mut [T]| {
+            for c in 0..cols {
+                let col = &mut b[c * full..(c + 1) * full];
+                col[..width].copy_from_slice(&rhs[c * width..(c + 1) * width]);
+                col[width..].fill(T::zero());
+                for o in &self.ore {
+                    o.t.to_eigen(&mut col[n + o.rows.start..n + o.rows.end]);
+                }
+            }
+        };
+        fill(&mut b);
         let timer = crate::receipt::start();
         self.ldlsolver.solve_many(&self.KKT, &mut x, &mut b, cols);
         crate::receipt::finish("trsv", timer);
         self.counters.rhs_applied += cols as u64;
         self.counters.linear_solves += cols as u64;
         // The factor solve may consume its right-hand sides: restore them.
-        for c in 0..cols {
-            b[c * full..c * full + width].copy_from_slice(&rhs[c * width..(c + 1) * width]);
-            b[c * full + width..(c + 1) * full].fill(T::zero());
-        }
+        fill(&mut b);
         let timer = crate::receipt::start();
         let flags = if settings.iterative_refinement_enable {
             self.refine(&mut x, &b, cols, settings)
@@ -334,7 +434,11 @@ where
         crate::receipt::finish("ir", timer);
         for (c, &ok) in flags.iter().enumerate() {
             if ok {
-                out[c * width..(c + 1) * width].copy_from_slice(&x[c * full..c * full + width]);
+                let col = &mut out[c * width..(c + 1) * width];
+                col.copy_from_slice(&x[c * full..c * full + width]);
+                for o in &self.ore {
+                    o.t.from_eigen(&mut col[n + o.rows.start..n + o.rows.end]);
+                }
             }
         }
         self.batch_rhs = b;
@@ -358,7 +462,25 @@ where
     }
 
     fn update_A(&mut self, A: &CscMatrix<T>) {
-        _update_values(&mut self.ldlsolver, &mut self.KKT, &self.map.A, &A.nzval);
+        if self.ore.is_empty() {
+            _update_values(&mut self.ldlsolver, &mut self.KKT, &self.map.A, &A.nzval);
+            return;
+        }
+        let index: Vec<usize> = self.a_index.iter().map(|&k| self.map.A[k]).collect();
+        _update_values(&mut self.ldlsolver, &mut self.KKT, &index, &A.nzval);
+        // the next cone update writes these rows transformed
+        for o in &mut self.ore {
+            let d = o.rows.len();
+            for (c, &col) in o.cols.iter().enumerate() {
+                let dst = &mut o.a[c * d..(c + 1) * d];
+                dst.fill(T::zero());
+                for p in A.colptr[col]..A.colptr[col + 1] {
+                    if o.rows.contains(&A.rowval[p]) {
+                        dst[A.rowval[p] - o.rows.start] = A.nzval[p];
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -418,6 +540,17 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
         // change signs to get -W^TW
         values.negate();
         _update_values(&mut self.ldlsolver, &mut self.KKT, index, values);
+
+        for o in &mut self.ore {
+            if let Some(SupportedCone::OpRelEntropyCone(c)) = cones.clone().nth(o.cone) {
+                o.t.clone_from(c.rows());
+            }
+            let mut values = o.a.clone();
+            for column in values.chunks_exact_mut(o.rows.len()) {
+                o.t.to_eigen(column);
+            }
+            _update_values(&mut self.ldlsolver, &mut self.KKT, &o.pos, &values);
+        }
 
         let mut sparse_map_iter = map.sparse_maps.iter();
         let ldl = &mut self.ldlsolver;
@@ -636,6 +769,9 @@ where
         }
         if let Some(v) = lhsz {
             v.copy_from(&x[n..(n + m)]);
+            for o in &self.ore {
+                o.t.from_eigen(&mut v[o.rows.clone()]);
+            }
         }
     }
 

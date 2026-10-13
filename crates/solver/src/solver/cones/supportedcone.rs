@@ -47,6 +47,13 @@ pub enum SupportedConeT<T> {
     /// The parameter indicates the matrix dimension, i.e. size = n
     /// means that the variable is the upper triangle of an nxn matrix.
     PSDTriangleConeT(usize),
+
+    /// The operator relative entropy cone
+    /// cl{(T, X, Y) : X, Y ≻ 0, T ⪰ −X^½ log(X^-½ Y X^-½) X^½}.
+    ///
+    /// The parameter is the matrix dimension n; the variable stacks the
+    /// triangles of T, X and Y (each in `PSDTriangleConeT(n)` form).
+    OpRelEntropyConeT(usize),
 }
 
 impl<T> SupportedConeT<T> {
@@ -63,6 +70,7 @@ impl<T> SupportedConeT<T> {
             SupportedConeT::PowerConeT(_) => 3,
             SupportedConeT::PSDTriangleConeT(dim) => triangular_number(*dim),
             SupportedConeT::GenPowerConeT(α, dim2) => α.len() + *dim2,
+            SupportedConeT::OpRelEntropyConeT(dim) => 3 * triangular_number(*dim),
         }
     }
 }
@@ -91,6 +99,7 @@ pub fn make_cone<T: FloatT>(cone: &SupportedConeT<T>) -> SupportedCone<T> {
             GenPowerCone::<T>::new((*α).clone(), *dim2).into()
         }
         SupportedConeT::PSDTriangleConeT(dim) => PSDTriangleCone::<T>::new(*dim).into(),
+        SupportedConeT::OpRelEntropyConeT(dim) => OpRelEntropyCone::<T>::new(*dim).into(),
     }
 }
 
@@ -178,6 +187,7 @@ where
     PowerCone(PowerCone<T>),
     GenPowerCone(GenPowerCone<T>),
     PSDTriangleCone(PSDTriangleCone<T>),
+    OpRelEntropyCone(OpRelEntropyCone<T>),
 }
 
 // -------------------------------------
@@ -202,6 +212,7 @@ pub(crate) enum SupportedConeTag {
     PowerCone,
     GenPowerCone,
     PSDTriangleCone,
+    OpRelEntropyCone,
 }
 
 pub(crate) trait SupportedConeAsTag {
@@ -219,6 +230,7 @@ impl<T> SupportedConeAsTag for SupportedConeT<T> {
             SupportedConeT::PowerConeT(_) => SupportedConeTag::PowerCone,
             SupportedConeT::PSDTriangleConeT(_) => SupportedConeTag::PSDTriangleCone,
             SupportedConeT::GenPowerConeT(_, _) => SupportedConeTag::GenPowerCone,
+            SupportedConeT::OpRelEntropyConeT(_) => SupportedConeTag::OpRelEntropyCone,
         }
     }
 }
@@ -234,6 +246,7 @@ impl<T: FloatT> SupportedConeAsTag for SupportedCone<T> {
             SupportedCone::PowerCone(_) => SupportedConeTag::PowerCone,
             SupportedCone::PSDTriangleCone(_) => SupportedConeTag::PSDTriangleCone,
             SupportedCone::GenPowerCone(_) => SupportedConeTag::GenPowerCone,
+            SupportedCone::OpRelEntropyCone(_) => SupportedConeTag::OpRelEntropyCone,
         }
     }
 }
@@ -249,6 +262,7 @@ impl SupportedConeTag {
             SupportedConeTag::PowerCone => "PowerCone",
             SupportedConeTag::PSDTriangleCone => "PSDTriangleCone",
             SupportedConeTag::GenPowerCone => "GenPowerCone",
+            SupportedConeTag::OpRelEntropyCone => "OpRelEntropyCone",
         }
     }
 }

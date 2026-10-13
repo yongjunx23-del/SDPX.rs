@@ -1,6 +1,6 @@
 use super::*;
 use crate::solver::{
-    cones::{CompositeCone, Cone},
+    cones::{CompositeCone, Cone, SupportedCone},
     core::{
         traits::{KKTSystem, Settings},
         StepDirection,
@@ -389,6 +389,21 @@ where
                     workz[row] = lhs.s[row];
                 }
                 lhs.s.copy_from(workz);
+            }
+        }
+
+        // Operator relative entropy rows: Hs = N·D·Nᵀ with N as ill-conditioned
+        // as the cone point, so Hs·Δz misses the KKT row it was solved from
+        // by cond(N)·eps (two_matrix_L6 at 128 bits: primal residual 7e-23 →
+        // 1e-15 over the last eight iterations). Take Δs from the linear row
+        // as the binary64 condensed rows above do.
+        if cones.iter().any(|c| matches!(c, SupportedCone::OpRelEntropyCone(_))) {
+            workz.waxpby(-T::one(), &rhs.z, lhs.τ, &data.b);
+            data.A.gemv(workz, &lhs.x, -T::one(), T::one());
+            for (cone, rng) in cones.iter().zip(cones.rng_cones.iter()) {
+                if matches!(cone, SupportedCone::OpRelEntropyCone(_)) {
+                    lhs.s[rng.clone()].copy_from(&workz[rng.clone()]);
+                }
             }
         }
 

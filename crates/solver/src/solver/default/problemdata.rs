@@ -92,6 +92,7 @@ where
                     5
                 }
                 SupportedConeT::PSDTriangleConeT(_) => 6,
+                SupportedConeT::OpRelEntropyConeT(_) => 7,
             };
             shape.words(&[tag, cone.nvars()]);
         }

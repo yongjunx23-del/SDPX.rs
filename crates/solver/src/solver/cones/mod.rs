@@ -12,6 +12,7 @@ mod supportedcone;
 mod expcone;
 mod genpowcone;
 mod nonnegativecone;
+mod oprelentrcone;
 mod powcone;
 mod socone;
 mod zerocone;
@@ -22,7 +23,8 @@ mod symmetric_common;
 //re-export everything to appear as one module
 use nonsymmetric_common::*;
 pub use {
-    compositecone::*, expcone::*, genpowcone::*, nonnegativecone::*, powcone::*, socone::*,
+    compositecone::*, expcone::*, genpowcone::*, nonnegativecone::*, oprelentrcone::*, powcone::*,
+    socone::*,
     supportedcone::*, symmetric_common::*, zerocone::*,
 };
 

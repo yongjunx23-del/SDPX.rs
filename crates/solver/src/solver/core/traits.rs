@@ -25,6 +25,12 @@ pub trait ConeCollection<T: FloatT> {
     fn has_correctable(&self) -> bool {
         false
     }
+    /// Whether the combined step backtracks to the composite barrier: some
+    /// member has an exact conjugate barrier (exponential, power). Operator
+    /// relative entropy cones keep their own neighbourhood in `step_length`.
+    fn barrier_backtrack(&self) -> bool {
+        !self.all_symmetric()
+    }
     /// Whether primal-dual scaling is supported by all members.
     fn supports_primal_dual(&self) -> bool;
     /// Set identity scaling before the symmetric initializer.
@@ -44,6 +50,11 @@ impl<T: FloatT> ConeCollection<T> for crate::solver::cones::CompositeCone<T> {
     }
     fn all_symmetric(&self) -> bool {
         self.is_symmetric()
+    }
+    fn barrier_backtrack(&self) -> bool {
+        use crate::solver::cones::SupportedCone;
+        self.iter()
+            .any(|c| !c.is_symmetric() && !matches!(c, SupportedCone::OpRelEntropyCone(_)))
     }
     fn supports_primal_dual(&self) -> bool {
         self.allows_primal_dual_scaling()

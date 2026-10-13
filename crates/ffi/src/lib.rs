@@ -277,6 +277,7 @@ unsafe fn cones<T: Scalar>(input: &[Cone]) -> Result<Vec<SupportedConeT<T>>> {
             4 if d == 3 => ExponentialConeT(),
             5 if d == 3 && a.len() == 1 => PowerConeT(a[0]),
             6 => GenPowerConeT(a, d),
+            7 => OpRelEntropyConeT(d),
             _ => return Err(invalid("invalid cone kind/dimension/parameters")),
         };
         if c.kind != 5 && c.kind != 6 && c.alpha.count != 0 {

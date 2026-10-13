@@ -375,6 +375,12 @@ fn check_dimensions<T: FloatT>(
                 .and_then(|next| n.checked_mul(next))
                 .map(|twice| twice / 2)
                 .ok_or_else(invalid)?,
+            SupportedConeT::OpRelEntropyConeT(n) => n
+                .checked_add(1)
+                .and_then(|next| n.checked_mul(next))
+                .and_then(|twice| (twice / 2).checked_mul(3))
+                .filter(|_| *n > 0)
+                .ok_or_else(invalid)?,
         };
         p = p.checked_add(size).ok_or_else(invalid)?;
     }
