@@ -270,7 +270,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
      - Kept L82 as the default: the deep chase-restart scale is 2^-341 (eps^(1/3) at 1024 bits), clamped to [eps^(1/2), eps^(1/3)], so it no longer follows the precision. Λ35-s70/768 568 → 357 it (−28.1%), now on the 1024-bit path. Λ35-rs and Λ35-s70-p1024 are identical; audited.
      - Observed: a restart scale too shallow costs about 9 iterations per decade, too deep about 1.
      - Rejected L80 (τ capped at a scaled start): Λ27 −6…−15%, but Λ35-rs/pf and t11-aux35 +3–5%. Its premise (τ₀ bounds τ) is refuted. Rejected L81 (accept a stopped refinement candidate at its floor): neutral.
-     - Open: L83, faster infeasibility outcomes. t11-red60 needs 365 iterations to reach DualInfeasible: 230 of slow deflation from τ₀ = 1/max d, with max d clipped at the equilibration bound, then about 60 ray iterations to the ktratio gate, which stays. Probe l83a starts saturated inputs at eps^(1/8).
+     - Closed L83 (journal 2026-10-13, L83). t11-red60 is a synthetic facial-reduction input. Its DualInfeasible verdict is verified in original coordinates (qᵀx = −1, ‖Ax + s‖∞ = 8.3e-78, s exactly PSD), and every start ends there. The saturated start costs +22% iterations (rejected). L84 (shorten the 58-iteration ray phase without touching the gate) is parked until a real excluded-point feasibility input is in the suite.
    - Single-heavy-owner sampled splitting is closed: correct on both MPI gates, but neither improves end-to-end time.
    - Profile prime-group underfill and NUMA residue placement on large calls;
      split complete inner products over output tiles only if they dominate.

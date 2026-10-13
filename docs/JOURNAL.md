@@ -8,6 +8,26 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-13 — L83: t11-red60's DualInfeasible verdict verified; saturated start rejected (perf-mc-impl)
+
+- Context: t11-red60 is a synthetic input. It is one facial-reduction step of Λ35-s70 (`t11_reduce.py`, threshold 1e-60 from the t11-aux35 point, 1160 basis directions removed). Each Gram Y is replaced by VᵀYV, which relaxes the PSD constraint, so the reduced primal may be unbounded.
+- Observed, three starts on the same input (768 bits), all ending DualInfeasible:
+
+  | Start | Job, build | Path | Result |
+  |---|---|---|---|
+  | default τ₀ = 1/max d (max d clipped at eps^(-1/4)) | l83a A1 225485, mci115, node26 | ray phase 308–365 | DualInfeasible 365 it, 444.2 s |
+  | user `initial_tau` 1e-30 | dg83b 225478, mci114 (diagnostics) | plateau pcost = dcost = −26.680, gap 5.1e-7 at 388 | DualInfeasible 529 it, 1010.6 s |
+  | L83 switch `SDPX_TEST_SAT_START=1`: start saturated inputs at eps^(1/8) | l83a B1 | plateau −26.389, gap 2.3e-11 at 150; chase restart at 167 (τ 1.4e-29 → 2.2e-103) | still in the ray phase at 446 (κ/τ 2.9e58); stopped |
+
+- Verified, certificate in original coordinates. A new script, `audit/audit_cert.jl` (cert83 225488, node8, 768-bit BigFloat, no solver code), checked the default point:
+  - qᵀx = −1, ‖Ax + s‖∞ = 8.3e-78, ‖Ax‖∞ = ‖s‖∞ = 8.0e65, ‖x‖∞ = 2.9e210;
+  - each Gram slack is exactly PSD, and the equality slacks are 0.
+  - So the returned ray is a dual-infeasibility certificate, with a residual 1e-143 relative to ‖s‖. Any dual-feasible z would need ‖z‖₁ ≥ 1/8.3e-78 ≈ 1e77. Hypothesis: the reduced dual is weakly infeasible, which explains the near-optimal plateaus at moderate z. This is a property of the input, not a solver error.
+- Observed, the ray phase (dg83, 308–365): each iteration scales (z, τ) by 0.01, with x, s and κ fixed. The affine step is α = 1 with σ ≤ 1e-43; the combined step stops at the fraction 0.99. The 58 iterations from κ/τ ≈ 1 to the gate (1000/tol_ktratio, which stays) take about 70 s, 16% of the solve.
+- Decision:
+  - L83 rejected. On the only saturated input, the switch costs ≥ 81 more iterations (+22%). Switch removed; patch `l83-sat-start-rejected.patch`.
+  - L84 (shorten the ray phase) parked: no infeasible Ising input is in the suite, and t11-red60 is synthetic. An earlier Float64 test of global step fractions 0.98/0.995 failed, so any change would have to touch only the pure-scaling ray steps. That needs a real excluded-point feasibility input first.
+
 ## 2026-10-13 — L82: the deep restart scale no longer follows the precision (kept); L80, L81 rejected; L75 owner check (perf-mc-impl)
 
 - L75 owner check (l75n5 225446; Λ35-s70-p1024, 4 nodes, owner 16×16; mci111, A without and B with the L75 switch): A1 414 it / 659.6 s, B1 357 / 458.7 s, B2 357 / 458.3 s (−30.5%). Same objective, −2.63880096477167638679… The plain gain carries over to the owner path.
