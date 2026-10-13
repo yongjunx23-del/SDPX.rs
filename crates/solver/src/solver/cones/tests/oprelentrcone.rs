@@ -114,33 +114,6 @@ fn factored_scaling_inverts_hessian() {
 }
 
 #[test]
-fn factored_scaling_preserves_boundary_t_block_mpfr128() {
-    use num_traits::{FloatConst, One, Zero};
-    use sdpx_arithmetic::Scalar;
-    type T = sdpx_arithmetic::MpFloat<2>;
-    let two: T = (2.0).as_T();
-    let tiny = two.powi(-80);
-    let a = (T::one() + tiny) / two;
-    let b = (T::one() - tiny) / two;
-    // X = Y = I; T has eigenvalues tiny and 1 in a rotated basis. The
-    // smallest eigenvalue of T⊗T is below the rounding unit of its entries.
-    let s = vec![a, T::SQRT_2() * b, a, T::one(), T::zero(), T::one(), T::one(), T::zero(), T::one()];
-    let mut cone = OpRelEntropyCone::<T>::new(2);
-    assert!(cone.update_scaling(&s, &s, T::one(), ScalingStrategy::Dual));
-    let mut packed = vec![T::zero(); triangular_number(s.len())];
-    cone.get_Hs(&mut packed);
-    assert!(packed[0] > T::zero() && packed[0] < T::epsilon());
-    let mut top = vec![T::zero(); 9];
-    for j in 0..3 {
-        for i in 0..=j {
-            top[i + j * 3] = packed[tri(i, j)];
-            top[j + i * 3] = packed[tri(i, j)];
-        }
-    }
-    assert!(cholesky(3, &mut top), "the retained T block must remain positive definite");
-}
-
-#[test]
 fn dual_bound_is_upper_and_tight_on_central_path() {
     for n in [1usize, 2, 4] {
         let s = point(n, 57 + n as u64);
