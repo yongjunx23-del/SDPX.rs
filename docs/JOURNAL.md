@@ -8,6 +8,43 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — Thermal ORE: negated arrow, binary64 inverses, split ORE kernels (thermal-ore)
+
+- Hypotheses (one_L12 receipts):
+  - Above 64 bits the condensed ORE KKT fell to sparse QDLDL. Its dense blocks are the negative-sign retained cone rows, which the arrow solver did not take as leaves.
+  - At 53 bits the S₀ inverses ran exact-dot loops where LAPACK is faster.
+  - At 128 bits the ORE step search dominated: the dual Dikin CG bracket and serial kernels.
+- Change (on `39d7026`):
+  - `ArrowLDLSolver::try_negated` (`Negated`): the arrow of −K. ORE row blocks become leaves and the primal variables the border; values and right-hand sides change sign exactly. Order: positive arrow, negated arrow, QDLDL.
+  - A failed arrow factor falls back to QDLDL in the caller's z-first ordering. QDLDL's own AMD took tiny primal pivots, and two_L4/128 stopped AlmostSolved. Hypatia's structured fallback suggested keeping the structured order.
+  - Leaves above 64 bits factor left-looking with one exact dot per entry (`factor_dots`), unless the ≥256-bit exact blocked factor applies.
+  - Binary64 ORE inverses use TRSM + SYRK.
+  - Dual Dikin test:
+    - rejects on t alone (q ≥ 0);
+    - leaves the CG bracket once the lower bound fails;
+    - skips CG at 53 bits (one_L12/53: 18.6 s without CG, 24.1 s with).
+  - ORE Cholesky/inverse columns split under the inner-parallel gate (one dot per entry, thread-invariant). The ORE step search runs on the idle solver pool.
+  - Receipt phases `ore.schur_cholesky` and `ore.schur_inverse`.
+- E2E (Mac release, T=1; A = v0.9.2 `39d7026`, B = candidate, order ABBA):
+
+  | Case | A s | B s | Change | Status/it |
+  |---|---|---|---|---|
+  | one_L12/53 | 98.6, 101.5 | 20.9, 20.7 | −79% | Solved 47 both |
+  | one_L12/128, max 4 it | 471.3, 460.2 | 101.0, 105.0 | −78% | MaxIterations (setting) |
+  | two_L6/128 | 6.58, 7.78 | 6.52, 8.19 | neutral | Solved 71 both, identical iterates |
+
+  The second two_L6 pair overlapped a build. Fast profile, one_L12/128 4 it, pre-batch tree (with CG) → candidate: T=1 177 → 101 s, T=4 168 → 67 s.
+- Audits (original coordinates + Arb dual cone), all passed:
+  - one_L12/53 Solved 47: primal 1.56e-10, dual 5.12e-7, gap 1.40e-9 (gate 1e-6).
+  - two_L4/128 Solved 48: primal 8.9e-27, dual 2.4e-23, gap 5.8e-26.
+  - two_L4/256 Solved 80: dual 1.35e-45.
+  - two_L6/128 Solved 71.
+  - ising11/512 fast ABBA vs v0.9.2: Solved 54 both, identical residuals, audits 2/2 each. B/A 0.922 is noise: arrow leaves take ≈0.4 s there.
+- Observed:
+  - two_L8/53 ends AlmostSolved at 64–66 it on both trees.
+  - two_L8/128 on v0.9.2: the gap stalls at ≈3e-8 (it 160–180, residuals ≈1e-22), then chase restarts diverge. Stopped at it 248 after 2 h 09 min.
+- Decision: kept.
+
 ## 2026-10-13 — Review repairs: exact arithmetic, SVD, ORE and MPI keepers
 
 - Correctness repairs:

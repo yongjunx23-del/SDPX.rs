@@ -28,6 +28,16 @@
 
 use super::*;
 use crate::algebra::*;
+use rayon::prelude::*;
+
+/// Tasks for `mul_adds` exact multiply-adds over `items` independent
+/// pieces: more than one only on a solver-pool lane with spare workers (the
+/// inner-parallel gate). Entries stay one dot each, so results do not depend
+/// on the split.
+fn tasks<T: FloatT>(mul_adds: usize, items: usize) -> usize {
+    use sdpx_arithmetic::inner_parallel as ip;
+    ip::tasks(mul_adds as u128 * ip::weight(T::precision_bits() as usize), items)
+}
 
 /// Scalar central point (t, x, y) of the relative entropy cone, s = −∇f(s);
 /// refined to the working precision by `central_point`.
@@ -64,6 +74,7 @@ fn cholesky<T: FloatT>(n: usize, a: &mut [T]) -> bool {
         return (0..n).all(|i| a[i + i * n].is_finite() && a[i + i * n] > T::zero());
     }
     let mut r = vec![T::zero(); n * n];
+    let mut col = Vec::with_capacity(n);
     for j in 0..n {
         let rj = j * n;
         let d = a[j + j * n] - T::dot_slices(&r[rj..rj + j], &r[rj..rj + j]);
@@ -72,10 +83,17 @@ fn cholesky<T: FloatT>(n: usize, a: &mut [T]) -> bool {
         }
         let d = d.sqrt();
         r[rj + j] = d;
-        for i in j + 1..n {
-            let ri = i * n;
-            let v = (a[i + j * n] - T::dot_slices(&r[ri..ri + j], &r[rj..rj + j])) / d;
-            r[ri + j] = v;
+        let rr = &r;
+        let entry = |i: usize| (a[i + j * n] - T::dot_slices(&rr[i * n..i * n + j], &rr[rj..rj + j])) / d;
+        let rows = n - j - 1;
+        if tasks::<T>(rows * j, rows) > 1 {
+            (j + 1..n).into_par_iter().map(entry).collect_into_vec(&mut col);
+        } else {
+            col.clear();
+            col.extend((j + 1..n).map(entry));
+        }
+        for (i, &v) in (j + 1..n).zip(&col) {
+            r[i * n + j] = v;
         }
     }
     for j in 0..n {
@@ -87,20 +105,33 @@ fn cholesky<T: FloatT>(n: usize, a: &mut [T]) -> bool {
 }
 
 /// L⁻¹ of a lower triangular L by forward substitution (lower triangle),
-/// each entry one exact dot product.
+/// each entry one exact dot product; binary64 solves against the identity
+/// with TRSM.
 fn lower_inverse<T: FloatT>(n: usize, l: &[T], li: &mut [T]) {
+    if T::precision_bits() <= 53 {
+        li.fill(T::zero());
+        (0..n).for_each(|i| li[i + i * n] = T::one());
+        T::xtrsm_lower(n, l, li, false);
+        return;
+    }
     let mut rows = vec![T::zero(); n * n];
     for j in 0..n {
         for i in j..n {
             rows[j + i * n] = l[i + j * n];
         }
     }
-    for col in 0..n {
-        li[col + col * n] = T::one() / l[col + col * n];
+    // columns are independent
+    let column = |(col, lc): (usize, &mut [T])| {
+        lc[col] = T::one() / l[col + col * n];
         for i in col + 1..n {
-            let v = T::dot_slices(&rows[i * n + col..i * n + i], &li[col * n + col..col * n + i]);
-            li[i + col * n] = -v / l[i + i * n];
+            let v = T::dot_slices(&rows[i * n + col..i * n + i], &lc[col..i]);
+            lc[i] = -v / l[i + i * n];
         }
+    };
+    if tasks::<T>(n * n * n / 6, n) > 1 {
+        li.par_chunks_mut(n).enumerate().for_each(column);
+    } else {
+        li.chunks_mut(n).enumerate().for_each(column);
     }
 }
 
@@ -110,11 +141,29 @@ fn lower_inverse<T: FloatT>(n: usize, l: &[T], li: &mut [T]) {
 fn spd_inverse<T: FloatT>(n: usize, l: &[T], out: &mut [T]) -> bool {
     let mut li = vec![T::zero(); n * n];
     lower_inverse(n, l, &mut li);
-    for j in 0..n {
+    if T::precision_bits() <= 53 {
+        let ni = n as i32;
+        T::xsyrk(b'L', b'T', ni, ni, T::one(), &li, ni, T::zero(), out, ni);
+        for j in 0..n {
+            for i in j + 1..n {
+                out[j + i * n] = out[i + j * n];
+            }
+        }
+        return out.iter().all(|v| v.is_finite());
+    }
+    let column = |(j, oc): (usize, &mut [T])| {
         for i in j..n {
-            let v = T::dot_slices(&li[i + i * n..(i + 1) * n], &li[i + j * n..(j + 1) * n]);
-            out[i + j * n] = v;
-            out[j + i * n] = v;
+            oc[i] = T::dot_slices(&li[i + i * n..(i + 1) * n], &li[i + j * n..(j + 1) * n]);
+        }
+    };
+    if tasks::<T>(n * n * n / 6, n) > 1 {
+        out.par_chunks_mut(n).enumerate().for_each(column);
+    } else {
+        out.chunks_mut(n).enumerate().for_each(column);
+    }
+    for j in 0..n {
+        for i in j + 1..n {
+            out[j + i * n] = out[i + j * n];
         }
     }
     out.iter().all(|v| v.is_finite())
@@ -597,7 +646,10 @@ impl<T: FloatT> Oracle<T> {
         let m2 = self.n * (self.n + 1);
         let l = self.schur_factor()?;
         let mut s0i = vec![T::zero(); m2 * m2];
-        (spd_inverse(m2, &l, &mut s0i) && s0i.iter().all(|v| v.is_finite())).then_some(s0i)
+        let timer = crate::receipt::start();
+        let ok = spd_inverse(m2, &l, &mut s0i) && s0i.iter().all(|v| v.is_finite());
+        crate::receipt::finish("ore.schur_inverse", timer);
+        ok.then_some(s0i)
     }
 
     /// Lower Cholesky factor of S₀ (column-major, size 2m).
@@ -631,7 +683,10 @@ impl<T: FloatT> Oracle<T> {
             svec(n, &ok, &mut column[m..]);
         }
         symmetrize(m2, &mut s0);
-        cholesky(m2, &mut s0).then_some(s0)
+        let timer = crate::receipt::start();
+        let ok = cholesky(m2, &mut s0);
+        crate::receipt::finish("ore.schur_cholesky", timer);
+        ok.then_some(s0)
     }
 
     /// ⟨z, (∇²f)⁻¹z⟩ = t + vᵀS₀⁻¹v with t = tr(ẐR̂ẐR̂) = ‖LzᵀR̂Lz‖²,
@@ -715,9 +770,15 @@ impl<T: FloatT> Oracle<T> {
         let m = n * (n + 1) / 2;
         let nn = n * n;
         let m2 = w.len();
-        // the factor's (2m)³/6 multiply-adds against ≈ 18n³ per CG step
-        let budget = m2.pow(3) / (108 * n.pow(3));
-        if !ok(t) || budget == 0 {
+        // the factor's (2m)³/6 multiply-adds against ≈ 18n³ per CG step;
+        // binary64 factors with LAPACK, far cheaper per multiply-add than CG's
+        // products (one_matrix_L12: 18.6 s without CG, 24.1 s with)
+        let budget = if T::precision_bits() <= 53 { 0 } else { m2.pow(3) / (108 * n.pow(3)) };
+        // the exact form is t + q with q ≥ 0
+        if !ok(t) {
+            return false;
+        }
+        if budget == 0 {
             return self.schur_norm(w).is_some_and(|q| ok(t + q));
         }
         self.ensure_d2();
@@ -756,7 +817,7 @@ impl<T: FloatT> Oracle<T> {
                 return true;
             }
             if !ok(low) {
-                break;
+                return false;
             }
             for i in 0..m2 {
                 br[i] = r[i] * b[i];

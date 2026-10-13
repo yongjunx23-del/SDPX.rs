@@ -1,6 +1,6 @@
 # SDPX development plan
 
-Updated 2026-10-13. [AGENTS.md](AGENTS.md) defines working rules and numerical
+Updated 2026-10-14. [AGENTS.md](AGENTS.md) defines working rules and numerical
 contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 [Journal](docs/JOURNAL.md) holds full timings, job histories, source hashes,
 failed attempts and audit evidence. This file keeps goals, current state,
@@ -299,10 +299,12 @@ execution plans. The journal preserves all failed evidence and final decisions.
 8. **Thermal matrix models (journal 2026-10-13, thermal-ore):**
    - The native operator relative entropy cone is in, on branch `thermal-ore`. two_L4 (53/128/256 bits), two_L6 (53/128) and one_L10 (53) are Solved and audited. two_L6/128 takes 7.94 s.
    - Review repair: owner RHS/dual coordinates, linear slack recovery and fresh-solve phase resets match the ordinary path. After an actual zero-base factor failure, the retry shift now has an `eps · max|diag(KKT)|` floor (initial shift and refinement tolerances unchanged). two_L4/128: ordinary Solved/45, owner Solved/44, both pass original 1e-20 and Arb audits; the former owner path stopped AlmostSolved/37. Extra T-row eigen/Cholesky whitening trials regressed ordinary convergence and are reverted.
+   - 2026-10-14 (journal): the negated arrow takes the ORE rows as leaves; a failed arrow factor falls back in the z-first order. Binary64 inverses use BLAS, the dual test exits early (no CG at 53 bits), and ORE kernels split. Release T=1 against v0.9.2: one_L12/53 Solved 47 in 20.8 s (was 100 s, audited); one_L12/128 4 it 103 s (was 471 s). two_L4/two_L6 points are unchanged and audited.
    - Next:
-     - eliminate the cone in the condensed path (Gram rows; the border LDL is 54%);
-     - multithread the cone kernels;
-     - build larger models: one-matrix L=12 and two-matrix L=8 (Wolfram generation).
+     - a full one_L12/128 solve with audit;
+     - the S₀⁻¹ leaf factor from the cone's L⁻¹ (skip re-factoring the leaf);
+     - the two_L8 gap stall (53: AlmostSolved; 128: stall at 3e-8).
+   - Closed: Gram-row elimination of the cone (accuracy), μS₀ as the leaf inverse (inconsistent with the stored S₀⁻¹).
    - one_L8 and one_L10 at 128 bits are ill-posed inputs (known failures).
 
 Parked with WIP committed (journal 2026-10-09):

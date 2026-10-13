@@ -290,7 +290,56 @@ impl<T: FloatT> DenseLeaf<T> {
             self.l.copy_from_slice(a);
             return self.factor_exact(signs, reg, regularize_count, split);
         }
+        if T::precision_bits() > 64 {
+            return self.factor_dots(a, signs, reg, regularize_count, split);
+        }
         self.factor_signed(a, signs, reg, regularize_count, split)
+    }
+
+    /// Left-looking [`Self::factor_signed`] for wide types: entry (i, j) is
+    /// one exact dot product of rows of L and W = L·D (rounded entrywise),
+    /// rounded once, instead of j fused updates. Rows are packed row-major so
+    /// both operands are contiguous. `split`: a column's rows in parallel
+    /// (thread-invariant).
+    fn factor_dots(
+        &mut self,
+        a: &[T],
+        signs: &[i8],
+        reg: Option<(T, T)>,
+        regularize_count: &mut usize,
+        split: bool,
+    ) -> Result<(), &'static str> {
+        let n = self.n;
+        let row = |i: usize| i * (i + 1) / 2;
+        let mut r = vec![T::zero(); row(n)];
+        let mut w = vec![T::zero(); row(n)];
+        let mut col = Vec::with_capacity(n);
+        for j in 0..n {
+            let s = T::from_i8(signs[if signs.len() == 1 { 0 } else { j }]).unwrap();
+            let (rj, wj) = (&r[row(j)..row(j) + j], &w[row(j)..row(j) + j]);
+            let d = Self::pivot(a[j + j * n] - T::dot_slices(rj, wj), s, reg, regularize_count)?;
+            let dinv = T::one() / d;
+            self.dinv[j] = dinv;
+            let entry = |i: usize| (a[i + j * n] - T::dot_slices(&r[row(i)..row(i) + j], wj)) * dinv;
+            col.clear();
+            if split && n - j > 1 {
+                (j + 1..n).into_par_iter().map(entry).collect_into_vec(&mut col);
+            } else {
+                col.extend((j + 1..n).map(entry));
+            }
+            for (i, &v) in (j + 1..n).zip(&col) {
+                r[row(i) + j] = v;
+                w[row(i) + j] = v * d;
+            }
+        }
+        self.l.copy_from_slice(a);
+        for j in 0..n {
+            self.l[j + j * n] = T::one();
+            for i in j + 1..n {
+                self.l[i + j * n] = r[row(i) + j];
+            }
+        }
+        Ok(())
     }
 
     /// Blocked right-looking [`Self::factor_signed`] for wide types: each
@@ -1328,6 +1377,8 @@ pub struct ArrowLDLSolver<T: FloatT> {
     pool: Option<Arc<rayon::ThreadPool>>,
     regularize_count: usize,
     fallback: Option<BoxedDirectLDLSolver<T>>,
+    // the caller's ordering for the fallback (None: QDLDL's own AMD)
+    fallback_perm: Option<Vec<usize>>,
     use_arrow: bool,
     // Shared-SOC leaf primal columns: eliminated after their SPD cone block,
     // their pivot P_jj + aᵀH⁻¹a is positive without the static shift.
@@ -1483,6 +1534,25 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return None;
         }
         Some(Self::from_groups(k, signs, settings, groups, trunk, None))
+    }
+
+    /// The arrow of −K: dense negative-sign blocks (cone Hessians retained
+    /// in the KKT, such as operator relative entropy rows) become leaves and
+    /// the primal variables the border. LDLᵀ of −K is that of K with D
+    /// negated, so values and right-hand sides change sign exactly. A failed
+    /// factor falls back to QDLDL in `perm` (the caller's ordering of K).
+    pub fn try_negated(
+        k: &CscMatrix<T>,
+        signs: &[i8],
+        settings: &CoreSettings<T>,
+        perm: Option<Vec<usize>>,
+    ) -> Option<Negated<T>> {
+        let mut neg = k.clone();
+        neg.nzval.iter_mut().for_each(|v| *v = -*v);
+        let signs: Vec<i8> = signs.iter().map(|&s| -s).collect();
+        let mut inner = Self::try_new(&neg, &signs, settings)?;
+        inner.fallback_perm = perm;
+        Some(Negated { inner, values: Vec::new() })
     }
 
     /// Leaves made of an SOC block followed by one primal column with a
@@ -1662,6 +1732,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             pool: None,
             regularize_count: 0,
             fallback: None,
+            fallback_perm: None,
             use_arrow: false,
             unshifted,
             shift_exempt: false,
@@ -2075,7 +2146,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let matrix = self.materialize();
         if self.fallback.is_none() {
             let solver: BoxedDirectLDLSolver<T> = Box::new(
-                super::qdldl::QDLDLDirectLDLSolver::new(&matrix, &self.signs, &self.settings, None),
+                super::qdldl::QDLDLDirectLDLSolver::new(&matrix, &self.signs, &self.settings, self.fallback_perm.clone()),
             );
             self.fallback = Some(solver);
         }
@@ -2204,6 +2275,72 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             x[id] = value;
         }
         crate::receipt::finish("arrow.leaf_backward", timer);
+    }
+}
+
+/// [`ArrowLDLSolver::try_negated`]: an arrow factor of −K solving K x = b.
+pub struct Negated<T: FloatT> {
+    inner: ArrowLDLSolver<T>,
+    values: Vec<T>,
+}
+
+impl<T: FloatT> Negated<T> {
+    fn negated_solve(&mut self, b: &mut [T], solve: impl FnOnce(&mut ArrowLDLSolver<T>, &mut [T])) {
+        b.iter_mut().for_each(|v| *v = -*v);
+        solve(&mut self.inner, b);
+        b.iter_mut().for_each(|v| *v = -*v);
+    }
+}
+
+impl<T: FloatT> HasLinearSolverInfo for Negated<T> {
+    fn linear_solver_info(&self) -> LinearSolverInfo {
+        let mut info = self.inner.linear_solver_info();
+        info.name = format!("negated_{}", info.name);
+        info
+    }
+}
+
+impl<T: FloatT> DirectLDLSolver<T> for Negated<T> {
+    fn update_values(&mut self, index: &[usize], values: &[T]) {
+        self.values.clear();
+        self.values.extend(values.iter().map(|&v| -v));
+        self.inner.update_values(index, &self.values);
+    }
+
+    fn scale_values(&mut self, index: &[usize], scale: T) {
+        self.inner.scale_values(index, scale);
+    }
+
+    fn solve(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T]) {
+        self.negated_solve(b, |s, b| s.solve(kkt, x, b));
+    }
+
+    fn solve_many(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T], cols: usize) {
+        self.negated_solve(b, |s, b| s.solve_many(kkt, x, b, cols));
+    }
+
+    fn solve_coupling_panel(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T], cols: usize) {
+        self.negated_solve(b, |s, b| s.solve_coupling_panel(kkt, x, b, cols));
+    }
+
+    fn refactor(&mut self, kkt: &CscMatrix<T>) -> bool {
+        self.inner.refactor(kkt)
+    }
+
+    fn unshifted_columns(&self) -> &[usize] {
+        self.inner.unshifted_columns()
+    }
+
+    fn set_shift_exemption(&mut self, active: bool) {
+        self.inner.set_shift_exemption(active);
+    }
+
+    fn set_pool(&mut self, pool: Option<Arc<rayon::ThreadPool>>) {
+        self.inner.set_pool(pool);
+    }
+
+    fn set_world(&mut self, world: crate::MpiContext) {
+        self.inner.set_world(world);
     }
 }
 
