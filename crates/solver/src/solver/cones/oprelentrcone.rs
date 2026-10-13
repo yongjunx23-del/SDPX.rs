@@ -18,7 +18,8 @@
 //! of D is entrywise, DD[H, K]ᵢⱼ = cᵢⱼHᵢⱼ + g⁽¹⁾ᵢⱼKᵢⱼ, and
 //! ∇²f = Lᵀ·diag(W⊗W, S₀)·L with L = [I −DD; 0 I] and S₀ the (X, Y) Schur
 //! block (`schur_apply`). So (∇²f)⁻¹ needs only S₀⁻¹ (size 2m, m = n(n+1)/2)
-//! and the explicit Ẑ⊗Ẑ, which keeps W's conditioning from being squared.
+//! and Ẑ⊗Ẑ. The KKT diagonalizes Ẑ in its T rows so the small eigenvalue
+//! products survive when cond(Ẑ)² exceeds the working precision.
 //!
 //! Dual iterates are kept in K* by a Dikin test at the trial primal point:
 //! z ∈ int K* when ⟨z, s⟩² > (ν − 1)⟨z, (∇²f)⁻¹z⟩. Bounding ∇²f below by
@@ -854,7 +855,9 @@ fn solve3<T: FloatT>(mut a: [[T; 3]; 3], mut b: [T; 3]) -> [T; 3] {
 }
 
 /// The cone's change of KKT row coordinates. With 𝒫[M] = PMPᵀ,
-/// (μ∇²f)⁻¹ = N·D·Nᵀ, N = 𝒫·[I DD; 0 I], D = diag(Ẑ⊗Ẑ, S₀⁻¹)/μ. Forming
+/// (μ∇²f)⁻¹ = N·D·Nᵀ, N = 𝒫·[I DD; 0 I]·diag(𝒰, I, I), where
+/// 𝒰[M] = U_z M U_zᵀ and Ẑ = U_z diag(λ_z) U_zᵀ. D's T block is diagonal
+/// with entries λ_z,i λ_z,j / μ; its (X, Y) block is S₀⁻¹/μ. Forming
 /// N·D·Nᵀ explicitly adds D's T-block (O(μ²) on the boundary) to O(1)
 /// terms, so it is lost once μ² falls below the rounding unit. The augmented
 /// KKT instead takes the cone's rows as N⁻¹A with −D on its diagonal and
@@ -863,6 +866,8 @@ fn solve3<T: FloatT>(mut a: [[T; 3]; 3], mut b: [T; 3]) -> [T; 3] {
 pub(crate) struct OpRelEntropyRows<T> {
     n: usize,
     q: Vec<T>,
+    /// Eigenvectors of Ẑ, applied only to the T residual/covector.
+    uz: Vec<T>,
     /// DD in svec form: the X (c) and Y (g⁽¹⁾) coefficients
     dc: Vec<T>,
     dk: Vec<T>,
@@ -882,12 +887,14 @@ impl<T: FloatT> OpRelEntropyRows<T> {
         for i in 0..m {
             t[i] -= self.dc[i] * x[i] + self.dk[i] * y[i];
         }
+        congruence_parts(self.n, &self.uz, t, true);
     }
 
     /// v ← N⁻ᵀv
     pub(crate) fn from_eigen(&self, v: &mut [T]) {
         let m = self.dc.len();
         let (t, xy) = v.split_at_mut(m);
+        congruence_parts(self.n, &self.uz, t, false);
         let (x, y) = xy.split_at_mut(m);
         for i in 0..m {
             x[i] -= self.dc[i] * t[i];
@@ -920,6 +927,7 @@ pub struct OpRelEntropyConeData<T> {
     rows: OpRelEntropyRows<T>,
     p: Vec<T>,
     zh: Vec<T>,
+    lamz: Vec<T>,
     s0i: Vec<T>,
     work: Vec<T>,
 }
@@ -942,6 +950,7 @@ impl<T: FloatT> OpRelEntropyCone<T> {
                 rows: OpRelEntropyRows::default(),
                 p: Vec::new(),
                 zh: Vec::new(),
+                lamz: Vec::new(),
                 s0i: Vec::new(),
                 work: vec![T::zero(); d],
             }),
@@ -1108,6 +1117,14 @@ where
             return false;
         };
         let n = self.n;
+        let mut zh = oracle.zh.clone();
+        let mut lamz = vec![T::zero(); n];
+        let mut uz = vec![T::zero(); n * n];
+        if !sym_eig(n, &mut zh, &mut lamz, &mut uz)
+            || !lamz.iter().all(|&l| l.is_finite() && l > T::zero())
+        {
+            return false;
+        }
         let m = triangular_number(n);
         let data = &mut self.data;
         let rows = &mut data.rows;
@@ -1121,8 +1138,10 @@ where
             }
         }
         rows.q = std::mem::take(&mut oracle.q);
+        rows.uz = uz;
         data.p = std::mem::take(&mut oracle.p);
         data.zh = std::mem::take(&mut oracle.zh);
+        data.lamz = lamz;
         data.s0i = s0i;
         data.μ = μ;
         data.s.copy_from(s);
@@ -1138,28 +1157,14 @@ where
         // D in the KKT's eigen row coordinates (`OpRelEntropyRows`)
         let n = self.n;
         let m = triangular_number(n);
-        let (zh, s0i) = (&self.data.zh, &self.data.s0i);
+        let (lamz, s0i) = (&self.data.lamz, &self.data.s0i);
         let inv = self.data.μ.recip();
-        let sqrt2 = T::SQRT_2();
-        let z = |i: usize, j: usize| zh[i + j * n];
-        let mut idx = 0;
-        for l in 0..n {
-            for k in 0..=l {
-                for j in 0..=l {
-                    for i in 0..=j {
-                        if tri(i, j) > tri(k, l) {
-                            break;
-                        }
-                        Hsblock[idx] = inv
-                            * match (i == j, k == l) {
-                                (false, false) => z(i, k) * z(j, l) + z(i, l) * z(j, k),
-                                (true, false) => sqrt2 * z(j, l) * z(j, k),
-                                (false, true) => sqrt2 * z(i, l) * z(j, k),
-                                (true, true) => z(j, l) * z(j, l),
-                            };
-                        idx += 1;
-                    }
-                }
+        let mut idx = triangular_number(m);
+        Hsblock[..idx].fill(T::zero());
+        for j in 0..n {
+            for i in 0..=j {
+                let k = tri(i, j);
+                Hsblock[tri(k, k)] = inv * (lamz[i] * lamz[j]);
             }
         }
         let m2 = 2 * m;
