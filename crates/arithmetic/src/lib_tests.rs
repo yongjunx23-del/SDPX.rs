@@ -804,3 +804,23 @@ fn chunked_exact_dot_is_the_serial_value() {
     chunked_dot_matches::<4>();
     chunked_dot_matches::<16>();
 }
+
+#[test]
+fn chunked_exact_dot_rejects_incomplete_scheduler() {
+    let values = [MpFloat::<2>::one(), MpFloat::<2>::from_f64(1e-100).unwrap()];
+    for skipped_pass in 0..2 {
+        let calls = std::cell::Cell::new(0);
+        let par_for = |n: usize, f: &(dyn Fn(usize) + Sync)| {
+            let pass = calls.replace(calls.get() + 1);
+            for k in 0..n {
+                if pass != skipped_pass || k == 0 {
+                    f(k);
+                }
+            }
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            <MpFloat<2> as Scalar>::dot_slices_chunked(&values, &values, 2, &par_for)
+        }));
+        assert!(result.is_err(), "skipped pass {skipped_pass}");
+    }
+}

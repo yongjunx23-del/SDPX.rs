@@ -110,6 +110,7 @@ pub trait Scalar:
     /// `dot_slices` whose exactly accumulated types may split the work into
     /// `chunks` pieces run by `par_for(chunks, f)` (which calls `f(k)` once
     /// for every `k < chunks`, possibly concurrently). Same value.
+    /// Panics if `par_for` omits a chunk.
     fn dot_slices_chunked(
         a: &[Self],
         b: &[Self],
@@ -1750,6 +1751,24 @@ pub mod inner_parallel {
         // Listed posts, read without the lock by idle helpers.
         static POSTS: AtomicUsize = AtomicUsize::new(0);
 
+        struct PostGuard(Arc<Post>);
+        impl Drop for PostGuard {
+            fn drop(&mut self) {
+                BOARD.lock().unwrap().retain(|p| !Arc::ptr_eq(p, &self.0));
+                POSTS.fetch_sub(1, Ordering::Release);
+                while self.0.active.load(Ordering::Acquire) != 0 {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+
+        struct Active<'a>(&'a Post);
+        impl Drop for Active<'_> {
+            fn drop(&mut self) {
+                self.0.active.fetch_sub(1, Ordering::Release);
+            }
+        }
+
         std::thread_local! {
             static OFFER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
@@ -1761,8 +1780,8 @@ pub mod inner_parallel {
                 (0..items).for_each(job);
                 return;
             }
-            // SAFETY: the post is delisted below and this frame waits until
-            // no helper holds it, so the erased lifetime is never exceeded.
+            // SAFETY: PostGuard delists and waits for every helper, including
+            // on unwind, so the erased lifetime is never exceeded.
             let job: &'static (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(job) };
             let post = Arc::new(Post {
                 next: AtomicUsize::new(0),
@@ -1772,17 +1791,13 @@ pub mod inner_parallel {
             });
             BOARD.lock().unwrap().push(post.clone());
             POSTS.fetch_add(1, Ordering::Release);
+            let _posted = PostGuard(post.clone());
             loop {
                 let i = post.next.fetch_add(1, Ordering::Relaxed);
                 if i >= items {
                     break;
                 }
                 job(i);
-            }
-            BOARD.lock().unwrap().retain(|p| !Arc::ptr_eq(p, &post));
-            POSTS.fetch_sub(1, Ordering::Release);
-            while post.active.load(Ordering::Acquire) != 0 {
-                std::hint::spin_loop();
             }
         }
 
@@ -1810,6 +1825,7 @@ pub mod inner_parallel {
                 post.active.fetch_add(1, Ordering::Acquire);
                 post
             };
+            let _active = Active(&post);
             // SAFETY: counted in `active` while listed; the poster waits.
             let job = unsafe { &*post.job };
             loop {
@@ -1819,7 +1835,6 @@ pub mod inner_parallel {
                 }
                 job(i);
             }
-            post.active.fetch_sub(1, Ordering::Release);
             true
         }
 
@@ -1833,6 +1848,30 @@ pub mod inner_parallel {
         impl Drop for Offer {
             fn drop(&mut self) {
                 OFFER.with(|c| c.set(self.0));
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn panicking_jobs_release_posts_and_helpers() {
+                let _offer = Offer::enter();
+                assert!(std::panic::catch_unwind(|| run(2, &|_| panic!("poster"))).is_err());
+                assert!(BOARD.lock().unwrap().is_empty());
+                assert_eq!(POSTS.load(Ordering::Acquire), 0);
+
+                run(2, &|i| {
+                    if i == 0 {
+                        assert!(std::panic::catch_unwind(help).is_err());
+                    } else {
+                        panic!("helper");
+                    }
+                });
+                assert!(BOARD.lock().unwrap().is_empty());
+                assert_eq!(POSTS.load(Ordering::Acquire), 0);
+                assert!(!help());
             }
         }
     }

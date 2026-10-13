@@ -190,7 +190,7 @@ pub(crate) fn dot_slices_chunked<'a, const N: usize>(
     let chunks = a.len().div_ceil(size);
     let regular = |k: i32| k.abs() == mpfr::REGULAR_KIND;
     let zero = |k: i32| k.abs() == mpfr::ZERO_KIND;
-    let scans = std::sync::Mutex::new(vec![(i64::MAX, i64::MIN, true); chunks]);
+    let scans = std::sync::Mutex::new(vec![None; chunks]);
     par_for(chunks, &|k| {
         let (mut emin, mut emax, mut finite) = (i64::MAX, i64::MIN, true);
         let r = k * size..((k + 1) * size).min(a.len());
@@ -205,13 +205,16 @@ pub(crate) fn dot_slices_chunked<'a, const N: usize>(
                 finite = false;
             }
         }
-        scans.lock().unwrap()[k] = (emin, emax, finite);
+        scans.lock().unwrap()[k] = Some((emin, emax, finite));
     });
     let (emin, emax, finite) = scans
         .into_inner()
         .unwrap()
         .into_iter()
-        .fold((i64::MAX, i64::MIN, true), |(a, b, c), (x, y, z)| (a.min(x), b.max(y), c && z));
+        .fold((i64::MAX, i64::MIN, true), |(a, b, c), scan| {
+            let (x, y, z) = scan.expect("chunk scheduler skipped exponent scan");
+            (a.min(x), b.max(y), c && z)
+        });
     let len = match (finite, emin == i64::MAX) {
         (_, true) if finite => return MpFloat::<N>::default(),
         (true, false) => acc_len::<N>(emin, emax),
@@ -220,7 +223,7 @@ pub(crate) fn dot_slices_chunked<'a, const N: usize>(
     let Some(len) = len else {
         return dot_slices(a, b, chain);
     };
-    let parts = std::sync::Mutex::new(vec![(Vec::new(), Vec::new()); chunks]);
+    let parts = std::sync::Mutex::new(vec![None; chunks]);
     par_for(chunks, &|k| {
         let (mut pos, mut neg) = (vec![0u64; len], vec![0u64; len]);
         let r = k * size..((k + 1) * size).min(a.len());
@@ -229,9 +232,13 @@ pub(crate) fn dot_slices_chunked<'a, const N: usize>(
             .zip(&b[r])
             .filter(|(x, y)| regular(x.kind) && regular(y.kind));
         add_terms(&mut pos, &mut neg, emin, len, N <= INLINE_N, terms);
-        parts.lock().unwrap()[k] = (pos, neg);
+        parts.lock().unwrap()[k] = Some((pos, neg));
     });
-    let mut parts = parts.into_inner().unwrap().into_iter();
+    let mut parts = parts
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|part| part.expect("chunk scheduler skipped accumulation"));
     let (mut pos, mut neg) = parts.next().unwrap();
     for (p, n) in parts {
         // SAFETY: all accumulators hold `len` limbs; the total of all terms
