@@ -12,8 +12,9 @@
 //! 4-node owner Λ35 solve ran 8.0% faster. One process whose pool keeps its
 //! cores busy loses: plain Λ35 on 64 threads ran 2.0% slower (journal
 //! 2026-10-12, L35). Keepers therefore start by default only for multi-rank
-//! solves under a load-following governor; `SDPX_KEEP_CORES=0` disables them
-//! and any other value forces them. Linux only.
+//! solves under a load-following governor with disjoint rank masks matching
+//! the worker budget; `SDPX_KEEP_CORES=0` disables them and any other value
+//! forces them within that budget. Linux only.
 
 /// Keepers stop and join when dropped.
 pub struct CoreKeepers {

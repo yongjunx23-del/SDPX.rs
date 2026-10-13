@@ -360,9 +360,7 @@ fn advertised_size() -> usize {
     1
 }
 
-/// A live MPI world. The function table and communicator handle are
-/// process-global and constant after initialization; collectives are only
-/// invoked from the calling thread.
+/// Check node-local rank allocations while the shared communicator is live.
 #[cfg(target_os = "linux")]
 fn local_affinity_disjoint(fns: &Fns, local: MpiComm, size: usize) -> bool {
     let width = (libc::CPU_SETSIZE as usize).div_ceil(8);
@@ -408,6 +406,9 @@ fn local_affinity_disjoint(_fns: &Fns, _local: MpiComm, _size: usize) -> bool {
     false
 }
 
+/// A live MPI world. The function table and communicator handle are
+/// process-global and constant after initialization; collectives are only
+/// invoked from the calling thread.
 #[derive(Clone, Copy)]
 pub(crate) struct World {
     fns: &'static Fns,
@@ -415,6 +416,7 @@ pub(crate) struct World {
     rank: i32,
     size: i32,
     local_size: i32,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     local_affinity_disjoint: bool,
     owns_init: bool,
     init_thread: Option<ThreadId>,
@@ -815,6 +817,7 @@ impl World {
         self.local_size as usize
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn local_affinity_disjoint(&self) -> bool {
         self.local_affinity_disjoint
     }
