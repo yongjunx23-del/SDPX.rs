@@ -8,6 +8,35 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-13 — Thermal matrix models: native operator relative entropy cone (thermal-ore, 18976d7)
+
+- Request: support the thermal matrix-model SDPs (`thermal mattrix model/speed_workspace`) directly, then speed them up, then build larger models.
+- Change:
+  - New cone `OpRelEntropyConeT(n)`: K = cl{(T, X, Y): T ⪰ D(X, Y)}, ν = 3n. Available in the Rust API, the CLI and the C ABI.
+  - Primal barrier scaling Hs = (μ∇²f)⁻¹ = N·D·Nᵀ. The augmented path takes rows N⁻¹A with −D on the diagonal. The condensed path keeps the cone's rows retained (arrow border).
+  - Dual steps use the Dikin test at the trial primal point: an O(n³) bound first, then the exact form through S₀'s Cholesky factor.
+  - Δs comes from the linear rows, plus a Dahl–Andersen third-order corrector (α-weighted).
+- Audit: an exact arb certificate of the dual cone (`ore_cert.py`) plus original-coordinate residuals. Gates: 1e-6 at 53 bits, 1e-20 at 128, 1e-40 at 256.
+- Verified (Mac dev build, `fast` profile; every row Solved and audit passed):
+
+  | Model | bits | it | native s |
+  |---|---|---|---|
+  | two_L4 | 53 | 18 | 0.005 |
+  | two_L4 | 128 | 46 | 0.14 |
+  | two_L4 | 256 | 86 | 0.31 |
+  | two_L6 | 53 | 45 | 0.24 |
+  | two_L6 | 128 | 74 | 7.94 |
+  | one_L10 | 53 | 40 | 1.22 |
+
+  two_L6 at 128 bits: primal 1.3e-26, dual 1.7e-24, gap 5.7e-24.
+- Speed, two_L6 at 128 bits:
+  - augmented: 54.3 s;
+  - condensed with retained rows: 12.5 s;
+  - 7.94 s after three more changes: the oracle is cached per trial point, S₀ is assembled from unit columns (O(n²) each), and inverses are potri-style.
+  - one_L10 at 53 bits: 2.10 → 1.22 s.
+- Observed: one_L8 and one_L10 at 128 bits are ill-posed. The objective drifts while gap ≈ κ/τ stalls, and a chase restart follows. They stay failures. Hypothesis: a property of the inputs, not a solver error.
+- Next: the KKT update is 54% of two_L6/128, the border LDL of 186 cone rows. Eliminate the cone in the condensed path with Gram rows G = μ^½·diag(Lz⁻¹ ⊗ Lz⁻¹, L₀ᵀ)·N⁻¹A, so GᵀG = AᵀHs⁻¹A.
+
 ## 2026-10-13 — L83: t11-red60's DualInfeasible verdict verified; saturated start rejected (perf-mc-impl)
 
 - Context: t11-red60 is a synthetic input. It is one facial-reduction step of Λ35-s70 (`t11_reduce.py`, threshold 1e-60 from the t11-aux35 point, 1160 basis directions removed). Each Gram Y is replaced by VᵀYV, which relaxes the PSD constraint, so the reduced primal may be unbounded.

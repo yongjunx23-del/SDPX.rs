@@ -291,6 +291,14 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - csdr3 residue memory (about 25 MiB above 0.9.1 at four threads).
    - PMP conversion only when it limits the workflow.
 
+8. **Thermal matrix models (journal 2026-10-13, thermal-ore):**
+   - The native operator relative entropy cone is in, on branch `thermal-ore`. two_L4 (53/128/256 bits), two_L6 (53/128) and one_L10 (53) are Solved and audited. two_L6/128 takes 7.94 s.
+   - Next:
+     - eliminate the cone in the condensed path (Gram rows; the border LDL is 54%);
+     - multithread the cone kernels;
+     - build larger models: one-matrix L=12 and two-matrix L=8 (Wolfram generation).
+   - one_L8 and one_L10 at 128 bits are ill-posed inputs (known failures).
+
 Parked with WIP committed (journal 2026-10-09):
 - `perf-fulldir` `6af5724`: regression.
 - `perf-f64large` `50325c4`, `perf-threads` `946d4be`, `perf-facial` `a3a7271`: unverified.
