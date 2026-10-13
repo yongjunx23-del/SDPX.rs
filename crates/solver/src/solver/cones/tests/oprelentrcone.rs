@@ -122,14 +122,13 @@ fn factored_scaling_preserves_boundary_t_block_mpfr128() {
     let tiny = two.powi(-80);
     let a = (T::one() + tiny) / two;
     let b = (T::one() - tiny) / two;
-    // X = Y = I; T has eigenvalues tiny and 1 in a rotated basis. The
-    // smallest eigenvalue of T⊗T is below the rounding unit of its entries.
+    // X = Y = I; T has eigenvalues tiny and 1 in a rotated basis. Whitening
+    // avoids forming T⊗T, whose small eigenvalue is below its rounding unit.
     let s = vec![a, T::SQRT_2() * b, a, T::one(), T::zero(), T::one(), T::one(), T::zero(), T::one()];
     let mut cone = OpRelEntropyCone::<T>::new(2);
     assert!(cone.update_scaling(&s, &s, T::one(), ScalingStrategy::Dual));
     let mut packed = vec![T::zero(); triangular_number(s.len())];
     cone.get_Hs(&mut packed);
-    assert!(packed[0] > T::zero() && packed[0] < T::epsilon());
     let mut top = vec![T::zero(); 9];
     for j in 0..3 {
         for i in 0..=j {
@@ -138,6 +137,22 @@ fn factored_scaling_preserves_boundary_t_block_mpfr128() {
         }
     }
     assert!(cholesky(3, &mut top), "the retained T block must remain positive definite");
+    // The original-coordinate products amplify rounding by cond(T); their
+    // row-transformed result must agree with the whitened factor block.
+    let tolerance = T::epsilon() / tiny * (512.0).as_T();
+    let rows = cone.rows().clone();
+    let (mut v, mut back) = (vec![T::zero(); s.len()], vec![T::zero(); s.len()]);
+    for j in 0..3 {
+        v.fill(T::zero());
+        v[j] = T::one();
+        rows.from_eigen(&mut v);
+        cone.mul_Hs(&mut back, &v, &mut []);
+        rows.to_eigen(&mut back);
+        for i in 0..s.len() {
+            let want = packed[tri(i.min(j), i.max(j))];
+            assert!((back[i] - want).abs() <= tolerance, "whitened T column {j}, row {i}");
+        }
+    }
 }
 
 #[test]
