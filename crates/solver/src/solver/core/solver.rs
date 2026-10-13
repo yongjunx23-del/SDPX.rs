@@ -1099,6 +1099,7 @@ mod internal {
             }
             self.solution
                 .post_process(&self.data, &mut self.variables, &self.info, &self.settings);
+            self.best = None;
         }
 
         fn default_start(&mut self) {

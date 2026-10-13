@@ -70,11 +70,15 @@ static CPU_CLOCKS: AtomicBool = AtomicBool::new(true);
 /// would count as solver CPU time, and every process-clock read would sum
 /// threads running on all of the process's cores, so receipts started
 /// meanwhile record wall phases only.
-static KEEPERS: AtomicBool = AtomicBool::new(false);
+static KEEPERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn set_keepers(active: bool) {
-    KEEPERS.store(active, Ordering::Relaxed);
+    if active {
+        KEEPERS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        KEEPERS.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 fn cpu_clocks() -> bool {
@@ -414,7 +418,7 @@ impl Scope {
         let outer = guard.is_none().then_some(Snapshot::take());
         RECORDING_OWNED.set(true);
         CPU_CLOCKS.store(
-            !KEEPERS.load(Ordering::Relaxed) && process_threads().is_none_or(|n| n > 1),
+            KEEPERS.load(Ordering::Relaxed) == 0 && process_threads().is_none_or(|n| n > 1),
             Ordering::Relaxed,
         );
         if solve {

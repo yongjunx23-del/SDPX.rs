@@ -363,6 +363,51 @@ fn advertised_size() -> usize {
 /// A live MPI world. The function table and communicator handle are
 /// process-global and constant after initialization; collectives are only
 /// invoked from the calling thread.
+#[cfg(target_os = "linux")]
+fn local_affinity_disjoint(fns: &Fns, local: MpiComm, size: usize) -> bool {
+    let width = (libc::CPU_SETSIZE as usize).div_ceil(8);
+    let mut mask = vec![0u8; width];
+    // SAFETY: the zeroed set has libc's required size; CPU indices are bounded.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
+            for cpu in 0..libc::CPU_SETSIZE as usize {
+                if libc::CPU_ISSET(cpu, &set) {
+                    mask[cpu / 8] |= 1 << (cpu % 8);
+                }
+            }
+        }
+    }
+    let counts = vec![width as c_int; size];
+    let displs: Vec<c_int> = (0..size).map(|i| (i * width) as c_int).collect();
+    let mut masks = vec![0u8; width * size];
+    // SAFETY: each rank exchanges one fixed-size byte mask on its shared node.
+    if unsafe {
+        (fns.allgatherv)(mask.as_ptr().cast(), width as c_int, fns.byte,
+            masks.as_mut_ptr().cast(), counts.as_ptr(), displs.as_ptr(), fns.byte, local)
+    } != MPI_SUCCESS {
+        return false;
+    }
+    let mut seen = vec![0u8; width];
+    for mask in masks.chunks_exact(width) {
+        if mask.iter().all(|&b| b == 0) {
+            return false;
+        }
+        for (seen, &bits) in seen.iter_mut().zip(mask) {
+            if *seen & bits != 0 {
+                return false;
+            }
+            *seen |= bits;
+        }
+    }
+    true
+}
+
+#[cfg(not(target_os = "linux"))]
+fn local_affinity_disjoint(_fns: &Fns, _local: MpiComm, _size: usize) -> bool {
+    false
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct World {
     fns: &'static Fns,
@@ -370,6 +415,7 @@ pub(crate) struct World {
     rank: i32,
     size: i32,
     local_size: i32,
+    local_affinity_disjoint: bool,
     owns_init: bool,
     init_thread: Option<ThreadId>,
     /// Thread which owns the solver/control-side collective sequence.
@@ -699,14 +745,20 @@ impl World {
         }
         let mut local_size = 0;
         let rc = unsafe { (fns.comm_size)(local, &mut local_size) };
-        let freed = unsafe { (fns.comm_free)(&mut local) };
-        if rc != MPI_SUCCESS || freed != MPI_SUCCESS || !(1..=size).contains(&local_size) {
+        if rc != MPI_SUCCESS || !(1..=size).contains(&local_size) {
             return activation_failed_with_abort(
                 &fns,
                 fns.comm_world,
                 advertised,
                 requested,
                 "MPI returned an invalid node-local size",
+            );
+        }
+        let local_affinity_disjoint = local_affinity_disjoint(&fns, local, local_size as usize);
+        if unsafe { (fns.comm_free)(&mut local) } != MPI_SUCCESS {
+            return activation_failed_with_abort(
+                &fns, fns.comm_world, advertised, requested,
+                "MPI_Comm_free returned an error",
             );
         }
         if debug {
@@ -731,6 +783,7 @@ impl World {
             rank,
             size,
             local_size,
+            local_affinity_disjoint,
             owns_init,
             init_thread: owns_init.then(|| std::thread::current().id()),
             collective_thread: std::thread::current().id(),
@@ -760,6 +813,10 @@ impl World {
 
     pub(crate) fn local_size(&self) -> usize {
         self.local_size as usize
+    }
+
+    pub(crate) fn local_affinity_disjoint(&self) -> bool {
+        self.local_affinity_disjoint
     }
 
     fn shutdown_owned_inner(&self, source: &str) {

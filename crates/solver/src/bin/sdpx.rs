@@ -382,6 +382,9 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
         &(&problem, &sampled_metadata, T::precision_bits(), partitions),
     )?;
     let load_seconds = start.elapsed().as_secs_f64();
+    let _keepers = sdpx_solver::solver::CoreKeepers::for_world(
+        mpi.size(), problem.settings.max_threads as usize,
+    );
     let solve_start = Instant::now();
     let mut solver = stage(
         mpi,
@@ -568,8 +571,6 @@ with_frontend_precisions!(precision_runner);
 fn main() -> ExitCode {
     tune_allocator();
     let mpi = MpiContext::initialize();
-    // Before any worker pool or affinity narrowing: one per allocated CPU.
-    let _keepers = sdpx_solver::solver::CoreKeepers::for_world(mpi.size());
     if mpi.size() > 1 {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {

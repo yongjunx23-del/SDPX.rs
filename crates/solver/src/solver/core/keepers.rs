@@ -25,13 +25,14 @@ pub struct CoreKeepers {
 
 impl CoreKeepers {
     /// Keepers for a process of an MPI world with `ranks` processes: one per
-    /// CPU of the calling thread's affinity mask. Call it before any
-    /// affinity narrowing of the calling thread.
-    pub fn for_world(ranks: usize) -> Self {
+    /// CPU of a bounded, disjoint rank allocation. Call it after reading the
+    /// effective thread limit and before narrowing the calling thread's mask.
+    pub fn for_world(ranks: usize, requested: usize) -> Self {
+        let budget = super::worker_budget(requested);
         match std::env::var("SDPX_KEEP_CORES") {
             Ok(value) if value == "0" => Self::none(),
-            Ok(_) => Self::start(false),
-            Err(_) if ranks > 1 => Self::start(true),
+            Ok(_) => Self::start(false, budget),
+            Err(_) if ranks > 1 => Self::start(true, budget),
             Err(_) => Self::none(),
         }
     }
@@ -62,11 +63,11 @@ impl CoreKeepers {
 
     /// With `auto`, start only when the first CPU's governor follows load.
     #[cfg(target_os = "linux")]
-    fn start(auto: bool) -> Self {
+    fn start(auto: bool, budget: usize) -> Self {
         use std::sync::atomic::Ordering;
         let mut keepers = Self::none();
         // SAFETY: plain libc calls on zeroed, correctly sized cpu_set_t values.
-        let cpus: Vec<usize> = unsafe {
+        let mut cpus: Vec<usize> = unsafe {
             let mut mask: libc::cpu_set_t = std::mem::zeroed();
             if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut mask) != 0 {
                 return keepers;
@@ -75,11 +76,15 @@ impl CoreKeepers {
                 .filter(|&cpu| libc::CPU_ISSET(cpu, &mask))
                 .collect()
         };
-        if auto && !cpus.first().is_some_and(|&cpu| load_governed(cpu)) {
+        if auto && (cpus.len() != budget
+            || !crate::mpi::World::get().is_some_and(|w| w.local_affinity_disjoint())
+            || !cpus.first().is_some_and(|&cpu| load_governed(cpu))) {
             return keepers;
         }
+        cpus.truncate(budget);
         for cpu in cpus {
             let stop = keepers.stop.clone();
+            let (ready, started) = std::sync::mpsc::sync_channel(1);
             let spawned = std::thread::Builder::new()
                 .name(format!("sdpx-keeper-{cpu}"))
                 .stack_size(64 << 10)
@@ -93,6 +98,7 @@ impl CoreKeepers {
                             == 0
                             && libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) == 0
                     };
+                    let _ = ready.send(idle);
                     // Never spin at normal priority.
                     if !idle {
                         return;
@@ -104,16 +110,19 @@ impl CoreKeepers {
                     }
                 });
             match spawned {
-                Ok(handle) => keepers.threads.push(handle),
+                Ok(handle) if started.recv().unwrap_or(false) => keepers.threads.push(handle),
+                Ok(handle) => { let _ = handle.join(); }
                 Err(_) => break,
             }
         }
-        crate::receipt::set_keepers(!keepers.threads.is_empty());
+        if !keepers.threads.is_empty() {
+            crate::receipt::set_keepers(true);
+        }
         keepers
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn start(_auto: bool) -> Self {
+    fn start(_auto: bool, _budget: usize) -> Self {
         Self::none()
     }
 }
@@ -151,14 +160,15 @@ mod tests {
     #[test]
     fn single_process_starts_no_keepers_by_default() {
         if std::env::var_os("SDPX_KEEP_CORES").is_none() {
-            assert!(CoreKeepers::for_world(1).is_empty());
+            assert!(CoreKeepers::for_world(1, 1).is_empty());
         }
     }
 
     #[test]
     fn forced_keepers_stop_on_drop() {
         // Linux may refuse SCHED_IDLE and start none; dropping joins the rest.
-        let keepers = CoreKeepers::start(false);
+        let keepers = CoreKeepers::start(false, 1);
+        assert!(keepers.len() <= 1);
         if !cfg!(target_os = "linux") {
             assert!(keepers.is_empty());
         }
