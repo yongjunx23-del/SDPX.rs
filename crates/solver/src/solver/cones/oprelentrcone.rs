@@ -46,45 +46,73 @@ fn gemm<T: FloatT>(ta: bool, tb: bool, n: usize, a: &[T], b: &[T], c: &mut [T]) 
 }
 
 /// Lower Cholesky factor in place (upper triangle zeroed); false unless ≻ 0.
+/// Wide types go left-looking on rows, each entry one exact dot product
+/// rounded once (3× faster than potrf's FMA chains at order 72); binary64
+/// keeps LAPACK.
 fn cholesky<T: FloatT>(n: usize, a: &mut [T]) -> bool {
-    let mut info = 0;
-    T::xpotrf(b'L', n as i32, a, n as i32, &mut info);
-    if info != 0 {
-        return false;
+    if T::precision_bits() <= 53 {
+        let mut info = 0;
+        T::xpotrf(b'L', n as i32, a, n as i32, &mut info);
+        if info != 0 {
+            return false;
+        }
+        for j in 0..n {
+            for i in 0..j {
+                a[i + j * n] = T::zero();
+            }
+        }
+        return (0..n).all(|i| a[i + i * n].is_finite() && a[i + i * n] > T::zero());
     }
+    let mut r = vec![T::zero(); n * n];
     for j in 0..n {
-        for i in 0..j {
-            a[i + j * n] = T::zero();
+        let rj = j * n;
+        let d = a[j + j * n] - T::dot_slices(&r[rj..rj + j], &r[rj..rj + j]);
+        if !(d.is_finite() && d > T::zero()) {
+            return false;
+        }
+        let d = d.sqrt();
+        r[rj + j] = d;
+        for i in j + 1..n {
+            let ri = i * n;
+            let v = (a[i + j * n] - T::dot_slices(&r[ri..ri + j], &r[rj..rj + j])) / d;
+            r[ri + j] = v;
         }
     }
-    (0..n).all(|i| a[i + i * n].is_finite() && a[i + i * n] > T::zero())
+    for j in 0..n {
+        for i in 0..n {
+            a[i + j * n] = if i < j { T::zero() } else { r[j + i * n] };
+        }
+    }
+    true
 }
 
-/// L⁻¹ of a lower triangular L by forward substitution (lower triangle).
+/// L⁻¹ of a lower triangular L by forward substitution (lower triangle),
+/// each entry one exact dot product.
 fn lower_inverse<T: FloatT>(n: usize, l: &[T], li: &mut [T]) {
+    let mut rows = vec![T::zero(); n * n];
+    for j in 0..n {
+        for i in j..n {
+            rows[j + i * n] = l[i + j * n];
+        }
+    }
     for col in 0..n {
-        for i in col..n {
-            let mut v = if i == col { T::one() } else { T::zero() };
-            for k in col..i {
-                v -= l[i + k * n] * li[k + col * n];
-            }
-            li[i + col * n] = v / l[i + i * n];
+        li[col + col * n] = T::one() / l[col + col * n];
+        for i in col + 1..n {
+            let v = T::dot_slices(&rows[i * n + col..i * n + i], &li[col * n + col..col * n + i]);
+            li[i + col * n] = -v / l[i + i * n];
         }
     }
 }
 
 /// Inverse of a symmetric positive definite matrix from its lower factor:
 /// L⁻ᵀL⁻¹ (LAPACK's potri: a third of the products of solving against the
-/// identity).
+/// identity), each entry one exact dot product of two columns of L⁻¹.
 fn spd_inverse<T: FloatT>(n: usize, l: &[T], out: &mut [T]) -> bool {
     let mut li = vec![T::zero(); n * n];
     lower_inverse(n, l, &mut li);
     for j in 0..n {
         for i in j..n {
-            let mut v = T::zero();
-            for k in i..n {
-                v += li[k + i * n] * li[k + j * n];
-            }
+            let v = T::dot_slices(&li[i + i * n..(i + 1) * n], &li[i + j * n..(j + 1) * n]);
             out[i + j * n] = v;
             out[j + i * n] = v;
         }
@@ -261,8 +289,11 @@ pub(crate) struct Oracle<T> {
     /// g⁽¹⁾ (n×n) and c = (gᵢ+gⱼ)/2 − g⁽¹⁾ᵢⱼ(λᵢ+λⱼ)/2, the X-part of DD.
     d1: Vec<T>,
     c: Vec<T>,
-    /// g⁽²⁾ (n×n×n), built on demand for Hessian products.
+    /// g⁽²⁾ (n×n×n), built on demand for Hessian products, with the
+    /// point's constant Schur operands V = g⁽¹⁾∘W, A = ΛV + VΛ and
+    /// A2 = GW + WG (n×n each).
     d2: Vec<T>,
+    vaa: Vec<T>,
     zh: Vec<T>,
     lz: Vec<T>,
     w: Vec<T>,
@@ -353,6 +384,7 @@ impl<T: FloatT> Oracle<T> {
             d1,
             c,
             d2: Vec::new(),
+            vaa: Vec::new(),
             s0l: None,
             zh,
             lz,
@@ -381,6 +413,20 @@ impl<T: FloatT> Oracle<T> {
             }
         }
         self.d2 = d2;
+        let nn = n * n;
+        let mut vaa = vec![T::zero(); 3 * nn];
+        let (v, rest) = vaa.split_at_mut(nn);
+        let (a, a2) = rest.split_at_mut(nn);
+        let (lam, g, w) = (&self.lam, &self.g, &self.w);
+        for j in 0..n {
+            for i in 0..n {
+                let ij = i + j * n;
+                v[ij] = self.d1[ij] * w[ij];
+                a[ij] = (lam[i] + lam[j]) * v[ij];
+                a2[ij] = (g[i] + g[j]) * w[ij];
+            }
+        }
+        self.vaa = vaa;
     }
 
     /// Primal gradient ∇f(s) (svec, stacked T, X, Y).
@@ -415,8 +461,9 @@ impl<T: FloatT> Oracle<T> {
 
     /// Schur block S₀[H, K] in eigen-coordinates: the (X, Y) Hessian with the
     /// coupling through T eliminated. Writes (out_h, out_k). `unit` = (p, q)
-    /// when H and K vanish outside (p, q), (q, p) (S₀'s columns): the
-    /// products then skip exact zeros, O(n²) instead of O(n³).
+    /// when H and K vanish outside (p, q), (q, p) (S₀'s columns): every
+    /// term then vanishes outside rows and columns p, q, so only those
+    /// entries are formed, O(n) instead of O(n³).
     #[allow(clippy::too_many_arguments)]
     fn schur_apply(
         &self,
@@ -429,9 +476,8 @@ impl<T: FloatT> Oracle<T> {
     ) {
         let n = self.n;
         let nn = n * n;
-        ws.resize(12 * nn, T::zero());
-        let (v, rest) = ws.split_at_mut(nn);
-        let (e1, rest) = rest.split_at_mut(nn);
+        ws.resize(10 * nn, T::zero());
+        let (e1, rest) = ws.split_at_mut(nn);
         let (gam, rest) = rest.split_at_mut(nn);
         let (f1, rest) = rest.split_at_mut(nn);
         let (dj, rest) = rest.split_at_mut(nn);
@@ -440,17 +486,20 @@ impl<T: FloatT> Oracle<T> {
         let (m3, rest) = rest.split_at_mut(nn);
         let (m4, rest) = rest.split_at_mut(nn);
         let (m5, rest) = rest.split_at_mut(nn);
-        let (m6, rest) = rest.split_at_mut(nn);
-        let (aw, _) = rest.split_at_mut(nn);
+        let (m6, _) = rest.split_at_mut(nn);
         let (lam, g, d1, w) = (&self.lam, &self.g, &self.d1, &self.w);
+        let (v, rest) = self.vaa.split_at(nn);
+        let (aw, a2) = rest.split_at(nn);
+        // entries (i, j) that can be nonzero
+        let support: Vec<(usize, usize)> = (0..n)
+            .flat_map(|j| (0..n).map(move |i| (i, j)))
+            .filter(|&(i, j)| unit.is_none_or(|(p, q)| i == p || i == q || j == p || j == q))
+            .collect();
         let half: T = (0.5).as_T();
-        for j in 0..n {
-            for i in 0..n {
-                let ij = i + j * n;
-                v[ij] = d1[ij] * w[ij];
-                e1[ij] = k[ij] - half * (lam[i] + lam[j]) * h[ij];
-                f1[ij] = d1[ij] * e1[ij];
-            }
+        for &(i, j) in &support {
+            let ij = i + j * n;
+            e1[ij] = k[ij] - half * (lam[i] + lam[j]) * h[ij];
+            f1[ij] = d1[ij] * e1[ij];
         }
         // X·S (`right`) or S·X
         let prod = |x: &[T], s: &[T], right: bool, out: &mut [T]| match unit {
@@ -466,51 +515,42 @@ impl<T: FloatT> Oracle<T> {
             None => (0..n).collect(),
         };
         let d2 = &self.d2;
-        for b in 0..n {
-            for a in 0..n {
-                let mut acc = T::zero();
-                for &c in &cs {
-                    let t = w[a + c * n] * e1[c + b * n] + e1[a + c * n] * w[c + b * n];
-                    acc += d2[a + n * (b + n * c)] * t;
-                }
-                gam[a + b * n] = acc;
+        for &(a, b) in &support {
+            let mut acc = T::zero();
+            for &c in &cs {
+                let t = w[a + c * n] * e1[c + b * n] + e1[a + c * n] * w[c + b * n];
+                acc += d2[a + n * (b + n * c)] * t;
             }
+            gam[a + b * n] = acc;
         }
         prod(v, h, true, m1); // V H
         prod(w, h, true, m2); // W H
         prod(v, k, false, m3); // K V
-        for j in 0..n {
-            for i in 0..n {
-                let ij = i + j * n;
-                aw[ij] = (lam[i] + lam[j]) * v[ij]; // A = ΛV + VΛ
-                let ji = j + i * n;
-                dj[ij] = d1[ij] * half * (m2[ij] + m2[ji]); // g⁽¹⁾∘J, J = (WH + HW)/2
-            }
+        for &(i, j) in &support {
+            let (ij, ji) = (i + j * n, j + i * n);
+            dj[ij] = d1[ij] * half * (m2[ij] + m2[ji]); // g⁽¹⁾∘J, J = (WH + HW)/2
         }
-        prod(aw, h, true, m4); // A H
+        prod(aw, h, true, m4); // A H, A = ΛV + VΛ
         prod(w, f1, true, m5); // W F1
-        for j in 0..n {
-            for i in 0..n {
-                aw[i + j * n] = (g[i] + g[j]) * w[i + j * n]; // A2 = GW + WG
-            }
-        }
-        prod(aw, h, true, m6); // A2 H
+        prod(a2, h, true, m6); // A2 H, A2 = GW + WG
         let (q38, q14, q18): (T, T, T) = ((0.375).as_T(), (0.25).as_T(), (0.125).as_T());
-        for j in 0..n {
-            for i in 0..n {
-                let (ij, ji) = (i + j * n, j + i * n);
-                let (li, lj, gi, gj) = (lam[i], lam[j], g[i], g[j]);
-                let dhq = -half * (m3[ij] + m3[ji]) + q38 * (m4[ij] + m4[ji])
-                    + q14 * (lj * m1[ij] + li * m1[ji])
-                    - half * (li + lj) * gam[ij]
-                    + half * (m5[ij] + m5[ji])
-                    - half * (li + lj) * dj[ij]
-                    + q14 * (gj * m2[ij] + gi * m2[ji])
-                    - q18 * (m6[ij] + m6[ji]);
-                let dkq = -half * (m1[ij] + m1[ji]) + gam[ij] + dj[ij];
-                out_h[ij] = h[ij] + dhq;
-                out_k[ij] = k[ij] / (li * lj) + dkq;
-            }
+        if unit.is_some() {
+            out_h.fill(T::zero());
+            out_k.fill(T::zero());
+        }
+        for &(i, j) in &support {
+            let (ij, ji) = (i + j * n, j + i * n);
+            let (li, lj, gi, gj) = (lam[i], lam[j], g[i], g[j]);
+            let dhq = -half * (m3[ij] + m3[ji]) + q38 * (m4[ij] + m4[ji])
+                + q14 * (lj * m1[ij] + li * m1[ji])
+                - half * (li + lj) * gam[ij]
+                + half * (m5[ij] + m5[ji])
+                - half * (li + lj) * dj[ij]
+                + q14 * (gj * m2[ij] + gi * m2[ji])
+                - q18 * (m6[ij] + m6[ji]);
+            let dkq = -half * (m1[ij] + m1[ji]) + gam[ij] + dj[ij];
+            out_h[ij] = h[ij] + dhq;
+            out_k[ij] = k[ij] / (li * lj) + dkq;
         }
         symmetrize(n, out_h);
         symmetrize(n, out_k);
@@ -864,8 +904,11 @@ impl<T: FloatT> OpRelEntropyCone<T> {
     }
 
     /// ∇³f(s)[a, b] = d/dt ∇²f(s + ta)b by central differences with
-    /// ‖ta‖ₛ = ε_mach^⅓ (inside the Dikin ellipsoid, so both points are
-    /// interior); relative error ≈ ε_mach^⅔, enough for a corrector.
+    /// ‖ta‖ₛ = ε_mach^¼ (inside the Dikin ellipsoid, so both points are
+    /// interior). Ẑ = T − D(X, Y) carries absolute rounding ≈ ε_mach, so the
+    /// quotient's rounding error grows as λ_min(Ẑ) shrinks: at ε_mach^⅓ it
+    /// exceeded the corrector itself near the end of two_L4 at 128 bits
+    /// (λ_min(Ẑ) ≤ 4e-23), while the truncation term ε_mach^½ stays small.
     fn third_mixed(&self, a: &[T], b: &[T]) -> Option<Vec<T>> {
         let s = &self.data.s;
         let mut o = Oracle::new(self.n, s)?;
@@ -875,7 +918,7 @@ impl<T: FloatT> OpRelEntropyCone<T> {
         if !(norm2 > T::zero()) || !norm2.is_finite() {
             return None;
         }
-        let eps = T::epsilon().cbrt().min((0.1).as_T());
+        let eps = T::epsilon().sqrt().sqrt().min((0.1).as_T());
         let t = eps / norm2.sqrt();
         let mut out = vec![T::zero(); a.len()];
         let mut w = vec![T::zero(); a.len()];
