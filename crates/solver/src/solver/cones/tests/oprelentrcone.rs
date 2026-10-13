@@ -142,6 +142,59 @@ fn dual_bound_is_upper_and_tight_on_central_path() {
 }
 
 #[test]
+fn dual_ok_keeps_cheap_bound_lazy() {
+    let n = 4;
+    let s = point(n, 61);
+    let mut o = Oracle::new(n, &s).unwrap();
+    let mut z = vec![0.0; s.len()];
+    o.gradient(&mut z);
+    z.iter_mut().for_each(|v| *v = -*v);
+    let sz = s.dot(&z);
+    assert!(o.dual_ok(&z, |q| (3 * n - 1) as f64 * q < sz * sz));
+    assert!(o.d2.is_empty() && o.vaa.is_empty() && o.s0l.is_none());
+}
+
+#[test]
+fn dual_ok_matches_factor_near_threshold() {
+    fn check<T: FloatT>() {
+        let separation = T::epsilon().sqrt().sqrt();
+        for n in [4usize, 6] {
+            let m = triangular_number(n);
+            // T − D = margin·I, safely above rounding even for binary64.
+            for margin in [1.0, 1.0 / 1024.0, 1.0 / 16777216.0] {
+                let mut s = vec![T::zero(); 3 * m];
+                for j in 0..n {
+                    s[tri(j, j)] = margin.as_T();
+                    s[m + tri(j, j)] = T::one();
+                    s[2 * m + tri(j, j)] = T::one();
+                }
+                // This Schur eigenvector finishes CG in one step; a generic
+                // covector also exercises the factor fallback near its limit.
+                let mut eigen = vec![T::zero(); 3 * m];
+                eigen[m] = T::one();
+                eigen[2 * m] = -T::one();
+                let generic = direction(n, 911 + n as u64).into_iter().map(|v| v.as_T()).collect();
+                for (probe, z) in [eigen, generic].into_iter().enumerate() {
+                    let mut factor = Oracle::new(n, &s).unwrap();
+                    let exact = factor.dual_form(&z, true).unwrap();
+                    for sign in [-T::one(), T::one()] {
+                        let limit = exact * (T::one() + sign * separation);
+                        let mut cg = Oracle::new(n, &s).unwrap();
+                        assert_eq!(cg.dual_ok(&z, |q| q < limit), exact < limit,
+                            "n={n} margin={margin} probe={probe}");
+                        if probe == 0 && sign > T::zero() {
+                            assert!(!cg.d2.is_empty() && cg.s0l.is_none(), "CG must decide the eigenvector probe");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    check::<f64>();
+    check::<sdpx_arithmetic::MpFloat<128>>();
+}
+
+#[test]
 fn unit_initialization_is_central() {
     for n in [1usize, 3] {
         let cone = OpRelEntropyCone::<f64>::new(n);

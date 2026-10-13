@@ -701,17 +701,26 @@ impl<T: FloatT> Oracle<T> {
     /// `ok(⟨z, (∇²f)⁻¹z⟩)` for a monotone `ok` (true below a limit), decided
     /// as the exact form would be. For any x and r = v − S₀x,
     /// vᵀS₀⁻¹v = 2vᵀx − xᵀS₀x + rᵀS₀⁻¹r with 0 ≤ rᵀS₀⁻¹r ≤ rᵀBr. Conjugate
-    /// gradients on S₀ preconditioned by B narrow these bounds, one O(n³)
-    /// product per step (x = 0 gives the bound of `dual_form`); S₀'s O(n⁶)
+    /// gradients on S₀ preconditioned by B narrow these bounds, two O(n³)
+    /// products per step (one recomputes the residual for the bounds); S₀'s O(n⁶)
     /// factor decides only what about as many products as it costs leave
     /// open.
     pub(crate) fn dual_ok(&mut self, z: &[T], ok: impl Fn(T) -> bool) -> bool {
-        self.ensure_d2();
+        let (t, w, b) = self.dual_parts(z);
+        let upper = w.iter().zip(&b).fold(t, |a, (&w, &b)| a + b * w * w);
+        if ok(upper) {
+            return true;
+        }
         let n = self.n;
         let m = n * (n + 1) / 2;
         let nn = n * n;
-        let (t, w, b) = self.dual_parts(z);
         let m2 = w.len();
+        // the factor's (2m)³/6 multiply-adds against ≈ 18n³ per CG step
+        let budget = m2.pow(3) / (108 * n.pow(3));
+        if !ok(t) || budget == 0 {
+            return self.schur_norm(w).is_some_and(|q| ok(t + q));
+        }
+        self.ensure_d2();
         let mut x = vec![T::zero(); m2];
         let mut r = w.clone();
         let mut br: Vec<T> = r.iter().zip(&b).map(|(&r, &b)| r * b).collect();
@@ -721,17 +730,7 @@ impl<T: FloatT> Oracle<T> {
         let (mut h, mut k) = (vec![T::zero(); nn], vec![T::zero(); nn]);
         let (mut oh, mut ok_) = (vec![T::zero(); nn], vec![T::zero(); nn]);
         let mut ws = Vec::new();
-        // the factor's (2m)³/6 multiply-adds against ≈ 9n³ per product
-        let budget = m2.pow(3) / (54 * n.pow(3));
-        for step in 0..=budget {
-            // 2vᵀx − xᵀS₀x with S₀x = v − r
-            let low = t + w.dot(&x) + x.dot(&r);
-            if ok(low + rho) {
-                return true;
-            }
-            if !ok(low) || step == budget {
-                break;
-            }
+        for _ in 0..budget {
             smat(n, &p[..m], &mut h);
             smat(n, &p[m..], &mut k);
             self.schur_apply(&h, &k, &mut oh, &mut ok_, &mut ws, None);
@@ -743,7 +742,22 @@ impl<T: FloatT> Oracle<T> {
             }
             let alpha = rho / psp;
             x.axpby(alpha, &p, T::one());
-            r.axpby(-alpha, &sp, T::one());
+            // Bounds need r = w − S₀x, not CG's recursively rounded residual.
+            smat(n, &x[..m], &mut h);
+            smat(n, &x[m..], &mut k);
+            self.schur_apply(&h, &k, &mut oh, &mut ok_, &mut ws, None);
+            svec(n, &oh, &mut sp[..m]);
+            svec(n, &ok_, &mut sp[m..]);
+            r.waxpby(T::one(), &w, -T::one(), &sp);
+            let wx = w.dot(&x);
+            let low = t + wx + wx - x.dot(&sp);
+            let upper = r.iter().zip(&b).fold(low, |a, (&r, &b)| a + b * r * r);
+            if ok(upper) {
+                return true;
+            }
+            if !ok(low) {
+                break;
+            }
             for i in 0..m2 {
                 br[i] = r[i] * b[i];
             }
