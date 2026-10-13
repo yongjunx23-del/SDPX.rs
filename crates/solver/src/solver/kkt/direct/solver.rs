@@ -657,25 +657,6 @@ where
         let is_success = self.ldlsolver.refactor(KKT);
         self.counters.factorizations += u64::from(is_success);
         crate::receipt::finish("refactor", timer);
-        if !is_success && !self.ore.is_empty() && std::env::var_os("SDPX_TRACE_TAU").is_some() {
-            eprintln!(
-                "kkt-factor-fail backend {} dim {} shift {}",
-                self.ldlsolver.linear_solver_info().name, KKT.n, self.diagonal_regularizer,
-            );
-            for o in &self.ore {
-                eprintln!(
-                    "kkt-ore-rows {} {} t-end {}",
-                    self.n + o.rows.start, self.n + o.rows.end,
-                    self.n + o.rows.start + o.rows.len() / 3,
-                );
-            }
-            for col in 0..KKT.n {
-                for p in KKT.colptr[col]..KKT.colptr[col + 1] {
-                    eprintln!("kkt-factor-entry {} {} {}", KKT.rowval[p], col, KKT.nzval[p]);
-                }
-            }
-        }
-
         if applied_shift {
             // The factor backend intentionally retains the shifted values,
             // while the authoritative sparse operator must remain unshifted.
