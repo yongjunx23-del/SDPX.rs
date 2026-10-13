@@ -88,7 +88,18 @@ where
         //QDLDL has maintained its own version of the permuted
         //KKT matrix through custom update/scale/offset methods,
         //so we ignore the KKT matrix provided by the caller
-        self.factors.refactor().is_ok() && self.factors.Dinv.is_finite()
+        let result = self.factors.refactor();
+        let ok = result.is_ok() && self.factors.Dinv.is_finite();
+        if !ok && std::env::var_os("SDPX_TRACE_TAU").is_some() {
+            let pivot = self.factors.D.iter()
+                .position(|v| v.is_zero())
+                .or_else(|| self.factors.Dinv.iter().position(|v| !v.is_finite()));
+            eprintln!(
+                "qdldl-factor-fail {:?} pivot {:?} row {:?}",
+                result, pivot, pivot.map(|k| self.factors.perm[k]),
+            );
+        }
+        ok
     }
 
     fn set_pool(&mut self, pool: Option<std::sync::Arc<rayon::ThreadPool>>) {

@@ -609,7 +609,10 @@ where
                         *d = KKT.nzval[*idx];
                     }
 
-                    _escalated(_compute_regularizer(diag_kkt, settings), self.reg_boost)
+                    let diagonal = diag_kkt.norm_inf();
+                    let base = settings.static_regularization_constant
+                        + settings.static_regularization_proportional * diagonal;
+                    _escalated(base, self.reg_boost, diagonal)
                 }
             };
 
@@ -654,6 +657,24 @@ where
         let is_success = self.ldlsolver.refactor(KKT);
         self.counters.factorizations += u64::from(is_success);
         crate::receipt::finish("refactor", timer);
+        if !is_success && !self.ore.is_empty() && std::env::var_os("SDPX_TRACE_TAU").is_some() {
+            eprintln!(
+                "kkt-factor-fail backend {} dim {} shift {}",
+                self.ldlsolver.linear_solver_info().name, KKT.n, self.diagonal_regularizer,
+            );
+            for o in &self.ore {
+                eprintln!(
+                    "kkt-ore-rows {} {} t-end {}",
+                    self.n + o.rows.start, self.n + o.rows.end,
+                    self.n + o.rows.start + o.rows.len() / 3,
+                );
+            }
+            for col in 0..KKT.n {
+                for p in KKT.colptr[col]..KKT.colptr[col + 1] {
+                    eprintln!("kkt-factor-entry {} {} {}", KKT.rowval[p], col, KKT.nzval[p]);
+                }
+            }
+        }
 
         if applied_shift {
             // The factor backend intentionally retains the shifted values,
@@ -1256,24 +1277,19 @@ where
 
 /// Static shift at escalation level `boost`: ×100 per level. A zero base
 /// shift (the MPFR default) has no shift until a factorization fails; the
-/// first escalation is then `eps^(15/16)`, the former MPFR default.
-pub(crate) fn _escalated<T: FloatT>(base: T, boost: usize) -> T {
+/// first escalation is at least one rounding unit of the KKT diagonal.
+pub(crate) fn _escalated<T: FloatT>(base: T, boost: usize, diagonal: T) -> T {
     if boost == 0 {
         return base;
     }
     if base.is_zero() {
-        // The first level is the former MPFR default shift.
-        return crate::solver::default::regularization_default::<T>(0.0)
-            * 100f64.powi(boost as i32 - 1).as_T();
+        let floor = T::max(
+            crate::solver::default::regularization_default::<T>(0.0),
+            T::epsilon() * diagonal,
+        );
+        return floor * 100f64.powi(boost as i32 - 1).as_T();
     }
     base * 100f64.powi(boost as i32).as_T()
-}
-
-fn _compute_regularizer<T: FloatT>(diag_kkt: &[T], settings: &CoreSettings<T>) -> T {
-    let maxdiag = diag_kkt.norm_inf();
-
-    // Compute a new regularizer
-    settings.static_regularization_constant + settings.static_regularization_proportional * maxdiag
 }
 
 //  computes e = b - Kξ, overwriting the first argument
