@@ -462,7 +462,8 @@ struct EliminatedRows<T> {
     rows: Vec<(usize, usize)>,
     dense: Vec<usize>,
     /// Panel cells `(row + slot·rows, value index)` of the dense entries of
-    /// rows that also have sparse entries (their values feed the plan too).
+    /// rows that also have sparse entries (their values feed the plan too)
+    /// and of every cone row.
     cells: Vec<(usize, usize)>,
     /// Panel cell of each value index (`usize::MAX` off the panel), and
     /// whether a virtual row lies entirely in the panel (written directly).
@@ -630,10 +631,12 @@ impl<T: FloatT> EliminatedRows<T> {
                 filled: false,
             }
         });
+        // Panel-only orthant rows are written to the panel directly; cone
+        // rows always go through `values`.
         let cells = rows
             .iter()
             .enumerate()
-            .filter(|&(i, _)| !panel_only[i] && !fixed_row[i])
+            .filter(|&(i, _)| (!panel_only[i] || orthant_of[i].is_none()) && !fixed_row[i])
             .flat_map(|(_, &(start, end))| start..end)
             .filter(|&e| cell_of[e] != usize::MAX)
             .map(|e| (cell_of[e], e))

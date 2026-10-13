@@ -690,6 +690,53 @@ fn condensed_mixed_original_operator_mpfr128() {
     mixed_operator::<Bits128>();
 }
 
+#[test]
+fn condensed_panel_only_soc_rows() {
+    // Two eliminated SOCs over the same two columns: both columns are dense,
+    // so every virtual row lies in the panel and reaches the Gram only
+    // through `cells`.
+    let kinds = [
+        SupportedConeT::PSDTriangleConeT(2),
+        SupportedConeT::SecondOrderConeT(10),
+        SupportedConeT::SecondOrderConeT(10),
+    ];
+    let mut cones = CompositeCone::<f64>::new(&kinds);
+    let m = 23;
+    let P = CscMatrix::from(&[[3., 0.25], [0., 2.]]);
+    let mut nzval: Vec<f64> = (0..m).map(|i| 1. + 0.1 * i as f64).collect();
+    nzval.extend((0..m).map(|i| 0.5 - 0.03 * i as f64));
+    let A = CscMatrix::new(m, 2, vec![0, m, 2 * m], (0..m).chain(0..m).collect(), nzval);
+    let mut s = vec![3., 0.2, 2.];
+    let mut z = vec![1.5, -0.1, 2.5];
+    for k in 0..2 {
+        s.push(2. + k as f64);
+        s.extend((0..9).map(|i| 0.1 * (i as f64 - 4.)));
+        z.push(1.5 + k as f64);
+        z.extend((0..9).map(|i| 0.05 * (4. - i as f64)));
+    }
+    let settings = CoreSettings::<f64>::default();
+    let mut solver = CondensedKKTSolver::new(&P, &A, &kinds, &cones, &settings);
+    assert!(cones.update_scaling(&s, &z, 1., ScalingStrategy::PrimalDual));
+    assert!(solver.update(&cones, &settings));
+    let exact_x = [0.25, -0.5];
+    let exact_z: Vec<f64> = (0..m).map(|i| 0.1 * (i % 5) as f64 - 0.2).collect();
+    let (mut bx, mut bz) = (vec![0.; 2], vec![0.; m]);
+    let (mut hz, mut scratch) = (vec![0.; m], vec![0.; m]);
+    P.sym_up().symv(&mut bx, &exact_x, 1., 0.);
+    A.t().gemv(&mut bx, &exact_z, 1., 1.);
+    A.gemv(&mut bz, &exact_x, 1., 0.);
+    cones.mul_Hs(&mut hz, &exact_z, &mut scratch);
+    for (b, h) in bz.iter_mut().zip(hz) {
+        *b -= h;
+    }
+    let rhs: Vec<f64> = bx.iter().chain(&bz).copied().collect();
+    let mut point = vec![0.; rhs.len()];
+    assert!(solver.solve_raw(&mut point, &rhs, &settings));
+    for (got, want) in point.iter().zip(exact_x.iter().chain(&exact_z)) {
+        assert!((got - want).abs() < 1e-8, "{got} vs {want}");
+    }
+}
+
 fn nonsymmetric_operator<T: FloatT>() {
     let kinds = [
         SupportedConeT::PSDTriangleConeT(2),
