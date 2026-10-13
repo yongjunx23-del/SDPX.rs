@@ -436,9 +436,7 @@ where
             if ok {
                 let col = &mut out[c * width..(c + 1) * width];
                 col.copy_from_slice(&x[c * full..c * full + width]);
-                for o in &self.ore {
-                    o.t.from_eigen(&mut col[n + o.rows.start..n + o.rows.end]);
-                }
+                self.from_eigen_dual(&mut col[n..]);
             }
         }
         self.batch_rhs = b;
@@ -704,6 +702,20 @@ where
         self.solve_panel(rhs, out, cols, true)
     }
 
+    /// Map an original RHS to the retained cone coordinates of the factors.
+    pub(crate) fn to_eigen_rhs(&self, rhs: &mut [T]) {
+        for o in &self.ore {
+            o.t.to_eigen(&mut rhs[self.n + o.rows.start..self.n + o.rows.end]);
+        }
+    }
+
+    /// Recover original dual coordinates from the retained factor coordinates.
+    pub(crate) fn from_eigen_dual(&self, z: &mut [T]) {
+        for o in &self.ore {
+            o.t.from_eigen(&mut z[o.rows.clone()]);
+        }
+    }
+
     fn solve_panel(&mut self, rhs: &[T], out: &mut [T], cols: usize, coupling: bool) -> bool {
         let full = self.factor_dimension();
         assert_eq!(rhs.len(), cols * full);
@@ -769,9 +781,7 @@ where
         }
         if let Some(v) = lhsz {
             v.copy_from(&x[n..(n + m)]);
-            for o in &self.ore {
-                o.t.from_eigen(&mut v[o.rows.clone()]);
-            }
+            self.from_eigen_dual(v);
         }
     }
 

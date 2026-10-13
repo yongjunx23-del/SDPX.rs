@@ -805,6 +805,64 @@ fn condensed_retained_nonsymmetric_original_operator_mpfr128() {
     nonsymmetric_operator::<Bits128>();
 }
 
+fn ore_phase_coordinates<T: FloatT>() {
+    let kinds = [SupportedConeT::OpRelEntropyConeT(1)];
+    let mut cones = CompositeCone::new(&kinds);
+    let (mut s, mut z) = (vec![T::zero(); 3], vec![T::zero(); 3]);
+    cones.unit_initialization(&mut z, &mut s);
+    assert!(cones.update_scaling(&s, &z, T::one(), ScalingStrategy::Dual));
+    let a = CscMatrix::from(&[[(0.5).as_T()], [(-0.25).as_T()], [(0.75).as_T()]]);
+    let settings = CoreSettings {
+        static_regularization_enable: false,
+        ..CoreSettings::<T>::default()
+    };
+    let mut kkt = CondensedKKTSolver::new(&CscMatrix::identity(1), &a, &kinds, &cones, &settings);
+    assert!(kkt.update(&cones, &settings));
+    let known: Vec<T> = [0.125, 0.25, -0.125, 0.375].map(|v| v.as_T()).to_vec();
+    let mut rhs = vec![T::zero(); known.len()];
+    kkt.original_residual(&mut rhs, &vec![T::zero(); known.len()], &known);
+    rhs.negate();
+    let dim = kkt.interior_dimension();
+    let mut prepared = vec![T::zero(); dim];
+    kkt.prepare_interior_rhs(&rhs, &mut prepared);
+    let mut panel = vec![T::zero(); 2 * dim];
+    assert!(kkt.solve_interior_panel(
+        &[prepared.clone(), prepared.clone()].concat(),
+        &mut panel,
+        2,
+    ));
+    let tolerance = T::epsilon() * (4096.).as_T();
+    let mut error = vec![T::zero(); dim];
+    let mut recovered = vec![T::zero(); known.len()];
+    for point in panel.chunks(dim) {
+        assert!(kkt.interior_residual(&mut error, &prepared, point) <= tolerance);
+        assert!(kkt.recover_interior_rhs(&mut recovered, &rhs, point));
+        for (&got, &want) in recovered.iter().zip(&known) {
+            assert!((got - want).abs() <= tolerance);
+        }
+    }
+    // Owner border couplings touch x only; their response stays in factor
+    // coordinates until the same final recovery.
+    let mut coupling = vec![T::zero(); dim];
+    coupling[0] = T::one();
+    assert!(kkt.solve_interior_coupling(&coupling, &mut panel[..dim], 1));
+    assert!(kkt.interior_residual(&mut error, &coupling, &panel[..dim]) <= tolerance);
+    let mut rhs = vec![T::zero(); known.len()];
+    rhs[0] = T::one();
+    assert!(kkt.recover_interior_rhs(&mut recovered, &rhs, &panel[..dim]));
+    assert!(kkt.original_residual(&mut error, &rhs, &recovered) <= tolerance);
+}
+
+#[test]
+fn condensed_ore_phase_coordinates_f64() {
+    ore_phase_coordinates::<f64>();
+}
+
+#[test]
+fn condensed_ore_phase_coordinates_mpfr128() {
+    ore_phase_coordinates::<Bits128>();
+}
+
 #[test]
 fn structural_psd_blocks_remain_sparse_with_global_equalities() {
     let types = [

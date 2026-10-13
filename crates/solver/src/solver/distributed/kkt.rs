@@ -912,9 +912,14 @@ impl<T: FloatT> OwnedKkt<T> {
     }
 
     fn take_unrefined(&mut self, settings: &CoreSettings<T>) -> Option<usize> {
-        self.unrefined
-            .take()
-            .filter(|_| T::precision_bits() > 53 && settings.iterative_refinement_enable)
+        self.unrefined.take().filter(|_| {
+            T::precision_bits() > 53
+                && settings.iterative_refinement_enable
+                && self
+                    .collective
+                    .all_true(707, self.locals.iter().all(|l| l.kernel.fused_sampled()))
+                    .unwrap_or(false)
+        })
     }
 
     /// Each owner's Hs·z of an unrefined solution, as its residual would

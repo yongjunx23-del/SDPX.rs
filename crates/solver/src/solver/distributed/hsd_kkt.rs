@@ -183,6 +183,7 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
     fn reset_solve(&mut self) {
         self.kernel.reset_solve();
         self.affine_ready = None;
+        self.fixed_tau = false;
     }
     fn update(
         &mut self,

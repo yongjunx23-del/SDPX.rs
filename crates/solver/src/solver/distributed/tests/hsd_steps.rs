@@ -126,6 +126,7 @@ fn stages<T: FloatT>(mixed: bool) {
         .iter()
         .any(|v| v.x.is_empty() && v.s.len() == 1));
     assert_eq!(cones.all_symmetric(), original.is_symmetric());
+    assert_eq!(cones.barrier_backtrack(), original.barrier_backtrack());
     assert_eq!(
         cones.supports_primal_dual(),
         original.allows_primal_dual_scaling()
@@ -143,13 +144,30 @@ fn stages<T: FloatT>(mixed: bool) {
         }
         full.z.fill(n(2));
         owned = from_full(&layout, &full);
+        full.freeze_tau();
+        owned.freeze_tau();
         full.symmetric_initialization(&mut original);
         owned.symmetric_initialization(&mut cones);
+        assert!(!full.fixed_tau && !owned.fixed_tau);
+        assert!(owned.blocks.iter().all(|v| !v.fixed_tau));
         compare(&owned, &full);
     }
+    full.freeze_tau();
+    owned.freeze_tau();
     full.unit_initialization(&original);
     owned.unit_initialization(&cones);
+    assert!(!full.fixed_tau && !owned.fixed_tau);
+    assert!(owned.blocks.iter().all(|v| !v.fixed_tau));
     compare(&owned, &full);
+    if !mixed {
+        full.freeze_tau();
+        owned.freeze_tau();
+        assert!(full.unit_primal_initialization(&original));
+        assert!(owned.unit_primal_initialization(&cones));
+        assert!(!full.fixed_tau && !owned.fixed_tau);
+        assert!(owned.blocks.iter().all(|v| !v.fixed_tau));
+        compare(&owned, &full);
+    }
     {
         full.s[m - 3] = n(2);
         full.s[m - 2] = T::one() / n(8);
@@ -278,4 +296,31 @@ fn owned_hsd_steps_mpfr256() {
 #[test]
 fn owned_hsd_steps_mpfr512() {
     all::<MpFloat<8>>();
+}
+
+#[test]
+fn owned_ore_barrier_backtrack() {
+    for mixed in [false, true] {
+        let mut kinds = vec![SupportedConeT::OpRelEntropyConeT(1)];
+        if mixed {
+            kinds.push(SupportedConeT::ExponentialConeT());
+        }
+        let m = kinds.iter().map(|c| c.nvars()).sum();
+        let settings = DefaultSettings {
+            presolve_enable: false,
+            equilibrate_enable: false,
+            chordal_decomposition_enable: false,
+            ..DefaultSettings::<f64>::default()
+        };
+        let data = DefaultProblemData::new(
+            &CscMatrix::identity(1),
+            &[0.],
+            &CscMatrix::zeros((m, 1)),
+            &vec![0.; m],
+            &kinds,
+            &settings,
+        );
+        let state = crate::solver::distributed::state::tests::runtime(data, 1, settings, (1, m));
+        assert_eq!(state.cones.barrier_backtrack(), mixed);
+    }
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::solver::cones::{Cone, PrimalOrDualCone};
+use crate::solver::core::traits::Variables;
 use crate::solver::distributed::collective::MockCollective;
 use crate::solver::{IPSolver, SolverStatus};
 use sdpx_arithmetic::MpFloat;
@@ -87,6 +88,34 @@ fn problem<T: FloatT>(kind: usize) -> ProblemFixture<T> {
         cones,
         solver,
     }
+}
+
+#[test]
+fn fresh_solves_thaw_previous_fixed_tau_phase() {
+    type T = MpFloat<2>;
+    let fixture = problem::<T>(1);
+    let mut config = settings::<T>();
+    config.initial_tau = T::one() / n(4);
+    let mut plain = DefaultSolver::new(
+        &fixture.p,
+        &fixture.q,
+        &fixture.a,
+        &fixture.b,
+        &fixture.cones,
+        config,
+    )
+    .unwrap();
+    plain.solve();
+    assert_eq!(plain.info.status, SolverStatus::Solved);
+    plain.variables.freeze_tau();
+    plain.solve();
+    assert_eq!(plain.info.status, SolverStatus::Solved);
+    let mut owned = OwnedSolver::from_default(plain, 2).unwrap();
+    owned.solve();
+    assert_eq!(owned.info.0.status, SolverStatus::Solved);
+    owned.variables.freeze_tau();
+    owned.solve();
+    assert_eq!(owned.info.0.status, SolverStatus::Solved);
 }
 
 fn cone_margin<T: FloatT>(cones: &[SupportedConeT<T>], values: &[T], pd: PrimalOrDualCone) -> T {

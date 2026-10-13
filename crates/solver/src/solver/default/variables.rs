@@ -368,6 +368,7 @@ where
 
         self.τ = T::one();
         self.κ = T::one();
+        self.fixed_tau = false;
     }
 
     fn unit_initialization(&mut self, cones: &CompositeCone<T>) {
@@ -376,6 +377,7 @@ where
         self.x.set(T::zero());
         self.τ = T::one();
         self.κ = T::one();
+        self.fixed_tau = false;
     }
 
     fn taukappa_backtrack(
@@ -414,6 +416,7 @@ where
         self.x.set(T::zero());
         self.τ = T::one();
         self.κ = T::one();
+        self.fixed_tau = false;
         true
     }
 

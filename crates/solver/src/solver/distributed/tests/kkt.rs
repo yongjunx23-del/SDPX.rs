@@ -25,6 +25,28 @@ fn materialize_for_new_kkt<T: FloatT>(state: &mut OwnedSolver<T>) {
         }
     }
 }
+
+#[test]
+fn owned_unrefined_predictor_requires_sampled_kernels() {
+    use super::super::state::tests::{ordinary, sampled};
+    type T = MpFloat<2>;
+    let settings = CoreSettings::<T>::default();
+    for (data, eligible) in [(ordinary::<T>(), false), (sampled::<T>(), true)] {
+        let dims = (data.n, data.m);
+        let mut state = runtime(data, 1, settings.clone(), dims);
+        materialize_for_new_kkt(&mut state);
+        let mut kernel = OwnedKkt::new_with_pool(
+            &state.data.layout,
+            state.data.blocks.iter().zip(&state.cones.blocks),
+            &settings,
+            None,
+            false,
+        );
+        kernel.skip_refinement(0);
+        assert_eq!(kernel.take_unrefined(&settings), eligible.then_some(0));
+        assert_eq!(kernel.take_unrefined(&settings), None);
+    }
+}
 fn split<T: FloatT>(state: &OwnedSolver<T>, flat: &[T]) -> OwnedVariables<T> {
     let mut result = state.variables.new_like();
     for (rhs, ids) in result.blocks.iter_mut().zip(&state.data.layout.owners) {

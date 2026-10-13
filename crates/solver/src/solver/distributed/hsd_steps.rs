@@ -110,6 +110,10 @@ impl<T: FloatT> ConeCollection<T> for OwnedCones<T> {
         let local = self.blocks.iter().all(|c| c.is_symmetric());
         self.collective.all_true(470, local).unwrap_or(false)
     }
+    fn barrier_backtrack(&self) -> bool {
+        let local = self.blocks.iter().all(|c| !c.barrier_backtrack());
+        !self.collective.all_true(708, local).unwrap_or(false)
+    }
     fn supports_primal_dual(&self) -> bool {
         let local = self.blocks.iter().all(|c| c.allows_primal_dual_scaling());
         self.collective.all_true(471, local).unwrap_or(false)
@@ -445,9 +449,11 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         for v in &mut self.blocks {
             v.τ = T::one();
             v.κ = T::one();
+            v.fixed_tau = false;
         }
         self.tau = T::one();
         self.kappa = T::one();
+        self.fixed_tau = false;
         // Shared rows are ZeroCone rows, including a border-only owner.
         self.border_s.fill(T::zero());
         self.refresh_border_from_owner_zero();
@@ -458,6 +464,7 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         }
         self.tau = T::one();
         self.kappa = T::one();
+        self.fixed_tau = false;
         self.border_s.fill(T::zero());
         self.border_z.fill(T::zero());
         self.refresh_border_from_owner_zero();
@@ -472,6 +479,7 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         }
         self.tau = T::one();
         self.kappa = T::one();
+        self.fixed_tau = false;
         self.refresh_border_from_owner_zero();
         true
     }

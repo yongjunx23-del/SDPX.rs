@@ -139,6 +139,7 @@ where
         self.kktsolver.reset_solve();
         self.affine_ready = None;
         self.const_terms = None;
+        self.fixed_tau = false;
     }
 
     fn refine_further(&mut self) {
