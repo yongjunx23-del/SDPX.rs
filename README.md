@@ -1,6 +1,6 @@
 # SDPX
 
-SDPX is a Rust conic solver derived from Clarabel.rs, with one homogeneous
+SDPX v0.9.2 is a Rust conic solver derived from Clarabel.rs, with one homogeneous
 self-dual interior-point engine for Float64 and fixed-precision MPFR arithmetic.
 It solves
 

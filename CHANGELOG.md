@@ -4,7 +4,25 @@ All notable changes to SDPX are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Measurements quote audited full
 solves; the experiment log is [docs/JOURNAL.md](docs/JOURNAL.md).
 
-## [Unreleased]
+## [0.9.2] - 2026-10-13
+
+### Release highlights
+
+- Native operator relative entropy cones in the Rust API, CLI and C ABI;
+  ordinary and owner thermal solves pass original-coordinate and Arb audits.
+- Fixed full MPFR SVD vector pairing, exact-product helper lifetimes,
+  incomplete chunk dispatch, owner ORE coordinate maps and fresh-solve phase state.
+- Packed upper congruence residues, reused SVD output storage, lazy ORE dual
+  scratch, and released saved iterates after recovery.
+- Linux MPI keepers respect disjoint CPU masks and worker budgets; receipts
+  track active keeper instances. Ising11/512 remains Solved/54 with unchanged
+  serial points and passed ordinary/owner MPI audits.
+- Failed zero-base factor retries use a scale-aware shift floor; initial
+  zero shifts, requested precision and accuracy gates are unchanged.
+- Updated architecture, plan, working rules and LAPACK provenance. Detailed
+  evidence and known failures remain in the plan and journal.
+
+The changes and earlier measurements since 0.9.1 follow.
 
 g0-min reproduction SOCP (106,175 SOC3 cones, fixed multipliers): Float64
 solve 2.02 s/50 it (objective error 4.5e-7) → 9 ms/0 it (6.6e-14), whole CLI
@@ -25,7 +43,8 @@ solve 2.02 s/50 it (objective error 4.5e-7) → 9 ms/0 it (6.6e-14), whole CLI
   same iteration budget. Λ27 spins 0–50 (768 bits, 64 threads): 451
   iterations / 832 s at τ₀ = 1, 295 / 529 s at 1e-20, 181 / 385 s at 1e-30
   (SDPB: 265 / 375 s); ising11 prefers the unit start (52 vs 77 iterations
-  at 1e-20), so the default stays 1.
+  at 1e-20). `initial_tau` defaults to 1; the enabled `auto_initial_tau`
+  rule can choose a smaller effective start from the problem scaling.
 
 - Presolve merges second-order-cone tail coordinates whose rows of `A` are
   zero: `(s1, s_V, s_C) ∈ K` iff `(s1, s_V, ‖b_C‖) ∈ K`; a fully constant tail
@@ -40,8 +59,9 @@ solve 2.02 s/50 it (objective error 4.5e-7) → 9 ms/0 it (6.6e-14), whole CLI
 ### Performance
 
 - MPI owner path on Linux: `sdpx` keeps each rank's allocated cores clocked
-  with one `SCHED_IDLE` keeper thread per CPU when the frequency governor
-  follows load. Under `conservative`, cores that serve short parallel regions
+  with one `SCHED_IDLE` keeper thread per CPU in disjoint rank masks matching
+  their worker budgets when the frequency governor follows load. Under
+  `conservative`, cores that serve short parallel regions
   sat at 1.5 instead of 2.25 GHz. Multi-rank runs only (`SDPX_KEEP_CORES=0`
   disables, `1` forces): one busy 64-thread process ran 2.0% slower with
   keepers. Λ35 at 1024 bits, 60 it, 4 nodes × 16 ranks × 16 threads, points
