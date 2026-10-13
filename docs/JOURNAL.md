@@ -8,6 +8,44 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-13 — L82: the deep restart scale no longer follows the precision (kept); L80, L81 rejected; L75 owner check (perf-mc-impl)
+
+- L75 owner check (l75n5 225446; Λ35-s70-p1024, 4 nodes, owner 16×16; mci111, A without and B with the L75 switch): A1 414 it / 659.6 s, B1 357 / 458.7 s, B2 357 / 458.3 s (−30.5%). Same objective, −2.63880096477167638679… The plain gain carries over to the owner path.
+- L82, hypothesis (L75 entry): a τ-chase restart starts at `deep_tau` = eps^(1/3). That is 2.2e-103 at 1024 bits but 8.6e-78 at 768 bits. Λ35-s70's solution sits near τ 1e-100 at both precisions, so the 768-bit restart starts the primal about 23 decades below its solution scale. The primal then grows within the fixed-τ phase at about 0.08 decades per iteration (the 768-bit plateau).
+- L82 depth probes (`SDPX_TEST_DEEP_TAU=v`, mci113; plain 64 threads, iterations / native s, and the fixed-τ entry):
+
+  | Case | restart τ₀ | it, s | fixed τ from |
+  |---|---|---|---|
+  | Λ35-s70/768 | 8.6e-78 (eps^(1/3), default) | 568, 748.4 / 741.4 | 294, τ 3.5e-74 |
+  | Λ35-s70/768 | 1e-90 | 398, 592.0 | 376, τ 2.2e-92 |
+  | Λ35-s70/768 | 1e-103 | 358, 535.4 / 536.0 | 330, τ 3.5e-100 |
+  | Λ35-s70/768 | 1e-120 | 379, 573.4 | 349, τ 3.7e-117 |
+  | Λ35-rs/1024 | 2.2e-103 (default) | 347, 620.2 | 320, τ 4.0e-99 |
+  | Λ35-rs/1024 | 1e-139 | 382, 700.2 (+12.9%) | 352, τ 1.9e-135 |
+
+  - Observed: the best restart is near the solution's τ at both precisions. Starting too shallow costs about 9 iterations per decade (the primal must grow); starting too deep costs about 1 (it deflates). After a deep restart τ rises only 3–4 decades.
+  - A precision-relative exponent cannot fit both precisions: eps^0.45 would put 1024 bits at 1e-139 (+12.9%).
+- L82 change (convergence contract for chase restarts): `deep_tau` = 2^-341 (eps^(1/3) at 1024 bits), clamped to [eps^(1/2), eps^(1/3)]. At 1024 bits nothing changes. Above 1024 bits the scale stays eps^(1/3). Between 682 and 1023 bits it is 2^-341. Below 682 bits it is eps^(1/2) (no Ising input chases there). Binary64 never chases (`auto_start_scale` is off). `SDPX_TEST_DEEP_TAU` stays as a diagnostic override.
+- L82 results (mci114 with the rule behind `SDPX_TEST_DEEP_FLOOR=1`; A default, B the rule):
+
+  | Case | Job, node | A it, s | B it, s | change |
+  |---|---|---|---|---|
+  | Λ35-s70/768 | l82f 225472, node9 | 568, 742.1 / 748.0 | 357, 535.8 / 538.0 | −28.1% |
+  | Λ35-rs/1024 | l82g 225474, node26 | 347, 618.8 | 347, 615.9 | identical |
+  | Λ35-s70-p1024/1024 | l82g | 357, 676.6 | 357, 676.4 | identical |
+
+  - The other Ising inputs never restart at a precision below 1024 bits (no chase, or 1024 bits), so they are unchanged by construction.
+  - Audit (aud82 225479, Λ35-s70/768 B1): accepted. Residuals primal 4.41e-137, dual 1.75e-141, gap 1.45e-43, map 2.75e-42. Same objective.
+  - Observed: the 768-bit point now agrees with the 1024-bit Λ35-s70-p1024 point (l75b B1) to every printed digit of x and the residuals. With the restart at the same τ, both precisions follow the same 357-iteration path; their residuals are set by the path, not by the precision.
+- L82 decision: kept as the default (switch removed). A unit test pins the scale at 512, 768, 1024 and 2048 bits.
+- L80, an attempt started below τ = 1 never raises τ above its start (`SDPX_TEST_TAU_CAP`; mode 1 every attempt, mode 2 the first only; plain 64 threads, A default):
+  - Mode 1 gains on Λ27: s50c −13.7%, s50 170 → 147 it (131.3 / 131.4 → 112.1 / 112.3 s, −14.6%), p1024 170 → 147 (−14%), pf 127 → 111 (−6%), rs −7.3%. Λ19-xml −1.8%, t11-red60 365 → 359 (−1%), Λ35-s70/768 568 → 462 (−7.9%; the cap held its shallow restart τ, which L82 fixes directly).
+  - It loses on Λ35-rs (347 → 358 it, 618.9 / 622.8 → 648.7 / 646.5 s, +4.8%), Λ35-pf (+4.9%), Λ35-s70-p1024 (357 → 361) and t11-aux35 (71 → 74 it, +3.3%).
+  - Mode 2 (l80f 225475, node43) still loses on Λ35-rs: 354 it, 645.1 / 647.5 s against 347, 626.4 s (+3.3%). Capping the first attempt delays chase detection from iteration 144 to 151.
+  - Traces (tr80 225457; A `SDPX_TRACE_TAU=1`, B adds the cap): on Λ27-s50c, τ climbs 1.3e-28 → 1.8e-25 over iterations 29–59 while the primal deflates (s/τ 4.5e28 → 9e25). τ then falls back to 4.8e-29 while the primal regrows to 8.4e30 at about 0.08 decades per iteration. The cap removes that round trip. On t11-aux35, τ rises 2.4 decades over iterations 17–22 and stays (final 2.6e-27 from τ₀ 3.0e-30): its data-scaled start is simply too deep. The cap keeps it there, and the gap lags about 3 iterations from iteration 20 on.
+  - Decision: rejected. The premise (a data-scaled τ₀ bounds the solution's τ) is refuted by t11-aux35, and the Λ35 inputs lose 3–5% in both modes. Patch `l80-tau-cap-rejected-parts.patch` (kernel parts; the attempt-loop switch is in `l80-l82-solver-rs-before-l80-removal.patch`).
+- L81, accept a stopped refinement candidate whose rows are all at their floor (`SDPX_TEST_FLOOR_ACCEPT=1`): rejected, neutral. Iterations are identical and times within noise: Λ27-s50c A 134.8 / 139.2 against B 136.4 / 138.1 s; t11-aux35 A 107.6 / 107.0 against B 106.5 / 107.8; Λ35-rs A1 617.9 against B1 618.7 (l81b 225455). Patch `l81-floor-accept-rejected.patch`.
+
 ## 2026-10-13 — L75: a chase restart keeps the KKT dual (kept); L76 rejected (perf-mc-impl)
 
 - L75, hypothesis: L71 keeps the shifted KKT dual when the KKT start is rejected, but a τ-chase restart of such an input still starts both sides at 1/τ₀. The side rule (L8) compares the chased norms against that unit start. Both sides have outgrown it, so nothing is kept. On Λ35-s70 at 1024 bits, the dual objective then runs out to −4e107 after the restart at iteration 152 and takes about 150 iterations to come back. Comparing the chased dual against the KKT dual instead, i.e. applying L8's rule to the start it would have kept, keeps the dual at its final scale.

@@ -53,7 +53,7 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 | spins 0–50 (s50) | 153 it / 153.8 s | SDPB 285 s |
 | Λ19 | 121 it / 71.0 s, audited | — |
 | ising11 (512 bits) | 54 it / 3.44 s | — |
-| Λ35 spins 0–70, 1024 bits | Solved 357 it / 676.3 s (1.87 s/it), audited (L75, 2026-10-13; was 683 it / 2426.5 s); 768 bits Solved 568 it / 773.7 s, audited (L75) | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
+| Λ35 spins 0–70, 1024 bits | Solved 357 it / 676.3 s (1.87 s/it), audited (L75, 2026-10-13; was 683 it / 2426.5 s); 768 bits Solved 357 it / 535.8 s, audited (L82, 2026-10-13; was 568 it / 742.1 s) | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
 | Float64 58 cases (t16b = int5 + task 16) | 54 audited solves, 0 Solved-but-fail; wins 19 (1 thr), 12 (16 thr) | MOSEK |
 
 These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5334dd` + FMA, plus task 16).
@@ -263,9 +263,14 @@ execution plans. The journal preserves all failed evidence and final decisions.
      - Observed: the 1e-30 componentwise dual test holds Λ27-s50c for 19 iterations (170 vs 151); it stays.
      - Open items: see follow-ups 6.
    - Follow-ups 6 (journal 2026-10-13, L75):
-     - Kept L75 as the default: a chase restart of a KKT-rejected input keeps the KKT dual when the chased ‖z‖∞ stayed within it. Λ35-s70-p1024 414 → 357 it (−32.5%), Λ35-s70/768 −15.3%; the other eight Ising inputs are identical; audited. The 4-node owner check (l75n5) is queued.
+     - Kept L75 as the default: a chase restart of a KKT-rejected input keeps the KKT dual when the chased ‖z‖∞ stayed within it. Λ35-s70-p1024 414 → 357 it (−32.5%), Λ35-s70/768 −15.3%; the other eight Ising inputs are identical; audited. 4-node owner (l75n5): 414 → 357 it, 659.6 → 458.5 s (−30.5%).
      - Rejected L76 (fixed τ on a settled-τ gap stall: never fires).
-     - Observed: the Λ35-s70/768 plateau is primal growth within fixed τ (s/τ 2e76 → 1.7e95 at 0.08 dec/it). The chase restart's τ₀ = eps^(1/3) is 1.1e-77 at 768 bits, which starts the primal below its solution scale. Open: L82 (deeper chase restart; probes l82a/b/c), L80 (τ capped at a scaled start: Λ27 −7…−14%, but Λ35-rs +4.8% and t11-aux35 +3.3%), L81 (accept a stopped refinement candidate at its floor). L79 (a chase predictor for KKT-rejected inputs) is parked.
+     - Observed: the Λ35-s70/768 plateau is primal growth within fixed τ (s/τ 2e76 → 1.7e95 at 0.08 dec/it). The chase restart's τ₀ = eps^(1/3) is 1.1e-77 at 768 bits, which starts the primal below its solution scale. L82, L80 and L81: see follow-ups 7. L79 (a chase predictor for KKT-rejected inputs) is parked.
+   - Follow-ups 7 (journal 2026-10-13, L82):
+     - Kept L82 as the default: the deep chase-restart scale is 2^-341 (eps^(1/3) at 1024 bits), clamped to [eps^(1/2), eps^(1/3)], so it no longer follows the precision. Λ35-s70/768 568 → 357 it (−28.1%), now on the 1024-bit path. Λ35-rs and Λ35-s70-p1024 are identical; audited.
+     - Observed: a restart scale too shallow costs about 9 iterations per decade, too deep about 1.
+     - Rejected L80 (τ capped at a scaled start): Λ27 −6…−15%, but Λ35-rs/pf and t11-aux35 +3–5%. Its premise (τ₀ bounds τ) is refuted. Rejected L81 (accept a stopped refinement candidate at its floor): neutral.
+     - Open: L83, faster infeasibility outcomes. t11-red60 needs 365 iterations to reach DualInfeasible: 230 of slow deflation from τ₀ = 1/max d, with max d clipped at the equilibration bound, then about 60 ray iterations to the ktratio gate, which stays. Probe l83a starts saturated inputs at eps^(1/8).
    - Single-heavy-owner sampled splitting is closed: correct on both MPI gates, but neither improves end-to-end time.
    - Profile prime-group underfill and NUMA residue placement on large calls;
      split complete inner products over output tiles only if they dominate.

@@ -1486,9 +1486,28 @@ impl<T: FloatT> TauChase<T> {
         T::min(tau, T::epsilon().sqrt().sqrt().sqrt())
     }
 
-    /// Second restart scale `eps^(1/3)`: 1.1e-103 at 1024 bits, 8.6e-78 at 768.
+    /// Second restart scale: 2^-341 (`eps^(1/3)` at 1024 bits, 2.2e-103),
+    /// clamped to [`eps^(1/2)`, `eps^(1/3)`]. A restart lands best near the
+    /// solution's τ, a property of the problem rather than the precision:
+    /// Λ35-s70 settles near τ 1e-100 at 768 and at 1024 bits alike, and
+    /// from `eps^(1/3)` = 8.6e-78 at 768 bits it took 568 iterations against
+    /// 357 from 1e-103 (l82). Restarting too deep costs about 1 iteration
+    /// per decade (Λ35-rs at 1024 bits: 347 from 2.2e-103, 382 from
+    /// 1e-139), too shallow about 9, so the scale errs deep. Above 1024
+    /// bits it stays `eps^(1/3)`; below 682 bits it is `eps^(1/2)`.
     fn deep_tau() -> T {
-        T::epsilon().cbrt()
+        // Diagnostic only: `SDPX_TEST_DEEP_TAU=v` overrides the scale.
+        static OVERRIDE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+        let v = *OVERRIDE.get_or_init(|| {
+            std::env::var("SDPX_TEST_DEEP_TAU")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        });
+        v.and_then(T::from_f64).unwrap_or_else(|| {
+            let eps = T::epsilon();
+            let target: T = (2.0f64).powi(-341).as_T();
+            T::max(eps.sqrt(), T::min(eps.cbrt(), target))
+        })
     }
 
     /// The side a chase restart keeps at its unscaled start: the dual
@@ -1543,8 +1562,32 @@ mod tau_chase_tests {
         assert!((0..12).all(|k| !c.observe(1e3, 10f64.powi(-4 * k), 1e-27, None)));
         assert!(!c.observe(1e-13, 1e-60, 1e-30, None));
         assert!(!c.observe(1e-13, 1e-62, 1e-30, None));
-        assert_eq!(TauChase::<f64>::deep_tau(), f64::EPSILON.cbrt());
+        assert_eq!(TauChase::<f64>::deep_tau(), f64::EPSILON.sqrt());
         assert_eq!(TauChase::<f64>::restart_tau(1e-11), 1e-11);
+    }
+
+    #[test]
+    fn deep_restart_scale_is_precision_independent_where_it_can_be() {
+        use crate::algebra::{AsFloatT, FloatT};
+        use sdpx_arithmetic::{Bits1024, Bits2048, Bits512, Bits768};
+        // (deep, eps^(1/2), eps^(1/3), 2^-341)
+        fn parts<T: FloatT>() -> (T, T, T, T) {
+            let eps = T::epsilon();
+            (
+                TauChase::<T>::deep_tau(),
+                eps.sqrt(),
+                eps.cbrt(),
+                (2.0f64).powi(-341).as_T(),
+            )
+        }
+        let (deep, _, cbrt, target) = parts::<Bits1024>();
+        assert!(deep == cbrt && deep == target);
+        let (deep, _, _, target) = parts::<Bits768>();
+        assert!(deep == target);
+        let (deep, sqrt, _, _) = parts::<Bits512>();
+        assert!(deep == sqrt);
+        let (deep, _, cbrt, _) = parts::<Bits2048>();
+        assert!(deep == cbrt);
     }
 
     #[test]
