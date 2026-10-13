@@ -122,7 +122,8 @@ impl<const N: usize> LDLConfiguration for MpFloat<N> {
         super::arrow::ArrowLDLSolver::try_new(matrix, signs, settings)
             .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
             .or_else(|| {
-                super::arrow::ArrowLDLSolver::try_negated(matrix, signs, settings, amd.as_ref().map(|o| o.0.clone()))
+                let order = amd.as_ref().map(|o| o.0.clone());
+                super::arrow::ArrowLDLSolver::try_negated(matrix, signs, settings, order)
                     .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
             })
             .unwrap_or_else(|| {

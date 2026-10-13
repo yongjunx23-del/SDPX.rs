@@ -50,6 +50,8 @@ const MIN_KKT_WORK: u128 = 8 << 20;
 fn cone_cost<T: FloatT>(cone: &SupportedCone<T>) -> u128 {
     let dimension_cost = match cone {
         SupportedCone::PSDTriangleCone(k) => (k.n as u128).saturating_pow(3),
+        // S₀'s factor and inverse, order 2m = n(n+1)
+        SupportedCone::OpRelEntropyCone(k) => ((k.n * (k.n + 1)) as u128).saturating_pow(3) / 2,
         _ => cone.numel() as u128,
     };
     let words = ((T::precision_bits() + 63) / 64) as u128;

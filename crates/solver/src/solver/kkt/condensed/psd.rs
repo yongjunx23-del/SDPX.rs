@@ -1113,48 +1113,60 @@ impl<T: FloatT> PsdBlock<T> {
             return;
         }
         with_block_work(self.Ginv.nrows(), |w: &mut BlockWork<T>| {
-            for (b, right) in self.columns.iter().enumerate() {
-                if self.dense_representatives[b] != b {
-                    continue;
-                }
-                if skip_sparse && right.sparse {
-                    continue;
-                }
-                if !right.sparse {
-                    coefficient_product(
-                        w.mat2.data_mut(),
-                        self.Ginv.nrows(),
-                        0,
-                        &self.Ginv,
-                        right,
-                        &self.axpy_plans[b],
-                        values,
-                    );
-                    pooled_gemm_sym(&mut w.mat3, &w.mat2, &self.Ginv, None);
-                    w.vector.resize(triangular_number(w.n), T::zero());
-                    mat_to_svec(&mut w.vector, &w.mat3);
-                }
-                // Stream one transform per exact representative at every precision.
-                // Float64 may batch these transforms; wide arithmetic keeps O(n²) scratch.
-                for (target, column) in self.columns[..=b].iter().enumerate() {
-                    if self.dense_representatives[target] != b {
-                        continue;
-                    }
-                    for (a, left) in self.columns[..=target].iter().enumerate() {
-                        let mut v = T::zero();
-                        if right.sparse {
-                            v = sparse_schur_value(left, right, &self.Ginv, values, self.sqrt2);
-                        } else {
-                            for e in &left.entries {
-                                v = values[e.position]
-                                    .mul_add(w.vector[triangular_number(e.j) + e.i], v);
-                            }
-                        }
-                        store(target, a, column.schur_position(left, a), v);
-                    }
-                }
+            for b in 0..self.columns.len() {
+                self.schur_column(values, skip_sparse, b, w, &mut store);
             }
         });
+    }
+
+    /// The Schur entries of every column represented by column `b`.
+    fn schur_column(
+        &self,
+        values: &[T],
+        skip_sparse: bool,
+        b: usize,
+        w: &mut BlockWork<T>,
+        store: &mut impl FnMut(usize, usize, usize, T),
+    ) {
+        let right = &self.columns[b];
+        if self.dense_representatives[b] != b {
+            return;
+        }
+        if skip_sparse && right.sparse {
+            return;
+        }
+        if !right.sparse {
+            coefficient_product(
+                w.mat2.data_mut(),
+                self.Ginv.nrows(),
+                0,
+                &self.Ginv,
+                right,
+                &self.axpy_plans[b],
+                values,
+            );
+            pooled_gemm_sym(&mut w.mat3, &w.mat2, &self.Ginv, None);
+            w.vector.resize(triangular_number(w.n), T::zero());
+            mat_to_svec(&mut w.vector, &w.mat3);
+        }
+        // Stream one transform per exact representative at every precision.
+        // Float64 may batch these transforms; wide arithmetic keeps O(n²) scratch.
+        for (target, column) in self.columns[..=b].iter().enumerate() {
+            if self.dense_representatives[target] != b {
+                continue;
+            }
+            for (a, left) in self.columns[..=target].iter().enumerate() {
+                let mut v = T::zero();
+                if right.sparse {
+                    v = sparse_schur_value(left, right, &self.Ginv, values, self.sqrt2);
+                } else {
+                    for e in &left.entries {
+                        v = values[e.position].mul_add(w.vector[triangular_number(e.j) + e.i], v);
+                    }
+                }
+                store(target, a, column.schur_position(left, a), v);
+            }
+        }
     }
 
     pub(super) fn compute_schur_dense_batched(
@@ -1222,6 +1234,23 @@ impl<T: FloatT> PsdBlock<T> {
         // Sampled and wide-precision blocks keep the closure path; only the
         // f64 batched dense path tiles over the pool.
         let packed = PackedSchur::new(out);
+        // Wide dense columns: one n³ congruence each, run on the pool. Each
+        // representative writes its own pairs, so values are unchanged.
+        if let Some(pool) = pool
+            .filter(|p| self.sampled.is_none() && dense_count > 0 && p.current_num_threads() > 1)
+        {
+            let (this, n) = (&*self, self.Ginv.nrows());
+            pool.install(|| {
+                (0..this.columns.len()).into_par_iter().for_each(|b| {
+                    with_block_work(n, |w: &mut BlockWork<T>| {
+                        this.schur_column(values, skip_sparse, b, w, &mut |t, a, _, v| {
+                            packed.write(t, a, v)
+                        })
+                    })
+                })
+            });
+            return;
+        }
         self.compute_schur_selected(
             values,
             skip_sparse,

@@ -8,6 +8,32 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — Thermal ORE: leaf row envelope, board-posted ORE kernels, parallel wide Schur columns (thermal-ore)
+
+- Hypotheses (one_L12/128 receipts after `f7fb3a9`):
+  - The S₀⁻¹ rows of an ORE leaf start at column m (the T coupling is a structural zero), yet `factor_dots` ran every dot from column 0.
+  - At T=4, two ORE cones run as two scaling-queue jobs, and the idle helpers only help board posts. The ORE kernels' rayon pieces never reached them: `ore.schur_inverse` used about 1.3 cores.
+  - `assemble` ran each 128-bit dense PSD Schur column serially: one n³ congruence per column, with the pool unused. It took 13% of the T=4 time, with CPU ≈ wall.
+- Change:
+  - Leaves record each row's first nonzero column (`first`). Exact dots in `factor_dots` and `forward_suffix_rows` start at the row envelope. The skipped products are exact zeros, so values are unchanged.
+  - ORE Cholesky, L⁻¹ and L⁻ᵀL⁻¹ pieces post to the scaling board when one is offered (`pieces`). `cone_cost` ranks ORE cones by (2m)³/2.
+  - `compute_schur_packed` runs the wide dense Schur columns on the pool, one representative per task (`schur_column`). Each pair has one writer, so values are unchanged.
+- E2E (Mac release, one_L12/128, max 4 iterations, A = `f7fb3a9`, B = candidate, ABBA):
+
+  | Threads | A s | B s | Change |
+  |---|---|---|---|
+  | 1 | 88.7, 87.5 | 76.0, 75.9 | −13.6% |
+  | 4 | 49.0, 50.9 | 36.3, 36.3 | −27% |
+
+  Fast-profile T=4 phases: `ore.schur_inverse` 21.9 → 8.8 s, `arrow.leaves` 15.2 → 7.2 s, `assemble` 4.4 → 1.3 s.
+- Points: iterates identical to `f7fb3a9`:
+  - two_L4/128, two_L4/256, two_L6/128 and one_L10/53 at T=1;
+  - two_L6/128 and two_L4/256 at T=4;
+  - one_L12/128 (4 it) at T=4.
+
+  ising11/512 fast A/B: Solved 54, identical points, audits 2/2 each, −0.2%.
+- Decision: kept.
+
 ## 2026-10-14 — Thermal ORE: negated arrow, binary64 inverses, split ORE kernels (thermal-ore)
 
 - Hypotheses (one_L12 receipts):

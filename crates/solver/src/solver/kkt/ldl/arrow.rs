@@ -110,6 +110,10 @@ struct DenseLeaf<T> {
     dinv: Vec<T>,
     /// Row block of every backward sweep of this factor.
     back: usize,
+    /// First nonzero column of each row of a factored leaf (empty: none
+    /// recorded). L keeps this envelope exactly: the products that would
+    /// fill it in are exact zeros.
+    first: Vec<usize>,
 }
 
 impl<T: FloatT> DenseLeaf<T> {
@@ -119,6 +123,7 @@ impl<T: FloatT> DenseLeaf<T> {
             l: vec![T::zero(); n * n],
             dinv: vec![T::zero(); n],
             back,
+            first: Vec::new(),
         }
     }
 
@@ -286,6 +291,10 @@ impl<T: FloatT> DenseLeaf<T> {
         regularize_count: &mut usize,
         split: bool,
     ) -> Result<(), &'static str> {
+        let n = self.n;
+        self.first.clear();
+        self.first
+            .extend((0..n).map(|i| (0..i).find(|&k| !a[i + k * n].is_zero()).unwrap_or(i)));
         if T::precision_bits() >= 256 && self.n >= EXACT_FACTOR_MIN {
             self.l.copy_from_slice(a);
             return self.factor_exact(signs, reg, regularize_count, split);
@@ -299,8 +308,9 @@ impl<T: FloatT> DenseLeaf<T> {
     /// Left-looking [`Self::factor_signed`] for wide types: entry (i, j) is
     /// one exact dot product of rows of L and W = L·D (rounded entrywise),
     /// rounded once, instead of j fused updates. Rows are packed row-major so
-    /// both operands are contiguous. `split`: a column's rows in parallel
-    /// (thread-invariant).
+    /// both operands are contiguous, and dots start at the row envelope
+    /// (`first`; the skipped products are exact zeros, so values are
+    /// unchanged). `split`: a column's rows in parallel (thread-invariant).
     fn factor_dots(
         &mut self,
         a: &[T],
@@ -314,13 +324,22 @@ impl<T: FloatT> DenseLeaf<T> {
         let mut r = vec![T::zero(); row(n)];
         let mut w = vec![T::zero(); row(n)];
         let mut col = Vec::with_capacity(n);
+        let first = &self.first;
         for j in 0..n {
             let s = T::from_i8(signs[if signs.len() == 1 { 0 } else { j }]).unwrap();
-            let (rj, wj) = (&r[row(j)..row(j) + j], &w[row(j)..row(j) + j]);
-            let d = Self::pivot(a[j + j * n] - T::dot_slices(rj, wj), s, reg, regularize_count)?;
+            let fj = first[j];
+            let (rj, wj) = (&r[row(j) + fj..row(j) + j], &w[row(j)..row(j) + j]);
+            let d = a[j + j * n] - T::dot_slices(rj, &wj[fj..]);
+            let d = Self::pivot(d, s, reg, regularize_count)?;
             let dinv = T::one() / d;
             self.dinv[j] = dinv;
-            let entry = |i: usize| (a[i + j * n] - T::dot_slices(&r[row(i)..row(i) + j], wj)) * dinv;
+            let entry = |i: usize| {
+                if first[i] > j {
+                    return T::zero();
+                }
+                let lo = first[i].max(fj);
+                (a[i + j * n] - T::dot_slices(&r[row(i) + lo..row(i) + j], &wj[lo..])) * dinv
+            };
             col.clear();
             if split && n - j > 1 {
                 (j + 1..n).into_par_iter().map(entry).collect_into_vec(&mut col);
@@ -493,7 +512,8 @@ impl<T: FloatT> DenseLeaf<T> {
         let n = self.n;
         for i in 0..x.len() {
             let r = i + start;
-            let v = T::dot_slices(&self.l[r * n + start..=r * n + r], &x[..=i]);
+            let lo = self.first.get(r).map_or(start, |&f| f.max(start));
+            let v = T::dot_slices(&self.l[r * n + lo..=r * n + r], &x[lo - start..=i]);
             x[i] = v;
         }
     }
@@ -1552,7 +1572,10 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let signs: Vec<i8> = signs.iter().map(|&s| -s).collect();
         let mut inner = Self::try_new(&neg, &signs, settings)?;
         inner.fallback_perm = perm;
-        Some(Negated { inner, values: Vec::new() })
+        Some(Negated {
+            inner,
+            values: Vec::new(),
+        })
     }
 
     /// Leaves made of an SOC block followed by one primal column with a
@@ -2145,9 +2168,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     fn factor_fallback(&mut self) -> bool {
         let matrix = self.materialize();
         if self.fallback.is_none() {
-            let solver: BoxedDirectLDLSolver<T> = Box::new(
-                super::qdldl::QDLDLDirectLDLSolver::new(&matrix, &self.signs, &self.settings, self.fallback_perm.clone()),
-            );
+            let solver: BoxedDirectLDLSolver<T> =
+                Box::new(super::qdldl::QDLDLDirectLDLSolver::new(
+                    &matrix,
+                    &self.signs,
+                    &self.settings,
+                    self.fallback_perm.clone(),
+                ));
             self.fallback = Some(solver);
         }
         let solver = self.fallback.as_mut().unwrap();

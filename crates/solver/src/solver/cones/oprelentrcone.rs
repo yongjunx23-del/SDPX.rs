@@ -39,6 +39,36 @@ fn tasks<T: FloatT>(mul_adds: usize, items: usize) -> usize {
     ip::tasks(mul_adds as u128 * ip::weight(T::precision_bits() as usize), items)
 }
 
+/// `f(k, piece)` over the `len`-element pieces of `out` (the last may be
+/// shorter) when [`tasks`] grants a split of `mul_adds`: posted on the
+/// scaling queue's board, whose idle workers only help posts, else on the
+/// pool. Who runs a piece never changes it.
+fn pieces<T: FloatT>(
+    out: &mut [T],
+    len: usize,
+    mul_adds: usize,
+    f: impl Fn(usize, &mut [T]) + Sync,
+) {
+    use sdpx_arithmetic::inner_parallel::board;
+    let items = out.len().div_ceil(len);
+    if tasks::<T>(mul_adds, items) <= 1 {
+        out.chunks_mut(len).enumerate().for_each(|(k, p)| f(k, p));
+    } else if board::offered() {
+        struct Out<T>(*mut T);
+        // SAFETY: items write disjoint pieces of `out`.
+        unsafe impl<T> Sync for Out<T> {}
+        let (base, total) = (Out(out.as_mut_ptr()), out.len());
+        board::run(items, &|k| {
+            let (start, base) = (k * len, &base);
+            let end = (start + len).min(total);
+            // SAFETY: piece k is [start, end), owned by item k alone.
+            f(k, unsafe { std::slice::from_raw_parts_mut(base.0.add(start), end - start) });
+        });
+    } else {
+        out.par_chunks_mut(len).enumerate().for_each(|(k, p)| f(k, p));
+    }
+}
+
 /// Scalar central point (t, x, y) of the relative entropy cone, s = −∇f(s);
 /// refined to the working precision by `central_point`.
 const CENTRAL: [f64; 3] = [0.8278383990656786, 0.8051020015847954, 1.290927709856958];
@@ -73,8 +103,11 @@ fn cholesky<T: FloatT>(n: usize, a: &mut [T]) -> bool {
         }
         return (0..n).all(|i| a[i + i * n].is_finite() && a[i + i * n] > T::zero());
     }
+    use sdpx_arithmetic::inner_parallel as ip;
     let mut r = vec![T::zero(); n * n];
     let mut col = Vec::with_capacity(n);
+    // rows per piece: one grain of dot work
+    let grain = ip::grain() / ip::weight(T::precision_bits() as usize);
     for j in 0..n {
         let rj = j * n;
         let d = a[j + j * n] - T::dot_slices(&r[rj..rj + j], &r[rj..rj + j]);
@@ -84,14 +117,16 @@ fn cholesky<T: FloatT>(n: usize, a: &mut [T]) -> bool {
         let d = d.sqrt();
         r[rj + j] = d;
         let rr = &r;
-        let entry = |i: usize| (a[i + j * n] - T::dot_slices(&rr[i * n..i * n + j], &rr[rj..rj + j])) / d;
+        let entry =
+            |i: usize| (a[i + j * n] - T::dot_slices(&rr[i * n..i * n + j], &rr[rj..rj + j])) / d;
         let rows = n - j - 1;
-        if tasks::<T>(rows * j, rows) > 1 {
-            (j + 1..n).into_par_iter().map(entry).collect_into_vec(&mut col);
-        } else {
-            col.clear();
-            col.extend((j + 1..n).map(entry));
-        }
+        let tile = (grain / j.max(1) as u128).max(1) as usize;
+        col.resize(rows, T::zero());
+        pieces::<T>(&mut col, tile, rows * j, |k, p| {
+            for (q, v) in p.iter_mut().enumerate() {
+                *v = entry(j + 1 + k * tile + q);
+            }
+        });
         for (i, &v) in (j + 1..n).zip(&col) {
             r[i * n + j] = v;
         }
@@ -121,18 +156,13 @@ fn lower_inverse<T: FloatT>(n: usize, l: &[T], li: &mut [T]) {
         }
     }
     // columns are independent
-    let column = |(col, lc): (usize, &mut [T])| {
+    pieces::<T>(li, n, n * n * n / 6, |col, lc| {
         lc[col] = T::one() / l[col + col * n];
         for i in col + 1..n {
             let v = T::dot_slices(&rows[i * n + col..i * n + i], &lc[col..i]);
             lc[i] = -v / l[i + i * n];
         }
-    };
-    if tasks::<T>(n * n * n / 6, n) > 1 {
-        li.par_chunks_mut(n).enumerate().for_each(column);
-    } else {
-        li.chunks_mut(n).enumerate().for_each(column);
-    }
+    });
 }
 
 /// Inverse of a symmetric positive definite matrix from its lower factor:
@@ -151,16 +181,11 @@ fn spd_inverse<T: FloatT>(n: usize, l: &[T], out: &mut [T]) -> bool {
         }
         return out.iter().all(|v| v.is_finite());
     }
-    let column = |(j, oc): (usize, &mut [T])| {
+    pieces::<T>(out, n, n * n * n / 6, |j, oc| {
         for i in j..n {
             oc[i] = T::dot_slices(&li[i + i * n..(i + 1) * n], &li[i + j * n..(j + 1) * n]);
         }
-    };
-    if tasks::<T>(n * n * n / 6, n) > 1 {
-        out.par_chunks_mut(n).enumerate().for_each(column);
-    } else {
-        out.chunks_mut(n).enumerate().for_each(column);
-    }
+    });
     for j in 0..n {
         for i in j + 1..n {
             out[j + i * n] = out[i + j * n];
@@ -773,7 +798,8 @@ impl<T: FloatT> Oracle<T> {
         // the factor's (2m)³/6 multiply-adds against ≈ 18n³ per CG step;
         // binary64 factors with LAPACK, far cheaper per multiply-add than CG's
         // products (one_matrix_L12: 18.6 s without CG, 24.1 s with)
-        let budget = if T::precision_bits() <= 53 { 0 } else { m2.pow(3) / (108 * n.pow(3)) };
+        let budget =
+            if T::precision_bits() <= 53 { 0 } else { m2.pow(3) / (108 * n.pow(3)) };
         // the exact form is t + q with q ≥ 0
         if !ok(t) {
             return false;

@@ -300,6 +300,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - The native operator relative entropy cone is in, on branch `thermal-ore`. two_L4 (53/128/256 bits), two_L6 (53/128) and one_L10 (53) are Solved and audited. two_L6/128 takes 7.94 s.
    - Review repair: owner RHS/dual coordinates, linear slack recovery and fresh-solve phase resets match the ordinary path. After an actual zero-base factor failure, the retry shift now has an `eps · max|diag(KKT)|` floor (initial shift and refinement tolerances unchanged). two_L4/128: ordinary Solved/45, owner Solved/44, both pass original 1e-20 and Arb audits; the former owner path stopped AlmostSolved/37. Extra T-row eigen/Cholesky whitening trials regressed ordinary convergence and are reverted.
    - 2026-10-14 (journal): the negated arrow takes the ORE rows as leaves; a failed arrow factor falls back in the z-first order. Binary64 inverses use BLAS, the dual test exits early (no CG at 53 bits), and ORE kernels split. Release T=1 against v0.9.2: one_L12/53 Solved 47 in 20.8 s (was 100 s, audited); one_L12/128 4 it 103 s (was 471 s). two_L4/two_L6 points are unchanged and audited.
+   - 2026-10-14 (journal): leaf dots start at the row envelope, ORE kernels post to the scaling board, and wide dense Schur columns run on the pool. one_L12/128 4 it: T=1 −13.6%, T=4 −27%, bitwise points.
    - Next:
      - a full one_L12/128 solve with audit;
      - the S₀⁻¹ leaf factor from the cone's L⁻¹ (skip re-factoring the leaf);
