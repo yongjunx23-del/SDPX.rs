@@ -634,11 +634,10 @@ impl<T: FloatT> Oracle<T> {
         cholesky(m2, &mut s0).then_some(s0)
     }
 
-    /// ⟨z, (∇²f)⁻¹z⟩ = ‖LzᵀR̂Lz‖² + vᵀS₀⁻¹v with R̂ = PᵀZ_TP and
-    /// v = (Û + c∘R̂, V̂ + g⁽¹⁾∘R̂): the upper bound replaces S₀⁻¹ by
-    /// diag(1, λᵢλⱼ) (exact on the central path); `exact` solves with S₀'s
-    /// factor (built once per oracle).
-    pub(crate) fn dual_form(&mut self, z: &[T], exact: bool) -> Option<T> {
+    /// ⟨z, (∇²f)⁻¹z⟩ = t + vᵀS₀⁻¹v with t = tr(ẐR̂ẐR̂) = ‖LzᵀR̂Lz‖²,
+    /// R̂ = PᵀZ_TP and v = svec(Û + c∘R̂, V̂ + g⁽¹⁾∘R̂). Returns (t, v) and
+    /// the diagonal of B = diag(1, λᵢλⱼ) ⪰ S₀⁻¹ (exact on the central path).
+    fn dual_parts(&self, z: &[T]) -> (T, Vec<T>, Vec<T>) {
         let n = self.n;
         let m = n * (n + 1) / 2;
         let nn = n * n;
@@ -651,40 +650,111 @@ impl<T: FloatT> Oracle<T> {
         }
         let (r, rest) = hat.split_at_mut(nn);
         let (u, v) = rest.split_at_mut(nn);
-        // tr(Ẑ R̂ Ẑ R̂) = ‖Lzᵀ R̂ Lz‖²
         congruence(n, &self.lz, r, true, &mut tmp, &mut x);
-        let mut b = x.iter().fold(T::zero(), |a, &t| a + t * t);
+        let t = x.iter().fold(T::zero(), |a, &t| a + t * t);
         for ij in 0..nn {
             u[ij] += self.c[ij] * r[ij];
             v[ij] += self.d1[ij] * r[ij];
         }
-        if !exact {
-            for j in 0..n {
-                for i in 0..n {
-                    let ij = i + j * n;
-                    b += u[ij] * u[ij] + self.lam[i] * self.lam[j] * v[ij] * v[ij];
-                }
+        let mut w = vec![T::zero(); 2 * m];
+        svec(n, u, &mut w[..m]);
+        svec(n, v, &mut w[m..]);
+        let mut b = vec![T::one(); 2 * m];
+        for j in 0..n {
+            for i in 0..=j {
+                b[m + tri(i, j)] = self.lam[i] * self.lam[j];
             }
-            return Some(b);
         }
+        (t, w, b)
+    }
+
+    /// ⟨z, (∇²f)⁻¹z⟩ (`exact`, through S₀'s factor) or its upper bound with
+    /// B in place of S₀⁻¹ (`dual_parts`).
+    pub(crate) fn dual_form(&mut self, z: &[T], exact: bool) -> Option<T> {
+        let (t, w, b) = self.dual_parts(z);
+        if exact {
+            Some(t + self.schur_norm(w)?)
+        } else {
+            Some(w.iter().zip(&b).fold(t, |a, (&w, &b)| a + b * w * w))
+        }
+    }
+
+    /// wᵀS₀⁻¹w = ‖L₀⁻¹w‖² by forward substitution (S₀'s factor built once
+    /// per oracle).
+    fn schur_norm(&mut self, mut w: Vec<T>) -> Option<T> {
         if self.s0l.is_none() {
             self.s0l = Some(self.schur_factor());
         }
         let l = self.s0l.as_ref().unwrap().as_ref()?;
-        let m2 = 2 * m;
-        let mut w = vec![T::zero(); m2];
-        svec(n, u, &mut w[..m]);
-        svec(n, v, &mut w[m..]);
-        // ‖L₀⁻¹w‖² by forward substitution
+        let m2 = w.len();
+        let mut q = T::zero();
         for j in 0..m2 {
             let wj = w[j] / l[j + j * m2];
-            w[j] = wj;
-            b += wj * wj;
+            q += wj * wj;
             for i in j + 1..m2 {
                 w[i] -= l[i + j * m2] * wj;
             }
         }
-        Some(b)
+        Some(q)
+    }
+
+    /// `ok(⟨z, (∇²f)⁻¹z⟩)` for a monotone `ok` (true below a limit), decided
+    /// as the exact form would be. For any x and r = v − S₀x,
+    /// vᵀS₀⁻¹v = 2vᵀx − xᵀS₀x + rᵀS₀⁻¹r with 0 ≤ rᵀS₀⁻¹r ≤ rᵀBr. Conjugate
+    /// gradients on S₀ preconditioned by B narrow these bounds, one O(n³)
+    /// product per step (x = 0 gives the bound of `dual_form`); S₀'s O(n⁶)
+    /// factor decides only what about as many products as it costs leave
+    /// open.
+    pub(crate) fn dual_ok(&mut self, z: &[T], ok: impl Fn(T) -> bool) -> bool {
+        self.ensure_d2();
+        let n = self.n;
+        let m = n * (n + 1) / 2;
+        let nn = n * n;
+        let (t, w, b) = self.dual_parts(z);
+        let m2 = w.len();
+        let mut x = vec![T::zero(); m2];
+        let mut r = w.clone();
+        let mut br: Vec<T> = r.iter().zip(&b).map(|(&r, &b)| r * b).collect();
+        let mut p = br.clone();
+        let mut rho = r.dot(&br);
+        let mut sp = vec![T::zero(); m2];
+        let (mut h, mut k) = (vec![T::zero(); nn], vec![T::zero(); nn]);
+        let (mut oh, mut ok_) = (vec![T::zero(); nn], vec![T::zero(); nn]);
+        let mut ws = Vec::new();
+        // the factor's (2m)³/6 multiply-adds against ≈ 9n³ per product
+        let budget = m2.pow(3) / (54 * n.pow(3));
+        for step in 0..=budget {
+            // 2vᵀx − xᵀS₀x with S₀x = v − r
+            let low = t + w.dot(&x) + x.dot(&r);
+            if ok(low + rho) {
+                return true;
+            }
+            if !ok(low) || step == budget {
+                break;
+            }
+            smat(n, &p[..m], &mut h);
+            smat(n, &p[m..], &mut k);
+            self.schur_apply(&h, &k, &mut oh, &mut ok_, &mut ws, None);
+            svec(n, &oh, &mut sp[..m]);
+            svec(n, &ok_, &mut sp[m..]);
+            let psp = p.dot(&sp);
+            if !(psp > T::zero()) {
+                break;
+            }
+            let alpha = rho / psp;
+            x.axpby(alpha, &p, T::one());
+            r.axpby(-alpha, &sp, T::one());
+            for i in 0..m2 {
+                br[i] = r[i] * b[i];
+            }
+            let rho1 = r.dot(&br);
+            let beta = rho1 / rho;
+            rho = rho1;
+            for i in 0..m2 {
+                p[i] = br[i] + beta * p[i];
+            }
+        }
+        self.schur_norm(w).is_some_and(|q| ok(t + q))
     }
 }
 
@@ -940,16 +1010,16 @@ impl<T: FloatT> OpRelEntropyCone<T> {
     /// z passes the Dikin test at the primal point s of `oracle`:
     /// r = (ν−1)⟨z, ∇²f(s)⁻¹z⟩/⟨s,z⟩² < 1 certifies z ∈ int K* (r₀ =
     /// (ν−1)/ν on the central path). The O(n³) bound first, then the exact
-    /// form (QICS's proximity test): the bound can be far above it off the
-    /// central path (two_matrix_L6: r 0.913 by the bound, 0.8333 exact).
+    /// form (QICS's proximity test), bracketed by conjugate gradients before
+    /// S₀'s factor: the bound can be far above it off the central path
+    /// (two_matrix_L6: r 0.913 by the bound, 0.8333 exact).
     fn dual_ok(&self, oracle: &mut Oracle<T>, s: &[T], z: &[T]) -> bool {
         let sz = s.dot(z);
         if !(sz > T::zero()) || !z.iter().all(|v| v.is_finite()) {
             return false;
         }
         let nu1 = self.nu() - T::one();
-        let ok = |q: Option<T>| q.is_some_and(|q| nu1 * q < sz * sz);
-        ok(oracle.dual_form(z, false)) || ok(oracle.dual_form(z, true))
+        oracle.dual_ok(z, |q| nu1 * q < sz * sz)
     }
 }
 
