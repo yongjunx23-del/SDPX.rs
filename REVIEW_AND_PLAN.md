@@ -53,7 +53,7 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 | spins 0–50 (s50) | 153 it / 153.8 s | SDPB 285 s |
 | Λ19 | 121 it / 71.0 s, audited | — |
 | ising11 (512 bits) | 54 it / 3.44 s | — |
-| Λ35 spins 0–70, 1024 bits | Solved 414 it / 1024.5 s (2.47 s/it), audited (L71, 2026-10-13; was 683 it / 2426.5 s); 768 bits Solved 554 it / 881.3 s, audited (L71) | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
+| Λ35 spins 0–70, 1024 bits | Solved 357 it / 676.3 s (1.87 s/it), audited (L75, 2026-10-13; was 683 it / 2426.5 s); 768 bits Solved 568 it / 773.7 s, audited (L75) | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
 | Float64 58 cases (t16b = int5 + task 16) | 54 audited solves, 0 Solved-but-fail; wins 19 (1 thr), 12 (16 thr) | MOSEK |
 
 These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5334dd` + FMA, plus task 16).
@@ -261,7 +261,11 @@ execution plans. The journal preserves all failed evidence and final decisions.
      - Kept L71 as the default: a rejected or chase-scale KKT start keeps its shifted dual and starts only the primal at unit slacks (plain and owner paths). Plain −3.5…−35.5% on all ten Ising inputs (Λ35-rs 372 → 347 it, Λ27 183 → 170, t11-aux35 103 → 71); 4-node owner −6.1% / −9.1%; audited.
      - Rejected L72 (one owner cone queue, 0%), L73 (restart dual at the chased scale, +1.1%) and L74 (deep τ start: Λ35-rs/pf −37%, but Λ27-rs +74%, and no static predictor separates them). Refuted L77 (dual-residual polish). Dropped L78 (lazy componentwise check: its products are hidden).
      - Observed: the 1e-30 componentwise dual test holds Λ27-s50c for 19 iterations (170 vs 151); it stays.
-     - Open: L75 (chase restart keeps the KKT dual), L76 (fixed τ on a settled-τ gap stall), L80 (τ capped at a scaled start) are on the cluster; L79 (a chase predictor for KKT-rejected inputs) is parked.
+     - Open items: see follow-ups 6.
+   - Follow-ups 6 (journal 2026-10-13, L75):
+     - Kept L75 as the default: a chase restart of a KKT-rejected input keeps the KKT dual when the chased ‖z‖∞ stayed within it. Λ35-s70-p1024 414 → 357 it (−32.5%), Λ35-s70/768 −15.3%; the other eight Ising inputs are identical; audited. The 4-node owner check (l75n5) is queued.
+     - Rejected L76 (fixed τ on a settled-τ gap stall: never fires).
+     - Observed: the Λ35-s70/768 plateau is primal growth within fixed τ (s/τ 2e76 → 1.7e95 at 0.08 dec/it). The chase restart's τ₀ = eps^(1/3) is 1.1e-77 at 768 bits, which starts the primal below its solution scale. Open: L82 (deeper chase restart; probes l82a/b/c), L80 (τ capped at a scaled start: Λ27 −7…−14%, but Λ35-rs +4.8% and t11-aux35 +3.3%), L81 (accept a stopped refinement candidate at its floor). L79 (a chase predictor for KKT-rejected inputs) is parked.
    - Single-heavy-owner sampled splitting is closed: correct on both MPI gates, but neither improves end-to-end time.
    - Profile prime-group underfill and NUMA residue placement on large calls;
      split complete inner products over output tiles only if they dominate.
@@ -404,4 +408,5 @@ are in [the journal](docs/JOURNAL.md).
   cut thread-seconds. Also the L44 corrector gated to short steps (L69), a
   warm chase restart (L70), one owner cone-scaling queue (L72), scaling the
   restart dual to the chased ‖z‖ (L73), a deep τ start without a chase
-  predictor (L74) and a dual-residual polish (L77).
+  predictor (L74), a dual-residual polish (L77) and a fixed-τ phase on a
+  settled-τ gap stall (L76).

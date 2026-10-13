@@ -8,6 +8,39 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-13 — L75: a chase restart keeps the KKT dual (kept); L76 rejected (perf-mc-impl)
+
+- L75, hypothesis: L71 keeps the shifted KKT dual when the KKT start is rejected, but a τ-chase restart of such an input still starts both sides at 1/τ₀. The side rule (L8) compares the chased norms against that unit start. Both sides have outgrown it, so nothing is kept. On Λ35-s70 at 1024 bits, the dual objective then runs out to −4e107 after the restart at iteration 152 and takes about 150 iterations to come back. Comparing the chased dual against the KKT dual instead, i.e. applying L8's rule to the start it would have kept, keeps the dual at its final scale.
+- L75 change (test switch `SDPX_TEST_RESTART_KKT_DUAL=1`, mci111): in the rejected-KKT branch, a chase restart whose chased ‖z‖∞ is at most the KKT dual's takes the L71 start (unit primal, kept dual). Only KKT-rejected inputs that chase are affected (Λ35-s70 at 768 and 1024 bits).
+- L75 results (plain 64 threads; A default with `SDPX_TEST_DUAL_START=1`, since mci111 keeps L71 behind its switch; B adds the L75 switch):
+
+  | Case | Job, node | A it, s | B it, s | change |
+  |---|---|---|---|---|
+  | Λ35-s70-p1024/1024 | l75b 225412, node85 | 414, 1002.7 / 1002.3 | 357, 675.7 / 676.8 | −32.5% |
+  | Λ35-s70/768 | l75a 225411, node55 | 554, 910.4 / 917.3 | 568, 774.6 / 772.8 | −15.3% |
+  | Λ19-xml/512 | l75e 225429, node45 | 105, 28.6 / 28.8 | 105, 28.7 / 28.9 | identical |
+  | Λ27-s50c/768 | l75e | 170, 132.3 / 133.1 | 170, 132.0 / 133.5 | identical |
+  | Λ27-s50/768 | l75e | 170, 134.3 / 133.3 | 170, 134.3 / 132.7 | identical |
+  | Λ27-p1024/1024 | l75e | 170, 176.0 / 175.2 | 170, 173.6 / 175.4 | identical |
+  | t11-aux35/768 | l75g 225432, node55 | 71, 106.6 / 106.9 | 71, 107.0 / 106.7 | identical |
+  | t11-red60/768 (DualInfeasible both) | l75g | 365, 451.4 / 453.2 | 365, 458.3 / 459.9 | identical |
+
+- Audit (aud75 225423, original coordinates): both B points accepted. Λ35-s70 has primal 6.9e-154, dual 1.4e-132 and gap 2.3e-43; Λ35-s70-p1024 has primal 4.4e-137, dual 1.8e-141 and gap 1.5e-43. The objective agrees to 41 digits (−18.153220539126861024…).
+- Observed (Λ35-s70-p1024):
+  - After the restart, A's dual objective is −3.2e107 at iteration 155 and still −3.7e107 at 250. B's is −5.3e4 at 155, and the primal descends alone.
+  - Fixed τ starts at iteration 331 instead of 382.
+  - Refinement work collapses: linear solves 4002 → 967, outer corrections 1032 → 200, inner corrections 2213 → 175. So s/it also falls, 2.41 → 1.87.
+- Observed (Λ35-s70 at 768 bits):
+  - Both legs keep a plateau with gap 1e-14…1e-18 and steps 0.003–0.5. A has it at iterations 400–530 with τ still moving. B has it at 295–535, after an earlier fixed-τ entry at 294 (τ 3.5e-74). B takes 14 more iterations, but each costs 17% less (fewer corrections).
+  - A traced B leg (tr75 225433) shows the cause. Over the plateau every solve converges without a correction, so refinement is not the cause. The plateau is the primal growing within fixed τ: s/τ climbs 2e76 → 1.7e95, about 0.08 decades per iteration. The chase restart's τ₀ = eps^(1/3) = 1.1e-77 puts the restarted primal near 1e77, below the solution's 1e95. At 1024 bits, τ₀ 2.2e-103 starts above it and there is no plateau. This is L82 (below).
+- Owner path: the 4-node check (l75n5, Λ35-s70-p1024 16×16) is queued behind the user processor limit; its result goes in the next entry.
+- Decision: kept as the default (switch removed).
+- L76, a fixed-τ phase also on a settled-τ gap stall (`SDPX_TEST_STALL_FIXED_TAU=1`, mci111): rejected, because it never fires.
+  - l76b 225415 (node97): points identical on Λ27-s50 (170 it, A 128.6 / 132.2 s, B 129.9 / 132.2), Λ27-rs (127 it), Λ19-xml (105 it) and t11-aux35 (71 it).
+  - l76a 225414 (node93): Λ35-s70/768 points identical, 554 it (A 890.9 / 879.9 s, B 877.9 / 880.8). Its plateau keeps τ moving (κ/τ 2e-17…1e-16 over iterations 400–525), so the settled-τ condition does not hold.
+- Observed (refinement load by input, A legs, corrections per iteration outer / inner): Λ27-rs 0.02 / 0, Λ35-rs 0.82 / 0.67, Λ27-s50 0.94 / 0.35, Λ19-xml 1.33 / 1.21, t11-aux35 1.03 / 1.38, Λ35-s70 1.45 / 2.53.
+  - A local Λ19-xml trace shows why the corrections are needed: the raw solve leaves an x-row residual 1e25 above the tolerance (about 1e63·eps at 512 bits), and one correction reaches it.
+
 ## 2026-10-13 — L71: start the dual at its KKT scale (kept); L72–L74, L77, L78 rejected or refuted (perf-mc-impl)
 
 - L71, hypothesis: when the KKT start is rejected (‖x‖∞ up to 1e100), the unit fallback puts the dual at 1/τ₀ in original coordinates (Λ27: z/τ jumps to 1e10 at iteration 1, against 1.4e5 at the solution). The shifted KKT dual is finite and already near its final scale, so the start should keep it, as the L8 restart rule does after a chase. The chase-scale branch (accepted KKT start, ‖s‖∞·‖z‖∞ > 1e15) also starts both sides at 1/τ₀, so the same applies there.

@@ -1167,8 +1167,15 @@ mod internal {
                     // automatic τ₀ = 1/max d is at least the equilibration
                     // bound (eps^(1/4) by default), so the two sides stay
                     // well within the precision; a caller's τ₀ keeps the
-                    // unit start.
-                    dual_start = !restart
+                    // unit start. A chase restart keeps it too when the
+                    // chased dual stayed within it (the side rule below):
+                    // otherwise the dual restarts at 1/τ₀ and spends ~150
+                    // iterations shrinking back (Λ35-s70 at 1024 bits:
+                    // dual objective −4e107 after the restart at 152).
+                    let chased_within = self
+                        .chase_sides
+                        .is_some_and(|(_, z)| z <= self.variables.slack_dual_norms().1);
+                    dual_start = (!restart || chased_within)
                         && core.initial_tau == T::one()
                         && self.start_tau.is_some_and(|t| t < T::one())
                         && self.callbacks.checkpoint.restart.is_none()
