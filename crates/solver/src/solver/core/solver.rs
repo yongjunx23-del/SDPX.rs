@@ -1102,6 +1102,7 @@ mod internal {
         }
 
         fn default_start(&mut self) {
+            let mut dual_start = false;
             if self.cones.all_symmetric() {
                 // set all scalings to identity (or zero for the zero cone)
                 self.cones.reset_scaling();
@@ -1137,6 +1138,9 @@ mod internal {
                     && self.callbacks.checkpoint.restart.is_none()
                     && self.variables.slack_dual_scale() > (CHASE_START_SCALE).as_T()
                 {
+                    // Only the primal starts at this scale; the dual keeps
+                    // its shifted KKT start (below).
+                    dual_start = true;
                     self.start_tau = Some(TauChase::restart_tau(T::one()));
                 }
                 // fix up (z,s) so that they are in the cone
@@ -1150,13 +1154,27 @@ mod internal {
                 // starting point; fall back to the unit interior point, at
                 // the data's scale unless the caller chose τ₀
                 if !ok {
-                    self.variables.unit_initialization(&self.cones);
                     let core = self.settings.core();
-                    if self.start_tau.is_none()
-                        && core.auto_initial_tau
-                        && core.initial_tau == T::one()
-                    {
+                    let restart = self.start_tau.is_some();
+                    if !restart && core.auto_initial_tau && core.initial_tau == T::one() {
                         self.start_tau = self.data.unit_start_tau().filter(|&t| t < T::one());
+                    }
+                    // A rejected KKT start is degenerate in x (‖x‖∞ up to
+                    // 1e77), but its shifted dual is finite and near its
+                    // final scale: below τ₀ = 1, keep it and start only the
+                    // primal at unit slacks and x = 0 (Λ27: z/τ 1e10 at
+                    // iteration 1 otherwise, 1.4e5 at the solution). The
+                    // automatic τ₀ = 1/max d is at least the equilibration
+                    // bound (eps^(1/4) by default), so the two sides stay
+                    // well within the precision; a caller's τ₀ keeps the
+                    // unit start.
+                    dual_start = !restart
+                        && core.initial_tau == T::one()
+                        && self.start_tau.is_some_and(|t| t < T::one())
+                        && self.callbacks.checkpoint.restart.is_none()
+                        && self.variables.unit_primal_initialization(&self.cones);
+                    if !dual_start {
+                        self.variables.unit_initialization(&self.cones);
                     }
                 }
             } else {
@@ -1171,7 +1189,8 @@ mod internal {
             let keep = self
                 .chase_sides
                 .take()
-                .and_then(|now| TauChase::kept_side(now, self.variables.slack_dual_norms()));
+                .and_then(|now| TauChase::kept_side(now, self.variables.slack_dual_norms()))
+                .or(dual_start.then_some(true));
             if tau != T::one() {
                 self.variables.set_initial_tau(tau);
                 if let Some(dual) = keep.filter(|_| tau < T::one()) {

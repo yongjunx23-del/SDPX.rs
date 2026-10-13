@@ -8,6 +8,229 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-13 — L71: start the dual at its KKT scale (kept); L72–L74, L77, L78 rejected or refuted (perf-mc-impl)
+
+- L71, hypothesis: when the KKT start is rejected (‖x‖∞ up to 1e100), the unit fallback puts the dual at 1/τ₀ in original coordinates (Λ27: z/τ jumps to 1e10 at iteration 1, against 1.4e5 at the solution). The shifted KKT dual is finite and already near its final scale, so the start should keep it, as the L8 restart rule does after a chase. The chase-scale branch (accepted KKT start, ‖s‖∞·‖z‖∞ > 1e15) also starts both sides at 1/τ₀, so the same applies there.
+- L71 change (test switch `SDPX_TEST_DUAL_START=1`, mci107; owner port in mci109):
+  - `Variables::unit_primal_initialization`: unit slacks, x = 0, τ = κ = 1, and the shifted KKT dual kept.
+  - In the KKT-rejected branch (no caller τ₀, no checkpoint restart) and in the chase-scale branch, `default_start` keeps the dual through `keep_start_side(true)`, so in original coordinates the dual keeps its start and κ = 1.
+  - The owner path implements the same (`OwnedVariables::unit_primal_initialization`, finite-dual agreement across ranks).
+- Which inputs it touches (stcls 225387, one iteration each with `SDPX_START_STATS`):
+  - KKT start rejected: Λ19-xml, Λ27 (s50c, s50, p1024), Λ35-s70 (768, p1024), t11-aux35, t11-red60.
+  - Chase-scale start: Λ27-rs/pf, Λ35-rs/pf.
+  - Unchanged: Λ19-rs/pf, ising11, mixed Λ27-rs.
+- L71 results (mci107, plain 64 threads, A = default, B = `SDPX_TEST_DUAL_START=1`, untraced unless noted; status Solved unless noted):
+
+  | Case | Job, node | A it, s | B it, s | change |
+  |---|---|---|---|---|
+  | Λ19-xml/512 | 225392, node63 | 121, 33.6 | 105, 28.7 | −14.6% |
+  | Λ27-rs/768 | 225392, node63 | 138, 89.1 | 127, 78.6 | −11.8% |
+  | Λ27-pf/768 | 225392, node63 | 138, 90.5 | 127, 79.3 | −12.4% |
+  | Λ27-s50/768 | 225392, node63 | 183, 147.1 | 170, 132.4 | −10.0% |
+  | Λ27-p1024 | 225392, node63 | 183, 189.5 | 170, 174.6 | −7.9% |
+  | t11-aux35/768 | 225391, node61 | 103, 157.1 | 71, 101.4 | −35.5% |
+  | t11-red60/768 (DualInfeasible both) | 225391, node61 | 394, 462.4 | 365, 433.7 | −6.2% |
+  | Λ35-rs/1024 (ABBA) | 225388, node7 | 372, 653.5 / 654.0 | 347, 617.6 / 621.3 | −5.2% |
+  | Λ35-s70/768 | 225389, node45 | 575, 913.2 | 554, 881.3 | −3.5% |
+  | Λ35-s70-p1024/1024 | 225390, node55 | 435, 1062.2 | 414, 1024.5 | −3.5% |
+  | Λ27-s50c/768 (ABBA) | 225388, node7 | 183, 143.0 / 148.7 | 170, 129.8 / 131.2 | −10.5% |
+  | Λ35-pf/1024 | 225390, node55 | 372, 675.7 | 347, 644.0 | −4.7% |
+  | Λ35-rs, 4-node owner 16×16 (mci109) | 225398 | 372, 442.4 | 347, 415.3 | −6.1% |
+  | Λ27-s50c, 4-node owner 16×16 (mci109) | 225398 | 183, 99.4 | 170, 90.4 | −9.1% |
+
+- Audits (aud71, original coordinates): all ten B points accepted (Λ19-xml, Λ27-rs/pf/s50/s50c/p1024, Λ35-rs/s70/p1024, t11-aux35).
+- Decision: kept as the default (switch removed). The rejected-KKT branch keeps the dual only with the automatic τ₀ below 1 (1/max d, at least the equilibration bound); a caller's τ₀ keeps the unit start.
+  - Local checks: Λ19-xml/512 at 8 threads gives the switch run's point bitwise (105 it). e2e `medium` (Float64) Solved in 15 it and `csdr3` (SOC) in 36, as before, audits pass.
+  - Solver suite: 485 + 7 + 244 passed; the only failure is the known `overshooting_start_still_solves` (caller τ₀ 1e-70, unchanged).
+
+- Earlier fixed-τ entry, forced (mci110 with the L71 start, `SDPX_TEST_FIXED_TAU_AT`, one leg each, observed):
+  - Λ27-s50c: natural switch at 127 → 170 iterations; forced at 80 → 188; forced at 100 → 185.
+  - Λ27-rs: 127 iterations in all three.
+  - A mid-run freeze of a still-moving τ costs iterations, as in L51. The ft1 gain from fixing τ at iteration 1 (132 iterations) needs the κ/τ gate and infeasibility detection, so that direction stays closed.
+- L74, deep τ start (`TauChase::deep_tau`, eps^(1/3)) on the chase-scale branch with the L71 dual start (`SDPX_TEST_DEEP_START=1`, mci110, l74a 225401 node45):
+  - Λ35-rs/1024: A 347 it, 616.4 s; B 202 it, 390.2 / 389.7 s (−36.7%). No chase restart; fixed-τ phase from iteration 176 at τ 4.0e-99. The objective agrees with A to 41 digits.
+  - Λ35-pf/1024 (l74b 225402, node63): A 347 it, 626.2 / 619.2 s; B 202 it, 391.9 / 390.2 s (−37.4%).
+  - Λ27-rs/768 (l74a): A 127 it, 77.4 / 79.3 s; B 165 it, 135.6 / 136.7 s (+73.8%). The deep start overshoots its natural τ (2.8e-26) by 51 decades, and s/it rises 0.59 → 0.81.
+  - Λ27-pf/768 (l74b): A 127 it, 77.5 / 79.8 s; B 165 it, 136.4 / 137.3 s (+74.0%).
+  - Λ35-s70/768 (l74c 225405, node84): identical points (554 it). The KKT-rejected branch never takes the deep start; its chase restart already does.
+  - Decision: rejected. The gain needs a predictor of the chase, and none was found: Λ27-rs and Λ35-rs share the chase-scale start (‖s‖∞·‖z‖∞ 6.4e17 and 1.1e24), and t11-aux35 has Λ35-s70's start scales without a chase (L79 parked).
+- L72, one flattened cone-scaling queue per owner rank (mci108, `SDPX_TEST_OWNER_NESTED=1` keeps the old nested queues; points identical in every pair): rejected.
+  - 4 nodes 16×16 (225394): Λ35-rs nested 440.2 / 439.7 s, flat 440.3 / 439.8; Λ27-s50c 99.1 / 98.9 against 99.1 / 99.3.
+  - 1 node 4×16 (225393): Λ35-rs 826.7 / 825.9 against 827.5 / 827.2; Λ27-s50c 154.3 / 154.2 against 154.3 / 154.3.
+- L73, a chase restart that keeps the dual also scales it to the chased ‖z‖∞ (`SDPX_TEST_RESTART_DUAL`, rd1 225397, node61): rejected. Λ35-rs 350 it, 627.8 / 623.0 s against 347 it, 617.1 / 620.4 (+1.1%); Λ27-s50c identical (170 it).
+- L77, dual-residual polish after the other criteria pass: refuted on Λ19-xml locally. The full correction step's cone bound was 0.816: the HSD residual falls with μ, so in the NT metric it is O(1) against the small eigenvalues of z. Code reverted.
+- L78, the componentwise |A|ᵀ|z| products only once the other Solved criteria hold (cw1 225413, node91, `SDPX_PROFILE=1`): dropped.
+  - The products hide behind the cone-scaling critical path: Λ27-rs 127 it, 83.8 s with the componentwise test and 84.2 s without it.
+  - Observed: the 1e-30 componentwise dual test itself holds Λ27-s50c for 19 iterations (170 against 151 without it; fixed τ from 127 in both). Λ27-rs ends at 127 either way. The test stays.
+
+## 2026-10-13 — L50–L57 kept; L51, L58–L62, L64, L66, L67, L69, L70 rejected or refuted; L63 full-node layouts; L68 step limits (perf-mc-impl)
+
+- L50, hypothesis: the affine predictor only sets σ and the second-order term of the combined right-hand side, and that right-hand side is refined in full. Above binary64 the predictor's first solve is far more accurate than either use needs. In the L49 trace it lands within 2e-230 of its right-hand side, about tenfold over the refinement tolerance in 69 of 372 iterations.
+- L50 change (`d67ef07`, mci95):
+  - The condensed pair solve leaves the affine column without original-level refinement and forms its Hs·z directly (`scale_solution`).
+  - Taken only above binary64, with fused sampled blocks, and with refinement enabled.
+  - `SDPX_REFINE_PREDICTOR=1` restores the refined predictor.
+- L50 results (same binary, plain 64 threads; A = refined predictor; iterations and objectives unchanged):
+
+  | Run | Case | A s | B s | change |
+  |---|---|---|---|---|
+  | 225311 (node101) | Λ35-rs | 712.4, 716.9 | 674.1, 672.7 | −5.8% |
+  | 225312 (node104) | Λ27 | 159.6, 163.1 | 152.2, 153.4 | −5.3% |
+
+  - Audit 225325 accepted both B points. Λ35-rs: primal 3.2e-130, dual 1.2e-142, gap 4.0e-43. Λ27: primal 7.9e-120, dual 7.2e-87, gap 1.5e-59.
+  - Λ35-rs per iteration: KKT update 1.078 → 0.968 s; outer corrections 388 → 284 in the counted (post-restart) iterations.
+- L50 decision: kept.
+- L51, hypothesis: τ is flat within 10% from about iteration 318 of Λ35-rs, but the fixed-τ phase enters only at 345. An earlier entry would shorten the landing.
+  - Test: `SDPX_TEST_FIXED_TAU_AT=316`.
+  - Result: 373 iterations against 372; the landing steps are unchanged.
+  - Decision: refuted. The landing is limited by step length, not by the τ column.
+- L52, hypothesis: from iteration 2 the affine step length comes from the prepared cone bounds, which never read the PSD rows of the affine column's Hs·z. Forming that congruence for an unrefined column is wasted work.
+- L52 change (`0ce94f6`, mci97): the unrefined predictor solve forms Hs·z only for non-PSD blocks once prepared bounds take the step. `SDPX_TEST_AFFINE_HS=1` restores the full product.
+- L52 results (225322, node102, same binary, plain 64 threads):
+
+  | Case | A s | B s | change |
+  |---|---|---|---|
+  | Λ35-rs | 691.3, 677.8 | 667.6, 670.2 | −2.3% |
+
+  - KKT update 0.99 → 0.945 s/it. Points identical (bitwise), so no audit is needed.
+- L52 decision: kept.
+- L53, hypothesis: the owner (MPI-partitioned) path still refines the affine column. Porting L50 there should give the same gain on multi-node layouts.
+- L53 change (mci97): owner-path `skip_refinement` keeps the affine column's reduced solve and forms its scaled product (`restore_scaled_product`) without original-level refinement. Same gates as L50 (above binary64, refinement enabled); `SDPX_REFINE_PREDICTOR=1` restores it.
+- L53 results (225330, 4 nodes 16×16, same binary):
+
+  | Case | A s | B s | change |
+  |---|---|---|---|
+  | Λ35-rs | 479.6, 478.4 | 453.5, 454.2 | −5.4% |
+  | Λ27 | 108.5, 108.7 | 102.1, 101.6 | −6.2% |
+
+  - Iterations unchanged (372, 183). The points differ from A, as expected for an unrefined column; audit aud98 (225336).
+- L54, full-solve profile of plain Λ35-rs after L50 (225332/225333, mci97, perf 3.10 dwarf, 64 threads). Observed cycles:
+  - `__gmpn_mul_basecase` 27.2%, faer microkernels 20.7%, faer `pack_lhs` 6.8%, `memset` 3.4%, `__gmpn_lshift` 2.5%, `fill_chunk` 2.5%, rayon `with_handle` 2.3%, CRT `pack` 1.8%.
+  - Of the memset, 2.4% is `rns_blas::take_buffer` zero-filling pooled scratch that every caller overwrites (L56).
+  - GMP's assembly carries no CFI, so perf cannot attribute `mul_basecase` to callers on EPYC.
+  - A macOS `sample` of Λ27 at 1024 bits (4 threads, fast build) attributes the GMP time instead: exact dots 26% of busy samples, MPFR `mul_add`/`mul`/`div` 16%.
+  - Inclusive (Λ27 local): cone `update_scaling` 29% (SVD 17%), RNS `group_residues` 13% and `crt_tiled` 11% (congruence CRT alone 5.6%), `recover_rhs` 11%, Schur workspace 8%, arrow contributions 8%, leaf refactor 8%.
+  - Receipt (Λ35-rs, L52 B1) per iteration: `cones_schur` 0.379 s and `refactor` 0.377 s, each at ~51 of 64 busy cores; cone SVD 12.0 thread-s (bidiagonalization 4.5, reflectors 3.2, inverse iteration 2.5, dqds 1.8).
+- L53 decision: kept (`e7b1dc8`). Audit 225336 accepted both B points.
+- L56, hypothesis: `take_buffer` zero-fills pooled RNS scratch that every caller overwrites (2.4% of cycles).
+  - Change: `take_scratch` skips the fill for fully overwritten buffers (bitwise).
+- L57, hypothesis: `fill_chunk` re-reads limbs per chunk (`bits_at`, 2.5% of cycles).
+  - Change: one streaming pass per value writes its chunks through a shift/mask over the limbs (bitwise).
+- L56/L57 results (plain 64 threads, same inputs; points identical):
+
+  | Run | Arms | Case | A s | B s | change |
+  |---|---|---|---|---|---|
+  | sb98 (node101) | L56 vs base | Λ35-rs | 663.8, 664.8 | 661.0, 663.2 | −0.2% |
+  | sb98 (node101) | L56 vs base | Λ27 | 146.5, 149.7 | 147.2, 148.2 | −0.1% |
+  | sb99 (node102) | L56+L57 vs base | Λ35-rs | 667.5, 683.6 | 659.2, 662.4 | −2.2% |
+  | sb99 (node102) | L56+L57 vs base | Λ27 | 144.7, 149.1 | 144.4, 148.5 | −0.3% |
+
+- L56/L57 decision: kept (`965db88`).
+- L58, hypothesis: faer packs the entry-major chunk matrix (used as Aᵀ) again for every 16-prime group (`pack_lhs` 6.8% of cycles).
+  - Change: a chunk-major chunk matrix with an odd-cache-line padded leading dimension, so the weights GEMM reads it in place; ragged rows (len mod 8) go in a second call (bitwise).
+  - Mac micro (`chunk_layout_timing`): the group-residue GEMM is 20–45% faster.
+  - Result (sb100, node103, points identical): Λ35-rs A 687.8, 679.0 / B 685.3, 678.3 (−0.2%); Λ27 A 148.0, 151.9 / B 149.8, 150.9 (+0.3%).
+  - Decision: rejected; the kernel gain does not reach the solve. Patch `l56-l57-l58-rns.patch` (minus L56/L57).
+- L59, hypothesis: the leaf coupling solve Y = L⁻¹B by exact-dot rows is O(g²q) scalar exact MACs (Λ35-rs: g ≈ 114, q = 170).
+  - Change: row panels of 32; within a panel exact-dot rows, below it one exact residue product per panel. Changes bits (each row rounds per panel, not once).
+  - Mac (MpFloat<16>, g 114, q 170, one thread): 112.6 → 56.1 ms.
+  - Result (sb101, node106, which ran ~15% slower than other nodes): Λ35-rs A 768.3, 745.0 / B 719.4, 757.3 (−2.4%, but the pairs disagree in sign). `arrow.leaves` went 0.183/0.182 → 0.188/0.197 s/it and `refactor` 0.467/0.468 → 0.453/0.469.
+  - Decision: rejected on the phase evidence; under full load the panel solve does not cut leaf time. Λ27 legs and the audit were cancelled. Patch `l59-leaf-y-panels.patch`.
+- Not tried (judged under 2%):
+  - componentwise |A|ᵀ|z| quadratics are 1.8% of local busy samples and overlap cone scaling;
+  - L44 re-check: an unrefined corrector call costs ≈ prepare + trsv + recover 0.105 s + rhs 0.03 + bound 0.03 ≈ 0.165 s against a break-even of ≈ 0.16 s, so it stays closed;
+  - truncated (Ziv) exact-dot products: the 16×16 basecase runs at the hardware limit, and short products save ≤ 20% of multiplies at a per-row call overhead.
+- L4 (barrier-free per-component pipelines) closed: on 4-node L53 the max of per-rank wait sums is 0.427 against a sum of per-site maxima of 0.436 s/it (≤ 0.8%).
+- L63, full node (node36, mci97, Λ35-rs 1024, 372 iterations each):
+
+  | Layout | s | s/it |
+  |---|---|---|
+  | plain, 128 threads | 646.1 | 1.717 (70 of 128 busy) |
+  | owner 8 ranks × 16 | 564.9 | 1.518 |
+
+  - Plain at 64 threads on other nodes: 652–657 s, so 128 threads gains ≤ 3%. `refactor` drops 0.378 → 0.275 s/it, but `ir` ×1.85, `ir.residual` ×2.8, `cone_wprod` thread time ×1.5 and `rns.quadratic` ×2.4.
+- L63 node48 chain (mci97, Λ35-rs 1024, A1 legs on one node, all 372 iterations; "owner R×T" is R ranks of T threads):
+
+  | Layout | s |
+  |---|---|
+  | plain, 128 threads | 648.6 |
+  | plain, 64 threads | 667.4 |
+  | plain, 64 threads (second run) | 655.2 |
+  | owner 8×16 (128 cores) | 659.4 |
+  | owner 16×8 (128 cores) | 627.7 |
+  | owner 4×16 (64 cores) | 879.8 |
+  | owner 1×64 (64 cores) | 1633.4 |
+  | plain, 128 threads, `numactl --interleave=all` | 674.1 |
+  | plain, 64 threads, `numactl --interleave=all` | 687.2 |
+
+  - Interleaved pages are 2–4% slower than local allocation at both thread counts. So memory placement does not explain the weak gain from 64 to 128 threads; the NUMA-placement hypothesis is refuted for the plain path.
+  - On node48 the owner layouts with 128 cores gain at most 6% over plain 64 threads (16×8), against 13% on node36. One owner rank at 64 threads is 2.5× slower than plain (#46): its cone scaling and KKT update run at about 35 busy cores.
+- L60, hypothesis: Λ27 leaves (g 88–113, q 104) miss the residue contribution gate `g·q² ≥ 2²¹`, an unmeasured cutoff from `3bbef2b`, and take column exact dots.
+  - Change: drop the cutoff (bitwise: each entry is still its exact sum rounded once).
+  - Result (sb102, node7, mci101 vs mci102): Λ35-rs A 652.7, 656.7 / B 654.9, 653.1 (−0.1%, identical; its leaves already pass). Λ27 A 145.2, 150.1 / B 154.7, 152.7 (+4.1%, identical); KKT update 0.38–0.39 → 0.41–0.42 s/it at 42–43 instead of 47 busy cores.
+  - Decision: rejected. The cutoff now has evidence: for leaves this light, column exact dots beat residue products.
+- L61, hypothesis: each Λ35-rs leaf's contribution YᵀD⁻¹Y is a separate residue product after the leaf factor; fusing it into the leaf job removes one queue wave and the contribution pass's 41-of-64 busy tail.
+  - Change: each leaf job forms its own contribution right after its factor (bitwise).
+  - Result (sb103, node43, mci102 vs mci103; points identical): Λ35-rs A 652.8, 653.3 / B 640.1, 642.9 (−1.8%); Λ27 A 149.5, 155.4 / B 149.7, 150.4 (−1.6%, A2 an outlier). `arrow.leaves` 0.175 → 0.315 s/it, `arrow.contribution` 0.17 → 0.002, `refactor` 0.380 → 0.352.
+  - Decision: rejected (under 2%). The fused jobs only move the contribution work into the leaf wave.
+- L62, hypothesis: an `x86-64-v3` build (AVX2/FMA for faer and the residue kernels) speeds the RNS products.
+  - Result (sb104, node45, mci103 vs mci103v3; points identical): Λ35-rs A 643.0, 643.7 / B 635.3, 638.5 (−1.0%); Λ27 A 147.2, 150.9 / B 149.9, 150.1 (+0.6%).
+  - Decision: rejected; faer already dispatches its kernels at run time.
+- Observed across L47, L48 and L59–L62: changes that only fill idle cores move work without shortening the iteration. At 64 threads Λ35-rs spends about 90 thread-s per iteration at 52 of 64 busy cores, so a lever has to cut thread-seconds. By thread time the solve pipeline (prepare, recover, residual, with refinement) is the largest consumer, about 37 of 90.
+- L64, hypothesis: the 36 Λ35-rs leaf contributions each reconstruct a 170×170 upper triangle (one CRT per leaf). One stacked exact product Σ YᵀD⁻¹Y over all leaves (k = 4071, prime-parallel products, one tiled CRT) would remove 35 of the 36 reconstructions.
+  - Probe (`SDPX_DBG_STACK`, mci104s = `965db88` + probe, pb104 node7, 64 threads): the per-leaf path took 0.12–0.16 s per factor, the stacked product 0.95–0.99 s (operand copy alone 0.16 s). Both were exact; the results differ by up to ~2e3 ε·|s|, from cancellation in the border.
+  - Decision: refuted; not implemented. One window over every leaf's exponents, with smaller primes for k = 4071, costs far more than the saved reconstructions. Patch `l64-stack-probe.patch`.
+- L66, solve-pipeline sub-steps (temporary timers, Mac, 10 threads, 8 iterations of Λ35-rs at 1024 bits; mean per cone call):
+
+  | Step | Product | ms |
+  |---|---|---|
+  | condense | Rinv·X·Rinvᵀ congruence | 5.2 |
+  | condense | adjoint with V = Rinv·B | 4.1 |
+  | recover | forward V·C·Vᵀ | 8.3 |
+  | recover | Rinvᵀ·P·Rinv congruence | 7.5 |
+  | residual | forward with B | 9.0 |
+  | residual | adjoint with B | 8.0 |
+  | residual | G congruence (`apply`) | 8.2 |
+
+  - Congruences are about half of prepare plus recover. An explicit Ginv = RinvᵀRinv with U = Ginv·B would condense with no congruence and recover with one (Ginv·X·Ginv). That saves about one congruence per column, roughly 20% of prepare plus recover, before the cost of forming Ginv and U each iteration and the lost pre-images.
+  - Ginv squares the condition of Rinv. Each output stays exact for the rounded Ginv, but its error bound grows from ε·κ(R) to ε·κ(R)².
+  - Decision: not implemented (estimated net 1–3%, with an accuracy risk). Timer patch `dbg-solve-split-timers.patch`.
+- L67, hypothesis: Λ35-rs's first attempt already reaches the final objective (−26.388, gap 2e-18 at iteration 147). It restarts at 169 only because τ keeps falling. Freezing τ inside that attempt would skip the 203 iterations after the restart.
+  - Probe (`SDPX_TEST_FIXED_TAU_AT=145`, `SDPX_TRACE_TAU`, mci104s, node7): τ frozen at 2.0e-36. Over the next 30 iterations the gap rose 1.3e-15 → 4.6e-14, μ stopped falling (3e-88 → 1.1e-87) and steps fell to 0.001–0.5. The dual stayed at its final scale (z/τ 1.49e8), while the primal s/τ grew 1.3e41 → 1.6e44, about 0.1 decade per iteration.
+  - Decision: refuted; the probes were cancelled (the 120 leg too). The primal central path diverges, so the solution needs a primal near 1e94 (L8). With τ frozen the primal can grow only slowly, much as it does through the τ chase. A large primal start that deflates (about 0.8 decade per iteration over iterations 169–290) remains faster.
+- L44 re-check with current costs (not run): the measured L44 corrector cost was about 0.43 s per call ((802.8 − 747.1 + 46 × 2.01) / 342), not 0.25. An unrefined corrector solve would save about 0.08 s of that, so 342 calls would still cost more than the 46 iterations saved at 1.74 s. It stays closed.
+- L68, step limits by phase (`SDPX_DBG_STEPCONE`, `SDPX_TRACE_TAU`, mci104s; pdc 225376 Λ35-rs on node7, pdc27 225377 Λ27 on node43). Observed:
+  - Λ35-rs deflation (169–290): α_aff 0.61–0.69, σ 0.03–0.06, combined steps 0.886–0.93. The bound is the primal side (bs) of the largest cones (k 45–70, n 59–63), whose centrality spans [0.1–0.45, 2–7]·μ. μ falls 0.83 decade per iteration, as 1 − α(1 − σ) predicts. τ is flat (1.05–1.22e-101), s/τ grows 1.4e104 → 9.2e104 and the gap falls 4.5e102 → 1.4e7.
+  - Λ35-rs landing (289–345): α_aff 0.07–0.52, σ 0.11–0.81. The bound moves between a few small cones (k 1–10, n 48–50, and k 27–35). Their centrality spreads reach [0.008, 194]·μ, and either side (bz or bs) can bind.
+  - Λ27 (183 iterations): mean α_aff 0.58 over 0–65, 0.36 over 66–132 (27 of 67 below 0.3) and 0.65 from 133. τ climbs 1.3e-28 → 2.7e-25 over 24–56 while z/τ falls 1e38 → 1e26. That deflates the primal (s/τ 9.6e28 → 5.8e25), which then regrows to 8.4e30 at about 0.08 decade per iteration over 66–132 as τ falls back to 4.8e-29.
+  - Short steps (< 0.5) are 68 of 372 iterations on Λ35-rs and 40 of 183 on Λ27, all in the landing.
+- L68 conclusion: deflation steps are set by the primal neighbourhood of the large cones, not by a cutoff (L9 and L11 already tested longer steps). The landing is limited by a few off-centre small cones, which is what a centrality corrector targets. L44 ran its corrector below a step of 0.9, so nearly every deflation iteration (step ≈ 0.89) paid a call for about 0.14 iteration saved. That leads to L69.
+- L69 baseline, where L44's saved iterations fell (l44p runs, plain Λ35-rs, A without and B with the corrector at gate 0.9). Iteration at which each phase ends, A / B:
+  - chase restart: 170 / 155;
+  - gap < 1e50: 230 / 207;
+  - gap < 1: 289 / 257;
+  - gap < 1e-10: 336 / 292;
+  - end: 372 / 326.
+
+  The 46 saved iterations split as 15 in the first attempt, 17 in deflation (long steps), 12 in the landing and 2 at the end. On Λ27 (183 → 157) the phase ends are: gap < 1 at 65 / 53, < 1e-10 at 93 / 78, < 1e-20 at 135 / 115, < 1e-30 at 149 / 128. The savings spread over every phase, so a gate on short steps alone gives up most of them.
+- L69 change (test switch `SDPX_TEST_PSD_CORRECTOR=<gate>`, mci105): the L44 corrector runs only when the combined step is below the gate.
+- L69 results (A1 and B1 legs, plain 64 threads, both with `SDPX_TRACE_TAU`):
+
+  | Run | Gate | A it, s | B it, s | change |
+  |---|---|---|---|---|
+  | cg5 (node43) | 0.5 | 372, 862.5 | 367, 891.3 | +3.3% |
+  | cg7 (node7) | 0.7 | 372, 861.6 | 345, 877.2 | +1.8% |
+
+  - A short-step gate keeps few of L44's saved iterations (5 at 0.5, 27 at 0.7 of 46 at 0.9), and each call still costs more than the iterations it saves.
+  - Observed: `SDPX_TRACE_TAU` adds about 220 s (+34%) to a Λ35-rs leg (sb104 A1 643.0 s untraced). It also prints each refinement residual's parts, which runs an extra adjoint pass. Traced legs are fine for iteration counts but not for timings, so `mc/subenv.sh` now runs untraced unless asked.
+- L69 decision: rejected; the remaining legs were cancelled. The corrector direction stays closed at every gate.
+- L70, hypothesis: the τ-chase restart throws away the chased iterate, whose dual is already at its final scale (z/τ 1.49e8), and starts a new point at τ 2.2e-103 that deflates for about 120 iterations. Continuing the chased iterate at τ·r with z·r (r = new τ / old τ) would keep the dual and skip most of the deflation.
+- L70 probe (`SDPX_TEST_WARM_RESTART=1`, mci106, wr1, node45, traced):
+  - The warm point starts at gap 8.2e63, 35 decades below the cold restart's 1.2e99. Its dual stays at 1.487e8 and its objective is exact from the first step.
+  - The point is far from central: steps of 0.04–0.87 (about 0.45 on average) against 0.89 cold. The gap falls about 0.2 decade per iteration against 0.83 cold, so the cold run catches up by about iteration 228.
+  - Result: Solved in 381 iterations against 372.
+- L70 decision: rejected. A well-centred start that deflates fast beats a close but off-centre one.
+
 ## 2026-10-13 — L47: pair right-hand sides beside the arrow factor (rejected); L48: Gram sync behind each cone's scaling (rejected); L49: refinement after L43 (diagnosis) (perf-mc-impl)
 
 - L47, hypothesis: the pair's condensed right-hand sides (`prepare_rhs` of the affine and constant columns) depend only on the new scaling, so they can run on workers left idle by the arrow factor.

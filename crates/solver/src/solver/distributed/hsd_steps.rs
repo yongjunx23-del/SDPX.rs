@@ -462,6 +462,19 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         self.border_z.fill(T::zero());
         self.refresh_border_from_owner_zero();
     }
+    fn unit_primal_initialization(&mut self, cones: &Self::C) -> bool {
+        let finite = self.blocks.iter().all(|v| v.z.is_finite());
+        if !self.collective.all_true(706, finite).unwrap_or(false) {
+            return false;
+        }
+        for (v, c) in self.blocks.iter_mut().zip(&cones.blocks) {
+            v.unit_primal_initialization(c);
+        }
+        self.tau = T::one();
+        self.kappa = T::one();
+        self.refresh_border_from_owner_zero();
+        true
+    }
     fn set_initial_tau(&mut self, tau: T) {
         for v in &mut self.blocks {
             v.set_initial_tau(tau);

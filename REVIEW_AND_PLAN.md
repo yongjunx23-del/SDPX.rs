@@ -49,11 +49,11 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 
 | Case (64 threads, 768 bits, 1e-42 unless noted) | SDPX | Reference |
 |---|---|---|
-| Λ27 spins 0–50 | 183 it / 167.4 s (0.91 s/it), audited (L24, 2026-10-12) | SDPB 265 it / 375 s (1.41 s/it) |
+| Λ27 spins 0–50 | 170 it / 130.5 s (0.77 s/it), audited (Λ27-s50c, L71, 2026-10-13) | SDPB 265 it / 375 s (1.41 s/it) |
 | spins 0–50 (s50) | 153 it / 153.8 s | SDPB 285 s |
 | Λ19 | 121 it / 71.0 s, audited | — |
 | ising11 (512 bits) | 54 it / 3.44 s | — |
-| Λ35 spins 0–70, 1024 bits | Solved 435 it / 1259.2 s (2.89 s/it), audited (L24, 2026-10-12; was 683 it / 2426.5 s); 768 bits Solved 691 it / 1886 s, audited | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
+| Λ35 spins 0–70, 1024 bits | Solved 414 it / 1024.5 s (2.47 s/it), audited (L71, 2026-10-13; was 683 it / 2426.5 s); 768 bits Solved 554 it / 881.3 s, audited (L71) | SDPB 1024 bits 745 it / 2762 s (3.71 s/it); 768 bits 746 it / 2009 s |
 | Float64 58 cases (t16b = int5 + task 16) | 54 audited solves, 0 Solved-but-fail; wins 19 (1 thr), 12 (16 thr) | MOSEK |
 
 These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5334dd` + FMA, plus task 16).
@@ -240,6 +240,28 @@ execution plans. The journal preserves all failed evidence and final decisions.
      - Kept L43 (`eb78199`): a refinement floor for retained zero-cone rows, eps·(Σ|A_r||x| + |b_r|), on the plain and owner paths. Plain Λ35-rs −4.3%; 4-node Λ35-rs −3.3%, Λ27 −8.5%. Audited.
      - Rejected L44: the MPFR PSD Gondzio corrector. It saves 12–17% of iterations, but every call costs one combined solve, so plain is +2–8% and owner −0.4…+5.8%. Revisit only after the solve pipeline costs about half as much.
      - Next: the condensed solve pipeline. On plain Λ35-rs it takes about 0.98 of 2.02 s/it: residual 0.33, recover 0.21, prepare 0.17.
+   - Follow-ups 4 (journal 2026-10-13, `perf-mc-impl` at `965db88`):
+     - Kept:
+       - L50/L53: the affine predictor column is left unrefined above binary64 (plain Λ35-rs −5.8%, Λ27 −5.3%; 4 nodes −5.4%/−6.2%; audited).
+       - L52: no affine Hs·z congruence for PSD rows (−2.3%, bitwise).
+       - L56/L57: RNS scratch without zero-fill and a streaming chunk encode (−2.2%, bitwise).
+     - Plain Λ35-rs at 64 threads is now 372 iterations in about 650 s (1.74 s/it).
+     - Rejected or refuted:
+       - L51 earlier fixed-τ entry;
+       - L58 chunk-major RNS chunks;
+       - L59 panel leaf Y;
+       - L60 residue contributions for light leaves (the `g·q² ≥ 2²¹` gate now has evidence);
+       - L61 fused leaf contributions and L62 an `x86-64-v3` build (both under 2%);
+       - L64 one stacked contribution product;
+       - L66 an explicit-Ginv congruence (accuracy risk);
+       - L67 freezing τ inside a chasing attempt.
+     - Observed (L63): plain at 128 threads gains ≤ 3% over 64. Owner layouts on one 128-core node depend on the node: 8×16 −13% on node36 but +1.7% on node48, where 16×8 gives −3.2%. One rank × 64 threads takes 1633 s, 2.5× plain, so the owner path needs several ranks per node (task 46).
+     - Observed (L68): deflation steps (≈ 0.89) are limited by primal centrality in the largest cones, and landing steps by a few off-centre small cones. Iteration levers that remain: a cheaper corrector solve, or a chase signal for a deep first start (L1 is closed).
+   - Follow-ups 5 (journal 2026-10-13, L71):
+     - Kept L71 as the default: a rejected or chase-scale KKT start keeps its shifted dual and starts only the primal at unit slacks (plain and owner paths). Plain −3.5…−35.5% on all ten Ising inputs (Λ35-rs 372 → 347 it, Λ27 183 → 170, t11-aux35 103 → 71); 4-node owner −6.1% / −9.1%; audited.
+     - Rejected L72 (one owner cone queue, 0%), L73 (restart dual at the chased scale, +1.1%) and L74 (deep τ start: Λ35-rs/pf −37%, but Λ27-rs +74%, and no static predictor separates them). Refuted L77 (dual-residual polish). Dropped L78 (lazy componentwise check: its products are hidden).
+     - Observed: the 1e-30 componentwise dual test holds Λ27-s50c for 19 iterations (170 vs 151); it stays.
+     - Open: L75 (chase restart keeps the KKT dual), L76 (fixed τ on a settled-τ gap stall), L80 (τ capped at a scaled start) are on the cluster; L79 (a chase predictor for KKT-rejected inputs) is parked.
    - Single-heavy-owner sampled splitting is closed: correct on both MPI gates, but neither improves end-to-end time.
    - Profile prime-group underfill and NUMA residue placement on large calls;
      split complete inner products over output tiles only if they dominate.
@@ -373,3 +395,13 @@ are in [the journal](docs/JOURNAL.md).
   the allocated-core release repeat is neutral (+0.13% native time).
 - Single-heavy sampled operator splitting: operator phases are 24–25%
   faster, but uniform and denser MPI full solves have no end-to-end gain.
+- 2026-10-13 (journal): chunk-major RNS chunks (L58), leaf Y row panels
+  (L59), residue contributions below `g·q² = 2²¹` (L60, +4% on Λ27), fused
+  leaf contributions (L61), `x86-64-v3` builds (L62), one stacked
+  contribution product (L64, 7× slower), explicit-Ginv congruences (L66,
+  squares κ), an earlier fixed-τ entry (L51) and freezing τ in a chasing
+  attempt (L67). Changes that only fill idle cores move work; a lever must
+  cut thread-seconds. Also the L44 corrector gated to short steps (L69), a
+  warm chase restart (L70), one owner cone-scaling queue (L72), scaling the
+  restart dual to the chased ‖z‖ (L73), a deep τ start without a chase
+  predictor (L74) and a dual-residual polish (L77).

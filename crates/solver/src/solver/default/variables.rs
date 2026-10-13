@@ -404,6 +404,19 @@ where
         )
     }
 
+    fn unit_primal_initialization(&mut self, cones: &CompositeCone<T>) -> bool {
+        if !self.z.is_finite() {
+            return false;
+        }
+        let z = self.z.clone();
+        cones.unit_initialization(&mut self.z, &mut self.s);
+        self.z.copy_from(&z);
+        self.x.set(T::zero());
+        self.τ = T::one();
+        self.κ = T::one();
+        true
+    }
+
     fn set_initial_tau(&mut self, tau: T) {
         self.τ = tau;
         self.κ = T::recip(tau);

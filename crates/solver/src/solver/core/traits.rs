@@ -224,6 +224,13 @@ pub trait Variables<T: FloatT> {
     /// Initialize all conic variables to unit values.
     fn unit_initialization(&mut self, cones: &Self::C);
 
+    /// Unit slacks and zero primal, keeping a finite shifted dual (the
+    /// start after a rejected KKT start). Returns false (nothing changed)
+    /// when unsupported or the dual is not finite.
+    fn unit_primal_initialization(&mut self, _cones: &Self::C) -> bool {
+        false
+    }
+
     /// Start the embedding at `τ = tau`, `κ = 1/tau` (τκ unchanged at 1).
     fn set_initial_tau(&mut self, tau: T);
 
