@@ -18,6 +18,12 @@
       "destination": "crates/solver/src/algebra/dense/blas/mpfr.rs",
       "original_sha256": "da91f271c5f88ac14952056680de5526180977f7d80d0e20948c09b28a7d9b90",
       "license": "MIT, copyright Andreas Noack; notice retained beside ported code"
+    },
+    {
+      "source": "LAPACK v3.12.1/SRC/{dlasq1,dlasq2,dlasq3,dlasq4,dlasq5,dlasq6,dlas2}.f",
+      "reference": "https://github.com/Reference-LAPACK/lapack/tree/v3.12.1/SRC",
+      "destination": "crates/solver/src/algebra/dense/blas/mpfr_dqds.rs",
+      "license": "LAPACK-LICENSE"
     }
   ]
 }

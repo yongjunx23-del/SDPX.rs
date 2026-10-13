@@ -823,7 +823,7 @@ fn normal_vectors<const N: usize>(
         return false;
     }
     let c = (lo + hi) / num::<N>(2);
-    let InvitWork { off, order, xs, dd, du, du2, dl, swap, used } = ws;
+    let InvitWork { off, order, dd, du, du2, dl, swap, used, .. } = ws;
     // off[0..n] the diagonal of F, off[n..2n-1] its off-diagonal.
     off.clear();
     for i in 0..n {
@@ -860,8 +860,6 @@ fn normal_vectors<const N: usize>(
     order.sort_unstable_by(|&a, &b| {
         s[a].abs().partial_cmp(&s[b].abs()).unwrap().then(a.cmp(&b))
     });
-    xs.clear();
-    xs.resize(n * n, F::zero());
     for buffer in [&mut *dd, &mut *du, &mut *du2, &mut *dl] {
         buffer.clear();
         buffer.resize(n, F::zero());
@@ -916,8 +914,10 @@ fn normal_vectors<const N: usize>(
             }
         }
         let last = dd[n - 1].abs();
-        let (done, rest) = xs.split_at_mut(j * n);
-        let x = &mut rest[..n];
+        // Completed vectors already occupy their final V columns. Split off
+        // this column to keep the same Gram–Schmidt order without another n² buffer.
+        let (before, rest) = v.split_at_mut(p * n);
+        let (x, after) = rest.split_at_mut(n);
         for xi in x.iter_mut() {
             seed = seed
                 .wrapping_mul(6364136223846793005)
@@ -957,7 +957,12 @@ fn normal_vectors<const N: usize>(
                 x[i] = (x[i] - du[i] * x[i + 1] - du2[i] * x[i + 2]) / dd[i];
             }
             for q in group..j {
-                let y = &done[q * n..(q + 1) * n];
+                let p0 = order[q];
+                let y = if p0 < p {
+                    &before[p0 * n..(p0 + 1) * n]
+                } else {
+                    &after[(p0 - p - 1) * n..(p0 - p) * n]
+                };
                 let ndot = -F::dot_fma(x.iter().zip(y));
                 for (xi, &yi) in x.iter_mut().zip(y) {
                     *xi = yi.mul_add(ndot, *xi);
@@ -998,7 +1003,6 @@ fn normal_vectors<const N: usize>(
         for xi in x.iter_mut() {
             *xi *= inv;
         }
-        v[p * n..(p + 1) * n].copy_from_slice(x);
     }
     true
 }
@@ -1182,7 +1186,9 @@ pub(super) fn svd<'a, const N: usize>(
     }
     // The bidiagonal QR never reads U or V: log its rotations, then replay
     // them on U and V (see `replay_rotations`).
-    let invit = vr > 0 && n >= 2;
+    // Independent V signs and repeated-value bases cannot be paired with
+    // QR's U; full factorizations must replay both coherent factors.
+    let invit = uc == 0 && vr > 0 && n >= 2;
     crate::algebra::scratch::with_scratch(|sc: &mut SvdScratch<N>| {
     if invit {
         sc.d0.clear();
@@ -1193,7 +1199,7 @@ pub(super) fn svd<'a, const N: usize>(
     // Without U, dqds values and inverse-iteration vectors need no
     // rotations; any failure restores the bidiagonal for the QR below.
     let mut solved = false;
-    if invit && uc == 0 {
+    if invit {
         let timer = crate::receipt::start();
         let values = dqds_values(d, &sc.e0, n, &mut sc.qd).is_ok();
         crate::receipt::finish("svd.dqds", timer);

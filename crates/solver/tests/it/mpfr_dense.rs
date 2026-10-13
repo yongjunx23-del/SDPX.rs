@@ -1106,6 +1106,43 @@ fn single_index_eigen() {
 }
 
 #[test]
+fn full_svd_repeated_spectrum_reconstructs() {
+    let zero = F::<8>::zero();
+    let n = 4;
+    let mut original = vec![zero; n * n];
+    for (i, value) in [1, 1, 2, 2].into_iter().enumerate() {
+        original[i + i * n] = f(value);
+    }
+    let mut a = original.clone();
+    let mut s = vec![zero; n];
+    let mut u = vec![zero; n * n];
+    let mut vt = vec![zero; n * n];
+    let mut work = vec![zero];
+    let mut info = 0;
+    F::xgesvd(
+        b'S', b'S', n as i32, n as i32, &mut a, n as i32, &mut s, &mut u, n as i32, &mut vt,
+        n as i32, &mut work, -1, &mut info,
+    );
+    assert_eq!(info, 0);
+    let lwork = work[0].to_i32().unwrap();
+    work.resize(lwork as usize, zero);
+    F::xgesvd(
+        b'S', b'S', n as i32, n as i32, &mut a, n as i32, &mut s, &mut u, n as i32, &mut vt,
+        n as i32, &mut work, lwork, &mut info,
+    );
+    assert_eq!(info, 0);
+    for j in 0..n {
+        for i in 0..n {
+            let mut reconstructed = zero;
+            for k in 0..n {
+                reconstructed += u[i + k * n] * s[k] * vt[k + j * n];
+            }
+            close(reconstructed, original[i + j * n], f(2));
+        }
+    }
+}
+
+#[test]
 fn reflector_norm_extreme_exponents() {
     fn check<const N: usize>() {
         for exponent in [-4096, 0, 4096] {

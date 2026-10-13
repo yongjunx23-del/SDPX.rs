@@ -9,3 +9,10 @@ are recorded in provenance/upstream.json.
 
 Further retained ports and their licences are listed in provenance/
 (SDPB pmp2sdp, MIT; SDPX.jl, MIT; GenericLinearAlgebra.jl, MIT).
+
+The MPFR dqds implementation includes software derived from LAPACK 3.12.1,
+Copyright (c) 1992-2023 The University of Tennessee and The University of
+Tennessee Research Foundation; Copyright (c) 2000-2023 The University of
+California Berkeley; Copyright (c) 2006-2023 The University of Colorado Denver.
+The LAPACK license is retained in provenance/LAPACK-LICENSE, and the ported
+routines are recorded in provenance/reuse.json.
