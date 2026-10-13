@@ -10,9 +10,9 @@ $$
 $$
 
 Supported cones are zero, nonnegative, second-order, exponential, power,
-generalized power and PSD triangle. Sampled bootstrap SDPs retain their PSD
-coefficients as bases and sample weights through presolve; these factors
-remain the operator used by the solver.
+generalized power, PSD triangle and operator relative entropy. Sampled bootstrap
+SDPs retain their PSD coefficients as bases and sample weights through presolve;
+these factors remain the operator used by the solver.
 
 Use the native Rust API, the `sdpx` CLI or the C ABI in
 [`include/sdpx.h`](include/sdpx.h). The separate `sdpx-pmp2sdp` converter
@@ -73,12 +73,12 @@ nonfinite values and nonpositive homogenization or scaling factors.
 `SDPX_RECEIPT=FILE` records phase timings and peak RSS. Run each executable
 with `--help` for its full argument list, including MPI partitioning.
 
-On Linux, an MPI run with more than one rank starts one idle-priority keeper
-thread per allocated CPU when the frequency governor follows load
-(`conservative`, `ondemand`, `schedutil`). The keepers hold the cores at full
-clock between short parallel regions and yield to any solver thread.
-`SDPX_KEEP_CORES=0` turns them off, and any other value starts them for a
-single process too. While keepers run, receipts record wall times only.
+On Linux, multi-rank MPI runs can start idle-priority keeper threads when the
+frequency governor follows load (`conservative`, `ondemand`, `schedutil`).
+Automatic startup requires disjoint rank CPU masks matching each rank's worker
+budget. Keepers fill idle time between parallel regions and yield to solver
+threads. `SDPX_KEEP_CORES=0` disables them; any other value forces startup,
+capped by the worker budget. While keepers run, receipts record wall times only.
 
 ## Reducing explicit SDP inputs
 

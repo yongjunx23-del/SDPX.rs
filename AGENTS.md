@@ -28,7 +28,7 @@ Float64 and every MPFR width. BLAS/LAPACK are always linked (no SDP-less build).
   traits. `solver/default` — problem setup (Ruiz, presolve, chordal), variables,
   residuals, info, settings, JSON I/O.
 - `solver/cones` — zero, nonnegative, SOC, exponential, power, generalized
-  power and PSD-triangle cones, plus the cone worker pool.
+  power, PSD-triangle and operator-relative-entropy cones, plus the cone worker pool.
 - `solver/kkt` — `direct`: the augmented system factored by QDLDL (serial or
   elimination-tree parallel), faer, `dense_block` (pooled tiled Cholesky) or an
   arrow LDL that eliminates local structure (`local_bounds`, `local_soc`,

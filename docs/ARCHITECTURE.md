@@ -32,7 +32,7 @@ polynomial coefficients; only the replacement sampling metadata is owned.
 |---|---|
 | `solver/core` | HSD predictor/corrector loop and the traits it drives (data, variables, residuals, KKT, info, solution); callbacks, checkpoints and the CLI's idle-priority core keepers. |
 | `solver/default` | The standard problem: `PreparedProblem` setup, Ruiz equilibration, presolve, settings, convergence tests, JSON I/O, data updates. |
-| `solver/cones` | Zero, nonnegative, SOC, exponential, power, generalized power and PSD-triangle cones; the composite cone and its worker pool. |
+| `solver/cones` | Zero, nonnegative, SOC, exponential, power, generalized power, PSD-triangle and operator-relative-entropy cones; the composite cone and its worker pool. |
 | `solver/kkt` | Augmented (`direct`) and condensed formulations, LDL backends (`ldl`) and iterative refinement. |
 | `solver/sampled` | Factored PSD operators (bases × sample weights) for bootstrap SDPs. |
 | `solver/chordal` | Sparse PSD chordal decomposition and solution recovery. |
@@ -100,7 +100,9 @@ Condensed PSD blocks keep R for Float64 application and G for MPFR application;
 the unused matrix is empty. Ginv remains for Schur assembly when needed.
 MPFR SVD stores rotations in separate U/V logs without redundant factor flags;
 the logs reuse thread-local capacity, and the four-row parallel replay keeps
-each row's scalar rotation order.
+each row's scalar rotation order. Full SVDs retain the paired QR vectors;
+right-only SVDs can use inverse iteration. Completed normal vectors occupy
+their final V columns instead of a second square workspace.
 Serial exact sampled adjoints emit workspace results directly in block/column
 order; pooled adjoints use the same writer to fill their contribution buffers.
 Inverse scalar adjoints with distinct basis columns write exact quadratics
@@ -129,8 +131,11 @@ Float64 row plan each residual pass (MPFR exact residual rows and serial
 Float64 residuals run per right-hand side).
 At MPFR precision every refinement residual row is an exact dot product
 rounded once, so refinement keeps working on badly scaled bootstrap systems.
-Every right-hand side uses its own residual and measured correction gain;
+Refined right-hand sides use their own residual and measured correction gain;
 stalls from another right-hand side or factorization do not skip refinement.
+MPFR fused sampled solves can leave the affine predictor unrefined; the
+combined direction is refined with unchanged tolerances. Owner solves require
+every rank's local kernels to be eligible before taking that path.
 Condensed solves retain the final accepted H·z product in refinement workspace
 and snapshot only earlier right-hand sides. MPI completes the product gather
 before marking it valid; rejected refinement steps restore the accepted product.
@@ -138,6 +143,20 @@ Clarabel stopping rules, reduced tolerances, infeasibility detection,
 regularization with escalation and the distinct `AlmostSolved` status are
 part of the engine. There is no low-precision solver, mixed-precision
 factorization or precision-ladder warm start.
+The default MPFR shift starts at zero. After a failed factor, its first retry
+is at least `eps · max|diag(KKT)|`, then follows the existing ×100 escalation;
+refinement still uses the unshifted operator.
+Fresh ordinary and owner solves clear fixed-τ phase state. Solution recovery
+releases the saved best iterate once its original-coordinate point is installed.
+
+Operator relative entropy uses the primal barrier for
+`T ⪰ D(X,Y)`, with barrier parameter `3n`. Its inverse Hessian is represented
+as `N D Nᵀ`: augmented and retained-row KKT paths transform the RHS by `N⁻¹`
+and recover dual directions by `N⁻ᵀ`, including owner solves. Slack directions
+come from the original linear feasibility rows. Trial dual feasibility first
+uses a cheap bound; only inconclusive trials allocate the Schur CG workspace.
+CG bound decisions use a freshly applied Schur residual. Owner backtracking
+uses the same ORE-only barrier rule as the ordinary cone collection.
 
 ## KKT formulation and backends
 
@@ -225,7 +244,10 @@ results outside MPFR's exponent range retain MPFR handling.
 
 `exactdot` accumulates the exact sum of products in fixed point and rounds
 once (inline limb products through 256 bits, GMP above). The result does not
-depend on term order, partitioning or thread count. Large dense MPFR
+depend on term order, partitioning or thread count. Chunk dispatch verifies
+completed slots before handing their storage to GMP. Shared product callbacks
+are delisted and joined on normal return or unwinding, keeping borrowed
+callback storage alive until helpers finish. Large dense MPFR
 products, congruences (`Aᵀdiag(d)A`) and bound Grams use exact residue (RNS)
 kernels with caches for operands that stay fixed during a solve; CRT
 reconstruction rounds each entry once. GEMM, general congruence and sampled
@@ -234,7 +256,8 @@ CRT constants are built from one temporary large-integer cofactor at a time.
 Pooled calls share one CRT accumulator:
 independent prime products run in parallel, then disjoint digit columns update
 the accumulator. Fractional residues and mapped compaction keep their serial
-order. Congruence retains full square residue staging; quadratic/bilinear
+order. Upper-only congruences retain packed triangle residues and bounded
+BLAS panel scratch; full congruences retain square staging. Quadratic/bilinear
 tasks share operand staging and keep private matrix/product scratch. Diagonal
 congruence retains its row partitions and releases scaling residues after
 their joined products, before CRT allocates its buffers.
@@ -257,8 +280,9 @@ of the thread count.
 
 `BlasFloatT` maps Float64 to system BLAS/LAPACK and wide scalars to the MPFR
 dense kernels (GEMM/SYRK through `exactdot`/RNS, Cholesky, triangular
-solves, symmetric eigensolver and a bidiagonal-QR SVD whose rotations are
-logged and replayed row-parallel). Four-row replay tiles preserve each row's
+solves and symmetric eigensolver). Right-only SVD uses dqds and inverse
+iteration; full-factor and fallback SVD uses bidiagonal QR with rotations
+logged and replayed row-parallel. Four-row replay tiles preserve each row's
 rotation order. Float32 is configured only for dense kernel tests.
 
 ## Parallelism and memory
@@ -278,6 +302,12 @@ Linux worker binding preserves the caller's CPU mask. When the allocation
 matches the requested budget, the calling thread stays on its first CPU
 during a solve and regains its original mask on return. User termination
 callbacks temporarily receive the full mask so new pools inherit the allocation.
+Linux CLI keepers start after effective settings are read and before affinity
+narrowing. Automatic MPI keepers require disjoint node-local rank masks whose
+sizes match their worker budgets; forced startup is capped by that budget.
+Only successfully pinned `SCHED_IDLE` threads count as keepers. Receipts started
+while any keeper instance is alive omit CPU clocks; subsequent receipts enable
+them after the last instance is joined.
 Publication preserves each output's addition order; exact MPFR products
 produce the same rounded dot across thread counts. Float64 factor backends may change
 rounding; the original-coordinate audit remains the accuracy gate. Scratch

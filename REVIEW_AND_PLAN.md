@@ -1,6 +1,6 @@
 # SDPX development plan
 
-Updated 2026-10-09. [AGENTS.md](AGENTS.md) defines working rules and numerical
+Updated 2026-10-13. [AGENTS.md](AGENTS.md) defines working rules and numerical
 contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 [Journal](docs/JOURNAL.md) holds full timings, job histories, source hashes,
 failed attempts and audit evidence. This file keeps goals, current state,
@@ -32,7 +32,8 @@ failure never counts as a performance win.
 crate (`--locked --offline`, one feature set), one matching E2E against a
 frozen baseline with its original-coordinate audit. Pure refactors preserve
 points. Order-changing changes pass the full-solve audit instead of bitwise
-identity (no precision or refinement relaxation). Keep ≥2% end-to-end gains
+identity (fixed precision and unchanged audit gates). Refinement scope changes
+require the evidence specified in AGENTS.md. Keep ≥2% end-to-end gains
 or clear memory/correctness benefits. Long runs go to the cluster from
 frozen sources. Frontends dispatch Float64 plus MPFR128/256/512/768/1024 by
 default; `all-precisions` adds 128–2048 in steps of 64 (Lambda43 needs 1216).
@@ -43,7 +44,7 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 - Ising ABBA `t14abba.pbs` / `t15abba.pbs`, with audit `audit_point.jl` (`t4dgate.pbs`'s Λ27 audit call is broken; use `t14aud.pbs`).
 - Small-case timing across nodes is bimodal: the conservative governor, a cold process, and MOSEK's warm minimum-of-3. Decide small Float64 timing with same-node interleaved A/B (`t13/abfam.py`).
 
-## Current state (2026-10-09)
+## Current state (2026-10-13)
 
 ### Scoreboard against the goals
 
@@ -69,6 +70,10 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 - Exact residue products, packed Grams, bounded arrow kernels and shared
   operator products are retained. Their implementation is in the architecture;
   completed comparisons and source hashes are in the journal.
+- Review repairs (2026-10-13): coherent full MPFR SVD, joined helper lifetimes,
+  completed chunk dispatch, bounded/disjoint MPI keepers, packed upper
+  congruence residues and reused SVD output storage. Local Ising512 points
+  remain exactly unchanged; the journal records the matching gates.
 - Float64 uses original-coordinate acceptance, condensed slack recovery and
   continuation refinement after residual growth. Old small-case setup overhead
   repairs are retained; remaining presolve/pool/receipt costs need current profiles.
@@ -293,6 +298,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
 
 8. **Thermal matrix models (journal 2026-10-13, thermal-ore):**
    - The native operator relative entropy cone is in, on branch `thermal-ore`. two_L4 (53/128/256 bits), two_L6 (53/128) and one_L10 (53) are Solved and audited. two_L6/128 takes 7.94 s.
+   - Review repair: owner RHS/dual coordinates, linear slack recovery and fresh-solve phase resets match the ordinary path. After an actual zero-base factor failure, the retry shift now has an `eps · max|diag(KKT)|` floor (initial shift and refinement tolerances unchanged). two_L4/128: ordinary Solved/45, owner Solved/44, both pass original 1e-20 and Arb audits; the former owner path stopped AlmostSolved/37. Extra T-row eigen/Cholesky whitening trials regressed ordinary convergence and are reverted.
    - Next:
      - eliminate the cone in the condensed path (Gram rows; the border LDL is 54%);
      - multithread the cone kernels;
@@ -325,8 +331,8 @@ in the journal; they do not override SDPX's numerical contracts.
 
 ## Decisions
 
-[AGENTS.md](AGENTS.md) governs numerical changes and approvals. Preserve
-requested precision and every acceptance/refinement rule.
+[AGENTS.md](AGENTS.md) governs numerical changes and approvals. Requested
+precision is fixed; other contract changes require measured, audited evidence.
 
 **Open:**
 - **Mixed Lambda27/1024 explicit-gate pilot.** The frozen baseline binary, 32 cores, 64 GiB, 2 h, ≤100 iterations. Prepared and awaiting approval after two exhausted retries.
@@ -343,14 +349,16 @@ requested precision and every acceptance/refinement rule.
 Do not reopen without new evidence; numerical reasons, timings and sources
 are in [the journal](docs/JOURNAL.md).
 
-- Lower/mixed precision, relaxed refinement, NaN clamping and MᵀM eigenanalysis
-  violate numerical contracts. Fixed-point SVD replay erased tiny MPFR values.
+- Lower/mixed precision and NaN clamping violate numerical contracts.
+  Rejected: relaxed refinement gates and normal equations for singular values
+  or ill-conditioned spectra. Shifted-normal reconstruction of vectors for
+  spectra within a factor two is retained. Fixed-point SVD replay erased tiny MPFR values.
 - HKM (SDPB XZ) or mixed NT/HKM PSD direction, and NT scaling through
   eig(LᵀSL): HKM's cone update is 6.5× cheaper, but ising11/512 takes 52 → 58
   iterations and 37.1 → 41.9 s; net ≤ 0 for the condensed sampled path.
   Task 19 also declined HKM at larger scale; its proposed gains required
   contract changes.
-- Cone scaling by scheduling (task 19: LPT, inner ways, pool_ways ±0.5%; scaling is CPU-bound) and by a blocked Givens replay through residue GEMM (task 19b: +6–17% per iteration at L = 40–63). Fewer rotations (divide-and-conquer bidiagonal SVD) is the remaining SVD lever.
+- Cone scaling by scheduling (task 19: LPT, inner ways, pool_ways ±0.5%; scaling is CPU-bound) and by a blocked Givens replay through residue GEMM (task 19b: +6–17% per iteration at L = 40–63). The retained right-only SVD now avoids QR rotations on its default path.
 - Hypatia-style WSOS dual-barrier cone for the Ising PMPs (task 18):
   ising11 86 vs 54 it; Λ19 gap 4.6e-9 at 107 it vs SDPX's 73; the line
   search costs more than the factor.
