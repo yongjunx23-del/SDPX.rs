@@ -690,33 +690,40 @@ fn prime_group_congruence_matches_unsplit() {
                 + 3.0;
             let plan = Plan::new(m, needed).unwrap();
             for ways in 1..=5 {
-                let mut got = vec![<F<N> as num_traits::One>::one(); m * m];
-                pool.install(|| {
-                    let split = Split::Ways(ways);
-                    let ca = Operand::Chunks(chunk_matrix(av, lo_a, da, &plan, &split));
-                    let cx = chunk_matrix(xv, lo_x, dx, &plan, &split);
-                    let shape = CongruenceShape {
-                        ta: b'N',
-                        ta_n: true,
-                        m,
-                        k: m,
-                        lda: m,
-                        ldx: m,
-                        len_a: m * m,
-                        len_x: m * m,
-                        upper_only,
-                    };
-                    assert!(congruence_prime_groups(
-                        shape, &plan, &ca, &cx, &split, ways, 2 * lo_a + lo_x, &mut got
-                    ));
-                });
-                for j in 0..m {
-                    for i in 0..m {
-                        let o = i + j * m;
-                        if upper_only && i > j {
-                            assert_eq!(got[o], <F<N> as num_traits::One>::one());
+                for columns in [false, true] {
+                    let mut got = vec![<F<N> as num_traits::One>::one(); m * m];
+                    pool.install(|| {
+                        let split = Split::Ways(ways);
+                        let ca = Operand::Chunks(chunk_matrix(av, lo_a, da, &plan, &split));
+                        let cx = chunk_matrix(xv, lo_x, dx, &plan, &split);
+                        let shape = CongruenceShape {
+                            ta: b'N',
+                            ta_n: true,
+                            m,
+                            k: m,
+                            lda: m,
+                            ldx: m,
+                            len_a: m * m,
+                            len_x: m * m,
+                            upper_only,
+                        };
+                        let solve = if columns {
+                            congruence_columns::<N>
                         } else {
-                            assert!(got[o] == serial[o] || (got[o].is_zero() && serial[o].is_zero()));
+                            congruence_prime_groups::<N>
+                        };
+                        assert!(solve(
+                            shape, &plan, &ca, &cx, &split, ways, 2 * lo_a + lo_x, &mut got
+                        ));
+                    });
+                    for j in 0..m {
+                        for i in 0..m {
+                            let o = i + j * m;
+                            if upper_only && i > j {
+                                assert_eq!(got[o], <F<N> as num_traits::One>::one());
+                            } else {
+                                assert!(got[o] == serial[o] || (got[o].is_zero() && serial[o].is_zero()));
+                            }
                         }
                     }
                 }

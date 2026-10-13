@@ -2642,17 +2642,18 @@ pub(super) fn congruence<const N: usize>(
         return false;
     }
     let (len_a, len_x) = (av.len(), xv.len());
-    let outputs = m * m;
+    let outputs = if upper_only { m * (m + 1) / 2 } else { m * m };
     let tb = if ta_n { b'T' } else { b'N' };
     // T = X·op(A)ᵀ (k × m), reduced; then C = op(A)·T.
     let prime = |q: usize, aq: &[f64], xq: &[f64], cq: &mut [f64], t: &mut Vec<f64>| {
         let (p, pinv) = (plan.p[q], plan.pinv[q]);
-        t.resize(k * m, 0.0);
+        t.resize(k * m + if upper_only { m * m.min(UPPER_PANEL) } else { 0 }, 0.0);
+        let (t, panel) = t.split_at_mut(k * m);
         int_gemm(b'N', tb, k, m, k, xq, ldx, aq, lda, t, k);
         for v in t.iter_mut() {
             *v = reduce(*v, p, pinv);
         }
-        second_product(ta, m, 0, m, k, aq, lda, t, cq, upper_only, p, pinv);
+        second_product(ta, m, 0, m, k, aq, lda, t, cq, panel, upper_only, p, pinv);
     };
     let split = split_plan(pool, (m * k * (m + k)) as u128 * plan.count() as u128);
     let ca = match cache_a {
@@ -2676,7 +2677,7 @@ pub(super) fn congruence<const N: usize>(
             len_x,
             upper_only,
         };
-        if plan.count() * outputs * 8 <= ways * GROUP_SCRATCH_BYTES {
+        if plan.count() * m * m * 8 <= ways * GROUP_SCRATCH_BYTES {
             let ok = congruence_prime_groups(shape, &plan, &ca, &cx, &split, ways, 2 * lo_a + lo_x, out);
             crate::receipt::finish("rns.congruence.prime_groups", timer);
             return ok;
@@ -2729,14 +2730,13 @@ pub(super) fn congruence<const N: usize>(
         });
     }
     let optr = SendValues(out.as_mut_ptr());
-    let total = if selected.is_empty() { outputs } else { selected.len() };
     let write = |i: usize, v: F<N>| {
         let o = if selected.is_empty() { i } else { selected[i] };
         // SAFETY: every output index is written by exactly one tile.
         unsafe { *optr.get().add(o) = v };
     };
     let scale = 2 * lo_a + lo_x;
-    let ok = crt_tiled_split(&plan, &prod, outputs, &selected, total, scale, &split, &write);
+    let ok = crt_tiled_split(&plan, &prod, outputs, &[], outputs, scale, &split, &write);
     release_buffer(prod);
     crate::receipt::finish("rns.congruence.shared_crt", timer);
     ok
@@ -2749,11 +2749,12 @@ const CONGRUENCE_MIN_COLS: usize = 4;
 const UPPER_PANEL: usize = 16;
 
 /// Output columns `j0..j0 + n` of `C = op(A)·T` modulo `p`, for `T` stored
-/// `k × n` and `C` stored `m × n`. With `upper_only` each panel of
+/// `k × n` and `C` stored `m × n`, or as packed upper columns when
+/// `upper_only`. Each upper panel of
 /// [`UPPER_PANEL`] columns stops at the last row its final column keeps, so
 /// the product covers the upper block triangle only (about half the flops of
-/// a square output). Entries below that are never read; every kept entry is
-/// the same exact integer as in the full product.
+/// a square output). The bounded `panel` scratch is packed directly into
+/// `c`; every kept entry is the same exact integer as in the full product.
 #[allow(clippy::too_many_arguments)]
 fn second_product(
     ta: u8,
@@ -2765,18 +2766,31 @@ fn second_product(
     lda: usize,
     t: &[f64],
     c: &mut [f64],
+    panel: &mut [f64],
     upper_only: bool,
     p: f64,
     pinv: f64,
 ) {
-    let panel = if upper_only { UPPER_PANEL } else { n.max(1) };
-    for c0 in (0..n).step_by(panel) {
-        let c1 = (c0 + panel).min(n);
+    let width = if upper_only { UPPER_PANEL } else { n.max(1) };
+    let mut packed = 0;
+    for c0 in (0..n).step_by(width) {
+        let c1 = (c0 + width).min(n);
         let rows = if upper_only { (j0 + c1).min(m) } else { m };
-        int_gemm(ta, b'N', rows, c1 - c0, k, aq, lda, &t[c0 * k..], k, &mut c[c0 * m..], m);
-        for col in c[c0 * m..c1 * m].chunks_mut(m) {
-            for v in &mut col[..rows] {
-                *v = reduce(*v, p, pinv);
+        if upper_only {
+            int_gemm(ta, b'N', rows, c1 - c0, k, aq, lda, &t[c0 * k..], k, panel, rows);
+            for j in c0..c1 {
+                let begin = (j - c0) * rows;
+                for &v in &panel[begin..begin + j0 + j + 1] {
+                    c[packed] = reduce(v, p, pinv);
+                    packed += 1;
+                }
+            }
+        } else {
+            int_gemm(ta, b'N', rows, c1 - c0, k, aq, lda, &t[c0 * k..], k, &mut c[c0 * m..], m);
+            for col in c[c0 * m..c1 * m].chunks_mut(m) {
+                for v in &mut col[..rows] {
+                    *v = reduce(*v, p, pinv);
+                }
             }
         }
     }
@@ -2825,25 +2839,30 @@ fn congruence_prime_groups<const N: usize>(
         upper_only,
     } = shape;
     let count = plan.count();
-    let outputs = m * m;
+    let outputs = if upper_only { m * (m + 1) / 2 } else { m * m };
     let tb = if ta_n { b'T' } else { b'N' };
     let mut prod = take_scratch(count * outputs);
     let per = count.div_ceil(ways);
     let products = |(w, chunk): (usize, &mut [f64])| {
         let (q0, q1) = (w * per, (w * per + per).min(count));
-        let (mut a, mut x, mut t) = (take_buffer(0), take_buffer(0), take_scratch(k * m));
+        let (mut a, mut x, mut t) = (
+            take_buffer(0),
+            take_buffer(0),
+            take_scratch(k * m + if upper_only { m * m.min(UPPER_PANEL) } else { 0 }),
+        );
         ca.residues(plan, q0, q1, &mut a);
         group_residues(cx.view(), plan, q0, q1, &mut x);
         for q in q0..q1 {
             let (p, pinv) = (plan.p[q], plan.pinv[q]);
             let aq = &a[(q - q0) * len_a..(q - q0 + 1) * len_a];
             let xq = &x[(q - q0) * len_x..(q - q0 + 1) * len_x];
-            int_gemm(b'N', tb, k, m, k, xq, ldx, aq, lda, &mut t, k);
+            let (t, panel) = t.split_at_mut(k * m);
+            int_gemm(b'N', tb, k, m, k, xq, ldx, aq, lda, t, k);
             for v in t.iter_mut() {
                 *v = reduce(*v, p, pinv);
             }
             let cq = &mut chunk[(q - q0) * outputs..(q - q0 + 1) * outputs];
-            second_product(ta, m, 0, m, k, aq, lda, &t, cq, upper_only, p, pinv);
+            second_product(ta, m, 0, m, k, aq, lda, t, cq, panel, upper_only, p, pinv);
         }
         for v in [a, x, t] {
             release_buffer(v);
@@ -2879,11 +2898,17 @@ fn congruence_prime_groups<const N: usize>(
         let selected: Vec<usize> = (j0..j1)
             .flat_map(|j| (0..if upper_only { j + 1 } else { m }).map(move |i| i + j * m))
             .collect();
+        let (read, range) = if upper_only {
+            (&[][..], j0 * (j0 + 1) / 2..j1 * (j1 + 1) / 2)
+        } else {
+            (&selected[..], 0..selected.len())
+        };
+        let start = range.start;
         let write = |i: usize, value: F<N>| {
             // SAFETY: column ranges, hence output positions, are disjoint across ways.
-            unsafe { *optr.get().add(selected[i]) = value };
+            unsafe { *optr.get().add(selected[i - start]) = value };
         };
-        if !crt_tiled(plan, products_ref, outputs, &selected, 0..selected.len(), scale, &write) {
+        if !crt_tiled(plan, products_ref, outputs, read, range, scale, &write) {
             failed.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     };
@@ -2962,33 +2987,30 @@ fn congruence_columns<const N: usize>(
     let part = |w: usize| {
         let (j0, j1) = (bounds[w], bounds[w + 1]);
         let width = j1 - j0;
-        let outputs = m * width;
-        let selected: Vec<usize> = if upper_only {
-            (j0..j1)
-                .flat_map(|j| (0..=j).map(move |i| i + (j - j0) * m))
-                .collect()
+        let outputs = if upper_only {
+            (j1 * (j1 + 1) - j0 * (j0 + 1)) / 2
         } else {
-            Vec::new()
+            m * width
         };
-        let mut acc =
-            CrtAccumulator::new(plan, if upper_only { selected.len() } else { outputs }, &selected);
+        let mut acc = CrtAccumulator::new(plan, outputs, &[]);
         // Rows j0.. of op(A) (A itself when ta = 'N', else its columns).
         let a_cols = if ta_n { j0 } else { j0 * lda };
-        let group = stream_group_cap(outputs);
+        let group = stream_group_cap(m * width);
         let mut prod = take_scratch(group * outputs);
-        let mut t = take_scratch(k * width);
+        let mut t = take_scratch(k * width + if upper_only { m * width.min(UPPER_PANEL) } else { 0 });
         for q0 in (0..count).step_by(group) {
             let q1 = (q0 + group).min(count);
             for q in q0..q1 {
                 let (p, pinv) = (plan.p[q], plan.pinv[q]);
                 let aq = &ar[q * len_a..(q + 1) * len_a];
                 let xq = &xr[q * len_x..(q + 1) * len_x];
-                int_gemm(b'N', tb, k, width, k, xq, ldx, &aq[a_cols..], lda, &mut t, k);
+                let (t, panel) = t.split_at_mut(k * width);
+                int_gemm(b'N', tb, k, width, k, xq, ldx, &aq[a_cols..], lda, t, k);
                 for v in t.iter_mut() {
                     *v = reduce(*v, p, pinv);
                 }
                 let cq = &mut prod[(q - q0) * outputs..(q - q0 + 1) * outputs];
-                second_product(ta, m, j0, width, k, aq, lda, &t, cq, upper_only, p, pinv);
+                second_product(ta, m, j0, width, k, aq, lda, t, cq, panel, upper_only, p, pinv);
             }
             acc.add(plan, q0, q1, &mut prod, outputs, &Split::Serial);
         }
@@ -2999,10 +3021,13 @@ fn congruence_columns<const N: usize>(
             failed.store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         }
+        let mut packed = 0;
         for j in j0..j1 {
             for i in 0..if upper_only { j + 1 } else { m } {
                 // SAFETY: column ranges are disjoint across ways.
-                unsafe { *optr.get().add(i + j * m) = local[i + (j - j0) * m] };
+                let source = if upper_only { packed } else { i + (j - j0) * m };
+                unsafe { *optr.get().add(i + j * m) = local[source] };
+                packed += 1;
             }
         }
     };
