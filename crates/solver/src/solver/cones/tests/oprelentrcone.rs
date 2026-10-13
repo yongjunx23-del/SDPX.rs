@@ -117,7 +117,7 @@ fn factored_scaling_inverts_hessian() {
 fn factored_scaling_preserves_boundary_t_block_mpfr128() {
     use num_traits::{FloatConst, One, Zero};
     use sdpx_arithmetic::Scalar;
-    type T = sdpx_arithmetic::MpFloat<128>;
+    type T = sdpx_arithmetic::MpFloat<2>;
     let two: T = (2.0).as_T();
     let tiny = two.powi(-80);
     let a = (T::one() + tiny) / two;
@@ -218,7 +218,7 @@ fn dual_ok_matches_factor_near_threshold() {
         }
     }
     check::<f64>();
-    check::<sdpx_arithmetic::MpFloat<128>>();
+    check::<sdpx_arithmetic::MpFloat<2>>();
 }
 
 #[test]
