@@ -587,6 +587,12 @@ where
             .fold(T::zero(), T::max)
     }
 
+    /// Whether the KKT stores only its diagonal, so every factor has L = I.
+    pub(crate) fn structurally_diagonal(&self) -> bool {
+        self.ore.is_empty()
+            && (0..self.KKT.n).all(|j| self.KKT.colptr[j + 1] == j + 1 && self.KKT.rowval[j] == j)
+    }
+
     /// Dimension of the complete local KKT, including sparse-cone auxiliaries.
     pub(crate) fn factor_dimension(&self) -> usize {
         self.KKT.n

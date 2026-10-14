@@ -686,6 +686,36 @@ fn check_free_columns<T: FloatT>() {
     check(make);
 }
 
+fn check_diagonal_interior<T: FloatT>() {
+    let make = super::super::state::tests::bounded_lp::<T>;
+    let data = make();
+    let state = runtime(
+        make(),
+        1,
+        DefaultSettings {
+            max_threads: 1,
+            ..DefaultSettings::default()
+        },
+        (data.n, data.m),
+    );
+    let owned = OwnedKkt::new_with_pool(
+        &state.data.layout,
+        state.data.blocks.iter().zip(&state.cones.blocks),
+        &CoreSettings::<T>::default(),
+        None,
+        false,
+    );
+    let engaged = T::precision_bits() > 64;
+    assert!(owned.locals.iter().all(|l| l.diagonal.is_some() == engaged));
+    check(make);
+}
+
+#[test]
+fn owned_kkt_diagonal_interior() {
+    check_diagonal_interior::<f64>();
+    check_diagonal_interior::<MpFloat<4>>();
+}
+
 #[test]
 fn owned_kkt_free_columns() {
     check_free_columns::<f64>();

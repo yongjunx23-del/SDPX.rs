@@ -47,6 +47,19 @@ struct LocalKkt<T: FloatT> {
     /// and the position of the first in the global free list.
     free: Vec<usize>,
     free_offset: usize,
+    /// Set for a dense coupling over a diagonal interior (LP bounds).
+    diagonal: Option<DiagonalCoupling<T>>,
+}
+
+/// A diagonal interior factor has L = I under any order, so R = D⁻¹Cᵀ is a
+/// scaling of Cᵀ and C·R is the exact congruence C·D⁻¹·Cᵀ over Cᵀ's cached
+/// residues. Per factorization only D⁻¹ is new.
+struct DiagonalCoupling<T> {
+    /// Cᵀ, column-major n × border.
+    ct: Vec<T>,
+    /// The applied D⁻¹, zero on free columns.
+    weights: Vec<T>,
+    cache: ResidueCache,
 }
 
 impl<T: FloatT> LocalKkt<T> {
@@ -517,6 +530,19 @@ impl<T: FloatT> OwnedKkt<T> {
                 coupling_plan.configure(&coupling, pool.clone());
                 let cells = kernel.interior_dimension() * border;
                 let free = free_columns(&data.P, &data.A, &rows);
+                let diagonal = (dense_coupling
+                    && border > 0
+                    && T::precision_bits() > 64
+                    && kernel.interior_dimension() == data.n
+                    && kernel.interior_diagonal())
+                .then(|| DiagonalCoupling {
+                    ct: (0..border)
+                        .flat_map(|j| (0..data.n).map(move |c| (j, c)))
+                        .map(|(j, c)| coupling.nzval[c * border + j])
+                        .collect(),
+                    weights: vec![T::zero(); data.n],
+                    cache: ResidueCache::default(),
+                });
                 LocalKkt {
                     kernel,
                     n: data.n,
@@ -535,6 +561,7 @@ impl<T: FloatT> OwnedKkt<T> {
                     rhs_cache: [Vec::new(), Vec::new()],
                     free,
                     free_offset: 0,
+                    diagonal,
                 }
             })
             .collect();
@@ -766,10 +793,41 @@ impl<T: FloatT> OwnedKkt<T> {
         let shift = self.shift;
         let timer = crate::receipt::start();
         let record_costs = self.record_costs;
+        let pool = self.pool.clone();
         let factor = |(local,): (&mut LocalKkt<T>,)| {
             let started = record_costs.then(Instant::now);
             let valid = if !local.kernel.factor_interior(settings, shift) {
                 false
+            } else if let Some(diagonal) = local.diagonal.as_mut() {
+                // One solve of ones gives the applied D⁻¹; R = D⁻¹Cᵀ.
+                let n = local.n;
+                let ones = &mut local.coupling_rhs[..n];
+                ones.fill(T::one());
+                let solved = local
+                    .kernel
+                    .solve_interior_panel(ones, &mut diagonal.weights, 1);
+                if solved {
+                    for &f in &local.free {
+                        diagonal.weights[f] = T::zero();
+                    }
+                    let (ct, weights) = (&diagonal.ct, &diagonal.weights);
+                    let scale = |(column, rows): (&mut [T], &[T])| {
+                        for ((r, &c), &w) in column.iter_mut().zip(rows).zip(weights) {
+                            *r = c * w;
+                        }
+                    };
+                    let response = &mut local.response;
+                    match &pool {
+                        Some(pool) => pool.install(|| {
+                            response
+                                .par_chunks_mut(n)
+                                .zip(ct.par_chunks(n))
+                                .for_each(scale)
+                        }),
+                        None => response.chunks_mut(n).zip(ct.chunks(n)).for_each(scale),
+                    }
+                }
+                solved
             } else {
                 let d = local.kernel.interior_dimension();
                 local.coupling_rhs.fill(T::zero());
@@ -831,18 +889,37 @@ impl<T: FloatT> OwnedKkt<T> {
 
     fn assemble_border(&mut self) -> bool {
         let border = self.border_matrix.n;
-        let locals = &self.locals;
-        let pointers = &self.border_matrix.colptr;
+        let pool = self.pool.as_deref();
         // A dense coupling's upper C·R comes from one exact residue product:
         // each entry is the exact row sum rounded once, as its wide GEMV row.
-        let products: Vec<Option<Vec<T>>> = locals
-            .iter()
+        // Over a diagonal interior it is C·D⁻¹·Cᵀ, each entry rounded once.
+        let products: Vec<Option<Vec<T>>> = self
+            .locals
+            .iter_mut()
             .map(|local| {
                 if !local.dense_coupling {
                     return None;
                 }
-                let d = local.kernel.interior_dimension();
                 let mut product = vec![T::zero(); border * (border + 1) / 2];
+                if let Some(diagonal) = local.diagonal.as_mut() {
+                    let mut full = vec![T::zero(); border * border];
+                    if T::diag_congruence_upper_exact(
+                        border,
+                        local.n,
+                        &diagonal.ct,
+                        &diagonal.weights,
+                        &mut full,
+                        pool,
+                        &mut diagonal.cache,
+                    ) {
+                        for j in 0..border {
+                            product[j * (j + 1) / 2..][..j + 1]
+                                .clone_from_slice(&full[j * border..][..j + 1]);
+                        }
+                        return Some(product);
+                    }
+                }
+                let d = local.kernel.interior_dimension();
                 T::xgemm_upper_exact(
                     b'N',
                     b'N',
@@ -854,12 +931,14 @@ impl<T: FloatT> OwnedKkt<T> {
                     &local.response,
                     d,
                     &mut product,
-                    self.pool.as_deref(),
+                    pool,
                     None,
                 )
                 .then_some(product)
             })
             .collect();
+        let locals = &self.locals;
+        let pointers = &self.border_matrix.colptr;
         // Column j of the upper triangle needs coupling rows 0..=j only. Each
         // entry is the value the full local GEMV gives that row (same terms,
         // order and rounding) added in owner order, so the matrix is

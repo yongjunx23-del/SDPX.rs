@@ -1859,6 +1859,11 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         self.reduced.isolated_columns(columns)
     }
 
+    /// Whether the interior KKT stores only its diagonal.
+    pub(crate) fn interior_diagonal(&self) -> bool {
+        self.reduced.structurally_diagonal()
+    }
+
     pub(crate) fn factor_interior(&mut self, settings: &CoreSettings<T>, shift: T) -> bool {
         self.reduced.factor_with_shift(settings, Some(shift))
     }

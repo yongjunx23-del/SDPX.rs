@@ -318,6 +318,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - 2026-10-15 (journal): local condensed kernels (owner path) run A's products on their pool's output lanes. fix-a 256 owner −6.7% at T=2; points are bitwise unchanged.
    - 2026-10-15 (journal): the owner border assembly takes one exact residue product per dense coupling. fix-a 256 owner −19.1% (release); points are bitwise unchanged. The owner path is still about 16× plain on dense-border LPs.
    - 2026-10-15 (journal): owner free columns (only border equalities touch them) join the border system and are eliminated exactly, instead of an escalated 1e-72 shift that buried S in rounding. fix-a 256 owner 121.9 → 39.0 s (−68%), 0 outer refinements instead of 762; audited; plain bitwise unchanged. Late-iteration peak RSS rises (2.4 → 3.4–4.0 GB). Next: diagonal local kernels via the bound Gram congruence (border_assemble 11.3 s + factor_response 4.8 s).
+   - 2026-10-15 (journal): a structurally diagonal owner interior (LP bounds) takes R = D⁻¹Cᵀ by scaling and C·D⁻¹·Cᵀ by the exact diagonal congruence over cached Cᵀ residues. fix-a 256 owner 39.3 → 25.3 s (−35.8%), peak RSS 3.5–3.7 → 1.26 GB; partitions 2 −37%; audited. Next: serial condensed `residual`/`recover_rhs` in owner solves (7.9 s of 25.3).
    - Next:
      - a full one_L12/128 solve with audit;
      - the S₀⁻¹ leaf factor from the cone's L⁻¹ (skip re-factoring the leaf);

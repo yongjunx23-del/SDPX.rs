@@ -170,6 +170,36 @@ pub(crate) fn free_variables<T: FloatT>() -> DefaultProblemData<T> {
     d
 }
 
+/// Two dense equality rows over eight bounded variables with a diagonal P:
+/// every owner's interior KKT is diagonal and its coupling dense.
+pub(crate) fn bounded_lp<T: FloatT>() -> DefaultProblemData<T> {
+    let mut a = [[T::zero(); 8]; 10];
+    for j in 0..8 {
+        a[0][j] = n(j as i32 + 1);
+        a[1][j] = n(3 - 2 * (j as i32 % 3));
+        a[2 + j][j] = -T::one();
+    }
+    let mut p = [[T::zero(); 8]; 8];
+    for i in (0..8).step_by(2) {
+        p[i][i] = n(i as i32 + 1);
+    }
+    let kinds = vec![
+        SupportedConeT::ZeroConeT(2),
+        SupportedConeT::NonnegativeConeT(8),
+    ];
+    let settings = settings();
+    let mut d = DefaultProblemData::new(
+        &CscMatrix::from(&p),
+        &[1, -2, 3, -4, 5, -6, 2, -1].map(n),
+        &CscMatrix::from(&a),
+        &[4, 1, 0, 0, 0, 0, 0, 0, 0, 0].map(n),
+        &kinds,
+        &settings,
+    );
+    d.equilibrate(&CompositeCone::new(&d.cones), &settings);
+    d
+}
+
 pub(crate) fn sampled<T: FloatT>() -> DefaultProblemData<T> {
     let mut ptr = vec![0];
     let mut rows = Vec::new();

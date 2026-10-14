@@ -8,6 +8,35 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Owner border over a diagonal interior: exact congruence (thermal-ore)
+
+- Observed (fix-a 256, owner path, partitions 1, T=2, after d3230d1):
+  - The local interior KKT is structurally diagonal: 20200 single-entry bound rows condensed, P = 0, two free columns with unit pivots.
+  - The border coupling is dense (99 × 20202).
+  - Per factorization the owner still:
+    - solved 99 coupling columns through the arrow backend (`many.rows`/`trsv`: 3.3–3.8 s, serial);
+    - formed C·R by an exact residue gemm with R fresh each time (`border_assemble` 11.3 s).
+  - The residues of R also drove peak RSS to 3.4–4.0 GB late in the solve.
+- Change (`distributed::kkt`, `direct::solver`):
+  - When the interior KKT stores only its diagonal (any factor then has L = I), the coupling is dense and precision > 64 bits, one solve of a ones vector gives the applied D⁻¹, and R = D⁻¹Cᵀ is a scaling on the pool.
+  - C·R becomes `diag_congruence_upper_exact(Cᵀ, D⁻¹)`: each entry is the exact Σ c·d⁻¹·c rounded once. Cᵀ's residues stay cached, as in plain's bound Gram.
+  - Free columns get weight zero.
+  - A declined congruence (spread too wide) falls back to the previous residue gemm on R.
+- E2E (Mac, fast profile, fix-a 256, T=2): ABBA, every run Solved in 33 iterations.
+
+  | Arm | Run 1 s | Run 2 s | Peak RSS MiB |
+  |---|---|---|---|
+  | A (d3230d1) | 39.33 | 39.31 | 3495 / 3702 |
+  | B | 25.27 | 25.25 (−35.8%) | 1264 / 1265 |
+
+  - Phases in B: border_assemble 11.3 → 2.1 s, factor_response 4.8 → 0.7 s, backend linear solves 3731 → 399.
+  - Partitions 2: 30.3 → 19.0 s (−37%), RSS 3277 → 1332 MiB.
+  - Audit at 384 bits, original coordinates: primal rel 1.7e-19, dual rel 7.5e-19, gap rel 6.8e-21 for A, for B and for B at partitions 2. Points differ from A by ≤ 3.4e-60 (x) and 1.6e-74 (z).
+  - Plain points are bitwise identical (e3b8a66f5aec), 8.72 s.
+  - Unit test: a two-equality bounded LP at 1, 2 and 8 owners, f64 (path off) and 256 bits (path on), stationary and GMRES. 503 lib tests pass. The `it` suite fails only the known `overshooting_start_still_solves`.
+- Decision: kept.
+- Remaining owner cost (B, 25.3 s): the condensed `residual` 4.4 s and `recover_rhs` 3.5 s are ~90% serial at T=2. Plain takes 8.5 s in total.
+
 ## 2026-10-15 — Owner border: free columns join the border system (thermal-ore)
 
 - Observed (trace, fix-a 256, owner path, T=2):
