@@ -2317,7 +2317,8 @@ pub(super) fn diag_congruence<const N: usize>(
     let Some(plan) = Plan::new(k.min(DIAG_BLOCK_ROWS), needed) else {
         return false;
     };
-    let split = split_plan(pool, (m * m * k) as u128 * plan.count() as u128);
+    let work = (m * m * k) as u128 * plan.count() as u128;
+    let split = split_plan(pool, work);
     let entry = match cached.filter(|e| e.bits == plan.bits && e.count >= plan.count()) {
         Some(entry) => entry,
         None => {
@@ -2338,74 +2339,81 @@ pub(super) fn diag_congruence<const N: usize>(
     );
     let len = k * m;
     let outputs = if upper_only { m * (m + 1) / 2 } else { m * m };
-    // Ways own disjoint row blocks and run every prime over them; partial
-    // residues add exactly mod p, so the result is independent of the split.
-    // Scratch per way is one row block × m plus the selected residues per prime.
-    // Give each way the same number of cache-sized blocks. A plain 4096-row
-    // cap can leave one way with twice the work (five blocks on four ways).
-    let ways = split_ways(&split).min((k / 256).max(1)).max(1);
-    let blocks_per_way = k.div_ceil(ways * DIAG_BLOCK_ROWS);
-    let rows_per = k.div_ceil(ways * blocks_per_way);
-    let blocks = k.div_ceil(rows_per);
-    let parts: Vec<Mutex<Vec<f64>>> = (0..ways).map(|_| Mutex::new(Vec::new())).collect();
-    run_ways(&split, ways, |w| {
-        let mut part = take_buffer(count * outputs);
+    // The ways claim (row block, prime) units in turn. Each prime keeps one
+    // accumulator, so no way holds a private count × outputs copy to fold
+    // serially. Partial residues add exactly mod p, so the result does not
+    // depend on the split or the claiming order. Scratch per way is one row
+    // block × m plus the selected residues.
+    let blocks = k.div_ceil(DIAG_BLOCK_ROWS);
+    let rows_per = k.div_ceil(blocks);
+    let units = blocks * count;
+    let ways = split_ways(&split)
+        .min(units)
+        .min((work / way_work()).min(usize::MAX as u128) as usize)
+        .max(1);
+    let mut total = take_buffer(count * outputs);
+    let sums: Vec<Mutex<&mut [f64]>> = total.chunks_mut(outputs).map(Mutex::new).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    run_ways(&split, ways, |_| {
         let (mut ab, mut cb) = (take_scratch(rows_per * m), take_scratch(rows_per * m));
         let tile = if upper_only { 32 } else { m };
         let mut u = take_scratch(m * tile.min(m));
-        for b in (w..blocks).step_by(ways) {
+        let claimed = std::iter::from_fn(|| {
+            let unit = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (unit < units).then(|| (unit / count, unit % count))
+        });
+        for (b, q) in claimed {
             let (r0, rows) = (b * rows_per, rows_per.min(k - b * rows_per));
-            for q in 0..count {
-                let (p, pinv) = (plan.p[q], plan.pinv[q]);
-                ab.clear();
-                for j in 0..m {
-                    let at = q * len + j * k + r0;
-                    entry.res.extend(at..at + rows, &mut ab);
-                }
-                // Balanced residues below p/2 < 2^25: each product is exact.
-                let dq = &dres[q * k + r0..][..rows];
-                cb.clear();
-                for column in ab.chunks(rows) {
-                    cb.extend(
-                        column
-                            .iter()
-                            .zip(dq)
-                            .map(|(&x, &w)| residue_product(x, w, p, pinv)),
-                    );
-                }
-                // Rectangular tiles cover the upper triangle. Products and
-                // modular sums remain exact, independent of tile/way order.
-                // The prime width bounds one block: every <=4096-row block
-                // fits one product.
-                debug_assert!(rows <= plan.k_chunk);
-                for j0 in (0..m).step_by(tile) {
-                    let cols = tile.min(m - j0);
-                    let height = if upper_only { j0 + cols } else { m };
-                    int_gemm(
-                        b'T',
-                        b'N',
-                        height,
-                        cols,
-                        rows,
-                        &ab,
-                        rows,
-                        &cb[j0 * rows..],
-                        rows,
-                        &mut u[..height * cols],
-                        height,
-                    );
-                    for j in 0..cols {
-                        let end = if upper_only { j0 + j + 1 } else { height };
-                        let column = j0 + j;
-                        let offset = if upper_only {
-                            column * (column + 1) / 2
-                        } else {
-                            column * m
-                        };
-                        for i in 0..end {
-                            let x = &mut part[q * outputs + offset + i];
-                            *x = reduce(*x + reduce(u[j * height + i], p, pinv), p, pinv);
-                        }
+            let (p, pinv) = (plan.p[q], plan.pinv[q]);
+            ab.clear();
+            for j in 0..m {
+                let at = q * len + j * k + r0;
+                entry.res.extend(at..at + rows, &mut ab);
+            }
+            // Balanced residues below p/2 < 2^25: each product is exact.
+            let dq = &dres[q * k + r0..][..rows];
+            cb.clear();
+            for column in ab.chunks(rows) {
+                cb.extend(
+                    column
+                        .iter()
+                        .zip(dq)
+                        .map(|(&x, &w)| residue_product(x, w, p, pinv)),
+                );
+            }
+            // Rectangular tiles cover the upper triangle. Products and
+            // modular sums remain exact, independent of tile/way order.
+            // The prime width bounds one block: every <=4096-row block
+            // fits one product.
+            debug_assert!(rows <= plan.k_chunk);
+            for j0 in (0..m).step_by(tile) {
+                let cols = tile.min(m - j0);
+                let height = if upper_only { j0 + cols } else { m };
+                int_gemm(
+                    b'T',
+                    b'N',
+                    height,
+                    cols,
+                    rows,
+                    &ab,
+                    rows,
+                    &cb[j0 * rows..],
+                    rows,
+                    &mut u[..height * cols],
+                    height,
+                );
+                let mut sum = sums[q].lock().unwrap();
+                for j in 0..cols {
+                    let end = if upper_only { j0 + j + 1 } else { height };
+                    let column = j0 + j;
+                    let offset = if upper_only {
+                        column * (column + 1) / 2
+                    } else {
+                        column * m
+                    };
+                    for i in 0..end {
+                        let x = &mut sum[offset + i];
+                        *x = reduce(*x + reduce(u[j * height + i], p, pinv), p, pinv);
                     }
                 }
             }
@@ -2413,23 +2421,9 @@ pub(super) fn diag_congruence<const N: usize>(
         for v in [ab, cb, u] {
             release_buffer(v);
         }
-        *parts[w].lock().unwrap() = part;
     });
+    drop(sums);
     release_buffer(dres);
-    let mut parts = parts.into_iter().map(|p| p.into_inner().unwrap());
-    let mut total = parts.next().unwrap();
-    for part in parts {
-        for q in 0..count {
-            let (p, pinv) = (plan.p[q], plan.pinv[q]);
-            for (x, &y) in total[q * outputs..][..outputs]
-                .iter_mut()
-                .zip(&part[q * outputs..])
-            {
-                *x = reduce(*x + y, p, pinv);
-            }
-        }
-        release_buffer(part);
-    }
     let selected;
     let mut acc = CrtAccumulator::new(&plan, outputs, &[]);
     for q0 in (0..count).step_by(STREAM_GROUP) {

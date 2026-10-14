@@ -8,6 +8,23 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Bound Gram: shared per-prime sums instead of per-way copies (thermal-ore)
+
+- Observed (code): `diag_congruence` gave each way a private count × outputs residue copy and folded the copies serially after the products.
+  - For the full gravity border (t = 643, 31 primes) one copy is 51 MB. At 64 threads that is 3.3 GB, and the fold reads all of it on one thread.
+- Change (`rns_blas::diag_congruence`): ways claim (row block, prime) units from one counter. Each prime keeps one accumulator behind a lock.
+  - Residue sums are exact mod p, so neither the claiming order nor the split changes a bit.
+  - The way count is also capped by `way_work`, like the other residue kernels.
+- E2E: ABBA, quarter-size gravity LP, 128 bits, `SDPX_INT_GEMM=faer` (the Linux kernel), T=10 (Mac). All four points are identical.
+
+  | Arm | Run 1 s | Run 2 s | Mean s | `arrow.local_schur` s | Peak RSS MiB |
+  |---|---|---|---|---|---|
+  | A (f38aec9) | 80.4 | 81.2 | 80.8 | 57.8 / 58.7 | 4197 / 4115 |
+  | B | 78.3 | 79.2 | 78.8 (−2.6%) | 55.8 / 56.8 | 4125 / 3749 |
+
+- Rejected in the same ABBA: the owner pair solve's interior back-substitution on the pool (`border_rows`). fix-a 256 at T=2: 130.7 → 129.9 s (−0.6%), with bitwise-identical points.
+- Decision: kept (the Gram change). The memory saving grows with the thread count; it has not been measured on the cluster.
+
 ## 2026-10-15 — Owner border assembly: one exact residue product per dense coupling (thermal-ore)
 
 - Observed (fix-a gravity LP, 99 dense equality rows × 20,202 columns, 256 bits, `--partitions 1 --threads 2`): the owner path's `owned.border_assemble` took 43.6 s of 158.6 s.
