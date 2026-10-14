@@ -306,7 +306,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
      - the S₀⁻¹ leaf factor from the cone's L⁻¹ (skip re-factoring the leaf);
      - the two_L8 gap stall (53: AlmostSolved; 128: stall at 3e-8).
    - Closed: Gram-row elimination of the cone (accuracy), μS₀ as the leaf inverse (inconsistent with the stored S₀⁻¹).
-   - one_L8 and one_L10 at 128 bits are ill-posed inputs (known failures).
+   - one_L8 and one_L10 at 128 bits are known failures. 2026-10-14 (journal): one_L8's optimum is not attained; the value keeps falling as ORE10 X(9,9) = Y(9,9) grows. one_L12 is likely the same.
 
 Parked with WIP committed (journal 2026-10-09):
 - `perf-fulldir` `6af5724`: regression.

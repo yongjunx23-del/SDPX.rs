@@ -8,6 +8,27 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — Thermal one_L8/128 stall: the optimum is not attained (diagnosis, thermal-ore)
+
+- Observed: one_L8/128 stalls at gap ≈ 9e-9 (MaxIterations 400, τ chases at 60 and 151). The audit passes the residuals but fails the gap (8.8e-9); the ORE dual ratio is 1.4e49 and x9 = x10 → −1.07e13.
+- Structure (verified on the input with exact rational coefficients):
+  - x25 has zero cost and enters only PSD21(20,20).
+  - e9 + e10 changes only PSD21 (16,20), (18,20) and (19,20). With that diagonal free, x9 + x10 is a zero-cost recession direction, which is the drift.
+  - A Sieve-SDP-style pass removes x25–x28, x30 and PSD21 row 20 (PSD21 → PSD16). Columns 9 and 10 then coincide up to sign.
+- Test: the sieved input plus a bound Y(9,9) ≤ M on the ORE10 cone (X(9,9) moves with it), cg1 binary, T=1:
+
+  | M | Status | Iterations | Objective |
+  |---|---|---|---|
+  | 10 | AlmostSolved (gap 1.8e-22) | 201 | 0.897454 |
+  | 1e3 | AlmostSolved | 193 | 0.897142 |
+  | 1e5 | InsufficientProgress | 219 | 0.896997 |
+  | none (sieved) | AlmostSolved | 400 | 0.896673 |
+  | none (original) | MaxIterations | 400 | 0.896623 |
+
+  The objective keeps falling as the top diagonal X(9,9) = Y(9,9) of the largest ORE cone grows. The infimum is approached only at infinity, so no bounded point reaches a 1e-23 gap. The 128-bit failure is a property of the model in its present truncation, not of solver speed or accuracy.
+- Hypothesis: one_L12 behaves the same way. The sieve finds the same kind of free top moment there (x75, x210), and one_L12f/128 stalls at gap ≈ 7e-10 from iteration 60.
+- Decision: no solver change. The one-matrix 128-bit inputs stay known failures. Model note: bound the top moments or ORE10 X/Y(9,9), or restate the one-matrix problem. two_L4/two_L6 are attained.
+
 ## 2026-10-14 — Thermal ORE: leaf row envelope, board-posted ORE kernels, parallel wide Schur columns (thermal-ore)
 
 - Hypotheses (one_L12/128 receipts after `f7fb3a9`):
