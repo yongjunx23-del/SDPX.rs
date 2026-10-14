@@ -1573,14 +1573,18 @@ impl<T: FloatT> OwnedKkt<T> {
                 valid[c] = false;
                 continue;
             }
-            for (local, x) in self.locals.iter().zip(&mut point.blocks) {
+            let (pool, y) = (self.pool.as_ref(), &point.border);
+            let correct = |(local, x): (&LocalKkt<T>, &mut Vec<T>)| {
                 let d = x.len();
-                for (i, value) in x.iter_mut().enumerate() {
-                    *value -= T::dot_fma(
-                        (0..border).map(|j| (&local.response[j * d + i], &point.border[j])),
-                    );
-                }
-            }
+                border_rows(pool, x, border, |i, v| {
+                    *v -= T::dot_fma((0..border).map(|j| (&local.response[j * d + i], &y[j])));
+                });
+            };
+            for_blocks!(
+                self.pool.as_ref(),
+                (&self.locals, &mut point.blocks),
+                correct
+            );
             FreeBorder::place(&self.locals, &mut point.blocks, x_free);
             valid[c] &= point.norm().is_finite();
         }

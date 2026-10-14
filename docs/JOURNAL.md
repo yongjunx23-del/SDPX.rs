@@ -8,6 +8,20 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Owner pair solve: interior back-substitution on the pool (thermal-ore)
+
+- Observed (9e4708f, d6n640q owner): about 8.6 s of the 55.6 s `kkt update` was the constant/affine pair solve. After the border solve, its interior back-substitution x −= R·y ran one serial loop per local: 16.8k rows × 640 exact terms per column. The single-column solve already split those rows over the owner pool (`border_rows`).
+- Change: the pair path uses the same `border_rows` closure under `for_blocks!`. Each row keeps its exact dot, so results are bitwise identical.
+- E2E (Mac, fast profile), ABBA, every point bitwise identical to A:
+
+  | Case | A (9e4708f) s | B s | Change |
+  |---|---|---|---|
+  | fix-a 256, partitions 1, T=2 | 10.49 / 10.53 | 10.15 / 10.21 | −3.1% |
+  | fix-a 256, partitions 2, T=10 | 7.36 / 7.32 | 6.79 / 6.85 | −7.1% |
+  | d6n640q 128, partitions 1, T=10 | 75.10 / 73.54 | 70.29 / 68.65 | −6.5% |
+
+- Decision: kept. Audits carry over from 9e4708f.
+
 ## 2026-10-15 — Owner free-column border: one refinement round on the bordered system (thermal-ore)
 
 - Observed (Mac, 5da083c, d6n640q 128 owner, T=10):
