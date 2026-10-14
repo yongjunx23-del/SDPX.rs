@@ -2264,6 +2264,9 @@ fn round_slots<const N: usize>(slots: &[i128], scale: i64, mag: &mut Vec<u64>) -
 /// `k` scaling values are encoded per call. Reset `cache_a` when `A` changes.
 /// `upper_only` as in [`gemm`].
 #[allow(clippy::too_many_arguments)]
+/// Rows per integer product in [`diag_congruence`].
+const DIAG_BLOCK_ROWS: usize = 4096;
+
 pub(super) fn diag_congruence<const N: usize>(
     m: usize,
     k: usize,
@@ -2309,7 +2312,9 @@ pub(super) fn diag_congruence<const N: usize>(
     // |C| <= k·2^(2(P+da))·2^(P+dd), with the 4|C| CRT margin.
     let p_bits = F::<N>::PRECISION_BITS as f64;
     let needed = 3.0 * p_bits + (2 * da + dd) as f64 + (k.max(1) as f64).log2() + 3.0;
-    let Some(plan) = Plan::new(k, needed) else {
+    // Each integer product below sums at most one row block before its
+    // reduction, so the primes are as wide as a block allows, not all of k.
+    let Some(plan) = Plan::new(k.min(DIAG_BLOCK_ROWS), needed) else {
         return false;
     };
     let split = split_plan(pool, (m * m * k) as u128 * plan.count() as u128);
@@ -2339,7 +2344,7 @@ pub(super) fn diag_congruence<const N: usize>(
     // Give each way the same number of cache-sized blocks. A plain 4096-row
     // cap can leave one way with twice the work (five blocks on four ways).
     let ways = split_ways(&split).min((k / 256).max(1)).max(1);
-    let blocks_per_way = k.div_ceil(ways * 4096);
+    let blocks_per_way = k.div_ceil(ways * DIAG_BLOCK_ROWS);
     let rows_per = k.div_ceil(ways * blocks_per_way);
     let blocks = k.div_ceil(rows_per);
     let parts: Vec<Mutex<Vec<f64>>> = (0..ways).map(|_| Mutex::new(Vec::new())).collect();
@@ -2370,8 +2375,8 @@ pub(super) fn diag_congruence<const N: usize>(
                 }
                 // Rectangular tiles cover the upper triangle. Products and
                 // modular sums remain exact, independent of tile/way order.
-                // The prime width bounds the full k, or (at its minimum)
-                // k_chunk is 2^19: every <=4096-row block fits one product.
+                // The prime width bounds one block: every <=4096-row block
+                // fits one product.
                 debug_assert!(rows <= plan.k_chunk);
                 for j0 in (0..m).step_by(tile) {
                     let cols = tile.min(m - j0);

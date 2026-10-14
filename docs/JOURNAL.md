@@ -8,6 +8,24 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Bound Gram primes sized by the row block (thermal-ore)
+
+- Observed (quarter-size gravity LP, 16,780 columns, 128 bits): the bound-arrow border Gram (`arrow.local_schur`, the exact residue Yᵀdiag(d)Y) scales 1.12× from T=1 to T=4 (52.1 → 46.3 s). Every other phase scales 3.0–3.5×.
+  - The cause is Mac-specific. Accelerate's integer products run on the shared AMX unit. With `SDPX_INT_GEMM=faer` (the Linux default) the Gram scales 3.5× (254.8 → 72.1 s), but it is 5× slower per core. Points are identical on all four runs.
+- Observed (spread probe): the Gram needs 24 primes at the start and 31 at the end. 3P = 384 bits, 2·da = 78 bits (the A spread) and dd = 0 → 133 bits (the bound pivots' spread).
+  - The primes were sized for the whole k: 20 bits at 16,780 rows and 19 bits at 33,560 or more.
+  - Each integer product, however, sums one ≤4096-row block before its reduction. That block allows 21 bits.
+- Change (`rns_blas::diag_congruence`): `Plan::new(k.min(DIAG_BLOCK_ROWS), needed)`. The magnitude bound still uses the full k. It is exact, so the bits are unchanged, and the residue cache shrinks by the same share.
+  - A new unit case (k = 9000) checks the exactly rounded result at the wider primes.
+- E2E: ABBA, half-size gravity LP (33,563 columns), 128 bits, T=4 (Mac). All four points are identical.
+
+  | Arm | Run 1 s | Run 2 s | Mean s | `arrow.local_schur` s |
+  |---|---|---|---|---|
+  | A (0eb9a7d) | 244.7 | 246.8 | 245.8 | 140.6 / 139.4 |
+  | B | 226.5 | 210.2 | 218.4 (−11.2%) | 124.6 / 116.5 |
+
+- Decision: kept.
+
 ## 2026-10-14 — Gravity LP: bound-arrow memory gate as the generic arrow's (thermal-ore)
 
 - Observed: the user's restricted fixed-a LP (gravity_sampling_prl, D6 N640 J1792, whitened) has 640 dense equality rows and 67,120 bounded plus 3 free columns: 43M nonzeros at 128 bits. It never reached `local_bounds` and fell to serial QDLDL on the 134,883-row KKT (`eligible=false`, no `LOCAL_BOUNDS` line).

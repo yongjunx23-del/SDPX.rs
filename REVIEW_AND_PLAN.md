@@ -313,6 +313,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - 2026-10-14 (journal): affine ORE step searches run on the idle pool, as final searches already did, so their dual trials below αs are batched. two_L6 −5…−8% at T=4 and T=8. Points are bitwise unchanged.
    - 2026-10-14 (journal): the ORE combined shift runs its independent products in paired joins and reuses the scaling's oracle at s. two_L6 −3.6…−4.1% at T=4 and −0.8…−0.9% at T=1. Points are bitwise unchanged.
    - 2026-10-14 (journal): the bound-arrow memory gate uses the generic arrow's ceiling. Large dense MPFR LPs (the gravity restricted LP: 640 × 67k at 128 bits) no longer fall to serial QDLDL, which took 330 s per factorization on half the instance. Both sizes are Solved and audited. Open: the owner path's border assembly and pair solves for LP leaves (166–226 s vs 6–16 s plain on fix-a 256).
+   - 2026-10-15 (journal): bound-arrow Gram primes are sized by the 4096-row product block, not the whole k (21 instead of 19–20 bits). Half-size gravity LP −11.2% at T=4; points are bitwise unchanged.
    - Next:
      - a full one_L12/128 solve with audit;
      - the S₀⁻¹ leaf factor from the cone's L⁻¹ (skip re-factoring the leaf);
