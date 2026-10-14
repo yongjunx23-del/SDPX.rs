@@ -856,28 +856,32 @@ impl<T: FloatT> Oracle<T> {
         let nn = n * n;
         let m2 = 2 * m;
         let mut s0 = vec![T::zero(); m2 * m2];
-        let mut h = vec![T::zero(); nn];
-        let mut k = vec![T::zero(); nn];
-        let mut oh = vec![T::zero(); nn];
-        let mut ok = vec![T::zero(); nn];
-        let mut ws = Vec::new();
-        let mut e = vec![T::zero(); m];
         let pairs: Vec<(usize, usize)> = (0..n).flat_map(|j| (0..=j).map(move |i| (i, j))).collect();
-        for col in 0..m2 {
-            e.fill(T::zero());
-            e[col % m] = T::one();
-            if col < m {
-                smat(n, &e, &mut h);
-                k.fill(T::zero());
-            } else {
-                h.fill(T::zero());
-                smat(n, &e, &mut k);
+        // columns in pieces of n, each piece with its own scratch
+        let this = &*self;
+        pieces::<T>(&mut s0, n * m2, 16 * m2 * nn, |piece, cols| {
+            let mut h = vec![T::zero(); nn];
+            let mut k = vec![T::zero(); nn];
+            let mut oh = vec![T::zero(); nn];
+            let mut ok = vec![T::zero(); nn];
+            let mut ws = Vec::new();
+            let mut e = vec![T::zero(); m];
+            for (c, column) in cols.chunks_exact_mut(m2).enumerate() {
+                let col = piece * n + c;
+                e.fill(T::zero());
+                e[col % m] = T::one();
+                if col < m {
+                    smat(n, &e, &mut h);
+                    k.fill(T::zero());
+                } else {
+                    h.fill(T::zero());
+                    smat(n, &e, &mut k);
+                }
+                this.schur_apply(&h, &k, &mut oh, &mut ok, &mut ws, Some(pairs[col % m]));
+                svec(n, &oh, &mut column[..m]);
+                svec(n, &ok, &mut column[m..]);
             }
-            self.schur_apply(&h, &k, &mut oh, &mut ok, &mut ws, Some(pairs[col % m]));
-            let column = &mut s0[col * m2..(col + 1) * m2];
-            svec(n, &oh, &mut column[..m]);
-            svec(n, &ok, &mut column[m..]);
-        }
+        });
         symmetrize(m2, &mut s0);
         let timer = crate::receipt::start();
         let ok = cholesky(m2, &mut s0);

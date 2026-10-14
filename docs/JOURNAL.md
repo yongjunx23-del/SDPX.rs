@@ -8,6 +8,22 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — ORE S₀ assembly in parallel pieces; two_L8 at 128 bits (thermal-ore)
+
+- Hypothesis: `schur_factor` builds S₀'s 2m columns one after another (one unit `schur_apply` each). That is about 37% of a factor in the synthetic T=4 sample. It runs in every `update_scaling` and in every step-test factor. Columns are independent.
+- Change: the columns are built in n + 1 pieces of n columns through `pieces` (board or pool, granted by work), each piece with its own scratch. Each column's arithmetic is unchanged.
+- E2E (Mac release, A = `27c0736`, B = candidate, ABBA A B B A, solve s). Every B point is bitwise A's:
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | synthetic n=20/128 | 4 | 16.27 / 16.49 | 15.39 / 15.36 | −6.2% |
+  | one_L12/128, 4 it | 4 | 25.90 / 25.75 | 25.02 / 25.31 | −2.6% |
+  | two_L6/256 | 4 | 5.10 / 5.09 | 5.03 / 4.99 | −1.7% |
+  | two_L6/256 | 1 | 9.99 / 10.38 | 10.07 / 10.06 | −1.2% |
+
+- Decision: kept.
+- Observed, larger input: two_L8/128 (S₀ up to order 702, 669 variables, 13803 rows, T=8, `27c0736`) ends MaxIterations at 400 iterations (884 s). By iteration 75 the gap stalls near 6e-8 with residuals at 1e-16. τ-chase restarts at 77 and 182, then an InsufficientProgress restart at 290. It stays a failure; the stall resembles one_L12's non-attained optimum (unverified).
+
 ## 2026-10-14 — ORE dual step tests: CG preconditioned by the current S₀⁻¹ (thermal-ore)
 
 - Hypothesis: the dual step tests left by B-preconditioned CG fall back to an S₀ factor at every trial point. On the synthetic n=20/128 input at T=4, that is 285 factors in 50 iterations, and step searches take 34% of wall. The current iterate's S₀⁻¹ is already explicit (`update_scaling`). Carried into a trial point's eigen coordinates by N = QᵀP₀, it should fit trial points far better than B = diag(1, λᵢλⱼ), which is exact only on the central path.
