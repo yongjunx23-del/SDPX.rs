@@ -8,6 +8,27 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — Gravity LP: bound-arrow memory gate as the generic arrow's (thermal-ore)
+
+- Observed: the user's restricted fixed-a LP (gravity_sampling_prl, D6 N640 J1792, whitened) has 640 dense equality rows and 67,120 bounded plus 3 free columns: 43M nonzeros at 128 bits. It never reached `local_bounds` and fell to serial QDLDL on the 134,883-row KKT (`eligible=false`, no `LOCAL_BOUNDS` line).
+  - The gate charged two n×t MPFR panels (2·67,120·643·32 B = 2.8 GB) against 512 MiB + nnz(K) bytes, so it refused every MPFR LP above about n·t·S = 512 MiB.
+  - QDLDL's factor of a dense coupling holds the same n·t entries, plus a serial MPFR elimination. On the half-size instance (every second active column, 33,560 columns, 21.6M nonzeros), one 128-bit QDLDL factorization took 330 s (Mac, T=4).
+- Change: `try_local_bounds` uses the generic arrow's ceiling, max(512 MiB, 8 × stored KKT bytes), which already admits dense couplings because "a dense border coupling fills QDLDL's factor just as much".
+- E2E (Mac, 128 bits, T=4; the audit is an independent 384-bit gmpy2 check of A x + s = b, Aᵀz + q = 0, the cones and the gap, all relative):
+
+  | Instance | Before | After | Audit (primal / dual / gap) |
+  |---|---|---|---|
+  | half-size (33,563 columns) | QDLDL, 330 s per factorization | Solved, 57 it, 267.6 s, 5.8 GB RSS | 1.3e-25 / 7.4e-22 / 1.6e-20 |
+  | full (67,123 columns) | QDLDL (not run) | Solved, 67 it, 1381 s; the Mac swaps at 7.6 GB RSS | 2.7e-25 / 3.2e-21 / 3.5e-20 |
+
+  - The tolerance is 7.7e-20.
+  - Inputs the old gate already admitted are bitwise unchanged: fix-a Float64, fix-a 256 and gravity-small-256.
+- Observed (half-size profile): the residue border Gram `arrow.local_schur` takes 141.6 of 261 s; refinement 53.7; residual update 27.8; final step length 19.9.
+- Observed: the owner (MPI) path is not usable for this LP shape yet. On fix-a 256 (T=2) it takes 166 s with one partition and 226 s with two, against 6–16 s plain.
+  - The border assembly is a rounded MPFR FMA chain per entry (45 s, about t²n/2 products per factorization).
+  - The pair solves and their refinements take about 70 s; the plain path has 25 iterations against 33.
+- Decision: kept. Next: residue products in the owner border assembly (multi-node LP), then the plain path's serial phases.
+
 ## 2026-10-14 — ORE combined shift: paired products and the scaling's oracle (thermal-ore)
 
 - Hypothesis: after `e88f6df`, the combined right-hand side took 0.33 s of 3.25 s on two_L6/256 at T=4, against 0.51 s at T=1.
