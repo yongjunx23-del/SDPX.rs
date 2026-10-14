@@ -984,18 +984,19 @@ impl<T: FloatT> Oracle<T> {
         let m = n * (n + 1) / 2;
         let nn = n * n;
         let m2 = w.len();
-        // the factor's (2m)³/6 multiply-adds against ≈ 26n³ + (2m)² per CG
-        // step (S₀ products, the preconditioner's congruences and S₀⁻¹
-        // product), above order `BASE` with the factor's residue products
-        // ≈ 4.6× cheaper per multiply-add (one_matrix_L12f at 128 bits,
-        // n = 42: factor 1.4 s); binary64 factors with LAPACK, far cheaper
-        // per multiply-add than CG's products (one_matrix_L12: 18.6 s without
-        // CG, 24.1 s with)
+        // the factor's (2m)³/6 multiply-adds and 2m unit columns of ≈ 24n²
+        // each against ≈ 26n³ + (2m)² per CG step (S₀ products, the
+        // preconditioner's congruences and S₀⁻¹ product), above order `BASE`
+        // with the factor's residue products ≈ 4.6× cheaper per multiply-add
+        // (one_matrix_L12f at 128 bits, n = 42: factor 1.4 s; measured
+        // factor/step 3.7, 7.4, 17 at n = 4, 8, 20); binary64 factors with
+        // LAPACK, far cheaper per multiply-add than CG's products
+        // (one_matrix_L12: 18.6 s without CG, 24.1 s with)
         let budget = if T::precision_bits() <= 53 {
             0
         } else {
             let per = if m2 > BASE { 28 } else { 6 };
-            (m2.pow(3) / (per * (26 * n.pow(3) + m2 * m2)))
+            ((m2.pow(3) / per + 24 * m2 * n * n) / (26 * n.pow(3) + m2 * m2))
                 .max(1)
                 .checked_shr(*cg)
                 .unwrap_or(0)
@@ -1239,7 +1240,8 @@ pub struct OpRelEntropyConeData<T> {
     zh: Vec<T>,
     s0i: Vec<T>,
     work: Vec<T>,
-    /// Dual tests CG left open since it last decided one (`Oracle::dual_ok`).
+    /// Dual tests CG left open since it last decided one or the scaling
+    /// moved (`Oracle::dual_ok`).
     cg: u32,
 }
 
@@ -1444,6 +1446,8 @@ where
         data.p = std::mem::take(&mut oracle.p);
         data.zh = std::mem::take(&mut oracle.zh);
         data.s0i = s0i;
+        // the next searches have a fresh preconditioner: forgive one open test
+        data.cg = data.cg.saturating_sub(1);
         data.μ = μ;
         data.s.copy_from(s);
         data.z.copy_from(z);

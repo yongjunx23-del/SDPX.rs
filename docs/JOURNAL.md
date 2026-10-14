@@ -8,6 +8,36 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — ORE dual step tests: CG budget by measured cost, one open test forgiven per iteration (thermal-ore)
+
+- Hypothesis: on two_L6/256 at T=4, dual step tests still take 20% of the main thread, nearly all in S₀ factors. A probe counted, T=1:
+  - 1151 of 1674 tests factored with a zero budget; CG decided only 4.
+  - The budget counter `cg` only reset on a CG decision. After one or two open tests at budget 1–3 it reached 0 for good.
+  - two_L4/256 behaved the same way: 394 factors.
+  - The budget model also counted the factor as (2m)³/6 multiply-adds only.
+- Measured factor/step cost (Mac fast profile, 128 and 256 bits alike): 1.7, 3.7, 7.4, 10.5 and 17 at n = 2, 4, 8, 12 and 20.
+  - The model gave budgets of 1, 1, 3, 1 and 6.
+  - Building S₀'s 2m unit columns costs ≈ 24n² each, the same order as the Cholesky step below n ≈ 40.
+- Change:
+  - Factor cost = (2m)³/per + 24·2m·n². Budgets are now 2, 4, 9, 9 and 17 at those n, and 55 at n = 42.
+  - `update_scaling` forgives one open test (`cg -= 1`). The new S₀⁻¹ preconditions the next searches, and a cone where CG keeps failing retries with a short budget.
+  - A full reset per iteration (cg1) was within noise of this rule (cg2).
+- Probe after the change, two_L6/256 T=1: n=8 factors 473 → 38, decided mostly at the first S₀⁻¹ step. n=2 tests still mostly factor; their factor is about 18 µs.
+- E2E (Mac release, A = `b357ef6`, B = candidate, ABBA A B B A, solve s). Every B point is bitwise A's; two_L4/128 Solved 46:
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | two_L6/256 | 4 | 5.09 / 5.02 | 4.66 / 4.61 (cg1) | −8.3% |
+  | two_L6/256 | 1 | 10.06 / 10.11 | 9.60 / 9.68 | −4.5% |
+  | two_L6/128 | 1 | 4.57 / 4.61 | 4.50 / 4.49 | −2.0% |
+  | two_L6/128 | 1 | 4.52 / 4.53 | 4.28 / 4.29 (cg1) | −5.3% |
+  | two_L4/256 | 1 | 0.270 / 0.251 | 0.255 / 0.253 | −2.4% |
+  | synthetic n=20/128 | 4 | 15.33 / 15.50 | 15.28 / 15.47 | −0.2% |
+  | one_L12/128, 4 it | 4 | 25.59 / 26.29 | 24.83 / 25.66 (cg1) | −1.5% |
+
+  cg1 against cg2: T=1 two_L6/128 −1.8%; T=4 two_L6/256 0.0%, two_L4/256 −3.3%, two_L6/128 +0.9%. With cg1, two_L4/256 was +4% at T=1 (n=2 CG every iteration).
+- Decision: kept (cg2).
+
 ## 2026-10-14 — ORE S₀ assembly in parallel pieces; two_L8 at 128 bits (thermal-ore)
 
 - Hypothesis: `schur_factor` builds S₀'s 2m columns one after another (one unit `schur_apply` each). That is about 37% of a factor in the synthetic T=4 sample. It runs in every `update_scaling` and in every step-test factor. Columns are independent.

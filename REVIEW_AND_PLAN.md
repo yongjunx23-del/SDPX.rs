@@ -307,6 +307,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - 2026-10-14 (journal): the ORE KKT row transform (N⁻¹A per column) runs on the solver pool. T=4: synthetic −8.1%, one_L12 −5.1%, two_L6/256 −2.7%. Points are bitwise unchanged.
    - 2026-10-14 (journal): ORE dual step tests take one B step, then CG preconditioned by the current iterate's S₀⁻¹ carried to the trial point. Synthetic −20.8% at T=4 and −15.0% at T=1 (S₀ factors 385 → 181); two_L6 and one_L12 within noise. Points are bitwise unchanged.
    - 2026-10-14 (journal): S₀'s columns are built in parallel pieces. T=4: synthetic −6.2%, one_L12 −2.6%. Points are bitwise unchanged. two_L8/128 ends MaxIterations (gap stalls near 6e-8 from iteration 75) and stays a known failure.
+   - 2026-10-14 (journal): the ORE dual-test CG budget counts S₀'s column build, and each new scaling forgives one open test. Before this, the budget stuck at 0 and two_L6/256 factored S₀ 1151 times. two_L6/256 −8.3% at T=4 and −4.5% at T=1, two_L6/128 −2…−5%. Points are bitwise unchanged.
    - Next:
      - a full one_L12/128 solve with audit;
      - the S₀⁻¹ leaf factor from the cone's L⁻¹ (skip re-factoring the leaf);
