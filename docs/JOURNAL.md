@@ -8,6 +8,22 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — ORE KKT rows: column transform on the solver pool (thermal-ore)
+
+- Hypothesis: a macOS `sample` of the synthetic n=20/128 solve at T=4 (15 s, main thread) put 7.7% of wall in `congruence_parts`, called serially from `assemble_from_cones`. Each KKT update maps every A column touching the ORE rows by N⁻¹: three n×n congruences per column. The columns are independent.
+- Change: the column loop runs on the solver pool (`residual_pool`) when there is one. Each column's arithmetic is unchanged.
+- E2E (Mac release, A = `47955d2`, B = candidate, ABBA A B B A, T=4, solve s). Every B point is bitwise A's:
+
+  | Case | A | B | Change |
+  |---|---|---|---|
+  | two_L6/128 | 2.43 / 2.42 | 2.37 / 2.44 | −0.5% |
+  | two_L6/256 | 5.27 / 5.18 | 5.08 / 5.09 | −2.7% |
+  | synthetic n=20/128 | 22.73 / 22.77 | 20.87 / 20.90 | −8.1% |
+  | one_L12/128, 4 it | 27.42 / 27.30 | 26.11 / 25.86 | −5.1% |
+
+- The same sample, main thread at T=4: step-length searches 29%, arrow refactor 24% (leaves 13%, contributions 6%, border 5%), cone scaling 17%, combined RHS 7%, KKT solves 5%.
+- Decision: kept.
+
 ## 2026-10-14 — Residue-batched arrow contributions at 128–256 bits (thermal-ore)
 
 - Hypothesis: arrow contributions (s −= YᵀD⁻¹Y per leaf) took the residue-batched path only above 256 bits. That gate predates `3050619`, which made 2- and 3-limb residue products profitable from 64³. Below the gate every entry was one exact dot. Both paths round each entry's exact sum once and subtract leaves in the same order, so values should not change.

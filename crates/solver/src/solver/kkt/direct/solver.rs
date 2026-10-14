@@ -540,12 +540,18 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
         _update_values(&mut self.ldlsolver, &mut self.KKT, index, values);
 
         for o in &mut self.ore {
+            use rayon::prelude::*;
             if let Some(SupportedCone::OpRelEntropyCone(c)) = cones.clone().nth(o.cone) {
                 o.t.clone_from(c.rows());
             }
             let mut values = o.a.clone();
-            for column in values.chunks_exact_mut(o.rows.len()) {
-                o.t.to_eigen(column);
+            let (t, rows) = (&o.t, o.rows.len());
+            // Columns are independent: the solver pool keeps their bits.
+            match self.residual_pool.as_deref() {
+                Some(pool) => pool.install(|| {
+                    values.par_chunks_exact_mut(rows).for_each(|column| t.to_eigen(column))
+                }),
+                None => values.chunks_exact_mut(rows).for_each(|column| t.to_eigen(column)),
             }
             _update_values(&mut self.ldlsolver, &mut self.KKT, &o.pos, &values);
         }
