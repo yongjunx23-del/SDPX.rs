@@ -316,6 +316,8 @@ pub(crate) struct OwnedKkt<T: FloatT> {
     /// digit per reduced refinement step). C_f and W are stored column by
     /// column, each column's border entries contiguous.
     free: FreeBorder<T>,
+    /// Every owner (on every rank) has a diagonal interior (`diagonal`).
+    diagonal_interior: bool,
 }
 
 #[derive(Default)]
@@ -566,6 +568,9 @@ impl<T: FloatT> OwnedKkt<T> {
             })
             .collect();
         let free = Self::free_border(&mut locals, border, collective.as_ref());
+        let diagonal_interior = collective
+            .all_true(108, locals.iter().all(|l| l.diagonal.is_some()))
+            .unwrap_or(false);
         let ptr: Vec<_> = (0..=border).map(|j| j * (j + 1) / 2).collect();
         let rowval = (0..border).flat_map(|j| 0..=j).collect();
         let matrix = CscMatrix::new(
@@ -620,6 +625,7 @@ impl<T: FloatT> OwnedKkt<T> {
             fused_ready: false,
             unrefined: None,
             free,
+            diagonal_interior,
         }
     }
 
@@ -1059,7 +1065,7 @@ impl<T: FloatT> OwnedKkt<T> {
             .unwrap_or(false);
         let unrefined = self.take_unrefined(settings) == Some(0);
         let success = input_ok
-            && self.solve_original(&mut work.x, &work.b, settings)
+            && self.solve_original(&mut work.x, &work.b, !unrefined, settings)
             && if unrefined {
                 self.scale_unrefined(&work.x)
             } else {
@@ -1145,21 +1151,24 @@ impl<T: FloatT> OwnedKkt<T> {
 
         let reduced = self.solve_reduced_panel([&mut inner0, &mut inner1], flags);
         flags = reduced;
+        let unrefined = self.take_unrefined(settings);
         for c in 0..2 {
             if !flags[c] {
                 continue;
             }
-            flags[c] = refine(
-                &mut OwnedRefinement {
-                    solver: self,
-                    work: if c == 0 { &mut inner0 } else { &mut inner1 },
-                    reduced: true,
-                    basis: Vec::new(),
-                    directions: Vec::new(),
-                },
-                settings,
-            );
-            flags[c] = self.collective.all_true(260 + c, flags[c]).unwrap_or(false);
+            if self.refines_reduced(unrefined != Some(c), settings) {
+                flags[c] = refine(
+                    &mut OwnedRefinement {
+                        solver: self,
+                        work: if c == 0 { &mut inner0 } else { &mut inner1 },
+                        reduced: true,
+                        basis: Vec::new(),
+                        directions: Vec::new(),
+                    },
+                    settings,
+                );
+                flags[c] = self.collective.all_true(260 + c, flags[c]).unwrap_or(false);
+            }
             if !flags[c] {
                 continue;
             }
@@ -1178,7 +1187,6 @@ impl<T: FloatT> OwnedKkt<T> {
         // as the scalar correction workspace required by the shared original
         // refinement helper, leaving only one extra persistent Work value.
         self.inner = Some(inner1);
-        let unrefined = self.take_unrefined(settings);
         for c in 0..2 {
             if !flags[c] {
                 continue;
@@ -1626,10 +1634,21 @@ impl<T: FloatT> OwnedKkt<T> {
             .unwrap_or(false)
     }
 
+    /// Whether a reduced solve is refined at the reduced level. Over a
+    /// diagonal interior the raw reduced solve errs only through the border
+    /// factor; when the original-level refinement follows (`outer`), its
+    /// true residual corrects that error, and a reduced round (Cᵀ·border,
+    /// C·x, C·y and an interior solve) would only repeat its check. GMRES-IR
+    /// runs at the reduced level only, so it keeps that level.
+    fn refines_reduced(&self, outer: bool, settings: &CoreSettings<T>) -> bool {
+        !(outer && self.diagonal_interior && !settings.iterative_refinement_gmres)
+    }
+
     fn solve_original(
         &mut self,
         out: &mut Point<T>,
         rhs: &Point<T>,
+        outer: bool,
         settings: &CoreSettings<T>,
     ) -> bool {
         let mut work = self.inner.take().unwrap();
@@ -1645,16 +1664,17 @@ impl<T: FloatT> OwnedKkt<T> {
         // Both outcomes are already agreed: every exit of the reduced solve
         // and of the refinement follows a collective or a replicated value.
         let mut success = self.solve_reduced_raw(&mut work.x, &work.b)
-            && refine(
-                &mut OwnedRefinement {
-                    solver: self,
-                    work: &mut work,
-                    reduced: true,
-                    basis: Vec::new(),
-                    directions: Vec::new(),
-                },
-                settings,
-            );
+            && (!self.refines_reduced(outer, settings)
+                || refine(
+                    &mut OwnedRefinement {
+                        solver: self,
+                        work: &mut work,
+                        reduced: true,
+                        basis: Vec::new(),
+                        directions: Vec::new(),
+                    },
+                    settings,
+                ));
         if success {
             success = self.recover_original_work(out, rhs, &work.x, None);
             success = self.collective.all_true(291, success).unwrap_or(false);
@@ -2064,7 +2084,7 @@ impl<T: FloatT> Refinement<T> for OwnedRefinement<'_, T> {
             self.solver.solve_reduced_fused(&mut self.work.candidate)
         } else {
             self.solver
-                .solve_original(&mut self.work.candidate, &self.work.error, settings)
+                .solve_original(&mut self.work.candidate, &self.work.error, true, settings)
         };
         if !solved {
             // The next residual (a global maximum) is then non-finite on

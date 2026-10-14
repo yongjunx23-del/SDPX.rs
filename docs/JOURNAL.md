@@ -8,6 +8,44 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Owner solves over a diagonal interior: refine at the original level only (thermal-ore)
+
+- Observed (Mac, 286bd31, d6n640q 128 owner, T=10):
+  - Owner 97.5 s vs plain 65.8 s at the same 48 iterations. `border_assemble` (39 s) matches plain's `arrow.local_schur` (41 s).
+  - The gap is in the solves: kkt solve 10.5 vs 3.5 s, corrector solves 14.4 vs 4.7 s.
+  - Sampling: exact dots over the dense border coupling C (640 × 16.8k) dominate the busy time outside the Gram:
+    - column-streamed C·x: 52k samples;
+    - transposed products: 20k;
+    - response corrections: 17k.
+  - Per right-hand side the owner ran:
+    - the raw reduced solve;
+    - a stationary reduced-level refinement (each round: Cᵀ·border, C·x, C·y and an interior solve);
+    - recovery;
+    - an original-level residual that always passed (206 residuals for 206 right-hand sides, no original correction).
+  - Total: about 6 C·x, 3 Cᵀ·y and 2 response products per right-hand side. Plain does about 2 + 2.
+  - On fix-a the reduced level never corrected (`SDPX_TRACE_TAU`: every refinement 0 corrections), so its round only repeated the original check.
+- Change (`distributed::kkt`):
+  - `diagonal_interior` is agreed once across ranks: every owner has a diagonal interior (the L-O4 path).
+  - When it holds, the solve is refined at the original level, and GMRES-IR is off, the reduced level is not refined. The raw reduced solve goes straight to recovery and the original-level refinement, whose true residual corrects the border factor's error with the same tolerances.
+  - Unrefined columns (L50), GMRES-IR and every non-diagonal interior (Ising PSD owners) keep the reduced refinement.
+- E2E (Mac, fast profile), ABBA, every run Solved:
+
+  | Case | A (286bd31) s | B s | Change |
+  |---|---|---|---|
+  | fix-a 256, partitions 1, T=2 | 13.75 / 13.65 | 10.44 / 10.52 | −23.6% |
+  | fix-a 256, partitions 2, T=10 | 8.77 / 8.90 | 7.32 / 7.30 | −17.3% |
+  | d6n640q 128, partitions 1, T=10 | 97.49 / 96.69 | 92.65 / 91.53 | −5.1% |
+
+  - fix-a points are bitwise identical to A in both modes (no reduced correction ever ran), so A's audits carry over.
+  - d6n640q:
+    - 213 reduced corrections became 206 original ones (one per right-hand side).
+    - Interior solve batches 1064 → 844. kkt solve 10.5 → 8.9 s, corrector solves 14.4 → 12.6 s.
+    - Audit at 384 bits, original coordinates: primal rel 1.1e-26, dual rel 3.0e-23, gap rel 1.2e-20, equal to A's to 15 digits; the objective agrees to all 28 printed digits.
+  - ising11 owner (512 bits, partitions 2, T=4): points are bitwise identical to A.
+  - 505 solver lib tests pass.
+- Decision: kept.
+- Remaining owner cost on d6n640q: 92 s vs plain 66 s. Each original correction re-runs prepare/recover and the full A·x + Aᵀz residual.
+
 ## 2026-10-15 — Gondzio centrality correctors on the owner path (thermal-ore)
 
 - Observed (Mac, fast profile, after 91b0fac):
