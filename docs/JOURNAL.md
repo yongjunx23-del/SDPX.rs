@@ -8,6 +8,40 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — Wide PSD Schur columns: support-restricted congruence, lazy entries, measured sparse/dense rule (thermal-ore)
+
+- Hypothesis: profiling two_L6/256 at T=1 put the PSD Schur assembly at 21% of the main thread.
+  - `sparse_schur_value` took 59% of it and `pooled_gemm_sym` 20%.
+  - The sparse/dense column rule priced a dense column as 2n³ multiply-adds, but `Ginv·A_b` is nonzero only in A_b's index support r.
+- Probe (n = 26, both precisions):
+  - A sparse pair term costs ≈ 108 ns at 256 bits and 74 ns at 128.
+  - An exact-dot term costs ≈ 14 ns at 256 bits and 9 ns at 128.
+  - Per solve, the current flags cost 1913 ms. Dense everywhere (restricted) would cost 1537 ms; the best per-column choice, 1326 ms.
+- Change (`condensed/psd.rs`, above 64 bits only):
+  - The dense congruence sums over A's support: n²r terms instead of n³. A residue product is used when `residue_product_applies(n, n, r)`.
+  - Without the residue product, each packed entry a left column reads is one exact dot, computed when it is first read.
+  - Sums are exact, so both are bitwise equal to the old full product. Verified: with the old rule, points are unchanged (cb9b2b3cc43d, d20b1a5d4d6c).
+  - The rule prices a dense column as reads·(5 + r) + n·expanded + prefix in dot terms, where reads = distinct packed entries read so far, and a sparse term as 8. `configure_sparse_columns` uses the same model.
+  - Sparse columns: two_L6 57 → 9 of 75, two_L8 526 → 26 of 663, one_L12 121 → 10 of 320.
+  - Re-flagged columns change summation order, so these points change bits.
+- Receipts (T=1): assemble 1.974 → 1.149 s (two_L6/256) and 0.886 → 0.528 s (two_L6/128). Other phases unchanged.
+- E2E (Mac release, A = `6564ae3`, B = candidate, ABBA A B B A, solve s):
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | two_L6/256 | 1 | 9.72 / 9.95 | 8.82 / 8.92 | −9.8% |
+  | two_L6/128 | 1 | 4.32 / 4.36 | 4.01 / 3.98 | −7.8% |
+  | two_L6/256 | 4 | 4.89 / 4.82 | 4.44 / 4.46 | −8.4% |
+  | two_L6/128 | 4 | 2.30 / 2.37 | 2.13 / 2.26 | −6.1% |
+  | one_L12/128, 4 it | 4 | 26.65 / 24.93 | 24.90 / 24.69 | −3.9% |
+  | two_L4/256, two_L4/128 | 1 | 0.254 / 0.101 | 0.254 / 0.101 | 0% |
+  | synthetic n=20/128 (ORE only) | 4 | 15.69 / 16.84 | 15.94 / 17.27 | noise; bitwise equal |
+
+- Audits: every solve passes.
+  - two_L6/256 Solved 105 it (as A); two_L6/128 Solved 72 (A 71); two_L4/256 85 and two_L4/128 46 (as A).
+  - ising11 (512-bit E2E case) Solved 54, audit PASS, residuals equal to A's in every digit. Its point hash differs between two runs of the same binary, so hashes cannot compare it.
+- Decision: kept.
+
 ## 2026-10-14 — ORE dual step tests: CG budget by measured cost, one open test forgiven per iteration (thermal-ore)
 
 - Hypothesis: on two_L6/256 at T=4, dual step tests still take 20% of the main thread, nearly all in S₀ factors. A probe counted, T=1:
