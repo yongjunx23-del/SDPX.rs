@@ -364,6 +364,9 @@ impl<const N: usize> XgemmScalar for F<N> {
     fn residue_blas_applies(m: usize, n: usize, k: usize) -> bool {
         residue_blas_profitable::<N>(m, n, k)
     }
+    fn residue_product_applies(m: usize, n: usize, k: usize) -> bool {
+        residue_product_profitable::<N>(m, n, k)
+    }
     fn xsvec_quadratic_exact(
         h: usize,
         kmax: usize,

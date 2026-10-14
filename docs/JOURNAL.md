@@ -8,6 +8,37 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — Residue-batched arrow contributions at 128–256 bits (thermal-ore)
+
+- Hypothesis: arrow contributions (s −= YᵀD⁻¹Y per leaf) took the residue-batched path only above 256 bits. That gate predates `3050619`, which made 2- and 3-limb residue products profitable from 64³. Below the gate every entry was one exact dot. Both paths round each entry's exact sum once and subtract leaves in the same order, so values should not change.
+- Change:
+  - A new trait predicate, `residue_product_applies`, is true exactly when `xgemm_upper_exact` takes the residue kernel (`residue_product_profitable`).
+  - Leaf eligibility uses it in place of `precision_bits() > 256 && residue_blas_applies`.
+  - `residue_blas_applies` keeps the four-limb gate that its sampled-block callers pair with the quadratic forms.
+  - At four limbs and above the two predicates agree, so Ising at 768/1024 bits is unchanged.
+- E2E (Mac release, A = `d794900`, B = candidate, ABBA A B B A, solve s). Every B point is bitwise A's (x, s, z hashes):
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | two_L4/256 | 1 | 0.255 / 0.253 | 0.271 / 0.253 | noise |
+  | two_L6/128 | 1 | 4.78 / 4.78 | 4.56 / 4.57 | −4.5% |
+  | two_L6/256 | 1 | 10.81 / 10.81 | 10.09 / 10.08 | −6.7% |
+  | synthetic n=20/128 | 1 | 41.4 / 44.7 | 37.4 / 37.4 | −13.1% |
+  | two_L6/128 | 4 | 2.49 / 2.54 | 2.52 / 2.54 | +0.5% |
+  | two_L6/256 | 4 | 5.29 / 5.29 | 5.27 / 5.27 | −0.4% |
+  | synthetic n=20/128 | 4 | 23.8 / 23.8 | 23.3 / 25.8 | +2.5% (one slow B) |
+  | one_L12/128, 4 it | 4 | 29.6 / 26.3 | 26.9 / 27.6 | −2.4% (noisy) |
+
+  - Contribution phase, wall / CPU:
+    - synthetic T=1: 6.16 s → about 2.4 s;
+    - synthetic T=4: 1.91 / 7.57 → 1.34 / 2.40 s. The residue product uses about 1.8 of 4 cores, the column dots almost 4.
+    - one_L12 T=4: 0.33 / 1.30 → 0.39 / 0.51 s.
+  - Peak RSS:
+    - two_L6/256: T=1 43 → 65 MB, T=4 64 → 181 MB;
+    - one_L12 T=4: 2.98 → 3.18 GB (+6.7%);
+    - synthetic T=4: 765 → 698 MB.
+- Decision: kept, for the single-thread gain and about 3× less contribution CPU, with bitwise-identical points. The multi-thread wall gain waits on a better split of a lone residue product.
+
 ## 2026-10-14 — Arrow border factor by exact dots above 64 bits (thermal-ore)
 
 - Hypothesis: the arrow border factor (`factor_border`) still used scalar FMA chains (`factor_signed`) at every precision, while leaves above 64 bits already used exact dots (`factor_dots`, each entry one exact dot rounded once). The thermal borders are 105–250 rows. Serial microbenchmark on random SPD input, FMA vs dots:

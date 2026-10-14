@@ -1122,8 +1122,8 @@ fn subtract_contributions<T: FloatT>(
     if t == 0 {
         return;
     }
-    // Above the inline-dot precisions, batch substantial products when
-    // result storage is proportional to Y. A batch holds at most one leaf
+    // Batch substantial residue products when result storage is
+    // proportional to Y. A batch holds at most one leaf
     // per worker; a short batch grants its products the spare workers. Both
     // paths round every entry's exact sum once, so batching never changes
     // the bits. Short groups batch too: on Λ35 (36 leaves of g ≈ 114,
@@ -1133,8 +1133,7 @@ fn subtract_contributions<T: FloatT>(
     let width = pool.map_or(1, |p| p.current_num_threads());
     let eligible = |leaf: &Leaf<T>| {
         let (g, q) = (leaf.ids.len(), leaf.coupled.len());
-        T::precision_bits() > 256
-            && T::residue_blas_applies(q, q, g)
+        T::residue_product_applies(q, q, g)
             && g * q * q >= 1 << 21
             && q * q <= 8 * g * t
     };
