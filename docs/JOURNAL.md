@@ -8,6 +8,53 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — Arrow border factor by exact dots above 64 bits (thermal-ore)
+
+- Hypothesis: the arrow border factor (`factor_border`) still used scalar FMA chains (`factor_signed`) at every precision, while leaves above 64 bits already used exact dots (`factor_dots`, each entry one exact dot rounded once). The thermal borders are 105–250 rows. Serial microbenchmark on random SPD input, FMA vs dots:
+  - 128 bits: 3.7–4.0× faster with dots;
+  - 256 bits: 2.6–3.0×;
+  - 512 bits: 1.8×;
+  - 768 bits: 1.5×;
+  - 1024 bits: 1.2–1.25×.
+- The old split `factor_dots` (one Rayon split per column) lost to the FMA panels at 8 threads at 768 and 1024 bits. Example: 1024 bits n = 105, 10.1 ms vs 8.4 ms.
+- Change:
+  - Above 64 bits the border takes `factor_dots`, after the row envelope (`envelope`, shared with leaves).
+  - Split `factor_dots` now works in panels of `FACTOR_PANEL` pivots. The panel's own rows run serially, then the later rows take the panel's columns in parallel, one join per panel (rows per task: one grain of dot work). Every entry is the same dot as the serial form, so split equals serial bitwise; the parity test now covers the leaf form with mixed signs, clamped pivots and an envelope.
+  - 8-thread microbenchmark, FMA panels vs new dots, ms:
+
+    | bits | n = 105 | n = 170 | n = 250 |
+    |---|---|---|---|
+    | 128 | 2.07 / 1.41 | 4.96 / 2.53 | 13.3 / 5.96 |
+    | 256 | 2.22 / 1.50 | 6.94 / 3.90 | 18.8 / 9.32 |
+    | 512 | 4.1 / 3.1 | 13.8 / 9.5 | 37.0 / 25.5 |
+    | 768 | 6.01 / 4.76 | 19.8 / 15.4 | 55.4 / 42.7 |
+    | 1024 | 8.36 / 7.60 | 28.5 / 25.0 | 80.8 / 70.3 |
+
+  - Factors differ from the FMA form at rounding level, so the change is order-changing and gated on audits.
+- E2E (Mac release, A = `3050619`, B = candidate, ABBA A B B A, solve s):
+
+  | Case | T | A | B | Change | Iterations |
+  |---|---|---|---|---|---|
+  | two_L4/128 | 1 | 0.115 / 0.110 | 0.135 / 0.114 | noise (0.1 s) | 48 → 46 |
+  | two_L4/256 | 1 | 0.254 / 0.242 | 0.269 / 0.267 | +8.5% | 80 → 85 |
+  | two_L6/128 | 1 | 6.51 / 6.43 | 5.36 / 5.13 | −18.9% | 71 |
+  | two_L6/256 | 1 | 13.06 / 13.33 | 11.02 / 10.83 | −17.2% | 105 |
+  | synthetic n=20/128 | 1 | 58.3 / 57.9 | 42.4 / 42.9 | −26.6% | 50 |
+  | two_L6/128 | 4 | 2.76 / 2.81 | 2.40 / 2.41 | −13.6% | 71 |
+  | two_L6/256 | 4 | 6.08 / 6.09 | 5.28 / 5.48 | −11.6% | 105 |
+  | synthetic n=20/128 | 4 | 28.9 / 30.2 | 26.0 / 25.3 | −13.2% | 50 |
+  | one_L12/128, 4 it | 4 | 26.9 / 27.8 | 25.5 / 28.5 | −1.3% (noise) | 4 |
+  | Ising Λ11/768 | 1 | 13.41 / 13.69 | 13.55 / 13.52 | 0% | 54 |
+  | Ising Λ11/768 | 8 | 3.10 / 3.15 | 3.07 / 3.04 | −1.5% | 54 |
+
+  - Audits of the B points:
+    - two_L4/128, two_L4/256 (85 it), two_L6/128 and two_L6/256 pass the original-coordinate ORE audit;
+    - the synthetic input passes `synth/audit.py`;
+    - Ising Λ11 is accepted by `audit_point.jl` with the same objective as A; its point differs at rounding level.
+  - two_L4/256 takes five more iterations (0.25 s). That is a path change on the smallest input, not a slower factor.
+  - The Ising Λ11 border is 20 rows (7 vs 9 ms of 13 s). The Λ27/Λ35 borders (about 105–170 rows) at 64 threads are not measured: the cluster deploy is blocked (no new authority).
+- Decision: kept.
+
 ## 2026-10-14 — Thermal ORE: residue products at 128/192 bits, recursive S₀ kernels, cheaper dual step tests (thermal-ore)
 
 - Hypotheses (one_L12f/128 receipts, n = 42, S₀ of order 1806):

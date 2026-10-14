@@ -281,8 +281,9 @@ impl<T: FloatT> DenseLeaf<T> {
     }
 
     /// A leaf's [`Self::factor_signed`]: large wide-type leaves take the
-    /// exact blocked form. The border keeps the pooled scalar panels (mixed
-    /// Λ27/1024: its exact form took 2.0 s instead of 0.58 s per iteration).
+    /// exact blocked form. The border takes exact dots instead (mixed
+    /// Λ27/1024: the exact blocked form took 2.0 s instead of 0.58 s per
+    /// iteration for the scalar panels).
     fn factor_leaf(
         &mut self,
         a: &[T],
@@ -291,10 +292,7 @@ impl<T: FloatT> DenseLeaf<T> {
         regularize_count: &mut usize,
         split: bool,
     ) -> Result<(), &'static str> {
-        let n = self.n;
-        self.first.clear();
-        self.first
-            .extend((0..n).map(|i| (0..i).find(|&k| !a[i + k * n].is_zero()).unwrap_or(i)));
+        self.envelope(a);
         if T::precision_bits() >= 256 && self.n >= EXACT_FACTOR_MIN {
             self.l.copy_from_slice(a);
             return self.factor_exact(signs, reg, regularize_count, split);
@@ -305,12 +303,22 @@ impl<T: FloatT> DenseLeaf<T> {
         self.factor_signed(a, signs, reg, regularize_count, split)
     }
 
+    /// Each row's first nonzero column of `a` (`first`).
+    fn envelope(&mut self, a: &[T]) {
+        let n = self.n;
+        self.first.clear();
+        self.first
+            .extend((0..n).map(|i| (0..i).find(|&k| !a[i + k * n].is_zero()).unwrap_or(i)));
+    }
+
     /// Left-looking [`Self::factor_signed`] for wide types: entry (i, j) is
     /// one exact dot product of rows of L and W = L·D (rounded entrywise),
     /// rounded once, instead of j fused updates. Rows are packed row-major so
     /// both operands are contiguous, and dots start at the row envelope
     /// (`first`; the skipped products are exact zeros, so values are
-    /// unchanged). `split`: a column's rows in parallel (thread-invariant).
+    /// unchanged). `split`: after each panel of `FACTOR_PANEL` pivots, the
+    /// later rows take the panel's columns in parallel, one join per panel;
+    /// every entry is the same dot, so the factor is bitwise the serial one.
     fn factor_dots(
         &mut self,
         a: &[T],
@@ -319,37 +327,64 @@ impl<T: FloatT> DenseLeaf<T> {
         regularize_count: &mut usize,
         split: bool,
     ) -> Result<(), &'static str> {
+        use sdpx_arithmetic::inner_parallel as ip;
         let n = self.n;
         let row = |i: usize| i * (i + 1) / 2;
         let mut r = vec![T::zero(); row(n)];
         let mut w = vec![T::zero(); row(n)];
-        let mut col = Vec::with_capacity(n);
+        let mut d = vec![T::zero(); n];
         let first = &self.first;
-        for j in 0..n {
-            let s = T::from_i8(signs[if signs.len() == 1 { 0 } else { j }]).unwrap();
-            let fj = first[j];
-            let (rj, wj) = (&r[row(j) + fj..row(j) + j], &w[row(j)..row(j) + j]);
-            let d = a[j + j * n] - T::dot_slices(rj, &wj[fj..]);
-            let d = Self::pivot(d, s, reg, regularize_count)?;
-            let dinv = T::one() / d;
-            self.dinv[j] = dinv;
-            let entry = |i: usize| {
-                if first[i] > j {
-                    return T::zero();
+        // entry (i, j) from row i's first j entries and row j of W
+        let entry = |i: usize, j: usize, ri: &[T], wj: &[T], dinv: T| {
+            if first[i] > j {
+                return T::zero();
+            }
+            let lo = first[i].max(first[j]);
+            (a[i + j * n] - T::dot_slices(&ri[lo..j], &wj[lo..j])) * dinv
+        };
+        let mut p = 0;
+        while p < n {
+            let pe = if split { (p + FACTOR_PANEL).min(n) } else { n };
+            for j in p..pe {
+                let s = T::from_i8(signs[if signs.len() == 1 { 0 } else { j }]).unwrap();
+                let fj = first[j];
+                let (rj, wj) = (&r[row(j) + fj..row(j) + j], &w[row(j) + fj..row(j) + j]);
+                let dj = a[j + j * n] - T::dot_slices(rj, wj);
+                let dj = Self::pivot(dj, s, reg, regularize_count)?;
+                d[j] = dj;
+                self.dinv[j] = T::one() / dj;
+                let (wh, wt) = w.split_at_mut(row(j + 1));
+                let wj = &wh[row(j)..row(j) + j];
+                for i in j + 1..pe {
+                    let v = entry(i, j, &r[row(i)..row(i) + i], wj, self.dinv[j]);
+                    r[row(i) + j] = v;
+                    wt[row(i) - row(j + 1) + j] = v * dj;
                 }
-                let lo = first[i].max(fj);
-                (a[i + j * n] - T::dot_slices(&r[row(i) + lo..row(i) + j], &wj[lo..])) * dinv
-            };
-            col.clear();
-            if split && n - j > 1 {
-                (j + 1..n).into_par_iter().map(entry).collect_into_vec(&mut col);
-            } else {
-                col.extend((j + 1..n).map(entry));
             }
-            for (i, &v) in (j + 1..n).zip(&col) {
-                r[row(i) + j] = v;
-                w[row(i) + j] = v * d;
+            if pe < n {
+                let (_, mut rt) = r.split_at_mut(row(pe));
+                let (wh, mut wt) = w.split_at_mut(row(pe));
+                let mut rows = Vec::with_capacity(n - pe);
+                for i in pe..n {
+                    let (ri, rrest) = rt.split_at_mut(i + 1);
+                    let (wi, wrest) = wt.split_at_mut(i + 1);
+                    rows.push((i, ri, wi));
+                    (rt, wt) = (rrest, wrest);
+                }
+                let (dinv, d) = (&self.dinv, &d);
+                let panel = |(i, ri, wi): &mut (usize, &mut [T], &mut [T])| {
+                    for j in p..pe {
+                        let v = entry(*i, j, ri, &wh[row(j)..row(j) + j], dinv[j]);
+                        ri[j] = v;
+                        wi[j] = v * d[j];
+                    }
+                };
+                // rows per task: one grain of dot work
+                let work = ip::weight(T::precision_bits() as usize) * ((pe - p) * pe) as u128;
+                let tile = (ip::grain() / work.max(1)).max(1) as usize;
+                rows.par_iter_mut().with_min_len(tile).for_each(panel);
             }
+            p = pe;
         }
         self.l.copy_from_slice(a);
         for j in 0..n {
@@ -2154,10 +2189,21 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let timer = crate::receipt::start();
         // Every pool thread is idle during the border factor.
         let (tf, s) = (&mut self.tf, &self.s);
+        // Wide types take exact dots, as leaves do.
+        let signs = &self.border_signs;
+        let factor = |tf: &mut DenseLeaf<T>, count: &mut usize, split: bool| {
+            if T::precision_bits() > 64 {
+                tf.envelope(s);
+                tf.factor_dots(s, signs, reg, count, split)
+            } else {
+                tf.factor_signed(s, signs, reg, count, split)
+            }
+        };
         let ok = match &self.pool {
-            Some(pool) if tf.n >= f64_scaled::<T>(SPLIT_BORDER_FACTOR_MIN, 8) => pool
-                .install(|| tf.factor_signed(s, &self.border_signs, reg, &mut border_count, true)),
-            _ => tf.factor_signed(s, &self.border_signs, reg, &mut border_count, false),
+            Some(pool) if tf.n >= f64_scaled::<T>(SPLIT_BORDER_FACTOR_MIN, 8) => {
+                pool.install(|| factor(tf, &mut border_count, true))
+            }
+            _ => factor(tf, &mut border_count, false),
         }
         .is_ok();
         crate::receipt::finish("arrow.border_factor", timer);
@@ -3012,6 +3058,20 @@ mod tests {
             .unwrap();
         let mut split = DenseLeaf::<T>::new(n, LEAF_BLOCK);
         pool.install(|| split.factor_signed(&a, &signs, reg, &mut c2, true))
+            .unwrap();
+        assert!(c1 > 0);
+        assert_eq!(c1, c2);
+        assert_eq!(serial.l, split.l);
+        assert_eq!(serial.dinv, split.dinv);
+        // The leaf form (exact dots above 64 bits), with a row envelope.
+        for i in 40..n {
+            for j in 0..i % 9 {
+                a[i + j * n] = T::zero();
+            }
+        }
+        let (mut c1, mut c2) = (0, 0);
+        serial.factor_leaf(&a, &signs, reg, &mut c1, false).unwrap();
+        pool.install(|| split.factor_leaf(&a, &signs, reg, &mut c2, true))
             .unwrap();
         assert!(c1 > 0);
         assert_eq!(c1, c2);

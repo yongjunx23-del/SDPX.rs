@@ -302,6 +302,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - 2026-10-14 (journal): the negated arrow takes the ORE rows as leaves; a failed arrow factor falls back in the z-first order. Binary64 inverses use BLAS, the dual test exits early (no CG at 53 bits), and ORE kernels split. Release T=1 against v0.9.2: one_L12/53 Solved 47 in 20.8 s (was 100 s, audited); one_L12/128 4 it 103 s (was 471 s). two_L4/two_L6 points are unchanged and audited.
    - 2026-10-14 (journal): leaf dots start at the row envelope, ORE kernels post to the scaling board, and wide dense Schur columns run on the pool. one_L12/128 4 it: T=1 −13.6%, T=4 −27%, bitwise points.
    - 2026-10-14 (journal): 128/192-bit residue products, recursive S₀ kernels above order 128, a halving CG budget and batched dual trials. At T=2: two_L6/128 −5…−11%, two_L6/256 −8…−10%, one_L12/128 (4 it) −22…−32%. A synthetic ORE n=20 input is Solved and audited (−33…−41%). Peak RSS on one_L12 rises 32–65%.
+   - 2026-10-14 (journal): the arrow border factor takes exact dots above 64 bits, split in pivot panels (bitwise equal to serial). two_L6 −17…−19% at T=1 and −12…−14% at T=4; the synthetic input −27%/−13%. All points are audited. On the cluster, Ising Λ27/Λ35 at 64 threads is not yet measured.
    - Next:
      - a full one_L12/128 solve with audit;
      - the S₀⁻¹ leaf factor from the cone's L⁻¹ (skip re-factoring the leaf);
