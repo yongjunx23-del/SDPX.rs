@@ -282,58 +282,169 @@ fn add_terms<'a, const N: usize>(
     inline: bool,
     terms: impl Iterator<Item = Pair<'a, N>> + Clone,
 ) {
-    if inline && N <= INLINE_N {
-        // The accumulator is picked by the product's sign bit, not a branch:
-        // signs of consecutive terms are data-dependent and mispredict.
-        let accs = [pos.as_mut_ptr(), neg.as_mut_ptr()];
-        // One product buffer per dot; every term overwrites its 2N limbs.
-        let mut scratch = [0u64; 2 * MAX_N];
-        for (a, b) in terms.clone() {
-            let offset = (a.exponent as i64 + b.exponent as i64 - emin) as usize;
-            let negative = ((a.kind < 0) != (b.kind < 0)) as usize;
-            let limb = offset / 64;
-            // SAFETY: both accumulators hold `len` limbs and `limb < len`; the
-            // bound on `len` covers the shifted product and its carry. The two
-            // pointers address distinct vectors.
-            let target =
-                unsafe { std::slice::from_raw_parts_mut(accs[negative].add(limb), len - limb) };
-            add_shifted_product::<N>(
-                target,
-                &a.limbs,
-                &b.limbs,
-                (offset % 64) as u32,
-                &mut scratch,
-            );
-        }
+    debug_assert!(pos.len() >= len && neg.len() >= len);
+    let accs = [pos.as_mut_ptr(), neg.as_mut_ptr()];
+    // One product buffer per dot; every term overwrites its limbs.
+    let mut scratch = [0u64; 2 * MAX_N + 1];
+    for term in terms {
+        // SAFETY: both accumulators hold `len` limbs and are distinct.
+        unsafe { add_term::<N>(accs, emin, len, inline, term, &mut scratch) };
     }
-    let mut prod = [0u64; 2 * MAX_N + 1];
-    for (a, b) in terms.filter(|_| !(inline && N <= INLINE_N)) {
-        let offset = (a.exponent as i64 + b.exponent as i64 - emin) as usize;
-        let target = if (a.kind < 0) != (b.kind < 0) {
-            &mut *neg
-        } else {
-            &mut *pos
-        };
-        let (limb, shift) = (offset / 64, (offset % 64) as u32);
-        // SAFETY: `prod` holds 2N+1 <= 2*MAX_N+1 limbs; `target[limb..len]`
-        // covers the shifted product and its carry by the bound on `len`.
-        // In-place mpn operands are identical, which GMP permits.
-        unsafe {
-            mpn_mul_n::<N>(prod.as_mut_ptr(), a.limbs.as_ptr(), b.limbs.as_ptr());
-            let width = if shift == 0 {
-                2 * N
-            } else {
-                prod[2 * N] =
-                    gmp::mpn_lshift(prod.as_mut_ptr(), prod.as_ptr(), (2 * N) as _, shift);
-                2 * N + 1
-            };
-            let dst = target.as_mut_ptr().add(limb);
-            if gmp::mpn_add_n(dst, dst, prod.as_ptr(), width as _) != 0 {
-                let rest = dst.add(width);
-                gmp::mpn_add_1(rest, rest, (len - limb - width) as _, 1);
+}
+
+/// Add one regular term's exact product into `accs[0]` (positive) or
+/// `accs[1]` (negative), by the product's sign.
+///
+/// # Safety
+/// Both pointers address distinct accumulators of `len` limbs whose bit 0
+/// weighs 2^(emin - 2P), with `len` from [`acc_len`] over a range holding
+/// this term's exponent sum.
+#[inline(always)]
+unsafe fn add_term<const N: usize>(
+    accs: [*mut u64; 2],
+    emin: i64,
+    len: usize,
+    inline: bool,
+    (a, b): Pair<'_, N>,
+    scratch: &mut [u64; 2 * MAX_N + 1],
+) {
+    let offset = (a.exponent as i64 + b.exponent as i64 - emin) as usize;
+    // The accumulator is picked by the product's sign bit, not a branch:
+    // signs of consecutive terms are data-dependent and mispredict.
+    let negative = ((a.kind < 0) != (b.kind < 0)) as usize;
+    let (limb, shift) = (offset / 64, (offset % 64) as u32);
+    if inline && N <= INLINE_N {
+        // SAFETY: `limb < len`; the bound on `len` covers the shifted product
+        // and its carry.
+        let target = std::slice::from_raw_parts_mut(accs[negative].add(limb), len - limb);
+        add_shifted_product::<N>(target, &a.limbs, &b.limbs, shift, scratch);
+        return;
+    }
+    // SAFETY: `scratch` holds 2N+1 <= 2*MAX_N+1 limbs; `target[limb..len]`
+    // covers the shifted product and its carry by the bound on `len`.
+    // In-place mpn operands are identical, which GMP permits.
+    let prod = scratch.as_mut_ptr();
+    mpn_mul_n::<N>(prod, a.limbs.as_ptr(), b.limbs.as_ptr());
+    let width = if shift == 0 {
+        2 * N
+    } else {
+        *prod.add(2 * N) = gmp::mpn_lshift(prod, prod, (2 * N) as _, shift);
+        2 * N + 1
+    };
+    let dst = accs[negative].add(limb);
+    if gmp::mpn_add_n(dst, dst, prod, width as _) != 0 {
+        let rest = dst.add(width);
+        gmp::mpn_add_1(rest, rest, (len - limb - width) as _, 1);
+    }
+}
+
+/// Exact sums of `outputs` dot products whose terms `terms(c)` yields as
+/// `(output, a, b)` for chunks `c < chunks`; `par_for(chunks, f)` may run
+/// the chunks concurrently (calling `f(c)` once for every `c`). An output's
+/// partial sums share one alignment and add exactly, so each value is `dot`
+/// over that output's terms in any order. `None` marks an output `dot`
+/// leaves to the chain: a non-finite term or too wide an exponent spread.
+pub(crate) fn dot_outputs_chunked<'a, const N: usize, I>(
+    outputs: usize,
+    chunks: usize,
+    terms: &(dyn Fn(usize) -> I + Sync),
+    par_for: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
+) -> Vec<Option<MpFloat<N>>>
+where
+    I: Iterator<Item = (usize, &'a MpFloat<N>, &'a MpFloat<N>)>,
+{
+    let mut out = vec![None; outputs];
+    if N > MAX_N {
+        return out;
+    }
+    let chunks = chunks.max(1);
+    let regular = |k: i32| k.abs() == mpfr::REGULAR_KIND;
+    let zero = |k: i32| k.abs() == mpfr::ZERO_KIND;
+    let scans = std::sync::Mutex::new(vec![None; chunks]);
+    par_for(chunks, &|c| {
+        let mut scan = vec![(i64::MAX, i64::MIN, true); outputs];
+        for (k, x, y) in terms(c) {
+            let (emin, emax, finite) = &mut scan[k];
+            if regular(x.kind) && regular(y.kind) {
+                let e = x.exponent as i64 + y.exponent as i64;
+                *emin = (*emin).min(e);
+                *emax = (*emax).max(e);
+            } else if !(zero(x.kind) && (zero(y.kind) || regular(y.kind))
+                || zero(y.kind) && regular(x.kind))
+            {
+                *finite = false;
             }
         }
+        scans.lock().unwrap()[c] = Some(scan);
+    });
+    let mut range = vec![(i64::MAX, i64::MIN, true); outputs];
+    for scan in scans.into_inner().unwrap() {
+        let scan = scan.expect("chunk scheduler skipped exponent scan");
+        for (r, s) in range.iter_mut().zip(scan) {
+            *r = (r.0.min(s.0), r.1.max(s.1), r.2 && s.2);
+        }
     }
+    // Output k accumulates in `len` limbs from `start` at bit 0 weighing
+    // 2^(emin - 2P); none when it declines or holds no nonzero product.
+    let mut total = 0;
+    let slots: Vec<(usize, usize, i64)> = range
+        .iter()
+        .enumerate()
+        .map(|(k, &(emin, emax, finite))| {
+            let len = match (finite, emin == i64::MAX) {
+                (true, true) => {
+                    out[k] = Some(MpFloat::<N>::default());
+                    0
+                }
+                (true, false) => acc_len::<N>(emin, emax).unwrap_or(0),
+                _ => 0,
+            };
+            total += len;
+            (total - len, len, emin)
+        })
+        .collect();
+    if total == 0 {
+        return out;
+    }
+    let parts = std::sync::Mutex::new(vec![None; chunks]);
+    par_for(chunks, &|c| {
+        let (mut pos, mut neg) = (vec![0u64; total], vec![0u64; total]);
+        let mut scratch = [0u64; 2 * MAX_N + 1];
+        for (k, x, y) in terms(c) {
+            let (s, len, emin) = slots[k];
+            if len == 0 || !(regular(x.kind) && regular(y.kind)) {
+                continue;
+            }
+            // SAFETY: output k owns `len` limbs at `s` in both accumulators,
+            // sized by `acc_len` over every chunk's exponent sums.
+            unsafe {
+                let accs = [pos.as_mut_ptr().add(s), neg.as_mut_ptr().add(s)];
+                add_term::<N>(accs, emin, len, N <= INLINE_N, (x, y), &mut scratch);
+            }
+        }
+        parts.lock().unwrap()[c] = Some((pos, neg));
+    });
+    let mut parts = parts
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|part| part.expect("chunk scheduler skipped accumulation"));
+    let (mut pos, mut neg) = parts.next().unwrap();
+    for (p, n) in parts {
+        // SAFETY: all accumulators hold `total` limbs. Each output's total
+        // fits its own limbs by the bound on its length, so no carry crosses
+        // into the next output.
+        unsafe {
+            gmp::mpn_add_n(pos.as_mut_ptr(), pos.as_ptr(), p.as_ptr(), total as _);
+            gmp::mpn_add_n(neg.as_mut_ptr(), neg.as_ptr(), n.as_ptr(), total as _);
+        }
+    }
+    for (k, &(s, len, emin)) in slots.iter().enumerate() {
+        if len > 0 {
+            out[k] = round_acc(&mut pos[s..s + len], &mut neg[s..s + len], len, emin);
+        }
+    }
+    out
 }
 
 /// Round `pos - neg` (bit 0 weighing 2^(emin - 2P)) once, nearest-even.

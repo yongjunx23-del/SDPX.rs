@@ -8,6 +8,47 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Column-streamed exact forward products for long rows (thermal-ore)
+
+- Observed (Apple M4, 256 bits, 99 rows of 20202 entries):
+  - A wide exact forward row reads its values from CSC positions scattered across the whole matrix: 22 ns per term.
+  - The transposed product reads its values contiguously: 9.5 ns per term.
+  - On fix-a, the 99 dense border equality rows hold almost all of A's entries. Every A·x in the residuals, the KKT right-hand sides and the owner solves paid the scattered stride.
+- Change (`exactdot`, `sparse_parallel`):
+  - `dot_outputs_chunked` sums many exact dots in one pass over a stream of (output, a, b) terms.
+    - Each column chunk owns fixed-point accumulators per output.
+    - Chunks merge by limb addition, and each output is rounded once.
+    - The result is the serial exact sum. An output that declines (non-finite term or too-wide spread) falls back to the existing per-row branch.
+  - A forward product above 64 bits (with nnz ≥ 4m) streams its long rows column by column.
+    - A long row has at least 4096 entries.
+    - Long rows must hold at least half of A's entries.
+    - The pass uses 4 column chunks per lane.
+  - The other rows keep their lanes.
+  - Every output equals CSC gemv bitwise, including signed zeros and NaN fallbacks.
+- Thresholds (M4 sweep, 99 dense rows plus an identity block, streamed vs per row):
+
+  | Row length | Result at T = 1–8 |
+  |---|---|
+  | ≥ 4096 | 1.04–2.6× faster |
+  | 1024–2048 | up to 1.4× slower (rows still cache-resident) |
+
+  - Short rows taking 50% of nnz still left streaming ahead: 98 vs 120 ms.
+  - Four chunks per lane: −9…−10% at T = 8/10 on mixed P/E cores; T = 2/4 unchanged.
+- E2E (Mac, fast profile, fix-a 256): ABBA, every run Solved; points are bitwise identical to 3352eee in each mode.
+
+  | Mode | A s | B s | Change |
+  |---|---|---|---|
+  | Owner, partitions 1, T=2 | 22.24 / 22.23 | 14.38 / 14.58 | −34.9% |
+  | Owner, partitions 2, T=10 | 11.95 | 9.91 | −17.1% |
+  | Plain, T=2 | 8.45 / 8.46 | 7.82 / 7.84 | −7.4% |
+  | Plain, T=10 | 5.27 / 5.34 | 5.09 / 5.10 | −4.0% |
+
+  - Owner phases (T=2): kkt update 13.35 → 8.88 s, kkt solve 5.87 → 3.26, condensed residual 4.37 → 2.47.
+  - Plain: residual update 1.08 → 0.64 s.
+  - d6n640q 128 (plain, T=10, 640 rows of ~16.8k entries): 65.69 → 65.81 s. The points are bitwise identical. Residual update fell 2.68 → 1.70 s, inside the noise of `arrow.local_schur` (40 of 63 s).
+- Tests: chunked dots match the serial exact dot at 128/256/1024 bits for 1–2000 chunks. Long-row products match gemv at 1/2/4 threads, f64 and 256 bits. 505 solver lib tests pass; the `it` suite fails only the known `overshooting_start_still_solves`.
+- Decision: kept (bitwise; existing audits carry over).
+
 ## 2026-10-15 — Owner recovery skips zero-cone rows (thermal-ore)
 
 - Observed (fix-a 256, owner path, partitions 1, T=2, after 7e7d781):

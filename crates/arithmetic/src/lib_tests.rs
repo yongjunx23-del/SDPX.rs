@@ -805,6 +805,73 @@ fn chunked_exact_dot_is_the_serial_value() {
     chunked_dot_matches::<16>();
 }
 
+fn output_dots_match<const N: usize>() {
+    let value = |i: usize| {
+        let x = MpFloat::<N>::from_f64(((i * 7919) % 1013) as f64 - 506.25).unwrap();
+        let s = MpFloat::<N>::from_f64(2f64.powi((i % 41) as i32 * 9 - 180)).unwrap();
+        if i % 13 == 0 {
+            MpFloat::<N>::zero()
+        } else {
+            x * s / MpFloat::<N>::from_f64(3.0).unwrap()
+        }
+    };
+    // Output k takes terms i ≡ k (mod 5); output 3 has a NaN, output 4 only
+    // zero products and output 5 a spread beyond the accumulator bound.
+    let outputs = 6;
+    let mut terms: Vec<(usize, MpFloat<N>, MpFloat<N>)> = (0..997)
+        .map(|i| (i % 5, value(i), value(i * 3 + 1)))
+        .map(|(k, a, b)| {
+            if k == 4 {
+                (k, MpFloat::<N>::zero(), b)
+            } else {
+                (k, a, b)
+            }
+        })
+        .collect();
+    terms[3 + 5 * 7].1 = MpFloat::<N>::nan();
+    let huge = MpFloat::<N>::from_f64(2f64.powi(1000)).unwrap().powi(20);
+    terms.push((5, huge, huge));
+    terms.push((
+        5,
+        MpFloat::<N>::one(),
+        MpFloat::<N>::from_f64(1e-300).unwrap(),
+    ));
+    let expected: Vec<MpFloat<N>> = (0..outputs)
+        .map(|k| MpFloat::<N>::dot_fma(terms.iter().filter(|t| t.0 == k).map(|t| (&t.1, &t.2))))
+        .collect();
+    for chunks in [1, 2, 7, 64, 2000] {
+        let size = terms.len().div_ceil(chunks);
+        let part = |c: usize| {
+            terms[(c * size).min(terms.len())..((c + 1) * size).min(terms.len())]
+                .iter()
+                .map(|t| (t.0, &t.1, &t.2))
+        };
+        let par_for = |n: usize, f: &(dyn Fn(usize) + Sync)| (0..n).rev().for_each(f);
+        let sums = <MpFloat<N> as Scalar>::dot_outputs_chunked(outputs, chunks, &part, &par_for);
+        for (k, sum) in sums.iter().enumerate() {
+            match k {
+                3 | 5 => assert!(sum.is_none(), "N={N} chunks={chunks} k={k}"),
+                _ => {
+                    let sum = sum.unwrap();
+                    assert_eq!(
+                        sum.to_string(),
+                        expected[k].to_string(),
+                        "N={N} chunks={chunks} k={k}"
+                    );
+                    assert_eq!(sum.is_sign_negative(), expected[k].is_sign_negative());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn output_exact_dots_are_the_serial_values() {
+    output_dots_match::<2>();
+    output_dots_match::<4>();
+    output_dots_match::<16>();
+}
+
 #[test]
 fn chunked_exact_dot_rejects_incomplete_scheduler() {
     let values = [MpFloat::<2>::one(), MpFloat::<2>::from_f64(1e-100).unwrap()];

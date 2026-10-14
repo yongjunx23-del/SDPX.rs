@@ -3,6 +3,14 @@ use crate::algebra::*;
 use std::sync::Arc;
 
 const MIN_PARALLEL_WORK: u128 = 32768;
+/// Entries from which a row of a wide exact forward product is read column
+/// by column (`forward_long`). Apple M4, 99 rows at 256 bits, 1–8 threads:
+/// rows of 4096 entries and more run 1.04–2.6× faster; rows of 1024–2048,
+/// still cache-resident row by row, run up to 1.4× slower.
+const LONG_ROW_ENTRIES: usize = 4096;
+/// Column chunks per lane of `forward_long`, so faster cores take more of
+/// them (M4 at 8–10 threads: −9…−10%; 2–4 threads unchanged).
+const LONG_CHUNKS_PER_LANE: usize = 4;
 
 pub(crate) fn worthwhile<T: FloatT>(a: &CscMatrix<T>) -> bool {
     let words = T::precision_bits().div_ceil(64) as u128;
@@ -25,6 +33,16 @@ pub(crate) struct SparseParallel {
     active: Vec<usize>,
     active_ptr: Vec<usize>,
     active_lanes: Vec<usize>,
+    // Long rows of a wide exact forward product, with each row's index among
+    // them (usize::MAX elsewhere) and column lanes balancing their entries.
+    // A row's entries lie one per CSC column across the whole matrix, so a
+    // row-by-row pass strides through memory (fix-a 256: 22 ns per term,
+    // against 9.5 for the contiguous adjoint); `forward_long` reads them
+    // column by column into per-row exact accumulators instead.
+    long_rows: Vec<usize>,
+    long_index: Vec<usize>,
+    long_lanes: Vec<usize>,
+    symmetric: bool,
     workers: usize,
     pool: Option<Arc<rayon::ThreadPool>>,
 }
@@ -114,6 +132,10 @@ impl SparseParallel {
             active,
             active_ptr,
             active_lanes: Vec::new(),
+            long_rows: Vec::new(),
+            long_index: Vec::new(),
+            long_lanes: Vec::new(),
+            symmetric,
             workers: 0,
             pool: None,
         }
@@ -141,6 +163,101 @@ impl SparseParallel {
             } else {
                 partitions(&self.active_ptr, lanes)
             };
+            self.plan_long_rows(a, lanes);
+        }
+    }
+
+    /// Rows with at least [`LONG_ROW_ENTRIES`] entries, when the forward
+    /// product is exact and they hold at least half of its entries (the
+    /// column pass reads every entry to find theirs).
+    fn plan_long_rows<T: FloatT>(&mut self, a: &CscMatrix<T>, lanes: usize) {
+        self.long_rows.clear();
+        self.long_index = Vec::new();
+        self.long_lanes = Vec::new();
+        let exact = T::precision_bits() > 64 && a.nnz() >= 4 * a.m;
+        if !exact || self.symmetric {
+            return;
+        }
+        let length = |r: usize| self.rowptr[r + 1] - self.rowptr[r];
+        let rows: Vec<usize> = (0..a.m)
+            .filter(|&r| length(r) >= LONG_ROW_ENTRIES)
+            .collect();
+        if 2 * rows.iter().map(|&r| length(r)).sum::<usize>() < a.nnz() {
+            return;
+        }
+        let mut index = vec![usize::MAX; a.m];
+        for (k, &r) in rows.iter().enumerate() {
+            index[r] = k;
+        }
+        let mut ptr = Vec::with_capacity(a.n + 1);
+        ptr.push(0);
+        for j in 0..a.n {
+            let long = a.rowval[a.colptr[j]..a.colptr[j + 1]]
+                .iter()
+                .filter(|&&r| index[r] != usize::MAX)
+                .count();
+            ptr.push(ptr[j] + long);
+        }
+        self.long_lanes = partitions(&ptr, LONG_CHUNKS_PER_LANE * lanes.max(1));
+        self.long_rows = rows;
+        self.long_index = index;
+    }
+
+    /// Whether a forward product with this `alpha` takes `forward_long`.
+    fn streams_long<T: FloatT>(&self, alpha: T) -> bool {
+        !self.long_rows.is_empty() && alpha != T::zero()
+    }
+
+    fn is_long(&self, row: usize) -> bool {
+        self.long_index.get(row).is_some_and(|&k| k != usize::MAX)
+    }
+
+    /// The long rows of `y = alpha·A·x + beta·y`, read column by column on
+    /// the long lanes into per-row exact accumulators. Each output is the
+    /// exact sum `output` forms (with the incoming y for alpha = ±1),
+    /// rounded once; a row whose exact sum declines runs `output` itself.
+    fn forward_long<T: FloatT>(&self, a: &CscMatrix<T>, y: &mut [T], x: &[T], alpha: T, beta: T) {
+        use rayon::prelude::*;
+        let one = T::one();
+        let signed = alpha == one || alpha == -one;
+        let base: Vec<T> = self
+            .long_rows
+            .iter()
+            .map(|&r| {
+                let mut v = y[r];
+                scale_output(&mut v, beta);
+                v
+            })
+            .collect();
+        let heads: Vec<T> = if alpha == -one {
+            base.iter().map(|&v| -v).collect()
+        } else {
+            base.clone()
+        };
+        let lanes = &self.long_lanes;
+        let terms = |c: usize| {
+            let (j0, j1) = (lanes[c], lanes.get(c + 1).copied().unwrap_or(a.n));
+            LongTerms {
+                a,
+                x,
+                index: &self.long_index,
+                heads: if c == 0 && signed { &heads } else { &[] },
+                one: &one,
+                head: 0,
+                column: j0,
+                end_column: j1,
+                position: a.colptr[j0],
+            }
+        };
+        let par_for = |n: usize, f: &(dyn Fn(usize) + Sync)| (0..n).into_par_iter().for_each(f);
+        let sums = T::dot_outputs_chunked(self.long_rows.len(), lanes.len(), &terms, &par_for);
+        for ((k, &r), sum) in self.long_rows.iter().enumerate().zip(sums) {
+            match sum {
+                Some(s) if alpha == one => y[r] = s,
+                Some(s) if alpha == -one => y[r] = -s,
+                Some(s) => y[r] = base[k] + alpha * s,
+                None => self.output(a, false, r, &mut y[r], x, alpha, beta),
+            }
         }
     }
 
@@ -509,7 +626,8 @@ impl SparseParallel {
         } else {
             &self.row_lanes
         };
-        if lanes.len() <= 1 {
+        let long = !transpose && self.streams_long(alpha);
+        if lanes.len() <= 1 && !long {
             if transpose {
                 a.t().gemv(y, x, alpha, beta);
             } else {
@@ -517,8 +635,13 @@ impl SparseParallel {
             }
             return;
         }
+        if long {
+            self.forward_long(a, y, x, alpha, beta);
+        }
         split_outputs(y, lanes, &|output, y| {
-            self.output(a, transpose, output, y, x, alpha, beta)
+            if !(long && self.is_long(output)) {
+                self.output(a, transpose, output, y, x, alpha, beta)
+            }
         });
     }
 
@@ -534,9 +657,16 @@ impl SparseParallel {
     fn forward_active<T: FloatT>(&self, a: &CscMatrix<T>, y: &mut [T], x: &[T], alpha: T, beta: T) {
         use rayon::prelude::*;
         debug_assert!(beta == T::one());
+        let long = self.streams_long(alpha);
+        if long {
+            self.forward_long(a, y, x, alpha, beta);
+        }
         let mut values: Vec<T> = self.active.iter().map(|&r| y[r]).collect();
         split_outputs(&mut values, &self.active_lanes, &|k, value| {
-            self.output(a, false, self.active[k], value, x, alpha, beta)
+            let row = self.active[k];
+            if !(long && self.is_long(row)) {
+                self.output(a, false, row, value, x, alpha, beta)
+            }
         });
         for (&r, value) in self.active.iter().zip(values) {
             y[r] = value;
@@ -714,6 +844,45 @@ fn split_output_pair<T: FloatT, F: Fn(usize, &mut T, &mut T) + Sync>(
             || split_output_pair(l0, l1, &lanes[..mid], f),
             || split_output_pair(r0, r1, &lanes[mid..], f),
         );
+    }
+}
+
+/// Terms of the long rows in columns `column..end_column`, in CSC order, as
+/// `(long row index, a, x)`; chunk 0 leads with the incoming heads.
+struct LongTerms<'a, T> {
+    a: &'a CscMatrix<T>,
+    x: &'a [T],
+    index: &'a [usize],
+    heads: &'a [T],
+    one: &'a T,
+    head: usize,
+    column: usize,
+    end_column: usize,
+    position: usize,
+}
+
+impl<'a, T> Iterator for LongTerms<'a, T> {
+    type Item = (usize, &'a T, &'a T);
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.head < self.heads.len() {
+            self.head += 1;
+            return Some((self.head - 1, &self.heads[self.head - 1], self.one));
+        }
+        while self.column < self.end_column {
+            let end = self.a.colptr[self.column + 1];
+            while self.position < end {
+                let p = self.position;
+                self.position += 1;
+                let k = self.index[self.a.rowval[p]];
+                if k != usize::MAX {
+                    return Some((k, &self.a.nzval[p], &self.x[self.column]));
+                }
+            }
+            self.column += 1;
+        }
+        None
     }
 }
 

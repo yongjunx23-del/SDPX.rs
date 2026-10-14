@@ -119,6 +119,24 @@ pub trait Scalar:
     ) -> Self {
         Self::dot_slices(a, b)
     }
+    /// Sums of `outputs` dot products whose terms arrive in chunks:
+    /// `terms(c)` yields `(output, a, b)` for chunk `c < chunks`, and
+    /// `par_for(chunks, f)` may run the chunks concurrently. Exactly
+    /// accumulated types return each output's exact sum rounded once, the
+    /// value of `dot_fma` over its terms in any order. `None` marks an output
+    /// left to the caller: always here, and where the exact path declines.
+    fn dot_outputs_chunked<'a, I>(
+        outputs: usize,
+        _chunks: usize,
+        _terms: &(dyn Fn(usize) -> I + Sync),
+        _par_for: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
+    ) -> Vec<Option<Self>>
+    where
+        Self: 'a,
+        I: Iterator<Item = (usize, &'a Self, &'a Self)>,
+    {
+        vec![None; outputs]
+    }
     fn ln(self) -> Self;
     fn exp(self) -> Self;
     fn sin(self) -> Self;
@@ -1370,6 +1388,17 @@ impl<const N: usize> Scalar for MpFloat<N> {
         par_for: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
     ) -> Self {
         exactdot::dot_slices_chunked(a, b, chunks, par_for, |terms| Self::dot_fma_chain(terms))
+    }
+    fn dot_outputs_chunked<'a, I>(
+        outputs: usize,
+        chunks: usize,
+        terms: &(dyn Fn(usize) -> I + Sync),
+        par_for: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
+    ) -> Vec<Option<Self>>
+    where
+        I: Iterator<Item = (usize, &'a Self, &'a Self)>,
+    {
+        exactdot::dot_outputs_chunked(outputs, chunks, terms, par_for)
     }
     fn ln(self) -> Self {
         self.unary(mpfr::log)
