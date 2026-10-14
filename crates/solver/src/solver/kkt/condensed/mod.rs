@@ -1849,6 +1849,16 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         self.reduced.diagonal_norm()
     }
 
+    /// Interior columns factored with pivot one; see
+    /// [`DirectLDLKKTSolver::set_unit_pivots`].
+    pub(crate) fn set_interior_unit_pivots(&mut self, columns: Vec<usize>) {
+        self.reduced.set_unit_pivots(columns);
+    }
+
+    pub(crate) fn interior_columns_isolated(&self, columns: &[usize]) -> bool {
+        self.reduced.isolated_columns(columns)
+    }
+
     pub(crate) fn factor_interior(&mut self, settings: &CoreSettings<T>, shift: T) -> bool {
         self.reduced.factor_with_shift(settings, Some(shift))
     }

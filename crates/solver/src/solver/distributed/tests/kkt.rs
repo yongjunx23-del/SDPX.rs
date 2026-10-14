@@ -343,7 +343,10 @@ fn check_refinement<T: FloatT>(make: &impl Fn() -> DefaultProblemData<T>, gmres:
                 T::one(),
                 ScalingStrategy::PrimalDual
             ));
-            assert!(mono.update(&cones, &settings));
+            // The monolithic reference may need a shift on free columns.
+            while !mono.update(&cones, &settings) {
+                assert!(mono.escalate_regularization());
+            }
             assert!(owned.update_local(&state.cones.blocks, &settings));
             // A manufactured solution is checked through the independent
             // monolithic original operator, not the assembled Schur.
@@ -656,6 +659,37 @@ fn sampled_pair_cache_case<T: FloatT>() {
             );
         }
     }
+}
+
+/// Free variables join the border system; the unit-pivot local factors
+/// never escalate and solves still match the monolithic operator.
+fn check_free_columns<T: FloatT>() {
+    let make = super::super::state::tests::free_variables::<T>;
+    let data = make();
+    let state = runtime(
+        make(),
+        1,
+        DefaultSettings {
+            max_threads: 1,
+            ..DefaultSettings::default()
+        },
+        (data.n, data.m),
+    );
+    let owned = OwnedKkt::new_with_pool(
+        &state.data.layout,
+        state.data.blocks.iter().zip(&state.cones.blocks),
+        &CoreSettings::<T>::default(),
+        None,
+        false,
+    );
+    assert_eq!(owned.free.total, 2);
+    check(make);
+}
+
+#[test]
+fn owned_kkt_free_columns() {
+    check_free_columns::<f64>();
+    check_free_columns::<MpFloat<4>>();
 }
 
 #[test]

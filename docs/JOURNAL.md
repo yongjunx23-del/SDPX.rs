@@ -8,6 +8,36 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Owner border: free columns join the border system (thermal-ore)
+
+- Observed (trace, fix-a 256, owner path, T=2):
+  - Two primal columns of the local block appear only in border equality rows and have no P entries, so their local diagonal is exactly zero.
+  - The first local factor fails, and escalation sets the shared shift to 1.08e-72 on every interior diagonal.
+  - The border Schur then carries C_f·C_fᵀ/shift ≈ 1e72 next to the O(1) rest. Its rounding error (~1e-5 relative to S_b) limits each reduced refinement step to about one digit.
+  - 34 original-level refinements hit the 10-correction cap: 1933 interior solve batches and 762 outer refinements in 33 iterations. Plain needs one solve per refinement call.
+- Change (`distributed::kkt`, `direct::solver`):
+  - A free column (no P entries; A entries only in border rows; checked isolated in the local KKT) is factored locally with pivot one (`set_unit_pivots`). Its response rows and interior solution are zero.
+  - The border solve eliminates it exactly from [S, −C_f; C_fᵀ, shift·I]: y0 = S⁻¹g, x_f = G⁻¹(r_f − C_fᵀy0), y = y0 + W·x_f, with W = S⁻¹C_f and G = shift·I + C_fᵀW (dense LU, nf ≤ border).
+  - C_f is gathered across ranks once. r_f rides in the existing reductions: an extra reduce only when free columns exist, plus a wider fused all-gather.
+  - In exact arithmetic this is the same regularized operator as before. Only the elimination order changes, and with no failure the shift stays 0.
+  - Plain solves and owner inputs without free columns run the old code.
+- E2E (Mac, fast profile, fix-a 256, partitions 1, T=2): ABBA, both arms Solved in 33 iterations.
+
+  | Arm | Run 1 s | Run 2 s | Outer refinements | Interior batches | Peak RSS MiB |
+  |---|---|---|---|---|---|
+  | A (76e1763) | 122.1 | 121.7 | 762 | 1933 | 2364 / 2366 |
+  | B | 39.06 | 39.02 (−68%) | 0 | 305 | 3445 / 4036 |
+
+  - Audit at 384 bits, original coordinates:
+    - B: primal rel 1.7e-19, dual rel 7.5e-19, gap rel 6.8e-21.
+    - A: 1.9e-19, 8.4e-19 and 7.7e-21.
+    - Objectives agree to 18 digits.
+  - Plain (no partitions): points bitwise identical (e3b8a66f5aec), 8.48 / 8.49 s.
+  - Unit tests: a two-free-variable problem at 1, 2 and 8 owners, f64 and 256 bits, stationary and GMRES, pair and single solves. 502 lib tests pass. The `it` suite fails only the known `overshooting_start_still_solves`.
+- Peak RSS: B is lower early (2.01 GB at 3 and 10 iterations vs A's 2.48 GB) but grows late (2.40 GB at 20, 2.79 GB at 28).
+  - Hypothesis: the border's exact residue product (`border_assemble`, now 11.3 s of 39) needs more primes as the bound diagonals spread. A's 1e72 rows sent it elsewhere.
+- Decision: kept. Next is the remaining owner cost on LPs: border_assemble 11.3 s and factor_response 4.8 s. A bound-only local kernel is diagonal, so C·D⁻¹·Cᵀ could use the bound Gram congruence that plain uses (0.07 s per factorization).
+
 ## 2026-10-15 — Local condensed kernels: A's products on the pool (thermal-ore)
 
 - Observed (fix-a owner, 256 bits, T=2): the owner-local condensed kernel ran A·x and Aᵀ·z serially, in `recover_rhs`, the original-level `residual` and `prepare_rhs`.

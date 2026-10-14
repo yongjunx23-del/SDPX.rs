@@ -43,6 +43,10 @@ struct LocalKkt<T: FloatT> {
     // local kernel. Keep one snapshot per pair lane so recovery restores the
     // cache belonging to the column being recovered.
     rhs_cache: [Vec<T>; 2],
+    /// Primal columns only border equalities touch (see `OwnedKkt::free`)
+    /// and the position of the first in the global free list.
+    free: Vec<usize>,
+    free_offset: usize,
 }
 
 impl<T: FloatT> LocalKkt<T> {
@@ -291,6 +295,137 @@ pub(crate) struct OwnedKkt<T: FloatT> {
     /// Column of the next solve left without original-level refinement
     /// (`skip_refinement`).
     unrefined: Option<usize>,
+    /// Free columns: primal columns that only border equalities touch, so
+    /// their local diagonal is zero. Factored locally with pivot one, they
+    /// join the border system [S, -C_f; C_fᵀ, shift·I], eliminated through
+    /// W = S⁻¹C_f and G = shift·I + C_fᵀW. A shift on their zero pivots
+    /// would add C_f·C_fᵀ/shift to S and bury it in rounding (fix-a: one
+    /// digit per reduced refinement step). C_f and W are stored column by
+    /// column, each column's border entries contiguous.
+    free: FreeBorder<T>,
+}
+
+#[derive(Default)]
+struct FreeBorder<T> {
+    total: usize,
+    coupling: Vec<T>,
+    response: Vec<T>,
+    lu: Vec<T>,
+    pivots: Vec<usize>,
+    rhs: Vec<T>,
+    fused_rhs: Vec<T>,
+}
+
+impl<T: FloatT> FreeBorder<T> {
+    /// Factor G = shift·I + C_fᵀW once W = S⁻¹C_f is in `response`.
+    fn factor(&mut self, border: usize, shift: T) -> bool {
+        let nf = self.total;
+        self.lu.clear();
+        for a in 0..nf {
+            for b in 0..nf {
+                let c = &self.coupling[a * border..(a + 1) * border];
+                let w = &self.response[b * border..(b + 1) * border];
+                self.lu.push(T::dot_fma(c.iter().zip(w)));
+            }
+            self.lu[a * nf + a] += shift;
+        }
+        // Dense LU with partial pivoting; G is nf×nf with nf ≤ border.
+        self.pivots.clear();
+        let lu = &mut self.lu;
+        for k in 0..nf {
+            let p = (k..nf)
+                .max_by(|&i, &j| {
+                    lu[i * nf + k]
+                        .abs()
+                        .partial_cmp(&lu[j * nf + k].abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap();
+            let pivot = lu[p * nf + k];
+            if pivot.is_zero() || !pivot.is_finite() {
+                return false;
+            }
+            self.pivots.push(p);
+            if p != k {
+                for c in 0..nf {
+                    lu.swap(k * nf + c, p * nf + c);
+                }
+            }
+            for i in k + 1..nf {
+                let l = lu[i * nf + k] / pivot;
+                lu[i * nf + k] = l;
+                for c in k + 1..nf {
+                    let u = lu[k * nf + c];
+                    lu[i * nf + c] -= l * u;
+                }
+            }
+        }
+        true
+    }
+
+    /// `y` holds S⁻¹g and `r` the free columns' right-hand side; on return
+    /// `r` is x_f = G⁻¹(r − C_fᵀy) and `y` the border solution y + W·x_f.
+    fn solve(&self, y: &mut [T], r: &mut [T]) -> bool {
+        let nf = self.total;
+        let border = y.len();
+        for (k, r) in r.iter_mut().enumerate() {
+            *r -= T::dot_fma(self.coupling[k * border..(k + 1) * border].iter().zip(&*y));
+        }
+        for (k, &p) in self.pivots.iter().enumerate() {
+            r.swap(k, p);
+        }
+        for i in 0..nf {
+            let s = T::dot_fma((0..i).map(|j| (&self.lu[i * nf + j], &r[j])));
+            r[i] -= s;
+        }
+        for i in (0..nf).rev() {
+            let s = T::dot_fma((i + 1..nf).map(|j| (&self.lu[i * nf + j], &r[j])));
+            r[i] = (r[i] - s) / self.lu[i * nf + i];
+        }
+        for (i, y) in y.iter_mut().enumerate() {
+            *y += T::dot_fma((0..nf).map(|k| (&self.response[k * border + i], &r[k])));
+        }
+        r.is_finite() && y.is_finite()
+    }
+
+    /// This process's free right-hand side entries at their global slots.
+    fn gather_rhs(locals: &[LocalKkt<T>], blocks: &[Vec<T>], out: &mut [T]) {
+        out.fill(T::zero());
+        for (local, b) in locals.iter().zip(blocks) {
+            for (k, &f) in local.free.iter().enumerate() {
+                out[local.free_offset + k] = b[f];
+            }
+        }
+    }
+
+    fn place(locals: &[LocalKkt<T>], blocks: &mut [Vec<T>], x: &[T]) {
+        for (local, b) in locals.iter().zip(blocks) {
+            for (k, &f) in local.free.iter().enumerate() {
+                b[f] = x[local.free_offset + k];
+            }
+        }
+    }
+}
+
+/// Primal columns of an owner whose only entries are in `border` rows of A.
+fn free_columns<T: FloatT>(p: &CscMatrix<T>, a: &CscMatrix<T>, border: &[usize]) -> Vec<usize> {
+    let mut in_border = vec![false; a.m];
+    for &r in border {
+        in_border[r] = true;
+    }
+    let mut touched = vec![false; p.n];
+    for j in 0..p.n {
+        for &r in &p.rowval[p.colptr[j]..p.colptr[j + 1]] {
+            touched[j] = true;
+            touched[r] = true;
+        }
+    }
+    (0..a.n)
+        .filter(|&j| {
+            let rows = &a.rowval[a.colptr[j]..a.colptr[j + 1]];
+            !touched[j] && !rows.is_empty() && rows.iter().all(|&r| in_border[r])
+        })
+        .collect()
 }
 
 impl<T: FloatT> OwnedKkt<T> {
@@ -338,7 +473,7 @@ impl<T: FloatT> OwnedKkt<T> {
             _ => 0,
         };
         let mut assembly_budget = crate::solver::kkt::parallel_assembly_budget_bytes();
-        let locals: Vec<_> = parts
+        let mut locals: Vec<_> = parts
             .into_iter()
             .zip(owner_ids.iter().enumerate())
             .map(|((data, cones), (owner, _global_owner))| {
@@ -381,6 +516,7 @@ impl<T: FloatT> OwnedKkt<T> {
                 let mut coupling_plan = SparseParallel::new(&coupling);
                 coupling_plan.configure(&coupling, pool.clone());
                 let cells = kernel.interior_dimension() * border;
+                let free = free_columns(&data.P, &data.A, &rows);
                 LocalKkt {
                     kernel,
                     n: data.n,
@@ -397,9 +533,12 @@ impl<T: FloatT> OwnedKkt<T> {
                     local_assemble_ns: 0.0,
                     factor_response_ns: 0.0,
                     rhs_cache: [Vec::new(), Vec::new()],
+                    free,
+                    free_offset: 0,
                 }
             })
             .collect();
+        let free = Self::free_border(&mut locals, border, collective.as_ref());
         let ptr: Vec<_> = (0..=border).map(|j| j * (j + 1) / 2).collect();
         let rowval = (0..border).flat_map(|j| 0..=j).collect();
         let matrix = CscMatrix::new(
@@ -453,7 +592,63 @@ impl<T: FloatT> OwnedKkt<T> {
             fused_border_rhs: Vec::new(),
             fused_ready: false,
             unrefined: None,
+            free,
         }
+    }
+
+    /// Number the owners' free columns across ranks and gather C_f. Free
+    /// columns are used only when every one is isolated in its local KKT
+    /// and G can be nonsingular (at most `border` of them); otherwise the
+    /// locals keep their zero diagonals as before.
+    fn free_border(
+        locals: &mut [LocalKkt<T>],
+        border: usize,
+        collective: &dyn crate::solver::distributed::collective::Collective<T>,
+    ) -> FreeBorder<T> {
+        let count: usize = locals.iter().map(|l| l.free.len()).sum();
+        let isolated = locals
+            .iter()
+            .all(|l| l.kernel.interior_columns_isolated(&l.free));
+        let counts: Option<Vec<usize>> = collective
+            .all_gather(105, &[T::from_usize(count).unwrap_or(T::zero())])
+            .ok()
+            .and_then(|all| all.iter().map(|v| v.to_usize()).collect());
+        let isolated = collective.all_true(106, isolated).unwrap_or(false);
+        let counts = counts.unwrap_or_default();
+        let total: usize = counts.iter().sum();
+        let widest = counts.iter().copied().max().unwrap_or(0);
+        let mut free = FreeBorder::default();
+        if isolated && total > 0 && total <= border && counts.len() == collective.size() {
+            let mut payload = vec![T::zero(); widest * border];
+            let mut k = 0;
+            for local in locals.iter() {
+                for &f in &local.free {
+                    for p in local.coupling.colptr[f]..local.coupling.colptr[f + 1] {
+                        payload[k * border + local.coupling.rowval[p]] = local.coupling.nzval[p];
+                    }
+                    k += 1;
+                }
+            }
+            if let Ok(all) = collective.all_gather(107, &payload) {
+                let mut offset: usize = counts[..collective.rank()].iter().sum();
+                for local in locals.iter_mut() {
+                    local.free_offset = offset;
+                    offset += local.free.len();
+                    local.kernel.set_interior_unit_pivots(local.free.clone());
+                }
+                for (r, &c) in counts.iter().enumerate() {
+                    free.coupling
+                        .extend_from_slice(&all[r * widest * border..][..c * border]);
+                }
+                free.total = total;
+                free.rhs = vec![T::zero(); 2 * total];
+                return free;
+            }
+        }
+        for local in locals.iter_mut() {
+            local.free.clear();
+        }
+        free
     }
 
     fn new_pair_work(&self, reduced: bool, border: usize) -> Work<T> {
@@ -584,11 +779,18 @@ impl<T: FloatT> OwnedKkt<T> {
                             local.coupling.nzval[p];
                     }
                 }
-                local.kernel.solve_interior_coupling(
+                let solved = local.kernel.solve_interior_coupling(
                     &local.coupling_rhs,
                     &mut local.response,
                     border,
-                )
+                );
+                // Free columns are border unknowns: no interior response.
+                for j in 0..border {
+                    for &f in &local.free {
+                        local.response[j * d + f] = T::zero();
+                    }
+                }
+                solved
             };
             if let Some(started) = started {
                 local.factor_response_ns += elapsed_ns(started);
@@ -612,7 +814,16 @@ impl<T: FloatT> OwnedKkt<T> {
         // includes the one global equality shift. Dynamic pivot safeguards stay.
         border_settings.static_regularization_enable = false;
         let timer = crate::receipt::start();
-        let result = self.border_factor.factor_with_shift(&border_settings, None);
+        let mut result = self.border_factor.factor_with_shift(&border_settings, None);
+        if result && self.free.total > 0 {
+            let free = &mut self.free;
+            free.response.resize(free.coupling.len(), T::zero());
+            result = self.border_factor.solve_factor_panel(
+                &free.coupling,
+                &mut free.response,
+                free.total,
+            ) && free.factor(border, self.shift);
+        }
         let result = self.collective.all_true(104, result).unwrap_or(false);
         crate::receipt::finish("owned.border_factor", timer);
         result
@@ -1032,14 +1243,19 @@ impl<T: FloatT> OwnedKkt<T> {
             (((&mut LocalKkt<T>, &Vec<T>), &Vec<T>), &mut Vec<T>),
             &mut Vec<T>,
         )| {
-            if input_ok[0] && input_ok[1] {
+            let solved = if input_ok[0] && input_ok[1] {
                 local.solve_pair(b0, b1, x0, x1)
             } else {
                 [
                     input_ok[0] && local.kernel.solve_interior_panel(b0, x0, 1),
                     input_ok[1] && local.kernel.solve_interior_panel(b1, x1, 1),
                 ]
+            };
+            for &f in &local.free {
+                x0[f] = T::zero();
+                x1[f] = T::zero();
             }
+            solved
         };
         let mut valid = if let Some(pool) = &self.pool {
             pool.install(|| {
@@ -1107,6 +1323,21 @@ impl<T: FloatT> OwnedKkt<T> {
             valid[c] &=
                 self.collective.reduce_sum_in_place(200 + c, target).is_ok() && target.is_finite();
         }
+        let nf = self.free.total;
+        let mut free_rhs = std::mem::take(&mut self.free.rhs);
+        if nf > 0 {
+            for c in 0..2 {
+                let r = &mut free_rhs[c * nf..(c + 1) * nf];
+                if valid[c] {
+                    let b = if c == 0 { &first.b } else { &second.b };
+                    FreeBorder::gather_rhs(&self.locals, &b.blocks, r);
+                } else {
+                    r.fill(T::nan());
+                }
+                valid[c] &=
+                    self.collective.reduce_sum_in_place(205 + c, r).is_ok() && r.is_finite();
+            }
+        }
 
         for (c, value) in valid.iter_mut().enumerate() {
             *value = self.collective.all_true(210 + c, *value).unwrap_or(false);
@@ -1164,6 +1395,11 @@ impl<T: FloatT> OwnedKkt<T> {
                 (&mut second.x, &self.pair_border[border..2 * border])
             };
             point.border.copy_from_slice(border_point);
+            let x_free = &mut free_rhs[c * nf..(c + 1) * nf];
+            if nf > 0 && !self.free.solve(&mut point.border, x_free) {
+                valid[c] = false;
+                continue;
+            }
             for (local, x) in self.locals.iter().zip(&mut point.blocks) {
                 let d = x.len();
                 for (i, value) in x.iter_mut().enumerate() {
@@ -1172,8 +1408,10 @@ impl<T: FloatT> OwnedKkt<T> {
                     );
                 }
             }
+            FreeBorder::place(&self.locals, &mut point.blocks, x_free);
             valid[c] &= point.norm().is_finite();
         }
+        self.free.rhs = free_rhs;
         for (c, value) in valid.iter_mut().enumerate() {
             *value = self.collective.all_true(220 + c, *value).unwrap_or(false);
         }
@@ -1228,7 +1466,11 @@ impl<T: FloatT> OwnedKkt<T> {
 
     fn solve_reduced_raw(&mut self, out: &mut Point<T>, rhs: &Point<T>) -> bool {
         let solve = |(local, b, x): (&mut LocalKkt<T>, &Vec<T>, &mut Vec<T>)| {
-            local.kernel.solve_interior_panel(b, x, 1)
+            let solved = local.kernel.solve_interior_panel(b, x, 1);
+            for &f in &local.free {
+                x[f] = T::zero();
+            }
+            solved
         };
         let valid = all_blocks!(
             self.pool.as_ref(),
@@ -1267,10 +1509,25 @@ impl<T: FloatT> OwnedKkt<T> {
         {
             return false;
         }
-        if !self
+        let nf = self.free.total;
+        let mut free_rhs = std::mem::take(&mut self.free.rhs);
+        if nf > 0 {
+            FreeBorder::gather_rhs(&self.locals, &rhs.blocks, &mut free_rhs[..nf]);
+            if self
+                .collective
+                .reduce_sum_in_place(243, &mut free_rhs[..nf])
+                .is_err()
+            {
+                self.free.rhs = free_rhs;
+                return false;
+            }
+        }
+        let solved = self
             .border_factor
             .solve_factor_panel(&self.border_rhs, &mut out.border, 1)
-        {
+            && (nf == 0 || self.free.solve(&mut out.border, &mut free_rhs[..nf]));
+        if !solved {
+            self.free.rhs = free_rhs;
             return false;
         }
         let pool = self.pool.as_ref();
@@ -1283,6 +1540,8 @@ impl<T: FloatT> OwnedKkt<T> {
             });
         };
         for_blocks!(self.pool.as_ref(), (&self.locals, &mut out.blocks), correct);
+        FreeBorder::place(&self.locals, &mut out.blocks, &free_rhs[..nf]);
+        self.free.rhs = free_rhs;
         self.collective
             .all_true(242, out.norm().is_finite())
             .unwrap_or(false)
@@ -1366,7 +1625,11 @@ impl<T: FloatT> OwnedKkt<T> {
                 T::one(),
             );
             y.resize(e.len(), T::zero());
-            e.is_finite() && local.kernel.solve_interior_panel(e, y, 1)
+            let solved = e.is_finite() && local.kernel.solve_interior_panel(e, y, 1);
+            for &f in &local.free {
+                y[f] = T::zero();
+            }
+            solved
         };
         let solved = all_blocks!(
             self.pool.as_ref(),
@@ -1379,8 +1642,10 @@ impl<T: FloatT> OwnedKkt<T> {
             ),
             local
         );
-        // [border residual part | border rhs contribution | local norm | solved]
-        let mut message = vec![T::zero(); 2 * border + 2];
+        // [border residual part | border rhs contribution | local norm | solved
+        //  | free-column residuals]
+        let nf = self.free.total;
+        let mut message = vec![T::zero(); 2 * border + 2 + nf];
         let mut local_norm = T::zero();
         for ((local, e), (x, y)) in self
             .locals
@@ -1412,6 +1677,7 @@ impl<T: FloatT> OwnedKkt<T> {
         }
         message[2 * border] = local_norm;
         message[2 * border + 1] = if solved { T::one() } else { T::zero() };
+        FreeBorder::gather_rhs(&self.locals, &out.blocks, &mut message[2 * border + 2..]);
         let Ok(all) = self.collective.all_gather(323, &message) else {
             self.fused_ready = false;
             return T::infinity();
@@ -1458,7 +1724,22 @@ impl<T: FloatT> OwnedKkt<T> {
                 *o += v;
             }
         }
-        self.fused_ready = all_solved && norm.is_finite() && self.fused_border_rhs.is_finite();
+        self.free.fused_rhs.clear();
+        self.free.fused_rhs.resize(nf, T::zero());
+        for r in 0..ranks {
+            for (o, &v) in self
+                .free
+                .fused_rhs
+                .iter_mut()
+                .zip(&all[r * width + 2 * border + 2..(r + 1) * width])
+            {
+                *o += v;
+            }
+        }
+        self.fused_ready = all_solved
+            && norm.is_finite()
+            && self.fused_border_rhs.is_finite()
+            && self.free.fused_rhs.is_finite();
         norm
     }
 
@@ -1471,6 +1752,10 @@ impl<T: FloatT> OwnedKkt<T> {
             .border_factor
             .solve_factor_panel(&self.fused_border_rhs, &mut out.border, 1)
         {
+            return false;
+        }
+        let mut x_free = std::mem::take(&mut self.free.fused_rhs);
+        if self.free.total > 0 && !self.free.solve(&mut out.border, &mut x_free) {
             return false;
         }
         let border = &out.border;
@@ -1489,6 +1774,7 @@ impl<T: FloatT> OwnedKkt<T> {
             (&self.locals, &mut out.blocks, &self.fused_interior),
             correct
         );
+        FreeBorder::place(&self.locals, &mut out.blocks, &x_free);
         out.norm().is_finite()
     }
 

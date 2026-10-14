@@ -167,6 +167,9 @@ pub struct DirectLDLKKTSolver<T> {
     ore: Vec<OreRows<T>>,
     /// Position of each A entry in the KKT's A pattern (with `ore`).
     a_index: Vec<usize>,
+    /// Structurally isolated columns factored with pivot one in place of
+    /// their zero diagonal; the caller solves for them separately.
+    unit_pivots: Vec<usize>,
 }
 
 impl<T> DirectLDLKKTSolver<T>
@@ -313,6 +316,7 @@ where
             residual_pool: None,
             ore,
             a_index,
+            unit_pivots: Vec::new(),
         }
     }
 }
@@ -649,9 +653,22 @@ where
                     diag_shifted[k] = diag_kkt[k];
                 }
             }
+            for &k in &self.unit_pivots {
+                diag_shifted[k] = T::one();
+            }
 
             _update_values(&mut self.ldlsolver, KKT, &map.diag_full, diag_shifted);
             self.diagonal_regularizer = eps;
+            true
+        } else if !self.unit_pivots.is_empty() {
+            for (d, idx) in zip(&mut *diag_kkt, &map.diag_full) {
+                *d = KKT.nzval[*idx];
+            }
+            diag_shifted.copy_from(diag_kkt);
+            for &k in &self.unit_pivots {
+                diag_shifted[k] = T::one();
+            }
+            _update_values(&mut self.ldlsolver, KKT, &map.diag_full, diag_shifted);
             true
         } else {
             false
@@ -795,6 +812,30 @@ where
 
     fn regularize_and_refactor(&mut self, settings: &CoreSettings<T>) -> bool {
         self.factor_with_shift(settings, None)
+    }
+
+    /// Whether each of `columns` stores only its diagonal and appears in no
+    /// other column of the KKT pattern.
+    pub(crate) fn isolated_columns(&self, columns: &[usize]) -> bool {
+        let mut selected = vec![false; self.KKT.n];
+        for &k in columns {
+            if k >= self.KKT.n {
+                return false;
+            }
+            selected[k] = true;
+        }
+        (0..self.KKT.n).all(|j| {
+            self.KKT.rowval[self.KKT.colptr[j]..self.KKT.colptr[j + 1]]
+                .iter()
+                .all(|&r| r == j || !(selected[j] || selected[r]))
+        })
+    }
+
+    /// Factor `columns` with pivot one.  Each must be structurally isolated
+    /// in the KKT (only its diagonal stored) with a zero true diagonal, so the
+    /// factor leaves every other column unchanged; residuals keep the zero.
+    pub(crate) fn set_unit_pivots(&mut self, columns: Vec<usize>) {
+        self.unit_pivots = columns;
     }
 
     /// Forward the solver thread pool to the LDL factorisation kernels that

@@ -128,6 +128,48 @@ pub(crate) fn ordinary<T: FloatT>() -> DefaultProblemData<T> {
     d
 }
 
+/// [`ordinary`] with two free variables (no P entries) that only the two
+/// equality rows touch.
+pub(crate) fn free_variables<T: FloatT>() -> DefaultProblemData<T> {
+    let a = [
+        [1, 1, 1, 1, 1, 1, 1, 0],
+        [1, 0, 2, 0, 0, 0, 0, 0],
+        [0, 0, -1, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 1, 0, 0, 0, 0],
+        [0, -1, 0, 1, 0, 0, 0, 0],
+        [2, -1, 3, -2, 1, 4, -3, 1],
+        [0, 0, 0, 0, 1, 0, 0, 0],
+        [0, 0, 0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ]
+    .map(|r| r.map(n::<T>));
+    let mut p = [[T::zero(); 8]; 8];
+    for i in 0..6 {
+        p[i][i] = n(i as i32 + 2);
+    }
+    p[0][2] = T::one() / n(4);
+    p[1][3] = -T::one() / n(8);
+    let kinds = vec![
+        SupportedConeT::ZeroConeT(1),
+        SupportedConeT::NonnegativeConeT(2),
+        SupportedConeT::SecondOrderConeT(3),
+        SupportedConeT::ZeroConeT(1),
+        SupportedConeT::NonnegativeConeT(3),
+    ];
+    let settings = settings();
+    let mut d = DefaultProblemData::new(
+        &CscMatrix::from(&p),
+        &[1, -2, 3, -4, 5, -6, 2, -1].map(n),
+        &CscMatrix::from(&a),
+        &[1, 0, 2, 4, -1, 2, 3, 6, 7, 8].map(n),
+        &kinds,
+        &settings,
+    );
+    d.equilibrate(&CompositeCone::new(&d.cones), &settings);
+    d
+}
+
 pub(crate) fn sampled<T: FloatT>() -> DefaultProblemData<T> {
     let mut ptr = vec![0];
     let mut rows = Vec::new();
