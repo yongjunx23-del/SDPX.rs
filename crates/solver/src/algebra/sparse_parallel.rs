@@ -311,6 +311,42 @@ impl SparseParallel {
         }
     }
 
+    /// Forward `y = alpha·A·x + beta·y` on the sorted `rows` only, through
+    /// this plan's pool; every other output is left unchanged. Each listed
+    /// output equals the full product's.
+    pub(crate) fn forward_rows_local<T: FloatT>(
+        &self,
+        a: &CscMatrix<T>,
+        rows: &[usize],
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut ptr = Vec::with_capacity(rows.len() + 1);
+        ptr.push(0);
+        for &r in rows {
+            ptr.push(ptr.last().unwrap() + self.rowptr[r + 1] - self.rowptr[r]);
+        }
+        let lanes = partitions(&ptr, self.workers.max(1));
+        let mut values: Vec<T> = rows.iter().map(|&r| y[r]).collect();
+        let mut run = || {
+            split_outputs(&mut values, &lanes, &|k, value| {
+                self.output(a, false, rows[k], value, x, alpha, beta)
+            })
+        };
+        match &self.pool {
+            Some(pool) => pool.install(run),
+            None => run(),
+        }
+        for (&r, value) in rows.iter().zip(values) {
+            y[r] = value;
+        }
+    }
+
     /// Rank-sharded product. Every output is evaluated on exactly one rank in
     /// its original accumulation order; the gathered outputs reproduce the
     /// serial product bitwise.

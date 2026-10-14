@@ -246,7 +246,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             self.retained_rhs.copy_from_slice(&r[n..]);
             self.swap_rhs_mats(&mut saved[c * per_column..(c + 1) * per_column]);
             let corrections = self.counters.outer_refinements;
-            flags[c] = local_success(self.local_only, self.recover_rhs(&mut x, rhs))
+            flags[c] = local_success(self.local_only, self.recover_rhs(&mut x, rhs, false))
                 && if let Some((_, prepared)) = unrefined.filter(|&(u, _)| u == c) {
                     self.scale_solution(&x, prepared)
                 } else {

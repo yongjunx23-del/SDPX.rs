@@ -8,6 +8,29 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Owner recovery skips zero-cone rows (thermal-ore)
+
+- Observed (fix-a 256, owner path, partitions 1, T=2, after 7e7d781):
+  - `recover_rhs` took 3.47 s of 25.3 s.
+  - Each owner solve formed A·x on every row, including the 99 dense border equality rows (2M terms each).
+  - The owner then overwrote those rows with the border duals, so their products were never read.
+- Change (`condensed::mod`, `sparse_parallel`):
+  - A local kernel whose zero-cone rows hold entries lists the remaining rows once.
+  - The owner's `recover_interior_rhs` forms A·x only on those rows, on the pool, with the same per-row arithmetic.
+  - `solve_raw`, which reuses the forward product in its residual, keeps the full product.
+- E2E (Mac, fast profile, fix-a 256, T=2): ABBA, every run Solved in 33 iterations.
+
+  | Arm | Run 1 s | Run 2 s |
+  |---|---|---|
+  | A (7e7d781) | 25.31 | 25.22 |
+  | B | 22.23 | 22.75 (−11.0%) |
+
+  - Phases: recover_rhs 3.47 → 0.51 s; kkt update 15.3 → 13.3 s.
+  - Partitions 2: 19.0 → 17.2 s.
+  - Points are bitwise identical to A at partitions 1 and 2. 503 lib tests pass; the `it` suite fails only the known `overshooting_start_still_solves`.
+- Decision: kept.
+- Remaining owner cost (B, 22.5 s): the condensed `residual` takes 4.4 s; plain takes 8.5 s in total.
+
 ## 2026-10-15 — Owner border over a diagonal interior: exact congruence (thermal-ore)
 
 - Observed (fix-a 256, owner path, partitions 1, T=2, after d3230d1):
