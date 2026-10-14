@@ -8,6 +8,22 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Owner border assembly: one exact residue product per dense coupling (thermal-ore)
+
+- Observed (fix-a gravity LP, 99 dense equality rows × 20,202 columns, 256 bits, `--partitions 1 --threads 2`): the owner path's `owned.border_assemble` took 43.6 s of 158.6 s.
+  - Each of the 99·100/2 upper entries was its own wide row GEMV over 20,202 columns: an exact dot rounded once, which is correct but slow.
+- Change (`distributed/kkt.rs`): a local whose coupling stores every entry (`dense_coupling`: wide rows, nnz = border·n, column-major) forms its upper C·R with one `xgemm_upper_exact`.
+  - Each entry is the exact sum rounded once, as its wide GEMV row was, so the matrix is bitwise unchanged. Other locals keep the row GEMVs. Locals are still added in owner order.
+- E2E: release ABBA, fix-a 256, partitions 1, T=2 (Mac). All four points are identical (41ea9caa5f5d).
+
+  | Arm | Run 1 s | Run 2 s | Mean s | `owned.border_assemble` s |
+  |---|---|---|---|---|
+  | A (dd08399) | 159.1 | 158.1 | 158.6 | 43.8 / 43.5 |
+  | B | 128.7 | 128.0 | 128.3 (−19.1%) | 13.5 / 13.5 |
+
+- Bound-Gram release check (dd08399 against 0eb9a7d, half-size gravity LP, 128 bits, T=4): 219.2 → 196.8 s (−10.2%), `arrow.local_schur` 129.4 → 111.3 s. All four points are identical. This confirms the fast-profile ABBA below.
+- Decision: kept. The owner path is still about 16× slower than plain on this input (128 s vs 8.2 s). Its open costs are 33 vs 25 iterations, 237 vs 85 refinement solves and MPFR row products over the dense border rows in every solve.
+
 ## 2026-10-15 — Bound Gram primes sized by the row block (thermal-ore)
 
 - Observed (quarter-size gravity LP, 16,780 columns, 128 bits): the bound-arrow border Gram (`arrow.local_schur`, the exact residue Yᵀdiag(d)Y) scales 1.12× from T=1 to T=4 (52.1 → 46.3 s). Every other phase scales 3.0–3.5×.

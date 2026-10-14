@@ -23,6 +23,9 @@ struct LocalKkt<T: FloatT> {
     coupling: CscMatrix<T>,
     /// Row-grouped view of `coupling` for the border assembly.
     coupling_rows: CouplingRows,
+    /// Every coupling entry is stored and each row's product is the exact
+    /// sum rounded once: `coupling.nzval` is the dense column-major C.
+    dense_coupling: bool,
     /// Lanes for the border coupling products (54 x ~1200 dense on Λ19
     /// spins 0-50; 18 of 77 s serial on a 32-thread rank without them).
     coupling_plan: SparseParallel,
@@ -372,6 +375,9 @@ impl<T: FloatT> OwnedKkt<T> {
                 let columns: Vec<_> = (0..data.n).collect();
                 let coupling = select_rows(&data.A, &rows, &columns);
                 let coupling_rows = CouplingRows::new(&coupling);
+                let dense_coupling = coupling_rows.wide
+                    && coupling.nnz() == border * data.n
+                    && (0..data.n).all(|j| coupling.colptr[j] == j * border);
                 let mut coupling_plan = SparseParallel::new(&coupling);
                 coupling_plan.configure(&coupling, pool.clone());
                 let cells = kernel.interior_dimension() * border;
@@ -382,6 +388,7 @@ impl<T: FloatT> OwnedKkt<T> {
                     border_rows: rows,
                     coupling,
                     coupling_rows,
+                    dense_coupling,
                     coupling_plan,
                     coupling_rhs: vec![T::zero(); cells],
                     response: vec![T::zero(); cells],
@@ -615,13 +622,47 @@ impl<T: FloatT> OwnedKkt<T> {
         let border = self.border_matrix.n;
         let locals = &self.locals;
         let pointers = &self.border_matrix.colptr;
+        // A dense coupling's upper C·R comes from one exact residue product:
+        // each entry is the exact row sum rounded once, as its wide GEMV row.
+        let products: Vec<Option<Vec<T>>> = locals
+            .iter()
+            .map(|local| {
+                if !local.dense_coupling {
+                    return None;
+                }
+                let d = local.kernel.interior_dimension();
+                let mut product = vec![T::zero(); border * (border + 1) / 2];
+                T::xgemm_upper_exact(
+                    b'N',
+                    b'N',
+                    border,
+                    border,
+                    local.n,
+                    &local.coupling.nzval,
+                    border,
+                    &local.response,
+                    d,
+                    &mut product,
+                    self.pool.as_deref(),
+                    None,
+                )
+                .then_some(product)
+            })
+            .collect();
         // Column j of the upper triangle needs coupling rows 0..=j only. Each
         // entry is the value the full local GEMV gives that row (same terms,
         // order and rounding) added in owner order, so the matrix is
         // unchanged while about half the products are skipped. Columns are
         // independent; the row grouping is built once, not per GEMV.
         let assemble = |j: usize, column: &mut [T]| {
-            for local in locals {
+            for (local, product) in locals.iter().zip(&products) {
+                if let Some(product) = product {
+                    let packed = &product[j * (j + 1) / 2..][..j + 1];
+                    for (entry, &v) in column.iter_mut().zip(packed) {
+                        *entry += v;
+                    }
+                    continue;
+                }
                 let d = local.kernel.interior_dimension();
                 let x = &local.response[j * d..j * d + local.n];
                 for (i, entry) in column.iter_mut().enumerate() {
