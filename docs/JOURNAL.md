@@ -8,6 +8,15 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Condensed sync pass grouped by lane: rejected (thermal-ore)
+
+- Hypothesis: the condensed `sync` pass (copying each cone's scaling into its block) has the same one-job-per-block queue as the old scaling jobs (fix-a: 20200 jobs per update, 0.18 s per solve at T=10).
+- Change tried: group consecutive linear-cost blocks within a scaling lane into one job. PSD and ORE blocks stay alone. Results are bitwise identical.
+- E2E (Mac, ABBA against 5b310c2, bitwise identical):
+  - Profile: `sync` dropped from 0.176 to 0.015 s at T=10.
+  - Whole solve: fix-a partitions 1, T=10: −2.7% (6.92/6.97 → 6.74/6.78 s). T=2: −0.9%. Partitions 2, T=10: −0.5%. d6n640q: +0.9% (68.9/67.9 → 69.6/68.5 s).
+- Decision: rejected; only one configuration clears 2%. Patch saved as `lo12-sync-groups-rejected.patch`.
+
 ## 2026-10-15 — Condensed cone scaling: one queue job per lane of linear-cost blocks (thermal-ore)
 
 - Observed (24a04a6, fix-a 256 owner, T=10):
