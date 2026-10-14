@@ -8,6 +8,41 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Owner free-column border: one refinement round on the bordered system (thermal-ore)
+
+- Observed (Mac, 5da083c, d6n640q 128 owner, T=10):
+  - Every raw owner solve missed the refinement tolerance by about 1e5 (206 original corrections for 206 right-hand sides).
+  - Plain needed none on the same right-hand sides: first residual 2.5e-30 vs owner 4.3e-20 at ‖b‖ 7.7e4; on the constant column 3e-9 vs 8 at ‖b‖ 2e6.
+  - A row-split trace put the owner residual in the 640 equality rows (4e-20); x rows were at 1e-30.
+- Hypotheses:
+  - Refuted: interior back-substitution as D⁻¹b − R·y (cancelling where D⁻¹ is large). Computing x = D⁻¹(b − Cᵀy) as one exact dot lowered the x rows to 1e-45, but the equality rows stayed at 1e-19 (patch `lo9-backsub-and-dbg.patch`).
+  - Verified: the 3 free columns. The owner forms y = S⁻¹g + W·x_f with W = S⁻¹C_f, and S is nearly singular along C_f. On ordinary columns ‖S⁻¹g‖ is 1.6e9 and ‖W·x_f‖ is similar, but ‖y‖ is 3.5e-5, a 14-digit cancellation.
+  - Plain avoids this: its trunk factors the equality multipliers and the free variables as one signed LDL.
+  - Rejected: re-solving y = S⁻¹(g + C_f·x_f) once x_f is known. The equality rows became exact, but x_f carries G = C_fᵀW's error, which then shows in the free rows (first residual 1e-12; patch `lo9a-free-resolve-rejected.patch`).
+- Change (`distributed::kkt::FreeBorder::solve`):
+  - After the existing elimination, run one refinement round on the bordered system [S, −C_f; C_fᵀ, shift·I]·(y; x_f) = (g; h).
+  - The residual of each border row is one exact dot over g, the factored S (packed upper triangle) and C_f, run on the owner pool. The free rows use exact dots too.
+  - The correction reuses the factor: one border solve plus the 3×3 elimination. Its own cancellation scales with its small residual.
+  - Applies to single, pair and fused reduced solves. Inputs without free columns are untouched.
+- E2E (Mac, fast profile), ABBA, every run Solved:
+
+  | Case | A (5da083c) s | B s | Change |
+  |---|---|---|---|
+  | d6n640q 128, partitions 1, T=10 | 91.98 / 90.25 | 74.35 / 72.75 | −19.3% |
+  | fix-a 256, partitions 1, T=2 | 10.57 / 10.56 | 10.60 / 10.61 | +0.3% |
+  | fix-a 256, partitions 2, T=10 | 7.29 / 7.43 | 7.38 / 7.36 | +0.1% |
+
+  - d6n640q, traced:
+    - Raw first residuals 1.5e-30…3e-30 (constant column 6e-27), against tolerance 2.1e-29·‖b‖.
+    - Original corrections 206 → 1, interior solve batches 844 → 641.
+    - kkt solve 8.9 → 4.5 s, corrector solves 12.6 → 6.3 s; same 48 iterations.
+  - Audits at 384 bits, original coordinates, unchanged:
+    - fix-a points changed bitwise (both modes): primal rel 4.2e-19, dual rel 1.9e-18, gap rel 3.4e-19, same objective digits.
+    - d6n640q: 1.1e-26 / 3.0e-23 / 1.2e-20, objective equal in all 28 printed digits.
+  - ising11 owner (no free columns): points bitwise identical. 505 solver lib tests pass.
+- Decision: kept. fix-a's reduced solves never corrected, so it gains nothing; its +0.1–0.3% is within noise for the extra 640² product per solve.
+- Remaining d6n640q owner gap: 72–74 s vs plain 63–66 s. About 8.6 s of the 55.6 s `kkt update` is the const/affine pair solve, whose interior back-substitution loop is serial.
+
 ## 2026-10-15 — Owner solves over a diagonal interior: refine at the original level only (thermal-ore)
 
 - Observed (Mac, 286bd31, d6n640q 128 owner, T=10):

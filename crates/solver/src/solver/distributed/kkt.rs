@@ -329,6 +329,11 @@ struct FreeBorder<T> {
     pivots: Vec<usize>,
     rhs: Vec<T>,
     fused_rhs: Vec<T>,
+    /// Refinement scratch: the free right-hand side, the border residual and
+    /// its correction.
+    h: Vec<T>,
+    e: Vec<T>,
+    dy: Vec<T>,
 }
 
 impl<T: FloatT> FreeBorder<T> {
@@ -378,9 +383,79 @@ impl<T: FloatT> FreeBorder<T> {
         true
     }
 
+    /// [`Self::eliminate`], then one refinement round on the bordered system
+    /// [S, −C_f; C_fᵀ, shift·I]·(y; x_f) = (g; h) with the factored S
+    /// (`matrix`, its packed upper triangle). S⁻¹g and W·x_f are large and
+    /// cancel wherever S is nearly singular along C_f (d6n640q: ‖S⁻¹g‖ 1.6e9
+    /// for ‖y‖ 3.5e-5), which left equality residuals 1e10 above the plain
+    /// arrow's; the round's own cancellation scales with its small residual.
+    #[allow(clippy::too_many_arguments)]
+    fn solve(
+        &mut self,
+        factor: &mut DirectLDLKKTSolver<T>,
+        matrix: &CscMatrix<T>,
+        shift: T,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+        g: &[T],
+        y: &mut [T],
+        r: &mut [T],
+    ) -> bool {
+        let (nf, border) = (self.total, y.len());
+        let mut h = std::mem::take(&mut self.h);
+        h.clear();
+        h.extend_from_slice(r);
+        let mut e = std::mem::take(&mut self.e);
+        e.resize(border, T::zero());
+        let mut dy = std::mem::take(&mut self.dy);
+        dy.resize(border, T::zero());
+        let solved = self.eliminate(y, r) && {
+            let negated: Vec<T> = y.iter().map(|&v| -v).collect();
+            let one = T::one();
+            let (coupling, x_f): (&[T], &[T]) = (&self.coupling, r);
+            border_rows(pool, &mut e, border, |i, v| {
+                let lower = (0..i).map(|j| (&matrix.nzval[matrix.colptr[i] + j], &negated[j]));
+                let upper = (i..border).map(|j| (&matrix.nzval[matrix.colptr[j] + i], &negated[j]));
+                let free = (0..nf).map(|k| (&coupling[k * border + i], &x_f[k]));
+                *v = T::dot_fma(
+                    std::iter::once((&g[i], &one))
+                        .chain(lower)
+                        .chain(upper)
+                        .chain(free),
+                );
+            });
+            let mut e_free: Vec<T> = (0..nf)
+                .map(|k| {
+                    let negated_x = -x_f[k];
+                    T::dot_fma(
+                        [(&h[k], &one), (&shift, &negated_x)].into_iter().chain(
+                            self.coupling[k * border..(k + 1) * border]
+                                .iter()
+                                .zip(&negated),
+                        ),
+                    )
+                })
+                .collect();
+            e.is_finite()
+                && e_free.is_finite()
+                && factor.solve_factor_panel(&e, &mut dy, 1)
+                && self.eliminate(&mut dy, &mut e_free)
+                && {
+                    for (y, &d) in y.iter_mut().zip(&dy) {
+                        *y += d;
+                    }
+                    for (x, &d) in r.iter_mut().zip(&e_free) {
+                        *x += d;
+                    }
+                    r.is_finite() && y.is_finite()
+                }
+        };
+        (self.h, self.e, self.dy) = (h, e, dy);
+        solved
+    }
+
     /// `y` holds S⁻¹g and `r` the free columns' right-hand side; on return
     /// `r` is x_f = G⁻¹(r − C_fᵀy) and `y` the border solution y + W·x_f.
-    fn solve(&self, y: &mut [T], r: &mut [T]) -> bool {
+    fn eliminate(&self, y: &mut [T], r: &mut [T]) -> bool {
         let nf = self.total;
         let border = y.len();
         for (k, r) in r.iter_mut().enumerate() {
@@ -1483,7 +1558,18 @@ impl<T: FloatT> OwnedKkt<T> {
             };
             point.border.copy_from_slice(border_point);
             let x_free = &mut free_rhs[c * nf..(c + 1) * nf];
-            if nf > 0 && !self.free.solve(&mut point.border, x_free) {
+            let g = &self.border_panel_rhs[c * border..(c + 1) * border];
+            if nf > 0
+                && !self.free.solve(
+                    &mut self.border_factor,
+                    &self.border_matrix,
+                    self.shift,
+                    self.pool.as_ref(),
+                    g,
+                    &mut point.border,
+                    x_free,
+                )
+            {
                 valid[c] = false;
                 continue;
             }
@@ -1612,7 +1698,16 @@ impl<T: FloatT> OwnedKkt<T> {
         let solved = self
             .border_factor
             .solve_factor_panel(&self.border_rhs, &mut out.border, 1)
-            && (nf == 0 || self.free.solve(&mut out.border, &mut free_rhs[..nf]));
+            && (nf == 0
+                || self.free.solve(
+                    &mut self.border_factor,
+                    &self.border_matrix,
+                    self.shift,
+                    self.pool.as_ref(),
+                    &self.border_rhs,
+                    &mut out.border,
+                    &mut free_rhs[..nf],
+                ));
         if !solved {
             self.free.rhs = free_rhs;
             return false;
@@ -1854,7 +1949,17 @@ impl<T: FloatT> OwnedKkt<T> {
             return false;
         }
         let mut x_free = std::mem::take(&mut self.free.fused_rhs);
-        if self.free.total > 0 && !self.free.solve(&mut out.border, &mut x_free) {
+        if self.free.total > 0
+            && !self.free.solve(
+                &mut self.border_factor,
+                &self.border_matrix,
+                self.shift,
+                self.pool.as_ref(),
+                &self.fused_border_rhs,
+                &mut out.border,
+                &mut x_free,
+            )
+        {
             return false;
         }
         let border = &out.border;
