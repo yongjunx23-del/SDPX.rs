@@ -69,6 +69,20 @@ fn pieces<T: FloatT>(
     }
 }
 
+/// `rayon::join` when a spare worker can take `b` (the paired gate);
+/// outside a pool rayon would use its global pool.
+fn join_if<RA: Send, RB: Send>(
+    paired: bool,
+    a: impl FnOnce() -> RA + Send,
+    b: impl FnOnce() -> RB + Send,
+) -> (RA, RB) {
+    if paired {
+        rayon::join(a, b)
+    } else {
+        (a(), b())
+    }
+}
+
 /// Scalar central point (t, x, y) of the relative entropy cone, s = −∇f(s);
 /// refined to the working precision by `central_point`.
 const CENTRAL: [f64; 3] = [0.8278383990656786, 0.8051020015847954, 1.290927709856958];
@@ -525,6 +539,7 @@ fn divided2<T: FloatT>(v: [T; 3], d1: impl Fn(usize, usize) -> T) -> T {
 }
 
 /// Barrier oracle at an interior point, in the generalized eigenbasis.
+#[derive(Clone)]
 pub(crate) struct Oracle<T> {
     n: usize,
     q: Vec<T>,
@@ -1243,6 +1258,8 @@ pub struct OpRelEntropyConeData<T> {
     /// Dual tests CG left open since it last decided one or the scaling
     /// moved (`Oracle::dual_ok`).
     cg: u32,
+    /// The scaling's oracle at s (g⁽²⁾ built), for the corrector's ∇²f(s).
+    at_s: Option<Oracle<T>>,
 }
 
 #[derive(Clone)]
@@ -1266,6 +1283,7 @@ impl<T: FloatT> OpRelEntropyCone<T> {
                 s0i: Vec::new(),
                 work: vec![T::zero(); d],
                 cg: 0,
+                at_s: None,
             }),
         }
     }
@@ -1309,15 +1327,31 @@ impl<T: FloatT> OpRelEntropyCone<T> {
         out.iter().all(|v| v.is_finite()).then_some(out)
     }
 
-    /// ∇³f(s)[a, b] = d/dt ∇²f(s + ta)b by central differences with
-    /// ‖ta‖ₛ = ε_mach^¼ (inside the Dikin ellipsoid, so both points are
-    /// interior). Ẑ = T − D(X, Y) carries absolute rounding ≈ ε_mach, so the
+    #[cfg(test)]
+    fn third_mixed(&self, a: &[T], b: &[T]) -> Option<Vec<T>> {
+        self.third_mixed_at(self.mixed_points(None, a, false)?, b, false)
+    }
+
+    /// The points s ± ta of [`Self::third_mixed_at`] with ‖ta‖ₛ = ε_mach^¼
+    /// (inside the Dikin ellipsoid, so both are interior), as (t, oracles);
+    /// `at_s` is the oracle at s if already built.
+    /// Ẑ = T − D(X, Y) carries absolute rounding ≈ ε_mach, so the
     /// quotient's rounding error grows as λ_min(Ẑ) shrinks: at ε_mach^⅓ it
     /// exceeded the corrector itself near the end of two_L4 at 128 bits
     /// (λ_min(Ẑ) ≤ 4e-23), while the truncation term ε_mach^½ stays small.
-    fn third_mixed(&self, a: &[T], b: &[T]) -> Option<Vec<T>> {
+    #[allow(clippy::type_complexity)]
+    fn mixed_points(
+        &self,
+        at_s: Option<&mut Oracle<T>>,
+        a: &[T],
+        paired: bool,
+    ) -> Option<(T, Oracle<T>, Oracle<T>)> {
         let s = &self.data.s;
-        let mut o = Oracle::new(self.n, s)?;
+        let mut fresh = None;
+        let o = match at_s {
+            Some(o) => o,
+            None => fresh.insert(Oracle::new(self.n, s)?),
+        };
         let mut ha = vec![T::zero(); a.len()];
         o.hess_prod(a, &mut ha);
         let norm2 = ha.dot(a);
@@ -1326,17 +1360,75 @@ impl<T: FloatT> OpRelEntropyCone<T> {
         }
         let eps = T::epsilon().sqrt().sqrt().min((0.1).as_T());
         let t = eps / norm2.sqrt();
-        let mut out = vec![T::zero(); a.len()];
-        let mut w = vec![T::zero(); a.len()];
-        for sign in [T::one(), -T::one()] {
+        let point = |sign: T| {
+            let mut w = vec![T::zero(); a.len()];
             w.waxpby(T::one(), s, sign * t, a);
             let mut p = Oracle::new(self.n, &w)?;
-            p.hess_prod(b, &mut ha);
-            out.iter_mut().zip(&ha).for_each(|(o, &h)| *o += sign * h);
+            p.ensure_d2();
+            Some(p)
+        };
+        let (plus, minus) = join_if(paired, || point(T::one()), || point(-T::one()));
+        Some((t, plus?, minus?))
+    }
+
+    /// ∇³f(s)[a, b] = d/dt ∇²f(s + ta)b by central differences at the
+    /// points of [`Self::mixed_points`].
+    fn third_mixed_at(
+        &self,
+        (t, mut plus, mut minus): (T, Oracle<T>, Oracle<T>),
+        b: &[T],
+        paired: bool,
+    ) -> Option<Vec<T>> {
+        let prod = |o: &mut Oracle<T>| {
+            let mut h = vec![T::zero(); b.len()];
+            o.hess_prod(b, &mut h);
+            h
+        };
+        let (hp, hm) = join_if(paired, || prod(&mut plus), || prod(&mut minus));
+        let mut out = vec![T::zero(); b.len()];
+        for (sign, h) in [(T::one(), &hp), (-T::one(), &hm)] {
+            out.iter_mut().zip(h).for_each(|(o, &h)| *o += sign * h);
         }
         let scale = (t + t).recip();
         out.iter_mut().for_each(|o| *o *= scale);
         out.iter().all(|v| v.is_finite()).then_some(out)
+    }
+
+    /// y = Hs x = N·D·Nᵀx.
+    fn hs_prod(&self, y: &mut [T], x: &[T]) {
+        let n = self.n;
+        let m = triangular_number(n);
+        let data = &self.data;
+        let rows = &data.rows;
+        let mut v = x[..3 * m].to_vec();
+        congruence_parts(n, &data.p, &mut v, true);
+        for i in 0..m {
+            let t = v[i];
+            v[m + i] += rows.dc[i] * t;
+            v[2 * m + i] += rows.dk[i] * t;
+        }
+        let nn = n * n;
+        let (mut a, mut tmp, mut b) = (vec![T::zero(); nn], vec![T::zero(); nn], vec![T::zero(); nn]);
+        smat(n, &v[..m], &mut a);
+        congruence(n, &data.zh, &a, false, &mut tmp, &mut b);
+        let inv = data.μ.recip();
+        svec(n, &b, &mut y[..m]);
+        let m2 = 2 * m;
+        for i in 0..m2 {
+            y[m + i] = T::zero();
+        }
+        for j in 0..m2 {
+            let vj = v[m + j];
+            let col = &data.s0i[j * m2..(j + 1) * m2];
+            for i in 0..m2 {
+                y[m + i] += col[i] * vj;
+            }
+        }
+        y[..3 * m].iter_mut().for_each(|t| *t *= inv);
+        for i in 0..m {
+            y[i] += rows.dc[i] * y[m + i] + rows.dk[i] * y[2 * m + i];
+        }
+        congruence_parts(n, &data.p, &mut y[..3 * m], false);
     }
 
     pub(crate) fn rows(&self) -> &OpRelEntropyRows<T> {
@@ -1442,9 +1534,10 @@ where
                 rows.dk[tri(i, j)] = oracle.d1[i + j * n];
             }
         }
-        rows.q = std::mem::take(&mut oracle.q);
-        data.p = std::mem::take(&mut oracle.p);
-        data.zh = std::mem::take(&mut oracle.zh);
+        rows.q = oracle.q.clone();
+        data.p = oracle.p.clone();
+        data.zh = oracle.zh.clone();
+        data.at_s = Some(oracle);
         data.s0i = s0i;
         // the next searches have a fresh preconditioner: forgive one open test
         data.cg = data.cg.saturating_sub(1);
@@ -1498,77 +1591,56 @@ where
     }
 
     fn mul_Hs(&mut self, y: &mut [T], x: &[T], _work: &mut [T]) {
-        // y = N·D·Nᵀx
-        let n = self.n;
-        let m = triangular_number(n);
-        let data = &self.data;
-        let rows = &data.rows;
-        let mut v = x[..3 * m].to_vec();
-        congruence_parts(n, &data.p, &mut v, true);
-        for i in 0..m {
-            let t = v[i];
-            v[m + i] += rows.dc[i] * t;
-            v[2 * m + i] += rows.dk[i] * t;
-        }
-        let nn = n * n;
-        let (mut a, mut tmp, mut b) = (vec![T::zero(); nn], vec![T::zero(); nn], vec![T::zero(); nn]);
-        smat(n, &v[..m], &mut a);
-        congruence(n, &data.zh, &a, false, &mut tmp, &mut b);
-        let inv = data.μ.recip();
-        svec(n, &b, &mut y[..m]);
-        let m2 = 2 * m;
-        for i in 0..m2 {
-            y[m + i] = T::zero();
-        }
-        for j in 0..m2 {
-            let vj = v[m + j];
-            let col = &data.s0i[j * m2..(j + 1) * m2];
-            for i in 0..m2 {
-                y[m + i] += col[i] * vj;
-            }
-        }
-        y[..3 * m].iter_mut().for_each(|t| *t *= inv);
-        for i in 0..m {
-            y[i] += rows.dc[i] * y[m + i] + rows.dk[i] * y[2 * m + i];
-        }
-        congruence_parts(n, &data.p, &mut y[..3 * m], false);
+        self.hs_prod(y, x);
     }
 
     fn affine_ds(&self, ds: &mut [T], s: &[T]) {
         ds.copy_from(s);
     }
 
-    fn combined_ds_shift(
-        &mut self, shift: &mut [T], _step_z: &mut [T], _step_s: &mut [T], σμ: T
-    ) {
+    fn combined_ds_shift(&mut self, shift: &mut [T], step_z: &mut [T], step_s: &mut [T], σμ: T) {
         // ds = Hs z − (σμ/μ)s; the caller adds affine_ds = s.
-        let z = std::mem::take(&mut self.data.z);
+        // Mehrotra term of z + σμ∇f(s) = 0 (Dahl–Andersen, primal side):
+        // ds −= ½ Hs ∇³f(s)[Δs, H⁻¹Δz], H⁻¹ = μHs; for the orthant
+        // this is (ΔsΔz)/z, the symmetric-cone corrector. Hs z, H⁻¹Δz and
+        // the difference points are independent; a spare worker takes the
+        // second of each pair.
+        let paired = sdpx_arithmetic::inner_parallel::paired();
         let mut hz = std::mem::take(&mut self.data.work);
-        self.mul_Hs(&mut hz, &z, &mut []);
-        let c = T::one() + σμ / self.data.μ;
+        let mut at_s = self.data.at_s.take();
+        let (this, len, step_z) = (&*self, shift.len(), &*step_z);
+        let mu = this.data.μ;
+        let ((_, w), points) = join_if(
+            paired,
+            || {
+                join_if(
+                    paired,
+                    || this.hs_prod(&mut hz, &this.data.z),
+                    || {
+                        let mut w = vec![T::zero(); len];
+                        this.hs_prod(&mut w, step_z);
+                        w.iter_mut().for_each(|v| *v *= mu);
+                        w
+                    },
+                )
+            },
+            || this.mixed_points(at_s.as_mut(), step_s, paired),
+        );
+        let c = T::one() + σμ / mu;
         for ((o, &h), &s) in shift.iter_mut().zip(&hz).zip(&self.data.s) {
             *o = h - c * s;
         }
-        self.data.z = z;
         self.data.work = hz;
-        {
-            // Mehrotra term of z + σμ∇f(s) = 0 (Dahl–Andersen, primal side):
-            // ds −= ½ Hs ∇³f(s)[Δs, H⁻¹Δz], H⁻¹ = μHs; for the orthant
-            // this is (ΔsΔz)/z, the symmetric-cone corrector.
-            let mut w = vec![T::zero(); shift.len()];
-            self.mul_Hs(&mut w, _step_z, &mut []);
-            let mu = self.data.μ;
-            w.iter_mut().for_each(|v| *v *= mu);
-            if let Some(v) = self.third_mixed(_step_s, &w) {
-                let mut u = vec![T::zero(); v.len()];
-                self.mul_Hs(&mut u, &v, &mut []);
-                // weighted by α_aff (σ = (1 − α_aff)³): the full term
-                // overshoots after short affine steps
-                let σ = (σμ / mu).max(T::zero()).min(T::one());
-                let half: T = (0.5).as_T();
-                let w = half * (T::one() - σ.cbrt());
-                shift.iter_mut().zip(&u).for_each(|(o, &u)| *o -= w * u);
-            }
+        self.data.at_s = at_s;
+        if let Some(v) = points.and_then(|p| self.third_mixed_at(p, &w, paired)) {
+            let mut u = vec![T::zero(); v.len()];
+            self.hs_prod(&mut u, &v);
+            // weighted by α_aff (σ = (1 − α_aff)³): the full term
+            // overshoots after short affine steps
+            let σ = (σμ / mu).max(T::zero()).min(T::one());
+            let half: T = (0.5).as_T();
+            let w = half * (T::one() - σ.cbrt());
+            shift.iter_mut().zip(&u).for_each(|(o, &u)| *o -= w * u);
         }
     }
 

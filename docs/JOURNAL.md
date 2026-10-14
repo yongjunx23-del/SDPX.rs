@@ -8,6 +8,30 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — ORE combined shift: paired products and the scaling's oracle (thermal-ore)
+
+- Hypothesis: after `e88f6df`, the combined right-hand side took 0.33 s of 3.25 s on two_L6/256 at T=4, against 0.51 s at T=1.
+  - A probe put the n = 8 ORE cone's shift at 0.319 s (3.0 ms per iteration), the phase's critical path. The other cones' shifts finish on other lanes.
+  - Each shift ran, serially: three Hs products (Hs z, μHs Δz, Hs v); the oracle at s for ‖Δs‖ₛ; and two oracles at s ± tΔs with their Hessian products.
+  - Summed over the five ORE cones at T=1: oracles 0.176 s, Hessian products 0.137 s, Hs products ≈ 0.125 s.
+  - `update_scaling` already builds the oracle at the same s, with g⁽²⁾, and drops it.
+- Change:
+  - Hs z, μHs Δz and the difference points run as `rayon::join` pairs under the paired gate (serial otherwise), and so do the two Hessian products. Each value keeps its arithmetic and accumulation order.
+  - The cone keeps the scaling's oracle at s for the corrector's ∇²f(s)Δs.
+  - `mul_Hs` keeps its body as `hs_prod(&self)`.
+- Probe (fast profile): combined rhs at T=4 0.330 → 0.236 s (pairs) → 0.187 s (pairs plus oracle reuse); T=1 0.503 → 0.437 s.
+- E2E (Mac release, A = `e88f6df`, B = candidate, ABBA A B B A, solve s):
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | two_L6/256 | 4 | 3.17 / 3.13 | 3.04 / 2.99 | −4.1% |
+  | two_L6/128 | 4 | 1.54 / 1.51 | 1.46 / 1.48 | −3.6% |
+  | two_L6/256 | 1 | 6.36 / 6.36 | 6.31 / 6.30 | −0.9% |
+  | two_L6/128 | 1 | 3.01 / 3.00 | 2.98 / 2.98 | −0.8% |
+
+- Points: bitwise equal to A at T=1 and T=4, so A's audits carry over. The ORE unit tests pass (9).
+- Decision: kept.
+
 ## 2026-10-14 — ORE affine step searches on the idle pool (thermal-ore)
 
 - Hypothesis: on two_L6/256 at T=4 after `71a247c`, step lengths took 1.20 of 3.53 s and barely scaled from T=1 (1.33 s).
