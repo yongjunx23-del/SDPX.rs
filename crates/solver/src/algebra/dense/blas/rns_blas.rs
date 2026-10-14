@@ -1857,6 +1857,7 @@ pub(super) fn gemm<const N: usize>(
         ldb,
     };
     let split = split_plan(pool, (m * n * k) as u128 * plan.count() as u128);
+    let reach = inner_reach(&bv, tb_n, k, n);
     let ca = packed_operand(av, lo_a, da, &plan, &split);
     let cb = (!same_operand).then(|| match cache_b {
         Some(cache) => cache.operand(bv, lo_b, db, &plan, &split),
@@ -1886,7 +1887,7 @@ pub(super) fn gemm<const N: usize>(
         }
         let (sa, sb) = (&s.a, &s.b);
         let product = |qi, prod: &mut [f64], t: &mut Vec<f64>| {
-            shape.prime_product(
+            shape.prime_columns(
                 &plan,
                 q0 + qi,
                 &sa[qi * len_a..(qi + 1) * len_a],
@@ -1898,10 +1899,12 @@ pub(super) fn gemm<const N: usize>(
                 prod,
                 t,
                 upper_only,
+                0..n,
+                reach.as_deref(),
             );
         };
         let group = &mut prod[q0 * outputs..q1 * outputs];
-        let panels = column_panels(&shape, upper_only, q1 - q0, &split);
+        let panels = column_panels(&shape, upper_only, q1 - q0, &split, reach.as_deref());
         if panels.len() > 2 {
             // Fewer primes than ways: each prime's columns are shared too.
             let parts = panels.len() - 1;
@@ -1928,7 +1931,18 @@ pub(super) fn gemm<const N: usize>(
                     },
                 );
                 let mut t = take_buffer(0);
-                shape.prime_columns(&plan, q0 + qi, aq, bq, cq, &mut t, upper_only, columns);
+                let reach = reach.as_deref();
+                shape.prime_columns(
+                    &plan,
+                    q0 + qi,
+                    aq,
+                    bq,
+                    cq,
+                    &mut t,
+                    upper_only,
+                    columns,
+                    reach,
+                );
                 release_buffer(t);
             });
             continue;
@@ -1948,6 +1962,41 @@ pub(super) fn gemm<const N: usize>(
     ok
 }
 
+/// Inner range `[lo, hi)` of `op(B)` (`k × n`) outside which column `j` is
+/// zero, as a triangular factor's columns are: residue terms there are exact
+/// zeros. `None` when every column spans the whole inner dimension.
+fn inner_reach<const N: usize>(
+    b: &View<'_, N>,
+    tb_n: bool,
+    k: usize,
+    n: usize,
+) -> Option<Vec<(usize, usize)>> {
+    let zero = |i: usize, j: usize| {
+        let e = if tb_n { i + j * b.ld } else { j + i * b.ld };
+        matches!(b.data[e].dyadic_view().kind, DyadicKind::Zero)
+    };
+    let reach: Vec<(usize, usize)> = (0..n)
+        .map(|j| {
+            let lo = (0..k).find(|&i| !zero(i, j)).unwrap_or(k);
+            let hi = (lo..k).rev().find(|&i| !zero(i, j)).map_or(lo, |i| i + 1);
+            (lo, hi)
+        })
+        .collect();
+    reach.iter().any(|&(lo, hi)| hi - lo < k).then_some(reach)
+}
+
+/// Union of the non-empty inner ranges of a tile's columns; `(0, 0)` when
+/// every column is zero.
+fn tile_reach(columns: &[(usize, usize)]) -> (usize, usize) {
+    columns
+        .iter()
+        .filter(|&&(lo, hi)| lo < hi)
+        .fold(None, |r: Option<(usize, usize)>, &(lo, hi)| {
+            Some(r.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))))
+        })
+        .unwrap_or((0, 0))
+}
+
 /// Column bounds sharing each prime of a `primes`-prime group over the
 /// split's ways when the primes alone leave ways idle: as many panels per
 /// prime as idle ways need, at least [`PANEL_COLS`] wide and carrying
@@ -1958,6 +2007,7 @@ fn column_panels(
     upper_only: bool,
     primes: usize,
     split: &Split<'_>,
+    reach: Option<&[(usize, usize)]>,
 ) -> Vec<usize> {
     let (m, n, k) = (shape.m, shape.n, shape.k);
     let threads = match split {
@@ -1965,12 +2015,13 @@ fn column_panels(
         _ => rayon::current_num_threads(),
     };
     let ways = split_ways(split).min(threads);
-    let weight = |j: usize| if upper_only { (j + 1).min(m) } else { m } as u128;
+    let inner = |j: usize| reach.map_or(k, |r| r[j].1 - r[j].0);
+    let weight = |j: usize| (if upper_only { (j + 1).min(m) } else { m } * inner(j)) as u128;
     let total: u128 = (0..n).map(weight).sum();
     let parts = ways
         .div_ceil(primes.max(1))
         .min(n / PANEL_COLS)
-        .min((total * k as u128 / WAY_WORK).min(usize::MAX as u128) as usize);
+        .min((total / WAY_WORK).min(usize::MAX as u128) as usize);
     if parts <= 1 {
         return vec![0, n];
     }
@@ -2568,7 +2619,7 @@ impl GemmShape {
         part: &mut Vec<f64>,
         upper_only: bool,
     ) {
-        self.prime_columns(plan, q, aq, bq, cq, part, upper_only, 0..self.n);
+        self.prime_columns(plan, q, aq, bq, cq, part, upper_only, 0..self.n, None);
     }
 
     /// Output offset of column `j` in the requested layout: column-major
@@ -2585,6 +2636,9 @@ impl GemmShape {
     /// [`Self::prime_product`] restricted to output `columns`, written to
     /// `cq` from the first column's offset. Residue entries are exact
     /// integers, so any column range gives the whole product's values.
+    /// With `reach` ([`inner_reach`]), each tile of columns sums only the
+    /// inner range where they can be non-zero: the skipped terms are exact
+    /// zeros, and the residues are canonical whatever the chunking.
     #[allow(clippy::too_many_arguments)]
     fn prime_columns(
         &self,
@@ -2596,7 +2650,10 @@ impl GemmShape {
         part: &mut Vec<f64>,
         upper_only: bool,
         columns: std::ops::Range<usize>,
+        reach: Option<&[(usize, usize)]>,
     ) {
+        // Columns per tile of the triangle or of a reach-limited product.
+        const TILE: usize = 32;
         let (ta_n, tb_n) = (
             self.ta.to_ascii_uppercase() == b'N',
             self.tb.to_ascii_uppercase() == b'N',
@@ -2605,18 +2662,30 @@ impl GemmShape {
         let (first, n) = (columns.start, columns.len());
         let b_col = if tb_n { first * self.ldb } else { first };
         let outputs = m * n;
+        let tile_reach = |j0: usize, cols: usize| match reach {
+            None => (0, k),
+            Some(r) => tile_reach(&r[j0..j0 + cols]),
+        };
         if upper_only {
             // Rectangle tiles cover the requested triangle; only selected
             // residues survive into CRT, in column-major packed order.
-            const TILE: usize = 32;
             let base = self.column_offset(first, true);
             part.clear();
             part.resize(m * TILE.min(n), 0.0);
             for j0 in (first..columns.end).step_by(TILE) {
                 let cols = TILE.min(columns.end - j0);
                 let height = m.min(j0 + cols);
-                for k0 in (0..k).step_by(plan.k_chunk) {
-                    let kc = plan.k_chunk.min(k - k0);
+                let (k_lo, k_hi) = tile_reach(j0, cols);
+                if k_lo == k_hi {
+                    let (start, end) = (
+                        self.column_offset(j0, true) - base,
+                        self.column_offset(j0 + cols, true) - base,
+                    );
+                    cq[start..end].fill(0.0);
+                    continue;
+                }
+                for k0 in (k_lo..k_hi).step_by(plan.k_chunk) {
+                    let kc = plan.k_chunk.min(k_hi - k0);
                     let a_off = if ta_n { k0 * self.lda } else { k0 };
                     let b_off = if tb_n {
                         k0 + j0 * self.ldb
@@ -2642,11 +2711,49 @@ impl GemmShape {
                         for i in 0..m.min(column + 1) {
                             let value = reduce(part[i + j * height], plan.p[q], plan.pinv[q]);
                             let dest = &mut cq[offset + i];
-                            *dest = if k0 == 0 {
+                            *dest = if k0 == k_lo {
                                 value
                             } else {
                                 reduce(*dest + value, plan.p[q], plan.pinv[q])
                             };
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if reach.is_some() {
+            for j0 in (first..columns.end).step_by(TILE) {
+                let cols = TILE.min(columns.end - j0);
+                let c = &mut cq[(j0 - first) * m..(j0 - first + cols) * m];
+                let (k_lo, k_hi) = tile_reach(j0, cols);
+                if k_lo == k_hi {
+                    c.fill(0.0);
+                    continue;
+                }
+                for k0 in (k_lo..k_hi).step_by(plan.k_chunk) {
+                    let kc = plan.k_chunk.min(k_hi - k0);
+                    let a_off = if ta_n { k0 * self.lda } else { k0 };
+                    let b_off = if tb_n {
+                        k0 + j0 * self.ldb
+                    } else {
+                        j0 + k0 * self.ldb
+                    };
+                    let (a, b) = (&aq[a_off..], &bq[b_off..]);
+                    let (p, pinv) = (plan.p[q], plan.pinv[q]);
+                    if k0 == k_lo {
+                        int_gemm(
+                            self.ta, self.tb, m, cols, kc, a, self.lda, b, self.ldb, c, m,
+                        );
+                        c.iter_mut().for_each(|x| *x = reduce(*x, p, pinv));
+                    } else {
+                        part.clear();
+                        part.resize(m * cols, 0.0);
+                        int_gemm(
+                            self.ta, self.tb, m, cols, kc, a, self.lda, b, self.ldb, part, m,
+                        );
+                        for (x, y) in c.iter_mut().zip(part.iter()) {
+                            *x = reduce(*x + reduce(*y, p, pinv), p, pinv);
                         }
                     }
                 }

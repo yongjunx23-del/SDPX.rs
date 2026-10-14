@@ -8,6 +8,30 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — RNS products skip exact-zero inner terms of triangular operands (thermal-ore)
+
+- Observed (1b7f812, one_L12/128, 4 iterations): `ore.schur_inverse` (L⁻¹ by recursive halves, then L⁻ᵀL⁻¹) took 16.3 s at T=1 and 7.5 s at T=4 (faer). Its residue products multiplied full inner ranges although one operand is triangular: about half of every inner sum was exact zero terms.
+- Change (`rns_blas.rs`, `oprelentrcone.rs`):
+  - `gemm` scans op(B) once for each column's nonzero inner range (`inner_reach`, exact-zero test on the dyadic view). When some range is short, the per-prime products run in 32-column tiles over the union of their columns' ranges; a tile with no range writes zeros. Column panels are balanced by rows × inner length.
+  - `lower_inverse_rec` forms its second product transposed (X21ᵀ = −Tᵀ·X22ᵀ), so both right operands are triangular.
+  - Skipped terms are exact zeros and residues are exact integers, so every entry is unchanged. A new unit test covers banded and zero-column operands over all transposes, upper/full, and serial vs pool bitwise.
+- E2E (Mac, fast profile), ABBA, A = `1b7f812`; every point bitwise identical to A:
+
+  | Case | A s | B s | Change |
+  |---|---|---|---|
+  | one_L12/128 4 it, T=4, faer | 24.61 / 25.44 | 22.22 / 22.43 | −10.8% |
+  | one_L12/128 4 it, T=4, Accelerate | 21.22 / 21.49 | 20.27 / 20.32 | −5.0% |
+  | one_L12/128 4 it, T=1, faer | 59.95 / 58.04 | 50.05 / 51.84 | −13.7% |
+  | two_L6/256, T=4, faer | 2.95 / 2.97 | 2.99 / 2.96 | +0.4% |
+  | two_L6/256, T=4, Accelerate | 2.87 / 2.87 | 2.87 / 2.88 | +0.2% |
+  | fix-a 256, partitions 1, T=2 | 10.18 / 9.97 | 9.89 / 9.89 | −1.8% |
+  | fix-a 256, partitions 2, T=10 | 6.13 / 6.25 | 6.12 / 6.24 | −0.2% |
+  | d6n640q 128, partitions 1, T=10 | 68.88 / 67.44 | 67.95 / 67.62 | −0.5% |
+
+  - one_L12 phases, T=1 faer: `ore.schur_inverse` 16.3 → 8.6 s; T=4: 7.5 → 5.0 s. `arrow.leaves` (21.3 s at T=1, 7.3–7.8 s at T=4) is now the largest phase.
+  - two_L4/256: Solved, 85 iterations, same point. ising11 at 512 bits, T=4 (owner with partitions 2, and plain): bitwise identical. 506 solver lib tests pass.
+- Decision: kept. Audits carry over.
+
 ## 2026-10-15 — Split RNS products reach the scaling board; one-prime groups split by columns (thermal-ore)
 
 - Observed (5b310c2, one_L12/128, 4 iterations, T=4):

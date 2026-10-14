@@ -308,7 +308,9 @@ fn lower_inverse_dots<T: FloatT>(n: usize, l: &[T], li: &mut [T]) {
 /// L⁻¹ (`x`, leading dimension `ldx`, strict upper triangle left zero) of
 /// the order-`n` lower L at `l`: X21 = −X22·(L21·X11) from the inverses of
 /// the halves, two exact products per level; up to [`BASE`],
-/// [`lower_inverse_dots`].
+/// [`lower_inverse_dots`]. The second product is formed transposed,
+/// X21ᵀ = −Tᵀ·X22ᵀ, so both right operands are triangular and the residue
+/// product skips their zero inner terms.
 fn lower_inverse_rec<T: FloatT>(n: usize, l: &[T], ldl: usize, x: &mut [T], ldx: usize) {
     if n <= BASE {
         let lb: Vec<T> = (0..n * n).map(|e| l[e % n + e / n * ldl]).collect();
@@ -324,11 +326,11 @@ fn lower_inverse_rec<T: FloatT>(n: usize, l: &[T], ldl: usize, x: &mut [T], ldx:
     lower_inverse_rec(n2, &l[n1 + n1 * ldl..], ldl, &mut x[n1 + n1 * ldx..], ldx);
     let mut t = vec![T::zero(); n2 * n1];
     product((b'N', b'N'), (n2, n1, n1), (&l[n1..], ldl), (x, ldx), &mut t);
-    let mut p = vec![T::zero(); n2 * n1];
-    product((b'N', b'N'), (n2, n1, n2), (&x[n1 + n1 * ldx..], ldx), (&t, n2), &mut p);
+    let mut p = vec![T::zero(); n1 * n2];
+    product((b'T', b'T'), (n1, n2, n2), (&t, n2), (&x[n1 + n1 * ldx..], ldx), &mut p);
     for j in 0..n1 {
         for i in 0..n2 {
-            x[n1 + i + j * ldx] = -p[i + j * n2];
+            x[n1 + i + j * ldx] = -p[j + i * n1];
         }
     }
 }
