@@ -8,6 +8,42 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — ORE dual step tests: CG preconditioned by the current S₀⁻¹ (thermal-ore)
+
+- Hypothesis: the dual step tests left by B-preconditioned CG fall back to an S₀ factor at every trial point. On the synthetic n=20/128 input at T=4, that is 285 factors in 50 iterations, and step searches take 34% of wall. The current iterate's S₀⁻¹ is already explicit (`update_scaling`). Carried into a trial point's eigen coordinates by N = QᵀP₀, it should fit trial points far better than B = diag(1, λᵢλⱼ), which is exact only on the central path.
+- Probe (release, T=1, off the solve path): PCG on S₀ preconditioned by the transported S₀⁻¹ vs by B, up to 60 steps, against the exact factor:
+  - synthetic n=20: transported S₀⁻¹ decided all 230 non-trivial tests within 4 steps (54 / 90 / 84 / 2 at 1 / 2 / 3 / 4 steps); B left 177 open;
+  - two_L6/128 (n ≤ 8): 1–2 steps for most, against 3–5 with B;
+  - one_L12/128, first 4 iterations (n = 42): B decided 20 of 27 in one step; the transported S₀⁻¹ needed 2–4.
+  - Every decided test matched the exact factor.
+- Change: `Oracle::dual_ok` takes the cone's (P₀, S₀⁻¹).
+  - The first CG step keeps B. If that step leaves the test open, CG starts over from zero on the transported S₀⁻¹ (4 congruences and one exact-dot S₀⁻¹ product per step).
+  - The step budget's cost model adds those: per step 26n³ + (2m)².
+  - The bounds and the factor fallback are unchanged: the decision is still the exact form's.
+- Variants (T=4 receipts):
+
+  | Variant | synthetic step search s | S₀ factors | one_L12 4 it step search s |
+  |---|---|---|---|
+  | A (B only) | 7.07 | 385 | 1.63 |
+  | transported S₀⁻¹ only | 2.58 | 181 | 2.93 |
+  | B step, then restart from B's x | 6.69 | 368 | 1.81 |
+  | B step, then start over from 0 (kept) | 2.62 | 181 | 2.03 |
+
+  - Restarting from B's x left tests open off the path. Each open test halved the next budget down to zero, so tests factored again.
+- E2E (Mac release, A = `5de255c`, B = candidate, ABBA A B B A, solve s). Every B point is bitwise A's:
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | synthetic n=20/128 | 4 | 20.93 / 20.81 | 16.66 / 16.37 | −20.8% |
+  | synthetic n=20/128 | 1 | 37.20 / 37.77 | 31.51 / 32.22 | −15.0% |
+  | one_L12/128, 4 it | 4 | 24.92 / 25.37 | 25.26 / 25.28 | +0.5% |
+  | two_L6/256 | 4 | 5.07 / 5.07 | 5.10 / 5.08 | +0.3% |
+  | two_L6/256 | 1 | 10.08 / 10.57 | 10.51 / 10.39 | +1.2% |
+  | two_L6/128 | 4 | 2.60 / 2.36 | 2.57 / 2.37 | −0.6% |
+
+  - two_L4/128 and /256 stay Solved (46 and 85 iterations).
+- Decision: kept. The synthetic input gains; the small inputs and one_L12's first iterations stay within noise.
+
 ## 2026-10-14 — ORE KKT rows: column transform on the solver pool (thermal-ore)
 
 - Hypothesis: a macOS `sample` of the synthetic n=20/128 solve at T=4 (15 s, main thread) put 7.7% of wall in `congruence_parts`, called serially from `assemble_from_cones`. Each KKT update maps every A column touching the ORE rows by N⁻¹: three n×n congruences per column. The columns are independent.

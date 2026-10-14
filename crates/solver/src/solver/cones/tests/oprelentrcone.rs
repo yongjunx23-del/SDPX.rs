@@ -150,7 +150,14 @@ fn dual_ok_keeps_cheap_bound_lazy() {
     o.gradient(&mut z);
     z.iter_mut().for_each(|v| *v = -*v);
     let sz = s.dot(&z);
-    assert!(o.dual_ok(&z, |q| (3 * n - 1) as f64 * q < sz * sz, &mut 0));
+    let mut cur = Oracle::new(n, &s).unwrap();
+    let s0i = cur.schur_inverse().unwrap();
+    assert!(o.dual_ok(
+        &z,
+        |q| (3 * n - 1) as f64 * q < sz * sz,
+        &mut 0,
+        (&cur.p, &s0i)
+    ));
     assert!(o.d2.is_empty() && o.vaa.is_empty() && o.s0l.is_none());
 }
 
@@ -177,10 +184,11 @@ fn dual_ok_matches_factor_near_threshold() {
                 for (probe, z) in [eigen, generic].into_iter().enumerate() {
                     let mut factor = Oracle::new(n, &s).unwrap();
                     let exact = factor.dual_form(&z, true).unwrap();
+                    let s0i = factor.schur_inverse().unwrap();
                     for sign in [-T::one(), T::one()] {
                         let limit = exact * (T::one() + sign * separation);
                         let mut cg = Oracle::new(n, &s).unwrap();
-                        assert_eq!(cg.dual_ok(&z, |q| q < limit, &mut 0), exact < limit,
+                        assert_eq!(cg.dual_ok(&z, |q| q < limit, &mut 0, (&factor.p, &s0i)), exact < limit,
                             "n={n} margin={margin} probe={probe}");
                         // binary64 factors without CG
                         if probe == 0 && sign > T::zero() && T::precision_bits() > 53 {

@@ -952,12 +952,25 @@ impl<T: FloatT> Oracle<T> {
     /// `ok(⟨z, (∇²f)⁻¹z⟩)` for a monotone `ok` (true below a limit), decided
     /// as the exact form would be. For any x and r = v − S₀x,
     /// vᵀS₀⁻¹v = 2vᵀx − xᵀS₀x + rᵀS₀⁻¹r with 0 ≤ rᵀS₀⁻¹r ≤ rᵀBr. Conjugate
-    /// gradients on S₀ preconditioned by B narrow these bounds, two O(n³)
-    /// products per step (one recomputes the residual for the bounds); S₀'s O(n⁶)
-    /// factor decides only what about as many products as it costs leave
-    /// open. That budget is halved `cg` times: the caller counts tests CG
-    /// left open since it last decided one (`cg` += 1, or 0 on a decision).
-    pub(crate) fn dual_ok(&mut self, z: &[T], ok: impl Fn(T) -> bool, cg: &mut u32) -> bool {
+    /// gradients on S₀ narrow these bounds, two O(n³) S₀ products per step
+    /// (one recomputes the residual for the bounds). The first step takes B,
+    /// which decides points near the central path (one_L12 at 128 bits, first
+    /// iterations: 20 of 27 tests). Otherwise CG starts over, preconditioned
+    /// by the current iterate's S₀⁻¹ (`s0i` at eigenbasis `p0`, from
+    /// `update_scaling`), which fits the trial points of its step: N = QᵀP₀
+    /// carries covectors to P₀'s coordinates (NᵀMN) and the product back
+    /// (NMNᵀ). Synthetic n=20 at 128 bits: every test decided within 4 steps,
+    /// B alone left 177 of 230 open.
+    /// S₀'s O(n⁶) factor decides only what about as many steps as it costs
+    /// leave open. That budget is halved `cg` times: the caller counts tests
+    /// CG left open since it last decided one (`cg` += 1, or 0 on a decision).
+    pub(crate) fn dual_ok(
+        &mut self,
+        z: &[T],
+        ok: impl Fn(T) -> bool,
+        cg: &mut u32,
+        (p0, s0i): (&[T], &[T]),
+    ) -> bool {
         let (t, w, b) = self.dual_parts(z);
         let upper = w.iter().zip(&b).fold(t, |a, (&w, &b)| a + b * w * w);
         if ok(upper) {
@@ -967,17 +980,21 @@ impl<T: FloatT> Oracle<T> {
         let m = n * (n + 1) / 2;
         let nn = n * n;
         let m2 = w.len();
-        // the factor's (2m)³/6 multiply-adds against ≈ 18n³ per CG step,
-        // above order `BASE` with the factor's residue products ≈ 4.6×
-        // cheaper per multiply-add (one_matrix_L12f at 128 bits, n = 42:
-        // factor 1.4 s, step 8.8 ms); binary64 factors with LAPACK, far
-        // cheaper per multiply-add than CG's products (one_matrix_L12: 18.6 s
-        // without CG, 24.1 s with)
+        // the factor's (2m)³/6 multiply-adds against ≈ 26n³ + (2m)² per CG
+        // step (S₀ products, the preconditioner's congruences and S₀⁻¹
+        // product), above order `BASE` with the factor's residue products
+        // ≈ 4.6× cheaper per multiply-add (one_matrix_L12f at 128 bits,
+        // n = 42: factor 1.4 s); binary64 factors with LAPACK, far cheaper
+        // per multiply-add than CG's products (one_matrix_L12: 18.6 s without
+        // CG, 24.1 s with)
         let budget = if T::precision_bits() <= 53 {
             0
         } else {
-            let per = if m2 > BASE { 500 } else { 108 };
-            (m2.pow(3) / (per * n.pow(3))).max(1).checked_shr(*cg).unwrap_or(0)
+            let per = if m2 > BASE { 28 } else { 6 };
+            (m2.pow(3) / (per * (26 * n.pow(3) + m2 * m2)))
+                .max(1)
+                .checked_shr(*cg)
+                .unwrap_or(0)
         };
         // the exact form is t + q with q ≥ 0
         if !ok(t) {
@@ -987,6 +1004,30 @@ impl<T: FloatT> Oracle<T> {
             return self.schur_norm(w).is_some_and(|q| ok(t + q));
         }
         self.ensure_d2();
+        let mut nm = vec![T::zero(); nn];
+        gemm(true, false, n, &self.q, p0, &mut nm);
+        let (mut a, mut tmp, mut c) = (
+            vec![T::zero(); nn],
+            vec![T::zero(); nn],
+            vec![T::zero(); nn],
+        );
+        let mut v = vec![T::zero(); m2];
+        let mut pre = |r: &[T], out: &mut [T]| {
+            for part in 0..2 {
+                smat(n, &r[part * m..(part + 1) * m], &mut a);
+                congruence(n, &nm, &a, true, &mut tmp, &mut c);
+                svec(n, &c, &mut v[part * m..(part + 1) * m]);
+            }
+            // S₀⁻¹ is symmetric: its row i is column i
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = T::dot_slices(&s0i[i * m2..(i + 1) * m2], &v);
+            }
+            for part in 0..2 {
+                smat(n, &out[part * m..(part + 1) * m], &mut a);
+                congruence(n, &nm, &a, false, &mut tmp, &mut c);
+                svec(n, &c, &mut out[part * m..(part + 1) * m]);
+            }
+        };
         let mut x = vec![T::zero(); m2];
         let mut r = w.clone();
         let mut br: Vec<T> = r.iter().zip(&b).map(|(&r, &b)| r * b).collect();
@@ -996,7 +1037,7 @@ impl<T: FloatT> Oracle<T> {
         let (mut h, mut k) = (vec![T::zero(); nn], vec![T::zero(); nn]);
         let (mut oh, mut ok_) = (vec![T::zero(); nn], vec![T::zero(); nn]);
         let mut ws = Vec::new();
-        for _ in 0..budget {
+        for step in 0..budget {
             smat(n, &p[..m], &mut h);
             smat(n, &p[m..], &mut k);
             self.schur_apply(&h, &k, &mut oh, &mut ok_, &mut ws, None);
@@ -1026,11 +1067,14 @@ impl<T: FloatT> Oracle<T> {
                 *cg = 0;
                 return false;
             }
-            for i in 0..m2 {
-                br[i] = r[i] * b[i];
+            if step == 0 {
+                // B's step left it open: CG starts over on the transported S₀⁻¹
+                x.fill(T::zero());
+                r.copy_from(&w);
             }
+            pre(&r, &mut br);
             let rho1 = r.dot(&br);
-            let beta = rho1 / rho;
+            let beta = if step == 0 { T::zero() } else { rho1 / rho };
             rho = rho1;
             for i in 0..m2 {
                 p[i] = br[i] + beta * p[i];
@@ -1305,7 +1349,7 @@ impl<T: FloatT> OpRelEntropyCone<T> {
             return false;
         }
         let nu1 = self.nu() - T::one();
-        oracle.dual_ok(z, |q| nu1 * q < sz * sz, cg)
+        oracle.dual_ok(z, |q| nu1 * q < sz * sz, cg, (&self.data.p, &self.data.s0i))
     }
 }
 
