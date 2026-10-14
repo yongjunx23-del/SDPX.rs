@@ -1495,6 +1495,17 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     /// the border.  Returns `None` when the shape is not exploitable, so the
     /// caller transparently keeps QDLDL.
     pub fn try_new(k: &CscMatrix<T>, signs: &[i8], settings: &CoreSettings<T>) -> Option<Self> {
+        let (groups, trunk, _) = Self::plan(k, signs)?;
+        Some(Self::from_groups(k, signs, settings, groups, trunk, None))
+    }
+
+    /// Dense work estimate of the arrow of `signs`; `None` when ineligible.
+    pub fn work(k: &CscMatrix<T>, signs: &[i8]) -> Option<u128> {
+        Self::plan(k, signs).map(|(_, _, work)| work)
+    }
+
+    /// [`Self::try_new`]'s leaves, border and dense work estimate.
+    fn plan(k: &CscMatrix<T>, signs: &[i8]) -> Option<(Vec<Vec<usize>>, Vec<usize>, u128)> {
         let n = k.n;
         debug_assert!(k.m == n && signs.len() == n && signs.iter().all(|&s| s == 1 || s == -1));
         if n == 0 {
@@ -1587,7 +1598,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         if cells * std::mem::size_of::<T>() as u128 > max_bytes {
             return None;
         }
-        Some(Self::from_groups(k, signs, settings, groups, trunk, None))
+        Some((groups, trunk, leaf_work + border_work))
     }
 
     /// The arrow of −K: dense negative-sign blocks (cone Hessians retained

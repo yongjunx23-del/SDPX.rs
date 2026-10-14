@@ -189,7 +189,7 @@ reported as `linear_solver`.
 | 3 | `local_bounds_faer` / `local_bounds_arrow` | ≥ 64 variables with one or two local bound rows, diagonal `P` and a nonempty equality/free border, admitted by added storage. Float64 needs `faer-sparse`; MPFR uses exact bound Gram products. |
 | 4 | `local_cone_arrow` | MPFR only: Zero, orthant and SOC cones. Each orthant row or SOC (with its sparse-expansion coordinates) is a unit; variables touching at most four units join them while the leaf stays ≤ 64 coordinates (≥ 8 leaves). Equality rows, other variables and oversized cones form the border, ordered by coupling degree within each sign; workspace and border density as above. Couplings are stored per leaf over its own border columns; the border Schur complement is one exact residue block product with Z = D⁻¹Y formed while encoding. |
 | 5 | `dense_block` | Float64: an eligible dense leading positive block, pooled tiled Cholesky. |
-| 6 | `arrow` | Disconnected positive dense leaves around a negative border, estimated workspace ≤ max(512 MiB, 8 × KKT storage) (Float64 and MPFR). Leaf contributions are recomputed in bounded batches. |
+| 6 | `arrow` | Disconnected positive dense leaves around a negative border, estimated workspace ≤ max(512 MiB, 8 × KKT storage) (Float64 and MPFR). Leaf contributions are recomputed in bounded batches. MPFR also forms the arrow of −K (retained cone Hessian rows such as ORE rows as leaves, primal variables as border) and takes the eligible arrow with less estimated dense work. |
 | 7 | `faer` / `qdldl` | General sparse LDL. Float64 with `faer-sparse` uses faer when estimated flops ≥ 1e8 and flops per factor nonzero ≥ 40, else QDLDL. MPFR uses QDLDL. |
 
 Packed local bound leaves store their couplings in shared panels; their

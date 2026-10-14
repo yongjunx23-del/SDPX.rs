@@ -8,6 +8,28 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — MPFR arrow orientation by dense work: K's or −K's arrow (thermal-ore)
+
+- Hypothesis: on two_L6, the MPFR auto backend took K's arrow whenever it was eligible. That arrow has one leaf (81 primal columns) and a border of 186 ORE rows.
+  - At T=1 (256 bits), refactor took 2.52 of 8.6 s: border factor 1.15 s, contributions 0.63 s, leaves 0.73 s.
+  - −K's arrow has five ORE leaves (30, 108, 30, 9, 9) around an 81-column border. Its dense work estimate (Σg³ + n₊t² + t³, the eligibility model) is 3.1M against 9.8M.
+  - two_L8, one_L12 and the synthetic input already took −K's arrow, because K's is ineligible there.
+- Probe (fast profile, −K forced): two_L6/256 Solved 105 in 6.29 s against 8.64 s. Refactor 2.52 → 0.43 s; border factor 1.15 → 0.12 s. two_L6/128 Solved 71 (72 before).
+- Change: `ArrowLDLSolver::work` returns the eligibility model's dense work. MPFR auto takes −K's arrow first when it is eligible with less work, otherwise K's then −K's as before.
+  - two_L4 (−K ineligible) and ising11 (K: 11 leaves of 24–31, border 20) keep their arrows.
+  - csdr3 takes `local_soc_arrow` before this choice.
+- E2E (Mac release, A = `081ec70`, B = candidate, ABBA A B B A, solve s):
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | two_L6/256 | 1 | 8.80 / 8.74 | 6.33 / 6.31 | −28.0% |
+  | two_L6/128 | 1 | 3.98 / 4.01 | 3.00 / 3.01 | −24.9% |
+  | two_L6/256 | 4 | 4.35 / 4.37 | 3.46 / 3.45 | −20.8% |
+  | two_L6/128 | 4 | 2.06 / 2.07 | 1.61 / 1.61 | −22.0% |
+
+- Audits: two_L6/256 Solved 105 (dual 4.5e-43, gap 3.0e-44); two_L6/128 Solved 71 (dual 1.4e-24, gap 2.9e-24). ising11 Solved 54, audit PASS, residuals as before.
+- Decision: kept.
+
 ## 2026-10-14 — Wide PSD Schur columns: support-restricted congruence, lazy entries, measured sparse/dense rule (thermal-ore)
 
 - Hypothesis: profiling two_L6/256 at T=1 put the PSD Schur assembly at 21% of the main thread.
