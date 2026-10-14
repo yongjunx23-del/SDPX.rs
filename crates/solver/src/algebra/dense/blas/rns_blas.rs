@@ -21,6 +21,7 @@
 //! constant diagonal operands rely on their owner to invalidate the cache.
 use num_traits::{FromPrimitive, Zero};
 use rayon::prelude::*;
+use sdpx_arithmetic::inner_parallel::board;
 use sdpx_arithmetic::{DyadicKind, MpFloat, Scalar};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -784,15 +785,9 @@ fn chunk_matrix<const N: usize>(
         fill(0, &mut matrix.e);
     } else {
         let per = len.div_ceil(ways);
-        let mut run = || {
-            matrix.e.par_chunks_mut(per * chunks)
-                .enumerate()
-                .for_each(|(w, rows)| fill(w * per, rows))
-        };
-        match split {
-            Split::Pool(p) => p.install(run),
-            _ => run(),
-        }
+        ways_chunks(split, &mut matrix.e, per * chunks, |w, rows| {
+            fill(w * per, rows)
+        });
     }
     matrix
 }
@@ -1267,17 +1262,9 @@ impl<'a> CrtAccumulator<'a> {
         };
         match split {
             Split::Serial => update(0, self.crt.chunks, &mut self.y),
-            Split::Pool(p) => p.install(|| {
-                self.y
-                    .par_chunks_mut(n * digits)
-                    .enumerate()
-                    .for_each(|(i, y)| update(i * digits, y.len() / n, y))
+            _ => ways_chunks(split, &mut self.y, n * digits, |i, y| {
+                update(i * digits, y.len() / n, y)
             }),
-            Split::Ways(_) => self
-                .y
-                .par_chunks_mut(n * digits)
-                .enumerate()
-                .for_each(|(i, y)| update(i * digits, y.len() / n, y)),
         }
     }
 
@@ -1416,7 +1403,45 @@ fn run_ways(split: &Split<'_>, ways: usize, f: impl Fn(usize) + Sync + Send) {
     }
     match split {
         Split::Pool(p) => p.install(|| (0..ways).into_par_iter().for_each(&f)),
+        Split::Ways(_) if board::offered() => board::run(ways, &f),
         _ => (0..ways).into_par_iter().for_each(&f),
+    }
+}
+
+/// `f(i, chunk)` over the `len`-element chunks of `out` (the last may be
+/// shorter), as [`run_ways`] runs ways: a granted split under a board offer
+/// posts its chunks, since a cone queue's idle helpers take board items but
+/// never steal a Rayon split. Who runs a chunk never changes it.
+fn ways_chunks<E: Send>(
+    split: &Split<'_>,
+    out: &mut [E],
+    len: usize,
+    f: impl Fn(usize, &mut [E]) + Sync + Send,
+) {
+    match split {
+        Split::Pool(p) => p.install(|| {
+            out.par_chunks_mut(len)
+                .enumerate()
+                .for_each(|(i, c)| f(i, c))
+        }),
+        Split::Ways(_) if board::offered() => {
+            struct Base<E>(*mut E);
+            // SAFETY: items write disjoint chunks of `out`.
+            unsafe impl<E: Send> Sync for Base<E> {}
+            let (base, total) = (Base(out.as_mut_ptr()), out.len());
+            board::run(total.div_ceil(len), &|i| {
+                let (start, base) = (i * len, &base);
+                let end = (start + len).min(total);
+                // SAFETY: chunk i is [start, end), owned by item i alone.
+                f(i, unsafe {
+                    std::slice::from_raw_parts_mut(base.0.add(start), end - start)
+                });
+            });
+        }
+        _ => out
+            .par_chunks_mut(len)
+            .enumerate()
+            .for_each(|(i, c)| f(i, c)),
     }
 }
 
@@ -1459,21 +1484,13 @@ fn prime_products(
         return;
     }
     let primes = (prod.len() / outputs).div_ceil(split_ways(split));
-    let mut run = || {
-        prod.par_chunks_mut(primes * outputs)
-            .enumerate()
-            .for_each(|(i, chunk)| {
-                let mut t = take_buffer(0);
-                for (j, prod) in chunk.chunks_mut(outputs).enumerate() {
-                    product(i * primes + j, prod, &mut t);
-                }
-                release_buffer(t);
-            });
-    };
-    match split {
-        Split::Pool(p) => p.install(run),
-        _ => run(),
-    }
+    ways_chunks(split, prod, primes * outputs, |i, chunk| {
+        let mut t = take_buffer(0);
+        for (j, prod) in chunk.chunks_mut(outputs).enumerate() {
+            product(i * primes + j, prod, &mut t);
+        }
+        release_buffer(t);
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -1884,6 +1901,38 @@ pub(super) fn gemm<const N: usize>(
             );
         };
         let group = &mut prod[q0 * outputs..q1 * outputs];
+        let panels = column_panels(&shape, upper_only, q1 - q0, &split);
+        if panels.len() > 2 {
+            // Fewer primes than ways: each prime's columns are shared too.
+            let parts = panels.len() - 1;
+            let base = SendValues(group.as_mut_ptr());
+            run_ways(&split, (q1 - q0) * parts, |item| {
+                let (qi, columns) = (item / parts, panels[item % parts]..panels[item % parts + 1]);
+                let (start, end) = (
+                    shape.column_offset(columns.start, upper_only),
+                    shape.column_offset(columns.end, upper_only),
+                );
+                // SAFETY: item (qi, panel) alone owns these outputs of prime qi.
+                let cq = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        base.get().add(qi * outputs + start),
+                        end - start,
+                    )
+                };
+                let (aq, bq) = (
+                    &sa[qi * len_a..(qi + 1) * len_a],
+                    if same_operand {
+                        &sa[qi * len_a..(qi + 1) * len_a]
+                    } else {
+                        &sb[qi * len_b..(qi + 1) * len_b]
+                    },
+                );
+                let mut t = take_buffer(0);
+                shape.prime_columns(&plan, q0 + qi, aq, bq, cq, &mut t, upper_only, columns);
+                release_buffer(t);
+            });
+            continue;
+        }
         prime_products(&split, outputs, group, &mut s.t, product);
     }
     let optr = SendValues(out.as_mut_ptr());
@@ -1898,6 +1947,48 @@ pub(super) fn gemm<const N: usize>(
     crate::receipt::finish("rns.gemm.shared_crt", timer);
     ok
 }
+
+/// Column bounds sharing each prime of a `primes`-prime group over the
+/// split's ways when the primes alone leave ways idle: as many panels per
+/// prime as idle ways need, at least [`PANEL_COLS`] wide and carrying
+/// [`WAY_WORK`] each, balanced by the triangle's column heights. `[0, n]`
+/// keeps whole primes.
+fn column_panels(
+    shape: &GemmShape,
+    upper_only: bool,
+    primes: usize,
+    split: &Split<'_>,
+) -> Vec<usize> {
+    let (m, n, k) = (shape.m, shape.n, shape.k);
+    let threads = match split {
+        Split::Pool(p) => p.current_num_threads(),
+        _ => rayon::current_num_threads(),
+    };
+    let ways = split_ways(split).min(threads);
+    let weight = |j: usize| if upper_only { (j + 1).min(m) } else { m } as u128;
+    let total: u128 = (0..n).map(weight).sum();
+    let parts = ways
+        .div_ceil(primes.max(1))
+        .min(n / PANEL_COLS)
+        .min((total * k as u128 / WAY_WORK).min(usize::MAX as u128) as usize);
+    if parts <= 1 {
+        return vec![0, n];
+    }
+    let mut bounds = vec![0];
+    let mut acc = 0u128;
+    for j in 0..n {
+        acc += weight(j);
+        if acc * parts as u128 >= total * bounds.len() as u128 && bounds.len() < parts && j + 1 < n
+        {
+            bounds.push(j + 1);
+        }
+    }
+    bounds.push(n);
+    bounds
+}
+
+/// Narrowest column panel of a shared prime product.
+const PANEL_COLS: usize = 32;
 
 fn spread_probe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2466,6 +2557,7 @@ struct GemmShape {
 impl GemmShape {
     /// Exact residue product for prime `q` into `cq` (`m × n`), reduced; the
     /// inner dimension is chunked so every binary64 sum stays below 2^53.
+    #[allow(clippy::too_many_arguments)]
     fn prime_product(
         &self,
         plan: &Plan,
@@ -2476,19 +2568,52 @@ impl GemmShape {
         part: &mut Vec<f64>,
         upper_only: bool,
     ) {
+        self.prime_columns(plan, q, aq, bq, cq, part, upper_only, 0..self.n);
+    }
+
+    /// Output offset of column `j` in the requested layout: column-major
+    /// `m × n`, or the packed upper triangle.
+    fn column_offset(&self, j: usize, upper_only: bool) -> usize {
+        let m = self.m;
+        match upper_only {
+            false => j * m,
+            true if j < m => j * (j + 1) / 2,
+            true => m * (m + 1) / 2 + (j - m) * m,
+        }
+    }
+
+    /// [`Self::prime_product`] restricted to output `columns`, written to
+    /// `cq` from the first column's offset. Residue entries are exact
+    /// integers, so any column range gives the whole product's values.
+    #[allow(clippy::too_many_arguments)]
+    fn prime_columns(
+        &self,
+        plan: &Plan,
+        q: usize,
+        aq: &[f64],
+        bq: &[f64],
+        cq: &mut [f64],
+        part: &mut Vec<f64>,
+        upper_only: bool,
+        columns: std::ops::Range<usize>,
+    ) {
         let (ta_n, tb_n) = (
             self.ta.to_ascii_uppercase() == b'N',
             self.tb.to_ascii_uppercase() == b'N',
         );
-        let (m, n, k, outputs) = (self.m, self.n, self.k, self.m * self.n);
+        let (m, k) = (self.m, self.k);
+        let (first, n) = (columns.start, columns.len());
+        let b_col = if tb_n { first * self.ldb } else { first };
+        let outputs = m * n;
         if upper_only {
             // Rectangle tiles cover the requested triangle; only selected
             // residues survive into CRT, in column-major packed order.
             const TILE: usize = 32;
+            let base = self.column_offset(first, true);
             part.clear();
             part.resize(m * TILE.min(n), 0.0);
-            for j0 in (0..n).step_by(TILE) {
-                let cols = TILE.min(n - j0);
+            for j0 in (first..columns.end).step_by(TILE) {
+                let cols = TILE.min(columns.end - j0);
                 let height = m.min(j0 + cols);
                 for k0 in (0..k).step_by(plan.k_chunk) {
                     let kc = plan.k_chunk.min(k - k0);
@@ -2513,11 +2638,7 @@ impl GemmShape {
                     );
                     for j in 0..cols {
                         let column = j0 + j;
-                        let offset = if column < m {
-                            column * (column + 1) / 2
-                        } else {
-                            m * (m + 1) / 2 + (column - m) * m
-                        };
+                        let offset = self.column_offset(column, true) - base;
                         for i in 0..m.min(column + 1) {
                             let value = reduce(part[i + j * height], plan.p[q], plan.pinv[q]);
                             let dest = &mut cq[offset + i];
@@ -2536,7 +2657,7 @@ impl GemmShape {
         while k0 < k {
             let kc = plan.k_chunk.min(k - k0);
             let a_off = if ta_n { k0 * self.lda } else { k0 };
-            let b_off = if tb_n { k0 } else { k0 * self.ldb };
+            let b_off = b_col + if tb_n { k0 } else { k0 * self.ldb };
             if k0 == 0 {
                 int_gemm(
                     self.ta,
@@ -2867,15 +2988,9 @@ fn congruence_prime_groups<const N: usize>(
             release_buffer(v);
         }
     };
-    let mut run = || {
-        prod.par_chunks_mut(per * outputs)
-            .enumerate()
-            .for_each(products)
-    };
-    match split {
-        Split::Pool(p) => p.install(run),
-        _ => run(),
-    }
+    ways_chunks(split, &mut prod, per * outputs, |w, chunk| {
+        products((w, chunk))
+    });
     // Contiguous column ranges; an upper triangle weights later columns more.
     let weight = |j: usize| if upper_only { j as u128 + 1 } else { m as u128 };
     let total: u128 = (0..m).map(weight).sum();

@@ -326,6 +326,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - 2026-10-15 (journal): the owner's free-column border elimination y = S⁻¹g + W·x_f cancelled 14 digits on d6n640q. One refinement round on the bordered system with exact-dot residuals over the factored S brings raw residuals to plain's level (206 → 1 original corrections). d6n640q owner −19.3%, audited; fix-a neutral, audited; ising11 bitwise. Next: the serial pair-path back-substitution (~8.6 s of kkt update).
    - 2026-10-15 (journal): the pair-path interior back-substitution now runs on the owner pool (bitwise). fix-a −3.1% (T=2) and −7.1% (partitions 2); d6n640q −6.5% (69.5 s vs plain 63–66 s).
    - 2026-10-15 (journal): condensed cone scaling queues one job per lane of linear-cost blocks instead of one per block. The 20200 one-row orthants had serialized on the queue lock. fix-a owner −2.8% (T=2) and −9.6% (partitions 2); d6n640q −2.4%; bitwise.
+   - 2026-10-15 (journal): granted RNS ways post to the cone-scaling board, and one-prime groups split each prime's product by output columns. The cone queue's idle workers had never stolen the Rayon splits of the ORE Schur products. one_L12/128 (4 it) T=4 −30.5% (faer) and −7.2% (Accelerate); two_L6, fix-a and d6q are neutral; bitwise.
    - Next:
      - a full one_L12/128 solve with audit;
      - the S₀⁻¹ leaf factor from the cone's L⁻¹ (skip re-factoring the leaf);

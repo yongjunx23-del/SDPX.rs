@@ -8,6 +8,32 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Split RNS products reach the scaling board; one-prime groups split by columns (thermal-ore)
+
+- Observed (5b310c2, one_L12/128, 4 iterations, T=4):
+  - The ORE-42 cone's Schur work (order 1806) took about 1.96 of 2.05 s per scale-cones phase. With faer, `ore.schur_inverse` was 16.2 s at T=4 against 16.3 s at T=1.
+  - Its exact products got `Split::Ways`, but those ways ran as Rayon tasks. With 5 cones on 4 workers, the cone queue's idle workers only help board posts; they steal Rayon work only when workers > cones. So the splits ran serially on the ORE thread.
+  - After posting the ways to the board, a probe showed the remaining serial part: each `gemm` call carried one prime per group, because the 8 MB residue-scratch cap is below a 903² operand pair (13 MB). Each call was one 133 ms prime product that no way could share.
+- Change (`rns_blas.rs`):
+  - Granted ways (`Split::Ways`) post their items on the board when the thread runs under an offer. This covers chunk-matrix fills, residue encoding, per-prime products, CRT digit updates, congruence products and output-tiled CRT.
+  - When a group has fewer primes than ways (min of the split and the pool's threads), each prime's product is split into output-column panels: at least 32 columns and `WAY_WORK` each, balanced by triangle height.
+  - Residue entries are exact integers, so a panel's product equals the whole product's columns. Results are bitwise identical.
+- E2E (Mac, fast profile), ABBA, every point bitwise identical to A:
+
+  | Case | A (5b310c2) s | B s | Change |
+  |---|---|---|---|
+  | one_L12/128 4 it, T=4, faer | 35.12 / 34.98 | 24.44 / 24.28 | −30.5% |
+  | one_L12/128 4 it, T=4, Accelerate | 22.43 / 22.66 | 21.15 / 20.69 | −7.2% |
+  | two_L6/256, T=4, faer | 3.09 / 3.09 | 3.10 / 2.98 | −1.5% |
+  | two_L6/256, T=4, Accelerate | 2.95 / 2.92 | 2.89 / 2.91 | −1.3% |
+  | fix-a 256, partitions 1, T=2 | 9.93 / 9.90 | 9.85 / 9.93 | −0.3% |
+  | fix-a 256, partitions 2, T=10 | 6.23 / 6.35 | 6.17 / 6.23 | −1.0% |
+  | d6n640q 128, partitions 1, T=10 | 68.72 / 67.14 | 67.92 / 67.09 | −0.6% |
+
+  - one_L12 phases at T=4 (faer): `ore.schur_inverse` 16.2 → 7.5 s, `ore.schur_cholesky` 4.5 → 2.3 s; T=1 is unchanged. Accelerate gains less on the Mac because the P-cluster's matrix unit is shared; the cluster's x86 GEMM behaves like faer.
+  - two_L4/256: Solved, 85 iterations, same point. two_L6/256 T=1: 6.25 vs 6.31 s (one pair). ising11 at 512 bits, T=4 (owner with partitions 2, and plain): bitwise identical. 505 solver lib tests pass.
+- Decision: kept. Audits carry over.
+
 ## 2026-10-15 — Condensed sync pass grouped by lane: rejected (thermal-ore)
 
 - Hypothesis: the condensed `sync` pass (copying each cone's scaling into its block) has the same one-job-per-block queue as the old scaling jobs (fix-a: 20200 jobs per update, 0.18 s per solve at T=10).
