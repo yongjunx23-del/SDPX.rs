@@ -1486,6 +1486,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     crate::mpi::SITE_RZ
                 },
             );
+        } else if let (None, Some(plan)) = (world, plan) {
+            plan.product_local(a, transpose, y, x, alpha, beta);
         } else if transpose {
             a.t().gemv(y, x, alpha, beta);
         } else {
@@ -2384,14 +2386,18 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     );
                 }
             } else {
-                match a_panel {
-                    Some(panel) => panel.gemv(true, ex, z, -T::one(), T::one()),
-                    None => A.t().gemv(ex, z, -T::one(), T::one()),
+                match (a_panel.as_ref(), sparse_products.as_ref()) {
+                    (Some(panel), _) => panel.gemv(true, ex, z, -T::one(), T::one()),
+                    (None, Some(plan)) => plan.product_local(A, true, ex, z, -T::one(), T::one()),
+                    (None, None) => A.t().gemv(ex, z, -T::one(), T::one()),
                 }
                 if !reuse_forward {
-                    match a_panel {
-                        Some(panel) => panel.gemv(false, ez, x, -T::one(), T::one()),
-                        None => A.gemv(ez, x, -T::one(), T::one()),
+                    match (a_panel.as_ref(), sparse_products.as_ref()) {
+                        (Some(panel), _) => panel.gemv(false, ez, x, -T::one(), T::one()),
+                        (None, Some(plan)) => {
+                            plan.product_local(A, false, ez, x, -T::one(), T::one())
+                        }
+                        (None, None) => A.gemv(ez, x, -T::one(), T::one()),
                     }
                 }
             }

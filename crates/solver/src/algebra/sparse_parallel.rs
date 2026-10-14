@@ -294,6 +294,23 @@ impl SparseParallel {
         self.apply_in_pool(a, transpose, y, x, alpha, beta);
     }
 
+    /// [`Self::product`] entered through this plan's own pool (serial lanes
+    /// without one), for callers outside it.
+    pub(crate) fn product_local<T: FloatT>(
+        &self,
+        a: &CscMatrix<T>,
+        transpose: bool,
+        y: &mut [T],
+        x: &[T],
+        alpha: T,
+        beta: T,
+    ) {
+        match &self.pool {
+            Some(pool) => pool.install(|| self.apply_in_pool(a, transpose, y, x, alpha, beta)),
+            None => self.apply_in_pool(a, transpose, y, x, alpha, beta),
+        }
+    }
+
     /// Rank-sharded product. Every output is evaluated on exactly one rank in
     /// its original accumulation order; the gathered outputs reproduce the
     /// serial product bitwise.

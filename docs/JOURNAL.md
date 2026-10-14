@@ -8,6 +8,22 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Local condensed kernels: A's products on the pool (thermal-ore)
+
+- Observed (fix-a owner, 256 bits, T=2): the owner-local condensed kernel ran A·x and Aᵀ·z serially, in `recover_rhs`, the original-level `residual` and `prepare_rhs`.
+  - A `SparseParallel` plan existed only when an MPI world shards the product.
+  - The 99 dense border rows hold 2.0M of A's 2.02M entries. Each of the 237 solves paid about 110 ms of serial MPFR products while the second worker idled.
+- Change (`condensed`): a kernel with no world builds the plan when it first receives a pool of more than one thread (without a binary64 panel or a sampled operator). `sparse_gemv` and the residual then use `SparseParallel::product_local`.
+  - The plan keeps the CSC gemv arithmetic on each output, so the products are bitwise unchanged.
+- E2E: ABBA, fix-a 256, partitions 1, T=2 (Mac, fast profile). All four points are identical (41ea9caa5f5d).
+
+  | Arm | Run 1 s | Run 2 s | `residual` s | `recover_rhs` s | Peak RSS MiB |
+  |---|---|---|---|---|---|
+  | A (f38aec9) | 130.2 | 130.4 | 15.5 / 15.6 | 11.6 / 11.7 | 2383 / 2380 |
+  | B | 121.6 | 121.6 (−6.7%) | 10.5 / 10.4 | 8.3 / 8.3 | 2369 / 2364 |
+
+- Decision: kept. With more threads per rank the products split further. `recover_rhs` still evaluates the border rows, whose values no zero block reads.
+
 ## 2026-10-15 — Bound Gram: shared per-prime sums instead of per-way copies (thermal-ore)
 
 - Observed (code): `diag_congruence` gave each way a private count × outputs residue copy and folded the copies serially after the products.

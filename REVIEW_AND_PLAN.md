@@ -315,6 +315,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - 2026-10-14 (journal): the bound-arrow memory gate uses the generic arrow's ceiling. Large dense MPFR LPs (the gravity restricted LP: 640 × 67k at 128 bits) no longer fall to serial QDLDL, which took 330 s per factorization on half the instance. Both sizes are Solved and audited. Open: the owner path's border assembly and pair solves for LP leaves (166–226 s vs 6–16 s plain on fix-a 256).
    - 2026-10-15 (journal): bound-arrow Gram primes are sized by the 4096-row product block, not the whole k (21 instead of 19–20 bits). Half-size gravity LP −11.2% at T=4 (release −10.2%); points are bitwise unchanged.
    - 2026-10-15 (journal): the bound Gram's ways share one residue accumulator per prime, with no per-way copies and no serial fold. Quarter-size gravity LP −2.6% at T=10 (faer), peak RSS −6%; points are bitwise unchanged.
+   - 2026-10-15 (journal): local condensed kernels (owner path) run A's products on their pool's output lanes. fix-a 256 owner −6.7% at T=2; points are bitwise unchanged.
    - 2026-10-15 (journal): the owner border assembly takes one exact residue product per dense coupling. fix-a 256 owner −19.1% (release); points are bitwise unchanged. The owner path is still about 16× plain on dense-border LPs.
    - Next:
      - a full one_L12/128 solve with audit;
