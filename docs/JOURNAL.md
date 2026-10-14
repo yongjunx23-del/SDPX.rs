@@ -8,6 +8,37 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Gondzio centrality correctors on the owner path (thermal-ore)
+
+- Observed (Mac, fast profile, after 91b0fac):
+  - The owner (distributed) path took more iterations than plain on the same LPs: fix-a 256 33 vs 25, d6n640q 128 66 vs 48.
+  - Plain runs up to two centrality correctors per iteration on orthant and second-order rows (`has_correctable`). `OwnedCones` kept the trait default (`false`), so the owner never corrected.
+- Change (`distributed::hsd_steps`):
+  - `OwnedCones::has_correctable` is true when any owner block has correctable rows (one collective flag).
+  - `OwnedVariables::centrality_correction` runs each owner block's cone correction on the pool, as `DefaultVariables` does.
+    - Border rows are equalities and keep their right-hand side.
+    - τκ is replicated, so every rank applies the same band correction to κ.
+    - Ranks agree on "changed" through one collective flag.
+  - The corrector loop in `core::solver` is unchanged.
+  - PSD rows above binary64 are not correctable (as in plain), so Ising inputs never enter the loop.
+- E2E (Mac, fast profile, fix-a 256 owner; d6n640q 128 owner at T=10, partitions 1), ABBA, every run Solved:
+
+  | Mode | A (91b0fac) s | B s | Iterations | Change |
+  |---|---|---|---|---|
+  | fix-a, partitions 1, T=2 | 14.31 / 14.27 | 13.64 / 13.67 | 33 → 25 | −4.4% |
+  | fix-a, partitions 2, T=10 | 9.67 / 9.90 | 8.78 / 8.87 | 33 → 25 | −9.8% |
+  | fix-a, partitions 1, T=10 | 11.24 | 10.30 | 33 → 25 | −8.3% |
+  | d6n640q, partitions 1, T=10 | 117.1 | 97.9 | 66 → 48 | −16.4% |
+
+  - Peak RSS is unchanged (1.26–1.41 GB on fix-a).
+  - Audit at 384 bits, original coordinates:
+    - fix-a B: primal rel 4.2e-19, dual rel 1.9e-18, gap rel 3.4e-19 (A: 1.7e-19, 7.5e-19, 6.8e-21). Plain's point audits to the same B values in every printed digit.
+    - d6n640q B: 1.1e-26, 3.0e-23, 1.2e-20 (A: 8.6e-25, 2.3e-21, 4.0e-20).
+  - ising11 owner (512 bits, partitions 2, T=4): points are bitwise identical to A.
+  - 505 solver lib tests pass; the `it` suite fails only the known `overshooting_start_still_solves`.
+- Decision: kept.
+- Remaining owner cost on d6n640q: 97.9 s vs plain 65.8 s at the same 48 iterations.
+
 ## 2026-10-15 — Column-streamed exact forward products for long rows (thermal-ore)
 
 - Observed (Apple M4, 256 bits, 99 rows of 20202 entries):
