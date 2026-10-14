@@ -522,9 +522,28 @@ where
             } else {
                 false
             };
+            // As in `step_length`: an operator relative entropy search on the
+            // idle pool batches its trial chain and splits its kernels.
+            let idle = self
+                .threading
+                .as_ref()
+                .filter(|t| t.pool.current_num_threads() > 1)
+                .map(|t| std::sync::Arc::clone(&t.pool));
             return self.fold_step_bounds(αmax, cached, None, |cone, rows, cap| {
                 if let SupportedCone::PSDTriangleCone(cone) = cone {
                     cone.prepare_affine_bounds(&mut dz[rows.clone()], &mut ds[rows], cap)
+                } else if let (Some(pool), SupportedCone::OpRelEntropyCone(_)) = (&idle, &*cone) {
+                    pool.install(|| {
+                        let _inner = sdpx_arithmetic::inner_parallel::Guard::enter();
+                        cone.step_length(
+                            &dz[rows.clone()],
+                            &ds[rows.clone()],
+                            &z[rows.clone()],
+                            &s[rows],
+                            settings,
+                            cap,
+                        )
+                    })
                 } else {
                     cone.step_length(
                         &dz[rows.clone()],

@@ -8,6 +8,26 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — ORE affine step searches on the idle pool (thermal-ore)
+
+- Hypothesis: on two_L6/256 at T=4 after `71a247c`, step lengths took 1.20 of 3.53 s and barely scaled from T=1 (1.33 s).
+  - A trial trace of the n = 8 ORE cone showed 311 of its 329 failed dual trials in affine searches.
+  - Inputs with PSD cones take the affine search through `prepare_affine_bounds`, which called the ORE `step_length` outside any pool. So `rayon::current_thread_index()` was None, and the batched trials below αs ran one at a time.
+  - The final search (`step_length`) already installs the idle pool.
+- Change: `prepare_affine_bounds` runs ORE cones on the idle pool with the inner-parallel guard, as `step_length` does. T=1 and inputs without ORE cones are unchanged.
+- Probe (fast profile, T=4): affine step length 0.790 → 0.524 s; final step length unchanged (0.405 s).
+- E2E (Mac release, A = `71a247c`, B = candidate, ABBA A B B A, solve s):
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | two_L6/256 | 4 | 3.42 / 3.39 | 3.12 / 3.11 | −8.4% |
+  | two_L6/128 | 4 | 1.62 / 1.61 | 1.52 / 1.51 | −6.2% |
+  | two_L6/256 | 8 | 3.52 / 3.54 | 3.28 / 3.28 | −6.9% |
+  | two_L6/128 | 8 | 1.67 / 1.68 | 1.58 / 1.59 | −5.4% |
+
+- Points: bitwise equal to A at T=4 and T=8, so A's audits carry over (the batch takes the first passing trial in chain order). two_L4/256 and two_L4/128 are Solved 85 and 46 with identical points.
+- Decision: kept.
+
 ## 2026-10-14 — MPFR arrow orientation by dense work: K's or −K's arrow (thermal-ore)
 
 - Hypothesis: on two_L6, the MPFR auto backend took K's arrow whenever it was eligible. That arrow has one leaf (81 primal columns) and a border of 186 ORE rows.

@@ -310,6 +310,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - 2026-10-14 (journal): the ORE dual-test CG budget counts S₀'s column build, and each new scaling forgives one open test. Before this, the budget stuck at 0 and two_L6/256 factored S₀ 1151 times. two_L6/256 −8.3% at T=4 and −4.5% at T=1, two_L6/128 −2…−5%. Points are bitwise unchanged.
    - 2026-10-14 (journal): wide dense PSD Schur columns sum only over A's index support and compute packed entries when first read. The sparse/dense rule uses measured costs, so most sparse columns turn dense. two_L6 −6…−10% at T=1 and T=4, one_L12 (4 it) −3.9%. All solves are audited, ising11 included.
    - 2026-10-14 (journal): the MPFR auto backend takes K's or −K's arrow, whichever is eligible with less estimated dense work. On two_L6 that is −K's (five ORE leaves around 81 primal columns instead of one leaf and 186 ORE border rows): −21…−28% at T=1 and T=4, audited. Inputs with a single eligible arrow are unchanged.
+   - 2026-10-14 (journal): affine ORE step searches run on the idle pool, as final searches already did, so their dual trials below αs are batched. two_L6 −5…−8% at T=4 and T=8. Points are bitwise unchanged.
    - Next:
      - a full one_L12/128 solve with audit;
      - the S₀⁻¹ leaf factor from the cone's L⁻¹ (skip re-factoring the leaf);
