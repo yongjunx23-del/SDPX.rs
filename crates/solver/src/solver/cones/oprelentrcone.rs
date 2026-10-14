@@ -73,6 +73,26 @@ fn pieces<T: FloatT>(
 /// refined to the working precision by `central_point`.
 const CENTRAL: [f64; 3] = [0.8278383990656786, 0.8051020015847954, 1.290927709856958];
 
+/// Order up to which the recursive wide kernels take exact dots.
+const BASE: usize = 128;
+
+/// `c = op(a)·op(b)` (`m × n`, inner `k`): one exact sum rounded once per
+/// entry, with the spare workers [`tasks`] grants offered to the residue
+/// product.
+fn product<T: FloatT>(
+    (ta, tb): (u8, u8),
+    (m, n, k): (usize, usize, usize),
+    (a, lda): (&[T], usize),
+    (b, ldb): (&[T], usize),
+    c: &mut [T],
+) {
+    let ways = tasks::<T>(m * n * k, usize::MAX);
+    crate::algebra::with_split_hint(ways, || {
+        let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        T::xgemm(ta, tb, mi, ni, ki, T::one(), a, lda as i32, b, ldb as i32, T::zero(), c, mi)
+    });
+}
+
 #[inline]
 fn tri(i: usize, j: usize) -> usize {
     // svec index of (i, j), i ≤ j (upper triangle by column)
@@ -103,6 +123,22 @@ fn cholesky<T: FloatT>(n: usize, a: &mut [T]) -> bool {
         }
         return (0..n).all(|i| a[i + i * n].is_finite() && a[i + i * n] > T::zero());
     }
+    if n > BASE {
+        if !cholesky_rec(n, a, n) {
+            return false;
+        }
+        for j in 1..n {
+            a[j * n..j * n + j].fill(T::zero());
+        }
+        return true;
+    }
+    cholesky_dots(n, a)
+}
+
+/// Wide [`cholesky`] of order `n`, left-looking on rows: each entry one
+/// exact dot product rounded once (3× faster than potrf's FMA chains at
+/// order 72).
+fn cholesky_dots<T: FloatT>(n: usize, a: &mut [T]) -> bool {
     use sdpx_arithmetic::inner_parallel as ip;
     let mut r = vec![T::zero(); n * n];
     let mut col = Vec::with_capacity(n);
@@ -139,6 +175,89 @@ fn cholesky<T: FloatT>(n: usize, a: &mut [T]) -> bool {
     true
 }
 
+/// Lower Cholesky factor of the order-`n` block at `a` (leading dimension
+/// `ld`) in place, upper triangle untouched. Halving recursively makes the
+/// panel solve and the Schur update large exact products (each entry the
+/// exact sum rounded once, then subtracted), so residue operands are encoded
+/// once per large product; blocks up to [`BASE`] take [`cholesky_dots`].
+fn cholesky_rec<T: FloatT>(n: usize, a: &mut [T], ld: usize) -> bool {
+    if n <= BASE {
+        let mut b = vec![T::zero(); n * n];
+        for j in 0..n {
+            b[j + j * n..(j + 1) * n].copy_from_slice(&a[j + j * ld..n + j * ld]);
+        }
+        if !cholesky_dots(n, &mut b) {
+            return false;
+        }
+        for j in 0..n {
+            a[j + j * ld..n + j * ld].copy_from_slice(&b[j + j * n..(j + 1) * n]);
+        }
+        return true;
+    }
+    let (n1, n2) = (n / 2, n - n / 2);
+    if !cholesky_rec(n1, a, ld) {
+        return false;
+    }
+    let l11: Vec<T> = (0..n1 * n1).map(|e| a[e % n1 + e / n1 * ld]).collect();
+    solve_lower_t(n2, n1, &l11, n1, &mut a[n1..], ld);
+    let (left, right) = a.split_at_mut(n1 * ld);
+    let l21 = &left[n1..];
+    // packed (j, i), j ≤ i, is the Schur term (i, j)
+    let mut packed = vec![T::zero(); n2 * (n2 + 1) / 2];
+    let ways = tasks::<T>(n2 * n2 * n1 / 2, usize::MAX);
+    let upper = crate::algebra::with_split_hint(ways, || {
+        T::xgemm_upper_exact(b'N', b'T', n2, n2, n1, l21, ld, l21, ld, &mut packed, None, None)
+    });
+    if upper {
+        for j in 0..n2 {
+            for i in j..n2 {
+                right[n1 + i + j * ld] -= packed[i * (i + 1) / 2 + j];
+            }
+        }
+    } else {
+        let mut s = vec![T::zero(); n2 * n2];
+        product((b'N', b'T'), (n2, n2, n1), (l21, ld), (l21, ld), &mut s);
+        for j in 0..n2 {
+            for i in j..n2 {
+                right[n1 + i + j * ld] -= s[i + j * n2];
+            }
+        }
+    }
+    cholesky_rec(n2, &mut right[n1..], ld)
+}
+
+/// X·Lᵀ = B for X (`m × n`, overwriting B with leading dimension `ldb`),
+/// L lower of order `n`: recursive halves of L with one exact product
+/// update between them; up to [`BASE`] columns, rows of B solve
+/// independently by exact dots.
+fn solve_lower_t<T: FloatT>(m: usize, n: usize, l: &[T], ldl: usize, b: &mut [T], ldb: usize) {
+    if n <= BASE {
+        let lr: Vec<T> = (0..n * n).map(|e| l[e / n + e % n * ldl]).collect();
+        let mut rows: Vec<T> = (0..m * n).map(|e| b[e / n + e % n * ldb]).collect();
+        pieces::<T>(&mut rows, n, m * n * n / 2, |_, x| {
+            for j in 0..n {
+                let v = x[j] - T::dot_slices(&x[..j], &lr[j * n..j * n + j]);
+                x[j] = v / lr[j + j * n];
+            }
+        });
+        for (e, v) in rows.into_iter().enumerate() {
+            b[e / n + e % n * ldb] = v;
+        }
+        return;
+    }
+    let (n1, n2) = (n / 2, n - n / 2);
+    solve_lower_t(m, n1, l, ldl, b, ldb);
+    let (b1, b2) = b.split_at_mut(n1 * ldb);
+    let mut p = vec![T::zero(); m * n2];
+    product((b'N', b'T'), (m, n2, n1), (b1, ldb), (&l[n1..], ldl), &mut p);
+    for j in 0..n2 {
+        for i in 0..m {
+            b2[i + j * ldb] -= p[i + j * m];
+        }
+    }
+    solve_lower_t(m, n2, &l[n1 + n1 * ldl..], ldl, b2, ldb);
+}
+
 /// L⁻¹ of a lower triangular L by forward substitution (lower triangle),
 /// each entry one exact dot product; binary64 solves against the identity
 /// with TRSM.
@@ -149,6 +268,13 @@ fn lower_inverse<T: FloatT>(n: usize, l: &[T], li: &mut [T]) {
         T::xtrsm_lower(n, l, li, false);
         return;
     }
+    if n > BASE {
+        return lower_inverse_rec(n, l, n, li, n);
+    }
+    lower_inverse_dots(n, l, li);
+}
+
+fn lower_inverse_dots<T: FloatT>(n: usize, l: &[T], li: &mut [T]) {
     let mut rows = vec![T::zero(); n * n];
     for j in 0..n {
         for i in j..n {
@@ -165,6 +291,34 @@ fn lower_inverse<T: FloatT>(n: usize, l: &[T], li: &mut [T]) {
     });
 }
 
+/// L⁻¹ (`x`, leading dimension `ldx`, strict upper triangle left zero) of
+/// the order-`n` lower L at `l`: X21 = −X22·(L21·X11) from the inverses of
+/// the halves, two exact products per level; up to [`BASE`],
+/// [`lower_inverse_dots`].
+fn lower_inverse_rec<T: FloatT>(n: usize, l: &[T], ldl: usize, x: &mut [T], ldx: usize) {
+    if n <= BASE {
+        let lb: Vec<T> = (0..n * n).map(|e| l[e % n + e / n * ldl]).collect();
+        let mut xb = vec![T::zero(); n * n];
+        lower_inverse_dots(n, &lb, &mut xb);
+        for j in 0..n {
+            x[j + j * ldx..n + j * ldx].copy_from_slice(&xb[j + j * n..(j + 1) * n]);
+        }
+        return;
+    }
+    let (n1, n2) = (n / 2, n - n / 2);
+    lower_inverse_rec(n1, l, ldl, x, ldx);
+    lower_inverse_rec(n2, &l[n1 + n1 * ldl..], ldl, &mut x[n1 + n1 * ldx..], ldx);
+    let mut t = vec![T::zero(); n2 * n1];
+    product((b'N', b'N'), (n2, n1, n1), (&l[n1..], ldl), (x, ldx), &mut t);
+    let mut p = vec![T::zero(); n2 * n1];
+    product((b'N', b'N'), (n2, n1, n2), (&x[n1 + n1 * ldx..], ldx), (&t, n2), &mut p);
+    for j in 0..n1 {
+        for i in 0..n2 {
+            x[n1 + i + j * ldx] = -p[i + j * n2];
+        }
+    }
+}
+
 /// Inverse of a symmetric positive definite matrix from its lower factor:
 /// L⁻ᵀL⁻¹ (LAPACK's potri: a third of the products of solving against the
 /// identity), each entry one exact dot product of two columns of L⁻¹.
@@ -177,6 +331,23 @@ fn spd_inverse<T: FloatT>(n: usize, l: &[T], out: &mut [T]) -> bool {
         for j in 0..n {
             for i in j + 1..n {
                 out[j + i * n] = out[i + j * n];
+            }
+        }
+        return out.iter().all(|v| v.is_finite());
+    }
+    // One exact symmetric product (residue operands encoded once), else
+    // exact dots: either way each entry is one exact sum rounded once.
+    let mut packed = vec![T::zero(); n * (n + 1) / 2];
+    let ways = tasks::<T>(n * n * n / 2, usize::MAX);
+    let exact = crate::algebra::with_split_hint(ways, || {
+        T::xgemm_upper_exact(b'T', b'N', n, n, n, &li, n, &li, n, &mut packed, None, None)
+    });
+    if exact {
+        for j in 0..n {
+            for i in 0..=j {
+                let v = packed[j * (j + 1) / 2 + i];
+                out[i + j * n] = v;
+                out[j + i * n] = v;
             }
         }
         return out.iter().all(|v| v.is_finite());
@@ -784,8 +955,9 @@ impl<T: FloatT> Oracle<T> {
     /// gradients on S₀ preconditioned by B narrow these bounds, two O(n³)
     /// products per step (one recomputes the residual for the bounds); S₀'s O(n⁶)
     /// factor decides only what about as many products as it costs leave
-    /// open.
-    pub(crate) fn dual_ok(&mut self, z: &[T], ok: impl Fn(T) -> bool) -> bool {
+    /// open. That budget is halved `cg` times: the caller counts tests CG
+    /// left open since it last decided one (`cg` += 1, or 0 on a decision).
+    pub(crate) fn dual_ok(&mut self, z: &[T], ok: impl Fn(T) -> bool, cg: &mut u32) -> bool {
         let (t, w, b) = self.dual_parts(z);
         let upper = w.iter().zip(&b).fold(t, |a, (&w, &b)| a + b * w * w);
         if ok(upper) {
@@ -795,16 +967,23 @@ impl<T: FloatT> Oracle<T> {
         let m = n * (n + 1) / 2;
         let nn = n * n;
         let m2 = w.len();
-        // the factor's (2m)³/6 multiply-adds against ≈ 18n³ per CG step;
-        // binary64 factors with LAPACK, far cheaper per multiply-add than CG's
-        // products (one_matrix_L12: 18.6 s without CG, 24.1 s with)
-        let budget =
-            if T::precision_bits() <= 53 { 0 } else { m2.pow(3) / (108 * n.pow(3)) };
+        // the factor's (2m)³/6 multiply-adds against ≈ 18n³ per CG step,
+        // above order `BASE` with the factor's residue products ≈ 4.6×
+        // cheaper per multiply-add (one_matrix_L12f at 128 bits, n = 42:
+        // factor 1.4 s, step 8.8 ms); binary64 factors with LAPACK, far
+        // cheaper per multiply-add than CG's products (one_matrix_L12: 18.6 s
+        // without CG, 24.1 s with)
+        let budget = if T::precision_bits() <= 53 {
+            0
+        } else {
+            let per = if m2 > BASE { 500 } else { 108 };
+            (m2.pow(3) / (per * n.pow(3))).max(1).checked_shr(*cg).unwrap_or(0)
+        };
         // the exact form is t + q with q ≥ 0
         if !ok(t) {
             return false;
         }
-        if budget == 0 {
+        if budget == 0 || self.s0l.is_some() {
             return self.schur_norm(w).is_some_and(|q| ok(t + q));
         }
         self.ensure_d2();
@@ -840,9 +1019,11 @@ impl<T: FloatT> Oracle<T> {
             let low = t + wx + wx - x.dot(&sp);
             let upper = r.iter().zip(&b).fold(low, |a, (&r, &b)| a + b * r * r);
             if ok(upper) {
+                *cg = 0;
                 return true;
             }
             if !ok(low) {
+                *cg = 0;
                 return false;
             }
             for i in 0..m2 {
@@ -855,6 +1036,7 @@ impl<T: FloatT> Oracle<T> {
                 p[i] = br[i] + beta * p[i];
             }
         }
+        *cg += 1;
         self.schur_norm(w).is_some_and(|q| ok(t + q))
     }
 }
@@ -1009,6 +1191,8 @@ pub struct OpRelEntropyConeData<T> {
     zh: Vec<T>,
     s0i: Vec<T>,
     work: Vec<T>,
+    /// Dual tests CG left open since it last decided one (`Oracle::dual_ok`).
+    cg: u32,
 }
 
 #[derive(Clone)]
@@ -1031,6 +1215,7 @@ impl<T: FloatT> OpRelEntropyCone<T> {
                 zh: Vec::new(),
                 s0i: Vec::new(),
                 work: vec![T::zero(); d],
+                cg: 0,
             }),
         }
     }
@@ -1114,13 +1299,13 @@ impl<T: FloatT> OpRelEntropyCone<T> {
     /// form (QICS's proximity test), bracketed by conjugate gradients before
     /// S₀'s factor: the bound can be far above it off the central path
     /// (two_matrix_L6: r 0.913 by the bound, 0.8333 exact).
-    fn dual_ok(&self, oracle: &mut Oracle<T>, s: &[T], z: &[T]) -> bool {
+    fn dual_ok(&self, oracle: &mut Oracle<T>, s: &[T], z: &[T], cg: &mut u32) -> bool {
         let sz = s.dot(z);
         if !(sz > T::zero()) || !z.iter().all(|v| v.is_finite()) {
             return false;
         }
         let nu1 = self.nu() - T::one();
-        oracle.dual_ok(z, |q| nu1 * q < sz * sz)
+        oracle.dual_ok(z, |q| nu1 * q < sz * sz, cg)
     }
 }
 
@@ -1364,17 +1549,62 @@ where
         // (`work` holds the point of `at`). A certificate at the current s
         // admits pairs far off the central path after the joint step:
         // two_matrix_L4 at 256 bits reached r = 1.22 at the new s, where no
-        // dual step certifies (AlmostSolved at 1e-42).
-        let αz = search(αmax, αmin, step, |α| {
-            wz.waxpby(T::one(), z, α, dz);
-            let a = α.min(αs);
-            if at.as_ref().is_none_or(|(b, _)| *b != a) {
-                work.waxpby(T::one(), s, a, ds);
-                at = Oracle::new(n, &work).map(|o| (a, o));
+        // dual step certifies (AlmostSolved at 1e-42). Neighbouring trials
+        // are alike, and so are later searches: each test CG leaves open
+        // halves the next one's budget (one_matrix_L12f: from iteration 40
+        // every search's first trial ran the whole budget, then factored).
+        // Trials below αs each have their own primal point and oracle; idle
+        // pool workers take the next ones of the chain at once and the first
+        // that passes wins, as in order (one_matrix_L12f: about seven such
+        // trials per late affine search, each a factor of S₀).
+        let mut cg = self.data.cg;
+        // outside a pool (one solver thread) rayon would use its global pool
+        let ways = rayon::current_thread_index().map_or(1, |_| rayon::current_num_threads());
+        let this = &*self;
+        let mut α = αmax;
+        let mut αz = T::zero();
+        while α > αmin {
+            if α >= αs || ways == 1 {
+                wz.waxpby(T::one(), z, α, dz);
+                let a = α.min(αs);
+                if at.as_ref().is_none_or(|(b, _)| *b != a) {
+                    work.waxpby(T::one(), s, a, ds);
+                    at = Oracle::new(n, &work).map(|o| (a, o));
+                }
+                if at.as_mut().is_some_and(|(_, o)| this.dual_ok(o, &work, &wz, &mut cg)) {
+                    αz = α;
+                    break;
+                }
+                α *= step;
+                continue;
             }
-            at.as_mut().is_some_and(|(_, o)| self.dual_ok(o, &work, &wz))
-        });
+            let mut batch = Vec::with_capacity(ways);
+            while batch.len() < ways && α > αmin {
+                batch.push(α);
+                α *= step;
+            }
+            let start = cg;
+            let trials: Vec<(bool, u32)> = batch
+                .par_iter()
+                .map(|&a| {
+                    let mut p = vec![T::zero(); s.len()];
+                    p.waxpby(T::one(), s, a, ds);
+                    let mut q = vec![T::zero(); z.len()];
+                    q.waxpby(T::one(), z, a, dz);
+                    let mut cg = start;
+                    let ok = Oracle::new(n, &p)
+                        .is_some_and(|mut o| this.dual_ok(&mut o, &p, &q, &mut cg));
+                    (ok, cg)
+                })
+                .collect();
+            if let Some(i) = trials.iter().position(|t| t.0) {
+                (αz, cg) = (batch[i], trials[i].1);
+                break;
+            }
+            cg = trials.iter().map(|t| t.1).max().unwrap_or(cg);
+        }
         self.data.work = work;
+        self.data.cg = cg;
         (αz, αs)
     }
 

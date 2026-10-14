@@ -150,7 +150,7 @@ fn dual_ok_keeps_cheap_bound_lazy() {
     o.gradient(&mut z);
     z.iter_mut().for_each(|v| *v = -*v);
     let sz = s.dot(&z);
-    assert!(o.dual_ok(&z, |q| (3 * n - 1) as f64 * q < sz * sz));
+    assert!(o.dual_ok(&z, |q| (3 * n - 1) as f64 * q < sz * sz, &mut 0));
     assert!(o.d2.is_empty() && o.vaa.is_empty() && o.s0l.is_none());
 }
 
@@ -180,9 +180,10 @@ fn dual_ok_matches_factor_near_threshold() {
                     for sign in [-T::one(), T::one()] {
                         let limit = exact * (T::one() + sign * separation);
                         let mut cg = Oracle::new(n, &s).unwrap();
-                        assert_eq!(cg.dual_ok(&z, |q| q < limit), exact < limit,
+                        assert_eq!(cg.dual_ok(&z, |q| q < limit, &mut 0), exact < limit,
                             "n={n} margin={margin} probe={probe}");
-                        if probe == 0 && sign > T::zero() {
+                        // binary64 factors without CG
+                        if probe == 0 && sign > T::zero() && T::precision_bits() > 53 {
                             assert!(!cg.d2.is_empty() && cg.s0l.is_none(), "CG must decide the eigenvector probe");
                         }
                     }

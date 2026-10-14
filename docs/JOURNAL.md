@@ -8,6 +8,50 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-14 — Thermal ORE: residue products at 128/192 bits, recursive S₀ kernels, cheaper dual step tests (thermal-ore)
+
+- Hypotheses (one_L12f/128 receipts, n = 42, S₀ of order 1806):
+  - Two- and three-limb exact products ran as per-entry exact dots, because residue products were gated to N ≥ 4. Serial on the Mac, at exponent spreads 2^±4 to 2^±200, the residue product was 2.0–4.8× faster at 64³ and 6–22× faster at 512³.
+  - S₀'s Cholesky, L⁻¹ and L⁻ᵀL⁻¹ were all dots, so none of that work reached the residue products.
+  - Late dual step tests dominate. Each search's first trial ran the whole CG budget and then factored. About seven trials per late affine search fall below αs, each an S₀ factor, and they ran one after another.
+- Change:
+  - `residue_product_profitable`: 2- and 3-limb `gemm` and `xgemm_upper_exact` take residue products from k ≥ 64 and m·n ≥ 4096. Each entry is still the exact sum rounded once, so values are unchanged.
+  - ORE kernels above order 128 (`BASE`):
+    - Cholesky and L⁻¹ split in recursive halves with exact products between them.
+    - L⁻ᵀL⁻¹ is one exact symmetric product.
+    - Entries in the recursion are rounded twice (the Schur update, then the subtraction), so the order changes for cones with n ≥ 11 only.
+  - CG budget in `Oracle::dual_ok`:
+    - The divisor is 500 above order 128, because the factor's residue products are about 4.6× cheaper per multiply-add (one_L12f: factor 1.4 s, CG step 8.8 ms).
+    - The budget halves for each test CG left open since its last decision (`cg`, kept in the cone).
+    - A cached S₀ factor is used directly.
+  - Dual trials below αs run in batches as wide as the pool. The first that passes in order wins, which is the same α as the serial search. At one solver thread nothing is batched.
+  - Test fix: `dual_ok_matches_factor_near_threshold` asserted a CG decision for binary64 too, which factors without CG since `f7fb3a9`. The assertion now applies above 53 bits only.
+- Rejected inside the candidate: Γ from a precomputed g⁽²⁾·W table, two dots per entry. It gave two_L6/128 about −5%, but two_L4/256 became AlmostSolved at 96 iterations (Solved at 80 without it). Reverted.
+- E2E (Mac release, A = `519ae71`, B = candidate, ABBA, mean of two):
+
+  | Case | Threads | A s | B s | Change |
+  |---|---|---|---|---|
+  | two_L4/256 | 2 | 0.197 | 0.192 | −2.4% |
+  | two_L6/128 | 2 | 4.18 / 4.17 | 3.72 / 3.96 | −10.8% / −5.1% |
+  | two_L6/256 | 2 | 9.05 / 9.05 | 8.18 / 8.34 | −9.6% / −7.8% |
+  | one_L12/128, 4 it | 2 | 51.9 / 50.6 | 40.4 / 34.6 | −22.0% / −31.7% |
+  | synthetic, 50 it | 1 / 2 / 8 | 85.5 / 61.5 / 50.5 | 57.2 / 37.8 / 29.6 | −33% / −39% / −41% (single runs) |
+
+  - The two values per row are two ABBA rounds. The second round's B has the final edit, which carries the winning trial's CG count; its points are identical to the first round's B.
+  - The synthetic input is min tr T over the ORE cones n = 20 and 12 (S₀ of order 420 and 156), with X fixed, Y's diagonal fixed and its off-diagonal free. Its optimum is attained and interior.
+- Audits:
+  - two_L4/128, two_L4/256, two_L6/128 and two_L6/256 passed. Their points are bitwise equal to A (no ORE cone above n = 8).
+  - Synthetic/128, Solved at 50 iterations in both arms, objective 413.883239295756077117968:
+    - gap 2.8e-24, primal 1.4e-24, dual 1.3e-25;
+    - ORE margin −5.4e-23;
+    - exact ORE dual ratio 0.99596 (< 1), Hessian checks pass.
+    - B differs from A at about 1e-29 relative.
+- Memory (peak RSS):
+  - one_L12/128, 4 it: T=1 2.10 → 3.47 GB, T=8 2.60 → 3.44 GB.
+  - Synthetic: T=1 224 → 423 MB, T=8 241 → 766 MB.
+  - The growth is transient residue operands plus one oracle per batched trial. Pooled residue buffers stay capped.
+- Decision: kept.
+
 ## 2026-10-14 — Thermal one_L8/128 stall: the optimum is not attained (diagnosis, thermal-ore)
 
 - Observed: one_L8/128 stalls at gap ≈ 9e-9 (MaxIterations 400, τ chases at 60 and 151). The audit passes the residuals but fails the gap (8.8e-9); the ORE dual ratio is 1.4e49 and x9 = x10 → −1.07e13.
