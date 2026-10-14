@@ -370,7 +370,7 @@ pub(super) fn apply_block_pool_with_world<T: FloatT>(
             // the shortest fill the tail.
             let workers = workers.min(pool.current_num_threads());
             pool.install(|| {
-                let jobs = scaling_jobs(blocks, y, x, action, gemm);
+                let jobs = scaling_jobs(blocks, lanes, y, x, action, gemm);
                 crate::algebra::run_queue(jobs, workers)
             });
             return;
@@ -487,33 +487,64 @@ pub(super) fn split_scaling<T: FloatT>(
 /// estimated by its last measured wall time. Each job zeroes and fills its
 /// own rows (rows between blocks are zeroed here), so no serial pass touches
 /// the whole vector; the per-block arithmetic is that of [`apply_blocks`].
+/// One queue job per PSD or ORE block. Consecutive blocks of linear-cost
+/// cones within one of `lanes` share a job: one-row orthants as separate
+/// jobs serialize on the queue's lock (fix-a: 20200 per call).
 pub(super) fn scaling_jobs<'a, T: FloatT>(
     blocks: &'a mut [Block<T>],
+    lanes: &[usize],
     y: &'a mut [T],
     x: &'a [T],
     action: ScalingAction<'a, T>,
     gemm: Option<(&'a rayon::ThreadPool, usize)>,
 ) -> Vec<crate::algebra::Job<'a>> {
+    type Part<'a, T> = (&'a mut Block<T>, &'a mut [T], &'a [T]);
     let a = action_index(&action);
     let offset = blocks.first().map_or(0, |b| b.rows.start);
-    let mut jobs = Vec::with_capacity(blocks.len());
+    let mut jobs = Vec::with_capacity(blocks.len().min(lanes.len().max(1) * 2));
+    let mut group: Vec<Part<'a, T>> = Vec::new();
+    let flush = |group: &mut Vec<Part<'a, T>>, jobs: &mut Vec<crate::algebra::Job<'a>>| {
+        if group.is_empty() {
+            return;
+        }
+        let group = std::mem::take(group);
+        let seconds = group
+            .iter()
+            .map(|(b, ..)| b.cost[a] / b.ways[a].max(1) as f64)
+            .sum();
+        let len = group.iter().map(|(_, rows, _)| rows.len()).sum();
+        let job = move || {
+            for (block, rows, xs) in group {
+                rows.fill(T::zero());
+                apply_block(block, rows, xs, action, gemm);
+            }
+        };
+        jobs.push((seconds, len, Box::new(job) as Box<dyn FnOnce() + Send + 'a>));
+    };
     let mut rest = y;
     let mut at = offset;
-    for block in blocks.iter_mut() {
+    let mut lane = 0;
+    for (k, block) in blocks.iter_mut().enumerate() {
+        while lane < lanes.len() && lanes[lane] <= k {
+            flush(&mut group, &mut jobs);
+            lane += 1;
+        }
         let (gap, tail) = std::mem::take(&mut rest).split_at_mut(block.rows.start - at);
         gap.fill(T::zero());
         let (rows, tail) = tail.split_at_mut(block.rows.len());
         rest = tail;
         at = block.rows.end;
         let xs = &x[block.rows.start - offset..block.rows.end - offset];
-        let seconds = block.cost[a] / block.ways[a].max(1) as f64;
-        let len = rows.len();
-        let job = move || {
-            rows.fill(T::zero());
-            apply_block(block, rows, xs, action, gemm);
-        };
-        jobs.push((seconds, len, Box::new(job) as Box<dyn FnOnce() + Send + 'a>));
+        let alone = matches!(block.scaling, Scaling::Psd(_) | Scaling::Ore(_));
+        if alone {
+            flush(&mut group, &mut jobs);
+        }
+        group.push((block, rows, xs));
+        if alone {
+            flush(&mut group, &mut jobs);
+        }
     }
+    flush(&mut group, &mut jobs);
     rest.fill(T::zero());
     jobs
 }

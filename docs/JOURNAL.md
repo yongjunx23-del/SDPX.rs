@@ -8,6 +8,28 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Condensed cone scaling: one queue job per lane of linear-cost blocks (thermal-ore)
+
+- Observed (24a04a6, fix-a 256 owner, T=10):
+  - Over 103 solves, `prepare_rhs.scaling` took 0.71 s and `recover_rhs.scaling` 0.80 s (partitions 2: 0.92 and 0.93 s); the whole solve was 7.8 s.
+  - The work is two 256-bit divisions per row over 20200 one-row orthant blocks, about 3 ms serial per call; each call took 7–9 ms.
+  - `scaling_jobs` boxes one queue job per block, so 10 workers popped 20200 single-row closures through one mutex.
+- Change: `scaling_jobs` takes the existing scaling lanes.
+  - PSD and ORE blocks keep one job each, cost-ordered as before.
+  - Consecutive blocks of the other cones (orthant, zero, SOC, 3×3, generalized power) inside one lane share one job.
+  - Each block's arithmetic is unchanged, so results are bitwise identical.
+- E2E (Mac, fast profile), ABBA, every point bitwise identical to A:
+
+  | Case | A (24a04a6) s | B s | Change |
+  |---|---|---|---|
+  | fix-a 256, partitions 1, T=2 | 10.17 / 10.17 | 9.88 / 9.89 | −2.8% |
+  | fix-a 256, partitions 2, T=10 | 6.81 / 6.79 | 6.11 / 6.16 | −9.6% |
+  | d6n640q 128, partitions 1, T=10 | 68.91 / 69.18 | 67.95 / 66.81 | −2.4% |
+
+  - fix-a T=10 owner phases: prepare scaling 0.71 → 0.10 s, recover 0.80 → 0.11 s, residual scale 0.35 → 0.15 s.
+  - ising11 at 512 bits, T=4 (owner with partitions 2, and plain): bitwise identical. 505 solver lib tests pass.
+- Decision: kept. Audits carry over.
+
 ## 2026-10-15 — Owner pair solve: interior back-substitution on the pool (thermal-ore)
 
 - Observed (9e4708f, d6n640q owner): about 8.6 s of the 55.6 s `kkt update` was the constant/affine pair solve. After the border solve, its interior back-substitution x −= R·y ran one serial loop per local: 16.8k rows × 640 exact terms per column. The single-column solve already split those rows over the owner pool (`border_rows`).

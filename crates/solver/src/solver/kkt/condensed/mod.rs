@@ -2370,7 +2370,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     assign_ways(blocks, action_index(&action), workers);
                     let gemm = Some((pool.as_ref(), (*scaling_tiles).max(1)));
                     pool.install(|| {
-                        jobs.extend(scaling_jobs(blocks, workh, z, action, gemm));
+                        jobs.extend(scaling_jobs(blocks, scaling_lanes, workh, z, action, gemm));
                         crate::algebra::run_queue(jobs, workers);
                     });
                     true
