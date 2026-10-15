@@ -54,6 +54,10 @@ impl Exact {
     pub fn is_zero(&self) -> bool {
         unsafe { gmp::mpq_sgn(&self.raw) == 0 }
     }
+    /// Numerator plus denominator limbs, the size GMP products and gcds scale with.
+    pub fn limbs(&self) -> usize {
+        unsafe { gmp::mpz_size(&self.raw.num) + gmp::mpz_size(&self.raw.den) }
+    }
     pub fn bounded(&self) -> bool {
         unsafe {
             gmp::mpz_sizeinbase(&self.raw.num, 2) <= 2048

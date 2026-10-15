@@ -534,11 +534,18 @@ where
 
 // Prove dependence over exact input values, including RHS. Retained rows are
 // unchanged, so zero multipliers restore a valid dual in original coordinates.
-// Elimination is bounded by an operation budget (modular proof and rational
-// fallback separately) and the per-coefficient size guard (`Exact::bounded`);
-// past either, no row is removed.
+// Elimination is bounded by an operation budget (modular proof and
+// limb-weighted rational fallback separately) and the per-coefficient size
+// guard (`Exact::bounded`); past either, no row is removed.
 const MODULAR_BUDGET: usize = 400_000_000;
 const RATIONAL_BUDGET: usize = 40_000_000;
+/// Rational updates are charged in GMP limbs, `limbs(factor)·limbs(value) +
+/// limbs(entry)` (a division `limbs(factor)·limbs(value)`), since products and
+/// gcds grow with operand size; the budget above counts updates of one-limb
+/// numerators and denominators, which cost this many. Counting updates let
+/// LP_brandy's fill grow to 24 limbs per update and run 23 ms (80 of 220
+/// rows, then out of budget) against 3.3 ms for its iterations.
+const SMALL_UPDATE_LIMBS: usize = 6;
 /// Elimination updates allowed per unit of one IPM iteration's estimated
 /// work (stored coefficients and rows of `A`, plus `p^3` per PSD block for
 /// its scaling). The proof is an optional reduction: this keeps it within a
@@ -641,7 +648,7 @@ fn redundant_equalities_impl<T: FloatT>(
     }
     let mut basis: BTreeMap<usize, BTreeMap<usize, Exact>> = BTreeMap::new();
     let mut redundant = Vec::new();
-    let mut budget = work.min(RATIONAL_BUDGET);
+    let mut budget = work.min(RATIONAL_BUDGET).saturating_mul(SMALL_UPDATE_LIMBS);
     for (id, mut row) in ids.into_iter().zip(rows) {
         loop {
             let Some((&pivot, value)) = row.first_key_value() else {
@@ -649,10 +656,11 @@ fn redundant_equalities_impl<T: FloatT>(
                 break;
             };
             let factor = value.clone();
+            let limbs = factor.limbs();
             if let Some(previous) = basis.get(&pivot) {
-                budget = budget.checked_sub(previous.len())?;
                 for (&c, value) in previous {
                     let entry = row.entry(c).or_default();
+                    budget = budget.checked_sub(limbs * value.limbs() + entry.limbs())?;
                     entry.subtract_product(&factor, value);
                     if !entry.bounded() {
                         return None;
@@ -663,6 +671,7 @@ fn redundant_equalities_impl<T: FloatT>(
                 }
             } else {
                 for value in row.values_mut() {
+                    budget = budget.checked_sub(limbs * value.limbs())?;
                     value.divide(&factor);
                     if !value.bounded() {
                         return None;
