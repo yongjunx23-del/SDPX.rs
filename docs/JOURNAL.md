@@ -8,6 +8,43 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Cone-queue helpers stay while a cone posts (thermal-ore)
+
+- Observed (one_L12/128, 4 iterations, T=4, faer): the ORE S₀ inverse's LᵀL product (order 1806) takes 0.58 s per call in the solver but 0.33 s in an isolated 4-thread pool (3.15× over T=1).
+  - A queue log showed the ORE cone (numel 2709, 4 ways) at 1.08, 2.97, 1.66 and 1.92 s per phase.
+  - Helpers stop at the previous phase's slowest cone time. After the 1.08 s first phase, they left at 1.08 s while the cone was still posting, and it finished alone at 2.97 s. The next phase then waited 2.97 s and was helped throughout (1.66 s).
+- L-R1 probe first (single runs, s; same points): wider generic-gemm primes (`Plan` on 512-row chunks) and 64/128-column triangular tiles.
+
+  | Arm | Accelerate | faer |
+  |---|---|---|
+  | base | 17.09 / 16.82 | 19.26 |
+  | 512-row primes | 16.64 | 19.22 |
+  | 64-column tiles | 16.55 | 19.23 |
+  | both | 16.51 | |
+
+  Within run noise (≤2.6%); not pursued.
+- Hypothesis: helpers should stay while a cone keeps posting items, not until a fixed deadline.
+- Variants (ABBA against `284ca6f`, Mac, s):
+
+  | Case | base | 2× deadline | 2× + yield | help-extended + yield | help-extended + spin |
+  |---|---|---|---|---|---|
+  | one_L12 T=4 faer | 19.07–19.71 | 17.82 / 18.25 | 17.51 / 17.60 | 17.77 / 17.65 | 17.61 / 17.76 |
+  | one_L12 T=8 Accelerate | 15.83–16.46 | 15.67 / 16.09 | 15.04 / 15.11 | 15.12 / 15.18 | 15.38 / 15.43 |
+  | one_L12 T=16 Accelerate | 15.47–19.42 | | 14.62 / 14.94 | 14.65 / 14.53 | 16.02 / 16.06 |
+  | ising11 T=10 (mean of 6) | 1.772 | 1.771 | 1.774 | 1.784 (one 1.852 outlier) | 1.770 |
+  | ising11 T=16 | 1.886–1.902 | 1.943 | 1.932 | 1.879 | 1.879 |
+  | ising11 T=24 | 2.012–2.041 | 2.272 | 2.031 | 1.971 | 2.018 |
+
+  - A 2× deadline cost ising11 11% at T=24 on 10 cores. A probe counted 204 timeout exits over 55 phases, and phases ended with the slowest cone, so no stall was involved. The slowest cones ran 2.1× longer than at T=10 because spinning helpers took their time slices.
+- Change (`cones/parallel.rs`): each item a helper runs moves its deadline to now plus the last slowest cone. The deadlock bound is unchanged once posts stop. A helper with nothing to run yields its OS time slice instead of `spin_loop`.
+- E2E (help-extended + yield):
+  - one_L12 T=4 faer −8.1%, T=8 Accelerate −5.7%, T=16 Accelerate −7.8%.
+  - ising11 T=10 and T=16 neutral, T=24 −2.0%.
+  - two_L8 (8 it), two_L6/256 and fix-a owner neutral.
+  - Every point is bitwise identical: ising11 plain `17ec111261c7` (54 runs) and owner `d73ecddbd4e9`; two_L4/128 and /256 Solved 46/85; two_L6/256 Solved 105; fix-a owner Solved 25.
+  - 507 lib tests pass.
+- Decision: kept. The cluster check (64 threads, ising11 and Λ35-rs) waits for a deploy.
+
 ## 2026-10-15 — Exact diagonal congruence in 512-row blocks (thermal-ore)
 
 - Observed (d6n640q/128, 8 iterations, Mac): the owner border assembly C·D⁻¹·Cᵀ (640 × 16,780) takes 7.2 s of 11.3 s at T=10 and barely scales (8.7 s at T=1).

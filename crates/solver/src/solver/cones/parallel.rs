@@ -174,24 +174,32 @@ impl ConeThreading {
                     }
                     // Out of cones: help the running cones' posted items (SVD
                     // replays start late in a cone), else run the caller's
-                    // tail jobs, until all are scaled, but never past the
-                    // last phase's slowest cone: a thread that stole this
-                    // item while blocked inside a cone would otherwise wait
-                    // for that cone forever.
+                    // tail jobs, until all are scaled, but never longer than
+                    // the last phase's slowest cone past the start or the
+                    // last helped item: a thread that stole this item while
+                    // blocked inside a cone would otherwise wait for that
+                    // cone forever. A cone that keeps posting keeps its
+                    // helpers: a fixed deadline left the ORE cone of a slower
+                    // phase to run alone (one_L12/128, T=4: 1.66 s helped,
+                    // 2.97 s after its helpers left at 1.08 s).
+                    let mut deadline = start + wait;
                     loop {
                         if sdpx_arithmetic::inner_parallel::board::help() {
+                            deadline = deadline.max(std::time::Instant::now() + wait);
                             continue;
                         }
                         if tail.is_some_and(|tail| tail.run_one()) {
                             continue;
                         }
                         if done.load(std::sync::atomic::Ordering::Acquire) == total
-                            || start.elapsed() >= wait
+                            || std::time::Instant::now() >= deadline
                         {
                             break;
                         }
+                        // Yield the core when nothing is posted: a spinning
+                        // helper on an oversubscribed pool delays the cones.
                         if !(steal && matches!(rayon::yield_now(), Some(rayon::Yield::Executed))) {
-                            std::hint::spin_loop();
+                            std::thread::yield_now();
                         }
                     }
                     ok
