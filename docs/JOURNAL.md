@@ -8,6 +8,41 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Recursive LDL for wide exactly accumulated arrow leaves (thermal-ore)
+
+- Observed (7f2c493, one_L12/128, 4 iterations): `arrow.leaves` was the largest phase (21.3 s at T=1, 7.3–7.8 s at T=4 faer). The ORE-42 leaf (order 2709: the 903-row T block, then 1806 S₀⁻¹ rows behind an envelope cut) factored by per-entry exact dots, so no residue product ever ran inside the leaf. From order 256 at 256 bits and above, a blocked exact form (48-pivot panels) ran instead.
+- Change (`arrow.rs`):
+  - Exactly accumulated leaves from order 256 (`REC_FACTOR_MIN`) factor recursively (`ldl_rec`). An envelope cut nearest the middle splits the leaf into two independent factors, which run concurrently when the pool is split. Otherwise the leaf halves:
+    - W21 = A21·L11⁻ᵀ by a recursive triangular solve that starts each row at its envelope;
+    - L21 = W21·D1⁻¹;
+    - A22 −= L21·W21ᵀ as one exact symmetric product.
+  - Blocks up to 128 rows (`REC_BASE`) keep the exact-dot factor (`ldl_dots`, the old body moved, same arithmetic). Envelope zeros stay exact zeros.
+  - The blocked exact form is removed. In a dense-leaf bench (faer, 256–512 bits) the recursion beat it at every order tried, up to 2.6× at 4 threads (512 bits, order 512: 0.12 vs 0.24 s). At 128 bits, order 1806: 4.2 → 1.5 s serial, 1.2 → 0.6 s at 4 threads. From order 256 down to about 384 at 4 threads it is level with exact dots; a split base of 192 or 256 gave nothing.
+  - New unit test (128 bits, order 300, envelope cut at 110, ragged rows, mixed signs, clamped pivots): matches `factor_dots` to 1e-25, with the same regularization count and exact envelope zeros; serial and pool(8) are bitwise equal. 507 solver lib tests pass.
+- E2E (Mac, fast profile), ABBA, A = `7f2c493`. Each product rounds once per level, so leaves of order ≥256 at 128 bits change bits:
+
+  | Case | A s | B s | Change |
+  |---|---|---|---|
+  | one_L12/128 4 it, T=4, faer | 24.18 / 25.98 | 23.39 / 23.55 | −6.4% |
+  | one_L12/128 4 it, T=4, Accelerate | 22.18 / 22.22 | 19.47 / 18.91 | −13.6% |
+  | one_L12/128 4 it, T=1, faer | 50.50 / 56.68 | 42.30 / 43.99 | −19.5% |
+  | two_L8/128 8 it, T=4, Accelerate | 14.81 / 14.75 | 14.40 / 14.19 | −3.3% |
+  | syn20/128 full solve, T=4 | 14.22 | 14.34 | +0.8% |
+  | d6n640q 128, partitions 1, T=10 | 67.42 / 66.39 | 68.15 / 66.64 | +0.7% |
+  | fix-a 256, partitions 1, T=2 | 9.96 / 9.97 | 9.89 / 9.96 | −0.4% |
+
+  - The T=1 A run at 56.7 s overlapped a niced build; against the earlier same-binary runs (50.0 / 51.8 s) the change is −15.6%.
+  - Phases, T=4 Accelerate: `arrow.leaves` 8.8 → 5.6 s. T=4 faer: 8.2–8.9 → 6.2 s.
+  - Audits:
+    - syn20: Solved 50 in both arms. B's original-coordinate audit: primal 1.4e-24, dual 1.3e-25, gap 2.8e-24, the same as A's.
+    - d6n640q: Solved 48 in both arms. B's audit: primal_rel 1.1e-26, dual_rel 3.0e-23, gap_rel 1.2e-20, the same as A's.
+  - Bitwise identical: two_L4/128 and /256, two_L6/256, ising11 at 512 bits (owner partitions 2 and plain), fix-a 256. None of these has a leaf of order ≥256 at ≥256 bits, so the removed blocked form is covered by the bench only.
+- Rejected variant: Y = L⁻¹B by the same recursion (one exact product per level instead of one exact dot per entry). one_L12 T=4 Accelerate 21.59 / 21.30 vs 19.22 / 19.49 s (+10.3%); `arrow.leaves` 5.4 → 7.4 s. A column dump explains it:
+  - the plain halving ignored the leaf's envelope cut at 903;
+  - it multiplied the 93 all-zero border columns of the 348.
+  - Together that is 936 M exact multiply-adds against the row sweep's 520 M. Next: a cut-aware recursion over the coupled columns only.
+- Decision: kept.
+
 ## 2026-10-15 — RNS products skip exact-zero inner terms of triangular operands (thermal-ore)
 
 - Observed (1b7f812, one_L12/128, 4 iterations): `ore.schur_inverse` (L⁻¹ by recursive halves, then L⁻ᵀL⁻¹) took 16.3 s at T=1 and 7.5 s at T=4 (faer). Its residue products multiplied full inner ranges although one operand is triangular: about half of every inner sum was exact zero terms.

@@ -50,17 +50,17 @@ const SINGLE_LEAF_MIN: usize = 16;
 const SPLIT_FACTOR_MIN: usize = 32;
 /// Pivots per panel of the split leaf factor (one join per panel).
 const FACTOR_PANEL: usize = 8;
-/// Wide-type leaves from this order factor in exact blocked form
-/// ([`DenseLeaf::factor_exact`]) with panels of `EXACT_PANEL` pivots (the
-/// residue product needs an inner dimension of at least 24). Below it the
-/// pooled scalar panels win: from 96, Λ35's leaves (order ~120–200) and
-/// 170-row border slowed 64-thread iterations by 2.9% and raised RSS 1.7 GB.
-const EXACT_FACTOR_MIN: usize = 256;
-const EXACT_PANEL: usize = 48;
+/// Wide-type leaves from this order factor recursively
+/// ([`DenseLeaf::factor_rec`]); blocks up to `REC_BASE` take exact dots.
+/// Dense leaves, faer residue products (Mac): from 256 the recursion is
+/// 15–28% faster than exact dots serially and level at 4 threads; at 1806
+/// rows (128 bits) 4.2 → 1.5 s serial, 1.2 → 0.6 s at 4 threads. It also
+/// beat the earlier blocked exact form (48-pivot panels) at every order and
+/// precision tried (256–512 bits, up to 2.6× at 4 threads).
+const REC_FACTOR_MIN: usize = 256;
+const REC_BASE: usize = 128;
 /// Estimated workspace of one batch of exact leaf contributions.
 const BATCH_WORK_BYTES: usize = 4 << 30;
-/// Residue-product ways a split exact factor offers to idle workers.
-const EXACT_FACTOR_WAYS: usize = 8;
 /// Per-step factor tasks are small: split a leaf factor only with at least
 /// this many threads per leaf (at ~2 per leaf it measured slower), and the
 /// border factor only from this dimension.
@@ -99,6 +99,364 @@ fn find(parent: &mut [usize], mut i: usize) -> usize {
         i = parent[i];
     }
     i
+}
+
+/// Wide [`DenseLeaf`] LDLᵀ of the order-`n` block at `l` (leading dimension
+/// `ld`) in place, left-looking: entry (i, j) is one exact dot product of
+/// rows of L and W = L·D (rounded entrywise), rounded once, instead of j
+/// fused updates. Rows are packed row-major so both operands are contiguous,
+/// and dots start at the row envelope (`first`, local to the block; the
+/// skipped products are exact zeros, so values are unchanged). `split`:
+/// after each panel of `FACTOR_PANEL` pivots, the later rows take the
+/// panel's columns in parallel, one join per panel; every entry is the same
+/// dot, so the factor is bitwise the serial one. On success the lower
+/// triangle holds the unit lower L and `dinv` its D⁻¹; the strict upper
+/// triangle is untouched.
+#[allow(clippy::too_many_arguments)]
+fn ldl_dots<T: FloatT>(
+    l: &mut [T],
+    ld: usize,
+    n: usize,
+    first: &[usize],
+    sign: &(dyn Fn(usize) -> T + Sync),
+    reg: Option<(T, T)>,
+    regularize_count: &mut usize,
+    split: bool,
+    dinv: &mut [T],
+) -> Result<(), &'static str> {
+    use sdpx_arithmetic::inner_parallel as ip;
+    let row = |i: usize| i * (i + 1) / 2;
+    let mut r = vec![T::zero(); row(n)];
+    let mut w = vec![T::zero(); row(n)];
+    let mut d = vec![T::zero(); n];
+    let a = &*l;
+    // entry (i, j) from row i's first j entries and row j of W
+    let entry = |i: usize, j: usize, ri: &[T], wj: &[T], dinv: T| {
+        if first[i] > j {
+            return T::zero();
+        }
+        let lo = first[i].max(first[j]);
+        (a[i + j * ld] - T::dot_slices(&ri[lo..j], &wj[lo..j])) * dinv
+    };
+    let mut p = 0;
+    while p < n {
+        let pe = if split { (p + FACTOR_PANEL).min(n) } else { n };
+        for j in p..pe {
+            let fj = first[j];
+            let (rj, wj) = (&r[row(j) + fj..row(j) + j], &w[row(j) + fj..row(j) + j]);
+            let dj = a[j + j * ld] - T::dot_slices(rj, wj);
+            let dj = DenseLeaf::<T>::pivot(dj, sign(j), reg, regularize_count)?;
+            d[j] = dj;
+            dinv[j] = T::one() / dj;
+            let (wh, wt) = w.split_at_mut(row(j + 1));
+            let wj = &wh[row(j)..row(j) + j];
+            for i in j + 1..pe {
+                let v = entry(i, j, &r[row(i)..row(i) + i], wj, dinv[j]);
+                r[row(i) + j] = v;
+                wt[row(i) - row(j + 1) + j] = v * dj;
+            }
+        }
+        if pe < n {
+            let (_, mut rt) = r.split_at_mut(row(pe));
+            let (wh, mut wt) = w.split_at_mut(row(pe));
+            let mut rows = Vec::with_capacity(n - pe);
+            for i in pe..n {
+                let (ri, rrest) = rt.split_at_mut(i + 1);
+                let (wi, wrest) = wt.split_at_mut(i + 1);
+                rows.push((i, ri, wi));
+                (rt, wt) = (rrest, wrest);
+            }
+            let (dinv, d) = (&*dinv, &d);
+            let panel = |(i, ri, wi): &mut (usize, &mut [T], &mut [T])| {
+                for j in p..pe {
+                    let v = entry(*i, j, ri, &wh[row(j)..row(j) + j], dinv[j]);
+                    ri[j] = v;
+                    wi[j] = v * d[j];
+                }
+            };
+            // rows per task: one grain of dot work
+            let work = ip::weight(T::precision_bits() as usize) * ((pe - p) * pe) as u128;
+            let tile = (ip::grain() / work.max(1)).max(1) as usize;
+            rows.par_iter_mut().with_min_len(tile).for_each(panel);
+        }
+        p = pe;
+    }
+    for j in 0..n {
+        l[j + j * ld] = T::one();
+        for i in j + 1..n {
+            l[i + j * ld] = r[row(i) + j];
+        }
+    }
+    Ok(())
+}
+
+/// Recursive [`ldl_dots`] of the order-`n` block at `l` (leading dimension
+/// `ld`, row envelope `first` local to the block). A cut of the envelope
+/// (no row from `c` on reaches a column before `c`) leaves the coupling
+/// block an exact zero, so the two sides factor independently (concurrently
+/// when `ways > 1`); otherwise the block halves: W21 = A21·L11⁻ᵀ
+/// ([`solve_unit_lower_t`]), L21 = W21·D1⁻¹, and A22 −= L21·W21ᵀ as one
+/// exact product (each entry the exact sum rounded once, then subtracted).
+/// Envelope zeros stay exact zeros, so `first` remains the factor's
+/// envelope. Blocks up to `REC_BASE` take [`ldl_dots`]. `ways`: spare workers
+/// granted to the products and base factors.
+#[allow(clippy::too_many_arguments)]
+fn ldl_rec<T: FloatT>(
+    l: &mut [T],
+    ld: usize,
+    n: usize,
+    first: &[usize],
+    sign: &(dyn Fn(usize) -> T + Sync),
+    reg: Option<(T, T)>,
+    regularize_count: &mut usize,
+    ways: usize,
+    dinv: &mut [T],
+) -> Result<(), &'static str> {
+    if n <= REC_BASE {
+        return ldl_dots(l, ld, n, first, sign, reg, regularize_count, ways > 1, dinv);
+    }
+    // the cut nearest the middle, if any
+    let mut low = n;
+    let mut cut = None;
+    for c in (1..n).rev() {
+        low = low.min(first[c]);
+        if low >= c && cut.is_none_or(|k: usize| c.abs_diff(n / 2) < k.abs_diff(n / 2)) {
+            cut = Some(c);
+        }
+    }
+    if let Some(c) = cut {
+        let (left, right) = l.split_at_mut(c * ld);
+        let (d1, d2) = dinv.split_at_mut(c);
+        let tail: Vec<usize> = first[c..].iter().map(|&f| f - c).collect();
+        let sign2 = |k: usize| sign(c + k);
+        let mut count2 = 0;
+        let (r1, r2) = join_if(
+            ways > 1,
+            || {
+                ldl_rec(
+                    left,
+                    ld,
+                    c,
+                    &first[..c],
+                    sign,
+                    reg,
+                    regularize_count,
+                    ways,
+                    d1,
+                )
+            },
+            || {
+                ldl_rec(
+                    &mut right[c..],
+                    ld,
+                    n - c,
+                    &tail,
+                    &sign2,
+                    reg,
+                    &mut count2,
+                    ways,
+                    d2,
+                )
+            },
+        );
+        *regularize_count += count2;
+        return r1.and(r2);
+    }
+    let (n1, n2) = (n / 2, n - n / 2);
+    let (left, right) = l.split_at_mut(n1 * ld);
+    let (d1, d2) = dinv.split_at_mut(n1);
+    ldl_rec(
+        left,
+        ld,
+        n1,
+        &first[..n1],
+        sign,
+        reg,
+        regularize_count,
+        ways,
+        d1,
+    )?;
+    let l11: Vec<T> = (0..n1 * n1).map(|e| left[e % n1 + e / n1 * ld]).collect();
+    let low: Vec<usize> = first[n1..].iter().map(|&f| f.min(n1)).collect();
+    solve_unit_lower_t(n2, n1, &l11, n1, &mut left[n1..], ld, &low, ways);
+    // W21 before scaling; L21 = W21·D1⁻¹ in place
+    let mut w = vec![T::zero(); n2 * n1];
+    for j in 0..n1 {
+        for i in 0..n2 {
+            let v = &mut left[n1 + i + j * ld];
+            w[i + j * n2] = *v;
+            *v *= d1[j];
+        }
+    }
+    let l21 = &left[n1..];
+    // packed (a, b), a ≤ b, is the Schur term (b, a)
+    let mut packed = vec![T::zero(); n2 * (n2 + 1) / 2];
+    let upper = crate::algebra::with_split_hint(ways, || {
+        T::xgemm_upper_exact(
+            b'N',
+            b'T',
+            n2,
+            n2,
+            n1,
+            &w,
+            n2,
+            l21,
+            ld,
+            &mut packed,
+            None,
+            None,
+        )
+    });
+    if upper {
+        for a in 0..n2 {
+            for b in a..n2 {
+                right[n1 + b + a * ld] -= packed[b * (b + 1) / 2 + a];
+            }
+        }
+    } else {
+        let mut s = vec![T::zero(); n2 * n2];
+        exact_product(
+            (b'N', b'T'),
+            (n2, n2, n1),
+            (&w, n2),
+            (l21, ld),
+            &mut s,
+            ways,
+        );
+        for a in 0..n2 {
+            for b in a..n2 {
+                right[n1 + b + a * ld] -= s[a + b * n2];
+            }
+        }
+    }
+    let tail: Vec<usize> = first[n1..].iter().map(|&f| f.saturating_sub(n1)).collect();
+    let sign2 = |k: usize| sign(n1 + k);
+    ldl_rec(
+        &mut right[n1..],
+        ld,
+        n2,
+        &tail,
+        &sign2,
+        reg,
+        regularize_count,
+        ways,
+        d2,
+    )
+}
+
+/// X·Lᵀ = B for X (`m × n`, overwriting B with leading dimension `ldb`), L
+/// unit lower of order `n` (its diagonal is not read): recursive halves of L
+/// with one exact product update between them; up to `REC_BASE` columns,
+/// rows of B solve independently by exact dots from their first nonzero
+/// column (`low`, at most `n`: the skipped entries stay exact zeros).
+#[allow(clippy::too_many_arguments)]
+fn solve_unit_lower_t<T: FloatT>(
+    m: usize,
+    n: usize,
+    l: &[T],
+    ldl: usize,
+    b: &mut [T],
+    ldb: usize,
+    low: &[usize],
+    ways: usize,
+) {
+    use sdpx_arithmetic::inner_parallel as ip;
+    if n <= REC_BASE {
+        let lr: Vec<T> = (0..n * n).map(|e| l[e / n + e % n * ldl]).collect();
+        let mut rows: Vec<T> = (0..m * n).map(|e| b[e / n + e % n * ldb]).collect();
+        let solve = |(i, x): (usize, &mut [T])| {
+            for j in low[i]..n {
+                let lo = low[i];
+                x[j] -= T::dot_slices(&x[lo..j], &lr[j * n + lo..j * n + j]);
+            }
+        };
+        if ways > 1 {
+            // rows per task: one grain of dot work
+            let work = ip::weight(T::precision_bits() as usize) * (n * n / 2).max(1) as u128;
+            let tile = (ip::grain() / work).max(1) as usize;
+            rows.par_chunks_mut(n)
+                .enumerate()
+                .with_min_len(tile)
+                .for_each(solve);
+        } else {
+            rows.chunks_mut(n).enumerate().for_each(solve);
+        }
+        for (e, v) in rows.into_iter().enumerate() {
+            b[e / n + e % n * ldb] = v;
+        }
+        return;
+    }
+    let (n1, n2) = (n / 2, n - n / 2);
+    solve_unit_lower_t(
+        m,
+        n1,
+        l,
+        ldl,
+        b,
+        ldb,
+        &low.iter().map(|&f| f.min(n1)).collect::<Vec<_>>(),
+        ways,
+    );
+    let (b1, b2) = b.split_at_mut(n1 * ldb);
+    let mut p = vec![T::zero(); m * n2];
+    exact_product(
+        (b'N', b'T'),
+        (m, n2, n1),
+        (b1, ldb),
+        (&l[n1..], ldl),
+        &mut p,
+        ways,
+    );
+    for j in 0..n2 {
+        for i in 0..m {
+            b2[i + j * ldb] -= p[i + j * m];
+        }
+    }
+    let low2: Vec<usize> = low.iter().map(|&f| f.saturating_sub(n1)).collect();
+    solve_unit_lower_t(m, n2, &l[n1 + n1 * ldl..], ldl, b2, ldb, &low2, ways);
+}
+
+/// `c = op(a)·op(b)` (`m × n`, inner `k`): one exact sum rounded once per
+/// entry, with `ways` offered to the residue product.
+fn exact_product<T: FloatT>(
+    (ta, tb): (u8, u8),
+    (m, n, k): (usize, usize, usize),
+    (a, lda): (&[T], usize),
+    (b, ldb): (&[T], usize),
+    c: &mut [T],
+    ways: usize,
+) {
+    crate::algebra::with_split_hint(ways, || {
+        let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        T::xgemm(
+            ta,
+            tb,
+            mi,
+            ni,
+            ki,
+            T::one(),
+            a,
+            lda as i32,
+            b,
+            ldb as i32,
+            T::zero(),
+            c,
+            mi,
+        )
+    });
+}
+
+/// `rayon::join` when spare workers may take `b`.
+fn join_if<RA: Send, RB: Send>(
+    paired: bool,
+    a: impl FnOnce() -> RA + Send,
+    b: impl FnOnce() -> RB + Send,
+) -> (RA, RB) {
+    if paired {
+        rayon::join(a, b)
+    } else {
+        (a(), b())
+    }
 }
 
 /// Unpivoted dense LDLᵀ with the same per-pivot dynamic regularization
@@ -280,9 +638,9 @@ impl<T: FloatT> DenseLeaf<T> {
         Ok(())
     }
 
-    /// A leaf's [`Self::factor_signed`]: large wide-type leaves take the
-    /// exact blocked form. The border takes exact dots instead (mixed
-    /// Λ27/1024: the exact blocked form took 2.0 s instead of 0.58 s per
+    /// A leaf's [`Self::factor_signed`]: large wide-type leaves factor
+    /// recursively, the others by exact dots. The border takes exact dots
+    /// (mixed Λ27/1024: a blocked exact form took 2.0 s instead of 0.58 s per
     /// iteration for the scalar panels).
     fn factor_leaf(
         &mut self,
@@ -293,11 +651,10 @@ impl<T: FloatT> DenseLeaf<T> {
         split: bool,
     ) -> Result<(), &'static str> {
         self.envelope(a);
-        if T::precision_bits() >= 256 && self.n >= EXACT_FACTOR_MIN {
-            self.l.copy_from_slice(a);
-            return self.factor_exact(signs, reg, regularize_count, split);
-        }
         if T::precision_bits() > 64 {
+            if self.n >= REC_FACTOR_MIN {
+                return self.factor_rec(a, signs, reg, regularize_count, split);
+            }
             return self.factor_dots(a, signs, reg, regularize_count, split);
         }
         self.factor_signed(a, signs, reg, regularize_count, split)
@@ -313,12 +670,7 @@ impl<T: FloatT> DenseLeaf<T> {
 
     /// Left-looking [`Self::factor_signed`] for wide types: entry (i, j) is
     /// one exact dot product of rows of L and W = L·D (rounded entrywise),
-    /// rounded once, instead of j fused updates. Rows are packed row-major so
-    /// both operands are contiguous, and dots start at the row envelope
-    /// (`first`; the skipped products are exact zeros, so values are
-    /// unchanged). `split`: after each panel of `FACTOR_PANEL` pivots, the
-    /// later rows take the panel's columns in parallel, one join per panel;
-    /// every entry is the same dot, so the factor is bitwise the serial one.
+    /// rounded once, instead of j fused updates ([`ldl_dots`]).
     fn factor_dots(
         &mut self,
         a: &[T],
@@ -327,158 +679,58 @@ impl<T: FloatT> DenseLeaf<T> {
         regularize_count: &mut usize,
         split: bool,
     ) -> Result<(), &'static str> {
-        use sdpx_arithmetic::inner_parallel as ip;
         let n = self.n;
-        let row = |i: usize| i * (i + 1) / 2;
-        let mut r = vec![T::zero(); row(n)];
-        let mut w = vec![T::zero(); row(n)];
-        let mut d = vec![T::zero(); n];
-        let first = &self.first;
-        // entry (i, j) from row i's first j entries and row j of W
-        let entry = |i: usize, j: usize, ri: &[T], wj: &[T], dinv: T| {
-            if first[i] > j {
-                return T::zero();
-            }
-            let lo = first[i].max(first[j]);
-            (a[i + j * n] - T::dot_slices(&ri[lo..j], &wj[lo..j])) * dinv
-        };
-        let mut p = 0;
-        while p < n {
-            let pe = if split { (p + FACTOR_PANEL).min(n) } else { n };
-            for j in p..pe {
-                let s = T::from_i8(signs[if signs.len() == 1 { 0 } else { j }]).unwrap();
-                let fj = first[j];
-                let (rj, wj) = (&r[row(j) + fj..row(j) + j], &w[row(j) + fj..row(j) + j]);
-                let dj = a[j + j * n] - T::dot_slices(rj, wj);
-                let dj = Self::pivot(dj, s, reg, regularize_count)?;
-                d[j] = dj;
-                self.dinv[j] = T::one() / dj;
-                let (wh, wt) = w.split_at_mut(row(j + 1));
-                let wj = &wh[row(j)..row(j) + j];
-                for i in j + 1..pe {
-                    let v = entry(i, j, &r[row(i)..row(i) + i], wj, self.dinv[j]);
-                    r[row(i) + j] = v;
-                    wt[row(i) - row(j + 1) + j] = v * dj;
-                }
-            }
-            if pe < n {
-                let (_, mut rt) = r.split_at_mut(row(pe));
-                let (wh, mut wt) = w.split_at_mut(row(pe));
-                let mut rows = Vec::with_capacity(n - pe);
-                for i in pe..n {
-                    let (ri, rrest) = rt.split_at_mut(i + 1);
-                    let (wi, wrest) = wt.split_at_mut(i + 1);
-                    rows.push((i, ri, wi));
-                    (rt, wt) = (rrest, wrest);
-                }
-                let (dinv, d) = (&self.dinv, &d);
-                let panel = |(i, ri, wi): &mut (usize, &mut [T], &mut [T])| {
-                    for j in p..pe {
-                        let v = entry(*i, j, ri, &wh[row(j)..row(j) + j], dinv[j]);
-                        ri[j] = v;
-                        wi[j] = v * d[j];
-                    }
-                };
-                // rows per task: one grain of dot work
-                let work = ip::weight(T::precision_bits() as usize) * ((pe - p) * pe) as u128;
-                let tile = (ip::grain() / work.max(1)).max(1) as usize;
-                rows.par_iter_mut().with_min_len(tile).for_each(panel);
-            }
-            p = pe;
-        }
         self.l.copy_from_slice(a);
-        for j in 0..n {
-            self.l[j + j * n] = T::one();
-            for i in j + 1..n {
-                self.l[i + j * n] = r[row(i) + j];
-            }
-        }
-        Ok(())
+        let sign = |k: usize| T::from_i8(signs[if signs.len() == 1 { 0 } else { k }]).unwrap();
+        ldl_dots(
+            &mut self.l,
+            n,
+            n,
+            &self.first,
+            &sign,
+            reg,
+            regularize_count,
+            split,
+            &mut self.dinv,
+        )
     }
 
-    /// Blocked right-looking [`Self::factor_signed`] for wide types: each
-    /// panel of `EXACT_PANEL` pivots is factored as in
-    /// [`Self::factor_panels`], then the trailing update `A22 -= L21·D1·L21ᵀ`
-    /// is one exact residue product (every entry the exact panel sum rounded
-    /// once, then subtracted). Thread-invariant but not bitwise equal to the
-    /// scalar loop (one rounding per panel instead of per pivot). A panel
-    /// without an exact plan takes the scalar trailing update. `split`: the
-    /// pool has spare workers, so products and the subtraction use them.
-    fn factor_exact(
+    /// Recursive [`Self::factor_dots`] for wide leaves from `REC_FACTOR_MIN`:
+    /// [`ldl_rec`] makes the panel solve and the Schur update large exact
+    /// products, so residue operands are encoded once per large product
+    /// instead of every entry taking its own exact dot. Thread-invariant but
+    /// not bitwise equal to [`Self::factor_dots`] (one rounding per level).
+    /// `split`: the leaf may use the pool's spare workers.
+    fn factor_rec(
         &mut self,
+        a: &[T],
         signs: &[i8],
         reg: Option<(T, T)>,
         regularize_count: &mut usize,
         split: bool,
     ) -> Result<(), &'static str> {
         let n = self.n;
-        let mut d = vec![T::zero(); n];
-        let (mut w, mut q) = (Vec::new(), Vec::new());
-        let ways = if split { EXACT_FACTOR_WAYS } else { 1 };
-        let mut p = 0;
-        while p < n {
-            let pe = (p + EXACT_PANEL).min(n);
-            for k in p..pe {
-                let s = T::from_i8(signs[if signs.len() == 1 { 0 } else { k }]).unwrap();
-                let dk = Self::pivot(self.l[k + k * n], s, reg, regularize_count)?;
-                d[k] = dk;
-                self.dinv[k] = T::one() / dk;
-                self.l[k + k * n] = T::one();
-                for i in k + 1..n {
-                    self.l[i + k * n] *= self.dinv[k];
-                }
-                for j in k + 1..pe {
-                    let v = self.l[j + k * n] * dk;
-                    for i in j..n {
-                        self.l[i + j * n] = (-self.l[i + k * n]).mul_add(v, self.l[i + j * n]);
-                    }
-                }
-            }
-            if pe == n {
-                break;
-            }
-            let (m, nb) = (n - pe, pe - p);
-            w.resize(m * nb, T::zero());
-            for c in 0..nb {
-                for i in 0..m {
-                    w[i + c * m] = self.l[pe + i + (p + c) * n] * d[p + c];
-                }
-            }
-            q.resize(m * (m + 1) / 2, T::zero());
-            // Q[a, b] (a <= b, packed by column) = Σ_c W[a, c]·L21[b, c],
-            // the update of lower entry (pe + b, pe + a).
-            let exact = crate::algebra::with_split_hint(ways, || {
-                T::xgemm_upper_exact(
-                    b'N', b'T', m, m, nb, &w, m, &self.l[pe + p * n..], n, &mut q, None, None,
-                )
-            });
-            let (head, tail) = self.l.split_at_mut(pe * n);
-            let panel = &head[p * n..];
-            let d = &d[p..pe];
-            let update = |(a, column): (usize, &mut [T])| {
-                if exact {
-                    for b in a..m {
-                        column[pe + b] -= q[b * (b + 1) / 2 + a];
-                    }
-                } else {
-                    let j = pe + a;
-                    for (c, &dk) in d.iter().enumerate() {
-                        let pivot = &panel[c * n..(c + 1) * n];
-                        let v = pivot[j] * dk;
-                        for i in j..n {
-                            column[i] = (-pivot[i]).mul_add(v, column[i]);
-                        }
-                    }
-                }
-            };
-            if split {
-                tail.par_chunks_mut(n).enumerate().for_each(update);
-            } else {
-                tail.chunks_mut(n).enumerate().for_each(update);
-            }
-            p = pe;
-        }
-        Ok(())
+        self.l.copy_from_slice(a);
+        let sign = |k: usize| T::from_i8(signs[if signs.len() == 1 { 0 } else { k }]).unwrap();
+        let ways = if split {
+            rayon::current_num_threads()
+        } else {
+            1
+        };
+        let mut count = 0;
+        let ok = ldl_rec(
+            &mut self.l,
+            n,
+            n,
+            &self.first,
+            &sign,
+            reg,
+            &mut count,
+            ways,
+            &mut self.dinv,
+        );
+        *regularize_count += count;
+        ok
     }
 
     fn forward(&self, x: &mut [T]) {
@@ -3015,6 +3267,68 @@ mod tests {
         solver.solve(&k, &mut single, &mut rhs[..k.n].to_vec());
         assert_eq!(single, out[..k.n]);
         assert_eq!(single, out[k.n..]);
+    }
+    /// The recursive wide leaf factor matches `factor_dots` to rounding, keeps
+    /// the row envelope (a cut and ragged rows past it), and gives the same
+    /// bits serially and on a pool.
+    fn recursive_leaf_factor<T: FloatT>() {
+        let n = 300;
+        let signs: Vec<i8> = (0..n).map(|k| if k % 5 == 4 { -1 } else { 1 }).collect();
+        let first = |i: usize| match i {
+            0..110 => 0,
+            110..230 => 110,
+            _ => 110 + i % 13,
+        };
+        let mut a = vec![T::zero(); n * n];
+        for j in 0..n {
+            for i in (j..n).filter(|&i| j >= first(i)) {
+                let v = if i == j {
+                    f64::from(signs[i])
+                        * if i % 37 == 3 {
+                            1e-40
+                        } else {
+                            n as f64 + (i % 7) as f64
+                        }
+                } else {
+                    ((i * 29 + j * 13) % 17) as f64 / 17.0 - 0.5
+                };
+                a[i + j * n] = T::from_f64(v).unwrap();
+            }
+        }
+        let reg = Some((T::from_f64(1e-20).unwrap(), T::one()));
+        let (mut c0, mut c1, mut c2) = (0, 0, 0);
+        let mut dots = DenseLeaf::<T>::new(n, LEAF_BLOCK);
+        dots.envelope(&a);
+        dots.factor_dots(&a, &signs, reg, &mut c0, false).unwrap();
+        let mut serial = DenseLeaf::<T>::new(n, LEAF_BLOCK);
+        serial.factor_leaf(&a, &signs, reg, &mut c1, false).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        let mut split = DenseLeaf::<T>::new(n, LEAF_BLOCK);
+        pool.install(|| split.factor_leaf(&a, &signs, reg, &mut c2, true))
+            .unwrap();
+        assert!(c0 > 0);
+        assert_eq!((c0, c0), (c1, c2));
+        assert_eq!(serial.l, split.l);
+        assert_eq!(serial.dinv, split.dinv);
+        assert_ne!(serial.l, dots.l);
+        let close = |x: T, y: T| {
+            (x - y).abs().to_f64().unwrap() <= 1e-25 * y.abs().to_f64().unwrap().max(1.0)
+        };
+        for j in 0..n {
+            assert!(close(serial.dinv[j], dots.dinv[j]));
+            for i in j + 1..n {
+                let v = serial.l[i + j * n];
+                assert!(j >= first(i) || v.is_zero());
+                assert!(close(v, dots.l[i + j * n]), "({i}, {j})");
+            }
+        }
+    }
+    #[test]
+    fn recursive_leaf_factor_mpfr128() {
+        recursive_leaf_factor::<sdpx_arithmetic::Bits128>();
     }
     fn split_factor_parity<T: FloatT>() {
         let n = 80;
