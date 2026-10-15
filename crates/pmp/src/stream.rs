@@ -134,7 +134,9 @@ fn scan(path: &Path, emit: Emit<'_>) -> Result<Header> {
 /// A header scan supports any field order. The second pass feeds at most one
 /// matrix per worker plus the reader's current matrix. Output matches the
 /// in-memory API; errors join workers before removing this call's directory.
-/// Returns the number of converted blocks. With `resample`, blocks given as
+/// Returns the number of converted blocks and workers. `threads == 0` uses
+/// the available cores whose estimated memory, 8x the mean input block size
+/// each, fits in half the physical RAM. With `resample`, blocks given as
 /// explicit sample points and scalings (PyCFTBoot/SDPB.m XML) take the SDPB
 /// 3.1 points and bases of their recovered prefactor instead.
 pub fn convert_file<T: Scalar + FromStr>(
@@ -142,10 +144,17 @@ pub fn convert_file<T: Scalar + FromStr>(
     destination: impl AsRef<Path>,
     threads: usize,
     resample: bool,
-) -> Result<usize> {
-    require(threads > 0, "threads must be positive")?;
+) -> Result<(usize, usize)> {
     let (input, destination) = (input.as_ref(), destination.as_ref());
     let header = scan(input, None)?;
+    let workers = if threads > 0 {
+        threads
+    } else {
+        let per_worker = 8 * std::fs::metadata(input)?.len() / header.count.max(1) as u64;
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        cores.min((physical_memory() / 2 / per_worker.max(1)).max(1) as usize)
+    }
+    .min(header.count.max(1));
     write_output::<T>(
         &header.objective,
         header.normalization.as_deref(),
@@ -153,7 +162,6 @@ pub fn convert_file<T: Scalar + FromStr>(
         destination,
         resample,
         |prepared| {
-            let workers = threads.min(header.count);
             if workers == 1 {
                 let mut completed = Vec::with_capacity(header.count);
                 let mut emit = |matrix| {
@@ -240,5 +248,19 @@ pub fn convert_file<T: Scalar + FromStr>(
             })
         },
     )?;
-    Ok(header.count)
+    Ok((header.count, workers))
+}
+
+/// Physical RAM in bytes.
+fn physical_memory() -> u64 {
+    extern "C" {
+        fn sysconf(name: std::ffi::c_int) -> std::ffi::c_long;
+    }
+    #[cfg(target_os = "macos")]
+    const NAMES: [std::ffi::c_int; 2] = [200, 29]; // _SC_PHYS_PAGES, _SC_PAGESIZE
+    #[cfg(not(target_os = "macos"))]
+    const NAMES: [std::ffi::c_int; 2] = [85, 30];
+    // SAFETY: sysconf reads a system constant.
+    let [pages, size] = NAMES.map(|name| unsafe { sysconf(name) }.max(0) as u64);
+    pages * size
 }
