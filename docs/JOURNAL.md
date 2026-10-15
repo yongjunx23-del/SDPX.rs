@@ -8,6 +8,23 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — L-P1: dense rank minor gets the sparse pass's time (kept, thermal-ore)
+
+- Observed (d6n640q/128, owner, T=4, `sample`): setup is about 6 s of a 17.7 s 8-iteration run, and none of it is parallel. The JSON parse takes 2.5 s and the presolver 1.7 s. The presolver's rank proof stops the dense modular minor after 0.02 s, when its budget of 4·(nnz + m) = 43M updates runs out. It then builds BTreeMap rows (0.57 s) and runs the sparse modular pass (1.59 s), which runs out of budget too, so no row is removed.
+- Probe (Mac M4): with a 600M budget the dense minor proves full rank (640 rows) in 0.031 s. Per budget unit, a dense update costs 0.49 ns and a sparse update 37 ns.
+- Change (`presolver.rs`): the dense minor's budget is the sparse modular budget times `DENSE_PER_SPARSE_UPDATE = 64`, still capped at 2m³ and floored at 16M. So the minor never takes longer than the sparse pass that would follow it. The proof only ever removes rows, and none are removed either way, so solves are bitwise identical.
+- Coverage: only the d6n640 family changes path. With the old budget, fix-a (99 rows), ising11 (20), Λ19-xml (54) and csdr3 (42) already proved full rank in the dense minor. The thermal inputs and Λ27-s50c never reach it.
+- E2E (ABBA against `bfca5ef`, Mac, s, hashes identical):
+
+  | Case | A | B | Change |
+  |---|---|---|---|
+  | d6q owner 8 it, process wall | 16.53 / 17.17 | 16.29 / 15.24 | −6.4% |
+  | d6q plain 8 it, process wall | 17.28 / 17.52 | 15.69 / 15.70 | −9.8% |
+  | d6q owner full (Solved 48, 7e703396b7e2), process wall | 67.11 / 66.03 | 65.15 / 63.88 | −3.1% |
+  | same, solve time | 64.13 / 63.03 | 62.18 / 60.90 | −3.2% |
+
+- Decision: kept. 507 lib tests pass. Next setup items: the JSON decimal parse (serial) and the Ruiz row-norm pass, which puts all 640 dense rows in one 4096-row chunk.
+
 ## 2026-10-15 — ORE Hs product in row pieces; diagonal CRT fold rejected (thermal-ore)
 
 - Observed (one_L12/128, 4 iterations, T=4 faer, after the queue-helper change): `residual` takes 0.95 s at parallelism 1.1, and all of it is `residual.scale`. That phase is the ORE `hs_prod`, whose dense S₀⁻¹ product (order 1806, 3.3M multiply-adds, about 79 ms per call) ran on one thread. The combined shift calls it three times per iteration.

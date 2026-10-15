@@ -547,6 +547,11 @@ const RATIONAL_BUDGET: usize = 40_000_000;
 /// without presolve, while the large Float64 SDP gains from the 1317 rows it
 /// removes in 1.2 s of a 45-125 s solve.
 const WORK_PER_UNIT: usize = 4;
+/// Dense minor updates per sparse modular update of the same time. d6n640q
+/// (640 dense equality rows, Apple M4): 0.49 ns per dense update against
+/// 37 ns per sparse update plus 13 ns to build its rows. The work budget
+/// stopped the minor 0.02 s in; the sparse pass then ran 2.2 s and ran out.
+const DENSE_PER_SPARSE_UPDATE: usize = 64;
 
 fn redundant_equalities<T: FloatT>(
     A: &CscMatrix<T>,
@@ -692,9 +697,12 @@ fn short_equalities_full_rank<T: FloatT>(
     // A full minor takes about m³/2 modular updates; past twice that (a
     // dependent system), defer to the sparse modular/rational path unchanged.
     // The dense modular minor is cheap per update: keep its 16M floor (SOCP
-    // nb_L2_bessel proves its 123 rows in 5.6 ms) and bound larger systems
-    // by the work estimate.
-    let mut budget = (2 * m * m * m).max(16_000_000).min(work.max(16_000_000));
+    // nb_L2_bessel proves its 123 rows in 5.6 ms) and give larger systems
+    // the time of the sparse modular pass that would follow.
+    let sparse = work
+        .min(MODULAR_BUDGET)
+        .saturating_mul(DENSE_PER_SPARSE_UPDATE);
+    let mut budget = (2 * m * m * m).max(16_000_000).min(sparse.max(16_000_000));
     // Any nonsingular minor is a proof, so visit the columns in a fixed
     // stride order: blocks of columns sharing a row pattern are then sampled
     // early instead of exhausting the budget one block at a time.
