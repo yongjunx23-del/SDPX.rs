@@ -8,6 +8,17 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-16 — Performance plan: where the time goes (diagnosis, thermal-ore)
+
+A read-only review (eight subsystem maps, two adversarial critiques) behind the 2026-10-16 plan section. Sources are journal entries and receipts; shares marked stale predate task 16 or the thermal-ore kernels.
+
+- Goal status (64 threads): Λ27-s50c/768 2.87× SDPB (170 it, 130.5 s vs 375 s; the 3× stretch needs ≤125 s); L19-s50/768 1.85× (153.8 vs 285 s, Oct 9 data that predates L24–L82: the only row under 2×); Λ19/768 about 2.15× (no matched SDPB 3.1.0 reference); Λ19-rs 4.4×, Λ27-rs 4.67×, Λ35-rs/1024 4.45×, Λ35-s70-p1024 4.08×; ising11 has no reference at 768+ bits. Memory: Λ19/768 at 4 cores 1136 MiB PSS against SDPB 445 MiB, unmatched since. Float64 (t16b): wins 19/58 at 1 thread and 12/58 at 16; geo-mean SDPX/MOSEK at 1 thread LP 2.39, SDP 1.65, SOCP 1.35; at 16 threads 2.21 / 2.50 / 1.68.
+- Ising on the cluster (Λ35-rs/1024, after L50): about 90 thread-s per iteration at 52 of 64 cores busy; the solve pipeline is about 37 of them. Cycles: `__gmpn_mul_basecase` 27.2%, faer microkernels 20.7%, `pack_lhs` 6.8%, CRT `pack` 1.8%; idle stealing about 8%. Corrections per iteration: Λ19-xml 1.33, Λ27-s50 0.94, Λ35-rs 0.82, Λ27-rs 0.02, Λ19-rs 0, so outer corrections are mostly an xml-input cost. At 64 threads a kernel share converts poorly into wall (L56: a 2.4% memset share gave −0.2%), so cluster gains are bounded by critical-path phase wall.
+- Ising on the Mac (Λ19-xml/512 T=4, `prof.l19.cur.receipt.json`, 219 CPU-s): residual update 81 (cone SVD 51.7 thread-s inside it, plus 27.9 CPU-s of IPM residual products run as tail jobs in the same window), KKT update 78 (`cones_schur` 22.9), solve pipeline about 85 across both (prepare 45 ms, recover 59 ms, residual 101 ms per call; 314 residuals = 171 refined columns + 143 corrections). Per congruence about 880 µs: prime products 39%, CRT 25%, X encode 20%, A operand 14.5%.
+- Float64 (stale t10d receipts, 1 thread): setup is 26–68% of tiny-LP time and alone exceeds MOSEK's whole solve on bore3d, brandy, beaconfd, recipe, bandm, capri, sc205 and sc105; trsv + ir.solve 36–40% on agg, bnl1, sched_100_100_orig; the binary64 PSD corrector right-hand side 15.5% of arch0 and 14% of gpp124-1; QDLDL refactor 56–71% on the nb family and mcp250-1. hinf3, sched_100_50_orig and f64_large (and csdr3 at 16 threads) would be wins if Solved. 16/20 SDP, 13/16 SOCP and 12/18 LP cases are slower at 16 threads than at 1.
+- Missing: no x86 run of any thermal-ore commit (L-X1, L-X2, L-G6, L-F1, L-D1, the exact-dot border factor), no HEAD profile at 768 or 1024 bits, no Float64 scoreboard since Oct 9.
+- Dropped in review: the √2-split quadratic (two CRTs at about 3P bits against one at 4P: kernel net about +2.75%), pre-image step bounds through corrections and skipping the dead affine z congruence (≤1.7%), an 8-limb Karatsuba (GMP crossover 26 limbs on M1).
+
 ## 2026-10-16 — L-M1: two-chain row products for 5–12-limb mantissas on aarch64 (rejected, thermal-ore)
 
 - Observed (L-F1 sample, Λ19-xml-512 T=4): GMP's `addmul_1`/`mul_1`/`mul_basecase` take 22% of busy CPU. At 8 limbs `mpn_mul_n` runs one `addmul_1` per row, each a single carry chain.

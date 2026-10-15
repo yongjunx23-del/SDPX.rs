@@ -1,6 +1,6 @@
 # SDPX development plan
 
-Updated 2026-10-14. [AGENTS.md](AGENTS.md) defines working rules and numerical
+Updated 2026-10-16. [AGENTS.md](AGENTS.md) defines working rules and numerical
 contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 [Journal](docs/JOURNAL.md) holds full timings, job histories, source hashes,
 failed attempts and audit evidence. This file keeps goals, current state,
@@ -200,6 +200,24 @@ execution plans. The journal preserves all failed evidence and final decisions.
 
 ## Next work, in order
 
+### Performance plan (2026-10-16)
+
+Ranked by the Amdahl-bounded gain on the goal workloads per unit of effort (journal 2026-10-16 has the cost map and sources). Float64 is the goal furthest from done (wins 19/58 at 1 thread, 12/58 at 16), so its items come first. Kinds: B bitwise, O audited (rounding order), P policy (audit + journal + plan line), D diagnostic.
+
+- **Tier A (Mac-local, in this order):**
+  - A1 F64-SETUP/PRE-1 (B/P): split setup per stage on the sub-10 ms LPs, then charge the presolver's rational pass by operand limbs (brandy's pass is 35–85 ms of GMP gcd). Gate: brandy/bore3d Solved and audited; medium, ising11, csdr3 bitwise.
+  - A2 F64-FAIL (P): diagnose, then fix hinf3, sched_100_50_orig, f64_large and csdr3 (Float64); +3 wins at 1 thread, +4 at 16 at today's speed.
+  - A3 F64-TRSV-1 (B): fused multi-column QDLDL solve (agg −5.6%, bnl1 −5.5% bound).
+  - A4 F64-PSDCOR-1 (O): binary64 PSD corrector right-hand side via dsyevr and one GEMM over the nonzero columns (arch0 15.5%, gpp124-1 14% shares).
+  - A5 F64-PSDREF (D): solves per iteration, outer refinements and offending rows on gpp100, gpp124-1, qap6, theta1.
+  - A6 ITER-1 preparation (P): `sdpx-pmp2sdp` resamples by default (`--keep-samples` opts out), converter threads from cores within a memory cap.
+  - A7 KKT-1 (P): x-first outer corrections in a decision-equivalent form. Only if the scoreboard keeps xml inputs (about 0 on resampled inputs).
+  - A8 ARITH-K (B): 12/16-limb Karatsuba microbenchmark first; an E2E only at ≥10% per product under concurrent load.
+  - Measurements first: M10 (Float64 counts, setup split, failure traces), M1 (Λ19-xml/L27-s50c correction split), M2 (goal-width profiles: L19-rs/768, L27-s50c/768, L35-rs-1024), M4/M5 (scale-cones split timers, dqds counters), M3 (CRT digit histogram), M9 (kernel microbenchmarks).
+- **Tier B (cluster; deploys need the user's authority):** B0 frozen x86 deploy of thermal-ore with the Λ35-rs ABBA, scoreboard re-measure with audits (L19-s50/768 is the only row below 2×, 1.85× on Oct 9 data), SDPB 3.1.0 references (Λ19/768, ising11 at 768) and same-node peak PSS; B1 ITER-1 matched resampled scoreboard; B2 58-case Float64 scoreboard at HEAD and same-node abfam for A1–A4; B3 F64-THR (binary64 width from measured work, task 22); B4 x86 width limits for the lean kernels (ARITH-3) and an x86 12/16-limb product (ARITH-2); B5 CRT-1 top-down partial CRT, only if M3 and the x86 share bound it ≥2%; B6 goal-width confirmation and the cone bundle (CONE-1 exact-dot Cholesky, blocked R⁻¹, first Gram–Schmidt skip); B7 task 21 OWN-128/HI-T1; B8 RCPT-1; B9 faer under load (measurement).
+- **Tier C (break-even first):** SOLVE-1 recovery from an exactly rounded difference (pays below about 0.11 s/it extra on Λ35-rs); ITER-3 deep-first τ start with an online overshoot restart (rs/pf inputs); F64-ITER step-limit diagnosis; F64-AFF-1; CONE-3 dqds shifts; the MPFR PSD corrector pays when t_call < (ΔN/calls)·t_it (re-measure t_call at HEAD).
+- **Off-goal track (thermal-ore/gravity, after the goal items):** RES-1 column-streamed direct refinement residual, KKT-4 D-exponent-banded congruence primes, ORE-HS exact-dot `hs_prod`, ORE-AFF/ORE-SEC step searches, ARITH-4 short-dot fixed costs, ORE-LEAF, RES-4.
+
 1. **Resampled Ising inputs (task 17).**
    - Fix the default-start τ chase without regressing old inputs or gravity256.
    - Then compare Λ35-rs at 1024 bits with the retained no-shift/GMP changes.
@@ -385,6 +403,12 @@ in the journal; they do not override SDPX's numerical contracts.
 [AGENTS.md](AGENTS.md) governs numerical changes and approvals. Requested
 precision is fixed; other contract changes require measured, audited evidence.
 
+**Taken 2026-10-16 (delegated contract authority):**
+- Mac keeps under 5% stay the L-F1/L-D1 practice: a bitwise change is kept on Mac cycles provisionally and confirmed or limited on x86 in B0/B4. Mac keep metrics use goal-width inputs (L19-rs/768, L27-s50c/768, L35-rs-1024) besides Λ19-xml/512.
+- Task 17 item F is met: at the default start Λ19-rs takes 89 it, Λ27-rs 127 and Λ35-rs 347, all audited (limits 121/183/683). Item G (resampled conversion by default) proceeds as A6/B1.
+- Thermal-ore/gravity items rank after the goal items.
+- The MPFR PSD corrector reopens only when t_call < (ΔN/calls)·t_it at HEAD (replaces "about half the cost").
+
 **Open:**
 - **Mixed Lambda27/1024 explicit-gate pilot.** The frozen baseline binary, 32 cores, 64 GiB, 2 h, ≤100 iterations. Prepared and awaiting approval after two exhausted retries.
 - **Deferred until a concrete need:**
@@ -482,3 +506,9 @@ are in [the journal](docs/JOURNAL.md).
   restart dual to the chased ‖z‖ (L73), a deep τ start without a chase
   predictor (L74), a dual-residual polish (L77) and a fixed-τ phase on a
   settled-τ gap stall (L76).
+- 2026-10-15/16 (journal): L-M1 two-chain row products (inlined or not), Rust
+  Comba and row-wise 8-limb products, an 8-limb Karatsuba (GMP's Toom-22
+  crossover is 26 limbs on M1, 19 on Zen 2), L-C2, L-H1, L-R2a, L-G7, L-G8,
+  L-X3; the √2-split quadratic congruence (two CRTs at about 3P bits cost more
+  than the 25% fewer prime products save); pre-image step bounds through
+  corrections and skipping the dead affine z congruence (≤1.7%).
