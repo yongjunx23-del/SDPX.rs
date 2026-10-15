@@ -3,8 +3,9 @@
 //! Every finite `MpFloat<N>` is `M · 2^(e - P)` with an `N`-limb mantissa `M`,
 //! so a product of two values is the exact `2N`-limb integer `Ma · Mb` scaled by
 //! `2^(ea + eb - 2P)`. Aligning all products to the smallest such scale and
-//! summing them with GMP's `mpn` layer gives the dot product exactly; one
-//! `mpfr_set_z_2exp` then rounds it once, nearest-even, at the destination.
+//! summing their 64-bit limbs into 128-bit slots, with carries resolved once at
+//! the end, gives the dot product exactly; one `mpfr_set_z_2exp` then rounds it
+//! once, nearest-even, at the destination.
 //!
 //! This is the contract of the residue (RNS) path: exact accumulation, one
 //! rounding. The result is never less accurate than the FMA chain it replaces
@@ -31,8 +32,8 @@ pub(crate) const SCHOOLBOOK_N: usize = 4;
 #[derive(Default)]
 struct Scratch {
     terms: Vec<(usize, usize)>,
-    pos: Vec<u64>,
-    neg: Vec<u64>,
+    pos: Vec<u128>,
+    neg: Vec<u128>,
 }
 
 thread_local! {
@@ -225,7 +226,7 @@ pub(crate) fn dot_slices_chunked<'a, const N: usize>(
     };
     let parts = std::sync::Mutex::new(vec![None; chunks]);
     par_for(chunks, &|k| {
-        let (mut pos, mut neg) = (vec![0u64; len], vec![0u64; len]);
+        let (mut pos, mut neg) = (vec![0u128; len], vec![0u128; len]);
         let r = k * size..((k + 1) * size).min(a.len());
         let terms = a[r.clone()]
             .iter()
@@ -241,14 +242,10 @@ pub(crate) fn dot_slices_chunked<'a, const N: usize>(
         .map(|part| part.expect("chunk scheduler skipped accumulation"));
     let (mut pos, mut neg) = parts.next().unwrap();
     for (p, n) in parts {
-        // SAFETY: all accumulators hold `len` limbs; the total of all terms
-        // fits by the bound on `len`, so no carry leaves the top limb.
-        unsafe {
-            gmp::mpn_add_n(pos.as_mut_ptr(), pos.as_ptr(), p.as_ptr(), len as _);
-            gmp::mpn_add_n(neg.as_mut_ptr(), neg.as_ptr(), n.as_ptr(), len as _);
-        }
+        add_slots(&mut pos, &p);
+        add_slots(&mut neg, &n);
     }
-    round_acc(&mut pos, &mut neg, len, emin).unwrap_or_else(|| dot_slices(a, b, chain))
+    round_slots(&mut pos, &mut neg, emin).unwrap_or_else(|| dot_slices(a, b, chain))
 }
 
 fn acc_len<const N: usize>(emin: i64, emax: i64) -> Option<usize> {
@@ -257,8 +254,8 @@ fn acc_len<const N: usize>(emin: i64, emax: i64) -> Option<usize> {
 }
 
 fn accumulate<'a, const N: usize>(
-    pos: &mut Vec<u64>,
-    neg: &mut Vec<u64>,
+    pos: &mut Vec<u128>,
+    neg: &mut Vec<u128>,
     emin: i64,
     emax: i64,
     inline: bool,
@@ -270,13 +267,13 @@ fn accumulate<'a, const N: usize>(
         acc.resize(len, 0);
     }
     add_terms(pos, neg, emin, len, inline, terms);
-    round_acc(pos, neg, len, emin)
+    round_slots(pos, neg, emin)
 }
 
-/// Add every term's exact product into the `len`-limb accumulators.
+/// Add every term's exact product into the `len`-slot accumulators.
 fn add_terms<'a, const N: usize>(
-    pos: &mut [u64],
-    neg: &mut [u64],
+    pos: &mut [u128],
+    neg: &mut [u128],
     emin: i64,
     len: usize,
     inline: bool,
@@ -285,9 +282,9 @@ fn add_terms<'a, const N: usize>(
     debug_assert!(pos.len() >= len && neg.len() >= len);
     let accs = [pos.as_mut_ptr(), neg.as_mut_ptr()];
     // One product buffer per dot; every term overwrites its limbs.
-    let mut scratch = [0u64; 2 * MAX_N + 1];
+    let mut scratch = [0u64; 2 * MAX_N];
     for term in terms {
-        // SAFETY: both accumulators hold `len` limbs and are distinct.
+        // SAFETY: both accumulators hold `len` slots and are distinct.
         unsafe { add_term::<N>(accs, emin, len, inline, term, &mut scratch) };
     }
 }
@@ -296,46 +293,94 @@ fn add_terms<'a, const N: usize>(
 /// `accs[1]` (negative), by the product's sign.
 ///
 /// # Safety
-/// Both pointers address distinct accumulators of `len` limbs whose bit 0
+/// Both pointers address distinct accumulators of `len` slots whose bit 0
 /// weighs 2^(emin - 2P), with `len` from [`acc_len`] over a range holding
 /// this term's exponent sum.
 #[inline(always)]
 unsafe fn add_term<const N: usize>(
-    accs: [*mut u64; 2],
+    accs: [*mut u128; 2],
     emin: i64,
     len: usize,
     inline: bool,
     (a, b): Pair<'_, N>,
-    scratch: &mut [u64; 2 * MAX_N + 1],
+    scratch: &mut [u64; 2 * MAX_N],
 ) {
     let offset = (a.exponent as i64 + b.exponent as i64 - emin) as usize;
     // The accumulator is picked by the product's sign bit, not a branch:
     // signs of consecutive terms are data-dependent and mispredict.
     let negative = ((a.kind < 0) != (b.kind < 0)) as usize;
     let (limb, shift) = (offset / 64, (offset % 64) as u32);
+    debug_assert!(limb + 2 * N < len);
+    // SAFETY: `limb < len`; the bound on `len` covers the shifted product.
+    let dst = accs[negative].add(limb);
     if inline && N <= INLINE_N {
-        // SAFETY: `limb < len`; the bound on `len` covers the shifted product
-        // and its carry.
-        let target = std::slice::from_raw_parts_mut(accs[negative].add(limb), len - limb);
-        add_shifted_product::<N>(target, &a.limbs, &b.limbs, shift, scratch);
+        // A local product buffer stays in registers.
+        let mut prod = [0u64; 2 * INLINE_N];
+        mul_limbs::<N>(&a.limbs, &b.limbs, &mut prod[..2 * N]);
+        add_shifted(dst, &prod[..2 * N], shift);
         return;
     }
-    // SAFETY: `scratch` holds 2N+1 <= 2*MAX_N+1 limbs; `target[limb..len]`
-    // covers the shifted product and its carry by the bound on `len`.
-    // In-place mpn operands are identical, which GMP permits.
-    let prod = scratch.as_mut_ptr();
-    mpn_mul_n::<N>(prod, a.limbs.as_ptr(), b.limbs.as_ptr());
-    let width = if shift == 0 {
-        2 * N
-    } else {
-        *prod.add(2 * N) = gmp::mpn_lshift(prod, prod, (2 * N) as _, shift);
-        2 * N + 1
-    };
-    let dst = accs[negative].add(limb);
-    if gmp::mpn_add_n(dst, dst, prod, width as _) != 0 {
-        let rest = dst.add(width);
-        gmp::mpn_add_1(rest, rest, (len - limb - width) as _, 1);
+    // SAFETY: `scratch` holds 2N <= 2*MAX_N limbs and does not overlap the
+    // inputs.
+    mpn_mul_n::<N>(scratch.as_mut_ptr(), a.limbs.as_ptr(), b.limbs.as_ptr());
+    add_shifted(dst, &scratch[..2 * N], shift);
+}
+
+/// `dst[0..=n] += limbs << shift` for `n` limbs and `shift < 64`, one 64-bit
+/// piece per 128-bit slot: no carry chain, so consecutive terms overlap.
+/// A slot absorbs 2^64 pieces before it could overflow.
+///
+/// # Safety
+/// `dst` addresses `limbs.len() + 1` slots.
+#[inline(always)]
+unsafe fn add_shifted(dst: *mut u128, limbs: &[u64], shift: u32) {
+    // `(x >> 1) >> (63 - shift)` is `x >> (64 - shift)`, and 0 at shift 0.
+    let mut below = 0u64;
+    for (t, &l) in limbs.iter().enumerate() {
+        *dst.add(t) += ((l << shift) | ((below >> 1) >> (63 - shift))) as u128;
+        below = l;
     }
+    *dst.add(limbs.len()) += ((below >> 1) >> (63 - shift)) as u128;
+}
+
+/// `acc += other`, slot by slot. Each slot stays below 2^128: it sums at most
+/// one 64-bit piece per term.
+fn add_slots(acc: &mut [u128], other: &[u128]) {
+    for (x, &y) in acc.iter_mut().zip(other) {
+        *x += y;
+    }
+}
+
+/// Resolve the carries of `slots` into its exact little-endian 64-bit limbs,
+/// written in place over the first `slots.len()` limbs of the same memory.
+fn fold_slots(slots: &mut [u128]) -> &mut [u64] {
+    let len = slots.len();
+    let (src, limbs) = (slots.as_mut_ptr(), slots.as_mut_ptr() as *mut u64);
+    let mut carry = 0u128;
+    for t in 0..len {
+        // SAFETY: slot t is read before limb t is written; limb t occupies
+        // bytes [8t, 8t + 8) of slot t/2 <= t, which was read already.
+        unsafe {
+            let x = src.add(t).read() + carry;
+            limbs.add(t).write(x as u64);
+            carry = x >> 64;
+        }
+    }
+    // The bound on the accumulator length keeps the total inside it.
+    debug_assert_eq!(carry, 0);
+    // SAFETY: the `len` limbs lie inside the slots' storage and were written.
+    unsafe { std::slice::from_raw_parts_mut(limbs, len) }
+}
+
+/// [`round_acc`] of `pos - neg` held in slots of equal length.
+fn round_slots<const N: usize>(
+    pos: &mut [u128],
+    neg: &mut [u128],
+    emin: i64,
+) -> Option<MpFloat<N>> {
+    let len = pos.len();
+    debug_assert_eq!(neg.len(), len);
+    round_acc(fold_slots(pos), fold_slots(neg), len, emin)
 }
 
 /// Exact sums of `outputs` dot products whose terms `terms(c)` yields as
@@ -408,14 +453,14 @@ where
     }
     let parts = std::sync::Mutex::new(vec![None; chunks]);
     par_for(chunks, &|c| {
-        let (mut pos, mut neg) = (vec![0u64; total], vec![0u64; total]);
-        let mut scratch = [0u64; 2 * MAX_N + 1];
+        let (mut pos, mut neg) = (vec![0u128; total], vec![0u128; total]);
+        let mut scratch = [0u64; 2 * MAX_N];
         for (k, x, y) in terms(c) {
             let (s, len, emin) = slots[k];
             if len == 0 || !(regular(x.kind) && regular(y.kind)) {
                 continue;
             }
-            // SAFETY: output k owns `len` limbs at `s` in both accumulators,
+            // SAFETY: output k owns `len` slots at `s` in both accumulators,
             // sized by `acc_len` over every chunk's exponent sums.
             unsafe {
                 let accs = [pos.as_mut_ptr().add(s), neg.as_mut_ptr().add(s)];
@@ -431,17 +476,13 @@ where
         .map(|part| part.expect("chunk scheduler skipped accumulation"));
     let (mut pos, mut neg) = parts.next().unwrap();
     for (p, n) in parts {
-        // SAFETY: all accumulators hold `total` limbs. Each output's total
-        // fits its own limbs by the bound on its length, so no carry crosses
-        // into the next output.
-        unsafe {
-            gmp::mpn_add_n(pos.as_mut_ptr(), pos.as_ptr(), p.as_ptr(), total as _);
-            gmp::mpn_add_n(neg.as_mut_ptr(), neg.as_ptr(), n.as_ptr(), total as _);
-        }
+        // Slots carry nothing into the next output's slots.
+        add_slots(&mut pos, &p);
+        add_slots(&mut neg, &n);
     }
     for (k, &(s, len, emin)) in slots.iter().enumerate() {
         if len > 0 {
-            out[k] = round_acc(&mut pos[s..s + len], &mut neg[s..s + len], len, emin);
+            out[k] = round_slots(&mut pos[s..s + len], &mut neg[s..s + len], emin);
         }
     }
     out
@@ -543,54 +584,6 @@ pub(crate) fn with_limbs<const N: usize, R>(f: impl FnOnce(&mut [u64]) -> R) -> 
         f(&mut [0u64; 34])
     } else {
         f(&mut [0u64; 2 * MAX_N + 2])
-    }
-}
-
-/// `dst += (a * b) << shift` for `N`-limb mantissas, `shift < 64`, with the
-/// carry propagated through `dst`. Schoolbook product and shifted add are
-/// inlined for the const width: the exact integer result of GMP's
-/// `mpn_mul_n` + `mpn_lshift` + `mpn_add_n` without three calls per term.
-#[inline(always)]
-fn add_shifted_product<const N: usize>(
-    dst: &mut [u64],
-    a: &[u64; N],
-    b: &[u64; N],
-    shift: u32,
-    prod: &mut [u64],
-) {
-    {
-        let prod = &mut prod[..2 * N];
-        mul_limbs::<N>(a, b, prod);
-        let mut carry = false;
-        let mut add = |slot: &mut u64, v: u64| {
-            let (s, c1) = slot.overflowing_add(v);
-            let (s, c2) = s.overflowing_add(carry as u64);
-            *slot = s;
-            carry = c1 | c2;
-        };
-        let width = if shift == 0 {
-            for t in 0..2 * N {
-                add(&mut dst[t], prod[t]);
-            }
-            2 * N
-        } else {
-            add(&mut dst[0], prod[0] << shift);
-            for t in 1..2 * N {
-                add(
-                    &mut dst[t],
-                    (prod[t] << shift) | (prod[t - 1] >> (64 - shift)),
-                );
-            }
-            add(&mut dst[2 * N], prod[2 * N - 1] >> (64 - shift));
-            2 * N + 1
-        };
-        let mut t = width;
-        while carry {
-            let (s, c) = dst[t].overflowing_add(1);
-            dst[t] = s;
-            carry = c;
-            t += 1;
-        }
     }
 }
 

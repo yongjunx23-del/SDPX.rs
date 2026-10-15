@@ -8,6 +8,34 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — L-X1: exact dot products accumulate in carry-free 128-bit slots (kept, thermal-ore)
+
+- Observed (d6n640q/128, owner, T=4, `sample` of the solve): exact-dot kernels take about 30% of busy CPU. `dot_outputs_chunked` from the sparse products has 3003 samples. `exactdot::dot` from `dot_fma` has about 3400: `wide_output` 1739, `solve_reduced_panel` 1152, `solve_reduced_raw` 576. Each term added its shifted 2N-limb product to a u64 accumulator with a carry chain: a carry-flag dependency through every limb and a data-dependent carry loop. At 512 bits it made three GMP calls (`mul_n`, `lshift`, `add_n`).
+- Hypothesis: a 128-bit slot per 64-bit limb absorbs 2^64 pieces without overflow. Then each term adds independent pieces with no carry chain, and the carries resolve once per dot.
+- Change (`crates/arithmetic/src/exactdot.rs`):
+  - The accumulators hold `u128` slots. `add_shifted` adds limb t of the shifted product into slot t. `(x >> 1) >> (63 - shift)` gives the spill-over piece for every shift, including 0, without a branch.
+  - The inline kernel (N ≤ 4) multiplies into a local buffer. The GMP kernel (N > 4) calls `mpn_mul_n` only, with no `lshift` or `add_n`.
+  - `fold_slots` turns slots back into limbs in place, once per dot. Chunk partial sums merge slot by slot. Rounding (`round_acc`) is unchanged.
+  - The exact integer is the same, so every result is bitwise identical.
+- Microbench (same process, ns per term, against a reconstruction of the u64 kernel): N=1 2.66 vs 2.51 (+6%), N=2 3.11 vs 3.57 (−13%), N=3 −8%, N=4 −11%. Against the production kernel at N=2: 7.85 → 6.37 (−19%). Two or four interleaved slot banks did not help at N ≥ 2.
+- E2E (ABBA against `f8ee8f4`, Mac, solve s; every point identical):
+
+  | Case | A | B | Change |
+  |---|---|---|---|
+  | d6q owner 8 it (a50df3c3265d) | 11.77 / 12.21 | 11.39 / 11.61 | −4.1% |
+  | d6q plain 8 it (5772c472b62f) | 12.91 / 13.41 | 12.57 / 12.76 | −3.8% |
+  | fix-a 256 owner (Solved 25) | 6.82 / 6.87 / 7.02 / 7.13 | 6.68 / 6.69 / 6.95 / 6.98 | −1.9% |
+  | fix-a 256 plain (Solved 25) | 5.33 / 5.59 / 5.39 / 5.33 | 5.21 / 5.23 / 5.21 / 5.24 | −3.4% |
+  | csdr3 256 (Solved 36) | 3.51 / 3.29 | 3.45 / 3.43 | +1% (noise) |
+  | two_L8/128 8 it | 13.30 / 12.25 | 12.15 / 11.89 | −5.9% |
+  | two_L6/256 (Solved 105) | 2.87 / 3.35 | 3.13 / 2.98 | −1.7% (noisy) |
+  | syn20/128 (Solved 50) | 14.53 / 15.24 | 13.63 / 13.96 | −7.3% |
+  | ising11/512 T=4, 2 rounds (Solved 54) | 2.42 / 2.43 / 2.43 / 2.47 | 2.38 / 2.41 / 2.42 / 2.41 | −1.2% |
+  | ising11/512 T=10, 2 rounds | 1.86 / 1.90 / 1.87 / 1.85 | 1.81 / 1.85 / 1.82 / 1.87 | −1.8% |
+
+  two_L4/128 and two_L4/256 are Solved and identical (46 and 85 it). 38 arithmetic tests (integer oracle at every precision; inline and GMP kernels agree), 508 solver lib tests and the JSON/CLI integration tests pass.
+- Decision: kept. The gain is ≥2% on the gravity, thermal and SOC inputs, and ising11 does not regress. Not yet measured on x86: the u128 adds compile to `add`/`adc` pairs there too, but this needs a cluster deploy.
+
 ## 2026-10-15 — L-P4: MPI ranks agree on a binary input hash; L-P3 Ruiz row ranges rejected (thermal-ore)
 
 - L-P4, observed: with more than one MPI rank, the CLI checks that all ranks read the same input. Every rank serialized the whole parsed problem to JSON into a SHA-256, which turns each MPFR value into decimal text. A timing probe on the Mac (same binary, d6n640q/128, T=4) measured 5.63 s for this. fix-a/256 took 1.34 s.
