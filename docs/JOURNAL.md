@@ -19,6 +19,29 @@ A read-only review (eight subsystem maps, two adversarial critiques) behind the 
 - Missing: no x86 run of any thermal-ore commit (L-X1, L-X2, L-G6, L-F1, L-D1, the exact-dot border factor), no HEAD profile at 768 or 1024 bits, no Float64 scoreboard since Oct 9.
 - Dropped in review: the √2-split quadratic (two CRTs at about 3P bits against one at 4P: kernel net about +2.75%), pre-image step bounds through corrections and skipping the dead affine z congruence (≤1.7%), an 8-limb Karatsuba (GMP crossover 26 limbs on M1).
 
+## 2026-10-16 — F64-PSDREF: refinement load on gpp100, gpp124-1, qap6, theta1 (diagnosis; F64-AFF-1 rejected, thermal-ore)
+
+- Observed (agent A5, fast, Mac T=1, `2709067`; evidence `~/.cache/sdpx-e2e/a5/`): all four Solved and audited at 23/22/22/9 iterations.
+
+  | | gpp100 | gpp124-1 | qap6 | theta1 |
+  |---|---|---|---|---|
+  | Refined columns per iteration | 4.4 | 4.6 | 4.2 | 3.8 |
+  | Outer corrections per iteration | 9.8 | 7.1 | 5.6 | 2.4 |
+  | Linear solves per iteration | 27.6 | 20.4 | 21.1 | 13.1 |
+  | Outer refinement share | 30% | 23% | 21% | 20% |
+  | Inner refinement share | 8% | 5% | 11% | 16% |
+  | Factorization share | 6% | 7% | 28% | 12% |
+  | Step-length eigmin share | 19% | 24% | 8% | 13% |
+  | Cone scaling share | 12% | 13% | 5% | 11% |
+
+  On gpp100, 97 of its 226 corrections are GMRES-continuation steps (about 11% of the solve); they never reach the tolerance.
+- Rows (L49 method plus a trace-only floor eps·|R|⁴|Z| for ordinary PSD blocks, `diag-floor-trace.patch`):
+  - Early: x rows carry the z-recovery error (eps·cond(H) through Aᵀ). One correction is required and productive.
+  - Late: first solves miss by 1e5–1e6×. After one correction the z rows sit at the binary64 floor of H·z = R(RᵀZR)Rᵀ (30–41 columns per case), so the 1e-12 tolerance is unreachable and each late column ends with one non-productive correction (58/57/66/9 in total). Static regularization is not the limiter.
+- Bounds: a more accurate raw solve ≤8–10% at unchanged acceptance (M effort). A binary64 PSD floor stop: gross 2.3–4.6%, net about 0 after its 4k³ test. Neither is taken now.
+- F64-AFF-1 (affine column unrefined in binary64, `f64-aff1.patch`): instructions gpp100 −12.6% and theta1 −5.8%, but gpp124-1 takes +1 iteration (+6.3%) and qap6 ends AlmostSolved at 35 iterations (r_d 1.5e-5). Rejected.
+- Next: the larger binary64 PSD shares at T=1 are outside refinement (step-length eigmin and cone scaling). Whether the GMRES continuation should run where it cannot reach the tolerance is an open scope question (acceptance tolerances stay fixed).
+
 ## 2026-10-16 — F64-FAIL-1: sched_100_50_orig and hinf3 diagnosis (no change, thermal-ore)
 
 - Hypothesis: sched_100_50_orig stalls at an augmented end-game floor, and the audit's r_p 6.8e-6 against the solver's pres 1.8e-9 comes from scaling.
