@@ -8,6 +8,49 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-16 — L-M1: two-chain row products for 5–12-limb mantissas on aarch64 (rejected, thermal-ore)
+
+- Observed (L-F1 sample, Λ19-xml-512 T=4): GMP's `addmul_1`/`mul_1`/`mul_basecase` take 22% of busy CPU. At 8 limbs `mpn_mul_n` runs one `addmul_1` per row, each a single carry chain.
+- Change (`exactdot.rs`): `mul_rows`, an unrolled schoolbook for N ≤ 12 on aarch64. Each row forms its N 128-bit products first, then adds their low and high halves in two separate carry chains. `mpn_mul_n` used it for every product above 4 limbs (`MpFloat` products, FMA, exact dots). It passed a test against GMP's `mpn_mul_n` (N = 1…12, all-ones operands) and the arithmetic suite.
+- Microbench (M4, ns per product against `mpn_mul_n`): 8 limbs 22.2 → 12.7, 10 limbs 29.6 → 19.4, 12 limbs 42.9 → 35.3. At 16 limbs it took 88 → 150 (spills), so 16 limbs stayed on GMP.
+- E2E (ABBA 4+4, Mac, fast profile, A `sdpx-cur` = `c8417f3`; every point identical, y included):
+
+  | Case | B arm | Wall | Cycles | Instructions |
+  |---|---|---|---|---|
+  | ising11 512 T=1 | `sdpx-m1` (inlined) | −2.0% | −1.8% | −18.7% |
+  | Λ19-xml-512 T=4 | `sdpx-m1` (inlined) | +2.7% | +1.3% | −11.3% |
+  | ising11 512 T=1 | `sdpx-m1n` (`inline(never)`) | +3.5% | +3.1% | −16.6% |
+  | Λ19-xml-512 T=4 | `sdpx-m1n` | +2.4% | +3.2% | −10.7% |
+
+- Why it did not pay: instructions fall 11–19% but cycles do not, and the non-inlined variant is slower still, so code size is not the cause. Hypothesis: the products are limited by multiplier throughput, which two chains do not change (the same N² `mul`/`umulh` pairs as GMP). The microbench gain does not carry over to the solver's mixed code.
+- Decision: rejected; tree restored. Patches `~/.cache/sdpx-e2e/patches/lm1-mul-rows.patch` and `lm1n-mul-rows-noinline.patch`. The staged 16-limb Karatsuba over three `mul_rows::<8>` (`lm1b-kara16-staged.rs`, microbench 60.6 vs about 85 ns) stays unapplied. It would need its own 1024-bit E2E, and an x86 version for the cluster goal.
+
+## 2026-10-15 — L-R2a: product-ready f64 residue cache (rejected, thermal-ore)
+
+- Hypothesis: if the constant operand's residues are stored as product-ready `f64`, `Operand::group` can borrow them on a cache hit, with no unpack of the 24-bit store and no copy.
+- Change: a `CachedResidues::Full(Vec<f64>)` variant, filled at rebuild and borrowed by `Operand::group`.
+- E2E (Λ19-xml-512 T=4, A `sdpx-cur`, B `sdpx-r2a`, 2+2; identical points):
+
+  | | A | B | Change |
+  |---|---|---|---|
+  | Wall (median) | 58.41 s | 64.21 s | +9.9% |
+  | Cycles | 800.3G | 837.6G | +4.7% |
+  | Instructions | 3568.3G | 3511.2G | −1.6% |
+  | Max RSS | 622 MiB | 824 MiB | +32% |
+
+  A fifth run was stopped once the direction was clear. ising11 512 T=1 (1+1): cycles −1.3%.
+- Hypothesis for the loss: an `f64` residue is 8 bytes against 3, so every hit streams 2.7× the memory. The unpack it removes costs less than that bandwidth.
+- Decision: rejected. Patch `~/.cache/sdpx-e2e/patches/lr2a-full-cache-rejected.patch`.
+
+## 2026-10-15 — L-H1: residue-cache fingerprint in parallel lanes (rejected, thermal-ore)
+
+- Observed (Λ19-xml-512 T=4 receipt, `sdpx-cur`): `rns.cache.hit` runs 71087 times and takes 3.14 s summed wall (median 48 µs). It computes the 64-bit `fingerprint` of every stored entry, in one multiply chain over every word.
+- Change: one multiply chain per word position (kind, exponent, each limb), walked by column and mixed at the end.
+- Receipt (`sdpx-fp1`): `rns.cache.hit` 3.14 → 0.55 s (median 48 → 7.4 µs).
+- E2E (A `sdpx-cur`, B `sdpx-fp1`, 4+4 each; identical points): Λ19-xml-512 T=4 wall median 58.77 → 60.60 s (+3.1%, noise), cycles 804.7 → 807.3G (+0.3%), instructions flat. ising11 512 T=1 7.86 → 7.89 s, cycles +0.3%.
+- Why it did not pay: 2.6 s of summed hit time is about 1% of Λ19's busy CPU. That is under the 2% bar and inside the run-to-run cycle spread.
+- Decision: rejected. Patch `~/.cache/sdpx-e2e/patches/lh1-fingerprint-lanes-rejected.patch`.
+
 ## 2026-10-15 — L-C2: CRT digit pack through a 128-bit window (refuted, thermal-ore)
 
 - Observed (Λ19-xml-512 T=4 `sample` after L-D1): `pack`, the serial digit-carry rebuild of each CRT output from its ~50 signed 23-bit digits, plus `from_scaled_integer` are 5–6% of busy CPU.
