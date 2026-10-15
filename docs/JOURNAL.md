@@ -19,6 +19,13 @@ A read-only review (eight subsystem maps, two adversarial critiques) behind the 
 - Missing: no x86 run of any thermal-ore commit (L-X1, L-X2, L-G6, L-F1, L-D1, the exact-dot border factor), no HEAD profile at 768 or 1024 bits, no Float64 scoreboard since Oct 9.
 - Dropped in review: the √2-split quadratic (two CRTs at about 3P bits against one at 4P: kernel net about +2.75%), pre-image step bounds through corrections and skipping the dead affine z congruence (≤1.7%), an 8-limb Karatsuba (GMP crossover 26 limbs on M1).
 
+## 2026-10-16 — Task 17 G: the converter resamples by default (kept, thermal-ore)
+
+- Change (agent A6, `34e6283`, `crates/pmp`): `sdpx-pmp2sdp` resamples PyCFTBoot/SDPB.m explicit-sample blocks by default, and `--keep-samples` opts out. `--resample` is removed; no script used it. Without `--threads`, the converter uses the available cores whose estimated memory (8× the mean input block bytes per worker) fits in half the physical RAM. Measured per-worker memory is about 2× under that estimate on Λ19 and 3.5× under on Λ27. `convert_file` returns `(blocks, workers)`, and `threads == 0` means the default. The precision default stays 768.
+- Evidence (Λ19-xml at 512 bits, Mac under load): `--keep-samples` output is byte-identical to the old default output (combined sha256 `de63e5db`). The new default output is identical to old `--resample` at T=1 and T=4 and to t20 `L19-rs-512`. Conversion went from 1.8 s / 6.8 MB / 1 worker (old default) to 8.2 s / 29 MB / 10 workers (new); old `--resample` took 42.1 s at T=1. Solve at 512 bits, T=4, settings-full: Solved in 89 it, 40.1 s, against 105 it, 58.0 s on kept samples. Both points pass the original-coordinate audit (mapping 7.5e-31 and 2.3e-31; primal/dual ≤ 8e-55) with the same objective to 48 digits.
+- Risks: PBS on this cluster does not restrict affinity, so the default count sees every core of the node; cluster jobs pass `--threads`. A PMP whose prefactor fit fails now stops with an error unless `--keep-samples` is given.
+- Decision: kept. Task 17 G is ready for the matched resampled scoreboard (B1).
+
 ## 2026-10-16 — F64-PSDREF: refinement load on gpp100, gpp124-1, qap6, theta1 (diagnosis; F64-AFF-1 rejected, thermal-ore)
 
 - Observed (agent A5, fast, Mac T=1, `2709067`; evidence `~/.cache/sdpx-e2e/a5/`): all four Solved and audited at 23/22/22/9 iterations.
