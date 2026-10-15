@@ -19,6 +19,18 @@ A read-only review (eight subsystem maps, two adversarial critiques) behind the 
 - Missing: no x86 run of any thermal-ore commit (L-X1, L-X2, L-G6, L-F1, L-D1, the exact-dot border factor), no HEAD profile at 768 or 1024 bits, no Float64 scoreboard since Oct 9.
 - Dropped in review: the √2-split quadratic (two CRTs at about 3P bits against one at 4P: kernel net about +2.75%), pre-image step bounds through corrections and skipping the dead affine z congruence (≤1.7%), an 8-limb Karatsuba (GMP crossover 26 limbs on M1).
 
+## 2026-10-16 — F64-FAIL-1: sched_100_50_orig and hinf3 diagnosis (no change, thermal-ore)
+
+- Hypothesis: sched_100_50_orig stalls at an augmented end-game floor, and the audit's r_p 6.8e-6 against the solver's pres 1.8e-9 comes from scaling.
+- Evidence (agent A2, Mac T=1/T=4 on `2709067`; env-gated trace `~/.cache/sdpx-e2e/a2/a2-diag-trace.patch`; runs in `~/.cache/sdpx-e2e/a2/runs`):
+  - The gap is normalization. pres is ‖r_z‖₂/(τ·max(1, ‖b‖+‖x‖+‖s‖)) with ‖x‖ ≈ ‖s‖ ≈ 2.6e5, while the audit is absolute (2e-6). The returned s = Π_K(b−Ax), so the audit's r_p is dist_K(b−Ax): −6.76e-6 on the 3-dim SOC rows 9743–9744, where s ≈ ±1.2e5 (5.6e-11 relative). It is a real iterate residual. dres matches the original coordinates exactly. Passing needs about 3.4× on primal and 1.5× on dual, i.e. one more good iteration.
+  - At iteration 21 the internal Solved test passes, but the original-coordinate continuation keeps iterating. At iteration 22 (step 0.544) pres jumps to 3.79e-3, InsufficientProgress resets the solver to iteration 21, and the reduced check returns AlmostSolved.
+  - Cause: on the 4741-dim sparse-expanded SOC, w₀ grows from 1.70e3 to 7.585e3 between iterations 21 and 22, so cond(W²) ≈ (2w₀)⁴ goes from 1.3e14 to 5.3e16, past binary64. The last expansion auxiliary row keeps a residual of −7.6e-2, and every refinement correction makes it worse (rejected; the stop ratio ends refinement). Through u₀ ≈ 1.07e4 it puts 819 into AΔx+Δs−bΔτ. Dense and sparse W² products agree to 1e-10.
+  - Variants (all rejected): Δs from the row on expanded SOC rows (forbidden family) gives Solved/23 with a passing audit but turns sched_100_100_orig AlmostSolved. faer passes (Solved/22) by path luck from iteration 19. Condensed, a static shift of 1e-11 and longer refinement all fail.
+  - hinf3: Solved/16 locally on qdldl and faer at T=1/T=4, with a 2–3× margin on pres and gap. Backend objectives differ by 2.8e-5 relative at gap_rel 4e-9 (weakly determined optimum). The x86 failure does not reproduce here.
+  - Parity at `2709067` across 17 regression-v1 cases matches the earlier baseline.
+- Decision: no admissible mechanism within the contract. The sched family sits on a binary64 knife edge: rounding-level changes flip which case fails. Next design candidate: a KKT form that never builds W² for large-w SOCs (W-scaled rows, cond(W) ≈ 2e8), which probably also covers csdr3.
+
 ## 2026-10-16 — F64-PRE-1 and F64-SETUP: limb-weighted rational budget, column-owner peel (kept, thermal-ore)
 
 - M10c (agent A1, Mac T=1, median of 3, timer arm `a1-split`, patch `~/.cache/sdpx-e2e/patches/a1-setup-split-instrumentation.patch`): current small-LP setup is 0.1–1.5 ms, far below the stale Oct 9 receipts (bore3d 5.7 vs 25.6 ms). There are three exceptions. brandy takes 23 ms and bore3d 5.7 ms, both in the rational pass; bnl1 takes 6.8 ms, mostly the dense minor. Pool creation is 0 ms at T=1/8/16 (small-work cutoff), so the stale 1–6 ms does not reproduce. Receipts add 0.2–0.55 ms of native time on tiny LPs (afiro +66%, sc105 +29%), from per-timer CPU clock reads (M4: process clock 170–290 ns, thread clock 85–95 ns). The t7/t9 scoreboard times with `SDPX_RECEIPT` set.
