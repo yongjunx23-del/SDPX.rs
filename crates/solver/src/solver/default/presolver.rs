@@ -593,6 +593,14 @@ fn redundant_equalities_impl<T: FloatT>(
     for (i, &r) in ids.iter().enumerate() {
         lookup[r] = i;
     }
+    let ids = peel_owned_columns(A, b, &ids, &lookup)?;
+    if ids.is_empty() {
+        return Some(Vec::new());
+    }
+    lookup.fill(usize::MAX);
+    for (i, &r) in ids.iter().enumerate() {
+        lookup[r] = i;
+    }
     let psd_work = cones
         .iter()
         .map(|c| match c {
@@ -683,6 +691,76 @@ fn redundant_equalities_impl<T: FloatT>(
         }
     }
     Some(redundant)
+}
+
+/// Equality rows left after peeling every row that alone uses some column of
+/// `[A b]`: such a row has a zero multiplier in every dependence, so it is
+/// independent and each remaining row is redundant exactly when it was
+/// before. LP equality systems usually peel completely (full rank in
+/// O(nnz)). `None` on a non-finite coefficient, as the proofs below.
+fn peel_owned_columns<T: FloatT>(
+    a: &CscMatrix<T>,
+    b: &[T],
+    ids: &[usize],
+    lookup: &[usize],
+) -> Option<Vec<usize>> {
+    // Row-wise pattern of the equality rows (column a.n is b), with each
+    // column's count of live rows and the XOR of their indices: at count
+    // one, the XOR is the owning row.
+    let (m, n) = (ids.len(), a.n);
+    let (mut count, mut owner) = (vec![0u32; n + 1], vec![0usize; n + 1]);
+    let (mut start, mut entries) = (vec![0usize; m + 1], Vec::with_capacity(a.nnz() + m));
+    let mut finite = true;
+    let mut add = |i: usize, c: usize, v: &T| {
+        finite &= v.is_finite();
+        entries.push((i, c));
+        start[i + 1] += 1;
+        count[c] += 1;
+        owner[c] ^= i;
+    };
+    for c in 0..n {
+        for k in a.colptr[c]..a.colptr[c + 1] {
+            let i = lookup[a.rowval[k]];
+            if i != usize::MAX && a.nzval[k] != T::zero() {
+                add(i, c, &a.nzval[k]);
+            }
+        }
+    }
+    for (i, &r) in ids.iter().enumerate() {
+        if b[r] != T::zero() {
+            add(i, n, &b[r]);
+        }
+    }
+    if !finite {
+        return None;
+    }
+    for i in 0..m {
+        start[i + 1] += start[i];
+    }
+    let mut cols = vec![0usize; entries.len()];
+    let mut fill = start.clone();
+    for &(i, c) in &entries {
+        cols[fill[i]] = c;
+        fill[i] += 1;
+    }
+    let mut live = vec![true; m];
+    let mut owned: Vec<usize> = (0..=n).filter(|&c| count[c] == 1).collect();
+    while let Some(c) = owned.pop() {
+        if count[c] != 1 {
+            continue;
+        }
+        let i = owner[c];
+        live[i] = false;
+        for &c in &cols[start[i]..start[i + 1]] {
+            count[c] -= 1;
+            owner[c] ^= i;
+            if count[c] == 1 {
+                owned.push(c);
+            }
+        }
+    }
+    let core = ids.iter().zip(live).filter_map(|(&r, l)| l.then_some(r));
+    Some(core.collect())
 }
 
 // A nonsingular minor over F_(2^31 - 1) proves independence over the exact
