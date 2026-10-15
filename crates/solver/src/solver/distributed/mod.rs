@@ -56,9 +56,9 @@ mod layout;
 mod partitioned;
 mod state;
 
-#[cfg(feature = "serde")]
-pub(crate) use costs::input_fingerprint;
 pub(crate) use costs::CostRuntimeConfig;
+#[cfg(feature = "serde")]
+pub(crate) use costs::{input_fingerprint, rank_identity};
 pub use costs::{CostComponent, CostHistory, CostHistoryOptions, CostOwnerSample};
 #[cfg(test)]
 pub(crate) use hsd::*;

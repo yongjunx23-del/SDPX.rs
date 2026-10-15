@@ -8,6 +8,24 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — L-P4: MPI ranks agree on a binary input hash; L-P3 Ruiz row ranges rejected (thermal-ore)
+
+- L-P4, observed: with more than one MPI rank, the CLI checks that all ranks read the same input. Every rank serialized the whole parsed problem to JSON into a SHA-256, which turns each MPFR value into decimal text. A timing probe on the Mac (same binary, d6n640q/128, T=4) measured 5.63 s for this. fix-a/256 took 1.34 s.
+- L-P4, change:
+  - `costs.rs`: a new `rank_identity` hashes the values `input_fingerprint` covers, using their binary wire payloads. Long arrays hash in fixed 64Ki-value chunks on the calling Rayon pool, followed by the chunk digests in order, so the result does not depend on the pool size.
+  - `JsonProblem::rank_identity` adds the sanitized settings JSON.
+  - `sdpx.rs`: the CLI computes the identity within `--threads`, only when there is more than one rank. One `within_threads` helper now serves the SDPB read, the JSON read and the identity.
+  - `feed_scalar` writes wire bytes into a stack buffer, so the cost-history fingerprint is unchanged.
+- L-P4, measured (probe): d6n640q 5.63 → 0.31 s (T=4), 1.20 s (T=1); fix-a 1.34 → 0.08 s (T=4).
+  - A unit test checks that the identity is the same with and without a 3-thread pool, and that one changed value or row index changes it.
+  - Single-process points are unchanged (d6q 8 it a50df3c3265d). 508 lib tests and the JSON/CLI integration tests pass.
+- L-P4, not yet verified: a multi-rank end-to-end run. The Mac has no MPI, and cluster deploys are on hold.
+- L-P3, hypothesis: the Ruiz row-norm pass puts all 640 dense rows of d6n640q in its first 4096-row chunk, so it runs serially.
+- L-P3, change: row ranges of equal entry counts, each at least n entries.
+- L-P3, result (in-binary toggle, T=4, 10 Ruiz passes): the norm pass went from 0.29 s to 0.72 s, because each of the 16 ranges binary-searches all 16783 columns. The old serial chunk costs only 29 ms per pass.
+- L-P3, decision: rejected. Patch `lp3-ruiz-ranges-with-probe-rejected.patch`.
+- Also observed (L-P2 follow-up): on macOS, the parallel decimal decode scales only about 1.2× at T=4. `mpfr_strtofr` calls `localeconv_l`, which takes a global lock (1.55 thread-s of lock waits on d6q). glibc's `localeconv` takes no lock, so on the cluster the decode should scale with `--threads`. Unverified.
+
 ## 2026-10-15 — L-P2: high-precision JSON arrays decode on the thread pool (kept, thermal-ore)
 
 - Observed (d6n640q/128, `sample`): the JSON read takes 2.5 s on one thread, of which 1.9 s is decimal conversion (`mpfr_strtofr` under the MpFloat visitor).

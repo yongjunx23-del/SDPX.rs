@@ -197,6 +197,17 @@ impl Write for Identity {
     }
 }
 
+/// Runs `f` in a pool of `--threads` workers, or on the caller without one.
+fn within_threads<R: Send>(threads: Option<u32>, f: impl FnOnce() -> R + Send) -> CliResult<R> {
+    Ok(match threads.filter(|&t| t > 0) {
+        Some(threads) => rayon::ThreadPoolBuilder::new()
+            .num_threads(threads as usize)
+            .build()?
+            .install(f),
+        None => f(),
+    })
+}
+
 fn agree<T: Serialize>(mpi: MpiContext, value: &T) -> CliResult<()> {
     if mpi.size() == 1 {
         return Ok(());
@@ -336,13 +347,7 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
             let mut problem = if path.is_dir() {
                 // Block files parse in parallel; keep that within --threads
                 // (the batch also bounds how many parsed blocks are alive).
-                let sampled = match options.threads.filter(|&t| t > 0) {
-                    Some(threads) => rayon::ThreadPoolBuilder::new()
-                        .num_threads(threads as usize)
-                        .build()?
-                        .install(|| read_sdpb_sampled::<T>(path))?,
-                    None => read_sdpb_sampled::<T>(path)?,
-                };
+                let sampled = within_threads(options.threads, || read_sdpb_sampled::<T>(path))??;
                 sdpx_solver::receipt::memory_mark("input read");
                 objective_constant = sampled.objective_constant;
                 equalities = sampled.num_equalities;
@@ -359,14 +364,7 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
             } else {
                 // High-precision arrays decode on the pool after the read.
                 let file = BufReader::new(File::open(path)?);
-                let read = move || JsonProblem::<T>::read(file);
-                match options.threads.filter(|&t| t > 0) {
-                    Some(threads) => rayon::ThreadPoolBuilder::new()
-                        .num_threads(threads as usize)
-                        .build()?
-                        .install(read)?,
-                    None => read()?,
-                }
+                within_threads(options.threads, move || JsonProblem::<T>::read(file))??
             };
             if let Some(path) = &options.settings {
                 problem.settings = serde_json::from_reader(BufReader::new(File::open(path)?))?;
@@ -384,11 +382,19 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
             Ok(problem)
         })(),
     )?;
-    // Hash authoritative parsed values and effective settings without allocating
-    // another full serialized problem. Recovery metadata is part of identity.
+    // Hash authoritative parsed values (binary payloads, within --threads) and
+    // effective settings. Recovery metadata is part of identity.
+    let identity = match mpi.size() {
+        1 => None,
+        _ => Some(stage(
+            mpi,
+            within_threads(options.threads, || problem.rank_identity())
+                .and_then(|identity| Ok(identity?)),
+        )?),
+    };
     agree(
         mpi,
-        &(&problem, &sampled_metadata, T::precision_bits(), partitions),
+        &(identity, &sampled_metadata, T::precision_bits(), partitions),
     )?;
     let load_seconds = start.elapsed().as_secs_f64();
     let _keepers = sdpx_solver::solver::CoreKeepers::for_world(

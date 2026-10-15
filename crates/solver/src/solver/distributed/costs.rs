@@ -375,13 +375,45 @@ fn feed_scalar<T: crate::algebra::FloatT>(hash: &mut Sha256, value: T) {
     feed_u64(hash, T::precision_bits() as u64);
     feed_u64(hash, T::wire_tag());
     if let Some(size) = T::wire_size() {
-        let mut bytes = vec![0u8; size];
-        if T::write_wire(value, &mut bytes) {
-            feed_bytes(hash, &bytes);
+        let (mut stack, mut heap) = ([0u8; 256], Vec::new());
+        let bytes = if size <= stack.len() {
+            &mut stack[..size]
+        } else {
+            heap.resize(size, 0);
+            &mut heap[..]
+        };
+        if T::write_wire(value, bytes) {
+            feed_bytes(hash, bytes);
             return;
         }
     }
     feed_bytes(hash, value.to_string().as_bytes());
+}
+
+/// Feeds the length of `values`, then the digests of their fixed-size chunks
+/// in order. Chunks hash on the calling Rayon pool, so the result does not
+/// depend on the pool or its size.
+#[cfg(feature = "serde")]
+fn feed_chunked<V: Sync>(hash: &mut Sha256, values: &[V], feed: impl Fn(&mut Sha256, &V) + Sync) {
+    use rayon::prelude::*;
+    const CHUNK: usize = 1 << 16;
+    let digest = |chunk: &[V]| -> [u8; 32] {
+        let mut hash = Sha256::new();
+        chunk.iter().for_each(|value| feed(&mut hash, value));
+        hash.finalize().into()
+    };
+    feed_u64(hash, values.len() as u64);
+    let digests: Vec<[u8; 32]> = if rayon::current_thread_index().is_some() {
+        values.par_chunks(CHUNK).map(digest).collect()
+    } else {
+        values.chunks(CHUNK).map(digest).collect()
+    };
+    digests.iter().for_each(|digest| hash.update(digest));
+}
+
+#[cfg(feature = "serde")]
+fn feed_scalars<T: crate::algebra::FloatT>(hash: &mut Sha256, values: &[T]) {
+    feed_chunked(hash, values, |hash, &value| feed_scalar(hash, value));
 }
 
 #[cfg(feature = "serde")]
@@ -493,6 +525,47 @@ pub(crate) fn input_fingerprint<T: crate::algebra::FloatT>(
     hash.finalize().into()
 }
 
+/// Exact identity of an input for agreement between MPI ranks. It covers the
+/// values of [`input_fingerprint`] (binary payloads, not decimal text), with
+/// long arrays hashed in chunks on the calling Rayon pool.
+#[cfg(feature = "serde")]
+pub(crate) fn rank_identity<T: crate::algebra::FloatT>(
+    p: &crate::algebra::CscMatrix<T>,
+    q: &[T],
+    a: &crate::algebra::CscMatrix<T>,
+    b: &[T],
+    cones: &[crate::solver::SupportedConeT<T>],
+    sampled: &[crate::solver::SampledBlock<T>],
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    feed_bytes(&mut hash, b"SDPX-rank-identity-v1");
+    for matrix in [p, a] {
+        feed_u64(&mut hash, matrix.m as u64);
+        feed_u64(&mut hash, matrix.n as u64);
+        feed_chunked(&mut hash, &matrix.colptr, |hash, &v| {
+            feed_u64(hash, v as u64)
+        });
+        feed_chunked(&mut hash, &matrix.rowval, |hash, &v| {
+            feed_u64(hash, v as u64)
+        });
+        feed_scalars(&mut hash, &matrix.nzval);
+    }
+    feed_scalars(&mut hash, q);
+    feed_scalars(&mut hash, b);
+    feed_cones(&mut hash, cones);
+    feed_u64(&mut hash, sampled.len() as u64);
+    for block in sampled {
+        feed_u64(&mut hash, block.row_start as u64);
+        feed_u64(&mut hash, block.column_start as u64);
+        feed_u64(&mut hash, block.dim as u64);
+        feed_u64(&mut hash, block.basis_rows as u64);
+        feed_u64(&mut hash, block.basis_cols as u64);
+        feed_scalars(&mut hash, &block.basis);
+        feed_scalars(&mut hash, &block.weights);
+    }
+    hash.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +610,36 @@ mod tests {
         assert!(history
             .validate(Some([7; 32]), 53, 2, 4, 3, &[1, 2, 3], &[2, 1, 1])
             .is_ok());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn rank_identity_is_independent_of_the_pool_and_sees_every_value() {
+        use crate::algebra::CscMatrix;
+        use crate::solver::SupportedConeT;
+        let n = 150_000;
+        let a = CscMatrix::new(
+            n,
+            1,
+            vec![0, n],
+            (0..n).collect(),
+            (0..n).map(|k| k as f64 * 0.5 - 7.0).collect(),
+        );
+        let p = CscMatrix::zeros((1, 1));
+        let b: Vec<f64> = (0..n).map(|k| 1.0 / (k + 1) as f64).collect();
+        let cones = [SupportedConeT::NonnegativeConeT(n)];
+        let identity = |a: &CscMatrix<f64>, b: &[f64]| rank_identity(&p, &[1.0], a, b, &cones, &[]);
+        let serial = identity(&a, &b);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        assert_eq!(pool.install(|| identity(&a, &b)), serial);
+        let mut changed = b.clone();
+        changed[n - 1] = f64::from_bits(changed[n - 1].to_bits() + 1);
+        assert_ne!(identity(&a, &changed), serial);
+        let mut changed = a.clone();
+        changed.rowval.swap(70_000, 70_001);
+        assert_ne!(identity(&changed, &b), serial);
     }
 }

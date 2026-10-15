@@ -49,6 +49,27 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
         Ok(serde_json::to_writer(writer, self)?)
     }
 
+    /// Exact identity of the input and its effective settings, for checking
+    /// that every MPI rank read the same problem. Values hash by their binary
+    /// payload rather than decimal text, and long arrays hash on the calling
+    /// Rayon pool.
+    pub fn rank_identity(&self) -> Result<[u8; 32], SolverError> {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(crate::solver::distributed::rank_identity(
+            &self.P,
+            &self.q,
+            &self.A,
+            &self.b,
+            &self.cones,
+            &self.sampled,
+        ));
+        let mut settings = self.settings.clone();
+        sanitize_settings(&mut settings);
+        hash.update(serde_json::to_vec(&settings)?);
+        Ok(hash.finalize().into())
+    }
+
     /// Build the shared Rust solver, validating serialized dimensions first.
     pub fn into_solver(self) -> Result<DefaultSolver<T>, SolverError> {
         DefaultSolver::from_prepared(self.into_prepared()?)
