@@ -364,6 +364,56 @@ impl<const N: usize> Default for MpFloat<N> {
         }
     }
 }
+/// Smallest limb count whose division skips MPFR: at one limb `mpfr_div_1`
+/// is as fast (Apple M4: 10.3 vs 10.5 ns; 2 limbs 20 vs 42 ns).
+const DIV_MIN_N: usize = 2;
+/// GMP's `invert_pi1`: floor((β³ − 1)/(d1·β + d0)) − β for a normalized
+/// two-limb divisor (top bit of `d1` set).
+#[inline(always)]
+fn inverse_3by2(d1: u64, d0: u64) -> u64 {
+    let mut v = (u128::MAX / d1 as u128 - (1u128 << 64)) as u64;
+    let mut p = d1.wrapping_mul(v).wrapping_add(d0);
+    if p < d0 {
+        v = v.wrapping_sub(1);
+        let mask = if p >= d1 { u64::MAX } else { 0 };
+        p = p.wrapping_sub(d1);
+        v = v.wrapping_add(mask);
+        p = p.wrapping_sub(mask & d1);
+    }
+    let t = d0 as u128 * v as u128;
+    let (t1, t0) = ((t >> 64) as u64, t as u64);
+    let (p2, over) = p.overflowing_add(t1);
+    if over {
+        v = v.wrapping_sub(1);
+        if p2 >= d1 && (p2 > d1 || t0 >= d0) {
+            v = v.wrapping_sub(1);
+        }
+    }
+    v
+}
+/// GMP's `udiv_qr_3by2`: quotient and two-limb remainder of
+/// (n2, n1, n0) / (d1, d0), given n2:n1 < d1:d0 and `dinv` from
+/// [`inverse_3by2`].
+#[inline(always)]
+fn div_3by2(n2: u64, n1: u64, n0: u64, d1: u64, d0: u64, dinv: u64) -> (u64, u64, u64) {
+    let t = n2 as u128 * dinv as u128 + (((n2 as u128) << 64) | n1 as u128);
+    let (mut q, q0) = ((t >> 64) as u64, t as u64);
+    let r1 = n1.wrapping_sub(d1.wrapping_mul(q));
+    let mut r = (((r1 as u128) << 64) | n0 as u128)
+        .wrapping_sub(((d1 as u128) << 64) | d0 as u128)
+        .wrapping_sub(d0 as u128 * q as u128);
+    q = q.wrapping_add(1);
+    if (r >> 64) as u64 >= q0 {
+        q = q.wrapping_sub(1);
+        r = r.wrapping_add(((d1 as u128) << 64) | d0 as u128);
+    }
+    let dd = ((d1 as u128) << 64) | d0 as u128;
+    if r >= dd {
+        q = q.wrapping_add(1);
+        r -= dd;
+    }
+    (q, (r >> 64) as u64, r as u64)
+}
 impl<const N: usize> MpFloat<N> {
     pub const PRECISION_BITS: usize = N * 64;
     fn check_precision() {
@@ -868,6 +918,144 @@ impl<const N: usize> MpFloat<N> {
             Some(Self::exact_decode(kind, exponent, limbs))
         })
     }
+    /// Correctly rounded (nearest-even) `self / b` for regular operands:
+    /// an N-limb schoolbook quotient of Ma·2^P by Mb on GMP's `submul_1`,
+    /// with the round and sticky bits from the remainder. Equal to
+    /// `mpfr_div` bit for bit; `None` defers to MPFR.
+    #[inline]
+    fn div_regular(&self, b: &Self) -> Option<Self> {
+        // Measured through 16 limbs (1024 bits −9% per division).
+        if N < DIV_MIN_N
+            || N > 16
+            || self.kind.abs() != mpfr::REGULAR_KIND
+            || b.kind.abs() != mpfr::REGULAR_KIND
+        {
+            return None;
+        }
+        let d = &b.limbs;
+        exactdot::with_limbs::<N, _>(|np| {
+            let np = &mut np[..2 * N];
+            np[N..].copy_from_slice(&self.limbs);
+            let mut q = [0u64; N];
+            // Ma/Mb is in (1/2, 2): the top quotient bit qh is Ma >= Mb.
+            let qh = self.limbs.iter().rev().cmp(d.iter().rev()) != Ordering::Less;
+            if qh {
+                let mut borrow = false;
+                for (n, &v) in np[N..].iter_mut().zip(d) {
+                    let (x, b1) = n.overflowing_sub(v);
+                    let (x, b2) = x.overflowing_sub(borrow as u64);
+                    *n = x;
+                    borrow = b1 | b2;
+                }
+            }
+            if N == 2 {
+                let (d1, d0) = (d[1], d[0]);
+                let dinv = inverse_3by2(d1, d0);
+                let (mut n2, mut n1) = (np[3], np[2]);
+                for k in (0..2).rev() {
+                    let (qq, r1, r0) = div_3by2(n2, n1, np[k], d1, d0, dinv);
+                    q[k] = qq;
+                    (n2, n1) = (r1, r0);
+                }
+                (np[1], np[0]) = (n2, n1);
+            } else {
+                // GMP's mpn_sbpi1_div_qr over the 2N-limb numerator.
+                let (d1, d0) = (d[N - 1], d[N - 2]);
+                let dinv = inverse_3by2(d1, d0);
+                let mut n1 = np[2 * N - 1];
+                for k in 0..N {
+                    let j = 2 * N - 3 - k;
+                    let lo = j + 2 - N;
+                    let qq = if n1 == d1 && np[j + 1] == d0 {
+                        // SAFETY: np[lo..lo+N] and d are disjoint N-limb ranges.
+                        unsafe {
+                            gmp::mpn_submul_1(np[lo..].as_mut_ptr(), d.as_ptr(), N as _, u64::MAX)
+                        };
+                        n1 = np[j + 1];
+                        u64::MAX
+                    } else {
+                        let (mut qq, r1, r0) = div_3by2(n1, np[j + 1], np[j], d1, d0, dinv);
+                        // SAFETY: np[lo..j] and d[..N-2] are disjoint.
+                        let cy = unsafe {
+                            gmp::mpn_submul_1(np[lo..].as_mut_ptr(), d.as_ptr(), (N - 2) as _, qq)
+                        };
+                        let cy1 = (r0 < cy) as u64;
+                        np[j] = r0.wrapping_sub(cy);
+                        let borrow = r1 < cy1;
+                        n1 = r1.wrapping_sub(cy1);
+                        if borrow {
+                            // SAFETY: np[lo..=j] and d[..N-1] are disjoint.
+                            let c = unsafe {
+                                let at = np[lo..].as_mut_ptr();
+                                gmp::mpn_add_n(at, at, d.as_ptr(), (N - 1) as _)
+                            };
+                            n1 = n1.wrapping_add(d1).wrapping_add(c);
+                            qq = qq.wrapping_sub(1);
+                        }
+                        qq
+                    };
+                    q[N - 1 - k] = qq;
+                }
+                np[N - 1] = n1;
+            }
+            let r = &np[..N];
+            let mut limbs = [0u64; N];
+            let (round, sticky) = if qh {
+                // q = 2^P + {q}: the mantissa drops the round bit q_0.
+                for (i, limb) in limbs.iter_mut().enumerate() {
+                    let hi = if i + 1 < N {
+                        q[i + 1] << 63
+                    } else {
+                        1u64 << 63
+                    };
+                    *limb = (q[i] >> 1) | hi;
+                }
+                (q[0] & 1 == 1, r.iter().any(|&l| l != 0))
+            } else {
+                limbs = q;
+                // Round bit: 2r >= Mb; sticky: 2r != Mb.
+                if r[N - 1] >> 63 == 1 {
+                    (true, true)
+                } else {
+                    let twice = |i: usize| (r[i] << 1) | if i > 0 { r[i - 1] >> 63 } else { 0 };
+                    match (0..N)
+                        .rev()
+                        .map(|i| twice(i).cmp(&d[i]))
+                        .find(|o| o.is_ne())
+                    {
+                        Some(Ordering::Greater) => (true, true),
+                        None => (true, false),
+                        _ => (false, true),
+                    }
+                }
+            };
+            let mut exponent = self.exponent as i64 - b.exponent as i64 + qh as i64;
+            if round && (sticky || limbs[0] & 1 == 1) {
+                let mut carry = true;
+                for limb in limbs.iter_mut() {
+                    let (v, o) = limb.overflowing_add(1);
+                    *limb = v;
+                    carry = o;
+                    if !carry {
+                        break;
+                    }
+                }
+                if carry {
+                    limbs[N - 1] = 1u64 << 63;
+                    exponent += 1;
+                }
+            }
+            if !Self::exponent_in_range(exponent) {
+                return None;
+            }
+            let kind = if (self.kind < 0) != (b.kind < 0) {
+                -mpfr::REGULAR_KIND
+            } else {
+                mpfr::REGULAR_KIND
+            };
+            Some(Self::exact_decode(kind, exponent, limbs))
+        })
+    }
     #[inline(always)]
     fn shift_exact_limbs(limbs: &mut [u64], shift: usize) {
         if shift != 0 {
@@ -1336,7 +1524,19 @@ impl<const N: usize> MulAssign for MpFloat<N> {
         *self = *self * b;
     }
 }
-binary_op!(Div, div, DivAssign, div_assign, div);
+impl<const N: usize> Div for MpFloat<N> {
+    type Output = Self;
+    #[inline]
+    fn div(self, b: Self) -> Self {
+        self.div_regular(&b)
+            .unwrap_or_else(|| self.binary(b, mpfr::div))
+    }
+}
+impl<const N: usize> DivAssign for MpFloat<N> {
+    fn div_assign(&mut self, b: Self) {
+        *self = *self / b;
+    }
+}
 binary_op!(Rem, rem, RemAssign, rem_assign, fmod);
 impl<const N: usize> Neg for MpFloat<N> {
     type Output = Self;

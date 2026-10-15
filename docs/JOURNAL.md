@@ -8,6 +8,33 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — L-C2: CRT digit pack through a 128-bit window (refuted, thermal-ore)
+
+- Observed (Λ19-xml-512 T=4 `sample` after L-D1): `pack`, the serial digit-carry rebuild of each CRT output from its ~50 signed 23-bit digits, plus `from_scaled_integer` are 5–6% of busy CPU.
+- Hypothesis: shifting digits into an `i128` window and flushing a limb at 64 bits would beat the per-digit mask, shift and two-limb OR.
+- Change: window `pack` with a test against the old digit-carry copy (in-range digit sums, out-of-range cases, ±1 and ±(2^w − 1) edge digits; the test caught a sign mutation).
+- Microbench (M4, 50-digit packs): window 43.6 ns against digit-carry 39.5 ns. The carry chain is already the critical path; the window adds a 128-bit shift and a compare per digit.
+- Decision: refuted; tree restored. Patch `~/.cache/sdpx-e2e/patches/lc2-pack-window-rejected.patch`.
+
+## 2026-10-15 — L-D1: lean exact division at 128–1024 bits (kept, thermal-ore)
+
+- Observed (Λ19-xml-512 T=4 `sample`, L-F1 entry): `mpfr_div` is 6.6% of busy CPU. Its callers are the dqds sweeps of the cone SVD (one division per element per sweep) and the inverse-iteration solves. At 2–4 limbs (thermal 128/256 bits) MPFR's general path costs about twice a schoolbook division.
+- First try: `mpn_tdiv_qr` on Ma·2^P / Mb, then rounding. Only −5.8% per division at N = 8, because `tdiv_qr` allocates and normalises internally.
+- Change (`crates/arithmetic/src/lib.rs`): `div_regular` ports GMP's `mpn_sbpi1_div_qr` for 2 ≤ N ≤ 16. It takes GMP's 3-by-2 inverse (`invert_pi1`) and runs one `udiv_qr_3by2` step per quotient limb in Rust `u128`, with the N-limb update in GMP's `mpn_submul_1` / `mpn_add_n`. The numerator is Ma·2^P over 2N scratch limbs; the top quotient bit says whether the mantissa is q or q/2. The remainder gives the round and sticky bits; ties cannot occur. One nearest-even rounding follows, then MPFR's exponent-range check. N = 1, N > 16, zeros and non-finite operands still go to `mpfr_div`; at one limb `mpfr_div_1` is as fast (10.5 vs 10.3 ns). The new test `exact_div_matches_mpfr_bitwise` covers N = 1/2/3/4/8/12/16 at exponent spreads 4 and 600. Its cases are random quotients, a/a, (a·b)/b, power-of-two and all-ones mantissas with both signs, and divisors one unit apart. It failed on a deliberately broken round bit (mutation check).
+- Microbench (M4, per division vs `mpfr_div`): N = 2 −52%, 3 −44%, 4 −35%, 6 −21%, 8 −17%, 12 −13%, 16 −9%.
+- E2E (ABBA, Mac, fast profile, A = `sdpx-f1b` (L-F1), B = `sdpx-d1`; every point identical):
+
+  | Case | A | B | Change | Cycles | Instructions |
+  |---|---|---|---|---|---|
+  | Λ19-xml-512 T=4 (Solved 105, d0b8cb9b611e), 2+2 | 68.56 s | 65.37 s | −4.7% | −2.7% | −2.0% |
+  | ising11 512 T=1 (Solved 54, 17ec111261c7), 4+4 | — | — | — | −1.5% | −2.0% |
+  | two_L6_p256 T=4 (Solved 105, d47a20b519d8), 2+2 | 3.076 s | 3.029 s | −1.5% | −1.5% | −2.9% |
+  | two_L6_p128 T=4 (Solved 71, 5401782ec921), 4+4 | 1.580 s | 1.566 s | −0.9% | −0.9% | −2.1% |
+  | two_L6_p128 T=1, 2+2 | 2.985 s | 2.947 s | −1.3% | −0.9% | −2.2% |
+  | two_L8_p128 T=4, 8 it (7fcb2f100169), 2+2 | 13.32 s | 11.90 s | −10.7% (one slow A) | −4.3% | −0.8% |
+
+- Decision: kept. Results are bitwise identical. Λ19, the main high-precision Ising input, gains 4.7% wall time and 2.7% CPU. The wall gain is larger because the dqds sweeps sit on each cone's critical path.
+
 ## 2026-10-15 — L-F1: lean exact FMA at 512–1024 bits (kept, thermal-ore); inline Comba product refuted
 
 - Observed (Λ19-xml-512, T=4, `sample` of `sdpx-g6b`, 88k busy samples): GMP's `addmul_1`/`mul_1`/`mul_basecase` take 22% of busy CPU. They are the 8-limb products inside exact dots, `MpFloat` products and `mpfr_fma`. `mpfr_fma` is 16% inclusive: the bidiagonal reduction and reflectors of the cone SVD (`svd.*` 57.5 thread-s of 230) are FMA-bound. `fma_regular` covered only N ≤ 4; its shifted-window path was slower than `mpfr_fma` at N ≥ 8.

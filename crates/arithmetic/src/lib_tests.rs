@@ -984,3 +984,86 @@ fn exact_fma_matches_mpfr_bitwise() {
         check_exact_fma::<16>(spread);
     }
 }
+
+fn check_exact_div<const N: usize>(spread: u64) {
+    let mut s = 0x2545f4914f6cdd1du64 ^ (N as u64 * 104729) ^ spread;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut vals: Vec<MpFloat<N>> = (0..1024)
+        .map(|i| {
+            let mut limbs = [0u64; N];
+            limbs.iter_mut().for_each(|l| *l = next());
+            limbs[N - 1] |= 1 << 63;
+            if i % 7 == 0 {
+                limbs[..N / 2].iter_mut().for_each(|l| *l = 0);
+            }
+            MpFloat::<N> {
+                limbs,
+                kind: if next() & 1 == 0 {
+                    mpfr::REGULAR_KIND
+                } else {
+                    -mpfr::REGULAR_KIND
+                },
+                exponent: ((next() % (2 * spread + 1)) as i64 - spread as i64) as mpfr::exp_t,
+            }
+        })
+        .collect();
+    // Powers of two and all-ones mantissas.
+    let mut pow2 = vals[0];
+    pow2.limbs = [0; N];
+    pow2.limbs[N - 1] = 1 << 63;
+    let mut ones = vals[1];
+    ones.limbs = [u64::MAX; N];
+    vals.extend([pow2, ones, -pow2, -ones]);
+    let mdiv = |a: &MpFloat<N>, b: &MpFloat<N>| {
+        let (x, y) = (a.descriptor(), b.descriptor());
+        MpFloat::<N>::output(|r| unsafe {
+            mpfr::div(r, &x, &y, ROUND);
+        })
+    };
+    let check = |a: &MpFloat<N>, b: &MpFloat<N>| {
+        let got = *a / *b;
+        let want = mdiv(a, b);
+        assert_eq!(
+            (got.kind, got.exponent, got.limbs),
+            (want.kind, want.exponent, want.limbs),
+            "N={N} spread={spread}"
+        );
+    };
+    for w in vals.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        check(a, b);
+        check(a, a);
+        // Exact quotients.
+        check(&(*a * *b), b);
+        // Mantissas one unit apart: the remainder's top limbs equal the
+        // divisor's (GMP's q = β − 1 step) and qh = 1 with a tiny excess.
+        for delta in [u64::MAX, 1] {
+            let mut c = *b;
+            let (v, o) = c.limbs[0].overflowing_add(delta);
+            // Adding β − 1 subtracts one unit when it carries out.
+            if o == (delta == u64::MAX) {
+                c.limbs[0] = v;
+                check(&c, b);
+                check(b, &c);
+            }
+        }
+    }
+}
+
+#[test]
+fn exact_div_matches_mpfr_bitwise() {
+    for spread in [4, 600] {
+        check_exact_div::<1>(spread);
+        check_exact_div::<2>(spread);
+        check_exact_div::<3>(spread);
+        check_exact_div::<4>(spread);
+        check_exact_div::<8>(spread);
+        check_exact_div::<12>(spread);
+        check_exact_div::<16>(spread);
+    }
+}
