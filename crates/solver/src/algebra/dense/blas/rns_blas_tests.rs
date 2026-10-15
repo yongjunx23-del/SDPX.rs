@@ -739,7 +739,7 @@ fn check_diag_congruence<const N: usize, const M: usize>(
 fn residue_diag_congruence_is_exact_rounded_once() {
     check_diag_congruence::<2, 8>(5, 200, 30, 21);
     check_diag_congruence::<4, 16>(7, 300, 40, 22);
-    // Longer than one 4096-row block.
+    // Several row blocks.
     check_diag_congruence::<2, 8>(3, 5000, 20, 23);
     // Primes sized by the block are wider than all 9000 rows allow.
     check_diag_congruence::<2, 8>(3, 9000, 20, 24);

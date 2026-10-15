@@ -2399,6 +2399,13 @@ fn round_slots<const N: usize>(slots: &[i128], scale: i64, mag: &mut Vec<u64>) -
     F::from_scaled_integer(negative, mag, scale)
 }
 
+/// Rows per integer product in [`diag_congruence`]. Shorter blocks admit
+/// wider primes (23 bits at 512 rows, 21 at 4096), so fewer primes cover the
+/// same product, at one extra reduction per output and block. On the gravity
+/// LP border (640 × 16,780) 512 rows cut the product time by 23–26% against
+/// 4096; 128 rows (24 bits) were slower again.
+const DIAG_BLOCK_ROWS: usize = 512;
+
 /// Correctly rounded `Aᵀ·diag(d)·A` (`m × m`) for a column-major `k × m`
 /// operand `A` (leading dimension `k`), written as `out[i + j·m]`. Each
 /// entry is the exact sum `Σ_r a_ri·d_r·a_rj` rounded once. `A` is meant to
@@ -2406,9 +2413,6 @@ fn round_slots<const N: usize>(slots: &[i128], scale: i64, mag: &mut Vec<u64>) -
 /// `k` scaling values are encoded per call. Reset `cache_a` when `A` changes.
 /// `upper_only` as in [`gemm`].
 #[allow(clippy::too_many_arguments)]
-/// Rows per integer product in [`diag_congruence`].
-const DIAG_BLOCK_ROWS: usize = 4096;
-
 pub(super) fn diag_congruence<const N: usize>(
     m: usize,
     k: usize,
@@ -2525,8 +2529,8 @@ pub(super) fn diag_congruence<const N: usize>(
             }
             // Rectangular tiles cover the upper triangle. Products and
             // modular sums remain exact, independent of tile/way order.
-            // The prime width bounds one block: every <=4096-row block
-            // fits one product.
+            // The prime width bounds one block: every block of at most
+            // `DIAG_BLOCK_ROWS` rows fits one product.
             debug_assert!(rows <= plan.k_chunk);
             for j0 in (0..m).step_by(tile) {
                 let cols = tile.min(m - j0);

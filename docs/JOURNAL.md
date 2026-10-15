@@ -8,6 +8,40 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Exact diagonal congruence in 512-row blocks (thermal-ore)
+
+- Observed (d6n640q/128, 8 iterations, Mac): the owner border assembly C·D⁻¹·Cᵀ (640 × 16,780) takes 7.2 s of 11.3 s at T=10 and barely scales (8.7 s at T=1).
+  - With Accelerate, its integer products share the AMX unit.
+  - With `SDPX_INT_GEMM=faer` it takes 9.6 s at T=10 against 11.8 s at T=4.
+  - The plain path's bound Gram (`arrow.local_schur`) is the same kernel.
+- Hypothesis: `diag_congruence` sizes its primes by the 4096-row block (21 bits). Shorter blocks admit wider primes (23 bits at ≤512 rows, 24 at ≤128), so fewer primes cover the same exact product. Each block adds one reduction per output, and its operands are cache-sized.
+- Probe (`SDPX_DIAG_ROWS`, 8 iterations, border s): every point identical.
+
+  | Rows | Prime bits | Owner faer T=10 | Owner Accelerate T=4 | Plain faer T=10 (Gram) |
+  |---|---|---|---|---|
+  | 4096 | 21 | 9.63 | 7.39 | 10.04 |
+  | 1024 | 22 | 8.25 | | |
+  | 512 | 23 | 7.45 | 5.27–5.43 | 7.62 |
+  | 384 | 23 | 7.51 | | |
+  | 256 | 23 | 7.40 | 5.54 | |
+  | 128 | 24 | 7.81 | 5.67 | 7.95 |
+
+- Change (`rns_blas.rs`): `DIAG_BLOCK_ROWS` 4096 → 512. The magnitude bound still uses the full k, so the result is exact and its bits are unchanged. The constant's doc comment now sits on the constant instead of on `diag_congruence`.
+- E2E: full solves, ABBA, A = `6657972` (Mac):
+
+  | Case | A s | B s | Change |
+  |---|---|---|---|
+  | d6n640q owner T=10, Accelerate | 68.26 / 66.96 | 58.26 / 57.08 | −14.7% |
+  | d6n640q plain T=10, Accelerate | 63.68 / 63.22 | 55.41 / 55.62 | −12.5% |
+  | d6n640q owner T=10, faer | 83.85 / 84.53 | 70.30 / 69.34 | −17.1% |
+  | fix-a/256 owner T=4 | 7.53 / 7.43 | 6.76 / 6.68 | −10.2% |
+  | fix-a/256 plain T=4 | 5.75 | 4.99 | −13.3% |
+
+  - Every pair is bitwise identical: d6n640q Solved 48 (owner `7e703396b7e2`, the audited point; plain `1b05ab68fdfb`) and fix-a Solved 25.
+  - ising11/512 owner and plain hashes are unchanged (`d73ecddbd4e9`, `17ec111261c7`).
+  - 507 lib tests pass.
+- Decision: kept.
+
 ## 2026-10-15 — Cut-aware recursive leaf Y solve rejected (thermal-ore)
 
 - Hypothesis: the rejected recursive Y solve of the L-T3 entry lost only because it ignored the envelope cut and zero columns. A recursion that splits at envelope cuts and multiplies only the coupled, nonzero columns (sorted by first nonzero row, so each level's product covers a column prefix and starts at the first nonzero inner row) matches the row sweep's 520 M multiply-adds. Its products should then beat per-entry exact dots, as the recursive factor does.
