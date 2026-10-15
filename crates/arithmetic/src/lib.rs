@@ -119,15 +119,27 @@ pub trait Scalar:
     ) -> Self {
         Self::dot_slices(a, b)
     }
+    /// Binary exponent of a finite nonzero value, in the units of the
+    /// `bounds` of [`Scalar::dot_outputs_chunked`]; `None` for zero,
+    /// non-finite values and types without exactly accumulated products.
+    #[doc(hidden)]
+    fn product_exponent(&self) -> Option<i64> {
+        None
+    }
     /// Sums of `outputs` dot products whose terms arrive in chunks:
     /// `terms(c)` yields `(output, a, b)` for chunk `c < chunks`, and
     /// `par_for(chunks, f)` may run the chunks concurrently. Exactly
     /// accumulated types return each output's exact sum rounded once, the
     /// value of `dot_fma` over its terms in any order. `None` marks an output
     /// left to the caller: always here, and where the exact path declines.
+    /// `bounds[k]`, if given, is a range holding `a.product_exponent() +
+    /// b.product_exponent()` for every finite nonzero term of output k; it
+    /// spares exactly accumulated types a pass over the terms. A term outside
+    /// it costs that pass again, never the value.
     fn dot_outputs_chunked<'a, I>(
         outputs: usize,
         _chunks: usize,
+        _bounds: Option<&[(i64, i64)]>,
         _terms: &(dyn Fn(usize) -> I + Sync),
         _par_for: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
     ) -> Vec<Option<Self>>
@@ -1389,16 +1401,20 @@ impl<const N: usize> Scalar for MpFloat<N> {
     ) -> Self {
         exactdot::dot_slices_chunked(a, b, chunks, par_for, |terms| Self::dot_fma_chain(terms))
     }
+    fn product_exponent(&self) -> Option<i64> {
+        (self.kind.abs() == mpfr::REGULAR_KIND).then_some(self.exponent as i64)
+    }
     fn dot_outputs_chunked<'a, I>(
         outputs: usize,
         chunks: usize,
+        bounds: Option<&[(i64, i64)]>,
         terms: &(dyn Fn(usize) -> I + Sync),
         par_for: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
     ) -> Vec<Option<Self>>
     where
         I: Iterator<Item = (usize, &'a Self, &'a Self)>,
     {
-        exactdot::dot_outputs_chunked(outputs, chunks, terms, par_for)
+        exactdot::dot_outputs_chunked(outputs, chunks, bounds, terms, par_for)
     }
     fn ln(self) -> Self {
         self.unary(mpfr::log)

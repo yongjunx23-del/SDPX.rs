@@ -389,22 +389,34 @@ fn round_slots<const N: usize>(
 /// partial sums share one alignment and add exactly, so each value is `dot`
 /// over that output's terms in any order. `None` marks an output `dot`
 /// leaves to the chain: a non-finite term or too wide an exponent spread.
+///
+/// `bounds[k]`, when given, is a range holding the exponent sum of every
+/// finite nonzero term of output k (empty when it has none). The terms are
+/// then read once, without an exponent scan; a term outside its range, or a
+/// non-finite one, makes the call scan after all. The alignment never
+/// changes a value, so the result is the same either way.
 pub(crate) fn dot_outputs_chunked<'a, const N: usize, I>(
     outputs: usize,
     chunks: usize,
+    bounds: Option<&[(i64, i64)]>,
     terms: &(dyn Fn(usize) -> I + Sync),
     par_for: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
 ) -> Vec<Option<MpFloat<N>>>
 where
     I: Iterator<Item = (usize, &'a MpFloat<N>, &'a MpFloat<N>)>,
 {
-    let mut out = vec![None; outputs];
     if N > MAX_N {
-        return out;
+        return vec![None; outputs];
     }
     let chunks = chunks.max(1);
+    if let Some(bounds) = bounds {
+        assert_eq!(bounds.len(), outputs);
+        let range: Vec<_> = bounds.iter().map(|&(lo, hi)| (lo, hi, true)).collect();
+        if let Some(out) = sum_outputs::<N, I, true>(&range, chunks, terms, par_for) {
+            return out;
+        }
+    }
     let regular = |k: i32| k.abs() == mpfr::REGULAR_KIND;
-    let zero = |k: i32| k.abs() == mpfr::ZERO_KIND;
     let scans = std::sync::Mutex::new(vec![None; chunks]);
     par_for(chunks, &|c| {
         let mut scan = vec![(i64::MAX, i64::MIN, true); outputs];
@@ -414,9 +426,7 @@ where
                 let e = x.exponent as i64 + y.exponent as i64;
                 *emin = (*emin).min(e);
                 *emax = (*emax).max(e);
-            } else if !(zero(x.kind) && (zero(y.kind) || regular(y.kind))
-                || zero(y.kind) && regular(x.kind))
-            {
+            } else if !zero_product(x, y) {
                 *finite = false;
             }
         }
@@ -429,43 +439,89 @@ where
             *r = (r.0.min(s.0), r.1.max(s.1), r.2 && s.2);
         }
     }
-    // Output k accumulates in `len` limbs from `start` at bit 0 weighing
+    sum_outputs::<N, I, false>(&range, chunks, terms, par_for)
+        .expect("scanned exponent ranges hold every term")
+}
+
+/// Whether `a·b` is an exact zero of finite factors, which adds nothing
+/// (the sign of a zero result is not significant to the solver).
+#[inline(always)]
+fn zero_product<const N: usize>(a: &MpFloat<N>, b: &MpFloat<N>) -> bool {
+    let regular = |k: i32| k.abs() == mpfr::REGULAR_KIND;
+    let zero = |k: i32| k.abs() == mpfr::ZERO_KIND;
+    zero(a.kind) && (zero(b.kind) || regular(b.kind)) || zero(b.kind) && regular(a.kind)
+}
+
+/// The accumulation pass of [`dot_outputs_chunked`] over per-output
+/// exponent-sum ranges `(emin, emax, finite)`. `GUARD` checks every term
+/// against its range and returns `None` on a miss; without it the ranges
+/// come from a scan of these very terms.
+fn sum_outputs<'a, const N: usize, I, const GUARD: bool>(
+    range: &[(i64, i64, bool)],
+    chunks: usize,
+    terms: &(dyn Fn(usize) -> I + Sync),
+    par_for: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
+) -> Option<Vec<Option<MpFloat<N>>>>
+where
+    I: Iterator<Item = (usize, &'a MpFloat<N>, &'a MpFloat<N>)>,
+{
+    let regular = |k: i32| k.abs() == mpfr::REGULAR_KIND;
+    let mut out = vec![None; range.len()];
+    // Output k accumulates in `len` slots from `start` at bit 0 weighing
     // 2^(emin - 2P); none when it declines or holds no nonzero product.
     let mut total = 0;
-    let slots: Vec<(usize, usize, i64)> = range
-        .iter()
-        .enumerate()
-        .map(|(k, &(emin, emax, finite))| {
-            let len = match (finite, emin == i64::MAX) {
-                (true, true) => {
-                    out[k] = Some(MpFloat::<N>::default());
-                    0
-                }
-                (true, false) => acc_len::<N>(emin, emax).unwrap_or(0),
-                _ => 0,
-            };
-            total += len;
-            (total - len, len, emin)
-        })
-        .collect();
-    if total == 0 {
-        return out;
+    let mut slots = Vec::with_capacity(range.len());
+    for (k, &(emin, emax, finite)) in range.iter().enumerate() {
+        let len = match (finite, emin > emax) {
+            (true, true) => {
+                out[k] = Some(MpFloat::<N>::default());
+                0
+            }
+            (true, false) => match acc_len::<N>(emin, emax) {
+                Some(len) => len,
+                // Too wide a bound: the scan may find a narrower range.
+                None if GUARD => return None,
+                None => 0,
+            },
+            _ => 0,
+        };
+        total += len;
+        slots.push((total - len, len, emin, emax));
     }
+    if total == 0 && !GUARD {
+        return Some(out);
+    }
+    let missed = std::sync::atomic::AtomicBool::new(false);
     let parts = std::sync::Mutex::new(vec![None; chunks]);
     par_for(chunks, &|c| {
         let (mut pos, mut neg) = (vec![0u128; total], vec![0u128; total]);
         let mut scratch = [0u64; 2 * MAX_N];
+        let mut miss = false;
         for (k, x, y) in terms(c) {
-            let (s, len, emin) = slots[k];
-            if len == 0 || !(regular(x.kind) && regular(y.kind)) {
+            let (s, len, emin, emax) = slots[k];
+            if !(regular(x.kind) && regular(y.kind)) {
+                miss |= GUARD && !zero_product(x, y);
+                continue;
+            }
+            if GUARD {
+                let e = x.exponent as i64 + y.exponent as i64;
+                if e < emin || e > emax {
+                    miss = true;
+                    continue;
+                }
+            } else if len == 0 {
                 continue;
             }
             // SAFETY: output k owns `len` slots at `s` in both accumulators,
-            // sized by `acc_len` over every chunk's exponent sums.
+            // sized by `acc_len` over a range holding this term's exponent
+            // sum (checked above, or scanned from these terms).
             unsafe {
                 let accs = [pos.as_mut_ptr().add(s), neg.as_mut_ptr().add(s)];
                 add_term::<N>(accs, emin, len, N <= INLINE_N, (x, y), &mut scratch);
             }
+        }
+        if miss {
+            missed.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         parts.lock().unwrap()[c] = Some((pos, neg));
     });
@@ -474,18 +530,21 @@ where
         .unwrap()
         .into_iter()
         .map(|part| part.expect("chunk scheduler skipped accumulation"));
+    if missed.into_inner() {
+        return None;
+    }
     let (mut pos, mut neg) = parts.next().unwrap();
     for (p, n) in parts {
         // Slots carry nothing into the next output's slots.
         add_slots(&mut pos, &p);
         add_slots(&mut neg, &n);
     }
-    for (k, &(s, len, emin)) in slots.iter().enumerate() {
+    for (k, &(s, len, emin, _)) in slots.iter().enumerate() {
         if len > 0 {
             out[k] = round_slots(&mut pos[s..s + len], &mut neg[s..s + len], emin);
         }
     }
-    out
+    Some(out)
 }
 
 /// Round `pos - neg` (bit 0 weighing 2^(emin - 2P)) once, nearest-even.

@@ -42,6 +42,11 @@ pub(crate) struct SparseParallel {
     long_rows: Vec<usize>,
     long_index: Vec<usize>,
     long_lanes: Vec<usize>,
+    // Exponent range (`product_exponent`) of each long row's nonzero entries
+    // when planned, so `forward_long` bounds its exact sums without a scan of
+    // the terms; empty when some entry has none. Values changed since only
+    // cost that scan again.
+    long_exponents: Vec<(i64, i64)>,
     symmetric: bool,
     workers: usize,
     pool: Option<Arc<rayon::ThreadPool>>,
@@ -135,6 +140,7 @@ impl SparseParallel {
             long_rows: Vec::new(),
             long_index: Vec::new(),
             long_lanes: Vec::new(),
+            long_exponents: Vec::new(),
             symmetric,
             workers: 0,
             pool: None,
@@ -174,6 +180,7 @@ impl SparseParallel {
         self.long_rows.clear();
         self.long_index = Vec::new();
         self.long_lanes = Vec::new();
+        self.long_exponents = Vec::new();
         let exact = T::precision_bits() > 64 && a.nnz() >= 4 * a.m;
         if !exact || self.symmetric {
             return;
@@ -199,8 +206,56 @@ impl SparseParallel {
             ptr.push(ptr[j] + long);
         }
         self.long_lanes = partitions(&ptr, LONG_CHUNKS_PER_LANE * lanes.max(1));
+        let mut exponents = vec![(i64::MAX, i64::MIN); rows.len()];
+        let known = a.rowval.iter().zip(&a.nzval).all(|(&r, v)| {
+            let k = index[r];
+            if k == usize::MAX || v.is_zero() {
+                return true;
+            }
+            v.product_exponent()
+                .map(|e| {
+                    let range = &mut exponents[k];
+                    *range = (range.0.min(e), range.1.max(e));
+                })
+                .is_some()
+        });
+        self.long_exponents = if known { exponents } else { Vec::new() };
         self.long_rows = rows;
         self.long_index = index;
+    }
+
+    /// Ranges holding the exponent sums of every finite nonzero term of
+    /// `forward_long`'s outputs: the planned entry ranges plus x's, widened
+    /// by each output's head. `None` when an x or an entry has no exponent.
+    fn long_bounds<T: FloatT>(&self, x: &[T], heads: &[T], one: &T) -> Option<Vec<(i64, i64)>> {
+        if self.long_exponents.len() != self.long_rows.len() {
+            return None;
+        }
+        let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+        for v in x {
+            match v.product_exponent() {
+                Some(e) => (lo, hi) = (lo.min(e), hi.max(e)),
+                None if v.is_zero() => {}
+                None => return None,
+            }
+        }
+        let unit = one.product_exponent()?;
+        let bounds = self
+            .long_exponents
+            .iter()
+            .enumerate()
+            .map(|(k, &(a0, a1))| {
+                let mut range = if a0 <= a1 && lo <= hi {
+                    (a0 + lo, a1 + hi)
+                } else {
+                    (i64::MAX, i64::MIN)
+                };
+                if let Some(e) = heads.get(k).and_then(|h| h.product_exponent()) {
+                    range = (range.0.min(e + unit), range.1.max(e + unit));
+                }
+                range
+            });
+        Some(bounds.collect())
     }
 
     /// Whether a forward product with this `alpha` takes `forward_long`.
@@ -250,7 +305,14 @@ impl SparseParallel {
             }
         };
         let par_for = |n: usize, f: &(dyn Fn(usize) + Sync)| (0..n).into_par_iter().for_each(f);
-        let sums = T::dot_outputs_chunked(self.long_rows.len(), lanes.len(), &terms, &par_for);
+        let bounds = self.long_bounds(x, if signed { &heads[..] } else { &[] }, &one);
+        let sums = T::dot_outputs_chunked(
+            self.long_rows.len(),
+            lanes.len(),
+            bounds.as_deref(),
+            &terms,
+            &par_for,
+        );
         for ((k, &r), sum) in self.long_rows.iter().enumerate().zip(sums) {
             match sum {
                 Some(s) if alpha == one => y[r] = s,

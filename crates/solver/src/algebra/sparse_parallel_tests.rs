@@ -182,10 +182,12 @@ fn long_row_parity<T: FloatT>() {
         assert_eq!(plan.long_rows.len(), if wide { long } else { 0 });
         for alpha in scales {
             for beta in betas {
-                for case in 0..3 {
+                for case in 0..5 {
                     // Row 2's terms alternate ±1 against a constant x, so its
                     // sum cancels; case 1 seeds a NaN into one column of x,
-                    // case 2 a signed zero and a NaN into the incoming y.
+                    // case 2 a signed zero and a NaN into the incoming y,
+                    // case 3 spreads x over 2^±100 with zeros, and case 4
+                    // runs on values scaled after planning (stale bounds).
                     let mut x = vec![T::one(); n];
                     let mut serial: Vec<T> =
                         (0..m).map(|i| num::<T>(i % 11) / num::<T>(5)).collect();
@@ -196,9 +198,25 @@ fn long_row_parity<T: FloatT>() {
                         serial[2] = -T::zero();
                         serial[1] = T::nan();
                     }
+                    if case == 3 {
+                        for (j, xj) in x.iter_mut().enumerate() {
+                            *xj = if j % 11 == 0 {
+                                T::zero()
+                            } else {
+                                num::<T>(j % 7 + 1) / num::<T>(3)
+                                    * num::<T>(2).powi(j as i32 % 201 - 100)
+                            };
+                        }
+                    }
+                    let mut b = a.clone();
+                    if case == 4 {
+                        for v in b.nzval.iter_mut().step_by(6 * 5) {
+                            *v *= num::<T>(2).powi(90);
+                        }
+                    }
                     let mut parallel = serial.clone();
-                    a.gemv(&mut serial, &x, alpha, beta);
-                    plan.product_local(&a, false, &mut parallel, &x, alpha, beta);
+                    b.gemv(&mut serial, &x, alpha, beta);
+                    plan.product_local(&b, false, &mut parallel, &x, alpha, beta);
                     same(&serial, &parallel);
                 }
             }

@@ -847,18 +847,41 @@ fn output_dots_match<const N: usize>() {
                 .map(|t| (t.0, &t.1, &t.2))
         };
         let par_for = |n: usize, f: &(dyn Fn(usize) + Sync)| (0..n).rev().for_each(f);
-        let sums = <MpFloat<N> as Scalar>::dot_outputs_chunked(outputs, chunks, &part, &par_for);
-        for (k, sum) in sums.iter().enumerate() {
-            match k {
-                3 | 5 => assert!(sum.is_none(), "N={N} chunks={chunks} k={k}"),
-                _ => {
-                    let sum = sum.unwrap();
-                    assert_eq!(
-                        sum.to_string(),
-                        expected[k].to_string(),
-                        "N={N} chunks={chunks} k={k}"
-                    );
-                    assert_eq!(sum.is_sign_negative(), expected[k].is_sign_negative());
+        // Exponent-sum ranges of each output's finite nonzero terms: exact,
+        // widened, too narrow for output 1 (a stale bound), and empty.
+        let mut exact = vec![(i64::MAX, i64::MIN); outputs];
+        for (k, a, b) in &terms {
+            if let (Some(x), Some(y)) = (a.product_exponent(), b.product_exponent()) {
+                exact[*k] = (exact[*k].0.min(x + y), exact[*k].1.max(x + y));
+            }
+        }
+        let wide: Vec<_> = exact
+            .iter()
+            .map(|&(lo, hi)| (lo - 300, hi.saturating_add(200)))
+            .collect();
+        let mut stale = exact.clone();
+        stale[1].1 -= 1;
+        let empty = vec![(1, 0); outputs];
+        for bounds in [None, Some(&exact), Some(&wide), Some(&stale), Some(&empty)] {
+            let sums = <MpFloat<N> as Scalar>::dot_outputs_chunked(
+                outputs,
+                chunks,
+                bounds.map(|b| b.as_slice()),
+                &part,
+                &par_for,
+            );
+            for (k, sum) in sums.iter().enumerate() {
+                match k {
+                    3 | 5 => assert!(sum.is_none(), "N={N} chunks={chunks} k={k}"),
+                    _ => {
+                        let sum = sum.unwrap();
+                        assert_eq!(
+                            sum.to_string(),
+                            expected[k].to_string(),
+                            "N={N} chunks={chunks} k={k} bounds={bounds:?}"
+                        );
+                        assert_eq!(sum.is_sign_negative(), expected[k].is_sign_negative());
+                    }
                 }
             }
         }

@@ -8,6 +8,28 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — L-X2: long-row exact products without an exponent scan (kept, thermal-ore)
+
+- Observed (d6n640q/128, owner, T=4, `sample` after L-X1): `dot_outputs_chunked` takes 3226 of 20656 busy samples. 1106 of them are its first pass, which reads every term only for its exponent before the accumulation pass reads them again. Each A entry is a 32-byte MpFloat, and the long rows hold about 10.7M entries, so the scan streams all of A once more for each product.
+- Change:
+  - `Scalar::product_exponent`: the binary exponent of a finite nonzero value (MpFloat only; the default is `None`).
+  - `dot_outputs_chunked` takes optional per-output exponent-sum `bounds`. With bounds it skips the scan. The accumulation pass checks each term against its output's range: a term out of range, or a non-finite one, makes the call run the scan path after all. A stale bound can therefore cost time but never the value. Alignment does not change the exact integer, so results are bitwise identical.
+  - `SparseParallel` records each long row's entry exponent range when it plans the long rows. `forward_long` adds x's range (one O(n) pass) and widens by each output's incoming head.
+  - Tests: the output-dot test runs exact, widened, too-narrow and empty bounds. The long-row parity test adds x spread over 2^±100 with zeros, and A values scaled by 2^90 after planning.
+- Profile (same sampling, d6q owner): exact long-row products 3226 → 2533 samples. Only the guarded pass appears; no call fell back to the scan.
+- E2E (ABBA against L-X1 `23d81dd`, Mac, solve s; every point identical):
+
+  | Case | A | B | Change |
+  |---|---|---|---|
+  | d6q owner 8 it (a50df3c3265d), 2 rounds | 12.45 / 13.65 / 12.84 / 13.25 | 11.94 / 12.60 / 11.52 / 12.40 | −7.1% |
+  | d6q plain 8 it (5772c472b62f), 3 rounds | 13.75 / 12.67 / 12.71 / 13.32 / 12.65 / 12.40 | 12.62 / 12.45 / 13.98 / 13.33 / 13.53 / 12.68 | +1.4% (noise) |
+  | fix-a 256 owner (Solved 25) | 6.79 / 6.66 / 6.79 / 6.66 | 6.36 / 6.28 / 6.23 / 6.28 | −6.4% |
+  | fix-a 256 plain (Solved 25) | 5.00 / 5.00 / 4.97 / 4.95 | 4.95 / 4.94 / 4.93 / 4.89 | −1.0% |
+  | csdr3 256 (Solved 36) | 3.30 / 3.31 | 3.42 / 3.24 | ±0 |
+
+  In plain mode, long-row products are 2% of busy CPU (448 samples before, 440 after), so plain can move by at most about 1%. Its ±5% swings between rounds are Mac load (load average about 5). two_L4/256, two_L6/256 and ising11/512 have no long rows and stay identical. 38 arithmetic tests, 508 solver lib tests and the JSON/CLI integration tests pass.
+- Decision: kept. Owner-path gravity LP gains 6–7%, every result is bitwise identical, and plain is unchanged.
+
 ## 2026-10-15 — L-X1: exact dot products accumulate in carry-free 128-bit slots (kept, thermal-ore)
 
 - Observed (d6n640q/128, owner, T=4, `sample` of the solve): exact-dot kernels take about 30% of busy CPU. `dot_outputs_chunked` from the sparse products has 3003 samples. `exactdot::dot` from `dot_fma` has about 3400: `wide_output` 1739, `solve_reduced_panel` 1152, `solve_reduced_raw` 576. Each term added its shifted 2N-limb product to a u64 accumulator with a carry chain: a carry-flag dependency through every limb and a data-dependent carry loop. At 512 bits it made three GMP calls (`mul_n`, `lshift`, `add_n`).
