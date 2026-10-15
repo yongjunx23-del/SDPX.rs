@@ -19,6 +19,28 @@ A read-only review (eight subsystem maps, two adversarial critiques) behind the 
 - Missing: no x86 run of any thermal-ore commit (L-X1, L-X2, L-G6, L-F1, L-D1, the exact-dot border factor), no HEAD profile at 768 or 1024 bits, no Float64 scoreboard since Oct 9.
 - Dropped in review: the √2-split quadratic (two CRTs at about 3P bits against one at 4P: kernel net about +2.75%), pre-image step bounds through corrections and skipping the dead affine z congruence (≤1.7%), an 8-limb Karatsuba (GMP crossover 26 limbs on M1).
 
+## 2026-10-16 — F64-TRSV-1 and F64-PSDCOR-1: fused QDLDL solves, binary64 PSD corrector (kept, thermal-ore)
+
+- F64-TRSV-1 (agent A3, `dacb804`). Observed: QDLDL `solve_many` looped single solves, while trsv + ir.solve took 19–40% of the T=1 solve on agg, bnl1, sched, nql60 and nb, mostly in two-column batches. Change: `QDLDLFactorisation::solve_many` interleaves column pairs by row and runs one forward sweep and one D·Lᵀ sweep for both columns. Each column keeps `_solve`'s operation order. The parallel elimination-tree plan and an odd last column use the single solve. Evidence (fast, Mac, vs `head-3269468`): x/s/z, status and iterations are bitwise identical on all 11 QDLDL inputs at T=1, and on nb, bnl1 and sched_100_100 at T=4. Process instructions at T=1: agg −5.7%, bnl1 −6.1%, sched_100_100 −5.6%, nql60 −4.5%, nb −2.4%. Cycles were −6.4/−8.5/−6.1/−3.7/+0.1% on a loaded host. Decision: kept, provisional until an x86 release ABBA on agg/bnl1.
+- F64-PSDCOR-1 (agent A4, `e8bfd01`). Observed (arch0, n 161, 26 calls): the binary64 PSD corrector right-hand side is 20% of the solve. dsyev takes 68% of it, the triple-loop Q·diag(t)·Qᵀ rebuild 23%, W products 6%, circ and unpack 2.5%. Between 1 and 92 of 161 eigenvalues fall outside the band. Change: one `PsdWork` scratch set and matrix-form W products. `EigEngine::eigen` (dsyevr, jobz V) replaces dsyev. ds is rebuilt by one GEMM over the columns with t ≠ 0. There are no allocations, and MPFR still returns at the top. Evidence (fast, T=1, 3+3 ABAB on a loaded Mac, original-coordinate audits at 1e-6): arch0 5.63 → 2.61 ms per call, 22/22 it, cycles −8.5%, instructions −23%; gpp124-1 24 → 22 it, cycles −21%, instructions −33%; theta2 9/9 it. The ising11 point is unchanged. The merged tree (`06987a0`) passes medium (15 it). Decision: kept; this is a rounding change (MRRR eigenvectors), so x86 release timing is still owed.
+- Rejected alongside (lead, M4 follow-up): exactly accumulated dots in the MPFR transposed `xtrsm_lower` that builds R⁻¹. ising11 passes (54 it, audit PASS), but R⁻¹ is 1.6% of ising11 and 2.7% of Λ19-xml CPU, so even removing it cannot meet the ≥2% gate. Patch `~/.cache/sdpx-e2e/patches/trsm-exactdot.patch`.
+
+## 2026-10-16 — M2, A8, M4: goal-width profiles, Karatsuba microbench, cone split (measurement, thermal-ore)
+
+- M2 (Mac T=4 under agent load, HEAD `209f635`, 5–8 iteration runs of L19-s50/768, Λ27-s50c/768 and Λ35-rs/1024, `~/.cache/sdpx-e2e/m2`): GMP limb products are 38–43% of busy CPU (`addmul_1` 30–35%), libBLAS 12–16%, CRT 3.5–5%, `group_residues` 2–3%. Cone SVD thread time is 24–28% of CPU. At 768 bits the GMP products split as scalar FMA `mul_add` 24.5% (SVD bidiagonalization, trsm, reflectors, potrf), scalar `Mul` 21.9% (dqds, inverse iteration) and exact dots about 50% (`forward_suffix_rows` 13%). L19-s50/768 at HEAD: 158 iterations, 1401 CPU-s, 602 s wall, 1.62 GiB RSS. Λ35-rs/1024: 3.7 GiB RSS after 5 iterations. The local `inputs/L19-rs-768` is in fact L19-s50 (26 blocks, n 2405, m 57241, not resampled).
+- A8 (`~/.cache/sdpx-e2e/mulbench`, one Karatsuba level over 6- or 8-limb halves, every variant exact against `mpn_mul_n`; Mac loaded, ns per product):
+
+  | Limbs | T | GMP | rows | Karatsuba/GMP | Karatsuba/rows |
+  |---|---|---|---|---|---|
+  | 12 | 1 | 62.2 | 49.9 | 102.9 | 84.7 |
+  | 16 | 1 | 116.3 | 213.6 | 158.9 | 112.4 |
+  | 12 | 4 | 87.0 | 80.2 | 126.3 | 106.9 |
+  | 16 | 4 | 147.3 | 266.7 | 179.5 | 165.4 |
+
+  Karatsuba misses the ≥10% kernel gate at both widths (16 limbs: −3% at T=1, +12% at T=4). Rejected on this evidence; a quiet re-run is only for the record.
+- M4 (probe arm `m4-probe`, timers only, patch `~/.cache/sdpx-e2e/patches/m4m5-cone-probe.patch`; ising11/512 T=1, point `9c6cd0baca3a` unchanged, 54 it, 12.4 s): cone scaling 3.44 s (28%), of which SVD 2.63 s: dqds 0.98, inverse iteration 0.82, bidiagonalization 0.49, reflectors 0.28. The rest of the PSD scaling (two Cholesky, L₂ᵀL₁, R, R⁻¹, G, svec) is about 0.75 s. dqds runs 123 sweeps per SVD; inverse iteration takes 2.0 steps per vector.
+  Λ19-xml/512 T=4 (point `6a4625474ca9` unchanged, 105 it, 130.6 s wall; thread-seconds): cone SVD 105.3 = bidiagonalization 31.9, inverse iteration 28.5, reflectors 22.1, dqds 21.6. The rest of the PSD scaling is 34.5: R⁻¹ 13.9, two Cholesky 10.0, R 4.2, L₂ᵀL₁ 4.0, G 2.4, svec 0.5. IPM residual tail jobs in the same window take 22.1. Per SVD: 385 dqds sweeps, 27 vectors at 2.0 inverse-iteration steps each. So the SVD has no single dominant stage, and R⁻¹ costs more than both Cholesky factorizations together.
+
 ## 2026-10-16 — L-M1: two-chain row products for 5–12-limb mantissas on aarch64 (rejected, thermal-ore)
 
 - Observed (L-F1 sample, Λ19-xml-512 T=4): GMP's `addmul_1`/`mul_1`/`mul_basecase` take 22% of busy CPU. At 8 limbs `mpn_mul_n` runs one `addmul_1` per row, each a single carry chain.

@@ -207,8 +207,8 @@ Ranked by the Amdahl-bounded gain on the goal workloads per unit of effort (jour
 - **Tier A (Mac-local, in this order):**
   - A1 F64-SETUP/PRE-1 (B/P): split setup per stage on the sub-10 ms LPs, then charge the presolver's rational pass by operand limbs (brandy's pass is 35–85 ms of GMP gcd). Gate: brandy/bore3d Solved and audited; medium, ising11, csdr3 bitwise.
   - A2 F64-FAIL (P): diagnose, then fix hinf3, sched_100_50_orig, f64_large and csdr3 (Float64); +3 wins at 1 thread, +4 at 16 at today's speed.
-  - A3 F64-TRSV-1 (B): fused multi-column QDLDL solve (agg −5.6%, bnl1 −5.5% bound).
-  - A4 F64-PSDCOR-1 (O): binary64 PSD corrector right-hand side via dsyevr and one GEMM over the nonzero columns (arch0 15.5%, gpp124-1 14% shares).
+  - A3 F64-TRSV-1 (B): fused multi-column QDLDL solve (agg −5.6%, bnl1 −5.5% bound). **Merged 2026-10-16** (`dacb804`): points bitwise identical on 11 QDLDL inputs; Mac instructions −2.4…−6.1%. Kept provisionally (under 5% on the Mac); confirm with an x86 release ABBA on agg/bnl1.
+  - A4 F64-PSDCOR-1 (O): binary64 PSD corrector right-hand side via dsyevr and one GEMM over the nonzero columns (arch0 15.5%, gpp124-1 14% shares). **Merged 2026-10-16** (`e8bfd01`): audits pass, arch0 22/22 it and gpp124-1 24→22 it; Mac cycles −8.5% (arch0) and −21% (gpp124-1). Kept; confirm with an x86 release ABBA.
   - A5 F64-PSDREF (D): solves per iteration, outer refinements and offending rows on gpp100, gpp124-1, qap6, theta1.
   - A6 ITER-1 preparation (P): `sdpx-pmp2sdp` resamples by default (`--keep-samples` opts out), converter threads from cores within a memory cap.
   - A7 KKT-1 (P): x-first outer corrections in a decision-equivalent form. Only if the scoreboard keeps xml inputs (about 0 on resampled inputs).
