@@ -198,8 +198,10 @@ impl Write for Identity {
 }
 
 /// Runs `f` in a pool of `--threads` workers, or on the caller without one.
+/// One thread runs on the caller: a pool's extra thread would switch receipts
+/// of the single-threaded solve to CPU clocks (`receipt::cpu_clocks`).
 fn within_threads<R: Send>(threads: Option<u32>, f: impl FnOnce() -> R + Send) -> CliResult<R> {
-    Ok(match threads.filter(|&t| t > 0) {
+    Ok(match threads.filter(|&t| t > 1) {
         Some(threads) => rayon::ThreadPoolBuilder::new()
             .num_threads(threads as usize)
             .build()?
