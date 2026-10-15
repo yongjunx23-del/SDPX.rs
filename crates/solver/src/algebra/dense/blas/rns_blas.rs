@@ -362,6 +362,11 @@ pub(crate) fn with_split_hint<R>(ways: usize, f: impl FnOnce() -> R) -> R {
     result
 }
 
+/// Ways granted to this thread's current block ([`with_split_hint`]).
+pub(crate) fn split_hint() -> usize {
+    SPLIT_HINT.with(|c| c.get())
+}
+
 /// How one product is split. A top-level call (not on a rayon worker) with a
 /// pool splits across all primes. A call already running as a pool task is
 /// one of many concurrent block tasks: it stays serial unless its caller

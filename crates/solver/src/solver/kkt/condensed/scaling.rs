@@ -135,7 +135,14 @@ pub(super) fn apply_block<T: FloatT>(
                 y.axpby(c, w, T::one());
                 y.scale(*eta * *eta);
             }
-            Scaling::Ore(c) => c.mul_Hs(y, x, &mut []),
+            Scaling::Ore(c) => {
+                // As a PSD block: measured work sets the next call's ways,
+                // which split S₀⁻¹'s rows without changing any entry.
+                let a = action_index(&action);
+                let start = std::time::Instant::now();
+                with_split_hint(block.ways[a], || c.mul_Hs(y, x, &mut []));
+                block.cost[a] = start.elapsed().as_secs_f64() * block.ways[a] as f64;
+            }
             Scaling::Dense3(h) => {
                 let mut p = 0;
                 for j in 0..3 {

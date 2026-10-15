@@ -332,6 +332,7 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - 2026-10-15 (journal): exact diagonal congruences (owner border C·D⁻¹·Cᵀ, bound Gram) multiply 512-row blocks with 23-bit primes instead of 4096-row blocks with 21-bit primes. d6n640q −14.7% owner, −12.5% plain, −17.1% faer; fix-a −10…−13%; bitwise.
    - 2026-10-15 (journal): a cut-aware recursive leaf Y solve over the coupled columns was rejected. T=1 −3.8%, but T=4 +0.1% (Accelerate) and +1.9% (faer), two_L8 +1.7%, syn20 +3.5%. The column-parallel sweep is already balanced at 4 threads.
    - 2026-10-15 (journal): cone-queue helpers stay while a cone keeps posting items (each helped item moves the deadline to now plus the last slowest cone), and they yield the core when idle. A fixed deadline had left the ORE cone of a slower phase to run alone (2.97 s against 1.66 s helped). one_L12/128 (4 it) −8.1% T=4 faer, −5.7% T=8 and −7.8% T=16 Accelerate; ising11 neutral at T=10/16, −2.0% at T=24; bitwise. Wider generic-gemm primes and wider triangular tiles were probed: within noise.
+   - 2026-10-15 (journal): the ORE Hs product splits S₀⁻¹'s rows (bitwise), and condensed ORE blocks run under measured ways. one_L12/128 (4 it) −4.4% T=4 faer, −7.0% T=8 Accelerate; T=1 and two_L6/L8 are flat; syn20 −3.1%; bitwise. A parallel CRT fold for exact diagonal congruences was rejected on the Mac (−0.9% d6n640q owner); re-test it at 64 threads.
    - Next:
      - a full one_L12/128 solve with audit;
      - the S₀⁻¹ leaf factor from the cone's L⁻¹ (skip re-factoring the leaf);

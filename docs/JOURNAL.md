@@ -8,6 +8,40 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — ORE Hs product in row pieces; diagonal CRT fold rejected (thermal-ore)
+
+- Observed (one_L12/128, 4 iterations, T=4 faer, after the queue-helper change): `residual` takes 0.95 s at parallelism 1.1, and all of it is `residual.scale`. That phase is the ORE `hs_prod`, whose dense S₀⁻¹ product (order 1806, 3.3M multiply-adds, about 79 ms per call) ran on one thread. The combined shift calls it three times per iteration.
+- Hypothesis: `hs_prod` should split S₀⁻¹'s rows like the other ORE kernels. The condensed scaling block of an ORE cone should measure its cost and pass its ways like a PSD block.
+- Change:
+  - `hs_prod` forms S₀⁻¹v in row pieces (`pieces`). Each entry sums its columns in order, so the split changes nothing.
+  - The ORE `tasks` also honours ways granted to the calling block (`with_split_hint` on a pool thread).
+  - The condensed `apply_block` times the `Scaling::Ore` block and runs it under its measured ways.
+- E2E (ABBA against `f9a6d6d`, Mac, s):
+
+  | Case | A | B | Change |
+  |---|---|---|---|
+  | one_L12 T=4 faer | 18.04 / 18.08 | 17.28 / 17.23 | −4.4% |
+  | one_L12 T=8 Accelerate | 15.66 / 15.18 | 14.32 / 14.36 | −7.0% |
+  | one_L12 T=1 faer (2 rounds) | 41.87 / 41.84 / 42.23 / 42.12 | 42.59 / 42.11 / 43.08 / 42.14 | +1.1% (medians +0.3%) |
+  | two_L8 T=4 (8 it) | 11.01 / 11.59 | 11.32 / 11.43 | +0.7% |
+  | two_L6/256 T=4 | 2.867 / 2.866 | 2.851 / 2.849 | −0.6% |
+  | syn20/128 T=4 (single) | 14.40 | 13.95 | −3.1% |
+
+  - At T=4, `residual` drops 0.95 → 0.38 s and `combined rhs` 0.72 → 0.55 s.
+  - Every point is bitwise identical: one_L12 `aacd1c62ec43`, two_L8 `7fcb2f100169`, two_L6/256 Solved 105 `d47a20b519d8`, two_L4/128 and /256 Solved 46/85, syn20 Solved 50 `308c4f2d8829`, ising11 `17ec111261c7`.
+  - 507 lib tests pass.
+- Decision: kept. T=1 has one slow B leg per round and is otherwise flat.
+- Rejected, L-G5: a parallel CRT fold over outputs in `diag_congruence`. The serial `CrtAccumulator::add` was the Amdahl term of the owner border assembly (1.18 s of 29.4 s at T=10). Splitting it over outputs halves it (0.58 s) but leaves wall time flat on the Mac.
+
+  | Case (T=10) | A | B |
+  |---|---|---|
+  | d6n640q owner | 57.36 / 56.90 | 56.98 / 56.23 (−0.9%) |
+  | d6n640q plain | 55.34 / 55.52 | 55.05 / 55.91 (±0) |
+  | d6n640q owner faer | 69.20 / 69.30 | 69.30 / 68.92 (−0.2%) |
+  | fix-a owner T=4 | 6.86 / 6.68 | 6.74 / 6.66 (−0.6%) |
+
+  All four cases are bitwise. The patch is `lg5-crt-fold.patch`. Re-test it at 64 threads, where the serial term weighs more.
+
 ## 2026-10-15 — Cone-queue helpers stay while a cone posts (thermal-ore)
 
 - Observed (one_L12/128, 4 iterations, T=4, faer): the ORE S₀ inverse's LᵀL product (order 1806) takes 0.58 s per call in the solver but 0.33 s in an isolated 4-thread pool (3.15× over T=1).

@@ -32,11 +32,14 @@ use rayon::prelude::*;
 
 /// Tasks for `mul_adds` exact multiply-adds over `items` independent
 /// pieces: more than one only on a solver-pool lane with spare workers (the
-/// inner-parallel gate). Entries stay one dot each, so results do not depend
-/// on the split.
+/// inner-parallel gate) or with ways granted to the calling block
+/// (`with_split_hint` on a pool thread). Entries stay one dot each, so
+/// results do not depend on the split.
 fn tasks<T: FloatT>(mul_adds: usize, items: usize) -> usize {
     use sdpx_arithmetic::inner_parallel as ip;
-    ip::tasks(mul_adds as u128 * ip::weight(T::precision_bits() as usize), items)
+    let work = mul_adds as u128 * ip::weight(T::precision_bits() as usize);
+    let hint = rayon::current_thread_index().map_or(1, |_| crate::algebra::split_hint());
+    ip::tasks(work, items).max(ip::tasks_if(hint > 1, work, items).min(hint))
 }
 
 /// `f(k, piece)` over the `len`-element pieces of `out` (the last may be
@@ -1416,16 +1419,19 @@ impl<T: FloatT> OpRelEntropyCone<T> {
         let inv = data.μ.recip();
         svec(n, &b, &mut y[..m]);
         let m2 = 2 * m;
-        for i in 0..m2 {
-            y[m + i] = T::zero();
-        }
-        for j in 0..m2 {
-            let vj = v[m + j];
-            let col = &data.s0i[j * m2..(j + 1) * m2];
-            for i in 0..m2 {
-                y[m + i] += col[i] * vj;
+        // S₀⁻¹v in row pieces: each entry sums its columns in order, so
+        // the split does not change it.
+        let (vs, s0i) = (&v[m..3 * m], &data.s0i);
+        pieces::<T>(&mut y[m..3 * m], n, m2 * m2, |piece, rows| {
+            let i0 = piece * n;
+            rows.fill(T::zero());
+            for (j, &vj) in vs.iter().enumerate() {
+                let col = &s0i[j * m2 + i0..][..rows.len()];
+                for (y, &c) in rows.iter_mut().zip(col) {
+                    *y += c * vj;
+                }
             }
-        }
+        });
         y[..3 * m].iter_mut().for_each(|t| *t *= inv);
         for i in 0..m {
             y[i] += rows.dc[i] * y[m + i] + rows.dk[i] * y[2 * m + i];
