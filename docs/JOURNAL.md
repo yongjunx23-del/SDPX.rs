@@ -19,6 +19,19 @@ A read-only review (eight subsystem maps, two adversarial critiques) behind the 
 - Missing: no x86 run of any thermal-ore commit (L-X1, L-X2, L-G6, L-F1, L-D1, the exact-dot border factor), no HEAD profile at 768 or 1024 bits, no Float64 scoreboard since Oct 9.
 - Dropped in review: the √2-split quadratic (two CRTs at about 3P bits against one at 4P: kernel net about +2.75%), pre-image step bounds through corrections and skipping the dead affine z congruence (≤1.7%), an 8-limb Karatsuba (GMP crossover 26 limbs on M1).
 
+## 2026-10-16 — B0: thermal-ore on x86 against v0.9.2 (measurement, thermal-ore)
+
+- Setup: thermal-ore `395a3b6` (L-X1, L-X2, L-G6, L-F1, L-D1, A3, A4 and the earlier thermal-ore kernels; A1 and A6 came later) archived (sha256 `344b1248`) and built as `bin/sdpx-to1` (job 226040, `t6bld.pbs`, GMPHOST, +fma, the v0.9.2 RUSTFLAGS). A is the deployed v0.9.2 release binary (`39d7026`, sha256 `3caa3877`, `bin/sdpx-rel092`). ABBA job 226045 ran on node26 (exclusive, `mc/abba.pbs`, 64 threads, `mc/settings-full.json`, OPENBLAS 1, `SDPX_INT_GEMM=faer`). The first attempt (226041, ppn=64 without a host) died with −9 before starting, the site's refused-request signature.
+
+  | Case | A1 / A2 (s) | B1 / B2 (s) | Iterations | Change of means |
+  |---|---|---|---|---|
+  | Λ35-rs/1024 | 608.1 / 610.8 | 601.0 / 606.1 | 347 / 347 | −1.0% |
+  | Λ27-s50c/768 | 126.8 / 128.0 | 125.4 / 125.8 | 170 / 170 | −1.4% |
+
+- The points differ (rounding-order changes) and the objectives agree to every printed digit. Audits of B1 (226046, `t17aud.pbs`): Λ35-rs accepted (primal 3.2e-130, dual 1.2e-142, gap 4.0e-43, map 4.0e-42); Λ27-s50c accepted (primal 1.0e-91, dual 1.3e-86, gap 3.0e-59, map 6.2e-31). Peak RSS on Λ35-rs: 8.27 GB (A) and 8.29 GB (B).
+- Per-iteration phases (Λ35-rs, A → B, s/it): scale cones 0.362 → 0.348, residual update 0.387 → 0.372, KKT update 0.928 → 0.918, KKT solve 0.322 → 0.328. The cone and residual kernels carry over; the KKT phases are flat.
+- Reading: at 64 threads the thermal-ore kernel gains convert to about 1% of wall, as the cost map predicted (critical-path phase wall bounds them). This confirms none of the Mac kernel numbers individually. The kernels stay, since none regresses on x86. L-M1-class 768-bit product work would need an x86 kernel (B4) to move these cases.
+
 ## 2026-10-16 — Task 17 G: the converter resamples by default (kept, thermal-ore)
 
 - Change (agent A6, `34e6283`, `crates/pmp`): `sdpx-pmp2sdp` resamples PyCFTBoot/SDPB.m explicit-sample blocks by default, and `--keep-samples` opts out. `--resample` is removed; no script used it. Without `--threads`, the converter uses the available cores whose estimated memory (8× the mean input block bytes per worker) fits in half the physical RAM. Measured per-worker memory is about 2× under that estimate on Λ19 and 3.5× under on Λ27. `convert_file` returns `(blocks, workers)`, and `threads == 0` means the default. The precision default stays 768.
