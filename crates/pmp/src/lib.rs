@@ -190,7 +190,7 @@ impl PolynomialMatrixProgram {
 struct Prepared<T> {
     norm: Vec<T>,
     pivot: usize,
-    /// Replace explicit sample points by the SDPB 3.1 rule (`--resample`).
+    /// Replace explicit sample points by the SDPB 3.1 rule (the CLI default).
     resample: bool,
 }
 

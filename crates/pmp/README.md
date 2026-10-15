@@ -11,10 +11,17 @@ cargo build --locked --release -p sdpx-pmp
 ```
 
 Use `--threads 8` to convert up to eight independent blocks concurrently.
-The default is one worker. The CLI reads blocks as workers become available.
-Each worker holds one input block and writes output row by row. Choose fewer
-workers when memory is limited. Output is identical across thread counts.
-Single-block inputs use one worker.
+By default the CLI uses the available cores whose estimated memory, eight
+times the mean input block size each, fits in half the physical RAM. The CLI
+reads blocks as workers become available. Each worker holds one input block
+and writes output row by row. Choose fewer workers when memory is limited.
+Output is identical across thread counts. Single-block inputs use one worker.
+
+Blocks given as explicit sample points and scalings r^x/Π(x−p),
+r = 3−2√2, with no prefactor (PyCFTBoot, SDPB.m XML) are resampled by
+default: they take SDPB 3.1 sample points and bilinear bases from their
+recovered prefactor, which must reproduce every given scaling.
+`--keep-samples` keeps the given points, scalings and bases instead.
 
 Input: SDPB JSON or legacy XML. Output: a new, uncompressed SDP directory.
 Existing paths are refused. The CLI supports MPFR at 128, 256, 512, 768 or 1024 bits by default —
@@ -73,10 +80,9 @@ fn main() -> sdpx_pmp::Result<()> {
 ```
 
 The library also provides `write_sdp_with_threads::<Bits768>(path, 8)`.
-For bounded input memory, use `sdpx_pmp::convert_file::<Bits768>(input, output, 8, false)`;
-with `true` (CLI `--resample`), blocks given as explicit sample points and
-scalings r^x/Π(x−p), r = 3−2√2 (PyCFTBoot, SDPB.m XML), get SDPB 3.1 points and
-bases from their recovered prefactor.
+For bounded input memory, use `sdpx_pmp::convert_file::<Bits768>(input, output, 8, true)`;
+it returns the block and worker counts. Threads `0` selects the CLI default;
+`true` resamples as the CLI does by default, `false` is `--keep-samples`.
 It scans the header, then converts blocks without retaining the whole program.
 JSON and XML field order is unrestricted. Conversion keeps
 MPFR coefficients for one matrix entry per worker and never expands PSD

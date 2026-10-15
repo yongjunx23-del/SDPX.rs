@@ -1,5 +1,5 @@
 //! Recover a block's damped-rational prefactor from explicit sample points
-//! and scalings, so the SDPB 3.1 rule can choose new points (`--resample`).
+//! and scalings, so the SDPB 3.1 rule can choose new points (the CLI default).
 //!
 //! PyCFTBoot and SDPB.m XML give s_k = c·r^x_k / Π_i (x_k − q_i) with
 //! r = 3 − 2√2 and no prefactor. Then v(x) = r^x / s is a polynomial whose
