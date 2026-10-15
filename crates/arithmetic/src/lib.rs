@@ -687,7 +687,9 @@ impl<const N: usize> MpFloat<N> {
     /// One exact product plus an exact addend in a bounded limb window.
     #[inline]
     fn fma_regular(&self, a: &Self, b: &Self) -> Option<Self> {
-        if N > exactdot::SCHOOLBOOK_N
+        // The lean window below beats `mpfr_fma` through 16 limbs on Apple M4
+        // (512 bits 13%, 768 bits 11%, 1024 bits 2% per FMA).
+        if N > 16
             || [self, a, b]
                 .iter()
                 .any(|v| v.kind.abs() != mpfr::REGULAR_KIND)
@@ -713,6 +715,13 @@ impl<const N: usize> MpFloat<N> {
         let scale = sp.min(sb);
         let sx = (self.kind < 0) != (a.kind < 0);
         let sy = b.kind < 0;
+        if d <= p {
+            return Self::fma_low(&self.limbs, &a.limbs, &b.limbs, sx, sy, d, sp);
+        }
+        if N > exactdot::SCHOOLBOOK_N {
+            // Shifting the full product loses to MPFR above the inlined product.
+            return None;
+        }
         Some(exactdot::with_limbs::<N, _>(|xb| {
             exactdot::with_limbs::<N, _>(|yb| {
                 let w = 2 * N + 2;
@@ -732,6 +741,132 @@ impl<const N: usize> MpFloat<N> {
                 Self::add_exact_limbs(xb, sx, yb, sy, scale)
             })
         }))
+    }
+    /// `fma_regular` when the product's low end sets the scale (`d <= p`).
+    /// The full product stays in place and only the N+1 limbs that the
+    /// shifted addend touches are added, so the product is never shifted.
+    /// One nearest-even rounding reads the top limbs and a sticky scan;
+    /// results outside MPFR's exponent range return `None` for MPFR.
+    #[inline(always)]
+    fn fma_low(
+        x: &[u64; N],
+        y: &[u64; N],
+        z: &[u64; N],
+        sx: bool,
+        sy: bool,
+        d: i64,
+        scale: i64,
+    ) -> Option<Self> {
+        exactdot::with_limbs::<N, _>(|buf| {
+            let w = 2 * N + 2;
+            let buf = &mut buf[..w];
+            exactdot::mul_limbs::<N>(x, y, &mut buf[..2 * N]);
+            // The addend is z·2^s with s = p - d in [0, p+127]: limbs q..=q+N,
+            // added by GMP's assembly over the N limbs it overlaps.
+            let s = (64 * N as i64 - d) as usize;
+            let (q, r) = (s / 64, (s % 64) as u32);
+            // The sum is below 2^(128N+128), so carries and borrows stay
+            // inside the 2N+2 limbs.
+            let mut lane = *z;
+            // SAFETY: `lane` and `z` are distinct N-limb arrays and 0 < r < 64.
+            let top = if r == 0 {
+                0
+            } else {
+                unsafe { gmp::mpn_lshift(lane.as_mut_ptr(), z.as_ptr(), N as _, r) }
+            };
+            // SAFETY: q <= N + 1, so limbs q..q+N lie inside the 2N+2-limb buffer;
+            // GMP allows the destination to equal the first source.
+            let at = unsafe { buf.as_mut_ptr().add(q) };
+            let negative = if sx == sy {
+                let c = unsafe { gmp::mpn_add_n(at, at, lane.as_ptr(), N as _) };
+                let (mut i, mut carry) = (q + N, top + c);
+                while carry != 0 {
+                    let (v, o) = buf[i].overflowing_add(carry);
+                    buf[i] = v;
+                    carry = o as u64;
+                    i += 1;
+                }
+                sx
+            } else {
+                let b = unsafe { gmp::mpn_sub_n(at, at, lane.as_ptr(), N as _) };
+                let (mut i, mut borrow) = (q + N, top + b);
+                while borrow != 0 && i < w {
+                    let (v, o) = buf[i].overflowing_sub(borrow);
+                    buf[i] = v;
+                    borrow = o as u64;
+                    i += 1;
+                }
+                if borrow != 0 {
+                    // The addend dominates: two's-complement negation.
+                    unsafe { gmp::mpn_neg(buf.as_mut_ptr(), buf.as_ptr(), w as _) };
+                    sy
+                } else {
+                    sx
+                }
+            };
+            let Some(t) = buf.iter().rposition(|&l| l != 0) else {
+                return Some(Self::default());
+            };
+            let p = 64 * N as i64;
+            let bits = 64 * t as i64 + 64 - buf[t].leading_zeros() as i64;
+            let mut shift = bits - p;
+            let mut limbs = [0u64; N];
+            if shift <= 0 {
+                let k = (-shift) as usize;
+                let (kq, kr) = (k / 64, (k % 64) as u32);
+                for i in kq..N {
+                    let src = i - kq;
+                    let hi = if kr != 0 && src > 0 {
+                        buf[src - 1] >> (64 - kr)
+                    } else {
+                        0
+                    };
+                    limbs[i] = (buf[src] << kr) | hi;
+                }
+            } else {
+                let (sq, sr) = ((shift / 64) as usize, (shift % 64) as u32);
+                for (l, limb) in limbs.iter_mut().enumerate() {
+                    let hi = if sr != 0 && sq + l + 1 < w {
+                        buf[sq + l + 1] << (64 - sr)
+                    } else {
+                        0
+                    };
+                    *limb = (buf[sq + l] >> sr) | hi;
+                }
+                let rb = (shift - 1) as usize;
+                let (rq, rr) = (rb / 64, rb % 64);
+                if (buf[rq] >> rr) & 1 == 1
+                    && (limbs[0] & 1 == 1
+                        || buf[rq] & ((1u64 << rr) - 1) != 0
+                        || buf[..rq].iter().any(|&v| v != 0))
+                {
+                    let mut carry = true;
+                    for limb in limbs.iter_mut() {
+                        let (v, o) = limb.overflowing_add(carry as u64);
+                        *limb = v;
+                        carry = o;
+                        if !carry {
+                            break;
+                        }
+                    }
+                    if carry {
+                        limbs[N - 1] = 1u64 << 63;
+                        shift += 1;
+                    }
+                }
+            }
+            let exponent = scale + shift + p;
+            let (emin, emax) = unsafe { (mpfr::get_emin() as i64, mpfr::get_emax() as i64) };
+            if exponent < emin || exponent > emax {
+                return None;
+            }
+            let kind = if negative {
+                -mpfr::REGULAR_KIND
+            } else {
+                mpfr::REGULAR_KIND
+            };
+            Some(Self::exact_decode(kind, exponent, limbs))
+        })
     }
     #[inline(always)]
     fn shift_exact_limbs(limbs: &mut [u64], shift: usize) {

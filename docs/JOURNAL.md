@@ -8,6 +8,24 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — L-F1: lean exact FMA at 512–1024 bits (kept, thermal-ore); inline Comba product refuted
+
+- Observed (Λ19-xml-512, T=4, `sample` of `sdpx-g6b`, 88k busy samples): GMP's `addmul_1`/`mul_1`/`mul_basecase` take 22% of busy CPU. They are the 8-limb products inside exact dots, `MpFloat` products and `mpfr_fma`. `mpfr_fma` is 16% inclusive: the bidiagonal reduction and reflectors of the cone SVD (`svd.*` 57.5 thread-s of 230) are FMA-bound. `fma_regular` covered only N ≤ 4; its shifted-window path was slower than `mpfr_fma` at N ≥ 8.
+- Change (`crates/arithmetic/src/lib.rs`): for N ≤ 16 and `d = e(x·y) − e(z) ≤ p`, the new `fma_low` keeps the 2N-limb product in place. GMP assembly adds or subtracts the shifted N-limb addend (`mpn_lshift` + `mpn_add_n`/`mpn_sub_n`, with `mpn_neg` when the addend dominates), and one nearest-even rounding reads the top limbs plus a sticky scan. Wider spreads above N = 4 go to MPFR. Results equal `mpfr_fma` bit for bit; a new test, `exact_fma_matches_mpfr_bitwise`, covers N = 4/8/12/16 at exponent spreads 4/64/600, plus exact, one-ulp-above and one-ulp-below cancellations against the rounded product.
+- Microbench (M4, per FMA vs `mpfr_fma`): N = 8 −13%, N = 12 −11%, N = 16 −2%.
+- E2E (ABBA, Mac, fast profile; every point identical):
+
+  | Case | A `sdpx-g6b` | B `sdpx-f1` | Change | Cycles | Instructions |
+  |---|---|---|---|---|---|
+  | Λ19-xml-512 T=4 (Solved 105, d0b8cb9b611e), 4+4 | 62.62 s | 62.05 s | −0.9% (pairs +0.1/−1.5/−3.0/+0.6) | −2.3% | −5.0% |
+  | ising11 512 T=1 (Solved 54, 17ec111261c7), 4+4 | 8.26 s | 8.00 s | −3.2% (all pairs −1.6…−5.2) | −2.6% | — |
+  | ising11 512 T=2, 4+4 | 4.33 s | 4.29 s | −0.8% (median pair −1.5) | −2.6% | — |
+
+  The final build (MPFR for `d > p` above N = 4) reproduces both hashes.
+- Decision: kept. The change is bitwise identical, and CPU work falls 2.3–2.6% on both inputs. Wall time falls 3.2% at one thread per rank, the layout of the cluster's MPI runs; at T=2/T=4 on the Mac the gain is within noise.
+- Refuted alongside: a Rust Comba (column-sum) 8-limb product took 63.5 ns against GMP `mpn_mul_n` 20.0 ns; a row-wise schoolbook took 25.3 ns. GMP stays the product kernel at N ≥ 8.
+- Other Λ19 leaves for later: `mpfr_div` is 6.6% (dqds and inverse iteration; reciprocal pivots do not pay at two solves per vector); `group_residues` reduce is 4.6%; √2 svec conversions in the PSD W-products are 1.8%.
+
 ## 2026-10-15 — L-G7: parallel residue-cache encode for the constant border operand (rejected, thermal-ore)
 
 - Observed (d6n640q/128 owner receipt): the first `owned.border_assemble` takes 1.0–2.4 s against a 0.66 s median, at about 2 busy cores. `ResidueCache::from_view_blocked` encodes 32768-entry blocks one after another. Only `chunk_matrix` takes the split; `group_residues` and the 24-bit packing run on the caller.

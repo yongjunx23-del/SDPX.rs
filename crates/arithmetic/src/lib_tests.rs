@@ -914,3 +914,73 @@ fn chunked_exact_dot_rejects_incomplete_scheduler() {
         assert!(result.is_err(), "skipped pass {skipped_pass}");
     }
 }
+
+fn check_exact_fma<const N: usize>(spread: u64) {
+    let mut s = 0x9e3779b97f4a7c15u64 ^ (N as u64 * 7919) ^ spread;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let vals: Vec<MpFloat<N>> = (0..1024)
+        .map(|_| {
+            let mut limbs = [0u64; N];
+            limbs.iter_mut().for_each(|l| *l = next());
+            limbs[N - 1] |= 1 << 63;
+            if next() % 5 == 0 {
+                // Short mantissas, so some sums cancel exactly.
+                limbs[..N / 2].iter_mut().for_each(|l| *l = 0);
+            }
+            let kind = if next() & 1 == 0 {
+                mpfr::REGULAR_KIND
+            } else {
+                -mpfr::REGULAR_KIND
+            };
+            MpFloat::<N> {
+                limbs,
+                kind,
+                exponent: ((next() % (2 * spread + 1)) as i64 - spread as i64) as mpfr::exp_t,
+            }
+        })
+        .collect();
+    let mpfr_fma = |a: &MpFloat<N>, b: &MpFloat<N>, c: &MpFloat<N>| {
+        let (x, y, z) = (a.descriptor(), b.descriptor(), c.descriptor());
+        MpFloat::<N>::output(|r| unsafe {
+            mpfr::fma(r, &x, &y, &z, ROUND);
+        })
+    };
+    let check = |a: &MpFloat<N>, b: &MpFloat<N>, c: &MpFloat<N>| {
+        let got = a.mul_add(*b, *c);
+        let want = mpfr_fma(a, b, c);
+        // The sign of a zero is significant; its exponent and limbs are not.
+        assert_eq!(got.kind, want.kind, "N={N} spread={spread}");
+        if got.kind.abs() == mpfr::REGULAR_KIND {
+            assert_eq!(
+                (got.exponent, got.limbs),
+                (want.exponent, want.limbs),
+                "N={N} spread={spread}"
+            );
+        }
+    };
+    for w in vals.windows(3) {
+        check(&w[0], &w[1], &w[2]);
+        // The addend cancels the rounded product's leading bits (or all of
+        // it), exercising the borrow, negation and exact-zero paths.
+        let cancel = -(w[0] * w[1]);
+        check(&w[0], &w[1], &cancel);
+        let ulp = MpFloat::<N>::epsilon() * cancel.abs();
+        check(&w[0], &w[1], &(cancel + ulp));
+        check(&w[0], &w[1], &(cancel - ulp));
+    }
+}
+
+#[test]
+fn exact_fma_matches_mpfr_bitwise() {
+    for spread in [4, 64, 600] {
+        check_exact_fma::<4>(spread);
+        check_exact_fma::<8>(spread);
+        check_exact_fma::<12>(spread);
+        check_exact_fma::<16>(spread);
+    }
+}
