@@ -8,6 +8,61 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — L-G7: parallel residue-cache encode for the constant border operand (rejected, thermal-ore)
+
+- Observed (d6n640q/128 owner receipt): the first `owned.border_assemble` takes 1.0–2.4 s against a 0.66 s median, at about 2 busy cores. `ResidueCache::from_view_blocked` encodes 32768-entry blocks one after another. Only `chunk_matrix` takes the split; `group_residues` and the 24-bit packing run on the caller.
+- Change: ways claim whole blocks and encode each one serially, writing their disjoint residue slots in place. The store is identical bit for bit.
+- Probe (`SDPX_PROFILE=1`, 1 iteration, 2 runs each, 29 primes, T=4): `rns.cache.rebuild` 0.505 / 0.477 s → 0.359 / 0.440 s. Serial time inside it fell 0.42 → 0.055 s, but CPU rose 0.60 → 0.78–0.97 s: four ways share the AMX unit and memory bandwidth.
+- Why it did not pay: the cache is built once per solve (29 primes cover the 21–28 the Gram needs). About 0.1 s saved is 0.7% of an 8-iteration d6q run and less on a full solve.
+- Decision: rejected (well under the 2% bar). Patch `~/.cache/sdpx-e2e/patches/lg7-parallel-cache-encode-rejected.patch`. On 64-thread nodes it saves at most the 0.4 s serial share, once per solve.
+
+## 2026-10-15 — L-G6: aligned recursive blocks for the exact diagonal-congruence triangle (kept, thermal-ore)
+
+- Observed (d6n640q/128 owner receipt, T=4): `owned.border_assemble` takes 7.96 s of the 11.1 s IP wall. Each (512-row block, prime) unit covered the 640 × 640 upper triangle with 20 tiles of 32 columns at full height (up to 640 × 32 × 512 per call).
+- Hypothesis: larger off-diagonal products would cut per-call packing and kernel overhead at the same multiply count.
+- First try (square diagonal leaves, halves at n/2, leaf ≤ 64): d6q instructions −1.7…−2.1%, but fix-a (border about 100 columns) was +1.7…+2.9% slower over 6 runs per arm. The 50-wide square leaves do 15% more multiplies than 32-column tiles, and off-grid shapes run slowly on AMX.
+- Microbench (`gr3.c`, 4 concurrent Accelerate ways, k = 512, min of 7 rounds, ms per triangle):
+
+  | m | 32-col tiles | square leaves | aligned + 32-col leaves |
+  |---|---|---|---|
+  | 101 | 0.085–0.087 | 0.098–0.099 | 0.084–0.085 |
+  | 200 | 0.256–0.262 | 0.300–0.321 | 0.237–0.251 |
+  | 320 | 0.599–0.608 | 0.604–0.628 | 0.584–0.605 |
+  | 640 | 2.318–2.350 | 2.270–2.292 | 2.062–2.144 |
+  | 1024 | 6.120–6.148 | 5.380–5.445 | 5.322–5.368 |
+
+- Change (`rns_blas.rs`, `upper_blocks`): halves are cut at a multiple of 32 columns, and each off-diagonal rectangle is one product. Diagonal leaves (≤ 64 wide) use 32-column tiles of the rows above them, so the multiply count equals plain 32-column tiles. `diag_congruence` sizes its scratch to the largest block. Modular sums are exact, so results are bitwise identical.
+- E2E (ABBA against `7cb59b3`, Mac T=4, fast profile, solve s medians; every point identical):
+
+  | Case | A | B | Change | Instructions |
+  |---|---|---|---|---|
+  | d6q owner 8 it (a50df3c3265d), 4 rounds | 11.69 | 11.75 | +0.5% (noise; B min 10.96 vs 11.18) | −1.8% |
+  | d6q plain 8 it (5772c472b62f) | 13.29 | 11.79 | −11.3% | −2.3% |
+  | d6q owner, `SDPX_INT_GEMM=faer` | 18.91 | 17.87 | −5.5% | −4.1% |
+  | fix-a 256 owner (Solved 25) | 6.74 | 6.55 | −2.8% | −0.2% |
+  | fix-a 256 plain (Solved 25) | 5.29 | 5.19 | −1.8% | −0.2% |
+  | csdr3 256 (Solved 36) | 3.61 | 3.43 | ±noise | −0.1% |
+
+  Mac load was 3–5 throughout. Wall swings between runs reached ±15%; retired instructions moved less than 0.5% between runs.
+- Decision: kept. Instructions fall on every case, d6q falls 2–4% under both kernels, and fix-a no longer regresses. The generic upper-triangle path (`prime_columns`, used by `gemm_blocks_upper`) keeps 32-column tiles for now.
+
+## 2026-10-15 — L-X3: bounded single-pass exact dots for adjoint columns (rejected, thermal-ore)
+
+- Observed (d6n640q/128, owner, T=4, `sample` after L-X2): `SparseParallel::output` → `wide_output` → `exactdot::dot` on transposed columns with ≥4 entries takes 1981 samples, about 8% of busy CPU. Each dot first collects pointer pairs while scanning exponents, then accumulates.
+- Hypothesis: the L-X2 trick applies per column. Plan-time column exponent ranges plus one O(m) pass over x give a range for every term. The dot can then accumulate in one guarded pass without collecting or scanning.
+- Change (patch `~/.cache/sdpx-e2e/patches/lx3-bounded-adjoint-rejected.patch`):
+  - `exactdot::dot_bounded`, exposed as `Scalar::dot_fma_bounded`. It runs one guarded pass and falls back to `dot` on a miss or a non-finite term.
+  - `wide_output` gains an optional bound, widened by the head term.
+  - `SparseParallel` records `column_exponents` at configure, and `output_in` passes the bound for exact adjoint columns.
+  - Tests: bounded dots against `dot_fma` for exact, wide, stale and empty bounds, and an adjoint parity case in `long_row_parity`. A deliberately broken kernel made both tests fail.
+- Evidence:
+  - Temporary counters on d6q owner: more than 2^20 bounded calls, 0 misses.
+  - Retired instructions (`/usr/bin/time -l`): fix-a 256 owner 365.6G → 362.5G (−0.85%); d6q owner 8 it 538.5/541.2G vs 535.6/545.8G (±1%).
+  - Samples under `with_head`: 2044 before, 2151 after (1469 bounded, 589 plain `dot` where the column×x range is too wide for the accumulator).
+  - The wall ABBA was dominated by Mac load (±15% between runs). Every point was identical.
+- Why it did not pay: these columns are short, so the dot cost is the per-term product and slot adds, not the exponent scan. A range from the whole of x is also much wider than a column's actual terms, so accumulators grow.
+- Decision: rejected (well under the 2% bar). Reverted.
+
 ## 2026-10-15 — L-X2: long-row exact products without an exponent scan (kept, thermal-ore)
 
 - Observed (d6n640q/128, owner, T=4, `sample` after L-X1): `dot_outputs_chunked` takes 3226 of 20656 busy samples. 1106 of them are its first pass, which reads every term only for its exponent before the accumulation pass reads them again. Each A entry is a 32-byte MpFloat, and the long rows hold about 10.7M entries, so the scan streams all of A once more for each product.

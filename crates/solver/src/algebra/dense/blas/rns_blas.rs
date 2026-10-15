@@ -2411,6 +2411,36 @@ fn round_slots<const N: usize>(slots: &[i128], scale: i64, mag: &mut Vec<u64>) -
 /// 4096; 128 rows (24 bits) were slower again.
 const DIAG_BLOCK_ROWS: usize = 512;
 
+/// Widest diagonal leaf of [`upper_blocks`].
+const TRIANGLE_LEAF: usize = 64;
+
+/// `(rows, columns)` rectangles covering the upper triangle of an `n × n`
+/// product over `range`: each halving, cut at a multiple of 32 columns,
+/// takes the off-diagonal rectangle whole, so most products are large, and
+/// the diagonal leaves (at most [`TRIANGLE_LEAF`] wide) go in 32-column
+/// tiles of the rows above them, with the multiplies of plain 32-column
+/// tiles. Against those tiles at full height, four concurrent Accelerate
+/// ways ran a 512-row block 1–7% faster for m = 101…320 and 8–13% for
+/// m = 640…1024; square leaves and unaligned halves were 15% slower at
+/// m ≤ 200.
+fn upper_blocks(
+    range: std::ops::Range<usize>,
+    out: &mut Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>,
+) {
+    const TILE: usize = 32;
+    if range.len() <= TRIANGLE_LEAF {
+        for j0 in range.clone().step_by(TILE) {
+            let j1 = (j0 + TILE).min(range.end);
+            out.push((range.start..j1, j0..j1));
+        }
+        return;
+    }
+    let half = range.start + (range.len() / 2).next_multiple_of(TILE);
+    upper_blocks(range.start..half, out);
+    out.push((range.start..half, half..range.end));
+    upper_blocks(half..range.end, out);
+}
+
 /// Correctly rounded `Aᵀ·diag(d)·A` (`m × m`) for a column-major `k × m`
 /// operand `A` (leading dimension `k`), written as `out[i + j·m]`. Each
 /// entry is the exact sum `Σ_r a_ri·d_r·a_rj` rounded once. `A` is meant to
@@ -2505,10 +2535,20 @@ pub(super) fn diag_congruence<const N: usize>(
     let mut total = take_buffer(count * outputs);
     let sums: Vec<Mutex<&mut [f64]>> = total.chunks_mut(outputs).map(Mutex::new).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut blocks = Vec::new();
+    if upper_only {
+        upper_blocks(0..m, &mut blocks);
+    } else {
+        blocks.push((0..m, 0..m));
+    }
+    let largest = blocks
+        .iter()
+        .map(|(r, c)| r.len() * c.len())
+        .max()
+        .unwrap_or(0);
     run_ways(&split, ways, |_| {
         let (mut ab, mut cb) = (take_scratch(rows_per * m), take_scratch(rows_per * m));
-        let tile = if upper_only { 32 } else { m };
-        let mut u = take_scratch(m * tile.min(m));
+        let mut u = take_scratch(largest);
         let claimed = std::iter::from_fn(|| {
             let unit = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (unit < units).then(|| (unit / count, unit % count))
@@ -2537,34 +2577,36 @@ pub(super) fn diag_congruence<const N: usize>(
             // The prime width bounds one block: every block of at most
             // `DIAG_BLOCK_ROWS` rows fits one product.
             debug_assert!(rows <= plan.k_chunk);
-            for j0 in (0..m).step_by(tile) {
-                let cols = tile.min(m - j0);
-                let height = if upper_only { j0 + cols } else { m };
+            for (r, c) in &blocks {
+                let (height, cols) = (r.len(), c.len());
                 int_gemm(
                     b'T',
                     b'N',
                     height,
                     cols,
                     rows,
-                    &ab,
+                    &ab[r.start * rows..],
                     rows,
-                    &cb[j0 * rows..],
+                    &cb[c.start * rows..],
                     rows,
                     &mut u[..height * cols],
                     height,
                 );
                 let mut sum = sums[q].lock().unwrap();
-                for j in 0..cols {
-                    let end = if upper_only { j0 + j + 1 } else { height };
-                    let column = j0 + j;
+                for (j, column) in c.clone().enumerate() {
+                    let end = if upper_only {
+                        r.end.min(column + 1)
+                    } else {
+                        r.end
+                    };
                     let offset = if upper_only {
                         column * (column + 1) / 2
                     } else {
                         column * m
                     };
-                    for i in 0..end {
+                    for i in r.start..end {
                         let x = &mut sum[offset + i];
-                        *x = reduce(*x + reduce(u[j * height + i], p, pinv), p, pinv);
+                        *x = reduce(*x + reduce(u[j * height + i - r.start], p, pinv), p, pinv);
                     }
                 }
             }
