@@ -19,6 +19,35 @@ A read-only review (eight subsystem maps, two adversarial critiques) behind the 
 - Missing: no x86 run of any thermal-ore commit (L-X1, L-X2, L-G6, L-F1, L-D1, the exact-dot border factor), no HEAD profile at 768 or 1024 bits, no Float64 scoreboard since Oct 9.
 - Dropped in review: the √2-split quadratic (two CRTs at about 3P bits against one at 4P: kernel net about +2.75%), pre-image step bounds through corrections and skipping the dead affine z congruence (≤1.7%), an 8-limb Karatsuba (GMP crossover 26 limbs on M1).
 
+## 2026-10-16 — B2 same-node A/B against v0.9.2; one-thread input pool removed (kept, thermal-ore)
+
+- Same-node interleaved A/B (node9, `t13ab.pbs`, receipts on as in the scoreboard, 5 reps, median API ms ratio B/A). A is v0.9.2 (`bin/sdpx-rel092`). B is `fd5a3b6` (thermal-ore with A1 and A3, A4 reverted; `bin/sdpx-to4`, job 226052):
+
+  | Case | T=1 | T=16 |
+  |---|---|---|
+  | LP_brandy | 0.234 | 0.329 |
+  | LP_bore3d | 0.351 | 0.612 |
+  | LP_recipe | 0.834 | 0.758 |
+  | LP_beaconfd | 0.748 | 0.887 |
+  | LP_bnl1 | 0.884 | 0.694 |
+  | LP_agg | 0.964 | 0.889 |
+  | SOCP_nb_L1 | 0.835 | 0.832 |
+  | SOCP_sched_50_50_orig | 0.901 | 0.912 |
+  | SOCP_sched_100_100_orig | 0.875 | 0.873 |
+  | SOCP_nql60 | 0.949 | 0.993 |
+  | SOCP_nb | 0.979 | 0.975 |
+  | SDP arch0, gpp100, gpp124-1, gpp250-1, qap6, theta2 | 1.000–1.016 | 0.958–1.017 |
+  | SDP_theta1 | 1.042 | 1.220 |
+  | LP_afiro | 1.234 | 1.000 |
+  | SOCP_sambal | 1.223 | 1.014 |
+  | SDP_hinf2 | 1.129 | 0.953 |
+  | LP_sc105 | 1.111 | 0.940 |
+
+  gpp250-1 is Solved again. The earlier int6-vs-`2709067` A/B (226047, with A4) had shown gpp100 1.76 and gpp124-1 0.54 at T=1; A4's iteration changes are gone with the revert.
+- Tiny-case T=1 slowdowns (+0.3–0.9 ms): every extra millisecond sits in `cpu.*` receipt phases that v0.9.2 does not record. L-P2 (`913a1f4`) reads inputs inside a `--threads` rayon pool. At `--threads 1` that pool's worker makes the process two-threaded, so `receipt::cpu_clocks` samples CPU clocks per timer (A1 measured 170–290 ns per read on M4). Fix (`211a192`): `within_threads` runs on the caller below two threads. It is Linux-only in effect (`process_threads` is None on macOS). Medium passes.
+- Recheck (job 226054, node9, T=1, 7 reps, v0.9.2 vs `211a192`): afiro 1.003, sc105 0.939, sambal 1.002, truss4 1.009, hinf2 1.018, control1 0.989; recipe 0.735, bore3d 0.434, brandy 0.221, bnl1 0.845, sched_50_50_orig 0.877. Decision: fix kept.
+- Open: SDP_theta1 at T=16 is 1.22 (one 5-rep A/B; its T=1 is 1.04). Check it before the next Float64 scoreboard. A1 and A3 meet their keep bar on x86. A3's own cases (agg, bnl1, sched, nql60) gain 4–13% at T=1, but this A/B cannot separate A3 from A1 and the main-line changes since v0.9.2.
+
 ## 2026-10-16 — B2: x86 Float64 scoreboard of `2709067`; F64-PSDCOR-1 reverted (thermal-ore)
 
 - Scoreboard (job 226044, node30, `t7/t9run2.pbs`, 58 cases at 1 and 16 threads, native_oracle audits; compared against t16b in `t7/to2-compare.md`): 54 audited solves on both sides, 0 Solved-but-fail, 39 strict passes on both. Iterations over 53 common cases: 756 → 756 (T=1). Two cases flip: SDP_hinf3 fail → audited win (Solved/15 at T=1 and T=16), and SDP_gpp250-1 Solved/20 → AlmostSolved/39 (r_d 3.5e-6; win → fail at T=1). Wins vs MOSEK: T=1 19 → 17, T=16 12 → 12. The cross-node time ratios (T=1 1.016, T=16 0.873) are not timings; the int6 entry showed this harness can read 1.19 on a neutral change. csdr3 and f64_large remain AlmostSolved.
