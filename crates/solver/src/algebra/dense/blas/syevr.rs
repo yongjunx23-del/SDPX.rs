@@ -107,7 +107,7 @@ where
                 self.eigvals3(A)?;
             }
             _ if T::precision_bits() > 53 => {
-                self.syevr_range(A, b'I', 1, 1, work, None)?;
+                self.syevr_range(A, b'I', 1, 1, work)?;
                 return Ok(self.λ[0]);
             }
             _ => {
@@ -194,23 +194,7 @@ where
     where
         S: AsMut<[T]> + AsRef<[T]>,
     {
-        self.syevr_range(A, b'A', 0, 0, work, None)
-    }
-
-    /// All eigenvalues (ascending, in `λ`) and orthonormal eigenvectors
-    /// (the columns of `Q`) of the upper triangle of `A`, which is destroyed.
-    pub(crate) fn eigen<S>(
-        &mut self,
-        A: &mut DenseStorageMatrix<S, T>,
-        Q: &mut Matrix<T>,
-        work: &mut Vec<T>,
-    ) -> Result<(), DenseFactorizationError>
-    where
-        S: AsMut<[T]> + AsRef<[T]>,
-    {
-        self.checkdim(A)?;
-        debug_assert!(Q.nrows() == self.n() && Q.ncols() == self.n());
-        self.syevr_range(A, b'A', 0, 0, work, Some(Q.data_mut()))
+        self.syevr_range(A, b'A', 0, 0, work)
     }
 
     fn syevr_range<S>(
@@ -220,7 +204,6 @@ where
         il: i32,
         iu: i32,
         work: &mut Vec<T>,
-        z: Option<&mut [T]>,
     ) -> Result<(), DenseFactorizationError>
     where
         S: AsMut<[T]> + AsRef<[T]>,
@@ -249,16 +232,12 @@ where
         let info = &mut 0_i32; // output info
 
         // The eigenvalue-only LAPACK call does not reference z.
-        let mut none = [T::zero()];
-        let (jobz, z) = match z {
-            Some(z) => (b'V', z),
-            None => (b'N', &mut none[..]),
-        };
+        let mut z = [T::zero()];
 
         for i in 0..2 {
             T::xsyevr(
-                jobz, range, uplo, n, a, lda, vl, vu, il, iu, abstol, m, w, z, ldz, isuppz, work,
-                lwork, iwork, liwork, info,
+                b'N', range, uplo, n, a, lda, vl, vu, il, iu, abstol, m, w, &mut z, ldz, isuppz,
+                work, lwork, iwork, liwork, info,
             );
             if *info != 0 {
                 return Err(DenseFactorizationError::Eigen(*info));
