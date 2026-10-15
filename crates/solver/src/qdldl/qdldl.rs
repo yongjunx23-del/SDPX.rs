@@ -191,6 +191,48 @@ where
         ipermute(b, tmp, &self.perm);
     }
 
+    /// Solves AX = B for `ncols` column-major right-hand sides. The serial
+    /// kernels sweep the factor once per pair of row-interleaved columns,
+    /// each column seeing exactly the operations of [`Self::solve`]; the
+    /// elimination-tree plan solves column by column.
+    pub fn solve_many(&mut self, x: &mut [T], b: &[T], ncols: usize) {
+        assert!(!self.is_symbolic);
+        let n = self.D.len();
+        assert_eq!(b.len(), n * ncols);
+        assert_eq!(x.len(), b.len());
+        let parallel =
+            matches!((&self.plan, &self.pool), (Some(Some(p)), Some(_)) if p.parallelisable());
+        let mut c = 0;
+        while c < ncols {
+            let k = if parallel || c + 1 == ncols { 1 } else { 2 };
+            let (x, b) = (&mut x[c * n..(c + k) * n], &b[c * n..(c + k) * n]);
+            if k == 1 {
+                x.copy_from_slice(b);
+                self.solve(x);
+            } else {
+                self.solve_block::<2>(x, b);
+            }
+            c += k;
+        }
+    }
+
+    fn solve_block<const K: usize>(&mut self, x: &mut [T], b: &[T]) {
+        let n = self.D.len();
+        let w = &mut self.workspace.mwork;
+        w.resize(n * K, T::zero());
+        for (i, &p) in self.perm.iter().enumerate() {
+            for c in 0..K {
+                w[K * i + c] = b[c * n + p];
+            }
+        }
+        _solve_rows::<T, K>(&self.L.colptr, &self.L.rowval, &self.L.nzval, &self.Dinv, w);
+        for (i, &p) in self.perm.iter().enumerate() {
+            for c in 0..K {
+                x[c * n + p] = w[K * i + c];
+            }
+        }
+    }
+
     /// Update a subset of the values of the matrix to be (re)factored.  See [`refactor`](crate::qdldl::QDLDLFactorisation::refactor)
     ///
     pub fn update_values(&mut self, indices: &[usize], values: &[T]) {
@@ -360,6 +402,8 @@ struct QDLDLWorkspace<T> {
     iwork: Vec<usize>,
     bwork: Vec<bool>,
     fwork: Vec<T>,
+    // row-interleaved right-hand sides of `solve_many`
+    mwork: Vec<T>,
 
     // number of positive values in D
     positive_inertia: usize,
@@ -425,6 +469,7 @@ where
             iwork,
             bwork,
             fwork,
+            mwork: Vec::new(),
             positive_inertia,
             triuA,
             AtoPAPt,
@@ -823,6 +868,48 @@ fn _solve<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], Dinv: &[T], b: &mut [
     // in separate passes for reference
     //zip(b.iter_mut(), Dinv).for_each(|(b, d)| *b *= *d);
     //_ltsolve_unsafe(Lp, Li, Lx, b);
+}
+
+// `_solve` for K row-interleaved right-hand sides (w[K * i + c] is row i of
+// column c): one sweep of L per triangular solve serves every column, and
+// each column performs the same operations in the same order as `_solve`.
+fn _solve_rows<T: FloatT, const K: usize>(
+    Lp: &[usize],
+    Li: &[usize],
+    Lx: &[T],
+    Dinv: &[T],
+    w: &mut [T],
+) {
+    let n = Dinv.len();
+    debug_assert_eq!(w.len(), n * K);
+    unsafe {
+        for i in 0..n {
+            let xi: [T; K] = std::array::from_fn(|c| *w.get_unchecked(K * i + c));
+            let f = *Lp.get_unchecked(i);
+            let l = *Lp.get_unchecked(i + 1);
+            for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
+                for c in 0..K {
+                    *w.get_unchecked_mut(K * Lij + c) -= Lxj * xi[c];
+                }
+            }
+        }
+        for i in (0..n).rev() {
+            let mut s = [T::zero(); K];
+            let f = *Lp.get_unchecked(i);
+            let l = *Lp.get_unchecked(i + 1);
+            for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
+                for c in 0..K {
+                    s[c] += Lxj * (*w.get_unchecked(K * Lij + c));
+                }
+            }
+            let d = *Dinv.get_unchecked(i);
+            for c in 0..K {
+                let xi = w.get_unchecked_mut(K * i + c);
+                *xi *= d;
+                *xi -= s[c];
+            }
+        }
+    }
 }
 
 // Construct an inverse permutation from a permutation

@@ -84,6 +84,10 @@ where
         self.factors.solve(x);
     }
 
+    fn solve_many(&mut self, _kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T], ncols: usize) {
+        self.factors.solve_many(x, b, ncols);
+    }
+
     fn refactor(&mut self, _kkt: &CscMatrix<T>) -> bool {
         //QDLDL has maintained its own version of the permuted
         //KKT matrix through custom update/scale/offset methods,
