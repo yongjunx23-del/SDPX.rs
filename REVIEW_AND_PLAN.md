@@ -329,8 +329,8 @@ execution plans. The journal preserves all failed evidence and final decisions.
    - 2026-10-15 (journal): granted RNS ways post to the cone-scaling board, and one-prime groups split each prime's product by output columns. The cone queue's idle workers had never stolen the Rayon splits of the ORE Schur products. one_L12/128 (4 it) T=4 −30.5% (faer) and −7.2% (Accelerate); two_L6, fix-a and d6q are neutral; bitwise.
    - 2026-10-15 (journal): RNS products skip the exact-zero inner terms of triangular right operands (per-column inner ranges, 32-column tiles), and the ORE L⁻¹ recursion forms its second product transposed. one_L12/128 (4 it) −10.8% T=4 faer, −5.0% Accelerate, −13.7% T=1; others neutral; bitwise.
    - 2026-10-15 (journal): exactly accumulated arrow leaves from order 256 factor recursively. Envelope cuts split them into independent halves; otherwise the coupling is one exact product per level. The blocked exact form at ≥256 bits is removed. one_L12/128 (4 it) −6.4% T=4 faer, −13.6% Accelerate, −19.5% T=1; two_L8 −3.3%. syn20 and d6n640q are audited; ising11, fix-a and two_L4/L6 are bitwise. A recursive Y solve was rejected (+10%: the plain halving ignored the envelope cut and zero columns).
+   - 2026-10-15 (journal): a cut-aware recursive leaf Y solve over the coupled columns was rejected. T=1 −3.8%, but T=4 +0.1% (Accelerate) and +1.9% (faer), two_L8 +1.7%, syn20 +3.5%. The column-parallel sweep is already balanced at 4 threads.
    - Next:
-     - a cut-aware recursive leaf Y solve over the coupled columns only;
      - a full one_L12/128 solve with audit;
      - the S₀⁻¹ leaf factor from the cone's L⁻¹ (skip re-factoring the leaf);
      - the two_L8 gap stall (53: AlmostSolved; 128: stall at 3e-8).

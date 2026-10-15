@@ -8,6 +8,24 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — Cut-aware recursive leaf Y solve rejected (thermal-ore)
+
+- Hypothesis: the rejected recursive Y solve of the L-T3 entry lost only because it ignored the envelope cut and zero columns. A recursion that splits at envelope cuts and multiplies only the coupled, nonzero columns (sorted by first nonzero row, so each level's product covers a column prefix and starts at the first nonzero inner row) matches the row sweep's 520 M multiply-adds. Its products should then beat per-entry exact dots, as the recursive factor does.
+- Change (`arrow.rs`, reverted): `solve_unit_lower` with `envelope_cut` shared with `ldl_rec`, gathering coupled columns for leaves from order 256 above binary64. The unit test matched per-column sweeps within rounding; serial and pool(8) were bitwise equal.
+- E2E (Mac, fast profile), ABBA, A = `6657972`:
+
+  | Case | A s | B s | Change |
+  |---|---|---|---|
+  | one_L12/128 4 it, T=4, Accelerate | 17.15 / 17.10 | 17.22 / 17.05 | +0.1% |
+  | one_L12/128 4 it, T=4, faer | 19.58 / 19.65 | 20.09 / 19.89 | +1.9% |
+  | one_L12/128 4 it, T=1, faer | 41.88 / 43.07 | 40.83 / 40.90 | −3.8% |
+  | two_L8/128 8 it, T=4, Accelerate | 11.21 / 11.88 | 11.64 / 11.85 | +1.7% |
+  | syn20/128 full solve, T=4 | 14.18 | 14.68 | +3.5% |
+
+  - B points: two_L4/128 and /256 and two_L6/256 bitwise; syn20 Solved 50 with audit residuals unchanged (primal 1.4e-24, gap 2.8e-24).
+  - `arrow.leaves`: T=1 13.7–13.9 → 12.3 s; T=4 faer 5.2 → 5.5 s.
+- Decision: rejected. Only the serial case gains. At 4 threads the column-parallel exact-dot sweep is already balanced (255 independent columns), while the narrow products (255 columns) and the recursion's serial levels are not. Patch: `lt4-rejected.patch`.
+
 ## 2026-10-15 — Recursive LDL for wide exactly accumulated arrow leaves (thermal-ore)
 
 - Observed (7f2c493, one_L12/128, 4 iterations): `arrow.leaves` was the largest phase (21.3 s at T=1, 7.3–7.8 s at T=4 faer). The ORE-42 leaf (order 2709: the 903-row T block, then 1806 S₀⁻¹ rows behind an envelope cut) factored by per-entry exact dots, so no residue product ever ran inside the leaf. From order 256 at 256 bits and above, a blocked exact form (48-pivot panels) ran instead.
