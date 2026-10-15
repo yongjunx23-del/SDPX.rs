@@ -357,7 +357,16 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
                 }
                 JsonProblem::<T>::read(io::stdin().lock())?
             } else {
-                JsonProblem::<T>::read(BufReader::new(File::open(path)?))?
+                // High-precision arrays decode on the pool after the read.
+                let file = BufReader::new(File::open(path)?);
+                let read = move || JsonProblem::<T>::read(file);
+                match options.threads.filter(|&t| t > 0) {
+                    Some(threads) => rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads as usize)
+                        .build()?
+                        .install(read)?,
+                    None => read()?,
+                }
             };
             if let Some(path) = &options.settings {
                 problem.settings = serde_json::from_reader(BufReader::new(File::open(path)?))?;

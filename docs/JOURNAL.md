@@ -8,6 +8,25 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-15 — L-P2: high-precision JSON arrays decode on the thread pool (kept, thermal-ore)
+
+- Observed (d6n640q/128, `sample`): the JSON read takes 2.5 s on one thread, of which 1.9 s is decimal conversion (`mpfr_strtofr` under the MpFloat visitor).
+- Change:
+  - `json.rs`: `P`, `q`, `A` and `b` (above binary64) keep each array element as text, or as its integer or float token, while serde_json parses the file. They then decode through `T`'s own deserializer on the calling Rayon pool.
+  - `sdpx.rs`: the CLI reads a file input inside a pool of `--threads`.
+  - Values are those of the ordinary read. A bad element's error now names the element index instead of the line and column.
+- E2E (ABBA against `aa29a67`, Mac, T=4, process wall in s, every point identical):
+
+  | Case | A | B | Change |
+  |---|---|---|---|
+  | d6q owner 8 it (a50df3c3265d) | 14.89 / 14.99 | 14.18 / 13.96 | −5.8% |
+  | d6q plain 8 it (5772c472b62f) | 15.98 / 16.03 | 14.93 / 15.01 | −6.5% |
+  | fix-a 256 owner (Solved 25) | 7.98 / 7.98 / 8.29 / 8.20 | 7.52 / 7.64 / 8.16 / 7.89 | −3.8% |
+  | fix-a 256 plain (Solved 25) | 6.58 / 6.68 / 6.61 / 6.50 | 6.05 / 6.20 / 6.14 / 6.04 | −7.4% |
+  | csdr3 256 (Solved 36) | 3.66 / 3.72 | 3.54 / 3.52 | −4.3% |
+
+- Decision: kept. 507 lib tests and the JSON integration tests (`json_io`, `native_input`) pass. Without `--threads`, the read stays serial.
+
 ## 2026-10-15 — L-P1: dense rank minor gets the sparse pass's time (kept, thermal-ore)
 
 - Observed (d6n640q/128, owner, T=4, `sample`): setup is about 6 s of a 17.7 s 8-iteration run, and none of it is parallel. The JSON parse takes 2.5 s and the presolver 1.7 s. The presolver's rank proof stops the dense modular minor after 0.02 s, when its budget of 4·(nnz + m) = 43M updates runs out. It then builds BTreeMap rows (0.57 s) and runs the sparse modular pass (1.59 s), which runs out of budget too, so no row is removed.
