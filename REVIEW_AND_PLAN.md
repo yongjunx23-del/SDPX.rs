@@ -89,7 +89,7 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 
 - **Λ35 conditioning:** the dual has no Slater point and both solvers retain a long gap plateau. Task 17 resolved the former 768-bit floor: Solved and audited at 768/1024 bits (scoreboard above). Shortening the plateau remains performance work.
 - **Mixed Lambda27 MPFR1024 (frozen 0.9.1):** `Solved`/42 but fails the 1e-30 original-coordinate audit: dual 1.475e-23, primal 3.73e-28, PSD link 2.73e-26, componentwise dual 0.84355. The resampled input (2026-10-10) also fails (dual 2.34e-23) and takes 57 iterations.
-- **Integration test failing on `main` (ee235b4) and `perf-mc-impl`:** `overshooting_start_still_solves` (NumericalError from τ₀ 1e-70), since `b718ace` removed the MPFR static shift. After an accepted 0.99 step, z leaves the PSD cone. A static shift of eps^(3/4) fixes it, while a step retake or refinement does not. Changing the default needs a decision (journal 2026-10-11). The chordal fixture tests were updated for `5b9980e`.
+- **Fixed on thermal-ore (2026-10-16):** `overshooting_start_still_solves` (NumericalError from τ₀ 1e-70, failing CI since v0.9.2). Root cause: the 2×2/3×3 Jacobi SVD/eigen kernels used absolute-ε tests, so a 2×2 NT block with entries below ε (1e-78 at 256 bits) got a 45° rotation and a wrong λ. The tests are now scale-relative below unit scale; there is no regularization change (journal 2026-10-16). The chordal fixture tests were updated for `5b9980e`.
   - Primal variables reach 5.8e118.
   - The explicit-gate pilot is prepared but not run (decision below).
   - Not the same input as the 768-bit Λ27 above, which passes its audit.

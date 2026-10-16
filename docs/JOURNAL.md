@@ -8,6 +8,33 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-16 — Scale-relative Jacobi tests in the 2×2/3×3 kernels (kept, thermal-ore)
+
+`start_scale::overshooting_start_still_solves` (Bits256, τ₀ 1e-70) had
+failed CI on Linux and macOS since v0.9.2. It reaches pcost = dcost = 6,
+then ends with NumericalError at iteration 82: the PSD Cholesky of z fails
+because the previous accepted 0.99 step left the cone.
+- Bisect over v0.9.1..v0.9.2: the first bad commit is `b718ace`. It changed
+  the trajectory without causing the failure.
+- The step bound was consistent with λ, but W·z ≠ λ at iteration 81:
+  λ ≈ (2.7, 1.7)e-78 there, below ε₂₅₆.
+- `compute_jacobi_rotation` tested `d < eps` absolutely. For the 2×2 SVD of
+  L₂ᵀL₁ it took the 45° branch, a rotation that does not diagonalize, so W
+  and λ were wrong.
+- The 3×3 SVD and eigen loops stopped on an absolute `off < 256·eps`, the
+  same flaw.
+
+The fix: `d.is_zero()` in place of `d < eps`. The loop tolerance becomes
+256·eps·min(1, max|aᵢⱼ|) with `<=`, unchanged for entries ≥ 1. A fully
+relative tolerance broke the f32 SVD unit tests: entries up to 12 loosened
+the stop 12×. The fixed-τ phase is not involved; the test fails with it
+off too. The 2026-10-11 static-shift diagnosis was a side effect: a shift
+keeps z away from the sub-ε range.
+
+Result: the solver suite passes (508 + 7 + 251 + 4). Fast-profile E2E:
+- medium: Solved/15, audit PASS.
+- ising11: Solved/54, audit PASS, reference agreement 4.6e-35.
+
 ## 2026-10-16 — Performance plan: where the time goes (diagnosis, thermal-ore)
 
 A read-only review (eight subsystem maps, two adversarial critiques) behind the 2026-10-16 plan section. Sources are journal entries and receipts; shares marked stale predate task 16 or the thermal-ore kernels.

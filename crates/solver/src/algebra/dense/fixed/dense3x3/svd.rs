@@ -15,14 +15,21 @@ where
         U.set_identity();
         V.set_identity();
 
-        let tol = T::epsilon() * (256.).as_T();
+        // Below unit scale, relative to the entries: an absolute tolerance
+        // stopped matrices with entries below eps (MPFR end games) unrotated.
+        let tol = T::epsilon()
+            * (256.).as_T()
+            * A.data
+                .iter()
+                .fold(T::zero(), |m, x| T::max(m, x.abs()))
+                .min(T::one());
 
         // benchmarks never exceed 10 iterations in f64
         for _ in 1..=25 {
             let (p, q, max_off_diag) = find_largest_off_diag_nonsym(A);
 
             // check convergence
-            if max_off_diag < tol {
+            if max_off_diag <= tol {
                 break;
             }
 
