@@ -26,6 +26,11 @@ pub(crate) const INLINE_N: usize = 4;
 /// Widest mantissa multiplied by the inlined schoolbook; GMP's assembly
 /// `mpn_mul_n` wins above (Apple M4: 8 limbs 30 -> 38 ns/term inline).
 pub(crate) const SCHOOLBOOK_N: usize = 4;
+/// Widest mantissa multiplied by [`mul_rows`] on aarch64. Apple M4, ns per
+/// product against GMP's `mpn_mul_n`: 8 limbs 22.2 -> 12.7, 10 limbs
+/// 29.6 -> 19.4, 12 limbs 42.9 -> 35.3; 16 limbs 88 -> 150 spills.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const ROWS_N: usize = 12;
 
 /// Per-thread scratch, retained across calls so a dot product allocates only
 /// on first use. Operands are held by address for the duration of one call.
@@ -586,12 +591,18 @@ fn round_acc<const N: usize>(
 /// Zen part Zen 1's `MUL_TOOM22_THRESHOLD` of 16, so 1024-bit (16-limb)
 /// products went through Toom-22 (EPYC 7742 at 1024 bits: `toom22`, `add_n`
 /// and `sub_n` 12% of cycles); GMP's own Zen 2 tuning keeps the basecase
-/// through 18 limbs. The product is exact either way.
+/// through 18 limbs. On aarch64, GMP's `addmul_1` rows (one call per limb
+/// of `up`) run at about half the multiplier throughput; [`mul_rows`] takes
+/// those widths. The product is exact either way.
 ///
 /// # Safety
 /// `rp` holds `2N` limbs and does not overlap the `N`-limb inputs.
 #[inline(always)]
 pub(crate) unsafe fn mpn_mul_n<const N: usize>(rp: *mut u64, up: *const u64, vp: *const u64) {
+    #[cfg(target_arch = "aarch64")]
+    if N <= ROWS_N {
+        return mul_rows::<N>(rp, up, vp);
+    }
     #[cfg(target_arch = "x86_64")]
     if N < 19 {
         extern "C" {
@@ -600,6 +611,50 @@ pub(crate) unsafe fn mpn_mul_n<const N: usize>(rp: *mut u64, up: *const u64, vp:
         return __gmpn_mul_basecase(rp, up, N as _, vp, N as _);
     }
     gmp::mpn_mul_n(rp, up, vp, N as _);
+}
+
+/// `a + b + c` and its carry.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[inline(always)]
+fn adc(a: u64, b: u64, c: bool) -> (u64, bool) {
+    let (s, o1) = a.overflowing_add(b);
+    let (s, o2) = s.overflowing_add(c as u64);
+    (s, o1 | o2)
+}
+
+/// `rp[..2N] = up * vp` for `N <= ROWS_N` limbs, unrolled for constant `N`:
+/// each row's `N` products are formed first, then their low and high halves
+/// go in by two separate carry chains, so the multiplies of a row overlap
+/// instead of waiting on one chain as in GMP's `addmul_1`.
+///
+/// # Safety
+/// As [`mpn_mul_n`].
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[inline(always)]
+unsafe fn mul_rows<const N: usize>(rp: *mut u64, up: *const u64, vp: *const u64) {
+    debug_assert!(N <= ROWS_N);
+    let (a, b) = (&*(up as *const [u64; N]), &*(vp as *const [u64; N]));
+    let mut r = [0u64; 2 * ROWS_N];
+    for i in 0..N {
+        let (mut lo, mut hi) = ([0u64; N], [0u64; N]);
+        for j in 0..N {
+            let p = a[i] as u128 * b[j] as u128;
+            (lo[j], hi[j]) = (p as u64, (p >> 64) as u64);
+        }
+        // Rows 0..i fill limbs 0..i+N, so limb i+N takes the low carry and
+        // the high chain ends without one.
+        let mut c = false;
+        for j in 0..N {
+            (r[i + j], c) = adc(r[i + j], lo[j], c);
+        }
+        r[i + N] = c as u64;
+        let mut c = false;
+        for j in 0..N {
+            (r[i + 1 + j], c) = adc(r[i + 1 + j], hi[j], c);
+        }
+        debug_assert!(!c);
+    }
+    std::ptr::copy_nonoverlapping(r.as_ptr(), rp, 2 * N);
 }
 
 /// `out[..2N] = a * b` for `N`-limb little-endian mantissas: an inlined
@@ -736,6 +791,50 @@ mod tests {
     use crate::integer::exact_product;
     use crate::MpFloat;
     use num_traits::{FromPrimitive, One, Zero};
+
+    // `mul_rows` against GMP over all-ones, one-hot and xorshift operands.
+    fn mul_rows_case<const N: usize>(seed: u64) {
+        let mut s = seed | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for case in 0..200 {
+            let (mut a, mut b) = ([0u64; N], [0u64; N]);
+            for j in 0..N {
+                (a[j], b[j]) = match case {
+                    0 => (u64::MAX, u64::MAX),
+                    1 => (u64::MAX, (j == N - 1) as u64),
+                    2 => ((j == 0) as u64 * u64::MAX, u64::MAX),
+                    _ => (next(), next()),
+                };
+            }
+            let (mut got, mut want) = ([0u64; 2 * super::MAX_N], [0u64; 2 * super::MAX_N]);
+            unsafe {
+                super::mul_rows::<N>(got.as_mut_ptr(), a.as_ptr(), b.as_ptr());
+                gmp_mpfr_sys::gmp::mpn_mul_n(want.as_mut_ptr(), a.as_ptr(), b.as_ptr(), N as _);
+            }
+            assert_eq!(got[..2 * N], want[..2 * N], "N={N} case={case}");
+        }
+    }
+
+    #[test]
+    fn mul_rows_matches_gmp() {
+        mul_rows_case::<1>(1);
+        mul_rows_case::<2>(2);
+        mul_rows_case::<3>(3);
+        mul_rows_case::<4>(4);
+        mul_rows_case::<5>(5);
+        mul_rows_case::<6>(6);
+        mul_rows_case::<7>(7);
+        mul_rows_case::<8>(8);
+        mul_rows_case::<9>(9);
+        mul_rows_case::<10>(10);
+        mul_rows_case::<11>(11);
+        mul_rows_case::<12>(12);
+    }
 
     // Deterministic xorshift values with a controllable exponent spread and
     // sign mix, including exact cancellation between terms.

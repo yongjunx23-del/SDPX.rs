@@ -19,6 +19,23 @@ A read-only review (eight subsystem maps, two adversarial critiques) behind the 
 - Missing: no x86 run of any thermal-ore commit (L-X1, L-X2, L-G6, L-F1, L-D1, the exact-dot border factor), no HEAD profile at 768 or 1024 bits, no Float64 scoreboard since Oct 9.
 - Dropped in review: the √2-split quadratic (two CRTs at about 3P bits against one at 4P: kernel net about +2.75%), pre-image step bounds through corrections and skipping the dead affine z congruence (≤1.7%), an 8-limb Karatsuba (GMP crossover 26 limbs on M1).
 
+## 2026-10-16 — B1: matched Ising scoreboard against official SDPB 3.1.0 (measurement, thermal-ore)
+
+- Correction: the 2026-10-09 "matched SDPB" rows (`t20/sbrs.pbs`, jobs 224375–224377) ran the `sdpb` on PATH (`~/apps/sdpb/current`, `SDPB 67ebd53-dirty`), not the official 3.1.0 tag. This run uses the official build (`sdpx-ising43-20260927/sdpb-install`, tag `fec8e93`, reports `3.1.0-dirty`, precision(actual) as requested).
+- Setup (job 226114, node26 exclusive, one fresh process per solve, sequential): per case, SDPB 3.1.0 with 64 ranks bound to cores (`--maxSharedMemory 8G`, thresholds 1e-42), then SDPX `211a192` (`bin/sdpx-to5`) with 64 threads pinned (`mc/cpus2.py`), `mc/settings-full.json`, OPENBLAS 1. Same input directory and precision for both. SDPB wall includes MPI startup; SDPX wall is the process wall.
+
+  | Case | Bits | SDPB 3.1.0 it / wall | SDPX it / wall | Ratio | SDPX peak RSS |
+  |---|---|---|---|---|---|
+  | Λ19-rs | 768 | 240 / 144.5 s | 89 / 25.5 s | 5.67× | 1.29 GB |
+  | Λ27-rs | 768 | 259 / 365.5 s | 127 / 73.8 s | 4.95× | 2.85 GB |
+  | Λ35-rs | 1024 | 734 / 2733.7 s | 347 / 609.6 s | 4.48× | 8.09 GB |
+  | Λ19-xml (not resampled) | 768 | 243 / 148.0 s | 105 / 35.3 s | 4.19× | 1.32 GB |
+  | ising11 | 768 | 201 / 14.6 s | 54 / 3.1 s | 4.70× | 0.24 GB |
+
+- Audits (226115, `t17aud.pbs`, original coordinates): every SDPX point is accepted. Λ19-rs: primal 3.8e-58, dual 7.8e-55, map 7.5e-31. Λ27-rs: 3.8e-67, 3.5e-69, map 1.6e-34. Λ35-rs: 3.2e-130, 1.2e-142, map 4.0e-42. Λ19-xml: 2.6e-74, 2.0e-74, map 2.3e-31. ising11: 1.3e-48, 2.4e-47, map 6.7e-39. Audited objectives equal the SDPB primal objectives to every printed digit (Λ35-rs −18.15322053912686102409787171643020135…).
+- Observed: SDPB gains almost nothing from resampling (Λ19 243 → 240 it, 148.0 → 144.5 s), while SDPX gains 105 → 89 it and 35.3 → 25.5 s. On matched resampled inputs every Ising row is ≥4.48× SDPB 3.1.0, and the original Λ19 input is 4.19×. SDPB peak memory was not sampled in this job. The memory goal (match SDPB's peak) stays unmeasured at this scale.
+- Decision: task 17 G holds on the scoreboard, and the resampled inputs are the scoreboard inputs from here on. These SDPB 3.1.0 rows replace the 67ebd53 references. Still missing: a matched-scale memory comparison, and L19-s50/768 (the Oct 9 1.85× row) against 3.1.0.
+
 ## 2026-10-16 — B2 same-node A/B against v0.9.2; one-thread input pool removed (kept, thermal-ore)
 
 - Same-node interleaved A/B (node9, `t13ab.pbs`, receipts on as in the scoreboard, 5 reps, median API ms ratio B/A). A is v0.9.2 (`bin/sdpx-rel092`). B is `fd5a3b6` (thermal-ore with A1 and A3, A4 reverted; `bin/sdpx-to4`, job 226052):
