@@ -1385,9 +1385,7 @@ fn subtract_contributions<T: FloatT>(
     let width = pool.map_or(1, |p| p.current_num_threads());
     let eligible = |leaf: &Leaf<T>| {
         let (g, q) = (leaf.ids.len(), leaf.coupled.len());
-        T::residue_product_applies(q, q, g)
-            && g * q * q >= 1 << 21
-            && q * q <= 8 * g * t
+        T::residue_product_applies(q, q, g) && g * q * q >= 1 << 21 && q * q <= 8 * g * t
     };
     if leaves.iter().any(eligible) {
         let build = |leaf: &Leaf<T>| {
@@ -2918,15 +2916,11 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
             None => {
                 // Several trunk columns: independent column chunks share the
                 // pool, each with the serial per-column order.
-                match self
-                    .pool
-                    .as_ref()
-                    .filter(|p| {
-                        cols > 1
-                            && p.current_num_threads() > 1
-                            && t >= f64_scaled::<T>(2 * FORWARD_BLOCK, 16)
-                    })
-                {
+                match self.pool.as_ref().filter(|p| {
+                    cols > 1
+                        && p.current_num_threads() > 1
+                        && t >= f64_scaled::<T>(2 * FORWARD_BLOCK, 16)
+                }) {
                     Some(pool) => {
                         let chunks = pool.current_num_threads().min(cols);
                         let tf = &self.tf;

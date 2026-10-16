@@ -292,7 +292,11 @@ pub fn memory_mark(label: &str) {
             let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
             let heap = heap_bytes()
                 .map(|(free, arena)| {
-                    format!(" heap_free={:.0} MiB arena={:.0} MiB", mib(free), mib(arena))
+                    format!(
+                        " heap_free={:.0} MiB arena={:.0} MiB",
+                        mib(free),
+                        mib(arena)
+                    )
                 })
                 .unwrap_or_default();
             match current_rss_bytes() {

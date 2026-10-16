@@ -1056,7 +1056,8 @@ mod internal {
                 || matches!(before, SolverStatus::MaxIterations | SolverStatus::MaxTime);
             for restore in [false, true] {
                 if restore {
-                    let (Some(now), Some((best, _))) = (self.tolerance_multiple(), &self.best) else {
+                    let (Some(now), Some((best, _))) = (self.tolerance_multiple(), &self.best)
+                    else {
                         break;
                     };
                     if !(unconverged
@@ -1087,10 +1088,12 @@ mod internal {
                 {
                     // The reduced status also needs its tolerances in original
                     // coordinates; otherwise the failure status stands.
-                    if let Some(ratio) =
-                        self.solution
-                            .original_ratio(&self.data, &self.variables, &self.settings, true)
-                    {
+                    if let Some(ratio) = self.solution.original_ratio(
+                        &self.data,
+                        &self.variables,
+                        &self.settings,
+                        true,
+                    ) {
                         if !crate::mpi::agreed_branch(ratio <= T::one()) {
                             self.info.set_status(before);
                         }
@@ -1123,7 +1126,10 @@ mod internal {
                 let stats = std::env::var_os("SDPX_START_STATS").is_some();
                 if stats {
                     eprintln!("start-stats data {}", self.data.scale_stats());
-                    eprintln!("start-stats kkt {} accepted={ok}", self.variables.scale_stats());
+                    eprintln!(
+                        "start-stats kkt {} accepted={ok}",
+                        self.variables.scale_stats()
+                    );
                 }
                 // An accepted KKT start whose slacks and duals are already
                 // huge in equilibrated units leads a unit-τ solve into a τ
@@ -1205,7 +1211,10 @@ mod internal {
                     self.variables.keep_start_side(dual);
                     if self.settings.core().verbose {
                         let side = if dual { "dual" } else { "primal" };
-                        let _ = writeln!(self.info.print_target(), "restart: {side} keeps its start scale");
+                        let _ = writeln!(
+                            self.info.print_target(),
+                            "restart: {side} keeps its start scale"
+                        );
                     }
                 }
             }
@@ -1380,7 +1389,11 @@ fn trace_tau<T: FloatT>(iter: u32, tau: T, gap: T, mu: T, sides: impl FnOnce() -
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("SDPX_TRACE_TAU").is_some()) {
         let (s, z) = sides();
-        eprintln!("tau-trace {iter} {tau:.3e} {gap:.3e} {mu:.3e} {:.3e} {:.3e}", s / tau, z / tau);
+        eprintln!(
+            "tau-trace {iter} {tau:.3e} {gap:.3e} {mu:.3e} {:.3e} {:.3e}",
+            s / tau,
+            z / tau
+        );
     }
 }
 
@@ -1553,9 +1566,8 @@ mod tau_chase_tests {
         let mut c = TauChase::<f64>::default();
         assert!((0..40).all(|k| !c.observe(1e-13, 10f64.powi(-k), 1e-33, None)));
         let mut c = TauChase::<f64>::default();
-        let fired = (0..40).position(|k| {
-            c.observe(1e-17, 10f64.powi(-2 * k), 1e-33 * 10f64.powi(-k / 4), None)
-        });
+        let fired = (0..40)
+            .position(|k| c.observe(1e-17, 10f64.powi(-2 * k), 1e-33 * 10f64.powi(-k / 4), None));
         assert_eq!(fired, Some(12));
         // ... but not from a start-phase anchor (gap above 1e-6).
         let mut c = TauChase::<f64>::default();
@@ -1594,8 +1606,14 @@ mod tau_chase_tests {
     #[test]
     fn restart_keeps_the_side_that_did_not_grow() {
         // Λ35-rs: primal 1e94 against a start of 1.3e3, dual 1.5e8 against 4.6e9.
-        assert_eq!(TauChase::<f64>::kept_side((1e94, 1.5e8), (1.3e3, 4.6e9)), Some(true));
-        assert_eq!(TauChase::<f64>::kept_side((1e2, 1e40), (1e3, 1e9)), Some(false));
+        assert_eq!(
+            TauChase::<f64>::kept_side((1e94, 1.5e8), (1.3e3, 4.6e9)),
+            Some(true)
+        );
+        assert_eq!(
+            TauChase::<f64>::kept_side((1e2, 1e40), (1e3, 1e9)),
+            Some(false)
+        );
         assert_eq!(TauChase::<f64>::kept_side((1e94, 1e40), (1e3, 1e9)), None);
         assert_eq!(TauChase::<f64>::kept_side((1e2, 1e8), (1e3, 1e9)), None);
     }

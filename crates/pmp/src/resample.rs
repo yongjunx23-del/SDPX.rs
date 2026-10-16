@@ -132,13 +132,20 @@ mod tests {
             W::from_f64(n).unwrap()
         }
         let number = convert::<W>;
-        let poles = [number(2f64.powi(-124)), number(-1.0), number(-1.5), number(-2.0)];
+        let poles = [
+            number(2f64.powi(-124)),
+            number(-1.0),
+            number(-1.5),
+            number(-2.0),
+        ];
         let base = number(3.0) - number(8.0).sqrt();
         let x: Vec<W> = (0..8).map(|k| number(0.01 + 0.7 * k as f64)).collect();
         let scalings: Vec<String> = x
             .iter()
             .map(|&xk| {
-                let s = poles.iter().fold(number(2.5) * base.powf(xk), |a, &q| a / (xk - q));
+                let s = poles
+                    .iter()
+                    .fold(number(2.5) * base.powf(xk), |a, &q| a / (xk - q));
                 s.decimal_string()
             })
             .collect();

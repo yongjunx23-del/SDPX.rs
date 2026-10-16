@@ -6,7 +6,9 @@ fn point(n: usize, seed: u64) -> Vec<f64> {
     let m = n * (n + 1) / 2;
     let mut state = seed;
     let mut rnd = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((state >> 11) as f64 / (1u64 << 53) as f64) - 0.5
     };
     let mut s = vec![0.0; 3 * m];
@@ -14,14 +16,22 @@ fn point(n: usize, seed: u64) -> Vec<f64> {
         for j in 0..n {
             for i in 0..=j {
                 let v = 0.3 * rnd();
-                s[part * m + tri(i, j)] = if i == j { 1.0 + 0.4 * (part as f64) * (j as f64 + 1.0) / n as f64 + v } else { v };
+                s[part * m + tri(i, j)] = if i == j {
+                    1.0 + 0.4 * (part as f64) * (j as f64 + 1.0) / n as f64 + v
+                } else {
+                    v
+                };
             }
         }
     }
     // T: large enough diagonal that T − D ≻ 0
     for j in 0..n {
         for i in 0..=j {
-            s[tri(i, j)] = if i == j { 2.5 + 0.2 * rnd() } else { 0.2 * rnd() };
+            s[tri(i, j)] = if i == j {
+                2.5 + 0.2 * rnd()
+            } else {
+                0.2 * rnd()
+            };
         }
     }
     s
@@ -49,7 +59,10 @@ fn gradient_and_hessian_match_differences() {
         };
         let fd = (at(h).barrier - at(-h).barrier) / (2.0 * h);
         let an: f64 = g.iter().zip(&d).map(|(a, b)| a * b).sum();
-        assert!((fd - an).abs() <= 1e-6 * (1.0 + an.abs()), "n={n} grad {fd} vs {an}");
+        assert!(
+            (fd - an).abs() <= 1e-6 * (1.0 + an.abs()),
+            "n={n} grad {fd} vs {an}"
+        );
         // Hessian product against the gradient difference
         let mut hd = vec![0.0; dim];
         o.hess_prod(&d, &mut hd);
@@ -59,7 +72,11 @@ fn gradient_and_hessian_match_differences() {
         let scale = hd.iter().fold(0.0f64, |a, v| a.max(v.abs()));
         for k in 0..dim {
             let fd = (gp[k] - gm[k]) / (2.0 * h);
-            assert!((fd - hd[k]).abs() <= 1e-5 * (1.0 + scale), "n={n} k={k} {fd} vs {}", hd[k]);
+            assert!(
+                (fd - hd[k]).abs() <= 1e-5 * (1.0 + scale),
+                "n={n} k={k} {fd} vs {}",
+                hd[k]
+            );
         }
         // log-homogeneity: ⟨g, s⟩ = −ν and H s = −g
         let gs: f64 = g.iter().zip(&s).map(|(a, b)| a * b).sum();
@@ -67,7 +84,10 @@ fn gradient_and_hessian_match_differences() {
         let mut hs = vec![0.0; dim];
         o.hess_prod(&s, &mut hs);
         for k in 0..dim {
-            assert!((hs[k] + g[k]).abs() < 1e-8 * (1.0 + g[k].abs()), "n={n} Hs+g at {k}");
+            assert!(
+                (hs[k] + g[k]).abs() < 1e-8 * (1.0 + g[k].abs()),
+                "n={n} Hs+g at {k}"
+            );
         }
     }
 }
@@ -107,7 +127,10 @@ fn factored_scaling_inverts_hessian() {
             for i in 0..dim {
                 let (a, b) = (i.min(j), i.max(j));
                 let want = packed[b * (b + 1) / 2 + a];
-                assert!((back[i] - want).abs() < 1e-9 * (1.0 + want.abs()), "n={n} D({i},{j})");
+                assert!(
+                    (back[i] - want).abs() < 1e-9 * (1.0 + want.abs()),
+                    "n={n} D({i},{j})"
+                );
             }
         }
     }
@@ -180,7 +203,10 @@ fn dual_ok_matches_factor_near_threshold() {
                 let mut eigen = vec![T::zero(); 3 * m];
                 eigen[m] = T::one();
                 eigen[2 * m] = -T::one();
-                let generic = direction(n, 911 + n as u64).into_iter().map(|v| v.as_T()).collect();
+                let generic = direction(n, 911 + n as u64)
+                    .into_iter()
+                    .map(|v| v.as_T())
+                    .collect();
                 for (probe, z) in [eigen, generic].into_iter().enumerate() {
                     let mut factor = Oracle::new(n, &s).unwrap();
                     let exact = factor.dual_form(&z, true).unwrap();
@@ -188,11 +214,17 @@ fn dual_ok_matches_factor_near_threshold() {
                     for sign in [-T::one(), T::one()] {
                         let limit = exact * (T::one() + sign * separation);
                         let mut cg = Oracle::new(n, &s).unwrap();
-                        assert_eq!(cg.dual_ok(&z, |q| q < limit, &mut 0, (&factor.p, &s0i)), exact < limit,
-                            "n={n} margin={margin} probe={probe}");
+                        assert_eq!(
+                            cg.dual_ok(&z, |q| q < limit, &mut 0, (&factor.p, &s0i)),
+                            exact < limit,
+                            "n={n} margin={margin} probe={probe}"
+                        );
                         // binary64 factors without CG
                         if probe == 0 && sign > T::zero() && T::precision_bits() > 53 {
-                            assert!(!cg.d2.is_empty() && cg.s0l.is_none(), "CG must decide the eigenvector probe");
+                            assert!(
+                                !cg.d2.is_empty() && cg.s0l.is_none(),
+                                "CG must decide the eigenvector probe"
+                            );
                         }
                     }
                 }
@@ -214,7 +246,12 @@ fn unit_initialization_is_central() {
         let mut g = vec![0.0; dim];
         o.gradient(&mut g);
         for k in 0..dim {
-            assert!((s[k] + g[k]).abs() < 1e-12, "n={n} s=-g at {k}: {} {}", s[k], g[k]);
+            assert!(
+                (s[k] + g[k]).abs() < 1e-12,
+                "n={n} s=-g at {k}: {} {}",
+                s[k],
+                g[k]
+            );
         }
     }
 }
@@ -266,14 +303,27 @@ fn third_order_matches_hessian_differences() {
         let scale = v.iter().fold(0.0f64, |m, x| m.max(x.abs()));
         let mixed = cone.third_mixed(&h, &h).expect("interior");
         let g = direction(n, 401 + n as u64);
-        let (ab, ba) = (cone.third_mixed(&h, &g).unwrap(), cone.third_mixed(&g, &h).unwrap());
+        let (ab, ba) = (
+            cone.third_mixed(&h, &g).unwrap(),
+            cone.third_mixed(&g, &h).unwrap(),
+        );
         for k in 0..s.len() {
-            assert!((mixed[k] - v[k]).abs() <= 1e-6 * (1.0 + scale), "n={n} k={k} mixed");
-            assert!((ab[k] - ba[k]).abs() <= 1e-6 * (1.0 + ab[k].abs()), "n={n} k={k} symmetric");
+            assert!(
+                (mixed[k] - v[k]).abs() <= 1e-6 * (1.0 + scale),
+                "n={n} k={k} mixed"
+            );
+            assert!(
+                (ab[k] - ba[k]).abs() <= 1e-6 * (1.0 + ab[k].abs()),
+                "n={n} k={k} symmetric"
+            );
         }
         for k in 0..s.len() {
             let fd = (a[k] - b[k]) / (2.0 * e);
-            assert!((fd - v[k]).abs() <= 1e-5 * (1.0 + scale), "n={n} k={k} fd {fd} toa {}", v[k]);
+            assert!(
+                (fd - v[k]).abs() <= 1e-5 * (1.0 + scale),
+                "n={n} k={k} fd {fd} toa {}",
+                v[k]
+            );
         }
     }
 }
@@ -287,7 +337,8 @@ fn unit_schur_columns_match_dense() {
         let (nn, m) = (n * n, n * (n + 1) / 2);
         let mut e = vec![0.0; m];
         let (mut h, mut k) = (vec![0.0; nn], vec![0.0; nn]);
-        let (mut a1, mut a2, mut b1, mut b2) = (vec![0.0; nn], vec![0.0; nn], vec![0.0; nn], vec![0.0; nn]);
+        let (mut a1, mut a2, mut b1, mut b2) =
+            (vec![0.0; nn], vec![0.0; nn], vec![0.0; nn], vec![0.0; nn]);
         let mut ws = Vec::new();
         for j in 0..n {
             for i in 0..=j {

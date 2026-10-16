@@ -400,7 +400,8 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
     )?;
     let load_seconds = start.elapsed().as_secs_f64();
     let _keepers = sdpx_solver::solver::CoreKeepers::for_world(
-        mpi.size(), problem.settings.max_threads as usize,
+        mpi.size(),
+        problem.settings.max_threads as usize,
     );
     let solve_start = Instant::now();
     let mut solver = stage(

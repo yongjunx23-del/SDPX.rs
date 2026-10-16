@@ -540,7 +540,12 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         for v in &mut self.blocks {
             v.keep_start_side(dual);
         }
-        if dual { &mut self.border_z } else { &mut self.border_s }.scale(tau);
+        if dual {
+            &mut self.border_z
+        } else {
+            &mut self.border_s
+        }
+        .scale(tau);
         self.kappa = T::one();
     }
     fn tau(&self) -> Option<T> {

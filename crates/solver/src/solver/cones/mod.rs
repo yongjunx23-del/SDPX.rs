@@ -24,8 +24,7 @@ mod symmetric_common;
 use nonsymmetric_common::*;
 pub use {
     compositecone::*, expcone::*, genpowcone::*, nonnegativecone::*, oprelentrcone::*, powcone::*,
-    socone::*,
-    supportedcone::*, symmetric_common::*, zerocone::*,
+    socone::*, supportedcone::*, symmetric_common::*, zerocone::*,
 };
 
 // only use PSD cones with SDP/Blas enabled

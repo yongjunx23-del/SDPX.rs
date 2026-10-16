@@ -787,7 +787,11 @@ fn chunked_dot_matches<const N: usize>() {
         .map(|i| {
             let x = MpFloat::<N>::from_f64(((i * 7919) % 1013) as f64 - 506.25).unwrap();
             let s = MpFloat::<N>::from_f64(2f64.powi((i % 41) as i32 * 9 - 180)).unwrap();
-            if i % 13 == 0 { MpFloat::<N>::zero() } else { x * s / MpFloat::<N>::from_f64(3.0).unwrap() }
+            if i % 13 == 0 {
+                MpFloat::<N>::zero()
+            } else {
+                x * s / MpFloat::<N>::from_f64(3.0).unwrap()
+            }
         })
         .collect();
     let w: Vec<MpFloat<N>> = v.iter().rev().cloned().collect();
@@ -795,7 +799,11 @@ fn chunked_dot_matches<const N: usize>() {
     for chunks in [1, 2, 7, 64, 997, 5000] {
         let par_for = |n: usize, f: &(dyn Fn(usize) + Sync)| (0..n).rev().for_each(f);
         let chunked = <MpFloat<N> as Scalar>::dot_slices_chunked(&v, &w, chunks, &par_for);
-        assert_eq!(chunked.to_string(), serial.to_string(), "N={N} chunks={chunks}");
+        assert_eq!(
+            chunked.to_string(),
+            serial.to_string(),
+            "N={N} chunks={chunks}"
+        );
     }
 }
 

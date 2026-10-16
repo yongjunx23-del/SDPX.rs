@@ -554,7 +554,11 @@ pub(crate) fn pin_worker(budget: usize, workers: usize) -> impl Fn(usize) + Send
     #[cfg(not(target_os = "linux"))]
     let cpus: Vec<usize> = Vec::new();
     let pin = cpus.len() == budget;
-    let cpus = if pin && workers < budget { spread(cpus) } else { cpus };
+    let cpus = if pin && workers < budget {
+        spread(cpus)
+    } else {
+        cpus
+    };
     move |i: usize| {
         debug_assert!(i < workers);
         #[cfg(target_os = "linux")]
@@ -574,7 +578,11 @@ pub(crate) fn pin_worker(budget: usize, workers: usize) -> impl Fn(usize) + Send
 /// groups, so a prefix of any length spreads over every group.
 #[cfg(target_os = "linux")]
 fn spread(cpus: Vec<usize>) -> Vec<usize> {
-    let read = |path: String| std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<i64>().ok());
+    let read = |path: String| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+    };
     let mut groups: std::collections::BTreeMap<(i64, i64), Vec<usize>> = Default::default();
     for &cpu in &cpus {
         let base = format!("/sys/devices/system/cpu/cpu{cpu}");

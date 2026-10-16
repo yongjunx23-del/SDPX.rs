@@ -7,8 +7,12 @@ use sdpx_arithmetic::MpFloat;
 
 /// The last argument is an AMD ordering of the same pattern computed earlier
 /// in backend selection (`None` when none was needed).
-type LDLConstructor<T> =
-    fn(&CscMatrix<T>, &[i8], &CoreSettings<T>, Option<super::AmdOrdering>) -> BoxedDirectLDLSolver<T>;
+type LDLConstructor<T> = fn(
+    &CscMatrix<T>,
+    &[i8],
+    &CoreSettings<T>,
+    Option<super::AmdOrdering>,
+) -> BoxedDirectLDLSolver<T>;
 
 /// Sparse numerical-provider selection, separate from scalar arithmetic.
 /// Implementations select only backends that support their scalar type.
@@ -45,7 +49,12 @@ macro_rules! primitive_configuration {
                     }),
                     #[cfg(feature = "faer-sparse")]
                     "faer" => (MatrixTriangle::Triu, |m, d, s, amd| {
-                        Box::new(super::faer_ldl::FaerDirectLDLSolver::new(m, d, s, amd.map(|o| o.0)))
+                        Box::new(super::faer_ldl::FaerDirectLDLSolver::new(
+                            m,
+                            d,
+                            s,
+                            amd.map(|o| o.0),
+                        ))
                     }),
                     method => panic!(
                         "LDL backend {method:?} is unavailable for {}",
@@ -74,7 +83,12 @@ macro_rules! primitive_configuration {
                 }
                 #[cfg(not(feature = "faer-sparse"))]
                 {
-                    Box::new(QDLDLDirectLDLSolver::new(matrix, signs, settings, amd.map(|o| o.0)))
+                    Box::new(QDLDLDirectLDLSolver::new(
+                        matrix,
+                        signs,
+                        settings,
+                        amd.map(|o| o.0),
+                    ))
                 }
             }
         }

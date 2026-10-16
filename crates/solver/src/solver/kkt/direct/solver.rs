@@ -73,7 +73,11 @@ struct OreRows<T> {
 fn ore_pattern<T: FloatT>(
     A: &CscMatrix<T>,
     cones: &CompositeCone<T>,
-) -> Option<(CscMatrix<T>, Vec<usize>, Vec<(usize, std::ops::Range<usize>)>)> {
+) -> Option<(
+    CscMatrix<T>,
+    Vec<usize>,
+    Vec<(usize, std::ops::Range<usize>)>,
+)> {
     let blocks: Vec<_> = cones
         .iter()
         .enumerate()
@@ -106,7 +110,11 @@ fn ore_pattern<T: FloatT>(
         }
         colptr.push(rowval.len());
     }
-    Some((CscMatrix::new(A.m, A.n, colptr, rowval, nzval), index, blocks))
+    Some((
+        CscMatrix::new(A.m, A.n, colptr, rowval, nzval),
+        index,
+        blocks,
+    ))
 }
 
 pub struct DirectLDLKKTSolver<T> {
@@ -205,7 +213,14 @@ where
                             pos.extend_from_slice(&map.A[p..p + rows.len()]);
                         }
                     }
-                    OreRows { cone: *cone, rows: rows.clone(), cols, a, pos, t: Default::default() }
+                    OreRows {
+                        cone: *cone,
+                        rows: rows.clone(),
+                        cols,
+                        a,
+                        pos,
+                        t: Default::default(),
+                    }
                 });
                 (rows.collect(), index.clone())
             }
@@ -251,8 +266,12 @@ where
             // tiny (one_matrix_L8 at 128 bits: x = 1e35 after one step);
             // z-first leaves −D per cone and then the SPD Schur AᵀHs⁻¹A.
             let (order, _, info) = crate::qdldl::get_amd_ordering(&KKT, 1.5);
-            let perm: Vec<usize> =
-                order.iter().filter(|&&k| k >= n).chain(order.iter().filter(|&&k| k < n)).copied().collect();
+            let perm: Vec<usize> = order
+                .iter()
+                .filter(|&&k| k >= n)
+                .chain(order.iter().filter(|&&k| k < n))
+                .copied()
+                .collect();
             let mut iperm = vec![0; perm.len()];
             perm.iter().enumerate().for_each(|(i, &k)| iperm[k] = i);
             let _ = amd.set((perm, iperm, info));
@@ -553,9 +572,13 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
             // Columns are independent: the solver pool keeps their bits.
             match self.residual_pool.as_deref() {
                 Some(pool) => pool.install(|| {
-                    values.par_chunks_exact_mut(rows).for_each(|column| t.to_eigen(column))
+                    values
+                        .par_chunks_exact_mut(rows)
+                        .for_each(|column| t.to_eigen(column))
                 }),
-                None => values.chunks_exact_mut(rows).for_each(|column| t.to_eigen(column)),
+                None => values
+                    .chunks_exact_mut(rows)
+                    .for_each(|column| t.to_eigen(column)),
             }
             _update_values(&mut self.ldlsolver, &mut self.KKT, &o.pos, &values);
         }

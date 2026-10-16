@@ -65,10 +65,14 @@ fn pieces<T: FloatT>(
             let (start, base) = (k * len, &base);
             let end = (start + len).min(total);
             // SAFETY: piece k is [start, end), owned by item k alone.
-            f(k, unsafe { std::slice::from_raw_parts_mut(base.0.add(start), end - start) });
+            f(k, unsafe {
+                std::slice::from_raw_parts_mut(base.0.add(start), end - start)
+            });
         });
     } else {
-        out.par_chunks_mut(len).enumerate().for_each(|(k, p)| f(k, p));
+        out.par_chunks_mut(len)
+            .enumerate()
+            .for_each(|(k, p)| f(k, p));
     }
 }
 
@@ -106,7 +110,21 @@ fn product<T: FloatT>(
     let ways = tasks::<T>(m * n * k, usize::MAX);
     crate::algebra::with_split_hint(ways, || {
         let (mi, ni, ki) = (m as i32, n as i32, k as i32);
-        T::xgemm(ta, tb, mi, ni, ki, T::one(), a, lda as i32, b, ldb as i32, T::zero(), c, mi)
+        T::xgemm(
+            ta,
+            tb,
+            mi,
+            ni,
+            ki,
+            T::one(),
+            a,
+            lda as i32,
+            b,
+            ldb as i32,
+            T::zero(),
+            c,
+            mi,
+        )
     });
 }
 
@@ -119,7 +137,21 @@ fn tri(i: usize, j: usize) -> usize {
 fn gemm<T: FloatT>(ta: bool, tb: bool, n: usize, a: &[T], b: &[T], c: &mut [T]) {
     let ni = n as i32;
     let t = |x: bool| if x { b'T' } else { b'N' };
-    T::xgemm(t(ta), t(tb), ni, ni, ni, T::one(), a, ni, b, ni, T::zero(), c, ni);
+    T::xgemm(
+        t(ta),
+        t(tb),
+        ni,
+        ni,
+        ni,
+        T::one(),
+        a,
+        ni,
+        b,
+        ni,
+        T::zero(),
+        c,
+        ni,
+    );
 }
 
 /// Lower Cholesky factor in place (upper triangle zeroed); false unless ≻ 0.
@@ -223,7 +255,20 @@ fn cholesky_rec<T: FloatT>(n: usize, a: &mut [T], ld: usize) -> bool {
     let mut packed = vec![T::zero(); n2 * (n2 + 1) / 2];
     let ways = tasks::<T>(n2 * n2 * n1 / 2, usize::MAX);
     let upper = crate::algebra::with_split_hint(ways, || {
-        T::xgemm_upper_exact(b'N', b'T', n2, n2, n1, l21, ld, l21, ld, &mut packed, None, None)
+        T::xgemm_upper_exact(
+            b'N',
+            b'T',
+            n2,
+            n2,
+            n1,
+            l21,
+            ld,
+            l21,
+            ld,
+            &mut packed,
+            None,
+            None,
+        )
     });
     if upper {
         for j in 0..n2 {
@@ -266,7 +311,13 @@ fn solve_lower_t<T: FloatT>(m: usize, n: usize, l: &[T], ldl: usize, b: &mut [T]
     solve_lower_t(m, n1, l, ldl, b, ldb);
     let (b1, b2) = b.split_at_mut(n1 * ldb);
     let mut p = vec![T::zero(); m * n2];
-    product((b'N', b'T'), (m, n2, n1), (b1, ldb), (&l[n1..], ldl), &mut p);
+    product(
+        (b'N', b'T'),
+        (m, n2, n1),
+        (b1, ldb),
+        (&l[n1..], ldl),
+        &mut p,
+    );
     for j in 0..n2 {
         for i in 0..m {
             b2[i + j * ldb] -= p[i + j * m];
@@ -328,9 +379,21 @@ fn lower_inverse_rec<T: FloatT>(n: usize, l: &[T], ldl: usize, x: &mut [T], ldx:
     lower_inverse_rec(n1, l, ldl, x, ldx);
     lower_inverse_rec(n2, &l[n1 + n1 * ldl..], ldl, &mut x[n1 + n1 * ldx..], ldx);
     let mut t = vec![T::zero(); n2 * n1];
-    product((b'N', b'N'), (n2, n1, n1), (&l[n1..], ldl), (x, ldx), &mut t);
+    product(
+        (b'N', b'N'),
+        (n2, n1, n1),
+        (&l[n1..], ldl),
+        (x, ldx),
+        &mut t,
+    );
     let mut p = vec![T::zero(); n1 * n2];
-    product((b'T', b'T'), (n1, n2, n2), (&t, n2), (&x[n1 + n1 * ldx..], ldx), &mut p);
+    product(
+        (b'T', b'T'),
+        (n1, n2, n2),
+        (&t, n2),
+        (&x[n1 + n1 * ldx..], ldx),
+        &mut p,
+    );
     for j in 0..n1 {
         for i in 0..n2 {
             x[n1 + i + j * ldx] = -p[j + i * n1];
@@ -404,8 +467,27 @@ fn sym_eig<T: FloatT>(n: usize, a: &mut [T], w: &mut [T], u: &mut [T]) -> bool {
     let mut iwork = vec![0i32; 1];
     let (zero, tol) = (T::zero(), -T::one());
     T::xsyevr(
-        b'V', b'A', b'U', ni, a, ni, zero, zero, 0, 0, tol, &mut m, w, u, ni, &mut isuppz,
-        &mut work, -1, &mut iwork, -1, &mut info,
+        b'V',
+        b'A',
+        b'U',
+        ni,
+        a,
+        ni,
+        zero,
+        zero,
+        0,
+        0,
+        tol,
+        &mut m,
+        w,
+        u,
+        ni,
+        &mut isuppz,
+        &mut work,
+        -1,
+        &mut iwork,
+        -1,
+        &mut info,
     );
     if info != 0 {
         return false;
@@ -415,8 +497,27 @@ fn sym_eig<T: FloatT>(n: usize, a: &mut [T], w: &mut [T], u: &mut [T]) -> bool {
     work.resize(lwork, T::zero());
     iwork.resize(liwork, 0);
     T::xsyevr(
-        b'V', b'A', b'U', ni, a, ni, zero, zero, 0, 0, tol, &mut m, w, u, ni, &mut isuppz,
-        &mut work, lwork as i32, &mut iwork, liwork as i32, &mut info,
+        b'V',
+        b'A',
+        b'U',
+        ni,
+        a,
+        ni,
+        zero,
+        zero,
+        0,
+        0,
+        tol,
+        &mut m,
+        w,
+        u,
+        ni,
+        &mut isuppz,
+        &mut work,
+        lwork as i32,
+        &mut iwork,
+        liwork as i32,
+        &mut info,
     );
     info == 0 && m == ni
 }
@@ -458,9 +559,19 @@ fn congruence<T: FloatT>(n: usize, b: &[T], m: &[T], left_t: bool, tmp: &mut [T]
 /// `out = X·S` (`right`) or `S·X` for a symmetric S whose nonzeros lie at
 /// (p, q) and (q, p): one product per output entry, the dense product's
 /// value (its other terms are exact zeros).
-fn mul_unit<T: FloatT>(n: usize, x: &[T], s: &[T], (p, q): (usize, usize), right: bool, out: &mut [T]) {
+fn mul_unit<T: FloatT>(
+    n: usize,
+    x: &[T],
+    s: &[T],
+    (p, q): (usize, usize),
+    right: bool,
+    out: &mut [T],
+) {
     out.fill(T::zero());
-    for (r, c) in [(p, q), (q, p)].into_iter().take(if p == q { 1 } else { 2 }) {
+    for (r, c) in [(p, q), (q, p)]
+        .into_iter()
+        .take(if p == q { 1 } else { 2 })
+    {
         let v = s[r + c * n];
         if v == T::zero() {
             continue;
@@ -671,7 +782,14 @@ impl<T: FloatT> Oracle<T> {
                     let ids = [a, b, c];
                     let v = [self.lam[a], self.lam[b], self.lam[c]];
                     let x = divided2(v, |p, q| d1[ids[p] + ids[q] * n]);
-                    for (i, j, k) in [(a, b, c), (a, c, b), (b, a, c), (b, c, a), (c, a, b), (c, b, a)] {
+                    for (i, j, k) in [
+                        (a, b, c),
+                        (a, c, b),
+                        (b, a, c),
+                        (b, c, a),
+                        (c, a, b),
+                        (c, b, a),
+                    ] {
                         d2[i + n * (j + n * k)] = x;
                     }
                 }
@@ -806,7 +924,8 @@ impl<T: FloatT> Oracle<T> {
         for &(i, j) in &support {
             let (ij, ji) = (i + j * n, j + i * n);
             let (li, lj, gi, gj) = (lam[i], lam[j], g[i], g[j]);
-            let dhq = -half * (m3[ij] + m3[ji]) + q38 * (m4[ij] + m4[ji])
+            let dhq = -half * (m3[ij] + m3[ji])
+                + q38 * (m4[ij] + m4[ji])
                 + q14 * (lj * m1[ij] + li * m1[ji])
                 - half * (li + lj) * gam[ij]
                 + half * (m5[ij] + m5[ji])
@@ -832,7 +951,14 @@ impl<T: FloatT> Oracle<T> {
         let mut x = vec![T::zero(); nn];
         for part in 0..3 {
             smat(n, &d[part * m..(part + 1) * m], &mut x);
-            congruence(n, &self.q, &x, true, &mut tmp, &mut mats[part * nn..(part + 1) * nn]);
+            congruence(
+                n,
+                &self.q,
+                &x,
+                true,
+                &mut tmp,
+                &mut mats[part * nn..(part + 1) * nn],
+            );
         }
         let (s, hk) = mats.split_at(nn);
         let (h, k) = hk.split_at(nn);
@@ -876,7 +1002,8 @@ impl<T: FloatT> Oracle<T> {
         let nn = n * n;
         let m2 = 2 * m;
         let mut s0 = vec![T::zero(); m2 * m2];
-        let pairs: Vec<(usize, usize)> = (0..n).flat_map(|j| (0..=j).map(move |i| (i, j))).collect();
+        let pairs: Vec<(usize, usize)> =
+            (0..n).flat_map(|j| (0..=j).map(move |i| (i, j))).collect();
         // columns in pieces of n, each piece with its own scratch
         let this = &*self;
         pieces::<T>(&mut s0, n * m2, 16 * m2 * nn, |piece, cols| {
@@ -921,7 +1048,14 @@ impl<T: FloatT> Oracle<T> {
         let mut hat = vec![T::zero(); 3 * nn];
         for part in 0..3 {
             smat(n, &z[part * m..(part + 1) * m], &mut x);
-            congruence(n, &self.p, &x, true, &mut tmp, &mut hat[part * nn..(part + 1) * nn]);
+            congruence(
+                n,
+                &self.p,
+                &x,
+                true,
+                &mut tmp,
+                &mut hat[part * nn..(part + 1) * nn],
+            );
         }
         let (r, rest) = hat.split_at_mut(nn);
         let (u, v) = rest.split_at_mut(nn);
@@ -1328,7 +1462,9 @@ impl<T: FloatT> OpRelEntropyCone<T> {
         }
         // (g₊ − 2g₀ + g₋)/ε² · ‖h‖ₛ²
         let scale = norm2 / (eps * eps);
-        out.iter_mut().zip(&g0).for_each(|(o, &g)| *o = (*o - g - g) * scale);
+        out.iter_mut()
+            .zip(&g0)
+            .for_each(|(o, &g)| *o = (*o - g - g) * scale);
         out.iter().all(|v| v.is_finite()).then_some(out)
     }
 
@@ -1413,7 +1549,11 @@ impl<T: FloatT> OpRelEntropyCone<T> {
             v[2 * m + i] += rows.dk[i] * t;
         }
         let nn = n * n;
-        let (mut a, mut tmp, mut b) = (vec![T::zero(); nn], vec![T::zero(); nn], vec![T::zero(); nn]);
+        let (mut a, mut tmp, mut b) = (
+            vec![T::zero(); nn],
+            vec![T::zero(); nn],
+            vec![T::zero(); nn],
+        );
         smat(n, &v[..m], &mut a);
         congruence(n, &data.zh, &a, false, &mut tmp, &mut b);
         let inv = data.μ.recip();
@@ -1703,7 +1843,10 @@ where
                     work.waxpby(T::one(), s, a, ds);
                     at = Oracle::new(n, &work).map(|o| (a, o));
                 }
-                if at.as_mut().is_some_and(|(_, o)| this.dual_ok(o, &work, &wz, &mut cg)) {
+                if at
+                    .as_mut()
+                    .is_some_and(|(_, o)| this.dual_ok(o, &work, &wz, &mut cg))
+                {
                     αz = α;
                     break;
                 }
@@ -1759,7 +1902,8 @@ where
                     T::infinity()
                 } else {
                     let half: T = (0.5).as_T();
-                    -nu * (T::one() + mu.ln()) + half * (o.dual_form(&wz, false).unwrap() / (mu * mu) - nu)
+                    -nu * (T::one() + mu.ln())
+                        + half * (o.dual_form(&wz, false).unwrap() / (mu * mu) - nu)
                 }
             }
         };

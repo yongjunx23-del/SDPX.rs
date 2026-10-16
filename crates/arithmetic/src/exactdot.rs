@@ -213,14 +213,13 @@ pub(crate) fn dot_slices_chunked<'a, const N: usize>(
         }
         scans.lock().unwrap()[k] = Some((emin, emax, finite));
     });
-    let (emin, emax, finite) = scans
-        .into_inner()
-        .unwrap()
-        .into_iter()
-        .fold((i64::MAX, i64::MIN, true), |(a, b, c), scan| {
+    let (emin, emax, finite) = scans.into_inner().unwrap().into_iter().fold(
+        (i64::MAX, i64::MIN, true),
+        |(a, b, c), scan| {
             let (x, y, z) = scan.expect("chunk scheduler skipped exponent scan");
             (a.min(x), b.max(y), c && z)
-        });
+        },
+    );
     let len = match (finite, emin == i64::MAX) {
         (_, true) if finite => return MpFloat::<N>::default(),
         (true, false) => acc_len::<N>(emin, emax),
@@ -606,7 +605,13 @@ pub(crate) unsafe fn mpn_mul_n<const N: usize>(rp: *mut u64, up: *const u64, vp:
     #[cfg(target_arch = "x86_64")]
     if N < 19 {
         extern "C" {
-            fn __gmpn_mul_basecase(rp: *mut u64, up: *const u64, un: gmp::size_t, vp: *const u64, vn: gmp::size_t);
+            fn __gmpn_mul_basecase(
+                rp: *mut u64,
+                up: *const u64,
+                un: gmp::size_t,
+                vp: *const u64,
+                vn: gmp::size_t,
+            );
         }
         return __gmpn_mul_basecase(rp, up, N as _, vp, N as _);
     }
