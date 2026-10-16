@@ -381,9 +381,18 @@ fn local_affinity_disjoint(fns: &Fns, local: MpiComm, size: usize) -> bool {
     let mut masks = vec![0u8; width * size];
     // SAFETY: each rank exchanges one fixed-size byte mask on its shared node.
     if unsafe {
-        (fns.allgatherv)(mask.as_ptr().cast(), width as c_int, fns.byte,
-            masks.as_mut_ptr().cast(), counts.as_ptr(), displs.as_ptr(), fns.byte, local)
-    } != MPI_SUCCESS {
+        (fns.allgatherv)(
+            mask.as_ptr().cast(),
+            width as c_int,
+            fns.byte,
+            masks.as_mut_ptr().cast(),
+            counts.as_ptr(),
+            displs.as_ptr(),
+            fns.byte,
+            local,
+        )
+    } != MPI_SUCCESS
+    {
         return false;
     }
     let mut seen = vec![0u8; width];
@@ -759,7 +768,10 @@ impl World {
         let local_affinity_disjoint = local_affinity_disjoint(&fns, local, local_size as usize);
         if unsafe { (fns.comm_free)(&mut local) } != MPI_SUCCESS {
             return activation_failed_with_abort(
-                &fns, fns.comm_world, advertised, requested,
+                &fns,
+                fns.comm_world,
+                advertised,
+                requested,
                 "MPI_Comm_free returned an error",
             );
         }

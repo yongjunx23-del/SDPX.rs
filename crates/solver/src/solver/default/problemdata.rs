@@ -567,8 +567,18 @@ where
                 Some(p) if ework.len() >= POOLED_RUIZ_MIN => p.install(|| {
                     use rayon::prelude::*;
                     rayon::join(
-                        || dwork.par_chunks_mut(RUIZ_CHUNK).zip(d.par_chunks(RUIZ_CHUNK)).for_each(|(w, s)| bound(w, s)),
-                        || ework.par_chunks_mut(RUIZ_CHUNK).zip(e.par_chunks(RUIZ_CHUNK)).for_each(|(w, s)| bound(w, s)),
+                        || {
+                            dwork
+                                .par_chunks_mut(RUIZ_CHUNK)
+                                .zip(d.par_chunks(RUIZ_CHUNK))
+                                .for_each(|(w, s)| bound(w, s))
+                        },
+                        || {
+                            ework
+                                .par_chunks_mut(RUIZ_CHUNK)
+                                .zip(e.par_chunks(RUIZ_CHUNK))
+                                .for_each(|(w, s)| bound(w, s))
+                        },
                     );
                 }),
                 _ => {
@@ -660,26 +670,33 @@ fn kkt_col_norms_pooled<T: FloatT>(
     pool.install(|| {
         rayon::join(
             || {
-                norm_LHS.par_iter_mut().enumerate().with_min_len(64).for_each(|(j, v)| {
-                    *v = nzval[colptr[j]..colptr[j + 1]]
-                        .iter()
-                        .fold(*v, |m, &x| T::max(m, T::abs(x)));
-                })
+                norm_LHS
+                    .par_iter_mut()
+                    .enumerate()
+                    .with_min_len(64)
+                    .for_each(|(j, v)| {
+                        *v = nzval[colptr[j]..colptr[j + 1]]
+                            .iter()
+                            .fold(*v, |m, &x| T::max(m, T::abs(x)));
+                    })
             },
             || {
-                norm_RHS.par_chunks_mut(RUIZ_CHUNK).enumerate().for_each(|(k, out)| {
-                    out.fill(T::zero());
-                    let (r0, r1) = (k * RUIZ_CHUNK, k * RUIZ_CHUNK + out.len());
-                    for j in 0..A.n {
-                        let rows = &rowval[colptr[j]..colptr[j + 1]];
-                        let lo = rows.partition_point(|&r| r < r0);
-                        let hi = lo + rows[lo..].partition_point(|&r| r < r1);
-                        for p in colptr[j] + lo..colptr[j] + hi {
-                            let v = &mut out[rowval[p] - r0];
-                            *v = T::max(*v, T::abs(nzval[p]));
+                norm_RHS
+                    .par_chunks_mut(RUIZ_CHUNK)
+                    .enumerate()
+                    .for_each(|(k, out)| {
+                        out.fill(T::zero());
+                        let (r0, r1) = (k * RUIZ_CHUNK, k * RUIZ_CHUNK + out.len());
+                        for j in 0..A.n {
+                            let rows = &rowval[colptr[j]..colptr[j + 1]];
+                            let lo = rows.partition_point(|&r| r < r0);
+                            let hi = lo + rows[lo..].partition_point(|&r| r < r1);
+                            for p in colptr[j] + lo..colptr[j] + hi {
+                                let v = &mut out[rowval[p] - r0];
+                                *v = T::max(*v, T::abs(nzval[p]));
+                            }
                         }
-                    }
-                })
+                    })
             },
         )
     });

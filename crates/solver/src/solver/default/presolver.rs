@@ -534,11 +534,18 @@ where
 
 // Prove dependence over exact input values, including RHS. Retained rows are
 // unchanged, so zero multipliers restore a valid dual in original coordinates.
-// Elimination is bounded by an operation budget (modular proof and rational
-// fallback separately) and the per-coefficient size guard (`Exact::bounded`);
-// past either, no row is removed.
+// Elimination is bounded by an operation budget (modular proof and
+// limb-weighted rational fallback separately) and the per-coefficient size
+// guard (`Exact::bounded`); past either, no row is removed.
 const MODULAR_BUDGET: usize = 400_000_000;
 const RATIONAL_BUDGET: usize = 40_000_000;
+/// Rational updates are charged in GMP limbs, `limbs(factor)·limbs(value) +
+/// limbs(entry)` (a division `limbs(factor)·limbs(value)`), since products and
+/// gcds grow with operand size; the budget above counts updates of one-limb
+/// numerators and denominators, which cost this many. Counting updates let
+/// LP_brandy's fill grow to 24 limbs per update and run 23 ms (80 of 220
+/// rows, then out of budget) against 3.3 ms for its iterations.
+const SMALL_UPDATE_LIMBS: usize = 6;
 /// Elimination updates allowed per unit of one IPM iteration's estimated
 /// work (stored coefficients and rows of `A`, plus `p^3` per PSD block for
 /// its scaling). The proof is an optional reduction: this keeps it within a
@@ -547,6 +554,11 @@ const RATIONAL_BUDGET: usize = 40_000_000;
 /// without presolve, while the large Float64 SDP gains from the 1317 rows it
 /// removes in 1.2 s of a 45-125 s solve.
 const WORK_PER_UNIT: usize = 4;
+/// Dense minor updates per sparse modular update of the same time. d6n640q
+/// (640 dense equality rows, Apple M4): 0.49 ns per dense update against
+/// 37 ns per sparse update plus 13 ns to build its rows. The work budget
+/// stopped the minor 0.02 s in; the sparse pass then ran 2.2 s and ran out.
+const DENSE_PER_SPARSE_UPDATE: usize = 64;
 
 fn redundant_equalities<T: FloatT>(
     A: &CscMatrix<T>,
@@ -578,6 +590,14 @@ fn redundant_equalities_impl<T: FloatT>(
         return None;
     }
     let mut lookup = vec![usize::MAX; b.len()];
+    for (i, &r) in ids.iter().enumerate() {
+        lookup[r] = i;
+    }
+    let ids = peel_owned_columns(A, b, &ids, &lookup)?;
+    if ids.is_empty() {
+        return Some(Vec::new());
+    }
+    lookup.fill(usize::MAX);
     for (i, &r) in ids.iter().enumerate() {
         lookup[r] = i;
     }
@@ -636,7 +656,7 @@ fn redundant_equalities_impl<T: FloatT>(
     }
     let mut basis: BTreeMap<usize, BTreeMap<usize, Exact>> = BTreeMap::new();
     let mut redundant = Vec::new();
-    let mut budget = work.min(RATIONAL_BUDGET);
+    let mut budget = work.min(RATIONAL_BUDGET).saturating_mul(SMALL_UPDATE_LIMBS);
     for (id, mut row) in ids.into_iter().zip(rows) {
         loop {
             let Some((&pivot, value)) = row.first_key_value() else {
@@ -644,10 +664,11 @@ fn redundant_equalities_impl<T: FloatT>(
                 break;
             };
             let factor = value.clone();
+            let limbs = factor.limbs();
             if let Some(previous) = basis.get(&pivot) {
-                budget = budget.checked_sub(previous.len())?;
                 for (&c, value) in previous {
                     let entry = row.entry(c).or_default();
+                    budget = budget.checked_sub(limbs * value.limbs() + entry.limbs())?;
                     entry.subtract_product(&factor, value);
                     if !entry.bounded() {
                         return None;
@@ -658,6 +679,7 @@ fn redundant_equalities_impl<T: FloatT>(
                 }
             } else {
                 for value in row.values_mut() {
+                    budget = budget.checked_sub(limbs * value.limbs())?;
                     value.divide(&factor);
                     if !value.bounded() {
                         return None;
@@ -669,6 +691,76 @@ fn redundant_equalities_impl<T: FloatT>(
         }
     }
     Some(redundant)
+}
+
+/// Equality rows left after peeling every row that alone uses some column of
+/// `[A b]`: such a row has a zero multiplier in every dependence, so it is
+/// independent and each remaining row is redundant exactly when it was
+/// before. LP equality systems usually peel completely (full rank in
+/// O(nnz)). `None` on a non-finite coefficient, as the proofs below.
+fn peel_owned_columns<T: FloatT>(
+    a: &CscMatrix<T>,
+    b: &[T],
+    ids: &[usize],
+    lookup: &[usize],
+) -> Option<Vec<usize>> {
+    // Row-wise pattern of the equality rows (column a.n is b), with each
+    // column's count of live rows and the XOR of their indices: at count
+    // one, the XOR is the owning row.
+    let (m, n) = (ids.len(), a.n);
+    let (mut count, mut owner) = (vec![0u32; n + 1], vec![0usize; n + 1]);
+    let (mut start, mut entries) = (vec![0usize; m + 1], Vec::with_capacity(a.nnz() + m));
+    let mut finite = true;
+    let mut add = |i: usize, c: usize, v: &T| {
+        finite &= v.is_finite();
+        entries.push((i, c));
+        start[i + 1] += 1;
+        count[c] += 1;
+        owner[c] ^= i;
+    };
+    for c in 0..n {
+        for k in a.colptr[c]..a.colptr[c + 1] {
+            let i = lookup[a.rowval[k]];
+            if i != usize::MAX && a.nzval[k] != T::zero() {
+                add(i, c, &a.nzval[k]);
+            }
+        }
+    }
+    for (i, &r) in ids.iter().enumerate() {
+        if b[r] != T::zero() {
+            add(i, n, &b[r]);
+        }
+    }
+    if !finite {
+        return None;
+    }
+    for i in 0..m {
+        start[i + 1] += start[i];
+    }
+    let mut cols = vec![0usize; entries.len()];
+    let mut fill = start.clone();
+    for &(i, c) in &entries {
+        cols[fill[i]] = c;
+        fill[i] += 1;
+    }
+    let mut live = vec![true; m];
+    let mut owned: Vec<usize> = (0..=n).filter(|&c| count[c] == 1).collect();
+    while let Some(c) = owned.pop() {
+        if count[c] != 1 {
+            continue;
+        }
+        let i = owner[c];
+        live[i] = false;
+        for &c in &cols[start[i]..start[i + 1]] {
+            count[c] -= 1;
+            owner[c] ^= i;
+            if count[c] == 1 {
+                owned.push(c);
+            }
+        }
+    }
+    let core = ids.iter().zip(live).filter_map(|(&r, l)| l.then_some(r));
+    Some(core.collect())
 }
 
 // A nonsingular minor over F_(2^31 - 1) proves independence over the exact
@@ -692,9 +784,12 @@ fn short_equalities_full_rank<T: FloatT>(
     // A full minor takes about m³/2 modular updates; past twice that (a
     // dependent system), defer to the sparse modular/rational path unchanged.
     // The dense modular minor is cheap per update: keep its 16M floor (SOCP
-    // nb_L2_bessel proves its 123 rows in 5.6 ms) and bound larger systems
-    // by the work estimate.
-    let mut budget = (2 * m * m * m).max(16_000_000).min(work.max(16_000_000));
+    // nb_L2_bessel proves its 123 rows in 5.6 ms) and give larger systems
+    // the time of the sparse modular pass that would follow.
+    let sparse = work
+        .min(MODULAR_BUDGET)
+        .saturating_mul(DENSE_PER_SPARSE_UPDATE);
+    let mut budget = (2 * m * m * m).max(16_000_000).min(sparse.max(16_000_000));
     // Any nonsingular minor is a proof, so visit the columns in a fixed
     // stride order: blocks of columns sharing a row pattern are then sampled
     // early instead of exhausting the budget one block at a time.

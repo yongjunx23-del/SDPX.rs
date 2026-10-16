@@ -91,10 +91,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         } else {
             0
         };
-        // Tall couplings already occupy the input CSC. Bound the additional
-        // dense storage, rather than rejecting a large, already dense LP.
+        // Tall couplings already occupy the input CSC, and a dense coupling
+        // fills QDLDL's factor just as much: bound the panels as the generic
+        // arrow does, rather than rejecting a large, already dense LP.
         if cells * std::mem::size_of::<T>() as u128 + packed_bytes
-            > ARROW_MAX_BYTES + k.nzval.len() as u128 * std::mem::size_of::<T>() as u128
+            > ARROW_MAX_BYTES
+                .max(ARROW_KKT_FACTOR * k.nzval.len() as u128 * std::mem::size_of::<T>() as u128)
         {
             return None;
         }

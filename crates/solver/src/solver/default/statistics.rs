@@ -44,7 +44,9 @@ impl<'a, T: FloatT> NormView<'a, T> {
     }
     fn scan(&self) -> ScaledNorm<T> {
         assert_eq!(self.values.len(), self.scales.len());
-        if T::precision_bits() > 64 && self.indices.is_none() && rayon::current_thread_index().is_some()
+        if T::precision_bits() > 64
+            && self.indices.is_none()
+            && rayon::current_thread_index().is_some()
             && self.values.len() >= POOLED_SCAN_MIN
         {
             // Long scans split over the ambient pool: entrywise products,

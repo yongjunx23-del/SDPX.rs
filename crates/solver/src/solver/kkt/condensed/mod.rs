@@ -987,6 +987,9 @@ pub(crate) struct CondensedKKTSolver<T: FloatT> {
     sampled: Option<(Arc<SampledOperator<T>>, SampledWorkspace<T>)>,
     sparse_products: Option<crate::algebra::sparse_parallel::SparseParallel>,
     counters: crate::solver::kkt::SolveCounters,
+    /// Rows outside zero cones, when zero-cone rows of a local kernel hold
+    /// entries: an owner's recovery reads A·x only on these rows.
+    forward_rows: Vec<usize>,
 }
 
 fn local_world(local_only: bool) -> Option<crate::mpi::World> {
@@ -1447,9 +1450,27 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 && crate::algebra::sparse_parallel::worthwhile(A))
             .then(|| crate::algebra::sparse_parallel::SparseParallel::new(A)),
             counters: Default::default(),
+            forward_rows: Vec::new(),
         };
         if let Some(plan) = &mut solver.sparse_products {
             plan.configure(A, solver.pool.clone());
+        }
+        if local_only {
+            let mut zero = vec![false; m];
+            for block in &solver.blocks {
+                if matches!(block.scaling, Scaling::Zero) {
+                    zero[block.rows.clone()].fill(true);
+                }
+            }
+            if A.rowval.iter().any(|&r| zero[r]) {
+                solver.forward_rows = (0..m).filter(|&r| !zero[r]).collect();
+                // Its row view serves the row-subset product; without lanes
+                // every other product keeps the serial gemv.
+                let plan = solver
+                    .sparse_products
+                    .get_or_insert_with(|| crate::algebra::sparse_parallel::SparseParallel::new(A));
+                plan.configure(A, solver.pool.clone());
+            }
         }
         solver.refresh_parallel_plan();
         solver
@@ -1486,6 +1507,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     crate::mpi::SITE_RZ
                 },
             );
+        } else if let (None, Some(plan)) = (world, plan) {
+            plan.product_local(a, transpose, y, x, alpha, beta);
         } else if transpose {
             a.t().gemv(y, x, alpha, beta);
         } else {
@@ -1847,6 +1870,21 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         self.reduced.diagonal_norm()
     }
 
+    /// Interior columns factored with pivot one; see
+    /// [`DirectLDLKKTSolver::set_unit_pivots`].
+    pub(crate) fn set_interior_unit_pivots(&mut self, columns: Vec<usize>) {
+        self.reduced.set_unit_pivots(columns);
+    }
+
+    pub(crate) fn interior_columns_isolated(&self, columns: &[usize]) -> bool {
+        self.reduced.isolated_columns(columns)
+    }
+
+    /// Whether the interior KKT stores only its diagonal.
+    pub(crate) fn interior_diagonal(&self) -> bool {
+        self.reduced.structurally_diagonal()
+    }
+
     pub(crate) fn factor_interior(&mut self, settings: &CoreSettings<T>, shift: T) -> bool {
         self.reduced.factor_with_shift(settings, Some(shift))
     }
@@ -1960,7 +1998,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         self.retained_rhs
             .copy_from_slice(&interior[self.n..self.n + nr]);
         self.reduced.from_eigen_dual(&mut self.retained_rhs);
-        self.recover_rhs(out, rhs)
+        self.recover_rhs(out, rhs, true)
     }
 
     pub(crate) fn original_residual(&mut self, out: &mut [T], rhs: &[T], point: &[T]) -> T {
@@ -2118,7 +2156,9 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         crate::receipt::finish("prepare_rhs", phase_timer);
     }
 
-    fn recover_rhs(&mut self, out: &mut [T], rhs: &[T]) -> bool {
+    /// `skip_zero`: the caller supplies zero-cone duals and never reuses
+    /// `workz` on those rows, so their A·x is not formed.
+    fn recover_rhs(&mut self, out: &mut [T], rhs: &[T], skip_zero: bool) -> bool {
         let phase_timer = crate::receipt::start();
         let bz = &rhs[self.n..];
         let (x, z) = out.split_at_mut(self.n);
@@ -2156,6 +2196,20 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     self.pool.as_ref(),
                 );
             }
+        } else if skip_zero
+            && !self.forward_rows.is_empty()
+            && self.a_panel.is_none()
+            && self.mpi_world().is_none()
+        {
+            self.workz.fill(T::zero());
+            self.sparse_products.as_ref().unwrap().forward_rows_local(
+                &self.A,
+                &self.forward_rows,
+                &mut self.workz,
+                x,
+                T::one(),
+                T::zero(),
+            );
         } else {
             Self::sparse_gemv(
                 self.mpi_world(),
@@ -2201,7 +2255,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
 
     fn solve_raw(&mut self, out: &mut [T], rhs: &[T], settings: &CoreSettings<T>) -> bool {
         self.solve_reduced(out, rhs, settings)
-            && local_success(self.local_only, self.recover_rhs(out, rhs))
+            && local_success(self.local_only, self.recover_rhs(out, rhs, false))
     }
 
     /// The reduced half of `solve_raw`: condense `rhs` and solve for
@@ -2316,7 +2370,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     assign_ways(blocks, action_index(&action), workers);
                     let gemm = Some((pool.as_ref(), (*scaling_tiles).max(1)));
                     pool.install(|| {
-                        jobs.extend(scaling_jobs(blocks, workh, z, action, gemm));
+                        jobs.extend(scaling_jobs(blocks, scaling_lanes, workh, z, action, gemm));
                         crate::algebra::run_queue(jobs, workers);
                     });
                     true
@@ -2384,14 +2438,18 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     );
                 }
             } else {
-                match a_panel {
-                    Some(panel) => panel.gemv(true, ex, z, -T::one(), T::one()),
-                    None => A.t().gemv(ex, z, -T::one(), T::one()),
+                match (a_panel.as_ref(), sparse_products.as_ref()) {
+                    (Some(panel), _) => panel.gemv(true, ex, z, -T::one(), T::one()),
+                    (None, Some(plan)) => plan.product_local(A, true, ex, z, -T::one(), T::one()),
+                    (None, None) => A.t().gemv(ex, z, -T::one(), T::one()),
                 }
                 if !reuse_forward {
-                    match a_panel {
-                        Some(panel) => panel.gemv(false, ez, x, -T::one(), T::one()),
-                        None => A.gemv(ez, x, -T::one(), T::one()),
+                    match (a_panel.as_ref(), sparse_products.as_ref()) {
+                        (Some(panel), _) => panel.gemv(false, ez, x, -T::one(), T::one()),
+                        (None, Some(plan)) => {
+                            plan.product_local(A, false, ez, x, -T::one(), T::one())
+                        }
+                        (None, None) => A.gemv(ez, x, -T::one(), T::one()),
                     }
                 }
             }

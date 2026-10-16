@@ -277,7 +277,7 @@ fn gemm<const N: usize>(
         return;
     }
     if alpha != F::<N>::zero()
-        && (residue_blas_profitable::<N>(m as usize, n as usize, k as usize)
+        && (residue_product_profitable::<N>(m as usize, n as usize, k as usize)
             || (N >= 16 && m == n && n == k && m >= 12))
     {
         let (mu, nu) = (m as usize, n as usize);
@@ -350,9 +350,22 @@ fn residue_blas_profitable<const N: usize>(m: usize, n: usize, k: usize) -> bool
     N >= 4 && k >= 24 && m * n >= 576
 }
 
+/// [`residue_blas_profitable`] for products whose other path is the same
+/// exact dots (`gemm`, `xgemm_upper_exact`): two- and three-limb types join
+/// from 64³. Serial on Apple M-series with Accelerate (2026-10-14), at
+/// exponent spreads 2^±4 to 2^±200, the residue product was 2.0–4.8× faster
+/// than per-entry exact dots at 64³ and 6–22× at 512³; below 48³ it could
+/// lose.
+fn residue_product_profitable<const N: usize>(m: usize, n: usize, k: usize) -> bool {
+    residue_blas_profitable::<N>(m, n, k) || (N >= 2 && k >= 64 && m * n >= 4096)
+}
+
 impl<const N: usize> XgemmScalar for F<N> {
     fn residue_blas_applies(m: usize, n: usize, k: usize) -> bool {
         residue_blas_profitable::<N>(m, n, k)
+    }
+    fn residue_product_applies(m: usize, n: usize, k: usize) -> bool {
+        residue_product_profitable::<N>(m, n, k)
     }
     fn xsvec_quadratic_exact(
         h: usize,
@@ -430,7 +443,7 @@ impl<const N: usize> XgemmScalar for F<N> {
         pool: Option<&rayon::ThreadPool>,
         cache_b: Option<&mut super::ResidueCache>,
     ) -> bool {
-        residue_blas_profitable::<N>(m, n, k)
+        residue_product_profitable::<N>(m, n, k)
             && super::rns_blas::gemm(ta, tb, m, n, k, a, lda, b, ldb, true, pool, c, cache_b)
     }
     fn xgemm_blocks_upper_exact(

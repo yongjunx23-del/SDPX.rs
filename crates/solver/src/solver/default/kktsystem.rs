@@ -398,7 +398,10 @@ where
         // by cond(N)·eps (two_matrix_L6 at 128 bits: primal residual 7e-23 →
         // 1e-15 over the last eight iterations). Take Δs from the linear row
         // as the binary64 condensed rows above do.
-        if cones.iter().any(|c| matches!(c, SupportedCone::OpRelEntropyCone(_))) {
+        if cones
+            .iter()
+            .any(|c| matches!(c, SupportedCone::OpRelEntropyCone(_)))
+        {
             workz.waxpby(-T::one(), &rhs.z, lhs.τ, &data.b);
             data.A.gemv(workz, &lhs.x, -T::one(), T::one());
             for (cone, rng) in cones.iter().zip(cones.rng_cones.iter()) {

@@ -7,8 +7,12 @@ use sdpx_arithmetic::MpFloat;
 
 /// The last argument is an AMD ordering of the same pattern computed earlier
 /// in backend selection (`None` when none was needed).
-type LDLConstructor<T> =
-    fn(&CscMatrix<T>, &[i8], &CoreSettings<T>, Option<super::AmdOrdering>) -> BoxedDirectLDLSolver<T>;
+type LDLConstructor<T> = fn(
+    &CscMatrix<T>,
+    &[i8],
+    &CoreSettings<T>,
+    Option<super::AmdOrdering>,
+) -> BoxedDirectLDLSolver<T>;
 
 /// Sparse numerical-provider selection, separate from scalar arithmetic.
 /// Implementations select only backends that support their scalar type.
@@ -45,7 +49,12 @@ macro_rules! primitive_configuration {
                     }),
                     #[cfg(feature = "faer-sparse")]
                     "faer" => (MatrixTriangle::Triu, |m, d, s, amd| {
-                        Box::new(super::faer_ldl::FaerDirectLDLSolver::new(m, d, s, amd.map(|o| o.0)))
+                        Box::new(super::faer_ldl::FaerDirectLDLSolver::new(
+                            m,
+                            d,
+                            s,
+                            amd.map(|o| o.0),
+                        ))
                     }),
                     method => panic!(
                         "LDL backend {method:?} is unavailable for {}",
@@ -74,7 +83,12 @@ macro_rules! primitive_configuration {
                 }
                 #[cfg(not(feature = "faer-sparse"))]
                 {
-                    Box::new(QDLDLDirectLDLSolver::new(matrix, signs, settings, amd.map(|o| o.0)))
+                    Box::new(QDLDLDirectLDLSolver::new(
+                        matrix,
+                        signs,
+                        settings,
+                        amd.map(|o| o.0),
+                    ))
                 }
             }
         }
@@ -119,10 +133,31 @@ impl<const N: usize> LDLConfiguration for MpFloat<N> {
         settings: &CoreSettings<Self>,
         amd: Option<super::AmdOrdering>,
     ) -> BoxedDirectLDLSolver<Self> {
-        super::arrow::ArrowLDLSolver::try_new(matrix, signs, settings)
-            .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
-            .unwrap_or_else(|| {
-                Box::new(QDLDLDirectLDLSolver::new(matrix, signs, settings, amd.map(|o| o.0)))
-            })
+        use super::arrow::ArrowLDLSolver as Arrow;
+        let negated = || {
+            let order = amd.as_ref().map(|o| o.0.clone());
+            Arrow::try_negated(matrix, signs, settings, order)
+                .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
+        };
+        // When both arrows are eligible, the one with less dense work
+        // (two_L6: K's border of 186 ORE rows against −K's 81 primal columns).
+        let flipped: Vec<i8> = signs.iter().map(|&s| -s).collect();
+        let negated_first = Arrow::work(matrix, &flipped)
+            .is_some_and(|w| Arrow::work(matrix, signs).is_none_or(|p| w < p));
+        let arrow = if negated_first {
+            negated()
+        } else {
+            Arrow::try_new(matrix, signs, settings)
+                .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
+                .or_else(negated)
+        };
+        arrow.unwrap_or_else(|| {
+            Box::new(QDLDLDirectLDLSolver::new(
+                matrix,
+                signs,
+                settings,
+                amd.map(|o| o.0),
+            ))
+        })
     }
 }

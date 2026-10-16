@@ -246,7 +246,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             self.retained_rhs.copy_from_slice(&r[n..]);
             self.swap_rhs_mats(&mut saved[c * per_column..(c + 1) * per_column]);
             let corrections = self.counters.outer_refinements;
-            flags[c] = local_success(self.local_only, self.recover_rhs(&mut x, rhs))
+            flags[c] = local_success(self.local_only, self.recover_rhs(&mut x, rhs, false))
                 && if let Some((_, prepared)) = unrefined.filter(|&(u, _)| u == c) {
                     self.scale_solution(&x, prepared)
                 } else {
@@ -1049,6 +1049,18 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         self.reduced.set_residual_pool(self.pool.clone());
         self.reduced.set_factor_pool(self.pool.clone());
         self.refresh_parallel_plan();
+        // Without a world, A's products run on this pool's output lanes. The
+        // plan keeps the CSC gemv arithmetic, so every output is unchanged.
+        if self.mpi_world().is_none() && self.a_panel.is_none() && self.sampled.is_none() {
+            use crate::algebra::sparse_parallel::{worthwhile, SparseParallel};
+            let lanes = self.pool.as_ref().map_or(1, |p| p.current_num_threads());
+            if self.sparse_products.is_none() && lanes > 1 && worthwhile(&self.A) {
+                self.sparse_products = Some(SparseParallel::new(&self.A));
+            }
+            if let Some(plan) = &mut self.sparse_products {
+                plan.configure(&self.A, self.pool.clone());
+            }
+        }
         let mut active_psd = false;
         self.parallel_assembly = self.pool.is_some()
             && self.blocks.iter().all(|block| match &block.scaling {

@@ -265,9 +265,12 @@ pub trait XgemmScalar: Sized {
         _m: usize, _k: usize, _a: &[Self], _d: &[Self], _c: &mut [Self],
         _pool: Option<&rayon::ThreadPool>, _cache_a: &mut ResidueCache
     ) -> bool { false }
+    // Whether the exact residue-BLAS kernel applies to this shape at four
+    // limbs and above (the gate of the quadratic forms).
+    fn residue_blas_applies(_m: usize, _n: usize, _k: usize) -> bool { false }
     // Whether `xgemm_upper_exact` (and the matching `xgemm` path) uses the
     // exact residue-BLAS kernel for this shape.
-    fn residue_blas_applies(_m: usize, _n: usize, _k: usize) -> bool { false }
+    fn residue_product_applies(_m: usize, _n: usize, _k: usize) -> bool { false }
     // `v[k] = Σ_{i≤j} c_ij·x_t·q_ik·q_jk` (svec `x`, `c_ij = sqrt2` off the
     // diagonal) for `q` of size h × kmax, rounded once from the exact value.
     // Passing scale 2 instead of sqrt2 accepts an unscaled packed symmetric X.
@@ -458,4 +461,4 @@ mod mpfr;
 mod rns_blas;
 // Integration tests include this file by `#[path]` and use only part of it.
 #[allow(unused_imports)]
-pub(crate) use rns_blas::{measured_ways, planned_ways, with_split_hint, ResidueCache};
+pub(crate) use rns_blas::{measured_ways, planned_ways, split_hint, with_split_hint, ResidueCache};

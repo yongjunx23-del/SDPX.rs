@@ -8,6 +8,1400 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-16 — Scale-relative Jacobi tests in the 2×2/3×3 kernels (kept, thermal-ore)
+
+`start_scale::overshooting_start_still_solves` (Bits256, τ₀ 1e-70) had
+failed CI on Linux and macOS since v0.9.2. It reaches pcost = dcost = 6,
+then ends with NumericalError at iteration 82: the PSD Cholesky of z fails
+because the previous accepted 0.99 step left the cone.
+- Bisect over v0.9.1..v0.9.2: the first bad commit is `b718ace`. It changed
+  the trajectory without causing the failure.
+- The step bound was consistent with λ, but W·z ≠ λ at iteration 81:
+  λ ≈ (2.7, 1.7)e-78 there, below ε₂₅₆.
+- `compute_jacobi_rotation` tested `d < eps` absolutely. For the 2×2 SVD of
+  L₂ᵀL₁ it took the 45° branch, a rotation that does not diagonalize, so W
+  and λ were wrong.
+- The 3×3 SVD and eigen loops stopped on an absolute `off < 256·eps`, the
+  same flaw.
+
+The fix: `d.is_zero()` in place of `d < eps`. The loop tolerance becomes
+256·eps·min(1, max|aᵢⱼ|) with `<=`, unchanged for entries ≥ 1. A fully
+relative tolerance broke the f32 SVD unit tests: entries up to 12 loosened
+the stop 12×. The fixed-τ phase is not involved; the test fails with it
+off too. The 2026-10-11 static-shift diagnosis was a side effect: a shift
+keeps z away from the sub-ε range.
+
+Result: the solver suite passes (508 + 7 + 251 + 4). Fast-profile E2E:
+- medium: Solved/15, audit PASS.
+- ising11: Solved/54, audit PASS, reference agreement 4.6e-35.
+
+## 2026-10-16 — Performance plan: where the time goes (diagnosis, thermal-ore)
+
+A read-only review (eight subsystem maps, two adversarial critiques) behind the 2026-10-16 plan section. Sources are journal entries and receipts; shares marked stale predate task 16 or the thermal-ore kernels.
+
+- Goal status (64 threads): Λ27-s50c/768 2.87× SDPB (170 it, 130.5 s vs 375 s; the 3× stretch needs ≤125 s); L19-s50/768 1.85× (153.8 vs 285 s, Oct 9 data that predates L24–L82: the only row under 2×); Λ19/768 about 2.15× (no matched SDPB 3.1.0 reference); Λ19-rs 4.4×, Λ27-rs 4.67×, Λ35-rs/1024 4.45×, Λ35-s70-p1024 4.08×; ising11 has no reference at 768+ bits. Memory: Λ19/768 at 4 cores 1136 MiB PSS against SDPB 445 MiB, unmatched since. Float64 (t16b): wins 19/58 at 1 thread and 12/58 at 16; geo-mean SDPX/MOSEK at 1 thread LP 2.39, SDP 1.65, SOCP 1.35; at 16 threads 2.21 / 2.50 / 1.68.
+- Ising on the cluster (Λ35-rs/1024, after L50): about 90 thread-s per iteration at 52 of 64 cores busy; the solve pipeline is about 37 of them. Cycles: `__gmpn_mul_basecase` 27.2%, faer microkernels 20.7%, `pack_lhs` 6.8%, CRT `pack` 1.8%; idle stealing about 8%. Corrections per iteration: Λ19-xml 1.33, Λ27-s50 0.94, Λ35-rs 0.82, Λ27-rs 0.02, Λ19-rs 0, so outer corrections are mostly an xml-input cost. At 64 threads a kernel share converts poorly into wall (L56: a 2.4% memset share gave −0.2%), so cluster gains are bounded by critical-path phase wall.
+- Ising on the Mac (Λ19-xml/512 T=4, `prof.l19.cur.receipt.json`, 219 CPU-s): residual update 81 (cone SVD 51.7 thread-s inside it, plus 27.9 CPU-s of IPM residual products run as tail jobs in the same window), KKT update 78 (`cones_schur` 22.9), solve pipeline about 85 across both (prepare 45 ms, recover 59 ms, residual 101 ms per call; 314 residuals = 171 refined columns + 143 corrections). Per congruence about 880 µs: prime products 39%, CRT 25%, X encode 20%, A operand 14.5%.
+- Float64 (stale t10d receipts, 1 thread): setup is 26–68% of tiny-LP time and alone exceeds MOSEK's whole solve on bore3d, brandy, beaconfd, recipe, bandm, capri, sc205 and sc105; trsv + ir.solve 36–40% on agg, bnl1, sched_100_100_orig; the binary64 PSD corrector right-hand side 15.5% of arch0 and 14% of gpp124-1; QDLDL refactor 56–71% on the nb family and mcp250-1. hinf3, sched_100_50_orig and f64_large (and csdr3 at 16 threads) would be wins if Solved. 16/20 SDP, 13/16 SOCP and 12/18 LP cases are slower at 16 threads than at 1.
+- Missing: no x86 run of any thermal-ore commit (L-X1, L-X2, L-G6, L-F1, L-D1, the exact-dot border factor), no HEAD profile at 768 or 1024 bits, no Float64 scoreboard since Oct 9.
+- Dropped in review: the √2-split quadratic (two CRTs at about 3P bits against one at 4P: kernel net about +2.75%), pre-image step bounds through corrections and skipping the dead affine z congruence (≤1.7%), an 8-limb Karatsuba (GMP crossover 26 limbs on M1).
+
+## 2026-10-16 — B1: matched Ising scoreboard against official SDPB 3.1.0 (measurement, thermal-ore)
+
+- Correction: the 2026-10-09 "matched SDPB" rows (`t20/sbrs.pbs`, jobs 224375–224377) ran the `sdpb` on PATH (`~/apps/sdpb/current`, `SDPB 67ebd53-dirty`), not the official 3.1.0 tag. This run uses the official build (`sdpx-ising43-20260927/sdpb-install`, tag `fec8e93`, reports `3.1.0-dirty`, precision(actual) as requested).
+- Setup (job 226114, node26 exclusive, one fresh process per solve, sequential): per case, SDPB 3.1.0 with 64 ranks bound to cores (`--maxSharedMemory 8G`, thresholds 1e-42), then SDPX `211a192` (`bin/sdpx-to5`) with 64 threads pinned (`mc/cpus2.py`), `mc/settings-full.json`, OPENBLAS 1. Same input directory and precision for both. SDPB wall includes MPI startup; SDPX wall is the process wall.
+
+  | Case | Bits | SDPB 3.1.0 it / wall | SDPX it / wall | Ratio | SDPX peak RSS |
+  |---|---|---|---|---|---|
+  | Λ19-rs | 768 | 240 / 144.5 s | 89 / 25.5 s | 5.67× | 1.29 GB |
+  | Λ27-rs | 768 | 259 / 365.5 s | 127 / 73.8 s | 4.95× | 2.85 GB |
+  | Λ35-rs | 1024 | 734 / 2733.7 s | 347 / 609.6 s | 4.48× | 8.09 GB |
+  | Λ19-xml (not resampled) | 768 | 243 / 148.0 s | 105 / 35.3 s | 4.19× | 1.32 GB |
+  | ising11 | 768 | 201 / 14.6 s | 54 / 3.1 s | 4.70× | 0.24 GB |
+
+- Audits (226115, `t17aud.pbs`, original coordinates): every SDPX point is accepted. Λ19-rs: primal 3.8e-58, dual 7.8e-55, map 7.5e-31. Λ27-rs: 3.8e-67, 3.5e-69, map 1.6e-34. Λ35-rs: 3.2e-130, 1.2e-142, map 4.0e-42. Λ19-xml: 2.6e-74, 2.0e-74, map 2.3e-31. ising11: 1.3e-48, 2.4e-47, map 6.7e-39. Audited objectives equal the SDPB primal objectives to every printed digit (Λ35-rs −18.15322053912686102409787171643020135…).
+- Observed: SDPB gains almost nothing from resampling (Λ19 243 → 240 it, 148.0 → 144.5 s), while SDPX gains 105 → 89 it and 35.3 → 25.5 s. On matched resampled inputs every Ising row is ≥4.48× SDPB 3.1.0, and the original Λ19 input is 4.19×. SDPB peak memory was not sampled in this job. The memory goal (match SDPB's peak) stays unmeasured at this scale.
+- Decision: task 17 G holds on the scoreboard, and the resampled inputs are the scoreboard inputs from here on. These SDPB 3.1.0 rows replace the 67ebd53 references. Still missing: a matched-scale memory comparison, and L19-s50/768 (the Oct 9 1.85× row) against 3.1.0.
+
+## 2026-10-16 — B2 same-node A/B against v0.9.2; one-thread input pool removed (kept, thermal-ore)
+
+- Same-node interleaved A/B (node9, `t13ab.pbs`, receipts on as in the scoreboard, 5 reps, median API ms ratio B/A). A is v0.9.2 (`bin/sdpx-rel092`). B is `fd5a3b6` (thermal-ore with A1 and A3, A4 reverted; `bin/sdpx-to4`, job 226052):
+
+  | Case | T=1 | T=16 |
+  |---|---|---|
+  | LP_brandy | 0.234 | 0.329 |
+  | LP_bore3d | 0.351 | 0.612 |
+  | LP_recipe | 0.834 | 0.758 |
+  | LP_beaconfd | 0.748 | 0.887 |
+  | LP_bnl1 | 0.884 | 0.694 |
+  | LP_agg | 0.964 | 0.889 |
+  | SOCP_nb_L1 | 0.835 | 0.832 |
+  | SOCP_sched_50_50_orig | 0.901 | 0.912 |
+  | SOCP_sched_100_100_orig | 0.875 | 0.873 |
+  | SOCP_nql60 | 0.949 | 0.993 |
+  | SOCP_nb | 0.979 | 0.975 |
+  | SDP arch0, gpp100, gpp124-1, gpp250-1, qap6, theta2 | 1.000–1.016 | 0.958–1.017 |
+  | SDP_theta1 | 1.042 | 1.220 |
+  | LP_afiro | 1.234 | 1.000 |
+  | SOCP_sambal | 1.223 | 1.014 |
+  | SDP_hinf2 | 1.129 | 0.953 |
+  | LP_sc105 | 1.111 | 0.940 |
+
+  gpp250-1 is Solved again. The earlier int6-vs-`2709067` A/B (226047, with A4) had shown gpp100 1.76 and gpp124-1 0.54 at T=1; A4's iteration changes are gone with the revert.
+- Tiny-case T=1 slowdowns (+0.3–0.9 ms): every extra millisecond sits in `cpu.*` receipt phases that v0.9.2 does not record. L-P2 (`913a1f4`) reads inputs inside a `--threads` rayon pool. At `--threads 1` that pool's worker makes the process two-threaded, so `receipt::cpu_clocks` samples CPU clocks per timer (A1 measured 170–290 ns per read on M4). Fix (`211a192`): `within_threads` runs on the caller below two threads. It is Linux-only in effect (`process_threads` is None on macOS). Medium passes.
+- Recheck (job 226054, node9, T=1, 7 reps, v0.9.2 vs `211a192`): afiro 1.003, sc105 0.939, sambal 1.002, truss4 1.009, hinf2 1.018, control1 0.989; recipe 0.735, bore3d 0.434, brandy 0.221, bnl1 0.845, sched_50_50_orig 0.877. Decision: fix kept.
+- Open: SDP_theta1 at T=16 is 1.22 (one 5-rep A/B; its T=1 is 1.04). Check it before the next Float64 scoreboard. A1 and A3 meet their keep bar on x86. A3's own cases (agg, bnl1, sched, nql60) gain 4–13% at T=1, but this A/B cannot separate A3 from A1 and the main-line changes since v0.9.2.
+
+## 2026-10-16 — B2: x86 Float64 scoreboard of `2709067`; F64-PSDCOR-1 reverted (thermal-ore)
+
+- Scoreboard (job 226044, node30, `t7/t9run2.pbs`, 58 cases at 1 and 16 threads, native_oracle audits; compared against t16b in `t7/to2-compare.md`): 54 audited solves on both sides, 0 Solved-but-fail, 39 strict passes on both. Iterations over 53 common cases: 756 → 756 (T=1). Two cases flip: SDP_hinf3 fail → audited win (Solved/15 at T=1 and T=16), and SDP_gpp250-1 Solved/20 → AlmostSolved/39 (r_d 3.5e-6; win → fail at T=1). Wins vs MOSEK: T=1 19 → 17, T=16 12 → 12. The cross-node time ratios (T=1 1.016, T=16 0.873) are not timings; the int6 entry showed this harness can read 1.19 on a neutral change. csdr3 and f64_large remain AlmostSolved.
+- Bisect of gpp250-1 on x86 (node100, T=1; jobs 226048 and 226050): int6 Solved/20, v0.9.2 Solved/20, `0ef8729` (thermal-ore with A3, before the A4 merge) Solved/20, `395a3b6` (adds A4) AlmostSolved/39, `2709067` AlmostSolved/39. The Mac solves gpp250-1 in 23 iterations on every arm. F64-PSDCOR-1 is therefore the cause; it is a rounding change (dsyevr MRRR vectors, matrix-form W products, one-GEMM rebuild) that tips gpp250-1 on x86.
+- Decision: F64-PSDCOR-1 reverted (`cbc209e`, a revert of merge `06987a0`); the two files are identical to `0ef8729`, and medium passes (15 it). A new failure is not traded for hinf3 plus the Mac speedup. A retry needs gpp250-1 Solved on x86 first. The likely first variant keeps the scratch reuse and the GEMM rebuild but takes dsyev (QR) vectors, which loses most of the 68% eigen share.
+
+## 2026-10-16 — B0: thermal-ore on x86 against v0.9.2 (measurement, thermal-ore)
+
+- Setup: thermal-ore `395a3b6` (L-X1, L-X2, L-G6, L-F1, L-D1, A3, A4 and the earlier thermal-ore kernels; A1 and A6 came later) archived (sha256 `344b1248`) and built as `bin/sdpx-to1` (job 226040, `t6bld.pbs`, GMPHOST, +fma, the v0.9.2 RUSTFLAGS). A is the deployed v0.9.2 release binary (`39d7026`, sha256 `3caa3877`, `bin/sdpx-rel092`). ABBA job 226045 ran on node26 (exclusive, `mc/abba.pbs`, 64 threads, `mc/settings-full.json`, OPENBLAS 1, `SDPX_INT_GEMM=faer`). The first attempt (226041, ppn=64 without a host) died with −9 before starting, the site's refused-request signature.
+
+  | Case | A1 / A2 (s) | B1 / B2 (s) | Iterations | Change of means |
+  |---|---|---|---|---|
+  | Λ35-rs/1024 | 608.1 / 610.8 | 601.0 / 606.1 | 347 / 347 | −1.0% |
+  | Λ27-s50c/768 | 126.8 / 128.0 | 125.4 / 125.8 | 170 / 170 | −1.4% |
+
+- The points differ (rounding-order changes) and the objectives agree to every printed digit. Audits of B1 (226046, `t17aud.pbs`): Λ35-rs accepted (primal 3.2e-130, dual 1.2e-142, gap 4.0e-43, map 4.0e-42); Λ27-s50c accepted (primal 1.0e-91, dual 1.3e-86, gap 3.0e-59, map 6.2e-31). Peak RSS on Λ35-rs: 8.27 GB (A) and 8.29 GB (B).
+- Per-iteration phases (Λ35-rs, A → B, s/it): scale cones 0.362 → 0.348, residual update 0.387 → 0.372, KKT update 0.928 → 0.918, KKT solve 0.322 → 0.328. The cone and residual kernels carry over; the KKT phases are flat.
+- Reading: at 64 threads the thermal-ore kernel gains convert to about 1% of wall, as the cost map predicted (critical-path phase wall bounds them). This confirms none of the Mac kernel numbers individually. The kernels stay, since none regresses on x86. L-M1-class 768-bit product work would need an x86 kernel (B4) to move these cases.
+
+## 2026-10-16 — Task 17 G: the converter resamples by default (kept, thermal-ore)
+
+- Change (agent A6, `34e6283`, `crates/pmp`): `sdpx-pmp2sdp` resamples PyCFTBoot/SDPB.m explicit-sample blocks by default, and `--keep-samples` opts out. `--resample` is removed; no script used it. Without `--threads`, the converter uses the available cores whose estimated memory (8× the mean input block bytes per worker) fits in half the physical RAM. Measured per-worker memory is about 2× under that estimate on Λ19 and 3.5× under on Λ27. `convert_file` returns `(blocks, workers)`, and `threads == 0` means the default. The precision default stays 768.
+- Evidence (Λ19-xml at 512 bits, Mac under load): `--keep-samples` output is byte-identical to the old default output (combined sha256 `de63e5db`). The new default output is identical to old `--resample` at T=1 and T=4 and to t20 `L19-rs-512`. Conversion went from 1.8 s / 6.8 MB / 1 worker (old default) to 8.2 s / 29 MB / 10 workers (new); old `--resample` took 42.1 s at T=1. Solve at 512 bits, T=4, settings-full: Solved in 89 it, 40.1 s, against 105 it, 58.0 s on kept samples. Both points pass the original-coordinate audit (mapping 7.5e-31 and 2.3e-31; primal/dual ≤ 8e-55) with the same objective to 48 digits.
+- Risks: PBS on this cluster does not restrict affinity, so the default count sees every core of the node; cluster jobs pass `--threads`. A PMP whose prefactor fit fails now stops with an error unless `--keep-samples` is given.
+- Decision: kept. Task 17 G is ready for the matched resampled scoreboard (B1).
+
+## 2026-10-16 — F64-PSDREF: refinement load on gpp100, gpp124-1, qap6, theta1 (diagnosis; F64-AFF-1 rejected, thermal-ore)
+
+- Observed (agent A5, fast, Mac T=1, `2709067`; evidence `~/.cache/sdpx-e2e/a5/`): all four Solved and audited at 23/22/22/9 iterations.
+
+  | | gpp100 | gpp124-1 | qap6 | theta1 |
+  |---|---|---|---|---|
+  | Refined columns per iteration | 4.4 | 4.6 | 4.2 | 3.8 |
+  | Outer corrections per iteration | 9.8 | 7.1 | 5.6 | 2.4 |
+  | Linear solves per iteration | 27.6 | 20.4 | 21.1 | 13.1 |
+  | Outer refinement share | 30% | 23% | 21% | 20% |
+  | Inner refinement share | 8% | 5% | 11% | 16% |
+  | Factorization share | 6% | 7% | 28% | 12% |
+  | Step-length eigmin share | 19% | 24% | 8% | 13% |
+  | Cone scaling share | 12% | 13% | 5% | 11% |
+
+  On gpp100, 97 of its 226 corrections are GMRES-continuation steps (about 11% of the solve); they never reach the tolerance.
+- Rows (L49 method plus a trace-only floor eps·|R|⁴|Z| for ordinary PSD blocks, `diag-floor-trace.patch`):
+  - Early: x rows carry the z-recovery error (eps·cond(H) through Aᵀ). One correction is required and productive.
+  - Late: first solves miss by 1e5–1e6×. After one correction the z rows sit at the binary64 floor of H·z = R(RᵀZR)Rᵀ (30–41 columns per case), so the 1e-12 tolerance is unreachable and each late column ends with one non-productive correction (58/57/66/9 in total). Static regularization is not the limiter.
+- Bounds: a more accurate raw solve ≤8–10% at unchanged acceptance (M effort). A binary64 PSD floor stop: gross 2.3–4.6%, net about 0 after its 4k³ test. Neither is taken now.
+- F64-AFF-1 (affine column unrefined in binary64, `f64-aff1.patch`): instructions gpp100 −12.6% and theta1 −5.8%, but gpp124-1 takes +1 iteration (+6.3%) and qap6 ends AlmostSolved at 35 iterations (r_d 1.5e-5). Rejected.
+- Next: the larger binary64 PSD shares at T=1 are outside refinement (step-length eigmin and cone scaling). Whether the GMRES continuation should run where it cannot reach the tolerance is an open scope question (acceptance tolerances stay fixed).
+
+## 2026-10-16 — F64-FAIL-1: sched_100_50_orig and hinf3 diagnosis (no change, thermal-ore)
+
+- Hypothesis: sched_100_50_orig stalls at an augmented end-game floor, and the audit's r_p 6.8e-6 against the solver's pres 1.8e-9 comes from scaling.
+- Evidence (agent A2, Mac T=1/T=4 on `2709067`; env-gated trace `~/.cache/sdpx-e2e/a2/a2-diag-trace.patch`; runs in `~/.cache/sdpx-e2e/a2/runs`):
+  - The gap is normalization. pres is ‖r_z‖₂/(τ·max(1, ‖b‖+‖x‖+‖s‖)) with ‖x‖ ≈ ‖s‖ ≈ 2.6e5, while the audit is absolute (2e-6). The returned s = Π_K(b−Ax), so the audit's r_p is dist_K(b−Ax): −6.76e-6 on the 3-dim SOC rows 9743–9744, where s ≈ ±1.2e5 (5.6e-11 relative). It is a real iterate residual. dres matches the original coordinates exactly. Passing needs about 3.4× on primal and 1.5× on dual, i.e. one more good iteration.
+  - At iteration 21 the internal Solved test passes, but the original-coordinate continuation keeps iterating. At iteration 22 (step 0.544) pres jumps to 3.79e-3, InsufficientProgress resets the solver to iteration 21, and the reduced check returns AlmostSolved.
+  - Cause: on the 4741-dim sparse-expanded SOC, w₀ grows from 1.70e3 to 7.585e3 between iterations 21 and 22, so cond(W²) ≈ (2w₀)⁴ goes from 1.3e14 to 5.3e16, past binary64. The last expansion auxiliary row keeps a residual of −7.6e-2, and every refinement correction makes it worse (rejected; the stop ratio ends refinement). Through u₀ ≈ 1.07e4 it puts 819 into AΔx+Δs−bΔτ. Dense and sparse W² products agree to 1e-10.
+  - Variants (all rejected): Δs from the row on expanded SOC rows (forbidden family) gives Solved/23 with a passing audit but turns sched_100_100_orig AlmostSolved. faer passes (Solved/22) by path luck from iteration 19. Condensed, a static shift of 1e-11 and longer refinement all fail.
+  - hinf3: Solved/16 locally on qdldl and faer at T=1/T=4, with a 2–3× margin on pres and gap. Backend objectives differ by 2.8e-5 relative at gap_rel 4e-9 (weakly determined optimum). The x86 failure does not reproduce here.
+  - Parity at `2709067` across 17 regression-v1 cases matches the earlier baseline.
+- Decision: no admissible mechanism within the contract. The sched family sits on a binary64 knife edge: rounding-level changes flip which case fails. Next design candidate: a KKT form that never builds W² for large-w SOCs (W-scaled rows, cond(W) ≈ 2e8), which probably also covers csdr3.
+
+## 2026-10-16 — F64-PRE-1 and F64-SETUP: limb-weighted rational budget, column-owner peel (kept, thermal-ore)
+
+- M10c (agent A1, Mac T=1, median of 3, timer arm `a1-split`, patch `~/.cache/sdpx-e2e/patches/a1-setup-split-instrumentation.patch`): current small-LP setup is 0.1–1.5 ms, far below the stale Oct 9 receipts (bore3d 5.7 vs 25.6 ms). There are three exceptions. brandy takes 23 ms and bore3d 5.7 ms, both in the rational pass; bnl1 takes 6.8 ms, mostly the dense minor. Pool creation is 0 ms at T=1/8/16 (small-work cutoff), so the stale 1–6 ms does not reproduce. Receipts add 0.2–0.55 ms of native time on tiny LPs (afiro +66%, sc105 +29%), from per-timer CPU clock reads (M4: process clock 170–290 ns, thread clock 85–95 ns). The t7/t9 scoreboard times with `SDPX_RECEIPT` set.
+- F64-PRE-1 (`b4e5907`). Observed: brandy's rational pass counted 14k updates averaging 24 limbs. It ran out of budget at row 80 of 220 and kept every row. Change: updates are charged `limbs(f)·limbs(v)+limbs(e)` (divisions `limbs(f)·limbs(v)`), the most uniform proxy measured (17–65 ns per unit against 77–1590 ns per update), and the budget is scaled by 6, the cost of a one-limb update. Running out still keeps every row.
+- F64-SETUP (`2c8e90b`). Change: rows that alone use some column of [A b] are peeled in O(nnz) before the dense minor, modular image and rational pass. A peeled row has a zero multiplier in every dependence, so the removed-row set is unchanged. Peeling proves full rank for 13 of 18 LP equality systems on its own. PRE-1 alone would drop bore3d's 2 removals (out of budget); the peel restores them, so the two are merged together.
+- Evidence (head-3269468 → PRE-1 + peel, fast, Mac under load): points and removed rows are bitwise identical on all 18 small LPs; on sched_50_50 orig/scaled, sched_100_50_orig (still AlmostSolved), sched_100_100, nb, nb_L1, nb_L2_bessel, nql30, qssp30, chainsing_1000_1, sambal and f64_medium; and on medium, ising11 and csdr3. f64_large keeps its 1317 removals (rank 1.27→1.06 s, presolve only). Setup ms: brandy 17.9→1.86 (native 20.9→4.75), bore3d 4.80→0.47 (native 8.2→3.9), bnl1 5.4→1.8, beaconfd 0.89→0.56, capri 1.04→0.57, sched_100_100 65.6→36.1, nb_L1 41.4→9.4. Cost: SOCP_nb rank 0.3→1.0 ms of a 215 ms solve. A u32 peel variant was about 20% faster there but was dropped for compactness (patch `a1-peel-u32-variant.patch`). The merged tree passes medium (15 it).
+- Decision: both kept; the x86 scoreboard (B2) confirms. After them, KKT construction (AMD + symbolic, 0.15–0.8 ms) is the largest small-LP setup stage, and it is needed work. Open for the lead: score the MOSEK comparison without receipts, or adopt a cheaper sampling policy.
+
+## 2026-10-16 — F64-TRSV-1 and F64-PSDCOR-1: fused QDLDL solves, binary64 PSD corrector (kept, thermal-ore)
+
+- F64-TRSV-1 (agent A3, `dacb804`). Observed: QDLDL `solve_many` looped single solves, while trsv + ir.solve took 19–40% of the T=1 solve on agg, bnl1, sched, nql60 and nb, mostly in two-column batches. Change: `QDLDLFactorisation::solve_many` interleaves column pairs by row and runs one forward sweep and one D·Lᵀ sweep for both columns. Each column keeps `_solve`'s operation order. The parallel elimination-tree plan and an odd last column use the single solve. Evidence (fast, Mac, vs `head-3269468`): x/s/z, status and iterations are bitwise identical on all 11 QDLDL inputs at T=1, and on nb, bnl1 and sched_100_100 at T=4. Process instructions at T=1: agg −5.7%, bnl1 −6.1%, sched_100_100 −5.6%, nql60 −4.5%, nb −2.4%. Cycles were −6.4/−8.5/−6.1/−3.7/+0.1% on a loaded host. Decision: kept, provisional until an x86 release ABBA on agg/bnl1.
+- F64-PSDCOR-1 (agent A4, `e8bfd01`). Observed (arch0, n 161, 26 calls): the binary64 PSD corrector right-hand side is 20% of the solve. dsyev takes 68% of it, the triple-loop Q·diag(t)·Qᵀ rebuild 23%, W products 6%, circ and unpack 2.5%. Between 1 and 92 of 161 eigenvalues fall outside the band. Change: one `PsdWork` scratch set and matrix-form W products. `EigEngine::eigen` (dsyevr, jobz V) replaces dsyev. ds is rebuilt by one GEMM over the columns with t ≠ 0. There are no allocations, and MPFR still returns at the top. Evidence (fast, T=1, 3+3 ABAB on a loaded Mac, original-coordinate audits at 1e-6): arch0 5.63 → 2.61 ms per call, 22/22 it, cycles −8.5%, instructions −23%; gpp124-1 24 → 22 it, cycles −21%, instructions −33%; theta2 9/9 it. The ising11 point is unchanged. The merged tree (`06987a0`) passes medium (15 it). Decision: kept; this is a rounding change (MRRR eigenvectors), so x86 release timing is still owed.
+- Rejected alongside (lead, M4 follow-up): exactly accumulated dots in the MPFR transposed `xtrsm_lower` that builds R⁻¹. ising11 passes (54 it, audit PASS), but R⁻¹ is 1.6% of ising11 and 2.7% of Λ19-xml CPU, so even removing it cannot meet the ≥2% gate. Patch `~/.cache/sdpx-e2e/patches/trsm-exactdot.patch`.
+
+## 2026-10-16 — M2, A8, M4: goal-width profiles, Karatsuba microbench, cone split (measurement, thermal-ore)
+
+- M2 (Mac T=4 under agent load, HEAD `209f635`, 5–8 iteration runs of L19-s50/768, Λ27-s50c/768 and Λ35-rs/1024, `~/.cache/sdpx-e2e/m2`): GMP limb products are 38–43% of busy CPU (`addmul_1` 30–35%), libBLAS 12–16%, CRT 3.5–5%, `group_residues` 2–3%. Cone SVD thread time is 24–28% of CPU. At 768 bits the GMP products split as scalar FMA `mul_add` 24.5% (SVD bidiagonalization, trsm, reflectors, potrf), scalar `Mul` 21.9% (dqds, inverse iteration) and exact dots about 50% (`forward_suffix_rows` 13%). L19-s50/768 at HEAD: 158 iterations, 1401 CPU-s, 602 s wall, 1.62 GiB RSS. Λ35-rs/1024: 3.7 GiB RSS after 5 iterations. The local `inputs/L19-rs-768` is in fact L19-s50 (26 blocks, n 2405, m 57241, not resampled).
+- A8 (`~/.cache/sdpx-e2e/mulbench`, one Karatsuba level over 6- or 8-limb halves, every variant exact against `mpn_mul_n`; Mac loaded, ns per product):
+
+  | Limbs | T | GMP | rows | Karatsuba/GMP | Karatsuba/rows |
+  |---|---|---|---|---|---|
+  | 12 | 1 | 62.2 | 49.9 | 102.9 | 84.7 |
+  | 16 | 1 | 116.3 | 213.6 | 158.9 | 112.4 |
+  | 12 | 4 | 87.0 | 80.2 | 126.3 | 106.9 |
+  | 16 | 4 | 147.3 | 266.7 | 179.5 | 165.4 |
+
+  Karatsuba misses the ≥10% kernel gate at both widths (16 limbs: −3% at T=1, +12% at T=4). Rejected on this evidence; a quiet re-run is only for the record.
+- M4 (probe arm `m4-probe`, timers only, patch `~/.cache/sdpx-e2e/patches/m4m5-cone-probe.patch`; ising11/512 T=1, point `9c6cd0baca3a` unchanged, 54 it, 12.4 s): cone scaling 3.44 s (28%), of which SVD 2.63 s: dqds 0.98, inverse iteration 0.82, bidiagonalization 0.49, reflectors 0.28. The rest of the PSD scaling (two Cholesky, L₂ᵀL₁, R, R⁻¹, G, svec) is about 0.75 s. dqds runs 123 sweeps per SVD; inverse iteration takes 2.0 steps per vector.
+  Λ19-xml/512 T=4 (point `6a4625474ca9` unchanged, 105 it, 130.6 s wall; thread-seconds): cone SVD 105.3 = bidiagonalization 31.9, inverse iteration 28.5, reflectors 22.1, dqds 21.6. The rest of the PSD scaling is 34.5: R⁻¹ 13.9, two Cholesky 10.0, R 4.2, L₂ᵀL₁ 4.0, G 2.4, svec 0.5. IPM residual tail jobs in the same window take 22.1. Per SVD: 385 dqds sweeps, 27 vectors at 2.0 inverse-iteration steps each. So the SVD has no single dominant stage, and R⁻¹ costs more than both Cholesky factorizations together.
+
+## 2026-10-16 — L-M1: two-chain row products for 5–12-limb mantissas on aarch64 (rejected, thermal-ore)
+
+- Observed (L-F1 sample, Λ19-xml-512 T=4): GMP's `addmul_1`/`mul_1`/`mul_basecase` take 22% of busy CPU. At 8 limbs `mpn_mul_n` runs one `addmul_1` per row, each a single carry chain.
+- Change (`exactdot.rs`): `mul_rows`, an unrolled schoolbook for N ≤ 12 on aarch64. Each row forms its N 128-bit products first, then adds their low and high halves in two separate carry chains. `mpn_mul_n` used it for every product above 4 limbs (`MpFloat` products, FMA, exact dots). It passed a test against GMP's `mpn_mul_n` (N = 1…12, all-ones operands) and the arithmetic suite.
+- Microbench (M4, ns per product against `mpn_mul_n`): 8 limbs 22.2 → 12.7, 10 limbs 29.6 → 19.4, 12 limbs 42.9 → 35.3. At 16 limbs it took 88 → 150 (spills), so 16 limbs stayed on GMP.
+- E2E (ABBA 4+4, Mac, fast profile, A `sdpx-cur` = `c8417f3`; every point identical, y included):
+
+  | Case | B arm | Wall | Cycles | Instructions |
+  |---|---|---|---|---|
+  | ising11 512 T=1 | `sdpx-m1` (inlined) | −2.0% | −1.8% | −18.7% |
+  | Λ19-xml-512 T=4 | `sdpx-m1` (inlined) | +2.7% | +1.3% | −11.3% |
+  | ising11 512 T=1 | `sdpx-m1n` (`inline(never)`) | +3.5% | +3.1% | −16.6% |
+  | Λ19-xml-512 T=4 | `sdpx-m1n` | +2.4% | +3.2% | −10.7% |
+
+- Why it did not pay: instructions fall 11–19% but cycles do not, and the non-inlined variant is slower still, so code size is not the cause. Hypothesis: the products are limited by multiplier throughput, which two chains do not change (the same N² `mul`/`umulh` pairs as GMP). The microbench gain does not carry over to the solver's mixed code.
+- Decision: rejected; tree restored. Patches `~/.cache/sdpx-e2e/patches/lm1-mul-rows.patch` and `lm1n-mul-rows-noinline.patch`. The staged 16-limb Karatsuba over three `mul_rows::<8>` (`lm1b-kara16-staged.rs`, microbench 60.6 vs about 85 ns) stays unapplied. It would need its own 1024-bit E2E, and an x86 version for the cluster goal.
+
+## 2026-10-15 — L-R2a: product-ready f64 residue cache (rejected, thermal-ore)
+
+- Hypothesis: if the constant operand's residues are stored as product-ready `f64`, `Operand::group` can borrow them on a cache hit, with no unpack of the 24-bit store and no copy.
+- Change: a `CachedResidues::Full(Vec<f64>)` variant, filled at rebuild and borrowed by `Operand::group`.
+- E2E (Λ19-xml-512 T=4, A `sdpx-cur`, B `sdpx-r2a`, 2+2; identical points):
+
+  | | A | B | Change |
+  |---|---|---|---|
+  | Wall (median) | 58.41 s | 64.21 s | +9.9% |
+  | Cycles | 800.3G | 837.6G | +4.7% |
+  | Instructions | 3568.3G | 3511.2G | −1.6% |
+  | Max RSS | 622 MiB | 824 MiB | +32% |
+
+  A fifth run was stopped once the direction was clear. ising11 512 T=1 (1+1): cycles −1.3%.
+- Hypothesis for the loss: an `f64` residue is 8 bytes against 3, so every hit streams 2.7× the memory. The unpack it removes costs less than that bandwidth.
+- Decision: rejected. Patch `~/.cache/sdpx-e2e/patches/lr2a-full-cache-rejected.patch`.
+
+## 2026-10-15 — L-H1: residue-cache fingerprint in parallel lanes (rejected, thermal-ore)
+
+- Observed (Λ19-xml-512 T=4 receipt, `sdpx-cur`): `rns.cache.hit` runs 71087 times and takes 3.14 s summed wall (median 48 µs). It computes the 64-bit `fingerprint` of every stored entry, in one multiply chain over every word.
+- Change: one multiply chain per word position (kind, exponent, each limb), walked by column and mixed at the end.
+- Receipt (`sdpx-fp1`): `rns.cache.hit` 3.14 → 0.55 s (median 48 → 7.4 µs).
+- E2E (A `sdpx-cur`, B `sdpx-fp1`, 4+4 each; identical points): Λ19-xml-512 T=4 wall median 58.77 → 60.60 s (+3.1%, noise), cycles 804.7 → 807.3G (+0.3%), instructions flat. ising11 512 T=1 7.86 → 7.89 s, cycles +0.3%.
+- Why it did not pay: 2.6 s of summed hit time is about 1% of Λ19's busy CPU. That is under the 2% bar and inside the run-to-run cycle spread.
+- Decision: rejected. Patch `~/.cache/sdpx-e2e/patches/lh1-fingerprint-lanes-rejected.patch`.
+
+## 2026-10-15 — L-C2: CRT digit pack through a 128-bit window (refuted, thermal-ore)
+
+- Observed (Λ19-xml-512 T=4 `sample` after L-D1): `pack`, the serial digit-carry rebuild of each CRT output from its ~50 signed 23-bit digits, plus `from_scaled_integer` are 5–6% of busy CPU.
+- Hypothesis: shifting digits into an `i128` window and flushing a limb at 64 bits would beat the per-digit mask, shift and two-limb OR.
+- Change: window `pack` with a test against the old digit-carry copy (in-range digit sums, out-of-range cases, ±1 and ±(2^w − 1) edge digits; the test caught a sign mutation).
+- Microbench (M4, 50-digit packs): window 43.6 ns against digit-carry 39.5 ns. The carry chain is already the critical path; the window adds a 128-bit shift and a compare per digit.
+- Decision: refuted; tree restored. Patch `~/.cache/sdpx-e2e/patches/lc2-pack-window-rejected.patch`.
+
+## 2026-10-15 — L-D1: lean exact division at 128–1024 bits (kept, thermal-ore)
+
+- Observed (Λ19-xml-512 T=4 `sample`, L-F1 entry): `mpfr_div` is 6.6% of busy CPU. Its callers are the dqds sweeps of the cone SVD (one division per element per sweep) and the inverse-iteration solves. At 2–4 limbs (thermal 128/256 bits) MPFR's general path costs about twice a schoolbook division.
+- First try: `mpn_tdiv_qr` on Ma·2^P / Mb, then rounding. Only −5.8% per division at N = 8, because `tdiv_qr` allocates and normalises internally.
+- Change (`crates/arithmetic/src/lib.rs`): `div_regular` ports GMP's `mpn_sbpi1_div_qr` for 2 ≤ N ≤ 16. It takes GMP's 3-by-2 inverse (`invert_pi1`) and runs one `udiv_qr_3by2` step per quotient limb in Rust `u128`, with the N-limb update in GMP's `mpn_submul_1` / `mpn_add_n`. The numerator is Ma·2^P over 2N scratch limbs; the top quotient bit says whether the mantissa is q or q/2. The remainder gives the round and sticky bits; ties cannot occur. One nearest-even rounding follows, then MPFR's exponent-range check. N = 1, N > 16, zeros and non-finite operands still go to `mpfr_div`; at one limb `mpfr_div_1` is as fast (10.5 vs 10.3 ns). The new test `exact_div_matches_mpfr_bitwise` covers N = 1/2/3/4/8/12/16 at exponent spreads 4 and 600. Its cases are random quotients, a/a, (a·b)/b, power-of-two and all-ones mantissas with both signs, and divisors one unit apart. It failed on a deliberately broken round bit (mutation check).
+- Microbench (M4, per division vs `mpfr_div`): N = 2 −52%, 3 −44%, 4 −35%, 6 −21%, 8 −17%, 12 −13%, 16 −9%.
+- E2E (ABBA, Mac, fast profile, A = `sdpx-f1b` (L-F1), B = `sdpx-d1`; every point identical):
+
+  | Case | A | B | Change | Cycles | Instructions |
+  |---|---|---|---|---|---|
+  | Λ19-xml-512 T=4 (Solved 105, d0b8cb9b611e), 2+2 | 68.56 s | 65.37 s | −4.7% | −2.7% | −2.0% |
+  | ising11 512 T=1 (Solved 54, 17ec111261c7), 4+4 | — | — | — | −1.5% | −2.0% |
+  | two_L6_p256 T=4 (Solved 105, d47a20b519d8), 2+2 | 3.076 s | 3.029 s | −1.5% | −1.5% | −2.9% |
+  | two_L6_p128 T=4 (Solved 71, 5401782ec921), 4+4 | 1.580 s | 1.566 s | −0.9% | −0.9% | −2.1% |
+  | two_L6_p128 T=1, 2+2 | 2.985 s | 2.947 s | −1.3% | −0.9% | −2.2% |
+  | two_L8_p128 T=4, 8 it (7fcb2f100169), 2+2 | 13.32 s | 11.90 s | −10.7% (one slow A) | −4.3% | −0.8% |
+
+- Decision: kept. Results are bitwise identical. Λ19, the main high-precision Ising input, gains 4.7% wall time and 2.7% CPU. The wall gain is larger because the dqds sweeps sit on each cone's critical path.
+
+## 2026-10-15 — L-F1: lean exact FMA at 512–1024 bits (kept, thermal-ore); inline Comba product refuted
+
+- Observed (Λ19-xml-512, T=4, `sample` of `sdpx-g6b`, 88k busy samples): GMP's `addmul_1`/`mul_1`/`mul_basecase` take 22% of busy CPU. They are the 8-limb products inside exact dots, `MpFloat` products and `mpfr_fma`. `mpfr_fma` is 16% inclusive: the bidiagonal reduction and reflectors of the cone SVD (`svd.*` 57.5 thread-s of 230) are FMA-bound. `fma_regular` covered only N ≤ 4; its shifted-window path was slower than `mpfr_fma` at N ≥ 8.
+- Change (`crates/arithmetic/src/lib.rs`): for N ≤ 16 and `d = e(x·y) − e(z) ≤ p`, the new `fma_low` keeps the 2N-limb product in place. GMP assembly adds or subtracts the shifted N-limb addend (`mpn_lshift` + `mpn_add_n`/`mpn_sub_n`, with `mpn_neg` when the addend dominates), and one nearest-even rounding reads the top limbs plus a sticky scan. Wider spreads above N = 4 go to MPFR. Results equal `mpfr_fma` bit for bit; a new test, `exact_fma_matches_mpfr_bitwise`, covers N = 4/8/12/16 at exponent spreads 4/64/600, plus exact, one-ulp-above and one-ulp-below cancellations against the rounded product.
+- Microbench (M4, per FMA vs `mpfr_fma`): N = 8 −13%, N = 12 −11%, N = 16 −2%.
+- E2E (ABBA, Mac, fast profile; every point identical):
+
+  | Case | A `sdpx-g6b` | B `sdpx-f1` | Change | Cycles | Instructions |
+  |---|---|---|---|---|---|
+  | Λ19-xml-512 T=4 (Solved 105, d0b8cb9b611e), 4+4 | 62.62 s | 62.05 s | −0.9% (pairs +0.1/−1.5/−3.0/+0.6) | −2.3% | −5.0% |
+  | ising11 512 T=1 (Solved 54, 17ec111261c7), 4+4 | 8.26 s | 8.00 s | −3.2% (all pairs −1.6…−5.2) | −2.6% | — |
+  | ising11 512 T=2, 4+4 | 4.33 s | 4.29 s | −0.8% (median pair −1.5) | −2.6% | — |
+
+  The final build (MPFR for `d > p` above N = 4) reproduces both hashes.
+- Decision: kept. The change is bitwise identical, and CPU work falls 2.3–2.6% on both inputs. Wall time falls 3.2% at one thread per rank, the layout of the cluster's MPI runs; at T=2/T=4 on the Mac the gain is within noise.
+- Refuted alongside: a Rust Comba (column-sum) 8-limb product took 63.5 ns against GMP `mpn_mul_n` 20.0 ns; a row-wise schoolbook took 25.3 ns. GMP stays the product kernel at N ≥ 8.
+- Other Λ19 leaves for later: `mpfr_div` is 6.6% (dqds and inverse iteration; reciprocal pivots do not pay at two solves per vector); `group_residues` reduce is 4.6%; √2 svec conversions in the PSD W-products are 1.8%.
+
+## 2026-10-15 — L-G7: parallel residue-cache encode for the constant border operand (rejected, thermal-ore)
+
+- Observed (d6n640q/128 owner receipt): the first `owned.border_assemble` takes 1.0–2.4 s against a 0.66 s median, at about 2 busy cores. `ResidueCache::from_view_blocked` encodes 32768-entry blocks one after another. Only `chunk_matrix` takes the split; `group_residues` and the 24-bit packing run on the caller.
+- Change: ways claim whole blocks and encode each one serially, writing their disjoint residue slots in place. The store is identical bit for bit.
+- Probe (`SDPX_PROFILE=1`, 1 iteration, 2 runs each, 29 primes, T=4): `rns.cache.rebuild` 0.505 / 0.477 s → 0.359 / 0.440 s. Serial time inside it fell 0.42 → 0.055 s, but CPU rose 0.60 → 0.78–0.97 s: four ways share the AMX unit and memory bandwidth.
+- Why it did not pay: the cache is built once per solve (29 primes cover the 21–28 the Gram needs). About 0.1 s saved is 0.7% of an 8-iteration d6q run and less on a full solve.
+- Decision: rejected (well under the 2% bar). Patch `~/.cache/sdpx-e2e/patches/lg7-parallel-cache-encode-rejected.patch`. On 64-thread nodes it saves at most the 0.4 s serial share, once per solve.
+
+## 2026-10-15 — L-G6: aligned recursive blocks for the exact diagonal-congruence triangle (kept, thermal-ore)
+
+- Observed (d6n640q/128 owner receipt, T=4): `owned.border_assemble` takes 7.96 s of the 11.1 s IP wall. Each (512-row block, prime) unit covered the 640 × 640 upper triangle with 20 tiles of 32 columns at full height (up to 640 × 32 × 512 per call).
+- Hypothesis: larger off-diagonal products would cut per-call packing and kernel overhead at the same multiply count.
+- First try (square diagonal leaves, halves at n/2, leaf ≤ 64): d6q instructions −1.7…−2.1%, but fix-a (border about 100 columns) was +1.7…+2.9% slower over 6 runs per arm. The 50-wide square leaves do 15% more multiplies than 32-column tiles, and off-grid shapes run slowly on AMX.
+- Microbench (`gr3.c`, 4 concurrent Accelerate ways, k = 512, min of 7 rounds, ms per triangle):
+
+  | m | 32-col tiles | square leaves | aligned + 32-col leaves |
+  |---|---|---|---|
+  | 101 | 0.085–0.087 | 0.098–0.099 | 0.084–0.085 |
+  | 200 | 0.256–0.262 | 0.300–0.321 | 0.237–0.251 |
+  | 320 | 0.599–0.608 | 0.604–0.628 | 0.584–0.605 |
+  | 640 | 2.318–2.350 | 2.270–2.292 | 2.062–2.144 |
+  | 1024 | 6.120–6.148 | 5.380–5.445 | 5.322–5.368 |
+
+- Change (`rns_blas.rs`, `upper_blocks`): halves are cut at a multiple of 32 columns, and each off-diagonal rectangle is one product. Diagonal leaves (≤ 64 wide) use 32-column tiles of the rows above them, so the multiply count equals plain 32-column tiles. `diag_congruence` sizes its scratch to the largest block. Modular sums are exact, so results are bitwise identical.
+- E2E (ABBA against `7cb59b3`, Mac T=4, fast profile, solve s medians; every point identical):
+
+  | Case | A | B | Change | Instructions |
+  |---|---|---|---|---|
+  | d6q owner 8 it (a50df3c3265d), 4 rounds | 11.69 | 11.75 | +0.5% (noise; B min 10.96 vs 11.18) | −1.8% |
+  | d6q plain 8 it (5772c472b62f) | 13.29 | 11.79 | −11.3% | −2.3% |
+  | d6q owner, `SDPX_INT_GEMM=faer` | 18.91 | 17.87 | −5.5% | −4.1% |
+  | fix-a 256 owner (Solved 25) | 6.74 | 6.55 | −2.8% | −0.2% |
+  | fix-a 256 plain (Solved 25) | 5.29 | 5.19 | −1.8% | −0.2% |
+  | csdr3 256 (Solved 36) | 3.61 | 3.43 | ±noise | −0.1% |
+
+  Mac load was 3–5 throughout. Wall swings between runs reached ±15%; retired instructions moved less than 0.5% between runs.
+- Decision: kept. Instructions fall on every case, d6q falls 2–4% under both kernels, and fix-a no longer regresses. The generic upper-triangle path (`prime_columns`, used by `gemm_blocks_upper`) keeps 32-column tiles for now.
+
+## 2026-10-15 — L-X3: bounded single-pass exact dots for adjoint columns (rejected, thermal-ore)
+
+- Observed (d6n640q/128, owner, T=4, `sample` after L-X2): `SparseParallel::output` → `wide_output` → `exactdot::dot` on transposed columns with ≥4 entries takes 1981 samples, about 8% of busy CPU. Each dot first collects pointer pairs while scanning exponents, then accumulates.
+- Hypothesis: the L-X2 trick applies per column. Plan-time column exponent ranges plus one O(m) pass over x give a range for every term. The dot can then accumulate in one guarded pass without collecting or scanning.
+- Change (patch `~/.cache/sdpx-e2e/patches/lx3-bounded-adjoint-rejected.patch`):
+  - `exactdot::dot_bounded`, exposed as `Scalar::dot_fma_bounded`. It runs one guarded pass and falls back to `dot` on a miss or a non-finite term.
+  - `wide_output` gains an optional bound, widened by the head term.
+  - `SparseParallel` records `column_exponents` at configure, and `output_in` passes the bound for exact adjoint columns.
+  - Tests: bounded dots against `dot_fma` for exact, wide, stale and empty bounds, and an adjoint parity case in `long_row_parity`. A deliberately broken kernel made both tests fail.
+- Evidence:
+  - Temporary counters on d6q owner: more than 2^20 bounded calls, 0 misses.
+  - Retired instructions (`/usr/bin/time -l`): fix-a 256 owner 365.6G → 362.5G (−0.85%); d6q owner 8 it 538.5/541.2G vs 535.6/545.8G (±1%).
+  - Samples under `with_head`: 2044 before, 2151 after (1469 bounded, 589 plain `dot` where the column×x range is too wide for the accumulator).
+  - The wall ABBA was dominated by Mac load (±15% between runs). Every point was identical.
+- Why it did not pay: these columns are short, so the dot cost is the per-term product and slot adds, not the exponent scan. A range from the whole of x is also much wider than a column's actual terms, so accumulators grow.
+- Decision: rejected (well under the 2% bar). Reverted.
+
+## 2026-10-15 — L-X2: long-row exact products without an exponent scan (kept, thermal-ore)
+
+- Observed (d6n640q/128, owner, T=4, `sample` after L-X1): `dot_outputs_chunked` takes 3226 of 20656 busy samples. 1106 of them are its first pass, which reads every term only for its exponent before the accumulation pass reads them again. Each A entry is a 32-byte MpFloat, and the long rows hold about 10.7M entries, so the scan streams all of A once more for each product.
+- Change:
+  - `Scalar::product_exponent`: the binary exponent of a finite nonzero value (MpFloat only; the default is `None`).
+  - `dot_outputs_chunked` takes optional per-output exponent-sum `bounds`. With bounds it skips the scan. The accumulation pass checks each term against its output's range: a term out of range, or a non-finite one, makes the call run the scan path after all. A stale bound can therefore cost time but never the value. Alignment does not change the exact integer, so results are bitwise identical.
+  - `SparseParallel` records each long row's entry exponent range when it plans the long rows. `forward_long` adds x's range (one O(n) pass) and widens by each output's incoming head.
+  - Tests: the output-dot test runs exact, widened, too-narrow and empty bounds. The long-row parity test adds x spread over 2^±100 with zeros, and A values scaled by 2^90 after planning.
+- Profile (same sampling, d6q owner): exact long-row products 3226 → 2533 samples. Only the guarded pass appears; no call fell back to the scan.
+- E2E (ABBA against L-X1 `23d81dd`, Mac, solve s; every point identical):
+
+  | Case | A | B | Change |
+  |---|---|---|---|
+  | d6q owner 8 it (a50df3c3265d), 2 rounds | 12.45 / 13.65 / 12.84 / 13.25 | 11.94 / 12.60 / 11.52 / 12.40 | −7.1% |
+  | d6q plain 8 it (5772c472b62f), 3 rounds | 13.75 / 12.67 / 12.71 / 13.32 / 12.65 / 12.40 | 12.62 / 12.45 / 13.98 / 13.33 / 13.53 / 12.68 | +1.4% (noise) |
+  | fix-a 256 owner (Solved 25) | 6.79 / 6.66 / 6.79 / 6.66 | 6.36 / 6.28 / 6.23 / 6.28 | −6.4% |
+  | fix-a 256 plain (Solved 25) | 5.00 / 5.00 / 4.97 / 4.95 | 4.95 / 4.94 / 4.93 / 4.89 | −1.0% |
+  | csdr3 256 (Solved 36) | 3.30 / 3.31 | 3.42 / 3.24 | ±0 |
+
+  In plain mode, long-row products are 2% of busy CPU (448 samples before, 440 after), so plain can move by at most about 1%. Its ±5% swings between rounds are Mac load (load average about 5). two_L4/256, two_L6/256 and ising11/512 have no long rows and stay identical. 38 arithmetic tests, 508 solver lib tests and the JSON/CLI integration tests pass.
+- Decision: kept. Owner-path gravity LP gains 6–7%, every result is bitwise identical, and plain is unchanged.
+
+## 2026-10-15 — L-X1: exact dot products accumulate in carry-free 128-bit slots (kept, thermal-ore)
+
+- Observed (d6n640q/128, owner, T=4, `sample` of the solve): exact-dot kernels take about 30% of busy CPU. `dot_outputs_chunked` from the sparse products has 3003 samples. `exactdot::dot` from `dot_fma` has about 3400: `wide_output` 1739, `solve_reduced_panel` 1152, `solve_reduced_raw` 576. Each term added its shifted 2N-limb product to a u64 accumulator with a carry chain: a carry-flag dependency through every limb and a data-dependent carry loop. At 512 bits it made three GMP calls (`mul_n`, `lshift`, `add_n`).
+- Hypothesis: a 128-bit slot per 64-bit limb absorbs 2^64 pieces without overflow. Then each term adds independent pieces with no carry chain, and the carries resolve once per dot.
+- Change (`crates/arithmetic/src/exactdot.rs`):
+  - The accumulators hold `u128` slots. `add_shifted` adds limb t of the shifted product into slot t. `(x >> 1) >> (63 - shift)` gives the spill-over piece for every shift, including 0, without a branch.
+  - The inline kernel (N ≤ 4) multiplies into a local buffer. The GMP kernel (N > 4) calls `mpn_mul_n` only, with no `lshift` or `add_n`.
+  - `fold_slots` turns slots back into limbs in place, once per dot. Chunk partial sums merge slot by slot. Rounding (`round_acc`) is unchanged.
+  - The exact integer is the same, so every result is bitwise identical.
+- Microbench (same process, ns per term, against a reconstruction of the u64 kernel): N=1 2.66 vs 2.51 (+6%), N=2 3.11 vs 3.57 (−13%), N=3 −8%, N=4 −11%. Against the production kernel at N=2: 7.85 → 6.37 (−19%). Two or four interleaved slot banks did not help at N ≥ 2.
+- E2E (ABBA against `f8ee8f4`, Mac, solve s; every point identical):
+
+  | Case | A | B | Change |
+  |---|---|---|---|
+  | d6q owner 8 it (a50df3c3265d) | 11.77 / 12.21 | 11.39 / 11.61 | −4.1% |
+  | d6q plain 8 it (5772c472b62f) | 12.91 / 13.41 | 12.57 / 12.76 | −3.8% |
+  | fix-a 256 owner (Solved 25) | 6.82 / 6.87 / 7.02 / 7.13 | 6.68 / 6.69 / 6.95 / 6.98 | −1.9% |
+  | fix-a 256 plain (Solved 25) | 5.33 / 5.59 / 5.39 / 5.33 | 5.21 / 5.23 / 5.21 / 5.24 | −3.4% |
+  | csdr3 256 (Solved 36) | 3.51 / 3.29 | 3.45 / 3.43 | +1% (noise) |
+  | two_L8/128 8 it | 13.30 / 12.25 | 12.15 / 11.89 | −5.9% |
+  | two_L6/256 (Solved 105) | 2.87 / 3.35 | 3.13 / 2.98 | −1.7% (noisy) |
+  | syn20/128 (Solved 50) | 14.53 / 15.24 | 13.63 / 13.96 | −7.3% |
+  | ising11/512 T=4, 2 rounds (Solved 54) | 2.42 / 2.43 / 2.43 / 2.47 | 2.38 / 2.41 / 2.42 / 2.41 | −1.2% |
+  | ising11/512 T=10, 2 rounds | 1.86 / 1.90 / 1.87 / 1.85 | 1.81 / 1.85 / 1.82 / 1.87 | −1.8% |
+
+  two_L4/128 and two_L4/256 are Solved and identical (46 and 85 it). 38 arithmetic tests (integer oracle at every precision; inline and GMP kernels agree), 508 solver lib tests and the JSON/CLI integration tests pass.
+- Decision: kept. The gain is ≥2% on the gravity, thermal and SOC inputs, and ising11 does not regress. Not yet measured on x86: the u128 adds compile to `add`/`adc` pairs there too, but this needs a cluster deploy.
+
+## 2026-10-15 — L-P4: MPI ranks agree on a binary input hash; L-P3 Ruiz row ranges rejected (thermal-ore)
+
+- L-P4, observed: with more than one MPI rank, the CLI checks that all ranks read the same input. Every rank serialized the whole parsed problem to JSON into a SHA-256, which turns each MPFR value into decimal text. A timing probe on the Mac (same binary, d6n640q/128, T=4) measured 5.63 s for this. fix-a/256 took 1.34 s.
+- L-P4, change:
+  - `costs.rs`: a new `rank_identity` hashes the values `input_fingerprint` covers, using their binary wire payloads. Long arrays hash in fixed 64Ki-value chunks on the calling Rayon pool, followed by the chunk digests in order, so the result does not depend on the pool size.
+  - `JsonProblem::rank_identity` adds the sanitized settings JSON.
+  - `sdpx.rs`: the CLI computes the identity within `--threads`, only when there is more than one rank. One `within_threads` helper now serves the SDPB read, the JSON read and the identity.
+  - `feed_scalar` writes wire bytes into a stack buffer, so the cost-history fingerprint is unchanged.
+- L-P4, measured (probe): d6n640q 5.63 → 0.31 s (T=4), 1.20 s (T=1); fix-a 1.34 → 0.08 s (T=4).
+  - A unit test checks that the identity is the same with and without a 3-thread pool, and that one changed value or row index changes it.
+  - Single-process points are unchanged (d6q 8 it a50df3c3265d). 508 lib tests and the JSON/CLI integration tests pass.
+- L-P4, not yet verified: a multi-rank end-to-end run. The Mac has no MPI, and cluster deploys are on hold.
+- L-P3, hypothesis: the Ruiz row-norm pass puts all 640 dense rows of d6n640q in its first 4096-row chunk, so it runs serially.
+- L-P3, change: row ranges of equal entry counts, each at least n entries.
+- L-P3, result (in-binary toggle, T=4, 10 Ruiz passes): the norm pass went from 0.29 s to 0.72 s, because each of the 16 ranges binary-searches all 16783 columns. The old serial chunk costs only 29 ms per pass.
+- L-P3, decision: rejected. Patch `lp3-ruiz-ranges-with-probe-rejected.patch`.
+- Also observed (L-P2 follow-up): on macOS, the parallel decimal decode scales only about 1.2× at T=4. `mpfr_strtofr` calls `localeconv_l`, which takes a global lock (1.55 thread-s of lock waits on d6q). glibc's `localeconv` takes no lock, so on the cluster the decode should scale with `--threads`. Unverified.
+
+## 2026-10-15 — L-P2: high-precision JSON arrays decode on the thread pool (kept, thermal-ore)
+
+- Observed (d6n640q/128, `sample`): the JSON read takes 2.5 s on one thread, of which 1.9 s is decimal conversion (`mpfr_strtofr` under the MpFloat visitor).
+- Change:
+  - `json.rs`: `P`, `q`, `A` and `b` (above binary64) keep each array element as text, or as its integer or float token, while serde_json parses the file. They then decode through `T`'s own deserializer on the calling Rayon pool.
+  - `sdpx.rs`: the CLI reads a file input inside a pool of `--threads`.
+  - Values are those of the ordinary read. A bad element's error now names the element index instead of the line and column.
+- E2E (ABBA against `aa29a67`, Mac, T=4, process wall in s, every point identical):
+
+  | Case | A | B | Change |
+  |---|---|---|---|
+  | d6q owner 8 it (a50df3c3265d) | 14.89 / 14.99 | 14.18 / 13.96 | −5.8% |
+  | d6q plain 8 it (5772c472b62f) | 15.98 / 16.03 | 14.93 / 15.01 | −6.5% |
+  | fix-a 256 owner (Solved 25) | 7.98 / 7.98 / 8.29 / 8.20 | 7.52 / 7.64 / 8.16 / 7.89 | −3.8% |
+  | fix-a 256 plain (Solved 25) | 6.58 / 6.68 / 6.61 / 6.50 | 6.05 / 6.20 / 6.14 / 6.04 | −7.4% |
+  | csdr3 256 (Solved 36) | 3.66 / 3.72 | 3.54 / 3.52 | −4.3% |
+
+- Decision: kept. 507 lib tests and the JSON integration tests (`json_io`, `native_input`) pass. Without `--threads`, the read stays serial.
+
+## 2026-10-15 — L-P1: dense rank minor gets the sparse pass's time (kept, thermal-ore)
+
+- Observed (d6n640q/128, owner, T=4, `sample`): setup is about 6 s of a 17.7 s 8-iteration run, and none of it is parallel. The JSON parse takes 2.5 s and the presolver 1.7 s. The presolver's rank proof stops the dense modular minor after 0.02 s, when its budget of 4·(nnz + m) = 43M updates runs out. It then builds BTreeMap rows (0.57 s) and runs the sparse modular pass (1.59 s), which runs out of budget too, so no row is removed.
+- Probe (Mac M4): with a 600M budget the dense minor proves full rank (640 rows) in 0.031 s. Per budget unit, a dense update costs 0.49 ns and a sparse update 37 ns.
+- Change (`presolver.rs`): the dense minor's budget is the sparse modular budget times `DENSE_PER_SPARSE_UPDATE = 64`, still capped at 2m³ and floored at 16M. So the minor never takes longer than the sparse pass that would follow it. The proof only ever removes rows, and none are removed either way, so solves are bitwise identical.
+- Coverage: only the d6n640 family changes path. With the old budget, fix-a (99 rows), ising11 (20), Λ19-xml (54) and csdr3 (42) already proved full rank in the dense minor. The thermal inputs and Λ27-s50c never reach it.
+- E2E (ABBA against `bfca5ef`, Mac, s, hashes identical):
+
+  | Case | A | B | Change |
+  |---|---|---|---|
+  | d6q owner 8 it, process wall | 16.53 / 17.17 | 16.29 / 15.24 | −6.4% |
+  | d6q plain 8 it, process wall | 17.28 / 17.52 | 15.69 / 15.70 | −9.8% |
+  | d6q owner full (Solved 48, 7e703396b7e2), process wall | 67.11 / 66.03 | 65.15 / 63.88 | −3.1% |
+  | same, solve time | 64.13 / 63.03 | 62.18 / 60.90 | −3.2% |
+
+- Decision: kept. 507 lib tests pass. Next setup items: the JSON decimal parse (serial) and the Ruiz row-norm pass, which puts all 640 dense rows in one 4096-row chunk.
+
+## 2026-10-15 — ORE Hs product in row pieces; diagonal CRT fold rejected (thermal-ore)
+
+- Observed (one_L12/128, 4 iterations, T=4 faer, after the queue-helper change): `residual` takes 0.95 s at parallelism 1.1, and all of it is `residual.scale`. That phase is the ORE `hs_prod`, whose dense S₀⁻¹ product (order 1806, 3.3M multiply-adds, about 79 ms per call) ran on one thread. The combined shift calls it three times per iteration.
+- Hypothesis: `hs_prod` should split S₀⁻¹'s rows like the other ORE kernels. The condensed scaling block of an ORE cone should measure its cost and pass its ways like a PSD block.
+- Change:
+  - `hs_prod` forms S₀⁻¹v in row pieces (`pieces`). Each entry sums its columns in order, so the split changes nothing.
+  - The ORE `tasks` also honours ways granted to the calling block (`with_split_hint` on a pool thread).
+  - The condensed `apply_block` times the `Scaling::Ore` block and runs it under its measured ways.
+- E2E (ABBA against `f9a6d6d`, Mac, s):
+
+  | Case | A | B | Change |
+  |---|---|---|---|
+  | one_L12 T=4 faer | 18.04 / 18.08 | 17.28 / 17.23 | −4.4% |
+  | one_L12 T=8 Accelerate | 15.66 / 15.18 | 14.32 / 14.36 | −7.0% |
+  | one_L12 T=1 faer (2 rounds) | 41.87 / 41.84 / 42.23 / 42.12 | 42.59 / 42.11 / 43.08 / 42.14 | +1.1% (medians +0.3%) |
+  | two_L8 T=4 (8 it) | 11.01 / 11.59 | 11.32 / 11.43 | +0.7% |
+  | two_L6/256 T=4 | 2.867 / 2.866 | 2.851 / 2.849 | −0.6% |
+  | syn20/128 T=4 (single) | 14.40 | 13.95 | −3.1% |
+
+  - At T=4, `residual` drops 0.95 → 0.38 s and `combined rhs` 0.72 → 0.55 s.
+  - Every point is bitwise identical: one_L12 `aacd1c62ec43`, two_L8 `7fcb2f100169`, two_L6/256 Solved 105 `d47a20b519d8`, two_L4/128 and /256 Solved 46/85, syn20 Solved 50 `308c4f2d8829`, ising11 `17ec111261c7`.
+  - 507 lib tests pass.
+- Decision: kept. T=1 has one slow B leg per round and is otherwise flat.
+- Rejected, L-G5: a parallel CRT fold over outputs in `diag_congruence`. The serial `CrtAccumulator::add` was the Amdahl term of the owner border assembly (1.18 s of 29.4 s at T=10). Splitting it over outputs halves it (0.58 s) but leaves wall time flat on the Mac.
+
+  | Case (T=10) | A | B |
+  |---|---|---|
+  | d6n640q owner | 57.36 / 56.90 | 56.98 / 56.23 (−0.9%) |
+  | d6n640q plain | 55.34 / 55.52 | 55.05 / 55.91 (±0) |
+  | d6n640q owner faer | 69.20 / 69.30 | 69.30 / 68.92 (−0.2%) |
+  | fix-a owner T=4 | 6.86 / 6.68 | 6.74 / 6.66 (−0.6%) |
+
+  All four cases are bitwise. The patch is `lg5-crt-fold.patch`. Re-test it at 64 threads, where the serial term weighs more.
+
+## 2026-10-15 — Cone-queue helpers stay while a cone posts (thermal-ore)
+
+- Observed (one_L12/128, 4 iterations, T=4, faer): the ORE S₀ inverse's LᵀL product (order 1806) takes 0.58 s per call in the solver but 0.33 s in an isolated 4-thread pool (3.15× over T=1).
+  - A queue log showed the ORE cone (numel 2709, 4 ways) at 1.08, 2.97, 1.66 and 1.92 s per phase.
+  - Helpers stop at the previous phase's slowest cone time. After the 1.08 s first phase, they left at 1.08 s while the cone was still posting, and it finished alone at 2.97 s. The next phase then waited 2.97 s and was helped throughout (1.66 s).
+- L-R1 probe first (single runs, s; same points): wider generic-gemm primes (`Plan` on 512-row chunks) and 64/128-column triangular tiles.
+
+  | Arm | Accelerate | faer |
+  |---|---|---|
+  | base | 17.09 / 16.82 | 19.26 |
+  | 512-row primes | 16.64 | 19.22 |
+  | 64-column tiles | 16.55 | 19.23 |
+  | both | 16.51 | |
+
+  Within run noise (≤2.6%); not pursued.
+- Hypothesis: helpers should stay while a cone keeps posting items, not until a fixed deadline.
+- Variants (ABBA against `284ca6f`, Mac, s):
+
+  | Case | base | 2× deadline | 2× + yield | help-extended + yield | help-extended + spin |
+  |---|---|---|---|---|---|
+  | one_L12 T=4 faer | 19.07–19.71 | 17.82 / 18.25 | 17.51 / 17.60 | 17.77 / 17.65 | 17.61 / 17.76 |
+  | one_L12 T=8 Accelerate | 15.83–16.46 | 15.67 / 16.09 | 15.04 / 15.11 | 15.12 / 15.18 | 15.38 / 15.43 |
+  | one_L12 T=16 Accelerate | 15.47–19.42 | | 14.62 / 14.94 | 14.65 / 14.53 | 16.02 / 16.06 |
+  | ising11 T=10 (mean of 6) | 1.772 | 1.771 | 1.774 | 1.784 (one 1.852 outlier) | 1.770 |
+  | ising11 T=16 | 1.886–1.902 | 1.943 | 1.932 | 1.879 | 1.879 |
+  | ising11 T=24 | 2.012–2.041 | 2.272 | 2.031 | 1.971 | 2.018 |
+
+  - A 2× deadline cost ising11 11% at T=24 on 10 cores. A probe counted 204 timeout exits over 55 phases, and phases ended with the slowest cone, so no stall was involved. The slowest cones ran 2.1× longer than at T=10 because spinning helpers took their time slices.
+- Change (`cones/parallel.rs`): each item a helper runs moves its deadline to now plus the last slowest cone. The deadlock bound is unchanged once posts stop. A helper with nothing to run yields its OS time slice instead of `spin_loop`.
+- E2E (help-extended + yield):
+  - one_L12 T=4 faer −8.1%, T=8 Accelerate −5.7%, T=16 Accelerate −7.8%.
+  - ising11 T=10 and T=16 neutral, T=24 −2.0%.
+  - two_L8 (8 it), two_L6/256 and fix-a owner neutral.
+  - Every point is bitwise identical: ising11 plain `17ec111261c7` (54 runs) and owner `d73ecddbd4e9`; two_L4/128 and /256 Solved 46/85; two_L6/256 Solved 105; fix-a owner Solved 25.
+  - 507 lib tests pass.
+- Decision: kept. The cluster check (64 threads, ising11 and Λ35-rs) waits for a deploy.
+
+## 2026-10-15 — Exact diagonal congruence in 512-row blocks (thermal-ore)
+
+- Observed (d6n640q/128, 8 iterations, Mac): the owner border assembly C·D⁻¹·Cᵀ (640 × 16,780) takes 7.2 s of 11.3 s at T=10 and barely scales (8.7 s at T=1).
+  - With Accelerate, its integer products share the AMX unit.
+  - With `SDPX_INT_GEMM=faer` it takes 9.6 s at T=10 against 11.8 s at T=4.
+  - The plain path's bound Gram (`arrow.local_schur`) is the same kernel.
+- Hypothesis: `diag_congruence` sizes its primes by the 4096-row block (21 bits). Shorter blocks admit wider primes (23 bits at ≤512 rows, 24 at ≤128), so fewer primes cover the same exact product. Each block adds one reduction per output, and its operands are cache-sized.
+- Probe (`SDPX_DIAG_ROWS`, 8 iterations, border s): every point identical.
+
+  | Rows | Prime bits | Owner faer T=10 | Owner Accelerate T=4 | Plain faer T=10 (Gram) |
+  |---|---|---|---|---|
+  | 4096 | 21 | 9.63 | 7.39 | 10.04 |
+  | 1024 | 22 | 8.25 | | |
+  | 512 | 23 | 7.45 | 5.27–5.43 | 7.62 |
+  | 384 | 23 | 7.51 | | |
+  | 256 | 23 | 7.40 | 5.54 | |
+  | 128 | 24 | 7.81 | 5.67 | 7.95 |
+
+- Change (`rns_blas.rs`): `DIAG_BLOCK_ROWS` 4096 → 512. The magnitude bound still uses the full k, so the result is exact and its bits are unchanged. The constant's doc comment now sits on the constant instead of on `diag_congruence`.
+- E2E: full solves, ABBA, A = `6657972` (Mac):
+
+  | Case | A s | B s | Change |
+  |---|---|---|---|
+  | d6n640q owner T=10, Accelerate | 68.26 / 66.96 | 58.26 / 57.08 | −14.7% |
+  | d6n640q plain T=10, Accelerate | 63.68 / 63.22 | 55.41 / 55.62 | −12.5% |
+  | d6n640q owner T=10, faer | 83.85 / 84.53 | 70.30 / 69.34 | −17.1% |
+  | fix-a/256 owner T=4 | 7.53 / 7.43 | 6.76 / 6.68 | −10.2% |
+  | fix-a/256 plain T=4 | 5.75 | 4.99 | −13.3% |
+
+  - Every pair is bitwise identical: d6n640q Solved 48 (owner `7e703396b7e2`, the audited point; plain `1b05ab68fdfb`) and fix-a Solved 25.
+  - ising11/512 owner and plain hashes are unchanged (`d73ecddbd4e9`, `17ec111261c7`).
+  - 507 lib tests pass.
+- Decision: kept.
+
+## 2026-10-15 — Cut-aware recursive leaf Y solve rejected (thermal-ore)
+
+- Hypothesis: the rejected recursive Y solve of the L-T3 entry lost only because it ignored the envelope cut and zero columns. A recursion that splits at envelope cuts and multiplies only the coupled, nonzero columns (sorted by first nonzero row, so each level's product covers a column prefix and starts at the first nonzero inner row) matches the row sweep's 520 M multiply-adds. Its products should then beat per-entry exact dots, as the recursive factor does.
+- Change (`arrow.rs`, reverted): `solve_unit_lower` with `envelope_cut` shared with `ldl_rec`, gathering coupled columns for leaves from order 256 above binary64. The unit test matched per-column sweeps within rounding; serial and pool(8) were bitwise equal.
+- E2E (Mac, fast profile), ABBA, A = `6657972`:
+
+  | Case | A s | B s | Change |
+  |---|---|---|---|
+  | one_L12/128 4 it, T=4, Accelerate | 17.15 / 17.10 | 17.22 / 17.05 | +0.1% |
+  | one_L12/128 4 it, T=4, faer | 19.58 / 19.65 | 20.09 / 19.89 | +1.9% |
+  | one_L12/128 4 it, T=1, faer | 41.88 / 43.07 | 40.83 / 40.90 | −3.8% |
+  | two_L8/128 8 it, T=4, Accelerate | 11.21 / 11.88 | 11.64 / 11.85 | +1.7% |
+  | syn20/128 full solve, T=4 | 14.18 | 14.68 | +3.5% |
+
+  - B points: two_L4/128 and /256 and two_L6/256 bitwise; syn20 Solved 50 with audit residuals unchanged (primal 1.4e-24, gap 2.8e-24).
+  - `arrow.leaves`: T=1 13.7–13.9 → 12.3 s; T=4 faer 5.2 → 5.5 s.
+- Decision: rejected. Only the serial case gains. At 4 threads the column-parallel exact-dot sweep is already balanced (255 independent columns), while the narrow products (255 columns) and the recursion's serial levels are not. Patch: `lt4-rejected.patch`.
+
+## 2026-10-15 — Recursive LDL for wide exactly accumulated arrow leaves (thermal-ore)
+
+- Observed (7f2c493, one_L12/128, 4 iterations): `arrow.leaves` was the largest phase (21.3 s at T=1, 7.3–7.8 s at T=4 faer). The ORE-42 leaf (order 2709: the 903-row T block, then 1806 S₀⁻¹ rows behind an envelope cut) factored by per-entry exact dots, so no residue product ever ran inside the leaf. From order 256 at 256 bits and above, a blocked exact form (48-pivot panels) ran instead.
+- Change (`arrow.rs`):
+  - Exactly accumulated leaves from order 256 (`REC_FACTOR_MIN`) factor recursively (`ldl_rec`). An envelope cut nearest the middle splits the leaf into two independent factors, which run concurrently when the pool is split. Otherwise the leaf halves:
+    - W21 = A21·L11⁻ᵀ by a recursive triangular solve that starts each row at its envelope;
+    - L21 = W21·D1⁻¹;
+    - A22 −= L21·W21ᵀ as one exact symmetric product.
+  - Blocks up to 128 rows (`REC_BASE`) keep the exact-dot factor (`ldl_dots`, the old body moved, same arithmetic). Envelope zeros stay exact zeros.
+  - The blocked exact form is removed. In a dense-leaf bench (faer, 256–512 bits) the recursion beat it at every order tried, up to 2.6× at 4 threads (512 bits, order 512: 0.12 vs 0.24 s). At 128 bits, order 1806: 4.2 → 1.5 s serial, 1.2 → 0.6 s at 4 threads. From order 256 down to about 384 at 4 threads it is level with exact dots; a split base of 192 or 256 gave nothing.
+  - New unit test (128 bits, order 300, envelope cut at 110, ragged rows, mixed signs, clamped pivots): matches `factor_dots` to 1e-25, with the same regularization count and exact envelope zeros; serial and pool(8) are bitwise equal. 507 solver lib tests pass.
+- E2E (Mac, fast profile), ABBA, A = `7f2c493`. Each product rounds once per level, so leaves of order ≥256 at 128 bits change bits:
+
+  | Case | A s | B s | Change |
+  |---|---|---|---|
+  | one_L12/128 4 it, T=4, faer | 24.18 / 25.98 | 23.39 / 23.55 | −6.4% |
+  | one_L12/128 4 it, T=4, Accelerate | 22.18 / 22.22 | 19.47 / 18.91 | −13.6% |
+  | one_L12/128 4 it, T=1, faer | 50.50 / 56.68 | 42.30 / 43.99 | −19.5% |
+  | two_L8/128 8 it, T=4, Accelerate | 14.81 / 14.75 | 14.40 / 14.19 | −3.3% |
+  | syn20/128 full solve, T=4 | 14.22 | 14.34 | +0.8% |
+  | d6n640q 128, partitions 1, T=10 | 67.42 / 66.39 | 68.15 / 66.64 | +0.7% |
+  | fix-a 256, partitions 1, T=2 | 9.96 / 9.97 | 9.89 / 9.96 | −0.4% |
+
+  - The T=1 A run at 56.7 s overlapped a niced build; against the earlier same-binary runs (50.0 / 51.8 s) the change is −15.6%.
+  - Phases, T=4 Accelerate: `arrow.leaves` 8.8 → 5.6 s. T=4 faer: 8.2–8.9 → 6.2 s.
+  - Audits:
+    - syn20: Solved 50 in both arms. B's original-coordinate audit: primal 1.4e-24, dual 1.3e-25, gap 2.8e-24, the same as A's.
+    - d6n640q: Solved 48 in both arms. B's audit: primal_rel 1.1e-26, dual_rel 3.0e-23, gap_rel 1.2e-20, the same as A's.
+  - Bitwise identical: two_L4/128 and /256, two_L6/256, ising11 at 512 bits (owner partitions 2 and plain), fix-a 256. None of these has a leaf of order ≥256 at ≥256 bits, so the removed blocked form is covered by the bench only.
+- Rejected variant: Y = L⁻¹B by the same recursion (one exact product per level instead of one exact dot per entry). one_L12 T=4 Accelerate 21.59 / 21.30 vs 19.22 / 19.49 s (+10.3%); `arrow.leaves` 5.4 → 7.4 s. A column dump explains it:
+  - the plain halving ignored the leaf's envelope cut at 903;
+  - it multiplied the 93 all-zero border columns of the 348.
+  - Together that is 936 M exact multiply-adds against the row sweep's 520 M. Next: a cut-aware recursion over the coupled columns only.
+- Decision: kept.
+
+## 2026-10-15 — RNS products skip exact-zero inner terms of triangular operands (thermal-ore)
+
+- Observed (1b7f812, one_L12/128, 4 iterations): `ore.schur_inverse` (L⁻¹ by recursive halves, then L⁻ᵀL⁻¹) took 16.3 s at T=1 and 7.5 s at T=4 (faer). Its residue products multiplied full inner ranges although one operand is triangular: about half of every inner sum was exact zero terms.
+- Change (`rns_blas.rs`, `oprelentrcone.rs`):
+  - `gemm` scans op(B) once for each column's nonzero inner range (`inner_reach`, exact-zero test on the dyadic view). When some range is short, the per-prime products run in 32-column tiles over the union of their columns' ranges; a tile with no range writes zeros. Column panels are balanced by rows × inner length.
+  - `lower_inverse_rec` forms its second product transposed (X21ᵀ = −Tᵀ·X22ᵀ), so both right operands are triangular.
+  - Skipped terms are exact zeros and residues are exact integers, so every entry is unchanged. A new unit test covers banded and zero-column operands over all transposes, upper/full, and serial vs pool bitwise.
+- E2E (Mac, fast profile), ABBA, A = `1b7f812`; every point bitwise identical to A:
+
+  | Case | A s | B s | Change |
+  |---|---|---|---|
+  | one_L12/128 4 it, T=4, faer | 24.61 / 25.44 | 22.22 / 22.43 | −10.8% |
+  | one_L12/128 4 it, T=4, Accelerate | 21.22 / 21.49 | 20.27 / 20.32 | −5.0% |
+  | one_L12/128 4 it, T=1, faer | 59.95 / 58.04 | 50.05 / 51.84 | −13.7% |
+  | two_L6/256, T=4, faer | 2.95 / 2.97 | 2.99 / 2.96 | +0.4% |
+  | two_L6/256, T=4, Accelerate | 2.87 / 2.87 | 2.87 / 2.88 | +0.2% |
+  | fix-a 256, partitions 1, T=2 | 10.18 / 9.97 | 9.89 / 9.89 | −1.8% |
+  | fix-a 256, partitions 2, T=10 | 6.13 / 6.25 | 6.12 / 6.24 | −0.2% |
+  | d6n640q 128, partitions 1, T=10 | 68.88 / 67.44 | 67.95 / 67.62 | −0.5% |
+
+  - one_L12 phases, T=1 faer: `ore.schur_inverse` 16.3 → 8.6 s; T=4: 7.5 → 5.0 s. `arrow.leaves` (21.3 s at T=1, 7.3–7.8 s at T=4) is now the largest phase.
+  - two_L4/256: Solved, 85 iterations, same point. ising11 at 512 bits, T=4 (owner with partitions 2, and plain): bitwise identical. 506 solver lib tests pass.
+- Decision: kept. Audits carry over.
+
+## 2026-10-15 — Split RNS products reach the scaling board; one-prime groups split by columns (thermal-ore)
+
+- Observed (5b310c2, one_L12/128, 4 iterations, T=4):
+  - The ORE-42 cone's Schur work (order 1806) took about 1.96 of 2.05 s per scale-cones phase. With faer, `ore.schur_inverse` was 16.2 s at T=4 against 16.3 s at T=1.
+  - Its exact products got `Split::Ways`, but those ways ran as Rayon tasks. With 5 cones on 4 workers, the cone queue's idle workers only help board posts; they steal Rayon work only when workers > cones. So the splits ran serially on the ORE thread.
+  - After posting the ways to the board, a probe showed the remaining serial part: each `gemm` call carried one prime per group, because the 8 MB residue-scratch cap is below a 903² operand pair (13 MB). Each call was one 133 ms prime product that no way could share.
+- Change (`rns_blas.rs`):
+  - Granted ways (`Split::Ways`) post their items on the board when the thread runs under an offer. This covers chunk-matrix fills, residue encoding, per-prime products, CRT digit updates, congruence products and output-tiled CRT.
+  - When a group has fewer primes than ways (min of the split and the pool's threads), each prime's product is split into output-column panels: at least 32 columns and `WAY_WORK` each, balanced by triangle height.
+  - Residue entries are exact integers, so a panel's product equals the whole product's columns. Results are bitwise identical.
+- E2E (Mac, fast profile), ABBA, every point bitwise identical to A:
+
+  | Case | A (5b310c2) s | B s | Change |
+  |---|---|---|---|
+  | one_L12/128 4 it, T=4, faer | 35.12 / 34.98 | 24.44 / 24.28 | −30.5% |
+  | one_L12/128 4 it, T=4, Accelerate | 22.43 / 22.66 | 21.15 / 20.69 | −7.2% |
+  | two_L6/256, T=4, faer | 3.09 / 3.09 | 3.10 / 2.98 | −1.5% |
+  | two_L6/256, T=4, Accelerate | 2.95 / 2.92 | 2.89 / 2.91 | −1.3% |
+  | fix-a 256, partitions 1, T=2 | 9.93 / 9.90 | 9.85 / 9.93 | −0.3% |
+  | fix-a 256, partitions 2, T=10 | 6.23 / 6.35 | 6.17 / 6.23 | −1.0% |
+  | d6n640q 128, partitions 1, T=10 | 68.72 / 67.14 | 67.92 / 67.09 | −0.6% |
+
+  - one_L12 phases at T=4 (faer): `ore.schur_inverse` 16.2 → 7.5 s, `ore.schur_cholesky` 4.5 → 2.3 s; T=1 is unchanged. Accelerate gains less on the Mac because the P-cluster's matrix unit is shared; the cluster's x86 GEMM behaves like faer.
+  - two_L4/256: Solved, 85 iterations, same point. two_L6/256 T=1: 6.25 vs 6.31 s (one pair). ising11 at 512 bits, T=4 (owner with partitions 2, and plain): bitwise identical. 505 solver lib tests pass.
+- Decision: kept. Audits carry over.
+
+## 2026-10-15 — Condensed sync pass grouped by lane: rejected (thermal-ore)
+
+- Hypothesis: the condensed `sync` pass (copying each cone's scaling into its block) has the same one-job-per-block queue as the old scaling jobs (fix-a: 20200 jobs per update, 0.18 s per solve at T=10).
+- Change tried: group consecutive linear-cost blocks within a scaling lane into one job. PSD and ORE blocks stay alone. Results are bitwise identical.
+- E2E (Mac, ABBA against 5b310c2, bitwise identical):
+  - Profile: `sync` dropped from 0.176 to 0.015 s at T=10.
+  - Whole solve: fix-a partitions 1, T=10: −2.7% (6.92/6.97 → 6.74/6.78 s). T=2: −0.9%. Partitions 2, T=10: −0.5%. d6n640q: +0.9% (68.9/67.9 → 69.6/68.5 s).
+- Decision: rejected; only one configuration clears 2%. Patch saved as `lo12-sync-groups-rejected.patch`.
+
+## 2026-10-15 — Condensed cone scaling: one queue job per lane of linear-cost blocks (thermal-ore)
+
+- Observed (24a04a6, fix-a 256 owner, T=10):
+  - Over 103 solves, `prepare_rhs.scaling` took 0.71 s and `recover_rhs.scaling` 0.80 s (partitions 2: 0.92 and 0.93 s); the whole solve was 7.8 s.
+  - The work is two 256-bit divisions per row over 20200 one-row orthant blocks, about 3 ms serial per call; each call took 7–9 ms.
+  - `scaling_jobs` boxes one queue job per block, so 10 workers popped 20200 single-row closures through one mutex.
+- Change: `scaling_jobs` takes the existing scaling lanes.
+  - PSD and ORE blocks keep one job each, cost-ordered as before.
+  - Consecutive blocks of the other cones (orthant, zero, SOC, 3×3, generalized power) inside one lane share one job.
+  - Each block's arithmetic is unchanged, so results are bitwise identical.
+- E2E (Mac, fast profile), ABBA, every point bitwise identical to A:
+
+  | Case | A (24a04a6) s | B s | Change |
+  |---|---|---|---|
+  | fix-a 256, partitions 1, T=2 | 10.17 / 10.17 | 9.88 / 9.89 | −2.8% |
+  | fix-a 256, partitions 2, T=10 | 6.81 / 6.79 | 6.11 / 6.16 | −9.6% |
+  | d6n640q 128, partitions 1, T=10 | 68.91 / 69.18 | 67.95 / 66.81 | −2.4% |
+
+  - fix-a T=10 owner phases: prepare scaling 0.71 → 0.10 s, recover 0.80 → 0.11 s, residual scale 0.35 → 0.15 s.
+  - ising11 at 512 bits, T=4 (owner with partitions 2, and plain): bitwise identical. 505 solver lib tests pass.
+- Decision: kept. Audits carry over.
+
+## 2026-10-15 — Owner pair solve: interior back-substitution on the pool (thermal-ore)
+
+- Observed (9e4708f, d6n640q owner): about 8.6 s of the 55.6 s `kkt update` was the constant/affine pair solve. After the border solve, its interior back-substitution x −= R·y ran one serial loop per local: 16.8k rows × 640 exact terms per column. The single-column solve already split those rows over the owner pool (`border_rows`).
+- Change: the pair path uses the same `border_rows` closure under `for_blocks!`. Each row keeps its exact dot, so results are bitwise identical.
+- E2E (Mac, fast profile), ABBA, every point bitwise identical to A:
+
+  | Case | A (9e4708f) s | B s | Change |
+  |---|---|---|---|
+  | fix-a 256, partitions 1, T=2 | 10.49 / 10.53 | 10.15 / 10.21 | −3.1% |
+  | fix-a 256, partitions 2, T=10 | 7.36 / 7.32 | 6.79 / 6.85 | −7.1% |
+  | d6n640q 128, partitions 1, T=10 | 75.10 / 73.54 | 70.29 / 68.65 | −6.5% |
+
+- Decision: kept. Audits carry over from 9e4708f.
+
+## 2026-10-15 — Owner free-column border: one refinement round on the bordered system (thermal-ore)
+
+- Observed (Mac, 5da083c, d6n640q 128 owner, T=10):
+  - Every raw owner solve missed the refinement tolerance by about 1e5 (206 original corrections for 206 right-hand sides).
+  - Plain needed none on the same right-hand sides: first residual 2.5e-30 vs owner 4.3e-20 at ‖b‖ 7.7e4; on the constant column 3e-9 vs 8 at ‖b‖ 2e6.
+  - A row-split trace put the owner residual in the 640 equality rows (4e-20); x rows were at 1e-30.
+- Hypotheses:
+  - Refuted: interior back-substitution as D⁻¹b − R·y (cancelling where D⁻¹ is large). Computing x = D⁻¹(b − Cᵀy) as one exact dot lowered the x rows to 1e-45, but the equality rows stayed at 1e-19 (patch `lo9-backsub-and-dbg.patch`).
+  - Verified: the 3 free columns. The owner forms y = S⁻¹g + W·x_f with W = S⁻¹C_f, and S is nearly singular along C_f. On ordinary columns ‖S⁻¹g‖ is 1.6e9 and ‖W·x_f‖ is similar, but ‖y‖ is 3.5e-5, a 14-digit cancellation.
+  - Plain avoids this: its trunk factors the equality multipliers and the free variables as one signed LDL.
+  - Rejected: re-solving y = S⁻¹(g + C_f·x_f) once x_f is known. The equality rows became exact, but x_f carries G = C_fᵀW's error, which then shows in the free rows (first residual 1e-12; patch `lo9a-free-resolve-rejected.patch`).
+- Change (`distributed::kkt::FreeBorder::solve`):
+  - After the existing elimination, run one refinement round on the bordered system [S, −C_f; C_fᵀ, shift·I]·(y; x_f) = (g; h).
+  - The residual of each border row is one exact dot over g, the factored S (packed upper triangle) and C_f, run on the owner pool. The free rows use exact dots too.
+  - The correction reuses the factor: one border solve plus the 3×3 elimination. Its own cancellation scales with its small residual.
+  - Applies to single, pair and fused reduced solves. Inputs without free columns are untouched.
+- E2E (Mac, fast profile), ABBA, every run Solved:
+
+  | Case | A (5da083c) s | B s | Change |
+  |---|---|---|---|
+  | d6n640q 128, partitions 1, T=10 | 91.98 / 90.25 | 74.35 / 72.75 | −19.3% |
+  | fix-a 256, partitions 1, T=2 | 10.57 / 10.56 | 10.60 / 10.61 | +0.3% |
+  | fix-a 256, partitions 2, T=10 | 7.29 / 7.43 | 7.38 / 7.36 | +0.1% |
+
+  - d6n640q, traced:
+    - Raw first residuals 1.5e-30…3e-30 (constant column 6e-27), against tolerance 2.1e-29·‖b‖.
+    - Original corrections 206 → 1, interior solve batches 844 → 641.
+    - kkt solve 8.9 → 4.5 s, corrector solves 12.6 → 6.3 s; same 48 iterations.
+  - Audits at 384 bits, original coordinates, unchanged:
+    - fix-a points changed bitwise (both modes): primal rel 4.2e-19, dual rel 1.9e-18, gap rel 3.4e-19, same objective digits.
+    - d6n640q: 1.1e-26 / 3.0e-23 / 1.2e-20, objective equal in all 28 printed digits.
+  - ising11 owner (no free columns): points bitwise identical. 505 solver lib tests pass.
+- Decision: kept. fix-a's reduced solves never corrected, so it gains nothing; its +0.1–0.3% is within noise for the extra 640² product per solve.
+- Remaining d6n640q owner gap: 72–74 s vs plain 63–66 s. About 8.6 s of the 55.6 s `kkt update` is the const/affine pair solve, whose interior back-substitution loop is serial.
+
+## 2026-10-15 — Owner solves over a diagonal interior: refine at the original level only (thermal-ore)
+
+- Observed (Mac, 286bd31, d6n640q 128 owner, T=10):
+  - Owner 97.5 s vs plain 65.8 s at the same 48 iterations. `border_assemble` (39 s) matches plain's `arrow.local_schur` (41 s).
+  - The gap is in the solves: kkt solve 10.5 vs 3.5 s, corrector solves 14.4 vs 4.7 s.
+  - Sampling: exact dots over the dense border coupling C (640 × 16.8k) dominate the busy time outside the Gram:
+    - column-streamed C·x: 52k samples;
+    - transposed products: 20k;
+    - response corrections: 17k.
+  - Per right-hand side the owner ran:
+    - the raw reduced solve;
+    - a stationary reduced-level refinement (each round: Cᵀ·border, C·x, C·y and an interior solve);
+    - recovery;
+    - an original-level residual that always passed (206 residuals for 206 right-hand sides, no original correction).
+  - Total: about 6 C·x, 3 Cᵀ·y and 2 response products per right-hand side. Plain does about 2 + 2.
+  - On fix-a the reduced level never corrected (`SDPX_TRACE_TAU`: every refinement 0 corrections), so its round only repeated the original check.
+- Change (`distributed::kkt`):
+  - `diagonal_interior` is agreed once across ranks: every owner has a diagonal interior (the L-O4 path).
+  - When it holds, the solve is refined at the original level, and GMRES-IR is off, the reduced level is not refined. The raw reduced solve goes straight to recovery and the original-level refinement, whose true residual corrects the border factor's error with the same tolerances.
+  - Unrefined columns (L50), GMRES-IR and every non-diagonal interior (Ising PSD owners) keep the reduced refinement.
+- E2E (Mac, fast profile), ABBA, every run Solved:
+
+  | Case | A (286bd31) s | B s | Change |
+  |---|---|---|---|
+  | fix-a 256, partitions 1, T=2 | 13.75 / 13.65 | 10.44 / 10.52 | −23.6% |
+  | fix-a 256, partitions 2, T=10 | 8.77 / 8.90 | 7.32 / 7.30 | −17.3% |
+  | d6n640q 128, partitions 1, T=10 | 97.49 / 96.69 | 92.65 / 91.53 | −5.1% |
+
+  - fix-a points are bitwise identical to A in both modes (no reduced correction ever ran), so A's audits carry over.
+  - d6n640q:
+    - 213 reduced corrections became 206 original ones (one per right-hand side).
+    - Interior solve batches 1064 → 844. kkt solve 10.5 → 8.9 s, corrector solves 14.4 → 12.6 s.
+    - Audit at 384 bits, original coordinates: primal rel 1.1e-26, dual rel 3.0e-23, gap rel 1.2e-20, equal to A's to 15 digits; the objective agrees to all 28 printed digits.
+  - ising11 owner (512 bits, partitions 2, T=4): points are bitwise identical to A.
+  - 505 solver lib tests pass.
+- Decision: kept.
+- Remaining owner cost on d6n640q: 92 s vs plain 66 s. Each original correction re-runs prepare/recover and the full A·x + Aᵀz residual.
+
+## 2026-10-15 — Gondzio centrality correctors on the owner path (thermal-ore)
+
+- Observed (Mac, fast profile, after 91b0fac):
+  - The owner (distributed) path took more iterations than plain on the same LPs: fix-a 256 33 vs 25, d6n640q 128 66 vs 48.
+  - Plain runs up to two centrality correctors per iteration on orthant and second-order rows (`has_correctable`). `OwnedCones` kept the trait default (`false`), so the owner never corrected.
+- Change (`distributed::hsd_steps`):
+  - `OwnedCones::has_correctable` is true when any owner block has correctable rows (one collective flag).
+  - `OwnedVariables::centrality_correction` runs each owner block's cone correction on the pool, as `DefaultVariables` does.
+    - Border rows are equalities and keep their right-hand side.
+    - τκ is replicated, so every rank applies the same band correction to κ.
+    - Ranks agree on "changed" through one collective flag.
+  - The corrector loop in `core::solver` is unchanged.
+  - PSD rows above binary64 are not correctable (as in plain), so Ising inputs never enter the loop.
+- E2E (Mac, fast profile, fix-a 256 owner; d6n640q 128 owner at T=10, partitions 1), ABBA, every run Solved:
+
+  | Mode | A (91b0fac) s | B s | Iterations | Change |
+  |---|---|---|---|---|
+  | fix-a, partitions 1, T=2 | 14.31 / 14.27 | 13.64 / 13.67 | 33 → 25 | −4.4% |
+  | fix-a, partitions 2, T=10 | 9.67 / 9.90 | 8.78 / 8.87 | 33 → 25 | −9.8% |
+  | fix-a, partitions 1, T=10 | 11.24 | 10.30 | 33 → 25 | −8.3% |
+  | d6n640q, partitions 1, T=10 | 117.1 | 97.9 | 66 → 48 | −16.4% |
+
+  - Peak RSS is unchanged (1.26–1.41 GB on fix-a).
+  - Audit at 384 bits, original coordinates:
+    - fix-a B: primal rel 4.2e-19, dual rel 1.9e-18, gap rel 3.4e-19 (A: 1.7e-19, 7.5e-19, 6.8e-21). Plain's point audits to the same B values in every printed digit.
+    - d6n640q B: 1.1e-26, 3.0e-23, 1.2e-20 (A: 8.6e-25, 2.3e-21, 4.0e-20).
+  - ising11 owner (512 bits, partitions 2, T=4): points are bitwise identical to A.
+  - 505 solver lib tests pass; the `it` suite fails only the known `overshooting_start_still_solves`.
+- Decision: kept.
+- Remaining owner cost on d6n640q: 97.9 s vs plain 65.8 s at the same 48 iterations.
+
+## 2026-10-15 — Column-streamed exact forward products for long rows (thermal-ore)
+
+- Observed (Apple M4, 256 bits, 99 rows of 20202 entries):
+  - A wide exact forward row reads its values from CSC positions scattered across the whole matrix: 22 ns per term.
+  - The transposed product reads its values contiguously: 9.5 ns per term.
+  - On fix-a, the 99 dense border equality rows hold almost all of A's entries. Every A·x in the residuals, the KKT right-hand sides and the owner solves paid the scattered stride.
+- Change (`exactdot`, `sparse_parallel`):
+  - `dot_outputs_chunked` sums many exact dots in one pass over a stream of (output, a, b) terms.
+    - Each column chunk owns fixed-point accumulators per output.
+    - Chunks merge by limb addition, and each output is rounded once.
+    - The result is the serial exact sum. An output that declines (non-finite term or too-wide spread) falls back to the existing per-row branch.
+  - A forward product above 64 bits (with nnz ≥ 4m) streams its long rows column by column.
+    - A long row has at least 4096 entries.
+    - Long rows must hold at least half of A's entries.
+    - The pass uses 4 column chunks per lane.
+  - The other rows keep their lanes.
+  - Every output equals CSC gemv bitwise, including signed zeros and NaN fallbacks.
+- Thresholds (M4 sweep, 99 dense rows plus an identity block, streamed vs per row):
+
+  | Row length | Result at T = 1–8 |
+  |---|---|
+  | ≥ 4096 | 1.04–2.6× faster |
+  | 1024–2048 | up to 1.4× slower (rows still cache-resident) |
+
+  - Short rows taking 50% of nnz still left streaming ahead: 98 vs 120 ms.
+  - Four chunks per lane: −9…−10% at T = 8/10 on mixed P/E cores; T = 2/4 unchanged.
+- E2E (Mac, fast profile, fix-a 256): ABBA, every run Solved; points are bitwise identical to 3352eee in each mode.
+
+  | Mode | A s | B s | Change |
+  |---|---|---|---|
+  | Owner, partitions 1, T=2 | 22.24 / 22.23 | 14.38 / 14.58 | −34.9% |
+  | Owner, partitions 2, T=10 | 11.95 | 9.91 | −17.1% |
+  | Plain, T=2 | 8.45 / 8.46 | 7.82 / 7.84 | −7.4% |
+  | Plain, T=10 | 5.27 / 5.34 | 5.09 / 5.10 | −4.0% |
+
+  - Owner phases (T=2): kkt update 13.35 → 8.88 s, kkt solve 5.87 → 3.26, condensed residual 4.37 → 2.47.
+  - Plain: residual update 1.08 → 0.64 s.
+  - d6n640q 128 (plain, T=10, 640 rows of ~16.8k entries): 65.69 → 65.81 s. The points are bitwise identical. Residual update fell 2.68 → 1.70 s, inside the noise of `arrow.local_schur` (40 of 63 s).
+- Tests: chunked dots match the serial exact dot at 128/256/1024 bits for 1–2000 chunks. Long-row products match gemv at 1/2/4 threads, f64 and 256 bits. 505 solver lib tests pass; the `it` suite fails only the known `overshooting_start_still_solves`.
+- Decision: kept (bitwise; existing audits carry over).
+
+## 2026-10-15 — Owner recovery skips zero-cone rows (thermal-ore)
+
+- Observed (fix-a 256, owner path, partitions 1, T=2, after 7e7d781):
+  - `recover_rhs` took 3.47 s of 25.3 s.
+  - Each owner solve formed A·x on every row, including the 99 dense border equality rows (2M terms each).
+  - The owner then overwrote those rows with the border duals, so their products were never read.
+- Change (`condensed::mod`, `sparse_parallel`):
+  - A local kernel whose zero-cone rows hold entries lists the remaining rows once.
+  - The owner's `recover_interior_rhs` forms A·x only on those rows, on the pool, with the same per-row arithmetic.
+  - `solve_raw`, which reuses the forward product in its residual, keeps the full product.
+- E2E (Mac, fast profile, fix-a 256, T=2): ABBA, every run Solved in 33 iterations.
+
+  | Arm | Run 1 s | Run 2 s |
+  |---|---|---|
+  | A (7e7d781) | 25.31 | 25.22 |
+  | B | 22.23 | 22.75 (−11.0%) |
+
+  - Phases: recover_rhs 3.47 → 0.51 s; kkt update 15.3 → 13.3 s.
+  - Partitions 2: 19.0 → 17.2 s.
+  - Points are bitwise identical to A at partitions 1 and 2. 503 lib tests pass; the `it` suite fails only the known `overshooting_start_still_solves`.
+- Decision: kept.
+- Remaining owner cost (B, 22.5 s): the condensed `residual` takes 4.4 s; plain takes 8.5 s in total.
+
+## 2026-10-15 — Owner border over a diagonal interior: exact congruence (thermal-ore)
+
+- Observed (fix-a 256, owner path, partitions 1, T=2, after d3230d1):
+  - The local interior KKT is structurally diagonal: 20200 single-entry bound rows condensed, P = 0, two free columns with unit pivots.
+  - The border coupling is dense (99 × 20202).
+  - Per factorization the owner still:
+    - solved 99 coupling columns through the arrow backend (`many.rows`/`trsv`: 3.3–3.8 s, serial);
+    - formed C·R by an exact residue gemm with R fresh each time (`border_assemble` 11.3 s).
+  - The residues of R also drove peak RSS to 3.4–4.0 GB late in the solve.
+- Change (`distributed::kkt`, `direct::solver`):
+  - When the interior KKT stores only its diagonal (any factor then has L = I), the coupling is dense and precision > 64 bits, one solve of a ones vector gives the applied D⁻¹, and R = D⁻¹Cᵀ is a scaling on the pool.
+  - C·R becomes `diag_congruence_upper_exact(Cᵀ, D⁻¹)`: each entry is the exact Σ c·d⁻¹·c rounded once. Cᵀ's residues stay cached, as in plain's bound Gram.
+  - Free columns get weight zero.
+  - A declined congruence (spread too wide) falls back to the previous residue gemm on R.
+- E2E (Mac, fast profile, fix-a 256, T=2): ABBA, every run Solved in 33 iterations.
+
+  | Arm | Run 1 s | Run 2 s | Peak RSS MiB |
+  |---|---|---|---|
+  | A (d3230d1) | 39.33 | 39.31 | 3495 / 3702 |
+  | B | 25.27 | 25.25 (−35.8%) | 1264 / 1265 |
+
+  - Phases in B: border_assemble 11.3 → 2.1 s, factor_response 4.8 → 0.7 s, backend linear solves 3731 → 399.
+  - Partitions 2: 30.3 → 19.0 s (−37%), RSS 3277 → 1332 MiB.
+  - Audit at 384 bits, original coordinates: primal rel 1.7e-19, dual rel 7.5e-19, gap rel 6.8e-21 for A, for B and for B at partitions 2. Points differ from A by ≤ 3.4e-60 (x) and 1.6e-74 (z).
+  - Plain points are bitwise identical (e3b8a66f5aec), 8.72 s.
+  - Unit test: a two-equality bounded LP at 1, 2 and 8 owners, f64 (path off) and 256 bits (path on), stationary and GMRES. 503 lib tests pass. The `it` suite fails only the known `overshooting_start_still_solves`.
+- Decision: kept.
+- Remaining owner cost (B, 25.3 s): the condensed `residual` 4.4 s and `recover_rhs` 3.5 s are ~90% serial at T=2. Plain takes 8.5 s in total.
+
+## 2026-10-15 — Owner border: free columns join the border system (thermal-ore)
+
+- Observed (trace, fix-a 256, owner path, T=2):
+  - Two primal columns of the local block appear only in border equality rows and have no P entries, so their local diagonal is exactly zero.
+  - The first local factor fails, and escalation sets the shared shift to 1.08e-72 on every interior diagonal.
+  - The border Schur then carries C_f·C_fᵀ/shift ≈ 1e72 next to the O(1) rest. Its rounding error (~1e-5 relative to S_b) limits each reduced refinement step to about one digit.
+  - 34 original-level refinements hit the 10-correction cap: 1933 interior solve batches and 762 outer refinements in 33 iterations. Plain needs one solve per refinement call.
+- Change (`distributed::kkt`, `direct::solver`):
+  - A free column (no P entries; A entries only in border rows; checked isolated in the local KKT) is factored locally with pivot one (`set_unit_pivots`). Its response rows and interior solution are zero.
+  - The border solve eliminates it exactly from [S, −C_f; C_fᵀ, shift·I]: y0 = S⁻¹g, x_f = G⁻¹(r_f − C_fᵀy0), y = y0 + W·x_f, with W = S⁻¹C_f and G = shift·I + C_fᵀW (dense LU, nf ≤ border).
+  - C_f is gathered across ranks once. r_f rides in the existing reductions: an extra reduce only when free columns exist, plus a wider fused all-gather.
+  - In exact arithmetic this is the same regularized operator as before. Only the elimination order changes, and with no failure the shift stays 0.
+  - Plain solves and owner inputs without free columns run the old code.
+- E2E (Mac, fast profile, fix-a 256, partitions 1, T=2): ABBA, both arms Solved in 33 iterations.
+
+  | Arm | Run 1 s | Run 2 s | Outer refinements | Interior batches | Peak RSS MiB |
+  |---|---|---|---|---|---|
+  | A (76e1763) | 122.1 | 121.7 | 762 | 1933 | 2364 / 2366 |
+  | B | 39.06 | 39.02 (−68%) | 0 | 305 | 3445 / 4036 |
+
+  - Audit at 384 bits, original coordinates:
+    - B: primal rel 1.7e-19, dual rel 7.5e-19, gap rel 6.8e-21.
+    - A: 1.9e-19, 8.4e-19 and 7.7e-21.
+    - Objectives agree to 18 digits.
+  - Plain (no partitions): points bitwise identical (e3b8a66f5aec), 8.48 / 8.49 s.
+  - Unit tests: a two-free-variable problem at 1, 2 and 8 owners, f64 and 256 bits, stationary and GMRES, pair and single solves. 502 lib tests pass. The `it` suite fails only the known `overshooting_start_still_solves`.
+- Peak RSS: B is lower early (2.01 GB at 3 and 10 iterations vs A's 2.48 GB) but grows late (2.40 GB at 20, 2.79 GB at 28).
+  - Hypothesis: the border's exact residue product (`border_assemble`, now 11.3 s of 39) needs more primes as the bound diagonals spread. A's 1e72 rows sent it elsewhere.
+- Decision: kept. Next is the remaining owner cost on LPs: border_assemble 11.3 s and factor_response 4.8 s. A bound-only local kernel is diagonal, so C·D⁻¹·Cᵀ could use the bound Gram congruence that plain uses (0.07 s per factorization).
+
+## 2026-10-15 — Local condensed kernels: A's products on the pool (thermal-ore)
+
+- Observed (fix-a owner, 256 bits, T=2): the owner-local condensed kernel ran A·x and Aᵀ·z serially, in `recover_rhs`, the original-level `residual` and `prepare_rhs`.
+  - A `SparseParallel` plan existed only when an MPI world shards the product.
+  - The 99 dense border rows hold 2.0M of A's 2.02M entries. Each of the 237 solves paid about 110 ms of serial MPFR products while the second worker idled.
+- Change (`condensed`): a kernel with no world builds the plan when it first receives a pool of more than one thread (without a binary64 panel or a sampled operator). `sparse_gemv` and the residual then use `SparseParallel::product_local`.
+  - The plan keeps the CSC gemv arithmetic on each output, so the products are bitwise unchanged.
+- E2E: ABBA, fix-a 256, partitions 1, T=2 (Mac, fast profile). All four points are identical (41ea9caa5f5d).
+
+  | Arm | Run 1 s | Run 2 s | `residual` s | `recover_rhs` s | Peak RSS MiB |
+  |---|---|---|---|---|---|
+  | A (f38aec9) | 130.2 | 130.4 | 15.5 / 15.6 | 11.6 / 11.7 | 2383 / 2380 |
+  | B | 121.6 | 121.6 (−6.7%) | 10.5 / 10.4 | 8.3 / 8.3 | 2369 / 2364 |
+
+- Decision: kept. With more threads per rank the products split further. `recover_rhs` still evaluates the border rows, whose values no zero block reads.
+
+## 2026-10-15 — Bound Gram: shared per-prime sums instead of per-way copies (thermal-ore)
+
+- Observed (code): `diag_congruence` gave each way a private count × outputs residue copy and folded the copies serially after the products.
+  - For the full gravity border (t = 643, 31 primes) one copy is 51 MB. At 64 threads that is 3.3 GB, and the fold reads all of it on one thread.
+- Change (`rns_blas::diag_congruence`): ways claim (row block, prime) units from one counter. Each prime keeps one accumulator behind a lock.
+  - Residue sums are exact mod p, so neither the claiming order nor the split changes a bit.
+  - The way count is also capped by `way_work`, like the other residue kernels.
+- E2E: ABBA, quarter-size gravity LP, 128 bits, `SDPX_INT_GEMM=faer` (the Linux kernel), T=10 (Mac). All four points are identical.
+
+  | Arm | Run 1 s | Run 2 s | Mean s | `arrow.local_schur` s | Peak RSS MiB |
+  |---|---|---|---|---|---|
+  | A (f38aec9) | 80.4 | 81.2 | 80.8 | 57.8 / 58.7 | 4197 / 4115 |
+  | B | 78.3 | 79.2 | 78.8 (−2.6%) | 55.8 / 56.8 | 4125 / 3749 |
+
+- Rejected in the same ABBA: the owner pair solve's interior back-substitution on the pool (`border_rows`). fix-a 256 at T=2: 130.7 → 129.9 s (−0.6%), with bitwise-identical points.
+- Decision: kept (the Gram change). The memory saving grows with the thread count; it has not been measured on the cluster.
+
+## 2026-10-15 — Owner border assembly: one exact residue product per dense coupling (thermal-ore)
+
+- Observed (fix-a gravity LP, 99 dense equality rows × 20,202 columns, 256 bits, `--partitions 1 --threads 2`): the owner path's `owned.border_assemble` took 43.6 s of 158.6 s.
+  - Each of the 99·100/2 upper entries was its own wide row GEMV over 20,202 columns: an exact dot rounded once, which is correct but slow.
+- Change (`distributed/kkt.rs`): a local whose coupling stores every entry (`dense_coupling`: wide rows, nnz = border·n, column-major) forms its upper C·R with one `xgemm_upper_exact`.
+  - Each entry is the exact sum rounded once, as its wide GEMV row was, so the matrix is bitwise unchanged. Other locals keep the row GEMVs. Locals are still added in owner order.
+- E2E: release ABBA, fix-a 256, partitions 1, T=2 (Mac). All four points are identical (41ea9caa5f5d).
+
+  | Arm | Run 1 s | Run 2 s | Mean s | `owned.border_assemble` s |
+  |---|---|---|---|---|
+  | A (dd08399) | 159.1 | 158.1 | 158.6 | 43.8 / 43.5 |
+  | B | 128.7 | 128.0 | 128.3 (−19.1%) | 13.5 / 13.5 |
+
+- Bound-Gram release check (dd08399 against 0eb9a7d, half-size gravity LP, 128 bits, T=4): 219.2 → 196.8 s (−10.2%), `arrow.local_schur` 129.4 → 111.3 s. All four points are identical. This confirms the fast-profile ABBA below.
+- Decision: kept. The owner path is still about 16× slower than plain on this input (128 s vs 8.2 s). Its open costs are 33 vs 25 iterations, 237 vs 85 refinement solves and MPFR row products over the dense border rows in every solve.
+
+## 2026-10-15 — Bound Gram primes sized by the row block (thermal-ore)
+
+- Observed (quarter-size gravity LP, 16,780 columns, 128 bits): the bound-arrow border Gram (`arrow.local_schur`, the exact residue Yᵀdiag(d)Y) scales 1.12× from T=1 to T=4 (52.1 → 46.3 s). Every other phase scales 3.0–3.5×.
+  - The cause is Mac-specific. Accelerate's integer products run on the shared AMX unit. With `SDPX_INT_GEMM=faer` (the Linux default) the Gram scales 3.5× (254.8 → 72.1 s), but it is 5× slower per core. Points are identical on all four runs.
+- Observed (spread probe): the Gram needs 24 primes at the start and 31 at the end. 3P = 384 bits, 2·da = 78 bits (the A spread) and dd = 0 → 133 bits (the bound pivots' spread).
+  - The primes were sized for the whole k: 20 bits at 16,780 rows and 19 bits at 33,560 or more.
+  - Each integer product, however, sums one ≤4096-row block before its reduction. That block allows 21 bits.
+- Change (`rns_blas::diag_congruence`): `Plan::new(k.min(DIAG_BLOCK_ROWS), needed)`. The magnitude bound still uses the full k. It is exact, so the bits are unchanged, and the residue cache shrinks by the same share.
+  - A new unit case (k = 9000) checks the exactly rounded result at the wider primes.
+- E2E: ABBA, half-size gravity LP (33,563 columns), 128 bits, T=4 (Mac). All four points are identical.
+
+  | Arm | Run 1 s | Run 2 s | Mean s | `arrow.local_schur` s |
+  |---|---|---|---|---|
+  | A (0eb9a7d) | 244.7 | 246.8 | 245.8 | 140.6 / 139.4 |
+  | B | 226.5 | 210.2 | 218.4 (−11.2%) | 124.6 / 116.5 |
+
+- Decision: kept.
+
+## 2026-10-14 — Gravity LP: bound-arrow memory gate as the generic arrow's (thermal-ore)
+
+- Observed: the user's restricted fixed-a LP (gravity_sampling_prl, D6 N640 J1792, whitened) has 640 dense equality rows and 67,120 bounded plus 3 free columns: 43M nonzeros at 128 bits. It never reached `local_bounds` and fell to serial QDLDL on the 134,883-row KKT (`eligible=false`, no `LOCAL_BOUNDS` line).
+  - The gate charged two n×t MPFR panels (2·67,120·643·32 B = 2.8 GB) against 512 MiB + nnz(K) bytes, so it refused every MPFR LP above about n·t·S = 512 MiB.
+  - QDLDL's factor of a dense coupling holds the same n·t entries, plus a serial MPFR elimination. On the half-size instance (every second active column, 33,560 columns, 21.6M nonzeros), one 128-bit QDLDL factorization took 330 s (Mac, T=4).
+- Change: `try_local_bounds` uses the generic arrow's ceiling, max(512 MiB, 8 × stored KKT bytes), which already admits dense couplings because "a dense border coupling fills QDLDL's factor just as much".
+- E2E (Mac, 128 bits, T=4; the audit is an independent 384-bit gmpy2 check of A x + s = b, Aᵀz + q = 0, the cones and the gap, all relative):
+
+  | Instance | Before | After | Audit (primal / dual / gap) |
+  |---|---|---|---|
+  | half-size (33,563 columns) | QDLDL, 330 s per factorization | Solved, 57 it, 267.6 s, 5.8 GB RSS | 1.3e-25 / 7.4e-22 / 1.6e-20 |
+  | full (67,123 columns) | QDLDL (not run) | Solved, 67 it, 1381 s; the Mac swaps at 7.6 GB RSS | 2.7e-25 / 3.2e-21 / 3.5e-20 |
+
+  - The tolerance is 7.7e-20.
+  - Inputs the old gate already admitted are bitwise unchanged: fix-a Float64, fix-a 256 and gravity-small-256.
+- Observed (half-size profile): the residue border Gram `arrow.local_schur` takes 141.6 of 261 s; refinement 53.7; residual update 27.8; final step length 19.9.
+- Observed: the owner (MPI) path is not usable for this LP shape yet. On fix-a 256 (T=2) it takes 166 s with one partition and 226 s with two, against 6–16 s plain.
+  - The border assembly is a rounded MPFR FMA chain per entry (45 s, about t²n/2 products per factorization).
+  - The pair solves and their refinements take about 70 s; the plain path has 25 iterations against 33.
+- Decision: kept. Next: residue products in the owner border assembly (multi-node LP), then the plain path's serial phases.
+
+## 2026-10-14 — ORE combined shift: paired products and the scaling's oracle (thermal-ore)
+
+- Hypothesis: after `e88f6df`, the combined right-hand side took 0.33 s of 3.25 s on two_L6/256 at T=4, against 0.51 s at T=1.
+  - A probe put the n = 8 ORE cone's shift at 0.319 s (3.0 ms per iteration), the phase's critical path. The other cones' shifts finish on other lanes.
+  - Each shift ran, serially: three Hs products (Hs z, μHs Δz, Hs v); the oracle at s for ‖Δs‖ₛ; and two oracles at s ± tΔs with their Hessian products.
+  - Summed over the five ORE cones at T=1: oracles 0.176 s, Hessian products 0.137 s, Hs products ≈ 0.125 s.
+  - `update_scaling` already builds the oracle at the same s, with g⁽²⁾, and drops it.
+- Change:
+  - Hs z, μHs Δz and the difference points run as `rayon::join` pairs under the paired gate (serial otherwise), and so do the two Hessian products. Each value keeps its arithmetic and accumulation order.
+  - The cone keeps the scaling's oracle at s for the corrector's ∇²f(s)Δs.
+  - `mul_Hs` keeps its body as `hs_prod(&self)`.
+- Probe (fast profile): combined rhs at T=4 0.330 → 0.236 s (pairs) → 0.187 s (pairs plus oracle reuse); T=1 0.503 → 0.437 s.
+- E2E (Mac release, A = `e88f6df`, B = candidate, ABBA A B B A, solve s):
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | two_L6/256 | 4 | 3.17 / 3.13 | 3.04 / 2.99 | −4.1% |
+  | two_L6/128 | 4 | 1.54 / 1.51 | 1.46 / 1.48 | −3.6% |
+  | two_L6/256 | 1 | 6.36 / 6.36 | 6.31 / 6.30 | −0.9% |
+  | two_L6/128 | 1 | 3.01 / 3.00 | 2.98 / 2.98 | −0.8% |
+
+- Points: bitwise equal to A at T=1 and T=4, so A's audits carry over. The ORE unit tests pass (9).
+- Decision: kept.
+
+## 2026-10-14 — ORE affine step searches on the idle pool (thermal-ore)
+
+- Hypothesis: on two_L6/256 at T=4 after `71a247c`, step lengths took 1.20 of 3.53 s and barely scaled from T=1 (1.33 s).
+  - A trial trace of the n = 8 ORE cone showed 311 of its 329 failed dual trials in affine searches.
+  - Inputs with PSD cones take the affine search through `prepare_affine_bounds`, which called the ORE `step_length` outside any pool. So `rayon::current_thread_index()` was None, and the batched trials below αs ran one at a time.
+  - The final search (`step_length`) already installs the idle pool.
+- Change: `prepare_affine_bounds` runs ORE cones on the idle pool with the inner-parallel guard, as `step_length` does. T=1 and inputs without ORE cones are unchanged.
+- Probe (fast profile, T=4): affine step length 0.790 → 0.524 s; final step length unchanged (0.405 s).
+- E2E (Mac release, A = `71a247c`, B = candidate, ABBA A B B A, solve s):
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | two_L6/256 | 4 | 3.42 / 3.39 | 3.12 / 3.11 | −8.4% |
+  | two_L6/128 | 4 | 1.62 / 1.61 | 1.52 / 1.51 | −6.2% |
+  | two_L6/256 | 8 | 3.52 / 3.54 | 3.28 / 3.28 | −6.9% |
+  | two_L6/128 | 8 | 1.67 / 1.68 | 1.58 / 1.59 | −5.4% |
+
+- Points: bitwise equal to A at T=4 and T=8, so A's audits carry over (the batch takes the first passing trial in chain order). two_L4/256 and two_L4/128 are Solved 85 and 46 with identical points.
+- Decision: kept.
+
+## 2026-10-14 — MPFR arrow orientation by dense work: K's or −K's arrow (thermal-ore)
+
+- Hypothesis: on two_L6, the MPFR auto backend took K's arrow whenever it was eligible. That arrow has one leaf (81 primal columns) and a border of 186 ORE rows.
+  - At T=1 (256 bits), refactor took 2.52 of 8.6 s: border factor 1.15 s, contributions 0.63 s, leaves 0.73 s.
+  - −K's arrow has five ORE leaves (30, 108, 30, 9, 9) around an 81-column border. Its dense work estimate (Σg³ + n₊t² + t³, the eligibility model) is 3.1M against 9.8M.
+  - two_L8, one_L12 and the synthetic input already took −K's arrow, because K's is ineligible there.
+- Probe (fast profile, −K forced): two_L6/256 Solved 105 in 6.29 s against 8.64 s. Refactor 2.52 → 0.43 s; border factor 1.15 → 0.12 s. two_L6/128 Solved 71 (72 before).
+- Change: `ArrowLDLSolver::work` returns the eligibility model's dense work. MPFR auto takes −K's arrow first when it is eligible with less work, otherwise K's then −K's as before.
+  - two_L4 (−K ineligible) and ising11 (K: 11 leaves of 24–31, border 20) keep their arrows.
+  - csdr3 takes `local_soc_arrow` before this choice.
+- E2E (Mac release, A = `081ec70`, B = candidate, ABBA A B B A, solve s):
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | two_L6/256 | 1 | 8.80 / 8.74 | 6.33 / 6.31 | −28.0% |
+  | two_L6/128 | 1 | 3.98 / 4.01 | 3.00 / 3.01 | −24.9% |
+  | two_L6/256 | 4 | 4.35 / 4.37 | 3.46 / 3.45 | −20.8% |
+  | two_L6/128 | 4 | 2.06 / 2.07 | 1.61 / 1.61 | −22.0% |
+
+- Audits: two_L6/256 Solved 105 (dual 4.5e-43, gap 3.0e-44); two_L6/128 Solved 71 (dual 1.4e-24, gap 2.9e-24). ising11 Solved 54, audit PASS, residuals as before.
+- Decision: kept.
+
+## 2026-10-14 — Wide PSD Schur columns: support-restricted congruence, lazy entries, measured sparse/dense rule (thermal-ore)
+
+- Hypothesis: profiling two_L6/256 at T=1 put the PSD Schur assembly at 21% of the main thread.
+  - `sparse_schur_value` took 59% of it and `pooled_gemm_sym` 20%.
+  - The sparse/dense column rule priced a dense column as 2n³ multiply-adds, but `Ginv·A_b` is nonzero only in A_b's index support r.
+- Probe (n = 26, both precisions):
+  - A sparse pair term costs ≈ 108 ns at 256 bits and 74 ns at 128.
+  - An exact-dot term costs ≈ 14 ns at 256 bits and 9 ns at 128.
+  - Per solve, the current flags cost 1913 ms. Dense everywhere (restricted) would cost 1537 ms; the best per-column choice, 1326 ms.
+- Change (`condensed/psd.rs`, above 64 bits only):
+  - The dense congruence sums over A's support: n²r terms instead of n³. A residue product is used when `residue_product_applies(n, n, r)`.
+  - Without the residue product, each packed entry a left column reads is one exact dot, computed when it is first read.
+  - Sums are exact, so both are bitwise equal to the old full product. Verified: with the old rule, points are unchanged (cb9b2b3cc43d, d20b1a5d4d6c).
+  - The rule prices a dense column as reads·(5 + r) + n·expanded + prefix in dot terms, where reads = distinct packed entries read so far, and a sparse term as 8. `configure_sparse_columns` uses the same model.
+  - Sparse columns: two_L6 57 → 9 of 75, two_L8 526 → 26 of 663, one_L12 121 → 10 of 320.
+  - Re-flagged columns change summation order, so these points change bits.
+- Receipts (T=1): assemble 1.974 → 1.149 s (two_L6/256) and 0.886 → 0.528 s (two_L6/128). Other phases unchanged.
+- E2E (Mac release, A = `6564ae3`, B = candidate, ABBA A B B A, solve s):
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | two_L6/256 | 1 | 9.72 / 9.95 | 8.82 / 8.92 | −9.8% |
+  | two_L6/128 | 1 | 4.32 / 4.36 | 4.01 / 3.98 | −7.8% |
+  | two_L6/256 | 4 | 4.89 / 4.82 | 4.44 / 4.46 | −8.4% |
+  | two_L6/128 | 4 | 2.30 / 2.37 | 2.13 / 2.26 | −6.1% |
+  | one_L12/128, 4 it | 4 | 26.65 / 24.93 | 24.90 / 24.69 | −3.9% |
+  | two_L4/256, two_L4/128 | 1 | 0.254 / 0.101 | 0.254 / 0.101 | 0% |
+  | synthetic n=20/128 (ORE only) | 4 | 15.69 / 16.84 | 15.94 / 17.27 | noise; bitwise equal |
+
+- Audits: every solve passes.
+  - two_L6/256 Solved 105 it (as A); two_L6/128 Solved 72 (A 71); two_L4/256 85 and two_L4/128 46 (as A).
+  - ising11 (512-bit E2E case) Solved 54, audit PASS, residuals equal to A's in every digit. Its point hash differs between two runs of the same binary, so hashes cannot compare it.
+- Decision: kept.
+
+## 2026-10-14 — ORE dual step tests: CG budget by measured cost, one open test forgiven per iteration (thermal-ore)
+
+- Hypothesis: on two_L6/256 at T=4, dual step tests still take 20% of the main thread, nearly all in S₀ factors. A probe counted, T=1:
+  - 1151 of 1674 tests factored with a zero budget; CG decided only 4.
+  - The budget counter `cg` only reset on a CG decision. After one or two open tests at budget 1–3 it reached 0 for good.
+  - two_L4/256 behaved the same way: 394 factors.
+  - The budget model also counted the factor as (2m)³/6 multiply-adds only.
+- Measured factor/step cost (Mac fast profile, 128 and 256 bits alike): 1.7, 3.7, 7.4, 10.5 and 17 at n = 2, 4, 8, 12 and 20.
+  - The model gave budgets of 1, 1, 3, 1 and 6.
+  - Building S₀'s 2m unit columns costs ≈ 24n² each, the same order as the Cholesky step below n ≈ 40.
+- Change:
+  - Factor cost = (2m)³/per + 24·2m·n². Budgets are now 2, 4, 9, 9 and 17 at those n, and 55 at n = 42.
+  - `update_scaling` forgives one open test (`cg -= 1`). The new S₀⁻¹ preconditions the next searches, and a cone where CG keeps failing retries with a short budget.
+  - A full reset per iteration (cg1) was within noise of this rule (cg2).
+- Probe after the change, two_L6/256 T=1: n=8 factors 473 → 38, decided mostly at the first S₀⁻¹ step. n=2 tests still mostly factor; their factor is about 18 µs.
+- E2E (Mac release, A = `b357ef6`, B = candidate, ABBA A B B A, solve s). Every B point is bitwise A's; two_L4/128 Solved 46:
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | two_L6/256 | 4 | 5.09 / 5.02 | 4.66 / 4.61 (cg1) | −8.3% |
+  | two_L6/256 | 1 | 10.06 / 10.11 | 9.60 / 9.68 | −4.5% |
+  | two_L6/128 | 1 | 4.57 / 4.61 | 4.50 / 4.49 | −2.0% |
+  | two_L6/128 | 1 | 4.52 / 4.53 | 4.28 / 4.29 (cg1) | −5.3% |
+  | two_L4/256 | 1 | 0.270 / 0.251 | 0.255 / 0.253 | −2.4% |
+  | synthetic n=20/128 | 4 | 15.33 / 15.50 | 15.28 / 15.47 | −0.2% |
+  | one_L12/128, 4 it | 4 | 25.59 / 26.29 | 24.83 / 25.66 (cg1) | −1.5% |
+
+  cg1 against cg2: T=1 two_L6/128 −1.8%; T=4 two_L6/256 0.0%, two_L4/256 −3.3%, two_L6/128 +0.9%. With cg1, two_L4/256 was +4% at T=1 (n=2 CG every iteration).
+- Decision: kept (cg2).
+
+## 2026-10-14 — ORE S₀ assembly in parallel pieces; two_L8 at 128 bits (thermal-ore)
+
+- Hypothesis: `schur_factor` builds S₀'s 2m columns one after another (one unit `schur_apply` each). That is about 37% of a factor in the synthetic T=4 sample. It runs in every `update_scaling` and in every step-test factor. Columns are independent.
+- Change: the columns are built in n + 1 pieces of n columns through `pieces` (board or pool, granted by work), each piece with its own scratch. Each column's arithmetic is unchanged.
+- E2E (Mac release, A = `27c0736`, B = candidate, ABBA A B B A, solve s). Every B point is bitwise A's:
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | synthetic n=20/128 | 4 | 16.27 / 16.49 | 15.39 / 15.36 | −6.2% |
+  | one_L12/128, 4 it | 4 | 25.90 / 25.75 | 25.02 / 25.31 | −2.6% |
+  | two_L6/256 | 4 | 5.10 / 5.09 | 5.03 / 4.99 | −1.7% |
+  | two_L6/256 | 1 | 9.99 / 10.38 | 10.07 / 10.06 | −1.2% |
+
+- Decision: kept.
+- Observed, larger input: two_L8/128 (S₀ up to order 702, 669 variables, 13803 rows, T=8, `27c0736`) ends MaxIterations at 400 iterations (884 s). By iteration 75 the gap stalls near 6e-8 with residuals at 1e-16. τ-chase restarts at 77 and 182, then an InsufficientProgress restart at 290. It stays a failure; the stall resembles one_L12's non-attained optimum (unverified).
+
+## 2026-10-14 — ORE dual step tests: CG preconditioned by the current S₀⁻¹ (thermal-ore)
+
+- Hypothesis: the dual step tests left by B-preconditioned CG fall back to an S₀ factor at every trial point. On the synthetic n=20/128 input at T=4, that is 285 factors in 50 iterations, and step searches take 34% of wall. The current iterate's S₀⁻¹ is already explicit (`update_scaling`). Carried into a trial point's eigen coordinates by N = QᵀP₀, it should fit trial points far better than B = diag(1, λᵢλⱼ), which is exact only on the central path.
+- Probe (release, T=1, off the solve path): PCG on S₀ preconditioned by the transported S₀⁻¹ vs by B, up to 60 steps, against the exact factor:
+  - synthetic n=20: transported S₀⁻¹ decided all 230 non-trivial tests within 4 steps (54 / 90 / 84 / 2 at 1 / 2 / 3 / 4 steps); B left 177 open;
+  - two_L6/128 (n ≤ 8): 1–2 steps for most, against 3–5 with B;
+  - one_L12/128, first 4 iterations (n = 42): B decided 20 of 27 in one step; the transported S₀⁻¹ needed 2–4.
+  - Every decided test matched the exact factor.
+- Change: `Oracle::dual_ok` takes the cone's (P₀, S₀⁻¹).
+  - The first CG step keeps B. If that step leaves the test open, CG starts over from zero on the transported S₀⁻¹ (4 congruences and one exact-dot S₀⁻¹ product per step).
+  - The step budget's cost model adds those: per step 26n³ + (2m)².
+  - The bounds and the factor fallback are unchanged: the decision is still the exact form's.
+- Variants (T=4 receipts):
+
+  | Variant | synthetic step search s | S₀ factors | one_L12 4 it step search s |
+  |---|---|---|---|
+  | A (B only) | 7.07 | 385 | 1.63 |
+  | transported S₀⁻¹ only | 2.58 | 181 | 2.93 |
+  | B step, then restart from B's x | 6.69 | 368 | 1.81 |
+  | B step, then start over from 0 (kept) | 2.62 | 181 | 2.03 |
+
+  - Restarting from B's x left tests open off the path. Each open test halved the next budget down to zero, so tests factored again.
+- E2E (Mac release, A = `5de255c`, B = candidate, ABBA A B B A, solve s). Every B point is bitwise A's:
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | synthetic n=20/128 | 4 | 20.93 / 20.81 | 16.66 / 16.37 | −20.8% |
+  | synthetic n=20/128 | 1 | 37.20 / 37.77 | 31.51 / 32.22 | −15.0% |
+  | one_L12/128, 4 it | 4 | 24.92 / 25.37 | 25.26 / 25.28 | +0.5% |
+  | two_L6/256 | 4 | 5.07 / 5.07 | 5.10 / 5.08 | +0.3% |
+  | two_L6/256 | 1 | 10.08 / 10.57 | 10.51 / 10.39 | +1.2% |
+  | two_L6/128 | 4 | 2.60 / 2.36 | 2.57 / 2.37 | −0.6% |
+
+  - two_L4/128 and /256 stay Solved (46 and 85 iterations).
+- Decision: kept. The synthetic input gains; the small inputs and one_L12's first iterations stay within noise.
+
+## 2026-10-14 — ORE KKT rows: column transform on the solver pool (thermal-ore)
+
+- Hypothesis: a macOS `sample` of the synthetic n=20/128 solve at T=4 (15 s, main thread) put 7.7% of wall in `congruence_parts`, called serially from `assemble_from_cones`. Each KKT update maps every A column touching the ORE rows by N⁻¹: three n×n congruences per column. The columns are independent.
+- Change: the column loop runs on the solver pool (`residual_pool`) when there is one. Each column's arithmetic is unchanged.
+- E2E (Mac release, A = `47955d2`, B = candidate, ABBA A B B A, T=4, solve s). Every B point is bitwise A's:
+
+  | Case | A | B | Change |
+  |---|---|---|---|
+  | two_L6/128 | 2.43 / 2.42 | 2.37 / 2.44 | −0.5% |
+  | two_L6/256 | 5.27 / 5.18 | 5.08 / 5.09 | −2.7% |
+  | synthetic n=20/128 | 22.73 / 22.77 | 20.87 / 20.90 | −8.1% |
+  | one_L12/128, 4 it | 27.42 / 27.30 | 26.11 / 25.86 | −5.1% |
+
+- The same sample, main thread at T=4: step-length searches 29%, arrow refactor 24% (leaves 13%, contributions 6%, border 5%), cone scaling 17%, combined RHS 7%, KKT solves 5%.
+- Decision: kept.
+
+## 2026-10-14 — Residue-batched arrow contributions at 128–256 bits (thermal-ore)
+
+- Hypothesis: arrow contributions (s −= YᵀD⁻¹Y per leaf) took the residue-batched path only above 256 bits. That gate predates `3050619`, which made 2- and 3-limb residue products profitable from 64³. Below the gate every entry was one exact dot. Both paths round each entry's exact sum once and subtract leaves in the same order, so values should not change.
+- Change:
+  - A new trait predicate, `residue_product_applies`, is true exactly when `xgemm_upper_exact` takes the residue kernel (`residue_product_profitable`).
+  - Leaf eligibility uses it in place of `precision_bits() > 256 && residue_blas_applies`.
+  - `residue_blas_applies` keeps the four-limb gate that its sampled-block callers pair with the quadratic forms.
+  - At four limbs and above the two predicates agree, so Ising at 768/1024 bits is unchanged.
+- E2E (Mac release, A = `d794900`, B = candidate, ABBA A B B A, solve s). Every B point is bitwise A's (x, s, z hashes):
+
+  | Case | T | A | B | Change |
+  |---|---|---|---|---|
+  | two_L4/256 | 1 | 0.255 / 0.253 | 0.271 / 0.253 | noise |
+  | two_L6/128 | 1 | 4.78 / 4.78 | 4.56 / 4.57 | −4.5% |
+  | two_L6/256 | 1 | 10.81 / 10.81 | 10.09 / 10.08 | −6.7% |
+  | synthetic n=20/128 | 1 | 41.4 / 44.7 | 37.4 / 37.4 | −13.1% |
+  | two_L6/128 | 4 | 2.49 / 2.54 | 2.52 / 2.54 | +0.5% |
+  | two_L6/256 | 4 | 5.29 / 5.29 | 5.27 / 5.27 | −0.4% |
+  | synthetic n=20/128 | 4 | 23.8 / 23.8 | 23.3 / 25.8 | +2.5% (one slow B) |
+  | one_L12/128, 4 it | 4 | 29.6 / 26.3 | 26.9 / 27.6 | −2.4% (noisy) |
+
+  - Contribution phase, wall / CPU:
+    - synthetic T=1: 6.16 s → about 2.4 s;
+    - synthetic T=4: 1.91 / 7.57 → 1.34 / 2.40 s. The residue product uses about 1.8 of 4 cores, the column dots almost 4.
+    - one_L12 T=4: 0.33 / 1.30 → 0.39 / 0.51 s.
+  - Peak RSS:
+    - two_L6/256: T=1 43 → 65 MB, T=4 64 → 181 MB;
+    - one_L12 T=4: 2.98 → 3.18 GB (+6.7%);
+    - synthetic T=4: 765 → 698 MB.
+- Decision: kept, for the single-thread gain and about 3× less contribution CPU, with bitwise-identical points. The multi-thread wall gain waits on a better split of a lone residue product.
+
+## 2026-10-14 — Arrow border factor by exact dots above 64 bits (thermal-ore)
+
+- Hypothesis: the arrow border factor (`factor_border`) still used scalar FMA chains (`factor_signed`) at every precision, while leaves above 64 bits already used exact dots (`factor_dots`, each entry one exact dot rounded once). The thermal borders are 105–250 rows. Serial microbenchmark on random SPD input, FMA vs dots:
+  - 128 bits: 3.7–4.0× faster with dots;
+  - 256 bits: 2.6–3.0×;
+  - 512 bits: 1.8×;
+  - 768 bits: 1.5×;
+  - 1024 bits: 1.2–1.25×.
+- The old split `factor_dots` (one Rayon split per column) lost to the FMA panels at 8 threads at 768 and 1024 bits. Example: 1024 bits n = 105, 10.1 ms vs 8.4 ms.
+- Change:
+  - Above 64 bits the border takes `factor_dots`, after the row envelope (`envelope`, shared with leaves).
+  - Split `factor_dots` now works in panels of `FACTOR_PANEL` pivots. The panel's own rows run serially, then the later rows take the panel's columns in parallel, one join per panel (rows per task: one grain of dot work). Every entry is the same dot as the serial form, so split equals serial bitwise; the parity test now covers the leaf form with mixed signs, clamped pivots and an envelope.
+  - 8-thread microbenchmark, FMA panels vs new dots, ms:
+
+    | bits | n = 105 | n = 170 | n = 250 |
+    |---|---|---|---|
+    | 128 | 2.07 / 1.41 | 4.96 / 2.53 | 13.3 / 5.96 |
+    | 256 | 2.22 / 1.50 | 6.94 / 3.90 | 18.8 / 9.32 |
+    | 512 | 4.1 / 3.1 | 13.8 / 9.5 | 37.0 / 25.5 |
+    | 768 | 6.01 / 4.76 | 19.8 / 15.4 | 55.4 / 42.7 |
+    | 1024 | 8.36 / 7.60 | 28.5 / 25.0 | 80.8 / 70.3 |
+
+  - Factors differ from the FMA form at rounding level, so the change is order-changing and gated on audits.
+- E2E (Mac release, A = `3050619`, B = candidate, ABBA A B B A, solve s):
+
+  | Case | T | A | B | Change | Iterations |
+  |---|---|---|---|---|---|
+  | two_L4/128 | 1 | 0.115 / 0.110 | 0.135 / 0.114 | noise (0.1 s) | 48 → 46 |
+  | two_L4/256 | 1 | 0.254 / 0.242 | 0.269 / 0.267 | +8.5% | 80 → 85 |
+  | two_L6/128 | 1 | 6.51 / 6.43 | 5.36 / 5.13 | −18.9% | 71 |
+  | two_L6/256 | 1 | 13.06 / 13.33 | 11.02 / 10.83 | −17.2% | 105 |
+  | synthetic n=20/128 | 1 | 58.3 / 57.9 | 42.4 / 42.9 | −26.6% | 50 |
+  | two_L6/128 | 4 | 2.76 / 2.81 | 2.40 / 2.41 | −13.6% | 71 |
+  | two_L6/256 | 4 | 6.08 / 6.09 | 5.28 / 5.48 | −11.6% | 105 |
+  | synthetic n=20/128 | 4 | 28.9 / 30.2 | 26.0 / 25.3 | −13.2% | 50 |
+  | one_L12/128, 4 it | 4 | 26.9 / 27.8 | 25.5 / 28.5 | −1.3% (noise) | 4 |
+  | Ising Λ11/768 | 1 | 13.41 / 13.69 | 13.55 / 13.52 | 0% | 54 |
+  | Ising Λ11/768 | 8 | 3.10 / 3.15 | 3.07 / 3.04 | −1.5% | 54 |
+
+  - Audits of the B points:
+    - two_L4/128, two_L4/256 (85 it), two_L6/128 and two_L6/256 pass the original-coordinate ORE audit;
+    - the synthetic input passes `synth/audit.py`;
+    - Ising Λ11 is accepted by `audit_point.jl` with the same objective as A; its point differs at rounding level.
+  - two_L4/256 takes five more iterations (0.25 s). That is a path change on the smallest input, not a slower factor.
+  - The Ising Λ11 border is 20 rows (7 vs 9 ms of 13 s). The Λ27/Λ35 borders (about 105–170 rows) at 64 threads are not measured: the cluster deploy is blocked (no new authority).
+- Decision: kept.
+
+## 2026-10-14 — Thermal ORE: residue products at 128/192 bits, recursive S₀ kernels, cheaper dual step tests (thermal-ore)
+
+- Hypotheses (one_L12f/128 receipts, n = 42, S₀ of order 1806):
+  - Two- and three-limb exact products ran as per-entry exact dots, because residue products were gated to N ≥ 4. Serial on the Mac, at exponent spreads 2^±4 to 2^±200, the residue product was 2.0–4.8× faster at 64³ and 6–22× faster at 512³.
+  - S₀'s Cholesky, L⁻¹ and L⁻ᵀL⁻¹ were all dots, so none of that work reached the residue products.
+  - Late dual step tests dominate. Each search's first trial ran the whole CG budget and then factored. About seven trials per late affine search fall below αs, each an S₀ factor, and they ran one after another.
+- Change:
+  - `residue_product_profitable`: 2- and 3-limb `gemm` and `xgemm_upper_exact` take residue products from k ≥ 64 and m·n ≥ 4096. Each entry is still the exact sum rounded once, so values are unchanged.
+  - ORE kernels above order 128 (`BASE`):
+    - Cholesky and L⁻¹ split in recursive halves with exact products between them.
+    - L⁻ᵀL⁻¹ is one exact symmetric product.
+    - Entries in the recursion are rounded twice (the Schur update, then the subtraction), so the order changes for cones with n ≥ 11 only.
+  - CG budget in `Oracle::dual_ok`:
+    - The divisor is 500 above order 128, because the factor's residue products are about 4.6× cheaper per multiply-add (one_L12f: factor 1.4 s, CG step 8.8 ms).
+    - The budget halves for each test CG left open since its last decision (`cg`, kept in the cone).
+    - A cached S₀ factor is used directly.
+  - Dual trials below αs run in batches as wide as the pool. The first that passes in order wins, which is the same α as the serial search. At one solver thread nothing is batched.
+  - Test fix: `dual_ok_matches_factor_near_threshold` asserted a CG decision for binary64 too, which factors without CG since `f7fb3a9`. The assertion now applies above 53 bits only.
+- Rejected inside the candidate: Γ from a precomputed g⁽²⁾·W table, two dots per entry. It gave two_L6/128 about −5%, but two_L4/256 became AlmostSolved at 96 iterations (Solved at 80 without it). Reverted.
+- E2E (Mac release, A = `519ae71`, B = candidate, ABBA, mean of two):
+
+  | Case | Threads | A s | B s | Change |
+  |---|---|---|---|---|
+  | two_L4/256 | 2 | 0.197 | 0.192 | −2.4% |
+  | two_L6/128 | 2 | 4.18 / 4.17 | 3.72 / 3.96 | −10.8% / −5.1% |
+  | two_L6/256 | 2 | 9.05 / 9.05 | 8.18 / 8.34 | −9.6% / −7.8% |
+  | one_L12/128, 4 it | 2 | 51.9 / 50.6 | 40.4 / 34.6 | −22.0% / −31.7% |
+  | synthetic, 50 it | 1 / 2 / 8 | 85.5 / 61.5 / 50.5 | 57.2 / 37.8 / 29.6 | −33% / −39% / −41% (single runs) |
+
+  - The two values per row are two ABBA rounds. The second round's B has the final edit, which carries the winning trial's CG count; its points are identical to the first round's B.
+  - The synthetic input is min tr T over the ORE cones n = 20 and 12 (S₀ of order 420 and 156), with X fixed, Y's diagonal fixed and its off-diagonal free. Its optimum is attained and interior.
+- Audits:
+  - two_L4/128, two_L4/256, two_L6/128 and two_L6/256 passed. Their points are bitwise equal to A (no ORE cone above n = 8).
+  - Synthetic/128, Solved at 50 iterations in both arms, objective 413.883239295756077117968:
+    - gap 2.8e-24, primal 1.4e-24, dual 1.3e-25;
+    - ORE margin −5.4e-23;
+    - exact ORE dual ratio 0.99596 (< 1), Hessian checks pass.
+    - B differs from A at about 1e-29 relative.
+- Memory (peak RSS):
+  - one_L12/128, 4 it: T=1 2.10 → 3.47 GB, T=8 2.60 → 3.44 GB.
+  - Synthetic: T=1 224 → 423 MB, T=8 241 → 766 MB.
+  - The growth is transient residue operands plus one oracle per batched trial. Pooled residue buffers stay capped.
+- Decision: kept.
+
+## 2026-10-14 — Thermal one_L8/128 stall: the optimum is not attained (diagnosis, thermal-ore)
+
+- Observed: one_L8/128 stalls at gap ≈ 9e-9 (MaxIterations 400, τ chases at 60 and 151). The audit passes the residuals but fails the gap (8.8e-9); the ORE dual ratio is 1.4e49 and x9 = x10 → −1.07e13.
+- Structure (verified on the input with exact rational coefficients):
+  - x25 has zero cost and enters only PSD21(20,20).
+  - e9 + e10 changes only PSD21 (16,20), (18,20) and (19,20). With that diagonal free, x9 + x10 is a zero-cost recession direction, which is the drift.
+  - A Sieve-SDP-style pass removes x25–x28, x30 and PSD21 row 20 (PSD21 → PSD16). Columns 9 and 10 then coincide up to sign.
+- Test: the sieved input plus a bound Y(9,9) ≤ M on the ORE10 cone (X(9,9) moves with it), cg1 binary, T=1:
+
+  | M | Status | Iterations | Objective |
+  |---|---|---|---|
+  | 10 | AlmostSolved (gap 1.8e-22) | 201 | 0.897454 |
+  | 1e3 | AlmostSolved | 193 | 0.897142 |
+  | 1e5 | InsufficientProgress | 219 | 0.896997 |
+  | none (sieved) | AlmostSolved | 400 | 0.896673 |
+  | none (original) | MaxIterations | 400 | 0.896623 |
+
+  The objective keeps falling as the top diagonal X(9,9) = Y(9,9) of the largest ORE cone grows. The infimum is approached only at infinity, so no bounded point reaches a 1e-23 gap. The 128-bit failure is a property of the model in its present truncation, not of solver speed or accuracy.
+- Hypothesis: one_L12 behaves the same way. The sieve finds the same kind of free top moment there (x75, x210), and one_L12f/128 stalls at gap ≈ 7e-10 from iteration 60.
+- Decision: no solver change. The one-matrix 128-bit inputs stay known failures. Model note: bound the top moments or ORE10 X/Y(9,9), or restate the one-matrix problem. two_L4/two_L6 are attained.
+
+## 2026-10-14 — Thermal ORE: leaf row envelope, board-posted ORE kernels, parallel wide Schur columns (thermal-ore)
+
+- Hypotheses (one_L12/128 receipts after `f7fb3a9`):
+  - The S₀⁻¹ rows of an ORE leaf start at column m (the T coupling is a structural zero), yet `factor_dots` ran every dot from column 0.
+  - At T=4, two ORE cones run as two scaling-queue jobs, and the idle helpers only help board posts. The ORE kernels' rayon pieces never reached them: `ore.schur_inverse` used about 1.3 cores.
+  - `assemble` ran each 128-bit dense PSD Schur column serially: one n³ congruence per column, with the pool unused. It took 13% of the T=4 time, with CPU ≈ wall.
+- Change:
+  - Leaves record each row's first nonzero column (`first`). Exact dots in `factor_dots` and `forward_suffix_rows` start at the row envelope. The skipped products are exact zeros, so values are unchanged.
+  - ORE Cholesky, L⁻¹ and L⁻ᵀL⁻¹ pieces post to the scaling board when one is offered (`pieces`). `cone_cost` ranks ORE cones by (2m)³/2.
+  - `compute_schur_packed` runs the wide dense Schur columns on the pool, one representative per task (`schur_column`). Each pair has one writer, so values are unchanged.
+- E2E (Mac release, one_L12/128, max 4 iterations, A = `f7fb3a9`, B = candidate, ABBA):
+
+  | Threads | A s | B s | Change |
+  |---|---|---|---|
+  | 1 | 88.7, 87.5 | 76.0, 75.9 | −13.6% |
+  | 4 | 49.0, 50.9 | 36.3, 36.3 | −27% |
+
+  Fast-profile T=4 phases: `ore.schur_inverse` 21.9 → 8.8 s, `arrow.leaves` 15.2 → 7.2 s, `assemble` 4.4 → 1.3 s.
+- Points: iterates identical to `f7fb3a9`:
+  - two_L4/128, two_L4/256, two_L6/128 and one_L10/53 at T=1;
+  - two_L6/128 and two_L4/256 at T=4;
+  - one_L12/128 (4 it) at T=4.
+
+  ising11/512 fast A/B: Solved 54, identical points, audits 2/2 each, −0.2%.
+- Decision: kept.
+
+## 2026-10-14 — Thermal ORE: negated arrow, binary64 inverses, split ORE kernels (thermal-ore)
+
+- Hypotheses (one_L12 receipts):
+  - Above 64 bits the condensed ORE KKT fell to sparse QDLDL. Its dense blocks are the negative-sign retained cone rows, which the arrow solver did not take as leaves.
+  - At 53 bits the S₀ inverses ran exact-dot loops where LAPACK is faster.
+  - At 128 bits the ORE step search dominated: the dual Dikin CG bracket and serial kernels.
+- Change (on `39d7026`):
+  - `ArrowLDLSolver::try_negated` (`Negated`): the arrow of −K. ORE row blocks become leaves and the primal variables the border; values and right-hand sides change sign exactly. Order: positive arrow, negated arrow, QDLDL.
+  - A failed arrow factor falls back to QDLDL in the caller's z-first ordering. QDLDL's own AMD took tiny primal pivots, and two_L4/128 stopped AlmostSolved. Hypatia's structured fallback suggested keeping the structured order.
+  - Leaves above 64 bits factor left-looking with one exact dot per entry (`factor_dots`), unless the ≥256-bit exact blocked factor applies.
+  - Binary64 ORE inverses use TRSM + SYRK.
+  - Dual Dikin test:
+    - rejects on t alone (q ≥ 0);
+    - leaves the CG bracket once the lower bound fails;
+    - skips CG at 53 bits (one_L12/53: 18.6 s without CG, 24.1 s with).
+  - ORE Cholesky/inverse columns split under the inner-parallel gate (one dot per entry, thread-invariant). The ORE step search runs on the idle solver pool.
+  - Receipt phases `ore.schur_cholesky` and `ore.schur_inverse`.
+- E2E (Mac release, T=1; A = v0.9.2 `39d7026`, B = candidate, order ABBA):
+
+  | Case | A s | B s | Change | Status/it |
+  |---|---|---|---|---|
+  | one_L12/53 | 98.6, 101.5 | 20.9, 20.7 | −79% | Solved 47 both |
+  | one_L12/128, max 4 it | 471.3, 460.2 | 101.0, 105.0 | −78% | MaxIterations (setting) |
+  | two_L6/128 | 6.58, 7.78 | 6.52, 8.19 | neutral | Solved 71 both, identical iterates |
+
+  The second two_L6 pair overlapped a build. Fast profile, one_L12/128 4 it, pre-batch tree (with CG) → candidate: T=1 177 → 101 s, T=4 168 → 67 s.
+- Audits (original coordinates + Arb dual cone), all passed:
+  - one_L12/53 Solved 47: primal 1.56e-10, dual 5.12e-7, gap 1.40e-9 (gate 1e-6).
+  - two_L4/128 Solved 48: primal 8.9e-27, dual 2.4e-23, gap 5.8e-26.
+  - two_L4/256 Solved 80: dual 1.35e-45.
+  - two_L6/128 Solved 71.
+  - ising11/512 fast ABBA vs v0.9.2: Solved 54 both, identical residuals, audits 2/2 each. B/A 0.922 is noise: arrow leaves take ≈0.4 s there.
+- Observed:
+  - two_L8/53 ends AlmostSolved at 64–66 it on both trees.
+  - two_L8/128 on v0.9.2: the gap stalls at ≈3e-8 (it 160–180, residuals ≈1e-22), then chase restarts diverge. Stopped at it 248 after 2 h 09 min.
+- Decision: kept.
+
 ## 2026-10-13 — Review repairs: exact arithmetic, SVD, ORE and MPI keepers
 
 - Correctness repairs:

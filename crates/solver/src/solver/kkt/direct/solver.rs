@@ -73,7 +73,11 @@ struct OreRows<T> {
 fn ore_pattern<T: FloatT>(
     A: &CscMatrix<T>,
     cones: &CompositeCone<T>,
-) -> Option<(CscMatrix<T>, Vec<usize>, Vec<(usize, std::ops::Range<usize>)>)> {
+) -> Option<(
+    CscMatrix<T>,
+    Vec<usize>,
+    Vec<(usize, std::ops::Range<usize>)>,
+)> {
     let blocks: Vec<_> = cones
         .iter()
         .enumerate()
@@ -106,7 +110,11 @@ fn ore_pattern<T: FloatT>(
         }
         colptr.push(rowval.len());
     }
-    Some((CscMatrix::new(A.m, A.n, colptr, rowval, nzval), index, blocks))
+    Some((
+        CscMatrix::new(A.m, A.n, colptr, rowval, nzval),
+        index,
+        blocks,
+    ))
 }
 
 pub struct DirectLDLKKTSolver<T> {
@@ -167,6 +175,9 @@ pub struct DirectLDLKKTSolver<T> {
     ore: Vec<OreRows<T>>,
     /// Position of each A entry in the KKT's A pattern (with `ore`).
     a_index: Vec<usize>,
+    /// Structurally isolated columns factored with pivot one in place of
+    /// their zero diagonal; the caller solves for them separately.
+    unit_pivots: Vec<usize>,
 }
 
 impl<T> DirectLDLKKTSolver<T>
@@ -202,7 +213,14 @@ where
                             pos.extend_from_slice(&map.A[p..p + rows.len()]);
                         }
                     }
-                    OreRows { cone: *cone, rows: rows.clone(), cols, a, pos, t: Default::default() }
+                    OreRows {
+                        cone: *cone,
+                        rows: rows.clone(),
+                        cols,
+                        a,
+                        pos,
+                        t: Default::default(),
+                    }
                 });
                 (rows.collect(), index.clone())
             }
@@ -248,8 +266,12 @@ where
             // tiny (one_matrix_L8 at 128 bits: x = 1e35 after one step);
             // z-first leaves −D per cone and then the SPD Schur AᵀHs⁻¹A.
             let (order, _, info) = crate::qdldl::get_amd_ordering(&KKT, 1.5);
-            let perm: Vec<usize> =
-                order.iter().filter(|&&k| k >= n).chain(order.iter().filter(|&&k| k < n)).copied().collect();
+            let perm: Vec<usize> = order
+                .iter()
+                .filter(|&&k| k >= n)
+                .chain(order.iter().filter(|&&k| k < n))
+                .copied()
+                .collect();
             let mut iperm = vec![0; perm.len()];
             perm.iter().enumerate().for_each(|(i, &k)| iperm[k] = i);
             let _ = amd.set((perm, iperm, info));
@@ -313,6 +335,7 @@ where
             residual_pool: None,
             ore,
             a_index,
+            unit_pivots: Vec::new(),
         }
     }
 }
@@ -540,12 +563,22 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
         _update_values(&mut self.ldlsolver, &mut self.KKT, index, values);
 
         for o in &mut self.ore {
+            use rayon::prelude::*;
             if let Some(SupportedCone::OpRelEntropyCone(c)) = cones.clone().nth(o.cone) {
                 o.t.clone_from(c.rows());
             }
             let mut values = o.a.clone();
-            for column in values.chunks_exact_mut(o.rows.len()) {
-                o.t.to_eigen(column);
+            let (t, rows) = (&o.t, o.rows.len());
+            // Columns are independent: the solver pool keeps their bits.
+            match self.residual_pool.as_deref() {
+                Some(pool) => pool.install(|| {
+                    values
+                        .par_chunks_exact_mut(rows)
+                        .for_each(|column| t.to_eigen(column))
+                }),
+                None => values
+                    .chunks_exact_mut(rows)
+                    .for_each(|column| t.to_eigen(column)),
             }
             _update_values(&mut self.ldlsolver, &mut self.KKT, &o.pos, &values);
         }
@@ -575,6 +608,12 @@ where
             .iter()
             .map(|&idx| self.KKT.nzval[idx].abs())
             .fold(T::zero(), T::max)
+    }
+
+    /// Whether the KKT stores only its diagonal, so every factor has L = I.
+    pub(crate) fn structurally_diagonal(&self) -> bool {
+        self.ore.is_empty()
+            && (0..self.KKT.n).all(|j| self.KKT.colptr[j + 1] == j + 1 && self.KKT.rowval[j] == j)
     }
 
     /// Dimension of the complete local KKT, including sparse-cone auxiliaries.
@@ -643,9 +682,22 @@ where
                     diag_shifted[k] = diag_kkt[k];
                 }
             }
+            for &k in &self.unit_pivots {
+                diag_shifted[k] = T::one();
+            }
 
             _update_values(&mut self.ldlsolver, KKT, &map.diag_full, diag_shifted);
             self.diagonal_regularizer = eps;
+            true
+        } else if !self.unit_pivots.is_empty() {
+            for (d, idx) in zip(&mut *diag_kkt, &map.diag_full) {
+                *d = KKT.nzval[*idx];
+            }
+            diag_shifted.copy_from(diag_kkt);
+            for &k in &self.unit_pivots {
+                diag_shifted[k] = T::one();
+            }
+            _update_values(&mut self.ldlsolver, KKT, &map.diag_full, diag_shifted);
             true
         } else {
             false
@@ -789,6 +841,30 @@ where
 
     fn regularize_and_refactor(&mut self, settings: &CoreSettings<T>) -> bool {
         self.factor_with_shift(settings, None)
+    }
+
+    /// Whether each of `columns` stores only its diagonal and appears in no
+    /// other column of the KKT pattern.
+    pub(crate) fn isolated_columns(&self, columns: &[usize]) -> bool {
+        let mut selected = vec![false; self.KKT.n];
+        for &k in columns {
+            if k >= self.KKT.n {
+                return false;
+            }
+            selected[k] = true;
+        }
+        (0..self.KKT.n).all(|j| {
+            self.KKT.rowval[self.KKT.colptr[j]..self.KKT.colptr[j + 1]]
+                .iter()
+                .all(|&r| r == j || !(selected[j] || selected[r]))
+        })
+    }
+
+    /// Factor `columns` with pivot one.  Each must be structurally isolated
+    /// in the KKT (only its diagonal stored) with a zero true diagonal, so the
+    /// factor leaves every other column unchanged; residuals keep the zero.
+    pub(crate) fn set_unit_pivots(&mut self, columns: Vec<usize>) {
+        self.unit_pivots = columns;
     }
 
     /// Forward the solver thread pool to the LDL factorisation kernels that

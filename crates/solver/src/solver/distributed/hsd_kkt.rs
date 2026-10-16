@@ -524,7 +524,10 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
             l.s.axpby(-T::one(), &offset[i].s, -T::one());
             // As in the plain path, ORE slacks come from linear feasibility:
             // ill-conditioned Hs times the recovered dual loses this row.
-            if cone.iter().any(|c| matches!(c, SupportedCone::OpRelEntropyCone(_))) {
+            if cone
+                .iter()
+                .any(|c| matches!(c, SupportedCone::OpRelEntropyCone(_)))
+            {
                 work.z.waxpby(-T::one(), &rhs.blocks[i].z, dtau, &d.b);
                 d.A.gemv(&mut work.z, &l.x, -T::one(), T::one());
                 for (c, rows) in cone.iter().zip(&cone.rng_cones) {

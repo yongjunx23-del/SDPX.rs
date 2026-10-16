@@ -746,6 +746,32 @@ fn support_product<T: FloatT>(
     }
 }
 
+/// Packed entries of `column` not read by an earlier column.
+fn newly_read(read: &mut [bool], column: &Column) -> u128 {
+    column
+        .entries
+        .iter()
+        .map(|e| !std::mem::replace(&mut read[triangular_number(e.j) + e.i], true) as u128)
+        .sum()
+}
+
+/// Wide-precision work of a dense Schur column in exact-dot terms: the AXPYs
+/// of `Ginv·A`, one exact dot over A's index support for each of the `reads`
+/// packed entries the left columns read (setup and packing ≈ 5 terms), and
+/// the left dots. A sparse pair term costs ≈ 8. Measured on two_L6 (n = 26):
+/// a dot term ≈ 14 ns at 256 bits, 9 ns at 128; a sparse pair term 108, 74 ns.
+fn wide_dense_work(n: usize, column: &Column, reads: u128, prefix_entries: u128) -> u128 {
+    let mut support: Vec<_> = column.entries.iter().flat_map(|e| [e.i, e.j]).collect();
+    support.sort_unstable();
+    support.dedup();
+    let expanded: u128 = column
+        .entries
+        .iter()
+        .map(|e| if e.i == e.j { 1 } else { 2 })
+        .sum();
+    reads * (5 + support.len() as u128) + n as u128 * expanded + prefix_entries
+}
+
 // Per-call panels of one block. Every call writes them before reading, so a
 // worker thread shares one set across the blocks it serves.
 struct BlockWork<T> {
@@ -754,6 +780,13 @@ struct BlockWork<T> {
     mat2: Matrix<T>,
     mat3: Matrix<T>,
     vector: Vec<T>,
+    // Wide dense Schur columns: A's index support, its residue-product
+    // operands, and which packed entries the current column has evaluated.
+    support: Vec<usize>,
+    panel: Matrix<T>,
+    rows: Matrix<T>,
+    stamp: Vec<u64>,
+    generation: u64,
 }
 
 fn with_block_work<T: FloatT, R>(n: usize, f: impl FnOnce(&mut BlockWork<T>) -> R) -> R {
@@ -765,6 +798,11 @@ fn with_block_work<T: FloatT, R>(n: usize, f: impl FnOnce(&mut BlockWork<T>) -> 
                 mat2: Matrix::zeros((n, n)),
                 mat3: Matrix::zeros((n, n)),
                 vector: Vec::new(),
+                support: Vec::new(),
+                panel: Matrix::zeros((0, 0)),
+                rows: Matrix::zeros((0, 0)),
+                stamp: Vec::new(),
+                generation: 0,
             });
         }
         f(slot.as_mut().unwrap())
@@ -823,20 +861,25 @@ impl<T: FloatT> PsdBlock<T> {
         // more triangular dot products, reducing total dot work (MOSEK ISMP 2012).
         columns.sort_by_key(|c| c.entries.len());
         let mut prefix_entries = 0u128;
+        let mut read = vec![
+            false;
+            if T::precision_bits() <= 53 {
+                0
+            } else {
+                rows_len
+            }
+        ];
+        let mut reads = 0u128;
         for column in columns.iter_mut().filter(|_| generic) {
             prefix_entries += column.entries.len() as u128;
             let rate: u128 = if T::precision_bits() <= 53 { 64 } else { 1 };
-            let expanded = column
-                .entries
-                .iter()
-                .map(|e| if e.i == e.j { 1u128 } else { 2 })
-                .sum::<u128>();
             let dense = if T::precision_bits() <= 53 {
                 // Preserve the qualified batched-BLAS crossover until its
                 // replacement also wins end-to-end measurements.
                 4 * (n as u128).pow(3) + prefix_entries
             } else {
-                2 * (n as u128).pow(3) + 2 * n as u128 * expanded + prefix_entries
+                reads += newly_read(&mut read, column);
+                wide_dense_work(n, column, reads, prefix_entries)
             };
             column.sparse = 8 * column.entries.len() as u128 * prefix_entries * rate <= dense;
         }
@@ -950,22 +993,38 @@ impl<T: FloatT> PsdBlock<T> {
         let words = T::precision_bits().div_ceil(64) as u128;
         let mut prefix_entries = 0u128;
         let mut dense_work = 0u128;
+        let mut read = vec![
+            false;
+            if T::precision_bits() <= 53 {
+                0
+            } else {
+                self.svec_len()
+            }
+        ];
+        let mut reads = 0u128;
         let costs: Vec<_> = self
             .columns
             .iter()
             .map(|column| {
                 prefix_entries += column.entries.len() as u128;
+                if T::precision_bits() > 53 {
+                    reads += newly_read(&mut read, column);
+                }
                 if column.sparse {
                     8 * prefix_entries * column.entries.len() as u128 * words * words
                 } else {
-                    let n = self.Rinv.size().0 as u128;
+                    let n = self.Rinv.size().0;
                     let expanded = column
                         .entries
                         .iter()
                         .map(|e| if e.i == e.j { 1u128 } else { 2 })
                         .sum::<u128>();
-                    dense_work +=
-                        (2 * n.pow(3) + 2 * n * expanded + prefix_entries) * words * words;
+                    dense_work += if T::precision_bits() <= 53 {
+                        2 * (n as u128).pow(3) + 2 * n as u128 * expanded + prefix_entries
+                    } else {
+                        wide_dense_work(n, column, reads, prefix_entries)
+                    } * words
+                        * words;
                     0
                 }
             })
@@ -1113,48 +1172,107 @@ impl<T: FloatT> PsdBlock<T> {
             return;
         }
         with_block_work(self.Ginv.nrows(), |w: &mut BlockWork<T>| {
-            for (b, right) in self.columns.iter().enumerate() {
-                if self.dense_representatives[b] != b {
-                    continue;
-                }
-                if skip_sparse && right.sparse {
-                    continue;
-                }
-                if !right.sparse {
-                    coefficient_product(
-                        w.mat2.data_mut(),
-                        self.Ginv.nrows(),
-                        0,
-                        &self.Ginv,
-                        right,
-                        &self.axpy_plans[b],
-                        values,
-                    );
-                    pooled_gemm_sym(&mut w.mat3, &w.mat2, &self.Ginv, None);
-                    w.vector.resize(triangular_number(w.n), T::zero());
-                    mat_to_svec(&mut w.vector, &w.mat3);
-                }
-                // Stream one transform per exact representative at every precision.
-                // Float64 may batch these transforms; wide arithmetic keeps O(n²) scratch.
-                for (target, column) in self.columns[..=b].iter().enumerate() {
-                    if self.dense_representatives[target] != b {
-                        continue;
-                    }
-                    for (a, left) in self.columns[..=target].iter().enumerate() {
-                        let mut v = T::zero();
-                        if right.sparse {
-                            v = sparse_schur_value(left, right, &self.Ginv, values, self.sqrt2);
-                        } else {
-                            for e in &left.entries {
-                                v = values[e.position]
-                                    .mul_add(w.vector[triangular_number(e.j) + e.i], v);
-                            }
-                        }
-                        store(target, a, column.schur_position(left, a), v);
-                    }
-                }
+            for b in 0..self.columns.len() {
+                self.schur_column(values, skip_sparse, b, w, &mut store);
             }
         });
+    }
+
+    /// The Schur entries of every column represented by column `b`.
+    fn schur_column(
+        &self,
+        values: &[T],
+        skip_sparse: bool,
+        b: usize,
+        w: &mut BlockWork<T>,
+        store: &mut impl FnMut(usize, usize, usize, T),
+    ) {
+        let right = &self.columns[b];
+        if self.dense_representatives[b] != b {
+            return;
+        }
+        if skip_sparse && right.sparse {
+            return;
+        }
+        let n = w.n;
+        let mut lazy = false;
+        if !right.sparse {
+            coefficient_product(
+                w.mat2.data_mut(),
+                n,
+                0,
+                &self.Ginv,
+                right,
+                &self.axpy_plans[b],
+                values,
+            );
+            w.vector.resize(triangular_number(n), T::zero());
+            if T::precision_bits() <= 64 {
+                pooled_gemm_sym(&mut w.mat3, &w.mat2, &self.Ginv, None);
+                mat_to_svec(&mut w.vector, &w.mat3);
+            } else {
+                // Only the columns of `Ginv·A` in A's index support are
+                // nonzero; exact sums over that support (n²r instead of n³
+                // terms) are the same values. Without the residue kernel each
+                // packed entry is one exact dot, evaluated when first read.
+                w.support.clear();
+                for &(q, _, _) in &self.axpy_plans[b] {
+                    if w.support.last() != Some(&(q as usize)) {
+                        w.support.push(q as usize);
+                    }
+                }
+                let r = w.support.len();
+                if T::residue_product_applies(n, n, r) {
+                    w.panel.resize((n, r));
+                    w.rows.resize((r, n));
+                    for (t, &q) in w.support.iter().enumerate() {
+                        w.panel.data_mut()[t * n..(t + 1) * n]
+                            .copy_from_slice(&w.mat2.data()[q * n..(q + 1) * n]);
+                        for j in 0..n {
+                            w.rows.data_mut()[t + j * r] = self.Ginv[(q, j)];
+                        }
+                    }
+                    pooled_gemm_sym(&mut w.mat3, &w.panel, &w.rows, None);
+                    mat_to_svec(&mut w.vector, &w.mat3);
+                } else {
+                    lazy = true;
+                    w.stamp.resize(triangular_number(n), 0);
+                    w.generation += 1;
+                }
+            }
+        }
+        // Stream one transform per exact representative at every precision.
+        // Float64 may batch these transforms; wide arithmetic keeps O(n²) scratch.
+        for (target, column) in self.columns[..=b].iter().enumerate() {
+            if self.dense_representatives[target] != b {
+                continue;
+            }
+            for (a, left) in self.columns[..=target].iter().enumerate() {
+                let mut v = T::zero();
+                if right.sparse {
+                    v = sparse_schur_value(left, right, &self.Ginv, values, self.sqrt2);
+                } else {
+                    for e in &left.entries {
+                        let p = triangular_number(e.j) + e.i;
+                        if lazy && w.stamp[p] != w.generation {
+                            // The upper entry and packing of `pooled_gemm_sym`
+                            // and `mat_to_svec`.
+                            w.stamp[p] = w.generation;
+                            let m = T::dot_fma(w.support.iter().map(|&q| {
+                                (&w.mat2.data()[e.i + q * n], &self.Ginv.data()[q + e.j * n])
+                            }));
+                            w.vector[p] = if e.i == e.j {
+                                m
+                            } else {
+                                (m + m) * T::FRAC_1_SQRT_2()
+                            };
+                        }
+                        v = values[e.position].mul_add(w.vector[p], v);
+                    }
+                }
+                store(target, a, column.schur_position(left, a), v);
+            }
+        }
     }
 
     pub(super) fn compute_schur_dense_batched(
@@ -1222,6 +1340,23 @@ impl<T: FloatT> PsdBlock<T> {
         // Sampled and wide-precision blocks keep the closure path; only the
         // f64 batched dense path tiles over the pool.
         let packed = PackedSchur::new(out);
+        // Wide dense columns: one n³ congruence each, run on the pool. Each
+        // representative writes its own pairs, so values are unchanged.
+        if let Some(pool) = pool
+            .filter(|p| self.sampled.is_none() && dense_count > 0 && p.current_num_threads() > 1)
+        {
+            let (this, n) = (&*self, self.Ginv.nrows());
+            pool.install(|| {
+                (0..this.columns.len()).into_par_iter().for_each(|b| {
+                    with_block_work(n, |w: &mut BlockWork<T>| {
+                        this.schur_column(values, skip_sparse, b, w, &mut |t, a, _, v| {
+                            packed.write(t, a, v)
+                        })
+                    })
+                })
+            });
+            return;
+        }
         self.compute_schur_selected(
             values,
             skip_sparse,

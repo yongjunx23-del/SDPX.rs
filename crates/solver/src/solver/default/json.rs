@@ -14,12 +14,16 @@ use std::{fs::File, io, io::Read};
 #[allow(non_snake_case)]
 pub struct JsonProblem<T: FloatT> {
     /// Upper-triangle quadratic objective matrix.
+    #[serde(deserialize_with = "deferred::csc")]
     pub P: CscMatrix<T>,
     /// Linear objective.
+    #[serde(deserialize_with = "deferred::values")]
     pub q: Vec<T>,
     /// Constraint matrix (ordinary entries only when sampled blocks are used).
+    #[serde(deserialize_with = "deferred::csc")]
     pub A: CscMatrix<T>,
     /// Constraint right-hand side.
+    #[serde(deserialize_with = "deferred::values")]
     pub b: Vec<T>,
     /// Ordered cone descriptors.
     pub cones: Vec<SupportedConeT<T>>,
@@ -43,6 +47,27 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
     /// Write the original input and factors; no scaling or materialization.
     pub fn write(&self, writer: impl Write) -> Result<(), SolverError> {
         Ok(serde_json::to_writer(writer, self)?)
+    }
+
+    /// Exact identity of the input and its effective settings, for checking
+    /// that every MPI rank read the same problem. Values hash by their binary
+    /// payload rather than decimal text, and long arrays hash on the calling
+    /// Rayon pool.
+    pub fn rank_identity(&self) -> Result<[u8; 32], SolverError> {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(crate::solver::distributed::rank_identity(
+            &self.P,
+            &self.q,
+            &self.A,
+            &self.b,
+            &self.cones,
+            &self.sampled,
+        ));
+        let mut settings = self.settings.clone();
+        sanitize_settings(&mut settings);
+        hash.update(serde_json::to_vec(&settings)?);
+        Ok(hash.finalize().into())
     }
 
     /// Build the shared Rust solver, validating serialized dimensions first.
@@ -145,6 +170,147 @@ impl<T: FloatT + Serialize + DeserializeOwned> JsonProblem<T> {
             self.settings,
             input_fingerprint,
         )
+    }
+}
+
+/// High-precision arrays decode after the read: each decimal string is kept
+/// as text while the JSON is parsed, then goes through `T`'s own visitor on
+/// the calling rayon pool (the CLI installs its `--threads` pool). Values are
+/// those of the ordinary read; only an error loses its line and column, and
+/// names the element instead. (d6n640q: 10.7M entries, 1.9 s of decimal
+/// conversion in a 2.5 s read.)
+mod deferred {
+    use crate::algebra::{CscMatrix, FloatT};
+    use serde::de::{self, value, DeserializeOwned, DeserializeSeed, SeqAccess, Visitor};
+    use serde::{Deserialize, Deserializer};
+    use std::fmt;
+    use std::marker::PhantomData;
+
+    pub(super) fn values<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: FloatT + DeserializeOwned,
+    {
+        if T::precision_bits() <= 53 {
+            return Vec::<T>::deserialize(deserializer);
+        }
+        deserializer.deserialize_seq(Values(PhantomData))
+    }
+
+    pub(super) fn csc<'de, D, T>(deserializer: D) -> Result<CscMatrix<T>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: FloatT + DeserializeOwned,
+    {
+        // The fields of `CscMatrix`'s derived form, with deferred values.
+        #[derive(Deserialize)]
+        #[serde(bound = "T: FloatT + DeserializeOwned")]
+        struct Csc<T: FloatT> {
+            m: usize,
+            n: usize,
+            colptr: Vec<usize>,
+            rowval: Vec<usize>,
+            #[serde(deserialize_with = "values")]
+            nzval: Vec<T>,
+        }
+        let Csc {
+            m,
+            n,
+            colptr,
+            rowval,
+            nzval,
+        } = Csc::<T>::deserialize(deserializer)?;
+        Ok(CscMatrix {
+            m,
+            n,
+            colptr,
+            rowval,
+            nzval,
+        })
+    }
+
+    /// One array element as read: decimal text at `text[start..start + len]`,
+    /// or an integer or float token.
+    enum Token {
+        Text { start: usize, len: u32 },
+        I64(i64),
+        U64(u64),
+        F64(f64),
+    }
+
+    struct Values<T>(PhantomData<T>);
+
+    impl<'de, T: FloatT + DeserializeOwned> Visitor<'de> for Values<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an array of finite decimal strings")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+            let mut text = String::new();
+            let mut tokens = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(token) = seq.next_element_seed(Element(&mut text))? {
+                tokens.push(token);
+            }
+            let decode = |(k, token): (usize, &Token)| -> Result<T, String> {
+                let value = match *token {
+                    Token::Text { start, len } => {
+                        let text = &text[start..start + len as usize];
+                        T::deserialize(value::StrDeserializer::<value::Error>::new(text))
+                    }
+                    Token::I64(v) => T::deserialize(value::I64Deserializer::<value::Error>::new(v)),
+                    Token::U64(v) => T::deserialize(value::U64Deserializer::<value::Error>::new(v)),
+                    Token::F64(v) => T::deserialize(value::F64Deserializer::<value::Error>::new(v)),
+                };
+                value.map_err(|e| format!("array element {k}: {e}"))
+            };
+            let values: Result<Vec<T>, String> = if rayon::current_thread_index().is_some() {
+                use rayon::prelude::*;
+                tokens.par_iter().enumerate().map(decode).collect()
+            } else {
+                tokens.iter().enumerate().map(decode).collect()
+            };
+            values.map_err(de::Error::custom)
+        }
+    }
+
+    struct Element<'a>(&'a mut String);
+
+    impl<'de> DeserializeSeed<'de> for Element<'_> {
+        type Value = Token;
+
+        fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Token, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Element<'_> {
+        type Value = Token;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a finite decimal string")
+        }
+
+        fn visit_str<E: de::Error>(self, text: &str) -> Result<Token, E> {
+            let len =
+                u32::try_from(text.len()).map_err(|_| E::custom("decimal string too long"))?;
+            let start = self.0.len();
+            self.0.push_str(text);
+            Ok(Token::Text { start, len })
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<Token, E> {
+            Ok(Token::I64(value))
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<Token, E> {
+            Ok(Token::U64(value))
+        }
+
+        fn visit_f64<E: de::Error>(self, value: f64) -> Result<Token, E> {
+            Ok(Token::F64(value))
+        }
     }
 }
 

@@ -787,7 +787,11 @@ fn chunked_dot_matches<const N: usize>() {
         .map(|i| {
             let x = MpFloat::<N>::from_f64(((i * 7919) % 1013) as f64 - 506.25).unwrap();
             let s = MpFloat::<N>::from_f64(2f64.powi((i % 41) as i32 * 9 - 180)).unwrap();
-            if i % 13 == 0 { MpFloat::<N>::zero() } else { x * s / MpFloat::<N>::from_f64(3.0).unwrap() }
+            if i % 13 == 0 {
+                MpFloat::<N>::zero()
+            } else {
+                x * s / MpFloat::<N>::from_f64(3.0).unwrap()
+            }
         })
         .collect();
     let w: Vec<MpFloat<N>> = v.iter().rev().cloned().collect();
@@ -795,7 +799,11 @@ fn chunked_dot_matches<const N: usize>() {
     for chunks in [1, 2, 7, 64, 997, 5000] {
         let par_for = |n: usize, f: &(dyn Fn(usize) + Sync)| (0..n).rev().for_each(f);
         let chunked = <MpFloat<N> as Scalar>::dot_slices_chunked(&v, &w, chunks, &par_for);
-        assert_eq!(chunked.to_string(), serial.to_string(), "N={N} chunks={chunks}");
+        assert_eq!(
+            chunked.to_string(),
+            serial.to_string(),
+            "N={N} chunks={chunks}"
+        );
     }
 }
 
@@ -803,6 +811,96 @@ fn chunked_dot_matches<const N: usize>() {
 fn chunked_exact_dot_is_the_serial_value() {
     chunked_dot_matches::<4>();
     chunked_dot_matches::<16>();
+}
+
+fn output_dots_match<const N: usize>() {
+    let value = |i: usize| {
+        let x = MpFloat::<N>::from_f64(((i * 7919) % 1013) as f64 - 506.25).unwrap();
+        let s = MpFloat::<N>::from_f64(2f64.powi((i % 41) as i32 * 9 - 180)).unwrap();
+        if i % 13 == 0 {
+            MpFloat::<N>::zero()
+        } else {
+            x * s / MpFloat::<N>::from_f64(3.0).unwrap()
+        }
+    };
+    // Output k takes terms i ≡ k (mod 5); output 3 has a NaN, output 4 only
+    // zero products and output 5 a spread beyond the accumulator bound.
+    let outputs = 6;
+    let mut terms: Vec<(usize, MpFloat<N>, MpFloat<N>)> = (0..997)
+        .map(|i| (i % 5, value(i), value(i * 3 + 1)))
+        .map(|(k, a, b)| {
+            if k == 4 {
+                (k, MpFloat::<N>::zero(), b)
+            } else {
+                (k, a, b)
+            }
+        })
+        .collect();
+    terms[3 + 5 * 7].1 = MpFloat::<N>::nan();
+    let huge = MpFloat::<N>::from_f64(2f64.powi(1000)).unwrap().powi(20);
+    terms.push((5, huge, huge));
+    terms.push((
+        5,
+        MpFloat::<N>::one(),
+        MpFloat::<N>::from_f64(1e-300).unwrap(),
+    ));
+    let expected: Vec<MpFloat<N>> = (0..outputs)
+        .map(|k| MpFloat::<N>::dot_fma(terms.iter().filter(|t| t.0 == k).map(|t| (&t.1, &t.2))))
+        .collect();
+    for chunks in [1, 2, 7, 64, 2000] {
+        let size = terms.len().div_ceil(chunks);
+        let part = |c: usize| {
+            terms[(c * size).min(terms.len())..((c + 1) * size).min(terms.len())]
+                .iter()
+                .map(|t| (t.0, &t.1, &t.2))
+        };
+        let par_for = |n: usize, f: &(dyn Fn(usize) + Sync)| (0..n).rev().for_each(f);
+        // Exponent-sum ranges of each output's finite nonzero terms: exact,
+        // widened, too narrow for output 1 (a stale bound), and empty.
+        let mut exact = vec![(i64::MAX, i64::MIN); outputs];
+        for (k, a, b) in &terms {
+            if let (Some(x), Some(y)) = (a.product_exponent(), b.product_exponent()) {
+                exact[*k] = (exact[*k].0.min(x + y), exact[*k].1.max(x + y));
+            }
+        }
+        let wide: Vec<_> = exact
+            .iter()
+            .map(|&(lo, hi)| (lo - 300, hi.saturating_add(200)))
+            .collect();
+        let mut stale = exact.clone();
+        stale[1].1 -= 1;
+        let empty = vec![(1, 0); outputs];
+        for bounds in [None, Some(&exact), Some(&wide), Some(&stale), Some(&empty)] {
+            let sums = <MpFloat<N> as Scalar>::dot_outputs_chunked(
+                outputs,
+                chunks,
+                bounds.map(|b| b.as_slice()),
+                &part,
+                &par_for,
+            );
+            for (k, sum) in sums.iter().enumerate() {
+                match k {
+                    3 | 5 => assert!(sum.is_none(), "N={N} chunks={chunks} k={k}"),
+                    _ => {
+                        let sum = sum.unwrap();
+                        assert_eq!(
+                            sum.to_string(),
+                            expected[k].to_string(),
+                            "N={N} chunks={chunks} k={k} bounds={bounds:?}"
+                        );
+                        assert_eq!(sum.is_sign_negative(), expected[k].is_sign_negative());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn output_exact_dots_are_the_serial_values() {
+    output_dots_match::<2>();
+    output_dots_match::<4>();
+    output_dots_match::<16>();
 }
 
 #[test]
@@ -822,5 +920,158 @@ fn chunked_exact_dot_rejects_incomplete_scheduler() {
             <MpFloat<2> as Scalar>::dot_slices_chunked(&values, &values, 2, &par_for)
         }));
         assert!(result.is_err(), "skipped pass {skipped_pass}");
+    }
+}
+
+fn check_exact_fma<const N: usize>(spread: u64) {
+    let mut s = 0x9e3779b97f4a7c15u64 ^ (N as u64 * 7919) ^ spread;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let vals: Vec<MpFloat<N>> = (0..1024)
+        .map(|_| {
+            let mut limbs = [0u64; N];
+            limbs.iter_mut().for_each(|l| *l = next());
+            limbs[N - 1] |= 1 << 63;
+            if next() % 5 == 0 {
+                // Short mantissas, so some sums cancel exactly.
+                limbs[..N / 2].iter_mut().for_each(|l| *l = 0);
+            }
+            let kind = if next() & 1 == 0 {
+                mpfr::REGULAR_KIND
+            } else {
+                -mpfr::REGULAR_KIND
+            };
+            MpFloat::<N> {
+                limbs,
+                kind,
+                exponent: ((next() % (2 * spread + 1)) as i64 - spread as i64) as mpfr::exp_t,
+            }
+        })
+        .collect();
+    let mpfr_fma = |a: &MpFloat<N>, b: &MpFloat<N>, c: &MpFloat<N>| {
+        let (x, y, z) = (a.descriptor(), b.descriptor(), c.descriptor());
+        MpFloat::<N>::output(|r| unsafe {
+            mpfr::fma(r, &x, &y, &z, ROUND);
+        })
+    };
+    let check = |a: &MpFloat<N>, b: &MpFloat<N>, c: &MpFloat<N>| {
+        let got = a.mul_add(*b, *c);
+        let want = mpfr_fma(a, b, c);
+        // The sign of a zero is significant; its exponent and limbs are not.
+        assert_eq!(got.kind, want.kind, "N={N} spread={spread}");
+        if got.kind.abs() == mpfr::REGULAR_KIND {
+            assert_eq!(
+                (got.exponent, got.limbs),
+                (want.exponent, want.limbs),
+                "N={N} spread={spread}"
+            );
+        }
+    };
+    for w in vals.windows(3) {
+        check(&w[0], &w[1], &w[2]);
+        // The addend cancels the rounded product's leading bits (or all of
+        // it), exercising the borrow, negation and exact-zero paths.
+        let cancel = -(w[0] * w[1]);
+        check(&w[0], &w[1], &cancel);
+        let ulp = MpFloat::<N>::epsilon() * cancel.abs();
+        check(&w[0], &w[1], &(cancel + ulp));
+        check(&w[0], &w[1], &(cancel - ulp));
+    }
+}
+
+#[test]
+fn exact_fma_matches_mpfr_bitwise() {
+    for spread in [4, 64, 600] {
+        check_exact_fma::<4>(spread);
+        check_exact_fma::<8>(spread);
+        check_exact_fma::<12>(spread);
+        check_exact_fma::<16>(spread);
+    }
+}
+
+fn check_exact_div<const N: usize>(spread: u64) {
+    let mut s = 0x2545f4914f6cdd1du64 ^ (N as u64 * 104729) ^ spread;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut vals: Vec<MpFloat<N>> = (0..1024)
+        .map(|i| {
+            let mut limbs = [0u64; N];
+            limbs.iter_mut().for_each(|l| *l = next());
+            limbs[N - 1] |= 1 << 63;
+            if i % 7 == 0 {
+                limbs[..N / 2].iter_mut().for_each(|l| *l = 0);
+            }
+            MpFloat::<N> {
+                limbs,
+                kind: if next() & 1 == 0 {
+                    mpfr::REGULAR_KIND
+                } else {
+                    -mpfr::REGULAR_KIND
+                },
+                exponent: ((next() % (2 * spread + 1)) as i64 - spread as i64) as mpfr::exp_t,
+            }
+        })
+        .collect();
+    // Powers of two and all-ones mantissas.
+    let mut pow2 = vals[0];
+    pow2.limbs = [0; N];
+    pow2.limbs[N - 1] = 1 << 63;
+    let mut ones = vals[1];
+    ones.limbs = [u64::MAX; N];
+    vals.extend([pow2, ones, -pow2, -ones]);
+    let mdiv = |a: &MpFloat<N>, b: &MpFloat<N>| {
+        let (x, y) = (a.descriptor(), b.descriptor());
+        MpFloat::<N>::output(|r| unsafe {
+            mpfr::div(r, &x, &y, ROUND);
+        })
+    };
+    let check = |a: &MpFloat<N>, b: &MpFloat<N>| {
+        let got = *a / *b;
+        let want = mdiv(a, b);
+        assert_eq!(
+            (got.kind, got.exponent, got.limbs),
+            (want.kind, want.exponent, want.limbs),
+            "N={N} spread={spread}"
+        );
+    };
+    for w in vals.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        check(a, b);
+        check(a, a);
+        // Exact quotients.
+        check(&(*a * *b), b);
+        // Mantissas one unit apart: the remainder's top limbs equal the
+        // divisor's (GMP's q = β − 1 step) and qh = 1 with a tiny excess.
+        for delta in [u64::MAX, 1] {
+            let mut c = *b;
+            let (v, o) = c.limbs[0].overflowing_add(delta);
+            // Adding β − 1 subtracts one unit when it carries out.
+            if o == (delta == u64::MAX) {
+                c.limbs[0] = v;
+                check(&c, b);
+                check(b, &c);
+            }
+        }
+    }
+}
+
+#[test]
+fn exact_div_matches_mpfr_bitwise() {
+    for spread in [4, 600] {
+        check_exact_div::<1>(spread);
+        check_exact_div::<2>(spread);
+        check_exact_div::<3>(spread);
+        check_exact_div::<4>(spread);
+        check_exact_div::<8>(spread);
+        check_exact_div::<12>(spread);
+        check_exact_div::<16>(spread);
     }
 }

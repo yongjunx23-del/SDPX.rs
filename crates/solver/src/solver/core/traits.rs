@@ -283,7 +283,14 @@ pub trait Variables<T: FloatT> {
     /// Separate primal (x, s) and dual (z) step lengths: rescale `step` so
     /// that the returned common `α` applies each part's own longest step.
     /// The default keeps the common step.
-    fn split_step(&self, _step: &mut Self, α: T, _data: &Self::D, _cones: &mut Self::C, _settings: &Self::SE) -> T {
+    fn split_step(
+        &self,
+        _step: &mut Self,
+        α: T,
+        _data: &Self::D,
+        _cones: &mut Self::C,
+        _settings: &Self::SE,
+    ) -> T {
         α
     }
 

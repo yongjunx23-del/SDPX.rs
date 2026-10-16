@@ -50,6 +50,8 @@ const MIN_KKT_WORK: u128 = 8 << 20;
 fn cone_cost<T: FloatT>(cone: &SupportedCone<T>) -> u128 {
     let dimension_cost = match cone {
         SupportedCone::PSDTriangleCone(k) => (k.n as u128).saturating_pow(3),
+        // S₀'s factor and inverse, order 2m = n(n+1)
+        SupportedCone::OpRelEntropyCone(k) => ((k.n * (k.n + 1)) as u128).saturating_pow(3) / 2,
         _ => cone.numel() as u128,
     };
     let words = ((T::precision_bits() + 63) / 64) as u128;
@@ -172,24 +174,32 @@ impl ConeThreading {
                     }
                     // Out of cones: help the running cones' posted items (SVD
                     // replays start late in a cone), else run the caller's
-                    // tail jobs, until all are scaled, but never past the
-                    // last phase's slowest cone: a thread that stole this
-                    // item while blocked inside a cone would otherwise wait
-                    // for that cone forever.
+                    // tail jobs, until all are scaled, but never longer than
+                    // the last phase's slowest cone past the start or the
+                    // last helped item: a thread that stole this item while
+                    // blocked inside a cone would otherwise wait for that
+                    // cone forever. A cone that keeps posting keeps its
+                    // helpers: a fixed deadline left the ORE cone of a slower
+                    // phase to run alone (one_L12/128, T=4: 1.66 s helped,
+                    // 2.97 s after its helpers left at 1.08 s).
+                    let mut deadline = start + wait;
                     loop {
                         if sdpx_arithmetic::inner_parallel::board::help() {
+                            deadline = deadline.max(std::time::Instant::now() + wait);
                             continue;
                         }
                         if tail.is_some_and(|tail| tail.run_one()) {
                             continue;
                         }
                         if done.load(std::sync::atomic::Ordering::Acquire) == total
-                            || start.elapsed() >= wait
+                            || std::time::Instant::now() >= deadline
                         {
                             break;
                         }
+                        // Yield the core when nothing is posted: a spinning
+                        // helper on an oversubscribed pool delays the cones.
                         if !(steal && matches!(rayon::yield_now(), Some(rayon::Yield::Executed))) {
-                            std::hint::spin_loop();
+                            std::thread::yield_now();
                         }
                     }
                     ok
@@ -544,7 +554,11 @@ pub(crate) fn pin_worker(budget: usize, workers: usize) -> impl Fn(usize) + Send
     #[cfg(not(target_os = "linux"))]
     let cpus: Vec<usize> = Vec::new();
     let pin = cpus.len() == budget;
-    let cpus = if pin && workers < budget { spread(cpus) } else { cpus };
+    let cpus = if pin && workers < budget {
+        spread(cpus)
+    } else {
+        cpus
+    };
     move |i: usize| {
         debug_assert!(i < workers);
         #[cfg(target_os = "linux")]
@@ -564,7 +578,11 @@ pub(crate) fn pin_worker(budget: usize, workers: usize) -> impl Fn(usize) + Send
 /// groups, so a prefix of any length spreads over every group.
 #[cfg(target_os = "linux")]
 fn spread(cpus: Vec<usize>) -> Vec<usize> {
-    let read = |path: String| std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<i64>().ok());
+    let read = |path: String| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+    };
     let mut groups: std::collections::BTreeMap<(i64, i64), Vec<usize>> = Default::default();
     for &cpu in &cpus {
         let base = format!("/sys/devices/system/cpu/cpu{cpu}");

@@ -218,7 +218,9 @@ pub struct DefaultSettings<T: FloatT> {
     pub static_regularization_constant: T,
 
     ///additional regularization parameter w.r.t. the maximum abs diagonal term
-    #[builder(default = "if is_primitive::<T>() { T::epsilon() * T::epsilon() } else { T::zero() }")]
+    #[builder(
+        default = "if is_primitive::<T>() { T::epsilon() * T::epsilon() } else { T::zero() }"
+    )]
     pub static_regularization_proportional: T,
 
     ///enable KKT dynamic regularization (immutable after setup; MPFR: off)

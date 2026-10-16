@@ -77,9 +77,11 @@ impl CoreKeepers {
                 .filter(|&cpu| libc::CPU_ISSET(cpu, &mask))
                 .collect()
         };
-        if auto && (cpus.len() != budget
-            || !crate::mpi::World::get().is_some_and(|w| w.local_affinity_disjoint())
-            || !cpus.first().is_some_and(|&cpu| load_governed(cpu))) {
+        if auto
+            && (cpus.len() != budget
+                || !crate::mpi::World::get().is_some_and(|w| w.local_affinity_disjoint())
+                || !cpus.first().is_some_and(|&cpu| load_governed(cpu)))
+        {
             return keepers;
         }
         cpus.truncate(budget);
@@ -112,7 +114,9 @@ impl CoreKeepers {
                 });
             match spawned {
                 Ok(handle) if started.recv().unwrap_or(false) => keepers.threads.push(handle),
-                Ok(handle) => { let _ = handle.join(); }
+                Ok(handle) => {
+                    let _ = handle.join();
+                }
                 Err(_) => break,
             }
         }

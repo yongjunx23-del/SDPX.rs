@@ -151,6 +151,88 @@ fn wide_exact_parity_mpfr256() {
     wide_exact_parity::<sdpx_arithmetic::Bits256>();
 }
 
+// Long rows of a wide exact forward product are read column by column into
+// per-row accumulators; every output must match CSC gemv bitwise, including
+// rows whose exact sum declines (NaN) or cancels to zero, and empty rows.
+fn long_row_parity<T: FloatT>() {
+    let n = LONG_ROW_ENTRIES + 7;
+    let long = 5;
+    // Five long rows (row 2 cancels exactly), one identity row per column
+    // and two empty rows: nnz ≥ 4m, so every row takes the exact branch.
+    let m = long + n + 2;
+    let mut colptr = vec![0];
+    let (mut rowval, mut nzval) = (Vec::new(), Vec::new());
+    for j in 0..n {
+        let v = num::<T>(j % 97 + 1) / num::<T>(j % 13 + 3) * num::<T>(2).powi(j as i32 % 61 - 30);
+        rowval.extend([0, 1, 2, 3, 4, long + j]);
+        let sign = if j % 2 == 0 { T::one() } else { -T::one() };
+        let w = T::one() / num::<T>(j + 1);
+        nzval.extend([v, -v / num::<T>(7), sign, v * w, w, -T::one()]);
+        colptr.push(rowval.len());
+    }
+    let a = CscMatrix::new(m, n, colptr, rowval, nzval);
+    let mut plan = SparseParallel::new(&a);
+    let mut cones = CompositeCone::<T>::new(&[NonnegativeConeT(32768)]);
+    let wide = T::precision_bits() > 64;
+    let scales = [T::one(), -T::one(), num::<T>(3) / num::<T>(7), T::zero()];
+    let betas = [T::one(), T::zero(), -T::one(), num::<T>(3) / num::<T>(4)];
+    for threads in [1, 2, 4] {
+        cones.configure_threads(threads).unwrap();
+        plan.configure(&a, cones.thread_pool());
+        assert_eq!(plan.long_rows.len(), if wide { long } else { 0 });
+        for alpha in scales {
+            for beta in betas {
+                for case in 0..5 {
+                    // Row 2's terms alternate ±1 against a constant x, so its
+                    // sum cancels; case 1 seeds a NaN into one column of x,
+                    // case 2 a signed zero and a NaN into the incoming y,
+                    // case 3 spreads x over 2^±100 with zeros, and case 4
+                    // runs on values scaled after planning (stale bounds).
+                    let mut x = vec![T::one(); n];
+                    let mut serial: Vec<T> =
+                        (0..m).map(|i| num::<T>(i % 11) / num::<T>(5)).collect();
+                    if case == 1 {
+                        x[17] = T::nan();
+                    }
+                    if case == 2 {
+                        serial[2] = -T::zero();
+                        serial[1] = T::nan();
+                    }
+                    if case == 3 {
+                        for (j, xj) in x.iter_mut().enumerate() {
+                            *xj = if j % 11 == 0 {
+                                T::zero()
+                            } else {
+                                num::<T>(j % 7 + 1) / num::<T>(3)
+                                    * num::<T>(2).powi(j as i32 % 201 - 100)
+                            };
+                        }
+                    }
+                    let mut b = a.clone();
+                    if case == 4 {
+                        for v in b.nzval.iter_mut().step_by(6 * 5) {
+                            *v *= num::<T>(2).powi(90);
+                        }
+                    }
+                    let mut parallel = serial.clone();
+                    b.gemv(&mut serial, &x, alpha, beta);
+                    plan.product_local(&b, false, &mut parallel, &x, alpha, beta);
+                    same(&serial, &parallel);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn long_row_parity_f64() {
+    long_row_parity::<f64>();
+}
+#[test]
+fn long_row_parity_mpfr256() {
+    long_row_parity::<sdpx_arithmetic::Bits256>();
+}
+
 #[test]
 fn sparse_products_f64() {
     kernel_equivalence::<f64>();

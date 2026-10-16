@@ -3,8 +3,9 @@
 //! Every finite `MpFloat<N>` is `M · 2^(e - P)` with an `N`-limb mantissa `M`,
 //! so a product of two values is the exact `2N`-limb integer `Ma · Mb` scaled by
 //! `2^(ea + eb - 2P)`. Aligning all products to the smallest such scale and
-//! summing them with GMP's `mpn` layer gives the dot product exactly; one
-//! `mpfr_set_z_2exp` then rounds it once, nearest-even, at the destination.
+//! summing their 64-bit limbs into 128-bit slots, with carries resolved once at
+//! the end, gives the dot product exactly; one `mpfr_set_z_2exp` then rounds it
+//! once, nearest-even, at the destination.
 //!
 //! This is the contract of the residue (RNS) path: exact accumulation, one
 //! rounding. The result is never less accurate than the FMA chain it replaces
@@ -25,14 +26,19 @@ pub(crate) const INLINE_N: usize = 4;
 /// Widest mantissa multiplied by the inlined schoolbook; GMP's assembly
 /// `mpn_mul_n` wins above (Apple M4: 8 limbs 30 -> 38 ns/term inline).
 pub(crate) const SCHOOLBOOK_N: usize = 4;
+/// Widest mantissa multiplied by [`mul_rows`] on aarch64. Apple M4, ns per
+/// product against GMP's `mpn_mul_n`: 8 limbs 22.2 -> 12.7, 10 limbs
+/// 29.6 -> 19.4, 12 limbs 42.9 -> 35.3; 16 limbs 88 -> 150 spills.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const ROWS_N: usize = 12;
 
 /// Per-thread scratch, retained across calls so a dot product allocates only
 /// on first use. Operands are held by address for the duration of one call.
 #[derive(Default)]
 struct Scratch {
     terms: Vec<(usize, usize)>,
-    pos: Vec<u64>,
-    neg: Vec<u64>,
+    pos: Vec<u128>,
+    neg: Vec<u128>,
 }
 
 thread_local! {
@@ -207,14 +213,13 @@ pub(crate) fn dot_slices_chunked<'a, const N: usize>(
         }
         scans.lock().unwrap()[k] = Some((emin, emax, finite));
     });
-    let (emin, emax, finite) = scans
-        .into_inner()
-        .unwrap()
-        .into_iter()
-        .fold((i64::MAX, i64::MIN, true), |(a, b, c), scan| {
+    let (emin, emax, finite) = scans.into_inner().unwrap().into_iter().fold(
+        (i64::MAX, i64::MIN, true),
+        |(a, b, c), scan| {
             let (x, y, z) = scan.expect("chunk scheduler skipped exponent scan");
             (a.min(x), b.max(y), c && z)
-        });
+        },
+    );
     let len = match (finite, emin == i64::MAX) {
         (_, true) if finite => return MpFloat::<N>::default(),
         (true, false) => acc_len::<N>(emin, emax),
@@ -225,7 +230,7 @@ pub(crate) fn dot_slices_chunked<'a, const N: usize>(
     };
     let parts = std::sync::Mutex::new(vec![None; chunks]);
     par_for(chunks, &|k| {
-        let (mut pos, mut neg) = (vec![0u64; len], vec![0u64; len]);
+        let (mut pos, mut neg) = (vec![0u128; len], vec![0u128; len]);
         let r = k * size..((k + 1) * size).min(a.len());
         let terms = a[r.clone()]
             .iter()
@@ -241,14 +246,10 @@ pub(crate) fn dot_slices_chunked<'a, const N: usize>(
         .map(|part| part.expect("chunk scheduler skipped accumulation"));
     let (mut pos, mut neg) = parts.next().unwrap();
     for (p, n) in parts {
-        // SAFETY: all accumulators hold `len` limbs; the total of all terms
-        // fits by the bound on `len`, so no carry leaves the top limb.
-        unsafe {
-            gmp::mpn_add_n(pos.as_mut_ptr(), pos.as_ptr(), p.as_ptr(), len as _);
-            gmp::mpn_add_n(neg.as_mut_ptr(), neg.as_ptr(), n.as_ptr(), len as _);
-        }
+        add_slots(&mut pos, &p);
+        add_slots(&mut neg, &n);
     }
-    round_acc(&mut pos, &mut neg, len, emin).unwrap_or_else(|| dot_slices(a, b, chain))
+    round_slots(&mut pos, &mut neg, emin).unwrap_or_else(|| dot_slices(a, b, chain))
 }
 
 fn acc_len<const N: usize>(emin: i64, emax: i64) -> Option<usize> {
@@ -257,8 +258,8 @@ fn acc_len<const N: usize>(emin: i64, emax: i64) -> Option<usize> {
 }
 
 fn accumulate<'a, const N: usize>(
-    pos: &mut Vec<u64>,
-    neg: &mut Vec<u64>,
+    pos: &mut Vec<u128>,
+    neg: &mut Vec<u128>,
     emin: i64,
     emax: i64,
     inline: bool,
@@ -270,70 +271,284 @@ fn accumulate<'a, const N: usize>(
         acc.resize(len, 0);
     }
     add_terms(pos, neg, emin, len, inline, terms);
-    round_acc(pos, neg, len, emin)
+    round_slots(pos, neg, emin)
 }
 
-/// Add every term's exact product into the `len`-limb accumulators.
+/// Add every term's exact product into the `len`-slot accumulators.
 fn add_terms<'a, const N: usize>(
-    pos: &mut [u64],
-    neg: &mut [u64],
+    pos: &mut [u128],
+    neg: &mut [u128],
     emin: i64,
     len: usize,
     inline: bool,
     terms: impl Iterator<Item = Pair<'a, N>> + Clone,
 ) {
+    debug_assert!(pos.len() >= len && neg.len() >= len);
+    let accs = [pos.as_mut_ptr(), neg.as_mut_ptr()];
+    // One product buffer per dot; every term overwrites its limbs.
+    let mut scratch = [0u64; 2 * MAX_N];
+    for term in terms {
+        // SAFETY: both accumulators hold `len` slots and are distinct.
+        unsafe { add_term::<N>(accs, emin, len, inline, term, &mut scratch) };
+    }
+}
+
+/// Add one regular term's exact product into `accs[0]` (positive) or
+/// `accs[1]` (negative), by the product's sign.
+///
+/// # Safety
+/// Both pointers address distinct accumulators of `len` slots whose bit 0
+/// weighs 2^(emin - 2P), with `len` from [`acc_len`] over a range holding
+/// this term's exponent sum.
+#[inline(always)]
+unsafe fn add_term<const N: usize>(
+    accs: [*mut u128; 2],
+    emin: i64,
+    len: usize,
+    inline: bool,
+    (a, b): Pair<'_, N>,
+    scratch: &mut [u64; 2 * MAX_N],
+) {
+    let offset = (a.exponent as i64 + b.exponent as i64 - emin) as usize;
+    // The accumulator is picked by the product's sign bit, not a branch:
+    // signs of consecutive terms are data-dependent and mispredict.
+    let negative = ((a.kind < 0) != (b.kind < 0)) as usize;
+    let (limb, shift) = (offset / 64, (offset % 64) as u32);
+    debug_assert!(limb + 2 * N < len);
+    // SAFETY: `limb < len`; the bound on `len` covers the shifted product.
+    let dst = accs[negative].add(limb);
     if inline && N <= INLINE_N {
-        // The accumulator is picked by the product's sign bit, not a branch:
-        // signs of consecutive terms are data-dependent and mispredict.
-        let accs = [pos.as_mut_ptr(), neg.as_mut_ptr()];
-        // One product buffer per dot; every term overwrites its 2N limbs.
-        let mut scratch = [0u64; 2 * MAX_N];
-        for (a, b) in terms.clone() {
-            let offset = (a.exponent as i64 + b.exponent as i64 - emin) as usize;
-            let negative = ((a.kind < 0) != (b.kind < 0)) as usize;
-            let limb = offset / 64;
-            // SAFETY: both accumulators hold `len` limbs and `limb < len`; the
-            // bound on `len` covers the shifted product and its carry. The two
-            // pointers address distinct vectors.
-            let target =
-                unsafe { std::slice::from_raw_parts_mut(accs[negative].add(limb), len - limb) };
-            add_shifted_product::<N>(
-                target,
-                &a.limbs,
-                &b.limbs,
-                (offset % 64) as u32,
-                &mut scratch,
-            );
+        // A local product buffer stays in registers.
+        let mut prod = [0u64; 2 * INLINE_N];
+        mul_limbs::<N>(&a.limbs, &b.limbs, &mut prod[..2 * N]);
+        add_shifted(dst, &prod[..2 * N], shift);
+        return;
+    }
+    // SAFETY: `scratch` holds 2N <= 2*MAX_N limbs and does not overlap the
+    // inputs.
+    mpn_mul_n::<N>(scratch.as_mut_ptr(), a.limbs.as_ptr(), b.limbs.as_ptr());
+    add_shifted(dst, &scratch[..2 * N], shift);
+}
+
+/// `dst[0..=n] += limbs << shift` for `n` limbs and `shift < 64`, one 64-bit
+/// piece per 128-bit slot: no carry chain, so consecutive terms overlap.
+/// A slot absorbs 2^64 pieces before it could overflow.
+///
+/// # Safety
+/// `dst` addresses `limbs.len() + 1` slots.
+#[inline(always)]
+unsafe fn add_shifted(dst: *mut u128, limbs: &[u64], shift: u32) {
+    // `(x >> 1) >> (63 - shift)` is `x >> (64 - shift)`, and 0 at shift 0.
+    let mut below = 0u64;
+    for (t, &l) in limbs.iter().enumerate() {
+        *dst.add(t) += ((l << shift) | ((below >> 1) >> (63 - shift))) as u128;
+        below = l;
+    }
+    *dst.add(limbs.len()) += ((below >> 1) >> (63 - shift)) as u128;
+}
+
+/// `acc += other`, slot by slot. Each slot stays below 2^128: it sums at most
+/// one 64-bit piece per term.
+fn add_slots(acc: &mut [u128], other: &[u128]) {
+    for (x, &y) in acc.iter_mut().zip(other) {
+        *x += y;
+    }
+}
+
+/// Resolve the carries of `slots` into its exact little-endian 64-bit limbs,
+/// written in place over the first `slots.len()` limbs of the same memory.
+fn fold_slots(slots: &mut [u128]) -> &mut [u64] {
+    let len = slots.len();
+    let (src, limbs) = (slots.as_mut_ptr(), slots.as_mut_ptr() as *mut u64);
+    let mut carry = 0u128;
+    for t in 0..len {
+        // SAFETY: slot t is read before limb t is written; limb t occupies
+        // bytes [8t, 8t + 8) of slot t/2 <= t, which was read already.
+        unsafe {
+            let x = src.add(t).read() + carry;
+            limbs.add(t).write(x as u64);
+            carry = x >> 64;
         }
     }
-    let mut prod = [0u64; 2 * MAX_N + 1];
-    for (a, b) in terms.filter(|_| !(inline && N <= INLINE_N)) {
-        let offset = (a.exponent as i64 + b.exponent as i64 - emin) as usize;
-        let target = if (a.kind < 0) != (b.kind < 0) {
-            &mut *neg
-        } else {
-            &mut *pos
-        };
-        let (limb, shift) = (offset / 64, (offset % 64) as u32);
-        // SAFETY: `prod` holds 2N+1 <= 2*MAX_N+1 limbs; `target[limb..len]`
-        // covers the shifted product and its carry by the bound on `len`.
-        // In-place mpn operands are identical, which GMP permits.
-        unsafe {
-            mpn_mul_n::<N>(prod.as_mut_ptr(), a.limbs.as_ptr(), b.limbs.as_ptr());
-            let width = if shift == 0 {
-                2 * N
-            } else {
-                prod[2 * N] =
-                    gmp::mpn_lshift(prod.as_mut_ptr(), prod.as_ptr(), (2 * N) as _, shift);
-                2 * N + 1
-            };
-            let dst = target.as_mut_ptr().add(limb);
-            if gmp::mpn_add_n(dst, dst, prod.as_ptr(), width as _) != 0 {
-                let rest = dst.add(width);
-                gmp::mpn_add_1(rest, rest, (len - limb - width) as _, 1);
+    // The bound on the accumulator length keeps the total inside it.
+    debug_assert_eq!(carry, 0);
+    // SAFETY: the `len` limbs lie inside the slots' storage and were written.
+    unsafe { std::slice::from_raw_parts_mut(limbs, len) }
+}
+
+/// [`round_acc`] of `pos - neg` held in slots of equal length.
+fn round_slots<const N: usize>(
+    pos: &mut [u128],
+    neg: &mut [u128],
+    emin: i64,
+) -> Option<MpFloat<N>> {
+    let len = pos.len();
+    debug_assert_eq!(neg.len(), len);
+    round_acc(fold_slots(pos), fold_slots(neg), len, emin)
+}
+
+/// Exact sums of `outputs` dot products whose terms `terms(c)` yields as
+/// `(output, a, b)` for chunks `c < chunks`; `par_for(chunks, f)` may run
+/// the chunks concurrently (calling `f(c)` once for every `c`). An output's
+/// partial sums share one alignment and add exactly, so each value is `dot`
+/// over that output's terms in any order. `None` marks an output `dot`
+/// leaves to the chain: a non-finite term or too wide an exponent spread.
+///
+/// `bounds[k]`, when given, is a range holding the exponent sum of every
+/// finite nonzero term of output k (empty when it has none). The terms are
+/// then read once, without an exponent scan; a term outside its range, or a
+/// non-finite one, makes the call scan after all. The alignment never
+/// changes a value, so the result is the same either way.
+pub(crate) fn dot_outputs_chunked<'a, const N: usize, I>(
+    outputs: usize,
+    chunks: usize,
+    bounds: Option<&[(i64, i64)]>,
+    terms: &(dyn Fn(usize) -> I + Sync),
+    par_for: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
+) -> Vec<Option<MpFloat<N>>>
+where
+    I: Iterator<Item = (usize, &'a MpFloat<N>, &'a MpFloat<N>)>,
+{
+    if N > MAX_N {
+        return vec![None; outputs];
+    }
+    let chunks = chunks.max(1);
+    if let Some(bounds) = bounds {
+        assert_eq!(bounds.len(), outputs);
+        let range: Vec<_> = bounds.iter().map(|&(lo, hi)| (lo, hi, true)).collect();
+        if let Some(out) = sum_outputs::<N, I, true>(&range, chunks, terms, par_for) {
+            return out;
+        }
+    }
+    let regular = |k: i32| k.abs() == mpfr::REGULAR_KIND;
+    let scans = std::sync::Mutex::new(vec![None; chunks]);
+    par_for(chunks, &|c| {
+        let mut scan = vec![(i64::MAX, i64::MIN, true); outputs];
+        for (k, x, y) in terms(c) {
+            let (emin, emax, finite) = &mut scan[k];
+            if regular(x.kind) && regular(y.kind) {
+                let e = x.exponent as i64 + y.exponent as i64;
+                *emin = (*emin).min(e);
+                *emax = (*emax).max(e);
+            } else if !zero_product(x, y) {
+                *finite = false;
             }
         }
+        scans.lock().unwrap()[c] = Some(scan);
+    });
+    let mut range = vec![(i64::MAX, i64::MIN, true); outputs];
+    for scan in scans.into_inner().unwrap() {
+        let scan = scan.expect("chunk scheduler skipped exponent scan");
+        for (r, s) in range.iter_mut().zip(scan) {
+            *r = (r.0.min(s.0), r.1.max(s.1), r.2 && s.2);
+        }
     }
+    sum_outputs::<N, I, false>(&range, chunks, terms, par_for)
+        .expect("scanned exponent ranges hold every term")
+}
+
+/// Whether `a·b` is an exact zero of finite factors, which adds nothing
+/// (the sign of a zero result is not significant to the solver).
+#[inline(always)]
+fn zero_product<const N: usize>(a: &MpFloat<N>, b: &MpFloat<N>) -> bool {
+    let regular = |k: i32| k.abs() == mpfr::REGULAR_KIND;
+    let zero = |k: i32| k.abs() == mpfr::ZERO_KIND;
+    zero(a.kind) && (zero(b.kind) || regular(b.kind)) || zero(b.kind) && regular(a.kind)
+}
+
+/// The accumulation pass of [`dot_outputs_chunked`] over per-output
+/// exponent-sum ranges `(emin, emax, finite)`. `GUARD` checks every term
+/// against its range and returns `None` on a miss; without it the ranges
+/// come from a scan of these very terms.
+fn sum_outputs<'a, const N: usize, I, const GUARD: bool>(
+    range: &[(i64, i64, bool)],
+    chunks: usize,
+    terms: &(dyn Fn(usize) -> I + Sync),
+    par_for: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
+) -> Option<Vec<Option<MpFloat<N>>>>
+where
+    I: Iterator<Item = (usize, &'a MpFloat<N>, &'a MpFloat<N>)>,
+{
+    let regular = |k: i32| k.abs() == mpfr::REGULAR_KIND;
+    let mut out = vec![None; range.len()];
+    // Output k accumulates in `len` slots from `start` at bit 0 weighing
+    // 2^(emin - 2P); none when it declines or holds no nonzero product.
+    let mut total = 0;
+    let mut slots = Vec::with_capacity(range.len());
+    for (k, &(emin, emax, finite)) in range.iter().enumerate() {
+        let len = match (finite, emin > emax) {
+            (true, true) => {
+                out[k] = Some(MpFloat::<N>::default());
+                0
+            }
+            (true, false) => match acc_len::<N>(emin, emax) {
+                Some(len) => len,
+                // Too wide a bound: the scan may find a narrower range.
+                None if GUARD => return None,
+                None => 0,
+            },
+            _ => 0,
+        };
+        total += len;
+        slots.push((total - len, len, emin, emax));
+    }
+    if total == 0 && !GUARD {
+        return Some(out);
+    }
+    let missed = std::sync::atomic::AtomicBool::new(false);
+    let parts = std::sync::Mutex::new(vec![None; chunks]);
+    par_for(chunks, &|c| {
+        let (mut pos, mut neg) = (vec![0u128; total], vec![0u128; total]);
+        let mut scratch = [0u64; 2 * MAX_N];
+        let mut miss = false;
+        for (k, x, y) in terms(c) {
+            let (s, len, emin, emax) = slots[k];
+            if !(regular(x.kind) && regular(y.kind)) {
+                miss |= GUARD && !zero_product(x, y);
+                continue;
+            }
+            if GUARD {
+                let e = x.exponent as i64 + y.exponent as i64;
+                if e < emin || e > emax {
+                    miss = true;
+                    continue;
+                }
+            } else if len == 0 {
+                continue;
+            }
+            // SAFETY: output k owns `len` slots at `s` in both accumulators,
+            // sized by `acc_len` over a range holding this term's exponent
+            // sum (checked above, or scanned from these terms).
+            unsafe {
+                let accs = [pos.as_mut_ptr().add(s), neg.as_mut_ptr().add(s)];
+                add_term::<N>(accs, emin, len, N <= INLINE_N, (x, y), &mut scratch);
+            }
+        }
+        if miss {
+            missed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        parts.lock().unwrap()[c] = Some((pos, neg));
+    });
+    let mut parts = parts
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|part| part.expect("chunk scheduler skipped accumulation"));
+    if missed.into_inner() {
+        return None;
+    }
+    let (mut pos, mut neg) = parts.next().unwrap();
+    for (p, n) in parts {
+        // Slots carry nothing into the next output's slots.
+        add_slots(&mut pos, &p);
+        add_slots(&mut neg, &n);
+    }
+    for (k, &(s, len, emin, _)) in slots.iter().enumerate() {
+        if len > 0 {
+            out[k] = round_slots(&mut pos[s..s + len], &mut neg[s..s + len], emin);
+        }
+    }
+    Some(out)
 }
 
 /// Round `pos - neg` (bit 0 weighing 2^(emin - 2P)) once, nearest-even.
@@ -375,20 +590,76 @@ fn round_acc<const N: usize>(
 /// Zen part Zen 1's `MUL_TOOM22_THRESHOLD` of 16, so 1024-bit (16-limb)
 /// products went through Toom-22 (EPYC 7742 at 1024 bits: `toom22`, `add_n`
 /// and `sub_n` 12% of cycles); GMP's own Zen 2 tuning keeps the basecase
-/// through 18 limbs. The product is exact either way.
+/// through 18 limbs. On aarch64, GMP's `addmul_1` rows (one call per limb
+/// of `up`) run at about half the multiplier throughput; [`mul_rows`] takes
+/// those widths. The product is exact either way.
 ///
 /// # Safety
 /// `rp` holds `2N` limbs and does not overlap the `N`-limb inputs.
 #[inline(always)]
 pub(crate) unsafe fn mpn_mul_n<const N: usize>(rp: *mut u64, up: *const u64, vp: *const u64) {
+    #[cfg(target_arch = "aarch64")]
+    if N <= ROWS_N {
+        return mul_rows::<N>(rp, up, vp);
+    }
     #[cfg(target_arch = "x86_64")]
     if N < 19 {
         extern "C" {
-            fn __gmpn_mul_basecase(rp: *mut u64, up: *const u64, un: gmp::size_t, vp: *const u64, vn: gmp::size_t);
+            fn __gmpn_mul_basecase(
+                rp: *mut u64,
+                up: *const u64,
+                un: gmp::size_t,
+                vp: *const u64,
+                vn: gmp::size_t,
+            );
         }
         return __gmpn_mul_basecase(rp, up, N as _, vp, N as _);
     }
     gmp::mpn_mul_n(rp, up, vp, N as _);
+}
+
+/// `a + b + c` and its carry.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[inline(always)]
+fn adc(a: u64, b: u64, c: bool) -> (u64, bool) {
+    let (s, o1) = a.overflowing_add(b);
+    let (s, o2) = s.overflowing_add(c as u64);
+    (s, o1 | o2)
+}
+
+/// `rp[..2N] = up * vp` for `N <= ROWS_N` limbs, unrolled for constant `N`:
+/// each row's `N` products are formed first, then their low and high halves
+/// go in by two separate carry chains, so the multiplies of a row overlap
+/// instead of waiting on one chain as in GMP's `addmul_1`.
+///
+/// # Safety
+/// As [`mpn_mul_n`].
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[inline(always)]
+unsafe fn mul_rows<const N: usize>(rp: *mut u64, up: *const u64, vp: *const u64) {
+    debug_assert!(N <= ROWS_N);
+    let (a, b) = (&*(up as *const [u64; N]), &*(vp as *const [u64; N]));
+    let mut r = [0u64; 2 * ROWS_N];
+    for i in 0..N {
+        let (mut lo, mut hi) = ([0u64; N], [0u64; N]);
+        for j in 0..N {
+            let p = a[i] as u128 * b[j] as u128;
+            (lo[j], hi[j]) = (p as u64, (p >> 64) as u64);
+        }
+        // Rows 0..i fill limbs 0..i+N, so limb i+N takes the low carry and
+        // the high chain ends without one.
+        let mut c = false;
+        for j in 0..N {
+            (r[i + j], c) = adc(r[i + j], lo[j], c);
+        }
+        r[i + N] = c as u64;
+        let mut c = false;
+        for j in 0..N {
+            (r[i + 1 + j], c) = adc(r[i + 1 + j], hi[j], c);
+        }
+        debug_assert!(!c);
+    }
+    std::ptr::copy_nonoverlapping(r.as_ptr(), rp, 2 * N);
 }
 
 /// `out[..2N] = a * b` for `N`-limb little-endian mantissas: an inlined
@@ -432,54 +703,6 @@ pub(crate) fn with_limbs<const N: usize, R>(f: impl FnOnce(&mut [u64]) -> R) -> 
         f(&mut [0u64; 34])
     } else {
         f(&mut [0u64; 2 * MAX_N + 2])
-    }
-}
-
-/// `dst += (a * b) << shift` for `N`-limb mantissas, `shift < 64`, with the
-/// carry propagated through `dst`. Schoolbook product and shifted add are
-/// inlined for the const width: the exact integer result of GMP's
-/// `mpn_mul_n` + `mpn_lshift` + `mpn_add_n` without three calls per term.
-#[inline(always)]
-fn add_shifted_product<const N: usize>(
-    dst: &mut [u64],
-    a: &[u64; N],
-    b: &[u64; N],
-    shift: u32,
-    prod: &mut [u64],
-) {
-    {
-        let prod = &mut prod[..2 * N];
-        mul_limbs::<N>(a, b, prod);
-        let mut carry = false;
-        let mut add = |slot: &mut u64, v: u64| {
-            let (s, c1) = slot.overflowing_add(v);
-            let (s, c2) = s.overflowing_add(carry as u64);
-            *slot = s;
-            carry = c1 | c2;
-        };
-        let width = if shift == 0 {
-            for t in 0..2 * N {
-                add(&mut dst[t], prod[t]);
-            }
-            2 * N
-        } else {
-            add(&mut dst[0], prod[0] << shift);
-            for t in 1..2 * N {
-                add(
-                    &mut dst[t],
-                    (prod[t] << shift) | (prod[t - 1] >> (64 - shift)),
-                );
-            }
-            add(&mut dst[2 * N], prod[2 * N - 1] >> (64 - shift));
-            2 * N + 1
-        };
-        let mut t = width;
-        while carry {
-            let (s, c) = dst[t].overflowing_add(1);
-            dst[t] = s;
-            carry = c;
-            t += 1;
-        }
     }
 }
 
@@ -573,6 +796,50 @@ mod tests {
     use crate::integer::exact_product;
     use crate::MpFloat;
     use num_traits::{FromPrimitive, One, Zero};
+
+    // `mul_rows` against GMP over all-ones, one-hot and xorshift operands.
+    fn mul_rows_case<const N: usize>(seed: u64) {
+        let mut s = seed | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for case in 0..200 {
+            let (mut a, mut b) = ([0u64; N], [0u64; N]);
+            for j in 0..N {
+                (a[j], b[j]) = match case {
+                    0 => (u64::MAX, u64::MAX),
+                    1 => (u64::MAX, (j == N - 1) as u64),
+                    2 => ((j == 0) as u64 * u64::MAX, u64::MAX),
+                    _ => (next(), next()),
+                };
+            }
+            let (mut got, mut want) = ([0u64; 2 * super::MAX_N], [0u64; 2 * super::MAX_N]);
+            unsafe {
+                super::mul_rows::<N>(got.as_mut_ptr(), a.as_ptr(), b.as_ptr());
+                gmp_mpfr_sys::gmp::mpn_mul_n(want.as_mut_ptr(), a.as_ptr(), b.as_ptr(), N as _);
+            }
+            assert_eq!(got[..2 * N], want[..2 * N], "N={N} case={case}");
+        }
+    }
+
+    #[test]
+    fn mul_rows_matches_gmp() {
+        mul_rows_case::<1>(1);
+        mul_rows_case::<2>(2);
+        mul_rows_case::<3>(3);
+        mul_rows_case::<4>(4);
+        mul_rows_case::<5>(5);
+        mul_rows_case::<6>(6);
+        mul_rows_case::<7>(7);
+        mul_rows_case::<8>(8);
+        mul_rows_case::<9>(9);
+        mul_rows_case::<10>(10);
+        mul_rows_case::<11>(11);
+        mul_rows_case::<12>(12);
+    }
 
     // Deterministic xorshift values with a controllable exponent spread and
     // sign mix, including exact cancellation between terms.

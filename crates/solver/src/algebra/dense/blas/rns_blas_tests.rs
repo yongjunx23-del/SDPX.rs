@@ -143,6 +143,85 @@ fn residue_blas_gemm_matches_exact_dots_bitwise() {
     check::<16>(35, 37, 45, 90, 7); // packed upper tiles across the 32-column boundary
 }
 
+/// Right operands with zero inner runs (triangular, banded, whole zero
+/// tiles): the inner reach skips only exact zeros, and pooled column panels
+/// of one-prime groups give the serial bits.
+#[test]
+fn residue_blas_gemm_skips_zero_inner_terms() {
+    fn shaped<const N: usize>(rng: &mut Lcg, tb: u8, n: usize, k: usize, band: usize) -> Vec<F<N>> {
+        let br = if tb == b'N' { k } else { n };
+        let mut b = random::<N>(rng, k * n, 20);
+        for j in 0..n {
+            for p in 0..k {
+                if p < j || p > j + band || (32..64).contains(&j) {
+                    b[if tb == b'N' { p + j * br } else { j + p * br }] = F::zero();
+                }
+            }
+        }
+        b
+    }
+    fn run<const N: usize>(m: usize, n: usize, k: usize, seed: u64) {
+        let mut rng = Lcg(seed);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        for (ta, tb) in [(b'N', b'N'), (b'T', b'N'), (b'N', b'T'), (b'T', b'T')] {
+            let ar = if ta == b'N' { m } else { k };
+            let br = if tb == b'N' { k } else { n };
+            let a = random::<N>(&mut rng, m * k, 20);
+            let b = shaped::<N>(&mut rng, tb, n, k, k / 3);
+            let expect = reference(ta, tb, m, n, k, &a, ar, &b, br);
+            for upper in [false, true] {
+                for pool in [None, Some(&pool)] {
+                    let mut got = vec![F::zero(); m * n];
+                    assert!(gemm(
+                        ta, tb, m, n, k, &a, ar, &b, br, upper, pool, &mut got, None
+                    ));
+                    for j in 0..n {
+                        for i in 0..if upper { (j + 1).min(m) } else { m } {
+                            let (x, y) = (&got[i + j * m], &expect[i + j * m]);
+                            assert!(x == y || (x.is_zero() && y.is_zero()), "{i} {j}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    run::<4>(37, 100, 90, 11);
+    run::<2>(20, 70, 130, 12);
+    // Operands above the residue-scratch cap: one-prime groups, so the
+    // pool splits each prime's columns.
+    let (n, mut rng) = (520, Lcg(13));
+    let a = random::<2>(&mut rng, n * n, 20);
+    let b = shaped::<2>(&mut rng, b'N', n, n, n);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(3)
+        .build()
+        .unwrap();
+    let product = |upper: bool, pool: Option<&rayon::ThreadPool>| {
+        let mut c = vec![F::zero(); n * n];
+        assert!(gemm(
+            b'T', b'N', n, n, n, &a, n, &b, n, upper, pool, &mut c, None
+        ));
+        c
+    };
+    for upper in [false, true] {
+        let (serial, split) = (product(upper, None), product(upper, Some(&pool)));
+        assert!(serial
+            .iter()
+            .zip(&split)
+            .all(|(x, y)| x == y || (x.is_zero() && y.is_zero())));
+        for (i, j) in (0..64).map(|t| ((t * 97) % n, (t * 131 + 7) % n)) {
+            let i = if upper { i.min(j) } else { i };
+            let at = |p: usize| &a[p + i * n];
+            let y = F::dot_fma((0..n).map(|p| (at(p), &b[p + j * n])));
+            let x = &serial[i + j * n];
+            assert!(*x == y || (x.is_zero() && y.is_zero()), "{i} {j}");
+        }
+    }
+}
+
 #[test]
 fn residue_blas_gemm_chunks_long_inner_dimension() {
     // A long inner dimension selects narrower primes.
@@ -660,8 +739,10 @@ fn check_diag_congruence<const N: usize, const M: usize>(
 fn residue_diag_congruence_is_exact_rounded_once() {
     check_diag_congruence::<2, 8>(5, 200, 30, 21);
     check_diag_congruence::<4, 16>(7, 300, 40, 22);
-    // Longer than one 4096-row block.
+    // Several row blocks.
     check_diag_congruence::<2, 8>(3, 5000, 20, 23);
+    // Primes sized by the block are wider than all 9000 rows allow.
+    check_diag_congruence::<2, 8>(3, 9000, 20, 24);
 }
 
 #[test]

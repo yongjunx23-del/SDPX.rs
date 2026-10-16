@@ -114,6 +114,10 @@ impl<T: FloatT> ConeCollection<T> for OwnedCones<T> {
         let local = self.blocks.iter().all(|c| !c.barrier_backtrack());
         !self.collective.all_true(708, local).unwrap_or(false)
     }
+    fn has_correctable(&self) -> bool {
+        let local = self.blocks.iter().all(|c| !c.has_correctable());
+        !self.collective.all_true(709, local).unwrap_or(true)
+    }
     fn supports_primal_dual(&self) -> bool {
         let local = self.blocks.iter().all(|c| c.allows_primal_dual_scaling());
         self.collective.all_true(471, local).unwrap_or(false)
@@ -286,6 +290,47 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         self.border_s.fill(T::zero());
         self.refresh_border_from_owner_zero();
         step.refresh_border_from_owner_zero();
+    }
+    fn centrality_correction(
+        &mut self,
+        step: &Self,
+        variables: &Self,
+        cones: &mut Self::C,
+        alpha: T,
+        sigma_mu: T,
+    ) -> bool {
+        // Each owner block corrects its own orthant and second-order rows as
+        // `DefaultVariables` does; border rows are equalities and keep their
+        // right-hand side. τκ is replicated, so every rank corrects it alike.
+        let (lo, hi) = (sigma_mu * (0.1).as_T(), sigma_mu * (10.0).as_T());
+        let mut flags = vec![false; self.blocks.len()];
+        debug_assert!(cones.pool.is_none() || owner_cone_pools_ok(&cones.blocks));
+        for_blocks!(
+            cones.pool.as_ref(),
+            (
+                &mut self.blocks,
+                &variables.blocks,
+                &mut cones.blocks,
+                &step.blocks,
+                &mut flags
+            ),
+            |(out, v, c, d, flag)| {
+                *flag = c.centrality_correction(&mut out.s, &v.s, &v.z, &d.s, &d.z, alpha, lo, hi)
+            }
+        );
+        let mut changed = flags.contains(&true);
+        let v = (variables.tau + alpha * step.tau) * (variables.kappa + alpha * step.kappa);
+        if let (false, Some(t)) = (
+            variables.fixed_tau,
+            crate::solver::default::band_correction(v, lo, hi),
+        ) {
+            self.kappa -= t;
+            for block in &mut self.blocks {
+                block.κ = self.kappa;
+            }
+            changed = true;
+        }
+        !self.collective.all_true(710, !changed).unwrap_or(true)
     }
     fn calc_step_length(
         &self,
@@ -495,7 +540,12 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         for v in &mut self.blocks {
             v.keep_start_side(dual);
         }
-        if dual { &mut self.border_z } else { &mut self.border_s }.scale(tau);
+        if dual {
+            &mut self.border_z
+        } else {
+            &mut self.border_s
+        }
+        .scale(tau);
         self.kappa = T::one();
     }
     fn tau(&self) -> Option<T> {
