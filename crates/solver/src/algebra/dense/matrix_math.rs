@@ -175,20 +175,23 @@ where
         dst[col] = src[col];
         idx += col + 1;
     }
-    for_upper_tiles(n, |i, j| a[j + i * n] = a[i + j * n]);
+    for_upper_tiles(n, |rows, j| {
+        for i in rows {
+            a[j + i * n] = a[i + j * n];
+        }
+    });
 }
 
-/// Visit each strict upper-triangle pair `(i, j)`, `i < j`, of an `n × n`
-/// matrix in square tiles, so the transposed accesses stay in cache.
+/// Visit the strict upper triangle (`i < j`) of an `n × n` matrix in square
+/// tiles, so the transposed accesses stay in cache: `f(rows, j)` per tile
+/// column.
 #[inline(always)]
-fn for_upper_tiles(n: usize, mut f: impl FnMut(usize, usize)) {
+fn for_upper_tiles(n: usize, mut f: impl FnMut(std::ops::Range<usize>, usize)) {
     const TILE: usize = 16;
     for jb in (0..n).step_by(TILE) {
         for ib in (0..=jb).step_by(TILE) {
             for j in jb..(jb + TILE).min(n) {
-                for i in ib..(ib + TILE).min(j) {
-                    f(i, j);
-                }
+                f(ib..(ib + TILE).min(j), j);
             }
         }
     }
@@ -204,9 +207,11 @@ pub(crate) fn symmetrize_svec<T: FloatT>(dst: &mut Matrix<T>, src: &Matrix<T>) {
         T::zero()
     };
     let (d, a) = (dst.data_mut(), src.data());
-    for_upper_tiles(n, |i, j| {
-        let v = (a[i + j * n] + a[j + i * n]) * scale * scale;
-        (d[i + j * n], d[j + i * n]) = (v, v);
+    for_upper_tiles(n, |rows, j| {
+        for i in rows {
+            let v = (a[i + j * n] + a[j + i * n]) * scale * scale;
+            (d[i + j * n], d[j + i * n]) = (v, v);
+        }
     });
     for j in 0..n {
         d[j * (n + 1)] = a[j * (n + 1)];
@@ -225,8 +230,11 @@ where
         T::zero()
     };
     if let Some(a) = M.plain_data() {
-        for_upper_tiles(n, |i, j| {
-            x[triangular_number(j) + i] = (a[i + j * n] + a[j + i * n]) * scale
+        for_upper_tiles(n, |rows, j| {
+            let base = triangular_number(j);
+            for i in rows {
+                x[base + i] = (a[i + j * n] + a[j + i * n]) * scale;
+            }
         });
         for j in 0..n {
             x[triangular_number(j) + j] = a[j * (n + 1)];
