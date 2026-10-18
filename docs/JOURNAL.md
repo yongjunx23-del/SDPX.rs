@@ -8,6 +8,17 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — Upper-only dense Schur transform (rejected: gpp250-1 loses its solves)
+
+- Hypothesis: the dense Schur transform forms the full product (G·Aⱼ)·G for each wide column, then packs every off-diagonal pair as (aᵢⱼ + aⱼᵢ)/√2. Packing (aᵢⱼ + aᵢⱼ)/√2 from the upper entry would need only half the GEMM. The transform is 45% of planted80 (Mac 21.3 of 47.3 ms), 18% of control3 and 5.6% of arch0.
+- Change (binary64, blocks from n = 64): 32-column upper panels per stacked block, the last panel stacked across the chunk, the narrow-support kernel restricted to the upper tiles, and upper packing. Below n = 64, per-block calls cost more than they save (qap6, n = 37, got slower) and those blocks stayed bitwise unchanged.
+- Result: all 17 local SDPs pass the audit except gpp250-1, which ends AlmostSolved at 18 iterations. Six jittered static regularizations (1e-8·(1 + r·1e-6)) on gpp250-1:
+  - this change: AlmostSolved 4 of 6 (18–20 iterations);
+  - the base (f51136b): Solved 6 of 6 (21–25 iterations);
+  - the A18 band eigensolve: Solved 6 of 6 (20–23 iterations).
+  Averaging the two independently rounded triangles matters for the late, ill-conditioned Schur complements. Mac timings were not decidable: another process was loading the machine.
+- Decision: rejected. Patch `~/.cache/sdpx-e2e/patches/upper-transform-rejected.patch`. A15/A16 differ: those products are exactly symmetric before rounding and keep each upper entry's own rounding, while this change replaced the pair average.
+
 ## 2026-10-18 — Column pairing in the two-RHS QDLDL solve (kept); paired symv dot chains (rejected)
 
 - Change: `_solve_rows::<2>` (`solve_many`) pairs independent adjacent columns of its backward sweep the same way as A19, giving four add chains in flight.
