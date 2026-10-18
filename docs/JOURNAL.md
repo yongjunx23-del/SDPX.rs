@@ -8,6 +8,16 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — Register-accumulated G·Aⱼ in the dense Schur transform (kept, thermal-ore)
+
+- Hypothesis: `coefficient_product` (G·Aⱼ by column AXPYs) zero-fills each n×n panel, then read-modify-writes its output column once per term. In the Mac planted80 profile (n = 80, ~300 terms per column; `#[inline(never)]` split) it is the largest piece of the assembly: 779 of 2904 samples, against 588 for the GEMM, 416 for packing and ~1070 for the dot accumulation.
+- Change: the plan is sorted by output column, so each column's terms are contiguous. Each output element now folds the same terms in the same order from +0 in 16-row register blocks and is stored once. The last block overlaps the previous one and rewrites equal values. Blocks with n < 16 fold into their zeroed column, as before. Columns without terms are zero-filled.
+- Result: bitwise identical on 17 local SDPs, medium (b54b58300d4c) and ising11 (b971aee3cf2d, audit PASS). Mac T=1, 5 interleaved reps, median against f51136b:
+  - planted80 53.0 → 50.4 ms (−4.9%), control3 26.9 → 26.2 ms (−2.6%);
+  - gpp100 −0.6%; qap6, mcp250-1, truss2 and theta1 within ±0.5%; theta2 +0.8% (its columns take the sparse Schur path and never call this code).
+- Rejected variants: 32-row blocks (control3 +2.6%: its n = 30 and n = 15 blocks fell to the slow path); a scalar tail that recomputes each term's coefficient per row (control3 +15%).
+- Decision: kept (A20). Mac gains under 5% stay provisional until an x86 run.
+
 ## 2026-10-18 — Upper-only dense Schur transform (rejected: gpp250-1 loses its solves)
 
 - Hypothesis: the dense Schur transform forms the full product (G·Aⱼ)·G for each wide column, then packs every off-diagonal pair as (aᵢⱼ + aⱼᵢ)/√2. Packing (aᵢⱼ + aᵢⱼ)/√2 from the upper entry would need only half the GEMM. The transform is 45% of planted80 (Mac 21.3 of 47.3 ms), 18% of control3 and 5.6% of arch0.

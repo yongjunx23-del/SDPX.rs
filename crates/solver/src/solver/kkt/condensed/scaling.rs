@@ -23,21 +23,51 @@ pub(super) fn coefficient_product<T: FloatT>(
     } else {
         T::zero()
     };
-    for q in 0..n {
-        output[q * ld + offset..q * ld + offset + n].fill(T::zero());
-    }
-    for &(q, p, eidx) in plan {
+    let coefficient = |&(_, p, eidx): &(u32, u32, u32)| {
         let e = &column.entries[eidx as usize];
         let v = if e.i == e.j {
             values[e.position]
         } else {
             values[e.position] * inv_sqrt2
         };
-        let dst = &mut output[q as usize * ld + offset..q as usize * ld + offset + n];
-        let src = &g.data()[p as usize * n..(p as usize + 1) * n];
-        for (x, &y) in dst.iter_mut().zip(src) {
-            *x = v.mul_add(y, *x);
+        (v, &g.data()[p as usize * n..(p as usize + 1) * n])
+    };
+    // The plan is sorted by output column. Each output element folds its
+    // column's terms in plan order from zero, as AXPYs into a zeroed column
+    // do, but in registers: one store per element instead of one per term.
+    // A block shorter than R folds into its zeroed column; otherwise the last
+    // register block overlaps the previous one and rewrites equal values.
+    const R: usize = 16;
+    let mut next = 0;
+    for terms in plan.chunk_by(|a, b| a.0 == b.0) {
+        let q = terms[0].0 as usize;
+        for z in next..q {
+            output[z * ld + offset..z * ld + offset + n].fill(T::zero());
         }
+        let dst = &mut output[q * ld + offset..q * ld + offset + n];
+        let fold = |acc: &mut [T], r0: usize| {
+            for t in terms {
+                let (v, src) = coefficient(t);
+                for (a, &y) in acc.iter_mut().zip(&src[r0..]) {
+                    *a = v.mul_add(y, *a);
+                }
+            }
+        };
+        if n < R {
+            dst.fill(T::zero());
+            fold(dst, 0);
+        } else {
+            for r0 in (0..n).step_by(R) {
+                let r0 = r0.min(n - R);
+                let mut acc = [T::zero(); R];
+                fold(&mut acc, r0);
+                dst[r0..r0 + R].copy_from_slice(&acc);
+            }
+        }
+        next = q + 1;
+    }
+    for z in next..n {
+        output[z * ld + offset..z * ld + offset + n].fill(T::zero());
     }
 }
 
