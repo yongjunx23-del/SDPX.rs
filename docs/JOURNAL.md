@@ -8,6 +8,18 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — x86 job t23: A16 confirmed, band eigensolve (A18) rejected (thermal-ore)
+
+- Setup: job 226619, node7 (singlejob, governor conservative), T=1 and T=16.
+  - Part U: to8c (27e10aa) → to8d (0d1e5a4, A16), 21 SDPs, 3 reps, min.
+  - Part E: to8d → to8e (+ `band-eigen.patch`), 21 SDPs × 8 jitters of the static regularization (1e-8·(1 + r·1e-6)), plus gpp500-1 × 4 at T=16. `native_oracle` audits of the r0 points.
+- Part U (A16): bitwise on all 21 SDPs; geomean 0.979 (T=1) and 0.968 (T=16). qap6 −9.7%, planted80 −3.1%, arch0 −2.3%, gpp124-1 −1.8%/−4.1%, gpp100 −1.6%/−3.3%. Confirmed.
+- Part E (A18):
+  - Statuses: gpp250-1 ends AlmostSolved in 2 of 8 jitters with the band eigensolve (35 and 41 iterations), 0 of 8 on the base. gpp124-1 is the reverse (base 1 of 8, band 0). The hinf family is AlmostSolved on both arms (hinf1 2/2, hinf2 4/1, hinf3 5/5 of 8).
+  - Audits: identical across arms. truss2, hinf2, hinf3 and gpp500-1 miss only the oracle's strict √eps gate and pass the 1e-6 audit.
+  - Time, jitter geomean: 1.020 (T=1) and 0.984 (T=16). Large blocks gain (gpp100 −11%/−12%, gpp124-1 −11%/−13%, arch0 −7.5%), but gpp250-1 is +7% from its long AlmostSolved runs. Small blocks lose (hinf2 +22%, truss1 +25%, qap5 +7%, control3 +6% at T=1).
+- Decision: A18 rejected, because an accuracy loss on gpp250-1 does not count as a speed win. A retry would need gpp250-1 Solved under jitter; a size gate would only address the small-block loss.
+
 ## 2026-10-18 — x86 job t22: A10–A15 confirmed, dgesdd rejected, A13 regresses (thermal-ore)
 
 - Setup: job 226609, node7 (singlejob, governor conservative), T=1 and T=16, `OPENBLAS_NUM_THREADS=1`, point hashes per run.
