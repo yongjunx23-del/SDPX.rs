@@ -8,6 +8,13 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — F64-USYM fix: the last panel takes the remainder (kept)
+
+- Observed: once arch0, gpp250-1, mcp500-1 and hinf3 were fetched locally, arch0 (PSD block n = 161) changed points under A15: same status and 22 iterations, different hash. Its last panel was one column wide, and Accelerate computes a one-column gemm with a kernel that rounds differently. The 10 SDPs checked first had no such narrow panel.
+- Change: `n / 32` panels, the last one taking the remainder (32–63 columns). Below n = 32 there is a single full call.
+- Result: points are bitwise identical to the pre-A15 build on all 17 local SDPs (arch0 included) and medium. Single T=1 runs: gpp250-1 1282 → 1218 ms (−5%), arch0 417 → 402 (−3.6%).
+- Decision: kept. The x86 run builds this version.
+
 ## 2026-10-18 — Binary64 symmetric products over upper column panels (kept, provisional on x86; u32 QDLDL indices rejected)
 
 - Observed: the x86 receipts of job 226592 (gpp100, T=1) put the condensed H-apply scalings at 162 of 405 ms. Those are `prepare_rhs.scaling`, `recover_rhs.scaling` and `residual.scale`, at about 255 µs per n = 100 apply, against 49 µs on the Mac. LAPACK phases are only 1.3–1.5× slower on x86. Each binary64 apply runs four n³ GEMMs. The second GEMM of each congruence (`pooled_gemm_sym`) computes the full product and then overwrites the lower triangle with the mirrored upper one.

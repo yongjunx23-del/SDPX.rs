@@ -323,10 +323,14 @@ pub(crate) fn pooled_gemm_sym_cached<T: FloatT, MATA, MATB>(
         // down to its last row (every entry is the dot product the full
         // product computes), then mirror the upper triangle so the result
         // is exactly symmetric.
+        // The last panel takes the remainder: a narrow call (one column on
+        // arch0's n = 161) runs another BLAS kernel and rounds differently.
         const PANEL: usize = 32;
         let cdata = c.data_mut();
-        for j0 in (0..n).step_by(PANEL) {
-            let j1 = (j0 + PANEL).min(n);
+        let panels = (n / PANEL).max(1);
+        for p in 0..panels {
+            let j0 = p * PANEL;
+            let j1 = if p + 1 == panels { n } else { j0 + PANEL };
             let b0 = if b.shape() == MatrixShape::N {
                 j0 * ldb
             } else {
