@@ -8,6 +8,32 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — Binary64 PSD step admission by Cholesky, capped components, contiguous correction rebuild (kept, thermal-ore)
+
+- Hypothesis: the curve trials and the corrector's 1% gain test only need a yes/no answer. A Cholesky of I + α·Δ̃ gives that answer at a fraction of the cost of the eigensolve (Mac dpotrf against dsyevr: n = 8 0.25 vs 1.4 µs, n = 101 12 vs 263 µs). The same test settles a step-length component whose cap does not bind. Callers only use min(αz, αs), so in binary64 the s component can take αz as its cap.
+- Change:
+  - `Variables::step_admits` (default `None`). `DefaultVariables` answers for binary64 symmetric cones with a PSD block of n ≥ 8, through `CompositeCone::step_admits`; PSD cones run one Cholesky per side. Trials use it in place of `calc_step_length`. The corrector computes its step length only after the test admits the 1% gain.
+  - `step_length_psd_component` (binary64, n > 3) returns αmax after a successful Cholesky at αmax, before the eigensolve.
+  - The serial binary64 `step_length` and `prepare_affine_bounds` cap the s component at αz.
+  - The `centrality_correction` rebuild sums the corrected eigenpairs from contiguous scaled columns, in the same order (bitwise).
+- Size gate: without it, SDP_truss2 (33 blocks of n = 4) lost 6% on the Mac. Its corrector step length went 0.275 → 0.521 ms: at n = 4, the W congruence that the test repeats costs as much as the whole step length, so an accepted corrector paid twice. With n ≥ 8, truss2 and truss4 match HEAD (min of 7: 5.33 vs 5.35 ms, 0.76 vs 0.75 ms).
+- Result: points are bitwise identical to HEAD.
+  - x86, job 226585: node7, release, `to7a` (HEAD) against `to7e` (before the size gate); 21 binary64 SDPs at T=1 and T=16, ABBA, 5 reps (gpp250-1 3); point hashes; r0 audited.
+  - Local: medium (b54b58300d4c) and ising11 (b971aee3cf2d).
+  - Min-of-reps API geomean: 0.953 at T=1 and 0.924 at T=16. Medians give 0.975 and 0.954; within one arm the node spreads ±25% on sub-200 ms cases.
+  - Per-case min ratios at T=1: gpp100 0.90, gpp124-1 0.94, gpp250-1 0.97, arch0 0.96, theta1 0.86, control2 0.73, qap5 0.74, mcp500-1 0.96. The affine + final step-length phases fall to 0.65–0.93 everywhere except the truss cases.
+  - On the Mac, gpp100 eigensolves fall from 204 to 73, plus 41 capped tests.
+- Decision: kept. Open, as job 226592 (jittered static regularization, four arms): dsyevd vectors in the correction, and dgesdd for square binary64 SVDs from n = 40 (Mac n = 501: 15.7 vs 46.5 ms). Both are non-bitwise. Patches are in `~/.cache/sdpx-e2e/patches/evd-dsyevd.patch` and `gesdd.patch`.
+
+## 2026-10-18 — Binary64 PSD: split congruence, static regularization, 'I'-range eigmin (all rejected, thermal-ore)
+
+- Split congruence (`to7b`): op(a)·X·op(a)ᵀ as `trmm` with X's halved lower triangle plus `syr2k`, 3n³ instead of two 4n³ GEMMs, in the condensed H-apply and `mul_Wx`. Job 226577, node7, release, 22 binary64 SDPs, ABBA, 5 reps (gpp250-1 3), r0 audited. Geomean against `to7a` (HEAD): 1.042 at T=1, 1.070 at T=16. Iteration counts move both ways: gpp124-1 31 → 24 (0.69), gpp100 20 → 23 (1.28), gpp250-1 20 → 25 (1.47), hinf1 20 → 22; hinf3 becomes Solved. control3 is 1.33 at equal iterations, so OpenBLAS `dtrmm`/`dsyr2k` are slower per flop than `dgemm` at these sizes. On the Mac, Accelerate's versions lose too at small n (qap6 n = 37: 33 → 44 ms). Rejected; patch `~/.cache/sdpx-e2e/patches/split-admit-full.patch`.
+- Static regularization (contract item; job 226579, node30, `to7a`, 58 cases, T=1, 3 reps, r0 audited by `native_oracle.jl`):
+  - 1e-9: geomean 0.973. hinf3 and sched_100_50_orig become audited solves. nql30, nql60 and sched_100_100_orig become AlmostSolved (three current wins against MOSEK).
+  - 1e-10: geomean 1.011. agg 0.67 and gpp124-1 0.57 (31 → 23 it), but beaconfd 8 → 17 it (2.09). hinf1 becomes AlmostSolved, sched_50_50_orig InsufficientProgress and f64_large NumericalError.
+  - LP refinement counts fall with the constant (agg 436 → 130 refinements), but the iteration paths of several SOCP and LP cases depend on it. No constant beats 1e-8 without new failures. The default stays.
+- 'I'-range eigmin in binary64 (`syevr` index 1 instead of the full spectrum; Mac `syevr` n = 101: 171 against 242 µs). Mac T=1: gpp100 21 → 23 it (+12%), qap6 22 → 23 (+7.5%), gpp124-1 24 → 23 (−8%), theta2 −6%. The ulp-level change in λmin moves iteration counts, as the comment in `eigval_min` says. Rejected; the full-spectrum path stays.
+
 ## 2026-10-18 — F64-THR follow-up: no solve pin without a pool (rejected); run-order clock bias
 
 - Hypothesis: a pool-less solve pinned to the first CPU leaves the core its setup warmed.
