@@ -8,6 +8,27 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — F64-THR follow-up: no solve pin without a pool (rejected); run-order clock bias
+
+- Hypothesis: a pool-less solve pinned to the first CPU leaves the core its setup warmed.
+- Test (job 226574, node7, `to6y` with `SDPX_X_PIN` first/none, 12 pool-less cases, 9 reps interleaved t1, t16first, t16none): none/first, median ratio:
+
+  | Case | none/first |
+  |---|---|
+  | chainsing_1000_1/2/3 | 0.89 / 0.96 / 0.83 |
+  | qssp30 | 0.91 |
+  | nql60 | 1.03 |
+  | sched_100_50_orig | 0.89 |
+  | nb | 0.98 |
+  | nb_L2_bessel | 0.96 |
+  | arch0 | 1.02 |
+  | control3 | 1.18 |
+  | mcp250-1 | 1.08 |
+  | qap6 | 1.45 |
+
+  The geometric mean is 1.005. Rejected.
+- Run-order bias: `cpus.py` puts both T=1 and the pinned T=16 solves on CPU 0. Every T=16 configuration runs right after another run on CPU 0, so that core is already clocked up. The T=1 run comes after the previous case's unpinned run. LP_agg T=1 takes 54 ms against 25 ms at T=16, with identical counters (29 factorizations, 570 solves) and both serial. So T=16/T=1 ratios of sub-200 ms cases flatter T=16. Pinned "first" also beats "cur" and "none" partly because CPU 0 is the warm core. Configurations compared within one rep run in the same warm position (base and rule in job 226573), so the F64-THR ratios against base stand. A protocol with an idle gap or a rotated order would be needed to settle the pin target.
+
 ## 2026-10-18 — B3 F64-THR: binary64 cone lanes and pools from measured work (kept, thermal-ore)
 
 - Observed (x86, conservative governor, 1.5–2.25 GHz nominal, about 3 GHz boost; jobs 226539, 226543 and 226544 on node9): at 16 threads Float64 solves ran up to 2× slower than at one thread.
