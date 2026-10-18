@@ -8,6 +8,14 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — Binary64 symmetric products over upper column panels (kept, provisional on x86; u32 QDLDL indices rejected)
+
+- Observed: the x86 receipts of job 226592 (gpp100, T=1) put the condensed H-apply scalings at 162 of 405 ms. Those are `prepare_rhs.scaling`, `recover_rhs.scaling` and `residual.scale`, at about 255 µs per n = 100 apply, against 49 µs on the Mac. LAPACK phases are only 1.3–1.5× slower on x86. Each binary64 apply runs four n³ GEMMs. The second GEMM of each congruence (`pooled_gemm_sym`) computes the full product and then overwrites the lower triangle with the mirrored upper one.
+- Change: `pooled_gemm_sym_cached` in binary64 calls BLAS gemm on 32-column panels, each only down to its last row, then mirrors in 16×16 tiles. Each upper entry is the same BLAS dot product as in the full call.
+- Result: points are bitwise identical on 10 local SDPs and medium (Accelerate). Mac, T=1, 5 reps, median: gpp100 137.3 → 134.6 ms (−2.0%), gpp124-1 287.8 → 281.7 (−2.1%); theta2 and mcp250-1 unchanged.
+- Decision: kept, provisional until the x86 run confirms OpenBLAS gives bitwise identical points and a larger gain there.
+- Rejected in the same session: a u32 copy of QDLDL's row indices for the replayed factor and the serial solves. Points were bitwise identical, but timings were mixed (nql60 −5.8%, nql30 −2%, LP_bnl1 +2.7%, sched_50_50_scaled +2%, LP_agg +8%) and it cost another 4 B per nnz(L).
+
 ## 2026-10-18 — Jittered x86 A/B of dsyevd correction vectors and dgesdd SVDs (dsyevd rejected; dgesdd open)
 
 - Setup (job 226592, node7, governor conservative): 20 binary64 SDPs plus gpp250-1 and gpp500-1, T=1 and T=16. Five reps per case (three for gpp250-1, two for gpp500-1, T=16 only), each at static regularization 1e-8·(1 + r·1e-6), with arm order rotated per rep. `native_oracle` audits the r0 points. Arms:

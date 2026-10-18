@@ -314,21 +314,47 @@ pub(crate) fn pooled_gemm_sym_cached<T: FloatT, MATA, MATB>(
 {
     let (m, n, k) = (a.nrows(), b.ncols(), a.ncols());
     debug_assert_eq!(m, n);
-    if T::precision_bits() <= 64 {
-        // Primitive floats: exact-arithmetic-symmetric product via BLAS gemm,
-        // then mirror the upper triangle so the result is exactly symmetric.
-        c.mul(a, b, T::one(), T::zero());
-        for j in 0..n {
-            for i in j + 1..n {
-                c[(i, j)] = c[(j, i)];
-            }
-        }
-        return;
-    }
     let (ta, tb) = (a.shape().as_blas_char(), b.shape().as_blas_char());
     let lda = if a.shape() == MatrixShape::N { m } else { k };
     let ldb = if b.shape() == MatrixShape::N { k } else { n };
     let (adata, bdata) = (a.data(), b.data());
+    if T::precision_bits() <= 64 {
+        // Primitive floats: BLAS gemm over column panels, each panel only
+        // down to its last row (every entry is the dot product the full
+        // product computes), then mirror the upper triangle so the result
+        // is exactly symmetric.
+        const PANEL: usize = 32;
+        let cdata = c.data_mut();
+        for j0 in (0..n).step_by(PANEL) {
+            let j1 = (j0 + PANEL).min(n);
+            let b0 = if b.shape() == MatrixShape::N {
+                j0 * ldb
+            } else {
+                j0
+            };
+            T::xgemm(
+                ta,
+                tb,
+                i32::try_from(j1).unwrap(),
+                i32::try_from(j1 - j0).unwrap(),
+                i32::try_from(k).unwrap(),
+                T::one(),
+                adata,
+                i32::try_from(lda).unwrap(),
+                &bdata[b0..],
+                i32::try_from(ldb).unwrap(),
+                T::zero(),
+                &mut cdata[j0 * m..],
+                i32::try_from(m).unwrap(),
+            );
+        }
+        for_upper_tiles(n, |rows, j| {
+            for i in rows {
+                cdata[j + i * n] = cdata[i + j * n];
+            }
+        });
+        return;
+    }
     // Exact residue-BLAS product: same correctly rounded values as the
     // per-entry exact dots below.
     if T::xgemm_upper_exact(
