@@ -88,6 +88,25 @@ fn congruence_sym<T: FloatT>(
     }
 }
 
+/// Primitive-float [`congruence_sym`] leaving only the upper triangle of `c`
+/// defined (the same entries, without the mirror).
+fn congruence_upper<T: FloatT>(
+    c: &mut Matrix<T>,
+    a: &Matrix<T>,
+    transpose_a: bool,
+    x: &Matrix<T>,
+    work: &mut Matrix<T>,
+    gemm: Option<(&rayon::ThreadPool, usize)>,
+) {
+    if transpose_a {
+        pooled_gemm(work, &a.t(), x, gemm);
+        gemm_sym_upper(c, work, a);
+    } else {
+        pooled_gemm(work, x, &a.t(), gemm);
+        gemm_sym_upper(c, a, work);
+    }
+}
+
 /// Lane-private panels for the chunk-parallel dense transform. A lane keeps
 /// its matrices across every chunk it owns, so the number of live panel
 /// allocations is bounded by the lane count rather than by the chunk count.
@@ -1685,11 +1704,11 @@ impl<T: FloatT> PsdBlock<T> {
                 } else {
                     (&self.R, true, false)
                 };
-                let cache = &mut self.rinv_cache;
-                congruence_sym(&mut w.mat3, r, first, &w.mat1, &mut w.mat2, gemm, cache);
+                // Both consumers read only the upper triangles of `mat3`.
+                congruence_upper(&mut w.mat3, r, first, &w.mat1, &mut w.mat2, gemm);
                 symmetrize_svec(&mut w.mat1, &w.mat3);
-                congruence_sym(&mut w.mat3, r, second, &w.mat1, &mut w.mat2, gemm, cache);
-                mat_to_svec(y, &w.mat3);
+                congruence_upper(&mut w.mat3, r, second, &w.mat1, &mut w.mat2, gemm);
+                upper_to_svec(y, &w.mat3);
                 return;
             }
             // `g` is stored exactly symmetric, so `x·gᵀ` equals the former `x·g`.

@@ -8,6 +8,13 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — Binary64 H-apply reads only upper triangles (kept, thermal-ore)
+
+- Observed: a Mac repeat profile of gpp100 at 27e10aa puts `PsdBlock::apply` at about 20% of the solve. Within it, 459 of 812 samples are GEMM and 353 are O(n²) passes: two mirrors inside `pooled_gemm_sym` (112), `symmetrize_svec` (88), `mat_to_svec` (82) and `svec_to_mat` (71). Both consumers of each mirrored product read the pair `(a_ij + a_ji)`, and after the mirror that pair equals `(a_ij + a_ij)`.
+- Change: the binary64 apply calls `gemm_sym_upper` (the A15 panel loop, factored out of `pooled_gemm_sym_cached`) with no mirror. `symmetrize_svec` reads only the upper triangle. The final product is packed by `upper_to_svec`, a contiguous column copy computing `(v + v)·(1/√2)`.
+- Result: points are bitwise identical on all 17 local SDPs; medium is Solved in 15 iterations, audit PASS, hash b54b58300d4c. Mac, T=1, 5 interleaved reps, median vs 27e10aa: gpp100 135.1 → 129.3 ms (−4.3%), gpp124-1 282.1 → 271.2 (−3.9%), arch0 384.8 → 371.6 (−3.4%), qap6 30.6 → 29.7 (−2.9%), gpp250-1 1219.6 → 1190.7 (−2.4%), theta2 61.3 → 59.9 (−2.3%), control3 28.5 → 27.9 (−2.1%).
+- Decision: kept. The same bitwise argument holds on any BLAS. Under 5% on the Mac, so x86 confirmation is pending.
+
 ## 2026-10-18 — F64-USYM fix: the last panel takes the remainder (kept)
 
 - Observed: once arch0, gpp250-1, mcp500-1 and hinf3 were fetched locally, arch0 (PSD block n = 161) changed points under A15: same status and 22 iterations, different hash. Its last panel was one column wide, and Accelerate computes a one-column gemm with a kernel that rounds differently. The 10 SDPs checked first had no such narrow panel.
