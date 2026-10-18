@@ -8,6 +8,19 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — QDLDL refactors sweep fundamental supernode pairs together (kept, thermal-ore)
+
+- Hypothesis: the up-looking QDLDL factor scatters each column of row k's pattern into y separately. For a fundamental supernode pair (c + 1 is c's parent, and c has exactly one more nonzero), both columns update the same rows. One sweep could apply c's term, then c + 1's, to each row and touch y once.
+- Change (`_factor_inner`):
+  - The first factorization marks such pairs with a high bit in the recorded row pattern when c directly precedes c + 1 in a row's elimination order.
+  - Refactor replays sweep a marked pair at once. They first take c's term into y[c + 1], then compute y[i] = (y[i] − L[i,c]·y_c) − L[i,c+1]·y_{c+1} per row: the same products and subtractions in the same order.
+  - A first version that tested etree/Lnz for every column visit cost sched_100_100 +3.1% (5% of its terms paired). Recording the bit removes that overhead (+1.0%).
+- Share of paired factor terms: nql60 98.5%, bnl1 71%, qssp30 66%, agg 63%, sched_100_100 5%, nb under 1% (its adjacent columns are rarely parent and child).
+- Result: bitwise identical on all 39 local LP/SOCP inputs, the five 1e8-floor inputs, medium (b54b58300d4c), ising11 (b971aee3cf2d) and csdr3 (71603237737a). Mac T=1, 5 interleaved reps, median against 9d969d3:
+  - nql60 228.4 → 197.8 ms (−13.4%), nql30 −9.6%, qssp30 −5.7%, bnl1 −3.7%, agg −1.7%;
+  - chainsing_1000_2 +0.5%, sched_100_100 +1.0%, nb (floor arm) −1.3%.
+- Decision: kept (A21). Provisional on x86 for the gains under 5%.
+
 ## 2026-10-18 — x86 job t23: A16 confirmed, band eigensolve (A18) rejected (thermal-ore)
 
 - Setup: job 226619, node7 (singlejob, governor conservative), T=1 and T=16.

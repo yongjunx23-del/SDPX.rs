@@ -546,6 +546,8 @@ fn _factor<T: FloatT>(
 }
 
 const QDLDL_UNKNOWN: usize = usize::MAX;
+// Marks a recorded column that the replay sweeps together with the next one.
+const PAIR: u32 = 1 << 31;
 const QDLDL_USED: bool = true;
 const QDLDL_UNUSED: bool = false;
 
@@ -683,8 +685,40 @@ fn _factor_inner<T: FloatT>(
                     y_vals[bidx] = Ax[i];
                 }
             }
-            for &c in &row_cols[row_ptr[k - 1]..row_ptr[k]] {
-                let cidx = c as usize;
+            let mut cols = row_cols[row_ptr[k - 1]..row_ptr[k]].iter();
+            while let Some(&c) = cols.next() {
+                let cidx = (c & !PAIR) as usize;
+                // A recorded supernode pair (c, c + 1): each row of y takes
+                // c's term, then c + 1's, as the two column sweeps apply them.
+                if c & PAIR != 0 {
+                    let c1 = cidx + 1;
+                    let _next = cols.next();
+                    debug_assert_eq!(_next.map(|&c| c as usize), Some(c1));
+                    let (f0, t0) = (Lp[cidx], next_colspace[cidx]);
+                    let (f1, t1) = (Lp[c1], next_colspace[c1]);
+                    debug_assert!(Li[f0] == c1 && t0 - f0 == t1 - f1 + 1);
+                    debug_assert!(Li[f0 + 1..t0] == Li[f1..t1]);
+                    let y0 = y_vals[cidx];
+                    y_vals[c1] -= Lx[f0] * y0;
+                    let y1 = y_vals[c1];
+                    unsafe {
+                        //Safety : as below, Lij is a row of L.
+                        for ((&a0, &a1), &Lij) in
+                            zip(zip(&Lx[f0 + 1..t0], &Lx[f1..t1]), &Li[f1..t1])
+                        {
+                            let y = y_vals.get_unchecked_mut(Lij);
+                            *y = (*y - a0 * y0) - a1 * y1;
+                        }
+                    }
+                    for (c, t, yc) in [(cidx, t0, y0), (c1, t1, y1)] {
+                        let l = yc * Dinv[c];
+                        Lx[t] = l;
+                        D[k] -= yc * l;
+                        next_colspace[c] += 1;
+                        y_vals[c] = T::zero();
+                    }
+                    continue;
+                }
                 let tmp_idx = next_colspace[cidx];
                 let y_vals_cidx = y_vals[cidx];
                 let f = Lp[cidx];
@@ -703,6 +737,9 @@ fn _factor_inner<T: FloatT>(
         } else {
             // number of nonzeros in this row of L
             let mut nnz_y = 0; // number of elements in this row
+
+            // The previous recorded column of this row may start a pair.
+            let mut pair_open = false;
 
             // This loop determines where nonzeros
             // will go in the kth row of L, but doesn't
@@ -792,6 +829,20 @@ fn _factor_inner<T: FloatT>(
                 // record which row it went into
                 Li[tmp_idx] = k;
                 next_colspace[cidx] += 1;
+                // A fundamental supernode pair: c is the previous column of
+                // this row, c + 1 its parent, and c's pattern is
+                // {c + 1} ∪ pattern(c + 1). Replays sweep both at once.
+                let c = cidx.wrapping_sub(1);
+                if pair_open
+                    && row_cols.last() == Some(&(c as u32))
+                    && etree[c] == cidx
+                    && Lnz[c] == Lnz[cidx] + 1
+                {
+                    *row_cols.last_mut().unwrap() |= PAIR;
+                    pair_open = false;
+                } else {
+                    pair_open = true;
+                }
                 row_cols.push(cidx as u32);
 
                 // reset the y_vals and indices back to zero and QDLDL_UNUSED
