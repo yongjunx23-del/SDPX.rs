@@ -814,46 +814,9 @@ impl<T: FloatT> PSDTriangleCone<T> {
         self.mul_W(MatrixShape::N, &mut zz, &trial_z, T::one(), T::zero());
         let mut v = vec![T::zero(); len];
         self.circ_op(&mut v, &ss, &zz);
-        // Unpack svec(V) to a binary64 column-major matrix.
-        let mut a = vec![0f64; n * n];
-        let r = std::f64::consts::FRAC_1_SQRT_2;
-        let mut idx = 0;
-        for j in 0..n {
-            for i in 0..=j {
-                let x = v[idx].to_f64().unwrap_or(f64::NAN);
-                a[i + j * n] = if i == j { x } else { x * r };
-                idx += 1;
-            }
-        }
-        if !a.iter().all(|x| x.is_finite()) {
+        let Some((a, w)) = svec_eigen_f64(&v, n) else {
             return false;
-        }
-        let mut w = vec![0f64; n];
-        let mut info = 0;
-        let mut query = [0f64];
-        unsafe {
-            lapack::dsyev(
-                b'V', b'U', n as i32, &mut a, n as i32, &mut w, &mut query, -1, &mut info,
-            )
         };
-        let lwork = (query[0] as usize).max(3 * n);
-        let mut work = vec![0f64; lwork];
-        unsafe {
-            lapack::dsyev(
-                b'V',
-                b'U',
-                n as i32,
-                &mut a,
-                n as i32,
-                &mut w,
-                &mut work,
-                lwork as i32,
-                &mut info,
-            )
-        };
-        if info != 0 {
-            return false;
-        }
         let (lo, hi) = (lo.to_f64().unwrap_or(0.), hi.to_f64().unwrap_or(0.));
         let t: Vec<f64> = w
             .iter()
@@ -862,34 +825,9 @@ impl<T: FloatT> PSDTriangleCone<T> {
         if t.iter().all(|&x| x == 0.) {
             return false;
         }
-        // ds -= svec(Q diag(t) Q'), summed over the corrected k in ascending
-        // order (the first term starts each sum) with contiguous columns.
-        let corrected: Vec<usize> = (0..n).filter(|&k| t[k] != 0.).collect();
-        let mut scaled = Vec::with_capacity(corrected.len() * n);
-        for &k in &corrected {
-            scaled.extend(a[k * n..(k + 1) * n].iter().map(|&q| q * t[k]));
-        }
-        let mut c = vec![0f64; n];
-        let mut idx = 0;
-        for j in 0..n {
-            let c = &mut c[..=j];
-            for (m, &k) in corrected.iter().enumerate() {
-                let (u, q) = (&scaled[m * n..m * n + j + 1], a[j + k * n]);
-                if m == 0 {
-                    c.iter_mut().zip(u).for_each(|(c, &u)| *c = u * q);
-                } else {
-                    c.iter_mut().zip(u).for_each(|(c, &u)| *c += u * q);
-                }
-            }
-            for (i, &v) in c.iter().enumerate() {
-                let v = if i == j {
-                    v
-                } else {
-                    v * std::f64::consts::SQRT_2
-                };
-                ds[idx] -= T::from_f64(v).unwrap();
-                idx += 1;
-            }
+        // ds -= svec(Q diag(t) Q').
+        for (d, v) in ds.iter_mut().zip(svec_spectral_f64(&a, n, &t)) {
+            *d -= T::from_f64(v).unwrap();
         }
         true
     }
@@ -1097,6 +1035,58 @@ where
         wm3,
     );
     step_length_psd_component(wm1, eig, wv, Λisqrt, αmax, &mut wm2.data)
+}
+
+/// Binary64 eigendecomposition `mat(v) = A diag(w) Aᵀ` (dsyev, vectors in
+/// the columns of `A`); `None` for a non-finite entry or a LAPACK failure.
+pub(crate) fn svec_eigen_f64<T: FloatT>(v: &[T], n: usize) -> Option<(Vec<f64>, Vec<f64>)> {
+    let mut a = vec![0f64; n * n];
+    let r = std::f64::consts::FRAC_1_SQRT_2;
+    let mut idx = 0;
+    for j in 0..n {
+        for i in 0..=j {
+            let x = v[idx].to_f64().unwrap_or(f64::NAN);
+            a[i + j * n] = if i == j { x } else { x * r };
+            idx += 1;
+        }
+    }
+    if !a.iter().all(|x| x.is_finite()) {
+        return None;
+    }
+    let mut w = vec![0f64; n];
+    let (mut info, mut query) = (0, [0f64]);
+    let ni = n as i32;
+    unsafe { lapack::dsyev(b'V', b'U', ni, &mut a, ni, &mut w, &mut query, -1, &mut info) };
+    let mut work = vec![0f64; (query[0] as usize).max(3 * n)];
+    let lwork = work.len() as i32;
+    unsafe { lapack::dsyev(b'V', b'U', ni, &mut a, ni, &mut w, &mut work, lwork, &mut info) };
+    (info == 0).then_some((a, w))
+}
+
+/// svec(A diag(t) Aᵀ) over the k with t[k] ≠ 0. Each entry sums in ascending
+/// k from −0, as `Iterator::sum` does, over contiguous scaled columns.
+pub(crate) fn svec_spectral_f64(a: &[f64], n: usize, t: &[f64]) -> Vec<f64> {
+    let kept: Vec<usize> = (0..n).filter(|&k| t[k] != 0.).collect();
+    let mut scaled = Vec::with_capacity(kept.len() * n);
+    for &k in &kept {
+        scaled.extend(a[k * n..(k + 1) * n].iter().map(|&q| q * t[k]));
+    }
+    let mut out = Vec::with_capacity(n * (n + 1) / 2);
+    let mut c = vec![-0f64; n];
+    for j in 0..n {
+        let c = &mut c[..=j];
+        for (m, &k) in kept.iter().enumerate() {
+            let (u, q) = (&scaled[m * n..m * n + j + 1], a[j + k * n]);
+            if m == 0 {
+                c.iter_mut().zip(u).for_each(|(c, &u)| *c = u * q);
+            } else {
+                c.iter_mut().zip(u).for_each(|(c, &u)| *c += u * q);
+            }
+        }
+        let sq2 = std::f64::consts::SQRT_2;
+        out.extend(c.iter().enumerate().map(|(i, &v)| if i == j { v } else { v * sq2 }));
+    }
+    out
 }
 
 /// Whether I + α·Δ is positive definite for the scaled step matrix Δ that

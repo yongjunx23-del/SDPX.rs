@@ -8,6 +8,15 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — One slack projection per solve; shared contiguous spectral rebuild (kept, thermal-ore)
+
+- Observed (macOS `sample` of repeated solves; x86 receipts of job 226585): the original-coordinate slack projection (`project_slack`) runs twice per Solved solve, once in the termination check and again in the final reconstruction, on the same point. Its cost is a dense `dsyev` per PSD cone plus a strided triple-loop rebuild. mcp250-1 (chordal, one 250×250 original cone) spends 20% of its samples there. On x86, post-processing alone is 15% of mcp500-1 and 8% of mcp250-1.
+- Change:
+  - `DefaultSolution` keeps its last projection: `x`, the slack it replaced, and the result. A bitwise-equal input (sign of zero included) reuses it.
+  - `svec_eigen_f64` and `svec_spectral_f64` serve both the PSD centrality correction and `project_psd_f64`. The rebuild sums each entry in ascending k from −0, as `Iterator::sum` did, over contiguous scaled columns.
+- Result: points are bitwise identical to HEAD on 13 local SDPs, LP_agg, LP_afiro, SOCP_nb, qssp30 and sched_50_50_orig, plus medium and ising11 (same hashes). Mac, T=1, 5 interleaved reps, median: mcp250-1 190.1 → 165.7 ms (−12.8%), theta2 65.4 → 63.6 (−2.8%), theta1 15.6 → 15.3 (−1.9%), planted80 59.7 → 58.9 (−1.3%).
+- Decision: kept. mcp500-1 should gain more (x86 post-processing alone is 196 ms of 1314).
+
 ## 2026-10-18 — Binary64 PSD step admission by Cholesky, capped components, contiguous correction rebuild (kept, thermal-ore)
 
 - Hypothesis: the curve trials and the corrector's 1% gain test only need a yes/no answer. A Cholesky of I + α·Δ̃ gives that answer at a fraction of the cost of the eigensolve (Mac dpotrf against dsyevr: n = 8 0.25 vs 1.4 µs, n = 101 12 vs 263 µs). The same test settles a step-length component whose cap does not bind. Callers only use min(αz, αs), so in binary64 the s component can take αz as its cap.
