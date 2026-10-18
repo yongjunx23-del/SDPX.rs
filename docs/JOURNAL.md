@@ -8,6 +8,16 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — LDL auto rule: no flop floor for the supernodal factor (kept, thermal-ore; contract item, backend selection)
+
+- Observed: `ldl_auto_select` uses faer's fill-ratio rule (flops/nnz(L) ≥ 40 → supernodal), plus a floor of 1e8 flops added in the 0.8 work. The journal of that change ("small factors are faster with QDLDL") records no measurement for the floor. Below it, high-fill factors run on QDLDL at 2–4 Gop/s. mcp250-1 (ratio 100, 2.0e7 flops) spends 53% of its solve in refactors, and SOCP_nb (ratio 63, 3.7e7) 71%.
+- Change: the floor is removed, so the ratio test alone decides.
+- Result: of 47 local inputs, only the five with ratio ≥ 40 and under 1e8 flops change backend. The other 42 points are bitwise identical.
+  - Statuses and iteration counts are unchanged; `native.audit` at 1e-6 passes all ten points, with residuals equal to two digits.
+  - Mac T=1, 5 reps, median: mcp250-1 166.7 → 105.2 ms (−37%), nb_L1 200.4 → 165.6 (−17%), axis_wide 8.8 → 7.3 (−17%), nb 206.6 → 189.8 (−8%), nb_L2_bessel 153.6 → 143.9 (−6%).
+  - T=8 (best of 3) keeps the order: mcp250-1 −31%, nb_L1 −16%, axis_wide −17%, nb −6%.
+- Decision: kept. Confirm on x86 at T=1 and T=16 against the scoreboard binary; the cases are known wins or near-ties against MOSEK (mcp250-1 1.0×, nb 2.8× behind).
+
 ## 2026-10-18 — Contiguous svec conversions; fused symmetrization in the binary64 H-apply (kept, thermal-ore)
 
 - Observed: the binary64 condensed H-apply (`PsdBlock::apply`) runs about 650 times per gpp100 solve, at about 48 µs each. Each call converts svec ↔ matrix four times through `M[(i, j)]`, writing or reading the transposed triangle with stride n. The middle `mat_to_svec` / `svec_to_mat` pair only symmetrizes the first congruence's result.
