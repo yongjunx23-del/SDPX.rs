@@ -182,6 +182,7 @@ where
                     &self.L.rowval,
                     &self.L.nzval,
                     &self.Dinv,
+                    &self.workspace.runs,
                     tmp,
                 );
             }
@@ -225,7 +226,8 @@ where
                 w[K * i + c] = b[c * n + p];
             }
         }
-        _solve_rows::<T, K>(&self.L.colptr, &self.L.rowval, &self.L.nzval, &self.Dinv, w);
+        let (L, runs) = (&self.L, &self.workspace.runs);
+        _solve_rows::<T, K>(&L.colptr, &L.rowval, &L.nzval, &self.Dinv, runs, w);
         for (i, &p) in self.perm.iter().enumerate() {
             for c in 0..K {
                 x[c * n + p] = w[K * i + c];
@@ -442,6 +444,8 @@ struct QDLDLWorkspace<T> {
     // structural, so refactors replay it instead of walking the etree.
     row_cols: Vec<u32>,
     row_ptr: Vec<usize>,
+    // The forward solve's supernode runs (`supernode_runs`).
+    runs: Vec<u32>,
 }
 
 impl<T> QDLDLWorkspace<T>
@@ -472,6 +476,8 @@ where
             &mut etree,
         )?;
 
+        let runs = supernode_runs(&etree, &Lnz);
+
         // positive inertia count.
         let positive_inertia = 0;
 
@@ -495,6 +501,7 @@ where
             regularize_count,
             row_cols: Vec::new(),
             row_ptr: Vec::new(),
+            runs,
         })
     }
 }
@@ -552,6 +559,26 @@ const QDLDL_UNKNOWN: usize = usize::MAX;
 const RUN_SHIFT: u32 = 29;
 const COLUMN: u32 = (1 << RUN_SHIFT) - 1;
 const MAX_RUN: usize = 8;
+
+// The fundamental supernode runs of L (column c's parent is c + 1 and it has
+// one more entry), split into runs of at most `MAX_RUN` columns and encoded
+// like `row_cols`; single columns are left out.
+fn supernode_runs(etree: &[usize], Lnz: &[usize]) -> Vec<u32> {
+    let link = |c: usize| etree[c] == c + 1 && Lnz[c] == Lnz[c + 1] + 1;
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < etree.len() {
+        let mut r = 1;
+        while r < MAX_RUN && i + r < etree.len() && link(i + r - 1) {
+            r += 1;
+        }
+        if r > 1 {
+            runs.push(i as u32 | ((r as u32 - 1) << RUN_SHIFT));
+        }
+        i += r;
+    }
+    runs
+}
 const QDLDL_USED: bool = true;
 const QDLDL_UNUSED: bool = false;
 
@@ -963,14 +990,97 @@ fn _ltsolve_safe<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], x: &mut [T]) {
 
 // Solves (L+I)x = b, with x replacing b.  Unchecked version
 fn _lsolve_unsafe<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], x: &mut [T]) {
+    _lsolve_rows::<T, 1>(Lp, Li, Lx, &[], x);
+}
+
+// `_lsolve_unsafe` for K row-interleaved right-hand sides, sweeping each
+// recorded supernode run (`supernode_runs`) at once.
+fn _lsolve_rows<T: FloatT, const K: usize>(
+    Lp: &[usize],
+    Li: &[usize],
+    Lx: &[T],
+    runs: &[u32],
+    w: &mut [T],
+) {
+    let n = w.len() / K;
     unsafe {
-        for i in 0..x.len() {
-            let xi = *x.get_unchecked(i);
-            let f = *Lp.get_unchecked(i);
-            let l = *Lp.get_unchecked(i + 1);
-            for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
-                *(x.get_unchecked_mut(Lij)) -= Lxj * xi;
+        let mut i = 0;
+        for &r in runs {
+            let (c0, len) = ((r & COLUMN) as usize, (r >> RUN_SHIFT) as usize + 1);
+            for i in i..c0 {
+                lsolve_column::<T, K>(i, Lp, Li, Lx, w);
             }
+            match len {
+                2 => lsolve_run::<T, 2, K>(c0, Lp, Li, Lx, w),
+                3 => lsolve_run::<T, 3, K>(c0, Lp, Li, Lx, w),
+                4 => lsolve_run::<T, 4, K>(c0, Lp, Li, Lx, w),
+                5 => lsolve_run::<T, 5, K>(c0, Lp, Li, Lx, w),
+                6 => lsolve_run::<T, 6, K>(c0, Lp, Li, Lx, w),
+                7 => lsolve_run::<T, 7, K>(c0, Lp, Li, Lx, w),
+                _ => lsolve_run::<T, 8, K>(c0, Lp, Li, Lx, w),
+            }
+            i = c0 + len;
+        }
+        for i in i..n {
+            lsolve_column::<T, K>(i, Lp, Li, Lx, w);
+        }
+    }
+}
+
+// Safety: as for `lsolve_run`.
+#[inline(always)]
+unsafe fn lsolve_column<T: FloatT, const K: usize>(
+    i: usize,
+    Lp: &[usize],
+    Li: &[usize],
+    Lx: &[T],
+    w: &mut [T],
+) {
+    let xi: [T; K] = std::array::from_fn(|c| *w.get_unchecked(K * i + c));
+    let f = *Lp.get_unchecked(i);
+    let l = *Lp.get_unchecked(i + 1);
+    for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
+        for c in 0..K {
+            *w.get_unchecked_mut(K * Lij + c) -= Lxj * xi[c];
+        }
+    }
+}
+
+// The forward sweeps of the supernode run `c0..c0 + R`, as in `sweep_run`:
+// each entry of w takes the run's column terms in column order.
+//
+// Safety: `c0..c0 + R` is a fundamental supernode run of L and w holds K
+// row-interleaved columns of L's dimension.
+#[inline(always)]
+unsafe fn lsolve_run<T: FloatT, const R: usize, const K: usize>(
+    c0: usize,
+    Lp: &[usize],
+    Li: &[usize],
+    Lx: &[T],
+    w: &mut [T],
+) {
+    let last = R - 1;
+    let f: [usize; R] = std::array::from_fn(|m| *Lp.get_unchecked(c0 + m));
+    let len = *Lp.get_unchecked(c0 + R) - f[last];
+    let mut xc = [[T::zero(); K]; R];
+    for j in 0..R {
+        for c in 0..K {
+            let x = w.get_unchecked_mut(K * (c0 + j) + c);
+            for m in 0..j {
+                *x -= *Lx.get_unchecked(f[m] + j - m - 1) * xc[m][c];
+            }
+            xc[j][c] = *x;
+        }
+    }
+    for p in 0..len {
+        let row = *Li.get_unchecked(f[last] + p);
+        for c in 0..K {
+            let x = w.get_unchecked_mut(K * row + c);
+            let mut v = *x;
+            for m in 0..R {
+                v -= *Lx.get_unchecked(f[m] + last - m + p) * xc[m][c];
+            }
+            *x = v;
         }
     }
 }
@@ -1039,12 +1149,12 @@ fn _dltsolve_unsafe<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], Dinv: &[T],
 }
 
 // Solves Ax = b where A has given LDL factors, with x replacing b
-fn _solve<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], Dinv: &[T], b: &mut [T]) {
+fn _solve<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], Dinv: &[T], runs: &[u32], b: &mut [T]) {
     // We call the `unsafe`d version of the forward and backward substitution
     // functions here, since the matrix data should be well posed and x of
     // compatible dimensions.   For super safety or debugging purposes, there
     // are also `safe` versions implemented above.
-    _lsolve_unsafe(Lp, Li, Lx, b);
+    _lsolve_rows::<T, 1>(Lp, Li, Lx, runs, b);
 
     // combined D and L^T solve in one pass
     _dltsolve_unsafe(Lp, Li, Lx, Dinv, b);
@@ -1062,21 +1172,13 @@ fn _solve_rows<T: FloatT, const K: usize>(
     Li: &[usize],
     Lx: &[T],
     Dinv: &[T],
+    runs: &[u32],
     w: &mut [T],
 ) {
     let n = Dinv.len();
     debug_assert_eq!(w.len(), n * K);
+    _lsolve_rows::<T, K>(Lp, Li, Lx, runs, w);
     unsafe {
-        for i in 0..n {
-            let xi: [T; K] = std::array::from_fn(|c| *w.get_unchecked(K * i + c));
-            let f = *Lp.get_unchecked(i);
-            let l = *Lp.get_unchecked(i + 1);
-            for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
-                for c in 0..K {
-                    *w.get_unchecked_mut(K * Lij + c) -= Lxj * xi[c];
-                }
-            }
-        }
         // As in `_dltsolve_unsafe`, independent adjacent columns interleave.
         let mut i = n;
         while i > 0 {

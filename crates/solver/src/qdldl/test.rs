@@ -95,7 +95,7 @@ fn test_solve_from_factors() {
 
     //(I+L)*D*(I+L)*x = b.  Back solve on b in place;
     let mut b = vec![4., -27., -1., -279.];
-    _solve(&Lp, &Li, &Lx, &dinv, &mut b);
+    _solve(&Lp, &Li, &Lx, &dinv, &[], &mut b);
     assert_eq!(b, x);
 }
 

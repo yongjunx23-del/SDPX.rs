@@ -8,6 +8,16 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — QDLDL forward solves sweep supernode runs of up to eight columns (kept, thermal-ore)
+
+- Hypothesis: the forward substitution (L + I)x = b is the same column sweep as the refactor replay, so the run sweep of A21 applies to it bitwise. The backward Lᵀ solve cannot fuse a run bitwise, since each column's dot product starts with the previous column's result.
+- Change: `supernode_runs` lists the fundamental runs of L (up to eight columns) once, from etree and Lnz. `_lsolve_rows::<K>` sweeps each listed run with `lsolve_run` and the other columns as before. Single solves (K = 1) and the row-interleaved pairs of `solve_many` (K = 2) both use it.
+- Detecting runs on the fly from Lp/Li instead gave the same gains, but sched_100_100 lost 2.0–3.5% to the per-column test (few runs, small columns).
+- Result: bitwise identical on all 51 local inputs, medium, ising11 and csdr3. Mac T=1, 5 interleaved reps, median against 83b8781:
+  - nql60 180.2 → 167.1 ms (−7.3%), nql30 −6.1%, qssp30 −2.5%, chainsing_1000_2 −2.4%, agg −1.7%, bnl1 −1.3%;
+  - sched_100_100 +0.5%, nb +0.2%.
+- Decision: kept (A21). Provisional on x86 for the gains under 5%.
+
 ## 2026-10-18 — QDLDL refactors sweep supernode runs of up to eight columns (kept, thermal-ore)
 
 - Hypothesis: after A21, nql60's refactor is still 70 of 181 ms, and almost all of its terms lie in fundamental supernodes longer than two columns. Sweeping a whole run of columns at once reads and writes each y row once per run instead of once per pair.
