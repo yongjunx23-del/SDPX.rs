@@ -100,7 +100,9 @@ where
         if settings.tol_original.is_some() && !is_infeasible && data.sampled.is_none() {
             let same = |a: &[T], b: &[T]| {
                 a.len() == b.len()
-                    && a.iter().zip(b).all(|(x, y)| x == y && x.is_sign_negative() == y.is_sign_negative())
+                    && a.iter()
+                        .zip(b)
+                        .all(|(x, y)| x == y && x.is_sign_negative() == y.is_sign_negative())
             };
             match &self.projected {
                 Some([x, s, out]) if same(x, &self.x) && same(s, &self.s) => {

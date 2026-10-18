@@ -159,11 +159,7 @@ where
     S: AsRef<[T]> + AsMut<[T]>,
 {
     let n = M.ncols();
-    let scale = if n > 1 {
-        T::FRAC_1_SQRT_2()
-    } else {
-        T::zero()
-    };
+    let scale = if n > 1 { T::FRAC_1_SQRT_2() } else { T::zero() };
     let a = M.data_mut();
     // svec and the upper triangle share their column order.
     let mut idx = 0;
@@ -201,11 +197,7 @@ fn for_upper_tiles(n: usize, mut f: impl FnMut(std::ops::Range<usize>, usize)) {
 /// by 1/√2 per off-diagonal pair.
 pub(crate) fn symmetrize_svec<T: FloatT>(dst: &mut Matrix<T>, src: &Matrix<T>) {
     let n = src.ncols();
-    let scale = if n > 1 {
-        T::FRAC_1_SQRT_2()
-    } else {
-        T::zero()
-    };
+    let scale = if n > 1 { T::FRAC_1_SQRT_2() } else { T::zero() };
     let (d, a) = (dst.data_mut(), src.data());
     for_upper_tiles(n, |rows, j| {
         for i in rows {
@@ -224,11 +216,7 @@ where
     T: FloatT,
 {
     let n = M.ncols();
-    let scale = if n > 1 {
-        T::FRAC_1_SQRT_2()
-    } else {
-        T::zero()
-    };
+    let scale = if n > 1 { T::FRAC_1_SQRT_2() } else { T::zero() };
     if let Some(a) = M.plain_data() {
         for_upper_tiles(n, |rows, j| {
             let base = triangular_number(j);

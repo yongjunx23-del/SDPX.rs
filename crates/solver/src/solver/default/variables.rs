@@ -272,7 +272,9 @@ where
         use crate::solver::cones::SupportedCone;
         if !cones.is_symmetric()
             || T::precision_bits() > 53
-            || !cones.iter().any(|c| matches!(c, SupportedCone::PSDTriangleCone(p) if p.n >= 8))
+            || !cones
+                .iter()
+                .any(|c| matches!(c, SupportedCone::PSDTriangleCone(p) if p.n >= 8))
         {
             return None;
         }

@@ -565,7 +565,11 @@ where
             // Callers use min(αz, αs): binary64 caps the second component at
             // the first. (The MPFR certificate depends on the cap.)
             let αz = self.step_component(dz, false, αmax);
-            let cap = if T::precision_bits() <= 53 { αz } else { αmax };
+            let cap = if T::precision_bits() <= 53 {
+                αz
+            } else {
+                αmax
+            };
             let αs = self.step_component(ds, true, cap);
             (αz, αs)
         }
@@ -1056,10 +1060,18 @@ pub(crate) fn svec_eigen_f64<T: FloatT>(v: &[T], n: usize) -> Option<(Vec<f64>, 
     let mut w = vec![0f64; n];
     let (mut info, mut query) = (0, [0f64]);
     let ni = n as i32;
-    unsafe { lapack::dsyev(b'V', b'U', ni, &mut a, ni, &mut w, &mut query, -1, &mut info) };
+    unsafe {
+        lapack::dsyev(
+            b'V', b'U', ni, &mut a, ni, &mut w, &mut query, -1, &mut info,
+        )
+    };
     let mut work = vec![0f64; (query[0] as usize).max(3 * n)];
     let lwork = work.len() as i32;
-    unsafe { lapack::dsyev(b'V', b'U', ni, &mut a, ni, &mut w, &mut work, lwork, &mut info) };
+    unsafe {
+        lapack::dsyev(
+            b'V', b'U', ni, &mut a, ni, &mut w, &mut work, lwork, &mut info,
+        )
+    };
     (info == 0).then_some((a, w))
 }
 
@@ -1084,7 +1096,11 @@ pub(crate) fn svec_spectral_f64(a: &[f64], n: usize, t: &[f64]) -> Vec<f64> {
             }
         }
         let sq2 = std::f64::consts::SQRT_2;
-        out.extend(c.iter().enumerate().map(|(i, &v)| if i == j { v } else { v * sq2 }));
+        out.extend(
+            c.iter()
+                .enumerate()
+                .map(|(i, &v)| if i == j { v } else { v * sq2 }),
+        );
     }
     out
 }
@@ -1106,7 +1122,11 @@ fn admits_component<T: FloatT>(
     if direction.is_empty() {
         return true;
     }
-    let shape = if primal { MatrixShape::T } else { MatrixShape::N };
+    let shape = if primal {
+        MatrixShape::T
+    } else {
+        MatrixShape::N
+    };
     mul_Wx_scratch(shape, wv, direction, T::one(), T::zero(), rx, wm1, wm2, wm3);
     svec_to_mat(wm1, wv);
     lrscale_symmetric(wm1, Λisqrt);
