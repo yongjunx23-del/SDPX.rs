@@ -8,6 +8,22 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — Jittered x86 A/B of dsyevd correction vectors and dgesdd SVDs (dsyevd rejected; dgesdd open)
+
+- Setup (job 226592, node7, governor conservative): 20 binary64 SDPs plus gpp250-1 and gpp500-1, T=1 and T=16. Five reps per case (three for gpp250-1, two for gpp500-1, T=16 only), each at static regularization 1e-8·(1 + r·1e-6), with arm order rotated per rep. `native_oracle` audits the r0 points. Arms:
+  - to7e, the base;
+  - to7f, with dsyevd vectors in the PSD centrality correction;
+  - to7g, with the bitwise A10 rebuild and dgesdd for square binary64 SVDs from n = 40;
+  - to7i, with both.
+- Result:
+  - to7f: geomean time ratio against to7e 1.032 (T=1) and 1.042 (T=16). gpp250-1 takes 29.3 iterations against 23.3, with one AlmostSolved at 45. control1's audit fails at both thread counts (the base passes).
+  - to7i: NumericalError at iteration 1 on gpp500-1 r0, and the same control1 audit loss. Rejected.
+  - to7g: audits identical to the base (24 pass, 19 fail; the failures are the base's labeled control/gpp cases). Geomean 0.973 (T=1) and 1.006 (T=16).
+    - Where dgesdd is active, the receipts' SVD time per call drops by 30–52%: arch0 6.86 → 3.82 ms, gpp250-1 19.4 → 9.3, gpp124-1 3.14 → 2.08, theta2 2.49 → 1.78. That is 1.3–4.2% of each solve.
+    - End to end, the iteration spread dominates: gpp124-1 runs 28.0 iterations against 25.6 (1.18×), while gpp250-1 runs 21.7 against 23.3 (0.80×).
+    - At T=16 the small cases differ by up to ±30% between arms whose code paths are identical (n < 40), so that geomean measures noise.
+- Decision: dsyevd rejected. dgesdd stays open for a focused rerun on HEAD: the cases where it is active, more jitters, and min-of-reps.
+
 ## 2026-10-18 — QDLDL refactors replay the recorded row pattern (kept, thermal-ore)
 
 - Observed: every QDLDL numeric refactor walks the elimination tree again to find each row's nonzero columns (`y_markers`, `elim_buffer`, `y_idx`), although the pattern depends only on the KKT structure, which is fixed for the whole solve. On the high-refactor SOCP cases the walk is a visible share of the factor time.
