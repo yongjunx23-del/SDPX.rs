@@ -982,10 +982,48 @@ fn _solve_rows<T: FloatT, const K: usize>(
                 }
             }
         }
-        for i in (0..n).rev() {
+        // As in `_dltsolve_unsafe`, independent adjacent columns interleave.
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
             let mut s = [T::zero(); K];
             let f = *Lp.get_unchecked(i);
             let l = *Lp.get_unchecked(i + 1);
+            let f0 = if i > 0 { *Lp.get_unchecked(i - 1) } else { f };
+            if i > 0 && (f0 == f || *Li.get_unchecked(f0) != i) {
+                let mut s0 = [T::zero(); K];
+                let m = (l - f).min(f - f0);
+                for t in 0..m {
+                    let (Lxj, Lij) = (*Lx.get_unchecked(f + t), *Li.get_unchecked(f + t));
+                    let (Lxk, Lik) = (*Lx.get_unchecked(f0 + t), *Li.get_unchecked(f0 + t));
+                    for c in 0..K {
+                        s[c] += Lxj * (*w.get_unchecked(K * Lij + c));
+                        s0[c] += Lxk * (*w.get_unchecked(K * Lik + c));
+                    }
+                }
+                for j in f + m..l {
+                    let (Lxj, Lij) = (*Lx.get_unchecked(j), *Li.get_unchecked(j));
+                    for c in 0..K {
+                        s[c] += Lxj * (*w.get_unchecked(K * Lij + c));
+                    }
+                }
+                for j in f0 + m..f {
+                    let (Lxj, Lij) = (*Lx.get_unchecked(j), *Li.get_unchecked(j));
+                    for c in 0..K {
+                        s0[c] += Lxj * (*w.get_unchecked(K * Lij + c));
+                    }
+                }
+                for (i, s) in [(i, s), (i - 1, s0)] {
+                    let d = *Dinv.get_unchecked(i);
+                    for c in 0..K {
+                        let xi = w.get_unchecked_mut(K * i + c);
+                        *xi *= d;
+                        *xi -= s[c];
+                    }
+                }
+                i -= 1;
+                continue;
+            }
             for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
                 for c in 0..K {
                     s[c] += Lxj * (*w.get_unchecked(K * Lij + c));

@@ -8,6 +8,16 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — Column pairing in the two-RHS QDLDL solve (kept); paired symv dot chains (rejected)
+
+- Change: `_solve_rows::<2>` (`solve_many`) pairs independent adjacent columns of its backward sweep the same way as A19, giving four add chains in flight.
+- Result: points are bitwise identical on 48 local cases and medium (b54b58300d4c). Mac T=1, 5 interleaved reps, median against 829a7a0, two passes in opposite arm order:
+  - chainsing_1000_1 −3.7% / −2.7%, chainsing_1000_2 −3.1%;
+  - bnl1 −2.6% / −2.3%, qssp30 −2.1% / −2.2%, agg −1.1% / −2.4%;
+  - nql60 −1.5%, nql30 −1.4%, bandm −1.6%.
+- Decision: kept (part of A19).
+- Rejected: the same idea in `_csc_symv_unsafe`, with column j+1's dot chain run beside column j's loop and its scatter afterwards. Bitwise identical, but slower: agg +5.7%, bnl1 +4.7%, chainsing +4.2%, bandm +4.6%. That kernel is bound by its scatter and loads, not by the add chain. Patch `~/.cache/sdpx-e2e/patches/symv-pair-rejected.patch`.
+
 ## 2026-10-18 — QDLDL backward solve pairs independent columns (kept, thermal-ore; provisional on x86)
 
 - Observed: refinement dominates small LPs. LP_agg ran 436 refinements in 28 iterations, with `ir` 7.45 of 12.84 ms; LP_bnl1's profile puts `refine` at 55%. In the single-column D(L+I)ᵀ solve, each column's dot product `s += Lx·x[Li]` is one serial add chain, latency-bound rather than load-bound. `solve_many` already interleaves two right-hand sides.
