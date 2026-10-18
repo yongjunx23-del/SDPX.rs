@@ -243,34 +243,7 @@ fn accumulate_column<T: FloatT>(
             &dense_vectors[end - len..][..len]
         });
         let v: [T; 8] = std::array::from_fn(|k| values[group[k].position]);
-        // Keep each output's FMA order, but interleave four independent
-        // outputs so the processor can overlap the dependent accumulator
-        // chains. The source slices are contiguous along the dense axis.
-        let mut i = 0;
-        while i + 4 <= len {
-            let mut x0 = row[i];
-            let mut x1 = row[i + 1];
-            let mut x2 = row[i + 2];
-            let mut x3 = row[i + 3];
-            for k in 0..8 {
-                x0 = v[k].mul_add(rows[k][i], x0);
-                x1 = v[k].mul_add(rows[k][i + 1], x1);
-                x2 = v[k].mul_add(rows[k][i + 2], x2);
-                x3 = v[k].mul_add(rows[k][i + 3], x3);
-            }
-            row[i] = x0;
-            row[i + 1] = x1;
-            row[i + 2] = x2;
-            row[i + 3] = x3;
-            i += 4;
-        }
-        for i in i..len {
-            let mut value = row[i];
-            for k in 0..8 {
-                value = v[k].mul_add(rows[k][i], value);
-            }
-            row[i] = value;
-        }
+        fma_rows(row, &rows, &v);
     }
     let mut groups = wide_groups.remainder().chunks_exact(4);
     for group in &mut groups {
@@ -281,30 +254,7 @@ fn accumulate_column<T: FloatT>(
             &dense_vectors[end - len..][..len]
         });
         let v: [T; 4] = std::array::from_fn(|k| values[group[k].position]);
-        let mut i = 0;
-        while i + 4 <= len {
-            let mut x00 = row[i];
-            let mut x01 = row[i + 1];
-            let mut x02 = row[i + 2];
-            let mut x03 = row[i + 3];
-            for k in 0..4 {
-                x00 = v[k].mul_add(rows[k][i], x00);
-                x01 = v[k].mul_add(rows[k][i + 1], x01);
-                x02 = v[k].mul_add(rows[k][i + 2], x02);
-                x03 = v[k].mul_add(rows[k][i + 3], x03);
-            }
-            row[i] = x00;
-            row[i + 1] = x01;
-            row[i + 2] = x02;
-            row[i + 3] = x03;
-            i += 4;
-        }
-        for i in i..len {
-            let x0 = v[0].mul_add(rows[0][i], row[i]);
-            let x1 = v[1].mul_add(rows[1][i], x0);
-            let x2 = v[2].mul_add(rows[2][i], x1);
-            row[i] = v[3].mul_add(rows[3][i], x2);
-        }
+        fma_rows(row, &rows, &v);
     }
     for e in groups.remainder() {
         let v = values[e.position];
@@ -316,6 +266,36 @@ fn accumulate_column<T: FloatT>(
         }
     }
     false
+}
+
+/// `row[i] = fma(v[K-1], rows[K-1][i], ... fma(v[0], rows[0][i], row[i]))`:
+/// each output keeps its ascending-k FMA order. Sixteen outputs per pass
+/// give the FMA unit independent chains; four did not cover its latency
+/// (SDP_planted80: 2.4 GFMA/s).
+#[inline(always)]
+fn fma_rows<T: FloatT, const K: usize>(row: &mut [T], rows: &[&[T]; K], v: &[T; K]) {
+    let len = row.len();
+    let rows: [&[T]; K] = std::array::from_fn(|k| &rows[k][..len]);
+    let mut i = 0;
+    while i + 16 <= len {
+        let out = &mut row[i..i + 16];
+        let mut x: [T; 16] = std::array::from_fn(|l| out[l]);
+        for k in 0..K {
+            let src = &rows[k][i..i + 16];
+            for l in 0..16 {
+                x[l] = v[k].mul_add(src[l], x[l]);
+            }
+        }
+        out.copy_from_slice(&x);
+        i += 16;
+    }
+    for i in i..len {
+        let mut x = row[i];
+        for k in 0..K {
+            x = v[k].mul_add(rows[k][i], x);
+        }
+        row[i] = x;
+    }
 }
 
 /// Accumulate and publish one tile of left columns `[a0, a1)`.

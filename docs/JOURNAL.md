@@ -8,6 +8,13 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — Schur dot accumulation 16 outputs wide (kept, thermal-ore)
+
+- Observed: SDP_planted80 (one 80×80 block, 300 constraints with about 150 scattered svec entries each) spends 62% of its Mac solve in dense-block Schur assembly. `schur.dot_fma` takes 11 ms for 8 × 6.75M FMAs, only 2.4 GFMA/s. With four outputs per pass, the vectorized loop keeps one or two dependent FMA chains, which leaves the FMA unit waiting on latency.
+- Change: `fma_rows` accumulates 16 outputs per pass for both the 8-entry and 4-entry groups; each output keeps its ascending-k FMA order. On the Mac, 32 outputs was no better (6.46 vs 6.17 ms), and an extra 4-wide stage before the scalar tail was within noise.
+- Result: points are bitwise identical on 9 local SDPs, medium and ising11. Mac, T=1, 5 reps, median: planted80 59.8 → 54.7 ms (−8.5%; dot_fma 10.97 → 6.20 ms), control3 30.2 → 29.1 (−3.6%), theta2 64.1 → 62.9 (−1.9%). qap5, qap6 and gpp100 are unchanged.
+- Decision: kept. The x86 AVX2 path runs the same loop under its `avx2,fma` wrapper; confirm there, where 32 outputs might pay.
+
 ## 2026-10-18 — One slack projection per solve; shared contiguous spectral rebuild (kept, thermal-ore)
 
 - Observed (macOS `sample` of repeated solves; x86 receipts of job 226585): the original-coordinate slack projection (`project_slack`) runs twice per Solved solve, once in the termination check and again in the final reconstruction, on the same point. Its cost is a dense `dsyev` per PSD cone plus a strided triple-loop rebuild. mcp250-1 (chordal, one 250×250 original cone) spends 20% of its samples there. On x86, post-processing alone is 15% of mcp500-1 and 8% of mcp250-1.
