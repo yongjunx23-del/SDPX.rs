@@ -8,6 +8,16 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — Contiguous svec conversions; fused symmetrization in the binary64 H-apply (kept, thermal-ore)
+
+- Observed: the binary64 condensed H-apply (`PsdBlock::apply`) runs about 650 times per gpp100 solve, at about 48 µs each. Each call converts svec ↔ matrix four times through `M[(i, j)]`, writing or reading the transposed triangle with stride n. The middle `mat_to_svec` / `svec_to_mat` pair only symmetrizes the first congruence's result.
+- Change:
+  - `svec_to_mat` copies the contiguous upper columns, then mirrors them in 16×16 tiles.
+  - `mat_to_svec` takes the same tiled path when `DenseMatrix::plain_data` exposes column-major storage; `Symmetric` and `Adjoint` views keep the indexed loop.
+  - `symmetrize_svec` replaces the middle pair, with the same two roundings by 1/√2 per off-diagonal entry.
+- Result: points are bitwise identical on 7 local SDPs, medium and ising11. Mac, T=1, 5 reps, median: gpp100 141.9 → 138.2 ms (−2.6%), qap6 31.4 → 30.6 (−2.5%), theta1 15.3 → 14.8 (−3.3%). The tiled conversions alone gave gpp100 −1.0% and qap6 −2.5%.
+- Decision: kept. On x86 (L1 smaller than one 101×101 matrix) the strided pass should cost more, so the gain may be larger there.
+
 ## 2026-10-18 — Schur dot accumulation 16 outputs wide (kept, thermal-ore)
 
 - Observed: SDP_planted80 (one 80×80 block, 300 constraints with about 150 scattered svec entries each) spends 62% of its Mac solve in dense-block Schur assembly. `schur.dot_fma` takes 11 ms for 8 × 6.75M FMAs, only 2.4 GFMA/s. With four outputs per pass, the vectorized loop keeps one or two dependent FMA chains, which leaves the FMA unit waiting on latency.

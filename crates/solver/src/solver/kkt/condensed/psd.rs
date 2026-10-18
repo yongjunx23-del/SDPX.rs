@@ -1687,9 +1687,7 @@ impl<T: FloatT> PsdBlock<T> {
                 };
                 let cache = &mut self.rinv_cache;
                 congruence_sym(&mut w.mat3, r, first, &w.mat1, &mut w.mat2, gemm, cache);
-                w.vector.resize(triangular_number(w.n), T::zero());
-                mat_to_svec(&mut w.vector, &w.mat3);
-                svec_to_mat(&mut w.mat1, &w.vector);
+                symmetrize_svec(&mut w.mat1, &w.mat3);
                 congruence_sym(&mut w.mat3, r, second, &w.mat1, &mut w.mat2, gemm, cache);
                 mat_to_svec(y, &w.mat3);
                 return;

@@ -41,6 +41,10 @@ where
 pub(crate) trait DenseMatrix<T>: ShapedMatrix + Index<(usize, usize), Output = T> {
     fn index_linear(&self, idx: (usize, usize)) -> usize;
     fn data(&self) -> &[T];
+    /// Column-major storage when `self[(i, j)] == data[i + nrows·j]`.
+    fn plain_data(&self) -> Option<&[T]> {
+        None
+    }
 }
 
 pub(crate) trait DenseMatrixMut<T>: DenseMatrix<T> {
@@ -56,6 +60,9 @@ where
     }
     fn data(&self) -> &[T] {
         self.data.as_ref()
+    }
+    fn plain_data(&self) -> Option<&[T]> {
+        Some(self.data.as_ref())
     }
 }
 

@@ -158,38 +158,83 @@ where
     T: FloatT,
     S: AsRef<[T]> + AsMut<[T]>,
 {
-    let scale = if M.ncols() > 1 {
+    let n = M.ncols();
+    let scale = if n > 1 {
         T::FRAC_1_SQRT_2()
     } else {
         T::zero()
     };
+    let a = M.data_mut();
+    // svec and the upper triangle share their column order.
     let mut idx = 0;
-    for col in 0..M.ncols() {
-        for row in 0..=col {
-            if row == col {
-                M[(row, col)] = x[idx];
-            } else {
-                M[(row, col)] = x[idx] * scale;
-                M[(col, row)] = M[(row, col)];
+    for col in 0..n {
+        let (dst, src) = (&mut a[col * n..][..=col], &x[idx..][..=col]);
+        for (d, &v) in dst[..col].iter_mut().zip(&src[..col]) {
+            *d = v * scale;
+        }
+        dst[col] = src[col];
+        idx += col + 1;
+    }
+    for_upper_tiles(n, |i, j| a[j + i * n] = a[i + j * n]);
+}
+
+/// Visit each strict upper-triangle pair `(i, j)`, `i < j`, of an `n × n`
+/// matrix in square tiles, so the transposed accesses stay in cache.
+#[inline(always)]
+fn for_upper_tiles(n: usize, mut f: impl FnMut(usize, usize)) {
+    const TILE: usize = 16;
+    for jb in (0..n).step_by(TILE) {
+        for ib in (0..=jb).step_by(TILE) {
+            for j in jb..(jb + TILE).min(n) {
+                for i in ib..(ib + TILE).min(j) {
+                    f(i, j);
+                }
             }
-            idx += 1;
         }
     }
 }
 
-// Perhaps implementation for Symmetric type would be faster
+/// `svec_to_mat(dst, svec(src))` without the vector: the same two roundings
+/// by 1/√2 per off-diagonal pair.
+pub(crate) fn symmetrize_svec<T: FloatT>(dst: &mut Matrix<T>, src: &Matrix<T>) {
+    let n = src.ncols();
+    let scale = if n > 1 {
+        T::FRAC_1_SQRT_2()
+    } else {
+        T::zero()
+    };
+    let (d, a) = (dst.data_mut(), src.data());
+    for_upper_tiles(n, |i, j| {
+        let v = (a[i + j * n] + a[j + i * n]) * scale * scale;
+        (d[i + j * n], d[j + i * n]) = (v, v);
+    });
+    for j in 0..n {
+        d[j * (n + 1)] = a[j * (n + 1)];
+    }
+}
+
 pub(crate) fn mat_to_svec<T, MATM>(x: &mut [T], M: &MATM)
 where
     MATM: DenseMatrix<T>,
     T: FloatT,
 {
-    let scale = if M.ncols() > 1 {
+    let n = M.ncols();
+    let scale = if n > 1 {
         T::FRAC_1_SQRT_2()
     } else {
         T::zero()
     };
+    if let Some(a) = M.plain_data() {
+        for_upper_tiles(n, |i, j| {
+            x[triangular_number(j) + i] = (a[i + j * n] + a[j + i * n]) * scale
+        });
+        for j in 0..n {
+            x[triangular_number(j) + j] = a[j * (n + 1)];
+        }
+        return;
+    }
     let mut idx = 0;
-    for col in 0..M.ncols() {
+    for col in 0..n {
         for row in 0..=col {
             x[idx] = {
                 if row == col {
