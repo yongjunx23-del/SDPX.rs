@@ -298,6 +298,15 @@ where
         }
     }
 
+    /// Threads the factor and solves run on: the pool's, when the
+    /// elimination tree splits.
+    pub fn threads(&self) -> usize {
+        match (&self.plan, &self.pool) {
+            (Some(Some(plan)), Some(pool)) if plan.parallelisable() => pool.current_num_threads(),
+            _ => 1,
+        }
+    }
+
     /// Returns the number of nonzeros in A for A = LDL^T
     pub fn nnzA(&self) -> usize {
         self.workspace.triuA.nnz()

@@ -56,7 +56,7 @@ where
     fn linear_solver_info(&self) -> LinearSolverInfo {
         LinearSolverInfo {
             name: "qdldl".to_string(),
-            threads: 1,
+            threads: self.factors.threads(),
             direct: true,
             nnzA: self.factors.nnzA(),
             nnzL: self.factors.nnzL(),

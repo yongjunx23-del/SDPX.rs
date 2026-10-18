@@ -26,6 +26,8 @@ pub(super) struct ConeThreading {
     // Choleskys) need only one stealer, so they activate with any spare
     // cone worker — a weaker condition than `inner_parallel`.
     pub(super) paired: bool,
+    // Binary64 cone phases too light to pay for workers (see `build`).
+    pub(super) light: bool,
     // Slowest cone of the last scaling phase (ns): how long idle workers
     // wait for inner items to be posted (see `update_scaling`).
     pub(super) slowest_cone: std::sync::atomic::AtomicU64,
@@ -46,6 +48,8 @@ const MIN_LANE_WORK: u128 = 4096;
 // Initial KKT admission cutoff in precision-weighted neighbor products.
 // Much more work is needed to amortize extra workers for short KKT phases.
 const MIN_KKT_WORK: u128 = 8 << 20;
+// Binary64 work (`cone_cost` units) of one cone lane: about a millisecond.
+const F64_LANE_WORK: u128 = 1 << 20;
 
 fn cone_cost<T: FloatT>(cone: &SupportedCone<T>) -> u128 {
     let dimension_cost = match cone {
@@ -298,7 +302,26 @@ impl ConeThreading {
             });
             (work.saturating_mul(words * words) / MIN_KKT_WORK).min(budget as u128) as usize
         };
+        // Binary64 cone kernels do not split inside a cone, so lanes save at
+        // most the work outside the largest cone, and a worker woken for a
+        // short phase runs on a core a load-following governor keeps at a
+        // low clock (x86, conservative governor: arch0 at 16 threads 2.76 s
+        // against 1.47 s with its one PSD cone on the solve thread; journal
+        // 2026-10-18). Binary64 lanes pay when that saving is a fifth of the
+        // work and the cones hold two F64_LANE_WORK (medium: four smaller
+        // cones overlap the largest). Otherwise (`light`) PSD phases stay
+        // serial and the pool stays only if the KKT factor runs on it
+        // (`CompositeCone::release_idle_pool`).
+        let light = T::precision_bits() <= 64
+            && existing.is_none()
+            && orthant_size.is_none()
+            && !single_zero
+            && {
+                let largest = cones.iter().map(cone_cost).max().unwrap_or(0);
+                4 * total < 5 * largest || total < 2 * F64_LANE_WORK
+            };
         let workers = cone_workers.max(kkt_workers).min(cap);
+        let cone_workers = if light && has_psd { 1 } else { cone_workers };
         if workers <= 1 {
             return Ok(None);
         }
@@ -394,6 +417,7 @@ impl ConeThreading {
             step_lane_ways,
             cone_ways,
             paired,
+            light,
             slowest_cone: std::sync::atomic::AtomicU64::new(0),
             step_costs: std::array::from_fn(|_| {
                 (0..step_lanes).map(|_| Default::default()).collect()

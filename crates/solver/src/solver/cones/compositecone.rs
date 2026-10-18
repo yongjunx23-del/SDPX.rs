@@ -629,6 +629,15 @@ where
         Ok(())
     }
 
+    /// Drop a pool whose binary64 cone phases are light when the KKT factor
+    /// runs on one thread: its other users (short residual and vector
+    /// phases) only wake cold cores.
+    pub(crate) fn release_idle_pool(&mut self, kkt_threads: usize) {
+        if kkt_threads <= 1 && self.threading.as_ref().is_some_and(|t| t.light) {
+            self.threading = None;
+        }
+    }
+
     /// Run this collection's cone lanes on an existing pool (shared with the
     /// caller, e.g. an MPI rank's owner pool) instead of building a new one.
     pub(crate) fn share_pool(&mut self, pool: std::sync::Arc<rayon::ThreadPool>) {

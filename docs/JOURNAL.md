@@ -8,6 +8,43 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — B3 F64-THR: binary64 cone lanes and pools from measured work (kept, thermal-ore)
+
+- Observed (x86, conservative governor, 1.5–2.25 GHz nominal, about 3 GHz boost; jobs 226539, 226543 and 226544 on node9): at 16 threads Float64 solves ran up to 2× slower than at one thread.
+  - (a) A single dominant PSD cone ran on a worker woken for short phases, on a core the governor keeps at a low clock. arch0 took 2.76 s against 1.47 s with the cone on the solve thread.
+  - (b) Tiny SOC lanes, and pools the serial QDLDL factor never uses, only wake cold cores (chainsing, qssp30, nql60, sched, nb).
+  - (c) csdr3's arrow KKT really uses its pool.
+  - (d) The serial path under a 16-CPU mask runs at 1.41 GHz against 3.02 GHz under a 1-CPU mask (perf stat: same cycles and instructions).
+- Change: `ConeThreading::build` marks binary64 cones `light` unless the work outside the largest cone is at least a fifth of the total and the cones hold two `F64_LANE_WORK` (2²⁰ `cone_cost` units, about 1 ms). Light PSD phases stay serial. `CompositeCone::release_idle_pool` drops the pool when the KKT factor runs on one thread. QDLDL now reports the pool width only when its elimination tree splits; it reported 1 before. medium and f64_large keep their lanes (their four smaller cones overlap the largest).
+- Result (job 226573, node7, release, 22 cases interleaved, 3 reps, median API ms, `SDPX_RECEIPT` on, ratio to T=1 in brackets):
+
+  | Case | T=1 | T=16 before | T=16 rule |
+  |---|---|---|---|
+  | SDP_arch0 | 1470 | 2977 (2.03) | 1497 (1.02) |
+  | SDP_gpp124-1 | 1535 | 1736 (1.13) | 1526 (0.99) |
+  | SDP_gpp100 | 465 | 572 (1.23) | 477 (1.02) |
+  | SDP_theta2 | 183 | 260 (1.42) | 208 (1.14) |
+  | SDP_control3 | 92 | 128 (1.39) | 89 (0.97) |
+  | SDP_mcp250-1 | 405 | 504 (1.24) | 394 (0.97) |
+  | SDP_mcp500-1 | 1761 | 2103 (1.19) | 1931 (1.10) |
+  | SDP_planted80 | 189 | 146 (0.77) | 139 (0.73) |
+  | f64_medium | 6701 | 3678 (0.55) | 3705 (0.55) |
+  | csdr3 | 2137 | 1368 (0.64) | 1314 (0.61) |
+  | SOCP_chainsing_1000_1/2/3 | 76/124/100 | 115/129/106 | 105/100/99 |
+  | SOCP_qssp30 | 198 | 220 (1.11) | 203 (1.03) |
+  | SOCP_nql60 | 494 | 563 (1.14) | 525 (1.06) |
+  | SOCP_sched_100_50_orig | 351 | 400 (1.14) | 350 (1.00) |
+  | SOCP_nb | 375 | 449 (1.20) | 366 (0.98) |
+  | SOCP_nb_L2_bessel | 291 | 309 (1.06) | 289 (0.99) |
+
+  Statuses and iteration counts are unchanged in every row. theta1 (T=1 50–83 ms over the reps), hinf1 (5 or 10 ms in every configuration) and LP_agg do not resolve at 3 reps. qap6 is 154 against 138 ms, but the rep ranges overlap (127–155 against 135–153).
+- Solve pin target (same job): pinning the solve to its current CPU or not pinning is worse than the first allocated CPU. theta2 1.56 and 2.21 against 1.14; gpp100 1.19 and 1.80 against 1.02. `SolveAffinityGuard` is unchanged.
+- Points: T=4 equals T=1 bitwise on the local SDP, SOCP and LP set, except faer on mcp500 (it differs at HEAD too). Fast-profile E2E medium: Solved/15, audit PASS; at T=4 its time is unchanged.
+- Decision: kept. MOSEK at 16 threads still wins mcp250, mcp500, chainsing and qssp30, now by the T=1 margin.
+- Open:
+  - theta2 1.14 and mcp500 1.10 keep the pool for the condensed or faer factor.
+  - chainsing_1 is 1.37 (102–105 against 74–97 ms). Without a pool, the unpinned solve was faster on 6 of the 8 SOCPs (chainsing_1 80–95 ms), plausibly because setup runs unpinned and the pin then moves the solve to a cold first CPU. Test pinning only when a pool exists.
+
 ## 2026-10-16 — Scale-relative Jacobi tests in the 2×2/3×3 kernels (kept, thermal-ore)
 
 `start_scale::overshooting_start_still_solves` (Bits256, τ₀ 1e-70) had
