@@ -8,6 +8,14 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — Presolve rank image by sorted rows; 'I'-range eigmin retest (rank kept; eigmin rejected again)
+
+- Observed: a Mac profile of nql60 put `presolver::modular_full_row_rank` at 166 of 4093 samples. It is sparse elimination over F_(2^31−1), with every row and the basis kept in `BTreeMap`s. nql60 setup took 23.9 ms.
+- Change: rows are column-sorted `Vec<(usize, u64)>`s, eliminated by a two-pointer merge. The basis is a `Vec` indexed by pivot column. The arithmetic, the elimination order, the cancellation drops and the budget charge (`previous.len()` per elimination) are unchanged, so the result is unchanged.
+- Result: points are bitwise identical on all 51 local cases; medium hash b54b58300d4c, audit PASS. Setup: nql60 23.9 → 15.1 ms, nql30 5.6 → 4.1 ms; other cases are unchanged. Mac T=1, 5 interleaved reps, median: nql60 246.6 → 239.4 ms (−2.9%), nql30 46.2 → 44.3 (−4.1%).
+- Decision: kept. Exact integer arithmetic, so it gives the same result on any host.
+- Retest of the binary64 step-length λmin by index range (`syevr` RANGE='I', patch `~/.cache/sdpx-e2e/patches/eigmin-irange.patch`), because jitter runs since its rejection show iteration counts move ±20% under 1e-6 perturbations. Mac T=1, 5 reps, median against 0d1e5a4: qap6 30.0 → 46.2 ms (+54%), gpp124-1 272 → 325 (+19%, 27 against 24 iterations), gpp100 129 → 151 (+17%), arch0 −3.9%, theta2 −3.7%. hinf3 becomes AlmostSolved and fails the audit. Rejected again: the slowdown is too large to come from iteration spread alone.
+
 ## 2026-10-18 — Binary64 H-apply reads only upper triangles (kept, thermal-ore)
 
 - Observed: a Mac repeat profile of gpp100 at 27e10aa puts `PsdBlock::apply` at about 20% of the solve. Within it, 459 of 812 samples are GEMM and 353 are O(n²) passes: two mirrors inside `pooled_gemm_sym` (112), `symmetrize_svec` (88), `mat_to_svec` (82) and `svec_to_mat` (71). Both consumers of each mirrored product read the pair `(a_ij + a_ji)`, and after the mirror that pair equals `(a_ij + a_ij)`.
