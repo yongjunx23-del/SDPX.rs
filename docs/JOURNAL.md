@@ -8,6 +8,20 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — QDLDL refactors sweep supernode runs of up to eight columns (kept, thermal-ore)
+
+- Hypothesis: after A21, nql60's refactor is still 70 of 181 ms, and almost all of its terms lie in fundamental supernodes longer than two columns. Sweeping a whole run of columns at once reads and writes each y row once per run instead of once per pair.
+- Change (`_factor_inner`, `sweep_run::<R>`):
+  - The recorded row pattern stores the run length − 1 in the top three bits of the run's first column. A run grows while the previous recorded column of the row is c − 1, its parent is c and Lnz[c − 1] = Lnz[c] + 1.
+  - The replay first applies the run's internal terms to y[c₀ + j] in column order. It then computes y[i] = (…(y[i] − L[i,c₀]·y₀) − …) − L[i,c_{R−1}]·y_{R−1} for each remaining row, and finally the L and D[k] updates in column order: the single sweeps' operations in their order.
+- Run length (Mac T=1, 5 interleaved reps, median against the pair code 18286b2):
+  - 4: nql60 −5.5%, nql30 −4.2%, qssp30 −4.3%.
+  - 8: nql60 196.0 → 177.4 ms (−9.5%), nql30 −6.3%, qssp30 −6.7%, sched_100_100 −1.7%.
+  - 16: nql60 +2.9% and qssp30 +2.9% against 8, likely from register pressure.
+- Neutral (within ±1.7%): bnl1, agg, nb, chainsing_1000_2, sched_50_50.
+- Result: bitwise identical on all 51 local inputs (34 LP/SOCP and 17 SDP), medium (b54b58300d4c), ising11 (b971aee3cf2d) and csdr3 (71603237737a).
+- Decision: kept with runs of up to eight (A21). Provisional on x86 for the gains under 5%.
+
 ## 2026-10-18 — QDLDL refactors sweep fundamental supernode pairs together (kept, thermal-ore)
 
 - Hypothesis: the up-looking QDLDL factor scatters each column of row k's pattern into y separately. For a fundamental supernode pair (c + 1 is c's parent, and c has exactly one more nonzero), both columns update the same rows. One sweep could apply c's term, then c + 1's, to each row and touch y once.

@@ -546,8 +546,12 @@ fn _factor<T: FloatT>(
 }
 
 const QDLDL_UNKNOWN: usize = usize::MAX;
-// Marks a recorded column that the replay sweeps together with the next one.
-const PAIR: u32 = 1 << 31;
+// A recorded column's top three bits hold the length - 1 of the supernode
+// run it starts; the replay sweeps the run's columns at once. Runs longer
+// than eight lost on nql60 and qssp30 (register pressure).
+const RUN_SHIFT: u32 = 29;
+const COLUMN: u32 = (1 << RUN_SHIFT) - 1;
+const MAX_RUN: usize = 8;
 const QDLDL_USED: bool = true;
 const QDLDL_UNUSED: bool = false;
 
@@ -687,35 +691,22 @@ fn _factor_inner<T: FloatT>(
             }
             let mut cols = row_cols[row_ptr[k - 1]..row_ptr[k]].iter();
             while let Some(&c) = cols.next() {
-                let cidx = (c & !PAIR) as usize;
-                // A recorded supernode pair (c, c + 1): each row of y takes
-                // c's term, then c + 1's, as the two column sweeps apply them.
-                if c & PAIR != 0 {
-                    let c1 = cidx + 1;
-                    let _next = cols.next();
-                    debug_assert_eq!(_next.map(|&c| c as usize), Some(c1));
-                    let (f0, t0) = (Lp[cidx], next_colspace[cidx]);
-                    let (f1, t1) = (Lp[c1], next_colspace[c1]);
-                    debug_assert!(Li[f0] == c1 && t0 - f0 == t1 - f1 + 1);
-                    debug_assert!(Li[f0 + 1..t0] == Li[f1..t1]);
-                    let y0 = y_vals[cidx];
-                    y_vals[c1] -= Lx[f0] * y0;
-                    let y1 = y_vals[c1];
-                    unsafe {
-                        //Safety : as below, Lij is a row of L.
-                        for ((&a0, &a1), &Lij) in
-                            zip(zip(&Lx[f0 + 1..t0], &Lx[f1..t1]), &Li[f1..t1])
-                        {
-                            let y = y_vals.get_unchecked_mut(Lij);
-                            *y = (*y - a0 * y0) - a1 * y1;
-                        }
+                let cidx = (c & COLUMN) as usize;
+                let run = (c >> RUN_SHIFT) as usize + 1;
+                if run > 1 {
+                    for _ in 1..run {
+                        cols.next();
                     }
-                    for (c, t, yc) in [(cidx, t0, y0), (c1, t1, y1)] {
-                        let l = yc * Dinv[c];
-                        Lx[t] = l;
-                        D[k] -= yc * l;
-                        next_colspace[c] += 1;
-                        y_vals[c] = T::zero();
+                    let dk = &mut D[k];
+                    let (y, colspace) = (&mut *y_vals, &mut *next_colspace);
+                    match run {
+                        2 => sweep_run::<T, 2>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
+                        3 => sweep_run::<T, 3>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
+                        4 => sweep_run::<T, 4>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
+                        5 => sweep_run::<T, 5>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
+                        6 => sweep_run::<T, 6>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
+                        7 => sweep_run::<T, 7>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
+                        _ => sweep_run::<T, 8>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
                     }
                     continue;
                 }
@@ -738,8 +729,8 @@ fn _factor_inner<T: FloatT>(
             // number of nonzeros in this row of L
             let mut nnz_y = 0; // number of elements in this row
 
-            // The previous recorded column of this row may start a pair.
-            let mut pair_open = false;
+            // The supernode run the previous recorded column of this row ends.
+            let (mut run_start, mut run_len) = (0, 0);
 
             // This loop determines where nonzeros
             // will go in the kth row of L, but doesn't
@@ -829,19 +820,21 @@ fn _factor_inner<T: FloatT>(
                 // record which row it went into
                 Li[tmp_idx] = k;
                 next_colspace[cidx] += 1;
-                // A fundamental supernode pair: c is the previous column of
-                // this row, c + 1 its parent, and c's pattern is
-                // {c + 1} ∪ pattern(c + 1). Replays sweep both at once.
+                // A fundamental supernode run: the previous column of this
+                // row is c - 1, its parent is c and its pattern is
+                // {c} ∪ pattern(c). Replays sweep up to eight such columns
+                // at once (`sweep_run`).
                 let c = cidx.wrapping_sub(1);
-                if pair_open
-                    && row_cols.last() == Some(&(c as u32))
+                if (1..MAX_RUN).contains(&run_len)
+                    && row_cols.last().map(|&v| v & COLUMN) == Some(c as u32)
                     && etree[c] == cidx
                     && Lnz[c] == Lnz[cidx] + 1
                 {
-                    *row_cols.last_mut().unwrap() |= PAIR;
-                    pair_open = false;
+                    run_len += 1;
+                    row_cols[run_start] =
+                        (row_cols[run_start] & COLUMN) | ((run_len as u32 - 1) << RUN_SHIFT);
                 } else {
-                    pair_open = true;
+                    (run_start, run_len) = (row_cols.len(), 1);
                 }
                 row_cols.push(cidx as u32);
 
@@ -879,6 +872,57 @@ fn _factor_inner<T: FloatT>(
     } //end for k
 
     Ok(positiveValuesInD)
+}
+
+/// One replayed sweep of the supernode run `c0..c0 + R` for the current row.
+/// Inside a run, pattern(c) = {c + 1} ∪ pattern(c + 1), so column `c0 + m`
+/// stores the run's later columns first, then the last column's rows. Each
+/// y entry takes the run's terms in column order, exactly as R single
+/// sweeps apply them, and D[k] its updates in the same order.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn sweep_run<T: FloatT, const R: usize>(
+    c0: usize,
+    y: &mut [T],
+    Lp: &[usize],
+    Li: &[usize],
+    Lx: &mut [T],
+    next_colspace: &mut [usize],
+    Dinv: &[T],
+    dk: &mut T,
+) {
+    let last = R - 1;
+    let f: [usize; R] = std::array::from_fn(|m| Lp[c0 + m]);
+    let t: [usize; R] = std::array::from_fn(|m| next_colspace[c0 + m]);
+    let len = t[last] - f[last];
+    debug_assert!((0..R).all(|m| t[m] - f[m] == len + last - m));
+    let mut yc = [T::zero(); R];
+    for j in 0..R {
+        let mut v = y[c0 + j];
+        for m in 0..j {
+            v -= Lx[f[m] + j - m - 1] * yc[m];
+        }
+        yc[j] = v;
+    }
+    unsafe {
+        //Safety : the rows come from L's rowval and are below the dimension;
+        //every run column stores `len` entries after its run rows.
+        for p in 0..len {
+            let row = y.get_unchecked_mut(*Li.get_unchecked(f[last] + p));
+            let mut v = *row;
+            for m in 0..R {
+                v -= *Lx.get_unchecked(f[m] + last - m + p) * yc[m];
+            }
+            *row = v;
+        }
+    }
+    for m in 0..R {
+        let l = yc[m] * Dinv[c0 + m];
+        Lx[t[m]] = l;
+        *dk -= yc[m] * l;
+        next_colspace[c0 + m] += 1;
+        y[c0 + m] = T::zero();
+    }
 }
 
 // Solves (L+I)x = b, with x replacing b (with standard bounds checks)
