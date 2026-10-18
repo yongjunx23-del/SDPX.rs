@@ -436,6 +436,12 @@ struct QDLDLWorkspace<T> {
 
     // number of regularized entries in D
     regularize_count: usize,
+
+    // Columns each row of L eliminates, in elimination order (`row_ptr`
+    // delimits rows), recorded by the first factorization: the pattern is
+    // structural, so refactors replay it instead of walking the etree.
+    row_cols: Vec<u32>,
+    row_ptr: Vec<usize>,
 }
 
 impl<T> QDLDLWorkspace<T>
@@ -487,6 +493,8 @@ where
             regularize_eps,
             regularize_delta,
             regularize_count,
+            row_cols: Vec::new(),
+            row_ptr: Vec::new(),
         })
     }
 }
@@ -528,6 +536,8 @@ fn _factor<T: FloatT>(
         workspace.regularize_eps,
         workspace.regularize_delta,
         &mut workspace.regularize_count,
+        &mut workspace.row_cols,
+        &mut workspace.row_ptr,
     )?;
 
     workspace.positive_inertia = pos_d_count;
@@ -599,8 +609,17 @@ fn _factor_inner<T: FloatT>(
     regularize_eps: T,
     regularize_delta: T,
     regularize_count: &mut usize,
+    row_cols: &mut Vec<u32>,
+    row_ptr: &mut Vec<usize>,
 ) -> Result<usize, QDLDLError> {
     *regularize_count = 0;
+    // A factorization that stopped at a zero pivot left a partial record.
+    let replay = !logical_factor && row_ptr.len() == n;
+    if !replay {
+        row_cols.clear();
+        row_ptr.clear();
+        row_ptr.push(0);
+    }
     let mut positiveValuesInD = 0;
 
     // partition working memory into pieces
@@ -654,102 +673,133 @@ fn _factor_inner<T: FloatT>(
         // The solution y is then the kth row of L,
         // with an implied '1' at the diagonal entry.
 
-        // number of nonzeros in this row of L
-        let mut nnz_y = 0; // number of elements in this row
-
-        // This loop determines where nonzeros
-        // will go in the kth row of L, but doesn't
-        // compute the actual values
-
-        for i in Ap[k]..Ap[k + 1] {
-            let bidx = Ai[i]; //we are working on this element of b
-
-            // Initialize D[k] as the element of this column
-            // corresponding to the diagonal place.  Don't use
-            // this element as part of the elimination step
-            // that computes the k^th row of L
-            if bidx == k {
-                D[k] = Ax[i];
-                continue;
-            }
-
-            y_vals[bidx] = Ax[i]; // initialise y(bidx) = b(bidx)
-
-            // use the forward elimination tree to figure
-            // out which elements must be eliminated after
-            // this element of b
-            let next_idx = bidx;
-
-            if y_markers[next_idx] == QDLDL_UNUSED {
-                //this y term not already visited
-
-                y_markers[next_idx] = QDLDL_USED; //I touched this one
-                elim_buffer[0] = next_idx; // It goes at the start of the current list
-                let mut nnz_e = 1; //length of unvisited elimination path from here
-
-                let mut next_idx = etree[bidx];
-
-                while next_idx != QDLDL_UNKNOWN && next_idx < k {
-                    if y_markers[next_idx] == QDLDL_USED {
-                        break;
-                    }
-
-                    y_markers[next_idx] = QDLDL_USED; // I touched this one
-                    elim_buffer[nnz_e] = next_idx; // It goes in the current list
-                    next_idx = etree[next_idx]; // one step further along tree
-                    nnz_e += 1; // the list is one longer than before
-                }
-
-                // now put the buffered elimination list into
-                // my current ordering in reverse order
-                while nnz_e != 0 {
-                    nnz_e -= 1;
-                    y_idx[nnz_y] = elim_buffer[nnz_e];
-                    nnz_y += 1;
+        if replay {
+            // The recorded pattern: the same updates in the same order.
+            for i in Ap[k]..Ap[k + 1] {
+                let bidx = Ai[i];
+                if bidx == k {
+                    D[k] = Ax[i];
+                } else {
+                    y_vals[bidx] = Ax[i];
                 }
             }
-        }
-
-        // This for loop places nonzeros values in the k^th row
-        for i in (0..nnz_y).rev() {
-            // which column are we working on?
-            let cidx = y_idx[i];
-
-            // loop along the elements in this
-            // column of L and subtract to solve to y
-            let tmp_idx = next_colspace[cidx];
-
-            // don't compute Lx for logical factorisation
-            // this logic is not implemented in the C version
-            if !logical_factor {
+            for &c in &row_cols[row_ptr[k - 1]..row_ptr[k]] {
+                let cidx = c as usize;
+                let tmp_idx = next_colspace[cidx];
                 let y_vals_cidx = y_vals[cidx];
-
-                let (f, l) = (Lp[cidx], tmp_idx);
+                let f = Lp[cidx];
                 unsafe {
-                    //Safety : Here the Lij index comes from the rowval
-                    //field of the sparse L factor matrix, and should
-                    //always be bounded by the matrix dimension.
-                    for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
+                    //Safety : as below, Lij is a row of L.
+                    for (&Lxj, &Lij) in zip(&Lx[f..tmp_idx], &Li[f..tmp_idx]) {
                         *(y_vals.get_unchecked_mut(Lij)) -= Lxj * y_vals_cidx;
                     }
+                }
+                let Lx_tmp_idx = y_vals_cidx * Dinv[cidx];
+                Lx[tmp_idx] = Lx_tmp_idx;
+                D[k] -= y_vals_cidx * Lx_tmp_idx;
+                next_colspace[cidx] += 1;
+                y_vals[cidx] = T::zero();
+            }
+        } else {
+            // number of nonzeros in this row of L
+            let mut nnz_y = 0; // number of elements in this row
 
-                    // Now I have the cidx^th element of y = L\b.
-                    // so compute the corresponding element of
-                    // this row of L and put it into the right place
-                    let Lx_tmp_idx = y_vals_cidx * *Dinv.get_unchecked(cidx);
-                    *Lx.get_unchecked_mut(tmp_idx) = Lx_tmp_idx;
-                    *D.get_unchecked_mut(k) -= y_vals_cidx * Lx_tmp_idx;
+            // This loop determines where nonzeros
+            // will go in the kth row of L, but doesn't
+            // compute the actual values
+
+            for i in Ap[k]..Ap[k + 1] {
+                let bidx = Ai[i]; //we are working on this element of b
+
+                // Initialize D[k] as the element of this column
+                // corresponding to the diagonal place.  Don't use
+                // this element as part of the elimination step
+                // that computes the k^th row of L
+                if bidx == k {
+                    D[k] = Ax[i];
+                    continue;
+                }
+
+                y_vals[bidx] = Ax[i]; // initialise y(bidx) = b(bidx)
+
+                // use the forward elimination tree to figure
+                // out which elements must be eliminated after
+                // this element of b
+                let next_idx = bidx;
+
+                if y_markers[next_idx] == QDLDL_UNUSED {
+                    //this y term not already visited
+
+                    y_markers[next_idx] = QDLDL_USED; //I touched this one
+                    elim_buffer[0] = next_idx; // It goes at the start of the current list
+                    let mut nnz_e = 1; //length of unvisited elimination path from here
+
+                    let mut next_idx = etree[bidx];
+
+                    while next_idx != QDLDL_UNKNOWN && next_idx < k {
+                        if y_markers[next_idx] == QDLDL_USED {
+                            break;
+                        }
+
+                        y_markers[next_idx] = QDLDL_USED; // I touched this one
+                        elim_buffer[nnz_e] = next_idx; // It goes in the current list
+                        next_idx = etree[next_idx]; // one step further along tree
+                        nnz_e += 1; // the list is one longer than before
+                    }
+
+                    // now put the buffered elimination list into
+                    // my current ordering in reverse order
+                    while nnz_e != 0 {
+                        nnz_e -= 1;
+                        y_idx[nnz_y] = elim_buffer[nnz_e];
+                        nnz_y += 1;
+                    }
                 }
             }
 
-            // record which row it went into
-            Li[tmp_idx] = k;
-            next_colspace[cidx] += 1;
+            // This for loop places nonzeros values in the k^th row
+            for i in (0..nnz_y).rev() {
+                // which column are we working on?
+                let cidx = y_idx[i];
 
-            // reset the y_vals and indices back to zero and QDLDL_UNUSED
-            // once I'm done with them
-            y_vals[cidx] = T::zero();
-            y_markers[cidx] = QDLDL_UNUSED;
+                // loop along the elements in this
+                // column of L and subtract to solve to y
+                let tmp_idx = next_colspace[cidx];
+
+                // don't compute Lx for logical factorisation
+                // this logic is not implemented in the C version
+                if !logical_factor {
+                    let y_vals_cidx = y_vals[cidx];
+
+                    let (f, l) = (Lp[cidx], tmp_idx);
+                    unsafe {
+                        //Safety : Here the Lij index comes from the rowval
+                        //field of the sparse L factor matrix, and should
+                        //always be bounded by the matrix dimension.
+                        for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
+                            *(y_vals.get_unchecked_mut(Lij)) -= Lxj * y_vals_cidx;
+                        }
+
+                        // Now I have the cidx^th element of y = L\b.
+                        // so compute the corresponding element of
+                        // this row of L and put it into the right place
+                        let Lx_tmp_idx = y_vals_cidx * *Dinv.get_unchecked(cidx);
+                        *Lx.get_unchecked_mut(tmp_idx) = Lx_tmp_idx;
+                        *D.get_unchecked_mut(k) -= y_vals_cidx * Lx_tmp_idx;
+                    }
+                }
+
+                // record which row it went into
+                Li[tmp_idx] = k;
+                next_colspace[cidx] += 1;
+                row_cols.push(cidx as u32);
+
+                // reset the y_vals and indices back to zero and QDLDL_UNUSED
+                // once I'm done with them
+                y_vals[cidx] = T::zero();
+                y_markers[cidx] = QDLDL_UNUSED;
+            }
+            row_ptr.push(row_cols.len());
         }
 
         if !logical_factor {

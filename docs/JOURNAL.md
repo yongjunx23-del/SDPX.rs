@@ -8,6 +8,13 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — QDLDL refactors replay the recorded row pattern (kept, thermal-ore)
+
+- Observed: every QDLDL numeric refactor walks the elimination tree again to find each row's nonzero columns (`y_markers`, `elim_buffer`, `y_idx`), although the pattern depends only on the KKT structure, which is fixed for the whole solve. On the high-refactor SOCP cases the walk is a visible share of the factor time.
+- Change: the first factorization (logical or numeric) records, for each row, the columns it eliminates in processing order (`row_cols: Vec<u32>`, `row_ptr`). Later numeric factorizations replay that list with the same updates in the same order. A factorization that stops at a zero pivot leaves a partial record, so replay requires a complete one.
+- Result: points are bitwise identical on 15 local LP/SOCP inputs and medium. Mac, T=1, 5 reps, median: SOCP_nql60 253.4 → 239.5 ms (−5.5%), sched_100_100_orig 337.6 → 316.1 (−6.4%), qssp30 82.5 → 78.2 (−5.2%), nql30 46.8 → 44.9 (−4.1%), sched_50_50_scaled 48.5 → 45.5 (−6.2%), LP_bnl1 35.5 → 34.1 (−3.9%); chainsing_1000_1 and LP_agg are unchanged. The cost is 4 bytes per nnz(L): nql60 RSS 69.4 → 72.2 MB (+3.9%).
+- Decision: kept.
+
 ## 2026-10-18 — LDL auto rule: no flop floor for the supernodal factor (kept, thermal-ore; contract item, backend selection)
 
 - Observed: `ldl_auto_select` uses faer's fill-ratio rule (flops/nnz(L) ≥ 40 → supernodal), plus a floor of 1e8 flops added in the 0.8 work. The journal of that change ("small factors are faster with QDLDL") records no measurement for the floor. Below it, high-fill factors run on QDLDL at 2–4 Gop/s. mcp250-1 (ratio 100, 2.0e7 flops) spends 53% of its solve in refactors, and SOCP_nb (ratio 63, 3.7e7) 71%.
