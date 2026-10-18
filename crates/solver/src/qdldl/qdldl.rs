@@ -896,12 +896,42 @@ fn _ltsolve_unsafe<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], x: &mut [T])
 }
 
 // Solves D(L+I)'x = b, with x replacing b.  Unchecked version.
+// Each column's rows ascend (the factor appends them row by row), so column
+// i-1 uses x[i] only if its first row is i. Otherwise the two dot products
+// are independent and run interleaved, each in its own order: two add
+// chains in flight instead of one.
 fn _dltsolve_unsafe<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], Dinv: &[T], x: &mut [T]) {
     unsafe {
-        for i in (0..x.len()).rev() {
-            let mut s = T::zero();
+        let mut i = x.len();
+        while i > 0 {
+            i -= 1;
             let f = *Lp.get_unchecked(i);
             let l = *Lp.get_unchecked(i + 1);
+            let f0 = if i > 0 { *Lp.get_unchecked(i - 1) } else { f };
+            if i > 0 && (f0 == f || *Li.get_unchecked(f0) != i) {
+                debug_assert!(Li[f0..f].windows(2).all(|w| w[0] < w[1]));
+                let (mut s, mut s0) = (T::zero(), T::zero());
+                let m = (l - f).min(f - f0);
+                for t in 0..m {
+                    s += *Lx.get_unchecked(f + t) * *x.get_unchecked(*Li.get_unchecked(f + t));
+                    s0 += *Lx.get_unchecked(f0 + t) * *x.get_unchecked(*Li.get_unchecked(f0 + t));
+                }
+                for j in f + m..l {
+                    s += *Lx.get_unchecked(j) * *x.get_unchecked(*Li.get_unchecked(j));
+                }
+                for j in f0 + m..f {
+                    s0 += *Lx.get_unchecked(j) * *x.get_unchecked(*Li.get_unchecked(j));
+                }
+                let xi = x.get_unchecked_mut(i);
+                *xi *= *Dinv.get_unchecked(i);
+                *xi -= s;
+                i -= 1;
+                let xi = x.get_unchecked_mut(i);
+                *xi *= *Dinv.get_unchecked(i);
+                *xi -= s0;
+                continue;
+            }
+            let mut s = T::zero();
             for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
                 s += Lxj * (*x.get_unchecked(Lij));
             }

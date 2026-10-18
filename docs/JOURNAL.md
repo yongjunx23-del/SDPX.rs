@@ -8,6 +8,13 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — QDLDL backward solve pairs independent columns (kept, thermal-ore; provisional on x86)
+
+- Observed: refinement dominates small LPs. LP_agg ran 436 refinements in 28 iterations, with `ir` 7.45 of 12.84 ms; LP_bnl1's profile puts `refine` at 55%. In the single-column D(L+I)ᵀ solve, each column's dot product `s += Lx·x[Li]` is one serial add chain, latency-bound rather than load-bound. `solve_many` already interleaves two right-hand sides.
+- Change: `_dltsolve_unsafe` checks whether column i−1 uses x[i]. Its rows ascend, so that holds only if its first row is i. When it does not, the two sums run interleaved: two add chains, each in its own order.
+- Result: points are bitwise identical on 48 local cases (all LP, SOCP and SDP but the three largest SDPs) and medium (b54b58300d4c, audit PASS). Mac T=1, 5 interleaved reps, median against 3e27b44: chainsing_1000_1 −6.4%, qssp30 −4.9%, bnl1 −4.8%, agg −4.2%, nql60 −3.1%, bandm −3.0%, sched_100_100_orig −1.7%, nb −0.1%.
+- Decision: kept. Under 5% on the Mac, so x86 confirmation is pending.
+
 ## 2026-10-18 — Presolve rank image by sorted rows; 'I'-range eigmin retest (rank kept; eigmin rejected again)
 
 - Observed: a Mac profile of nql60 put `presolver::modular_full_row_rank` at 166 of 4093 samples. It is sparse elimination over F_(2^31−1), with every row and the basis kept in `BTreeMap`s. nql60 setup took 23.9 ms.
