@@ -8,6 +8,23 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-18 — x86 job t22: A10–A15 confirmed, dgesdd rejected, A13 regresses (thermal-ore)
+
+- Setup: job 226609, node7 (singlejob, governor conservative), T=1 and T=16, `OPENBLAS_NUM_THREADS=1`, point hashes per run.
+  - Part A: to7e → to8a (A10–A14), 55 cases, min of reps.
+  - Part B: to8a → to8b (+ dgesdd from n = 40), 8 SDPs × 5 jitters.
+  - Part C: receipt overhead.
+  - Part D: to8a → to8c (A15 USYM), 21 SDPs, min of reps.
+- Part A: points are bitwise identical except the five inputs A13 moves to the supernodal factor, and hinf3 stays AlmostSolved as before.
+  - SDP geomean 0.974 (T=1) and 0.973 (T=16). Large SDPs: mcp500-1 −14%/−16%, gpp100 −10%/−9%, planted80 −9%/−6%, arch0 −7%/−6%, gpp124-1 −6%/−7%, gpp250-1 −6%/−6%.
+  - SOCP: nql30 −15%, sched_50_50_scaled −12%, qssp30 −8.5%, sched_100_100 −7%.
+  - Tiny LPs spread ±20–100% between reps on this governor (sc205 3.1 → 6.2 ms, agg +23% at T=1 but −29% at T=16), so they decide nothing.
+  - A13 regresses on x86: nb +21%/+38% (T=1/T=16), nb_L1 +13%/+41%, nb_L2_bessel +25%/+52%, axis_wide +138%/+162%. mcp250-1 is −25%/−2%, but that includes A10's projection change. Their fill ratios: mcp250-1 99.7 (2.0e7 flops), the nb family 62 (4–5e7), axis_wide 49.5 (1.4e6).
+- Part B (dgesdd): geomean 0.999 (T=1) and 0.981 (T=16); gpp124-1 +7–11% with one AlmostSolved jitter, theta1 +11–13%, gpp500-1 +8% at T=16, gpp250-1 −12%. Rejected.
+- Part D (A15): bitwise on all 21 SDPs; gpp250-1 −8.6%/−9.2%, arch0 −8.2%/−5.2%, gpp124-1 −6.0%/−4.7%, gpp100 −3.0%/−4.9%; geomean 0.994/0.982. Confirmed.
+- Part C: plain/receipt medians range 0.73–1.25 on small SDPs, i.e. within the run spread. T=16/T=1 without receipts is 1.23–1.51 on theta2, control2 and chainsing_1000_1 (the known small-case thread penalty).
+- Next: job t24 isolates A13 on x86 (to8g = 9d969d3 vs to8g + the 1e8 floor). The Mac keeps the faer advantage on mcp250-1 (106 vs 269 ms with the floor), so a flat floor is not assumed. Part G of t24 checks A17/A19/A20 on x86.
+
 ## 2026-10-18 — Register-accumulated G·Aⱼ in the dense Schur transform (kept, thermal-ore)
 
 - Hypothesis: `coefficient_product` (G·Aⱼ by column AXPYs) zero-fills each n×n panel, then read-modify-writes its output column once per term. In the Mac planted80 profile (n = 80, ~300 terms per column; `#[inline(never)]` split) it is the largest piece of the assembly: 779 of 2904 samples, against 588 for the GEMM, 416 for packing and ~1070 for the dot accumulation.
