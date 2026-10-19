@@ -8,6 +8,55 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-20 — BFSS L11u thermal bootstrap: MPFR KKT update and arrow leaf phase on all workers (kept, bfss-threads)
+
+- Case: `L11u_T0.5_r2.36_energy_min_g.json` (n 1090, m 14033; 22 PSD blocks and 19 operator relative entropy cones of three blocks each, n ≤ 38; negated arrow, augmented KKT, partitions 1). Reference at 128 bits, T=16: InsufficientProgress/107, primal 7.046089322701808, dual 7.05180711602981. Unless stated, timings are x86 node7, pinned, singlejob, 256 bits, T=16, 25 iterations.
+- Baseline (tb0 = 66e64b7): 532.9 s, 21.5 s/it, 1156% CPU.
+  - Thread use: one solve has 17–18 threads and one shared pool, so nothing is nested or oversubscribed. The reported 145 threads were four concurrent solves.
+  - perf (cycles): `dot_slices` 37.5% self, almost all of it the leaf Y solve (`forward_suffix_rows`, 31% inclusive); residue GEMMs 22.8%; ORE `update_scaling` 20.8% (congruences 4.8, `to_eigen` 4.7, `spd_inverse` 3.3); `ldl_rec` 15%. memset and memcpy are 5.8%; allocation does not show (MPFR values own their limbs).
+  - Phases per iteration: arrow refactor 11.2 s (leaves 8.1 at 14.3 busy; contributions 2.7 at 9.7 busy); KKT value update 2.7 s; scale cones 4.3 s at 15.6 busy; affine plus final step 2.3 s at 3–4 busy.
+- Kept (all bitwise: x, s, z and objectives identical to tb0):
+  - KKT update (tb1): each cone fills and negates its own Hs block in parallel, and the ORE rows N⁻¹A transform runs across cones. `ArrowLDLSolver` caches one value plan per index map: the single cached plan had been rebuilt serially for every map (about 17M entries per iteration). `Negated` maps values in place instead of copying them. Value update 67.1 → 51.3 s.
+  - Arrow leaf phase (tb6–tb13): leaves are claimed largest first (g³ plus product work), one lane per worker under a board offer, not by a parallel iterator. Split work (the recursive factor's halves, the Y columns) is posted on the board, where idle lanes help. A large leaf forms its residue contribution product inside the phase, split by its share of all products' work. The recursive factor keeps its larger half on its own worker.
+    - Under a parallel iterator, workers waiting in one leaf's join stole whole leaves: the same 1785 leaf factor took 3.6–13.8 s. On the board it takes 4.6–4.7 s.
+    - Leaves plus contributions 270.3 → 240.9 s, at 15.9 busy; the separate contribution phase fell 67.0 → 2.9 s.
+  - Small-case gates (tbJ–tbM): a leaf posts its Y columns only under a board offer and with a grain of work per extra column (the board is one lock: csdr3's 4200 SOC leaves at four threads lost 2.3% without it). Lanes run only when a leaf splits its factor or the phase forms residue products; balanced leaves keep the parallel iterator (binary64 nb, 797 leaves of g ≤ 6 on two workers, lost 1.7% to lanes). The Hs fill runs in parallel from a grain of work per cone. Review fixes (tbN, bitwise on BFSS): lanes run only when the factor is called from outside the pool. Owner factors inside the pool (an in-process partitioned solve) keep the parallel iterator, because two broadcasts there could wait on each other through the board's spin. In-phase products are admitted largest first while their Y, Z and product estimate fits `BATCH_WORK_BYTES`, so mixed Λ27/1024 keeps its batched peak (BFSS: 22 products, 1.44 GB, all admitted). In-process ising11 with two owners at eight threads is Solved/54, bitwise identical to HEAD. Mac fast profile against 66e64b7: csdr3 (256 bits, T=4, ABBA) 3.317 → 3.253 s (−1.9%), points identical, audits pass; binary64 nb 67.8 → 67.8 ms and nb_L2_bessel 77.7 → 78.4 ms (tbN, T=16, nine interleaved runs, points identical).
+- Rejected:
+  - Parallel ORE step search (tb2–tbH): admit operator relative entropy cones to `nonsym_step_parallel` from two cones (not 64), one cone per task. Almost every search takes one primal and one dual trial. A round's critical path (0.23–0.67 s) is an n = 34/38 cone whose test at αs needs S₀'s bound, followed by a batch of 16 dual trials.
+    - Every cone searches from α₀, not from the cap the earlier cones left, so more tests reach S₀'s factor. Affine step: L11u 34.2 → 35.2 s; L10 (ABBA, node55, 128 bits) `ore.schur_cholesky` 3.4 → 20.0 s, affine 7.9 → 13.2 s, solve +3.5%.
+    - Final step only: L11u 23.2 → 20.4 s (0.5% of the solve); L10 +0.3 s.
+    - Passing the inner-parallel gate to stolen batch trials (tbG): within noise (6 iterations: 105.0 against 105.9 s).
+  - Blocked exact Y solve: row blocks of L times column chunks of Y as residue products, entry for entry the per-entry exact dots. It was bitwise on the dumped 2223 leaf and 2.4× faster serially on the Mac (5.6 → 2.3 s). On x86 the leaf phase took 12.4 s against 9.7 s for the per-entry dots (157 against 125 CPU-s per call): faer's AVX2 residue GEMMs cost about twice Accelerate's share.
+  - Helping posted work before claiming the next leaf: neutral (phase 9.68 against 9.85 s).
+  - Row-block trsm in `ldl_rec`: bitwise, but slower (0.34 against 0.23 s at the 1482 level).
+  - Leaf lanes without the board (tb6, tb9): 793 and 672 s, stalled on big-leaf joins.
+- Options (no code change): kkt_form = condensed is valid (its 128-bit full run reproduces the reference status) and about 2.5% faster at 256 bits, but not bitwise. partitions > 1 is unsupported with ORE cones. MPI 2×8 is 1.7× slower. Chordal options change nothing on this case.
+- Result (tbM; final tbN gated on the same runs). Every check is bitwise identical to tb0: x, s, z, status, iterations and objectives.
+  - Scaling. Node7, 25 iterations, tb0 and tbM interleaved per thread count. Each row is s (s/it):
+
+    | T | tb0 | tbM | Change |
+    |---|---|---|---|
+    | 8 | 711.1 (28.77) | 689.6 (27.73) | −3.0% |
+    | 16 | 537.4 (21.50) | 494.6 (19.75) | −8.0% |
+    | 32 | 452.4 (18.23) | 384.9 (15.38) | −14.9% |
+    | 64 | 415.1 (16.76) | 375.2 (14.83) | −9.6% |
+
+    - Peak RSS: 14.3 → 12.6 GiB at T=16, 20.9 → 21.7 GiB at T=64.
+    - Going from 8 to 64 threads speeds tb0 up 1.71× and tbM 1.84×. tbM uses 3.4× the CPU of T=16 at T=64.
+    - Node55 (tb0 against tbI): −3.2%, −9.3%, −10.7% and −13.0%.
+  - Phases. T=16, 25 iterations, s:
+    - KKT update 348.5 → 304.9: value update 66.3 → 51.4; arrow refactor 282.1 → 253.5 (busy 13.0 → 15.8), of which leaves 203.6 → 239.9 (busy 14.2 → 15.9, products included) and the separate contribution phase 67.9 → 2.9.
+    - Scale cones 107.6 → 108.1. Steps 57.7 → 57.9.
+  - perf after (tbM, node55):
+    - Exact dots 38.5%, residue GEMM kernels about 22%, board `help` 0.9%, rayon epoch 2.3%.
+    - Busy per phase window: leaves 14.6, scale 14.4, factor 15.0, steps 4.1.
+  - 128 bits, full run (node10): InsufficientProgress/107, primal 7.046089322701808, dual 7.05180711602981, bitwise identical to the reference.
+    - Time 1411.7 s (tbN) and 1413.3 s (tbM). The reference took 1494.5 s on node16; tbI took 1364.4 s there (−8.7%).
+  - 512 bits, 10 iterations (node50): bitwise identical. tbN 412.5 → 378.4 s (−8.3%); tbM 413.3 → 378.6 s. RSS 18.9 → 17.3 GiB.
+  - L10 (Solved/198, ABBA): bitwise identical. tbN 106.3 → 105.4 s (node50); tbM 107.4 → 106.4 s (node10).
+  - tbM against tbN at 256 bits (ABBA, node55): bitwise identical, medians 536.5 and 539.2 s (noise).
+- Decision: kept. Next on this case: the Y solve's exact dots (39% of cycles) and the ORE scaling (Schur inverse and Cholesky, 4.3 s/it at 15.6 busy) are work, not idle time; step lengths are 2.3 s/it on the S₀ critical path.
+
 ## 2026-10-19 — Binary64 corrector budget: fewer centrality correctors rejected (thermal-ore)
 
 - Observed: on gpp124-1 (Mac T=1, 278 ms, 24 iterations) the Gondzio correctors take 43% of the solve: corrector right-hand sides 51 ms (dsyev of the trial product), corrector solves 37 ms, corrector step lengths 15 ms. 15 of 35 attempts are rejected, mostly by the cheap admissibility test after the solve. On x86, gpp100's correctors are 41% of 423 ms.
