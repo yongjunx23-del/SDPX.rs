@@ -8,6 +8,33 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-19 — x86 job t25: trmm + syr2k congruence rejected (thermal-ore)
+
+- Hypothesis: the binary64 H-apply congruence RᵀXR (two GEMMs) is cheaper on x86 as a TRMM plus a SYR2K, which OpenBLAS might run faster than its GEMM at the PSD block sizes of the scoreboard.
+- Setup: job 226689, node7, `t25/cong.c` against the scoreboard's OpenBLAS (Zen kernel, 1 thread), k = 16–250, repetitions sized to about 0.2 s.
+- Result: trmm + syr2k is slower at every size, 1.005× (k = 250) to 1.28× (k = 24); k = 124 is 1.08×. Errors are comparable: 0.17–0.42 eps·max|R||X||R| on both.
+- Decision: rejected. The x86 SDP congruences stay two GEMMs.
+
+## 2026-10-19 — x86 job t24: 1e8-flop supernodal floor restored (A13), A17/A19/A20 bitwise (thermal-ore)
+
+- Setup: job 226629, node7 (singlejob, governor conservative), T=1 and T=16, `OPENBLAS_NUM_THREADS=1`, min of reps, `native_oracle` audits of Part F.
+  - Part F: to8g (9d969d3, A13 without the floor) against to8h (to8g + `ldl-floor.patch`) on the five inputs that change backend.
+  - Part G: to8d → to8g (A17, A19, A20), 57 cases.
+- Part F (to8g / to8h):
+  - nb 1.26/1.46 (T=1/T=16), nb_L1 1.23/1.44, nb_L2_bessel 1.33/1.65, axis_wide 2.51/2.42, mcp250-1 0.82/1.09.
+  - Geomean 1.33 (T=1) and 1.56 (T=16). Every audit passes on both arms at the same iteration counts.
+  - On the Mac the floor had lost (nb −8%, nb_L1 −17%, axis_wide −17%, mcp250-1 −37% without it). Below 1e8 flops, x86 faer runs these factors slower than QDLDL.
+  - After the QDLDL run sweeps (A21), the floor is close to neutral on the Mac too (559b9f6 + floor, single runs): nb −8%, nb_L2_bessel −10%, axis_wide −21%, nb_L1 +6%, mcp250-1 +9%.
+- Part G: points bitwise identical on all 57 cases at both thread counts (hinf3, sched_100_50_orig, csdr3 and f64_large stay AlmostSolved).
+  - Geomean to8g/to8d: SDP 0.965 (T=1) and 0.951 (T=16); SOCP 1.020 and 0.934; LP 1.044 and 1.098.
+  - Largest SDP gains: theta1 −24%/−31%, qap5 −10%/−31%, hinf1 −21%, hinf2 −23%, truss2 −16% (T=16).
+  - LP and small SOCP timings remain undecidable on this node: adlittle 0.63, grow7 1.56, share2b 1.54, bnl1 1.15 at T=1 against 0.98 at T=16, agg 0.97 against 1.80.
+- Check: exactly the five Part F inputs change points locally, all audited at unchanged iteration counts; medium (b54b58300d4c) and csdr3 (71603237737a) are unchanged.
+- Decision:
+  - A13 floor restored (faer only from 1e8 flops; the scoreboard runs on x86). A ratio-aware rule would keep only mcp250-1's T=1 gain, which reverses at T=16.
+  - A20 confirmed on x86 (SDP geomean −3.5%/−4.9%).
+  - A17 and A19 stay bitwise; their x86 speed is unresolved at this noise level.
+
 ## 2026-10-18 — QDLDL forward solves sweep supernode runs of up to eight columns (kept, thermal-ore)
 
 - Hypothesis: the forward substitution (L + I)x = b is the same column sweep as the refactor replay, so the run sweep of A21 applies to it bitwise. The backward Lᵀ solve cannot fuse a run bitwise, since each column's dot product starts with the previous column's result.
