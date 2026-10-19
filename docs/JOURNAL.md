@@ -8,6 +8,22 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-19 — Serial KKT residual sweeps runs of dense constraint columns (kept, thermal-ore)
+
+- Hypothesis: after A22, nb's refinement residual `b − Kx` costs 0.137 ms per call (98 calls, about 13 of 66 ms). About 190k of its 199k KKT entries sit in the 123 dense equality columns (1,560–1,586 rows each). In `_csc_symv_unsafe` each such column's sum is one serial dependency chain, at about one FP-add latency per entry (≈2.4 cycles measured). Sweeping several such columns together makes their sums independent chains with no change in any operation.
+- Exact patterns do not work: adjacent dense rows of nb share about 99% of their columns, but no two neighbours are identical (39 distinct patterns).
+- Change (`SymvRuns`, `csc_symv_runs`; binary64 serial residuals only):
+  - A run is up to four adjacent KKT columns of at least 64 off-diagonal rows, all above the run, each covering 4/5 of the run's merged row list. Each merged row stores a mask of the columns that hold it.
+  - The run kernel updates y[row] in column order and each column's sum in row order, adding the diagonal last, so the result is bitwise that of the column sweep.
+  - Runs are built once with the KKT. The pooled residual plan and the MPFR exact residual are unchanged.
+- Tuning (Mac T=1, median of 5):
+  - Runs of eight columns matched four (residual 0.069 against 0.070 ms).
+  - A 16-row minimum cost LP_agg 6% (11.8 → 12.5 ms), from runs over its eight rows of 16–19 entries; 64 rows removes that.
+- Result: bitwise identical on all 51 local inputs and medium (b54b58300d4c); ising11 and csdr3 unchanged with the 16-row variant (MPFR does not use the path). nb residual 0.137 → 0.069 ms per call. Mac T=1 medians of 5 interleaved reps against e9f5019:
+  - nb 73.3 → 66.0 ms (−10.0%), nb_L2_bessel 88.7 → 82.6 ms (−6.9%), nb_L1 181.4 → 173.4 ms (−4.4%);
+  - bnl1 −1.6%, agg 12.0 → 12.0 ms.
+- Decision: kept (A23). Provisional on x86 for the gains under 5%.
+
 ## 2026-10-19 — Binary64 local cone arrow with class panels and a cost gate (kept, thermal-ore)
 
 - Hypothesis: SOCP_nb and SOCP_nb_L2_bessel are standard-form SOCPs whose cone rows are identities: 793 SOC3 leaves (plus orthant rows) around a 123-row dense equality border on nb. The local cone arrow fits them, but it was MPFR-only, because a binary64 border had lost accuracy on the crossing SOCP (journal 2026-10-07, before the border-order fix). Run with BLAS panels, its dense work should beat QDLDL when it costs about as many flops as the sparse LDL.

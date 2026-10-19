@@ -160,6 +160,8 @@ pub struct DirectLDLKKTSolver<T> {
     reg_boost: usize,
     counters: crate::solver::kkt::SolveCounters,
     residual_plan: Option<SparseParallel>,
+    /// Column runs of the serial binary64 residual product.
+    residual_runs: crate::algebra::SymvRuns,
     residual_dense: Option<Matrix<T>>,
     packed_residual: bool,
     /// Incoming symmetric mirrors of the fixed KKT pattern (MPFR exact residuals).
@@ -306,6 +308,11 @@ where
 
         let packed_residual = ldlsolver.linear_solver_info().name == "dense_block"
             && KKT.colptr[n] == triangular_number(n);
+        let residual_runs = if T::precision_bits() <= 64 {
+            crate::algebra::SymvRuns::new(&KKT)
+        } else {
+            Default::default()
+        };
 
         Self {
             m,
@@ -327,6 +334,7 @@ where
             reg_boost: 0,
             counters: Default::default(),
             residual_plan: None,
+            residual_runs,
             residual_dense: None,
             packed_residual,
             exact_rows: None,
@@ -821,7 +829,7 @@ where
         let plan = self.residual_plan.as_ref();
         {
             let dense = self.residual_dense.as_ref();
-            _get_refine_error_dense(out, rhs, &KKTsym, point, plan, dense)
+            _get_refine_error_dense(out, rhs, &KKTsym, point, plan, &self.residual_runs, dense)
         }
     }
 
@@ -1325,6 +1333,7 @@ where
                 &ksym,
                 &x[column(c)],
                 self.residual_plan.as_ref(),
+                &self.residual_runs,
                 dense,
             );
         }
@@ -1524,6 +1533,7 @@ fn _get_refine_error<T: FloatT>(
     KKTsym: &Symmetric<CscMatrix<T>>,
     ξ: &[T],
     plan: Option<&SparseParallel>,
+    runs: &crate::algebra::SymvRuns,
 ) -> T {
     // Note that K is only triu data, so need to
     // be careful when computing the residual here
@@ -1532,7 +1542,7 @@ fn _get_refine_error<T: FloatT>(
     if let Some(plan) = plan {
         plan.symv(KKTsym.src, KKTsym.uplo, e, ξ, -T::one(), T::one());
     } else {
-        KKTsym.symv(e, ξ, -T::one(), T::one());
+        crate::algebra::csc_symv_runs(KKTsym.src, runs, e, ξ, -T::one(), T::one());
     }
 
     e.norm_inf()
@@ -1544,6 +1554,7 @@ fn _get_refine_error_dense<T: FloatT>(
     KKTsym: &Symmetric<CscMatrix<T>>,
     ξ: &[T],
     plan: Option<&SparseParallel>,
+    runs: &crate::algebra::SymvRuns,
     dense: Option<&Matrix<T>>,
 ) -> T {
     if let Some(dense) = dense {
@@ -1551,7 +1562,7 @@ fn _get_refine_error_dense<T: FloatT>(
         dense.sym(KKTsym.uplo).symv(ξ, e, -T::one(), T::one());
         return e.norm_inf();
     }
-    _get_refine_error(e, b, KKTsym, ξ, plan)
+    _get_refine_error(e, b, KKTsym, ξ, plan, runs)
 }
 
 // update entries of the KKT matrix using the given index into its CSC representation.
@@ -1948,7 +1959,7 @@ mod parallel_residual_tests {
             let mut expected = vec![T::zero(); n];
             let mut actual = expected.clone();
             let k = solver.KKT.sym(solver.KKTuplo);
-            let en = _get_refine_error(&mut expected, &rhs, &k, &mut x, None);
+            let en = _get_refine_error(&mut expected, &rhs, &k, &mut x, None, &Default::default());
             solver.b.copy_from_slice(&rhs);
             solver.x.copy_from_slice(&x);
             assert!(solver.iterative_refinement(&settings));

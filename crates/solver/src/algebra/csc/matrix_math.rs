@@ -192,23 +192,189 @@ fn _csc_symv_unsafe<T: FloatT>(
     assert!(y.len() == A.n);
     assert!(A.n == A.m);
     unsafe {
-        for (col, &xcol) in x.iter().enumerate() {
-            let first = *A.colptr.get_unchecked(col);
-            let last = *A.colptr.get_unchecked(col + 1);
-            // y[col] is held in a register: within this column it is written
-            // only here, so the operation sequence on it is unchanged.
-            let mut ycol = *y.get_unchecked(col);
-            for (&row, &Aij) in zip(&A.rowval[first..last], &A.nzval[first..last]) {
-                if row == col {
-                    ycol += a * Aij * xcol;
-                } else {
-                    *y.get_unchecked_mut(row) += a * Aij * xcol;
-                    //don't double up on the diagonal
-                    ycol += a * Aij * (*x.get_unchecked(row));
+        for col in 0..A.n {
+            symv_column(A, col, y, x, a);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn symv_column<T: FloatT>(A: &CscMatrix<T>, col: usize, y: &mut [T], x: &[T], a: T) {
+    let first = *A.colptr.get_unchecked(col);
+    let last = *A.colptr.get_unchecked(col + 1);
+    let xcol = *x.get_unchecked(col);
+    // y[col] is held in a register: within this column it is written
+    // only here, so the operation sequence on it is unchanged.
+    let mut ycol = *y.get_unchecked(col);
+    for (&row, &Aij) in zip(&A.rowval[first..last], &A.nzval[first..last]) {
+        if row == col {
+            ycol += a * Aij * xcol;
+        } else {
+            *y.get_unchecked_mut(row) += a * Aij * xcol;
+            //don't double up on the diagonal
+            ycol += a * Aij * (*x.get_unchecked(row));
+        }
+    }
+    *y.get_unchecked_mut(col) = ycol;
+}
+
+/// Most adjacent columns one [`SymvRuns`] run sweeps together.
+const SYMV_RUN: usize = 4;
+/// Shortest off-diagonal column worth a run (LP_agg's runs of 16-19 rows
+/// cost 6%).
+const SYMV_RUN_ROWS: usize = 64;
+
+/// Runs of adjacent long columns of an upper CSC triangle whose off-diagonal
+/// rows all lie above the run and mostly coincide (dense constraint rows of
+/// an augmented KKT), each column's diagonal (if stored) last. A run keeps
+/// its merged row list and, per merged row, the mask of columns storing it;
+/// [`csc_symv_runs`] sweeps the run's columns together.
+#[derive(Default)]
+pub(crate) struct SymvRuns {
+    /// First column, column count and merged row range.
+    runs: Vec<(usize, usize, std::ops::Range<usize>)>,
+    rows: Vec<usize>,
+    masks: Vec<u8>,
+}
+
+impl SymvRuns {
+    pub(crate) fn new<T>(a: &CscMatrix<T>) -> Self {
+        let off = |j: usize| {
+            let (p, q) = (a.colptr[j], a.colptr[j + 1]);
+            &a.rowval[p..if q > p && a.rowval[q - 1] == j {
+                q - 1
+            } else {
+                q
+            }]
+        };
+        let mut out = Self::default();
+        let (mut merged, mut next) = (Vec::new(), Vec::new());
+        let mut j = 0;
+        while j < a.n {
+            let first = off(j);
+            let mut len = 1;
+            if first.len() >= SYMV_RUN_ROWS && first[first.len() - 1] < j {
+                merged.clear();
+                merged.extend(first.iter().map(|&r| (r, 1u8)));
+                let mut shortest = first.len();
+                while len < SYMV_RUN && j + len < a.n {
+                    let rows = off(j + len);
+                    if rows.len() < SYMV_RUN_ROWS || rows[rows.len() - 1] >= j {
+                        break;
+                    }
+                    // Sorted merge; each column must cover 4/5 of the union.
+                    next.clear();
+                    let (mut p, mut q) = (0, 0);
+                    while p < merged.len() || q < rows.len() {
+                        let (r, m) = merged.get(p).copied().unwrap_or((usize::MAX, 0));
+                        let s = rows.get(q).copied().unwrap_or(usize::MAX);
+                        if r <= s {
+                            next.push((r, if r == s { m | 1 << len } else { m }));
+                            p += 1;
+                            q += usize::from(r == s);
+                        } else {
+                            next.push((s, 1 << len));
+                            q += 1;
+                        }
+                    }
+                    if 4 * next.len() > 5 * shortest.min(rows.len()) {
+                        break;
+                    }
+                    shortest = shortest.min(rows.len());
+                    std::mem::swap(&mut merged, &mut next);
+                    len += 1;
                 }
             }
-            *y.get_unchecked_mut(col) = ycol;
+            if len > 1 {
+                let begin = out.rows.len();
+                out.rows.extend(merged.iter().map(|&(r, _)| r));
+                out.masks.extend(merged.iter().map(|&(_, m)| m));
+                out.runs.push((j, len, begin..out.rows.len()));
+            }
+            j += len;
         }
+        out
+    }
+}
+
+/// `_csc_symv_unsafe` with each run's columns swept together: every y[row]
+/// takes its updates in column order and every column its own row-order
+/// sum, so the product is bitwise unchanged while the run's column sums
+/// form independent dependency chains.
+pub(crate) fn csc_symv_runs<T: FloatT>(
+    A: &CscMatrix<T>,
+    runs: &SymvRuns,
+    y: &mut [T],
+    x: &[T],
+    a: T,
+    b: T,
+) {
+    y.scale(b);
+    assert!(x.len() == A.n && y.len() == A.n && A.n == A.m);
+    let mut col = 0;
+    // SAFETY: as `_csc_symv_unsafe`; the runs come from A's pattern.
+    unsafe {
+        for (start, len, range) in &runs.runs {
+            for c in col..*start {
+                symv_column(A, c, y, x, a);
+            }
+            let (rows, masks) = (&runs.rows[range.clone()], &runs.masks[range.clone()]);
+            match len {
+                2 => symv_run::<T, 2>(A, *start, rows, masks, y, x, a),
+                3 => symv_run::<T, 3>(A, *start, rows, masks, y, x, a),
+                _ => symv_run::<T, SYMV_RUN>(A, *start, rows, masks, y, x, a),
+            }
+            col = start + len;
+        }
+        for c in col..A.n {
+            symv_column(A, c, y, x, a);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn symv_run<T: FloatT, const R: usize>(
+    A: &CscMatrix<T>,
+    c0: usize,
+    rows: &[usize],
+    masks: &[u8],
+    y: &mut [T],
+    x: &[T],
+    a: T,
+) {
+    let mut pos: [usize; R] = std::array::from_fn(|k| *A.colptr.get_unchecked(c0 + k));
+    let xc: [T; R] = std::array::from_fn(|k| *x.get_unchecked(c0 + k));
+    // No merged row lies in the run, so these sums start from y as each
+    // column would see it.
+    let mut yc: [T; R] = std::array::from_fn(|k| *y.get_unchecked(c0 + k));
+    for (&row, &mask) in rows.iter().zip(masks) {
+        let xr = *x.get_unchecked(row);
+        let mut yr = *y.get_unchecked(row);
+        let mut term = |k: usize| {
+            let Aij = *A.nzval.get_unchecked(pos[k]);
+            pos[k] += 1;
+            yr += a * Aij * xc[k];
+            yc[k] += a * Aij * xr;
+        };
+        if u32::from(mask) == (1 << R) - 1 {
+            for k in 0..R {
+                term(k);
+            }
+        } else {
+            for k in 0..R {
+                if mask >> k & 1 != 0 {
+                    term(k);
+                }
+            }
+        }
+        *y.get_unchecked_mut(row) = yr;
+    }
+    for k in 0..R {
+        // A remaining entry is the column's diagonal.
+        if pos[k] < *A.colptr.get_unchecked(c0 + k + 1) {
+            yc[k] += a * *A.nzval.get_unchecked(pos[k]) * xc[k];
+        }
+        *y.get_unchecked_mut(c0 + k) = yc[k];
     }
 }
 
