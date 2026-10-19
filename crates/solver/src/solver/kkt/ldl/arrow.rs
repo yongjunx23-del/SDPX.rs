@@ -1695,6 +1695,7 @@ pub struct ArrowLDLSolver<T: FloatT> {
     exact_bound_panels: Option<local_bounds::ExactBoundPanels<T>>,
     #[cfg(feature = "faer-sparse")]
     bound_panels: Option<local_bounds::BoundPanels>,
+    cone_panels: Option<local_cones::ConePanels<T>>,
     ranks: Option<LeafRanks>,
     value_plan: Option<ValuePlan>,
 }
@@ -1972,10 +1973,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                             let q = if width == 0 { 0 } else { columns.len() };
                             leaf.b.resize(width.saturating_sub(1) * q, T::zero());
                             leaf.y.resize(width * q, T::zero());
-                            // MPFR forms Z = D⁻¹Y inside the exact Schur product.
-                            if T::precision_bits() <= 64 {
-                                leaf.z.resize(width * q, T::zero());
-                            }
+                            // MPFR forms Z = D⁻¹Y inside the exact Schur
+                            // product, binary64 in its class panels.
                             leaf.couples = vec![false; t];
                             for &c in &columns[..q] {
                                 leaf.couples[c] = true;
@@ -2026,6 +2025,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 classes[class].leaves.push(l);
             }
         }
+        let cone_panels = (matches!(local_structure, Some(LocalStructure::Cones))
+            && T::precision_bits() <= 64)
+            .then(|| local_cones::ConePanels::new(&classes, &leaves));
         let unshifted = if matches!(local_structure, Some(LocalStructure::SharedSoc)) {
             Self::single_primal_leaf_columns(k, signs, &leaves)
         } else {
@@ -2071,6 +2073,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             } else {
                 None
             },
+            cone_panels,
             ranks: None,
             value_plan: None,
         };
@@ -2498,6 +2501,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         if self.solve_bounds_faer(x, b, 1) {
             return;
         }
+        if self.solve_cones(x, b, 1) {
+            return;
+        }
         let t = self.trunk.len();
         let owned = self.owned_leaves();
         // One leaf too small to split its sweeps gains nothing from a round
@@ -2807,6 +2813,9 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
         }
         #[cfg(feature = "faer-sparse")]
         if self.solve_bounds_faer(x, b, cols) {
+            return;
+        }
+        if self.solve_cones(x, b, cols) {
             return;
         }
         self.batch_tx.resize(t * cols, T::zero());

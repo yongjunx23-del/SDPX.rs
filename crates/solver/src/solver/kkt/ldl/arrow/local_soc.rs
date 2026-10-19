@@ -109,7 +109,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             crate::receipt::finish("arrow.local_schur", timer);
             return;
         }
-        if self.assemble_bound_schur_exact() {
+        if self.assemble_bound_schur_exact() || self.assemble_cone_schur() {
             crate::receipt::finish("arrow.local_schur", timer);
             return;
         }

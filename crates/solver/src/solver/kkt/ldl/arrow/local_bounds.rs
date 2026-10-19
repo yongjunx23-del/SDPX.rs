@@ -130,7 +130,16 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 }
             }
         }
-        if T::precision_bits() <= 64 && !dense_border_pays(k, groups.len(), trunk.len(), amd) {
+        let t = trunk.len() as f64;
+        if T::precision_bits() <= 64
+            && !dense_border_pays(
+                k,
+                "LOCAL_BOUNDS",
+                groups.len() as f64 * t * t + t * t * t / 3.0,
+                DENSE_FLOP_RATIO,
+                amd,
+            )
+        {
             return None;
         }
         Some(Self::from_groups(
@@ -148,34 +157,30 @@ impl<T: FloatT> ArrowLDLSolver<T> {
 /// LP_bnl1 runs its dense border at 4.2 GF/s and QDLDL at about 0.4 GF/s.
 const DENSE_FLOP_RATIO: f64 = 10.0;
 
-/// The bound elimination leaves a dense `t x t` border: forming it costs
-/// `groups * t^2` and factoring it `t^3 / 3` per refactor, against the sparse
-/// LDL flops of the whole KKT under AMD. Keep the dense border only when it
-/// is cheaper after crediting dense kernels with [`DENSE_FLOP_RATIO`].
-/// Measured on the regression LPs, sparse LDL was 4-80x faster (LP_bnl1
-/// 8.09 -> 0.098 s, LP_agg 2.55 -> 0.032 s).
+/// A local elimination leaves a dense `t x t` border: forming it costs
+/// `dense` flops with its factor (`groups * t^2 + t^3 / 3` for bounds) per
+/// refactor, against the sparse LDL flops of the whole KKT under AMD. Keep
+/// the dense border only when it is cheaper after crediting dense kernels
+/// with `ratio`. Measured on the regression LPs, sparse LDL was 4-80x faster
+/// (LP_bnl1 8.09 -> 0.098 s, LP_agg 2.55 -> 0.032 s).
 /// The AMD ordering is kept in `amd` for the sparse factor that follows.
-fn dense_border_pays<T: FloatT>(
+pub(super) fn dense_border_pays<T: FloatT>(
     k: &CscMatrix<T>,
-    groups: usize,
-    t: usize,
+    label: &str,
+    dense: f64,
+    ratio: f64,
     amd: &std::cell::OnceCell<crate::solver::kkt::ldl::AmdOrdering>,
 ) -> bool {
-    let t = t as f64;
-    let dense = groups as f64 * t * t + t * t * t / 3.0;
     let info = &amd.get_or_init(|| crate::solver::kkt::ldl::amd_order(k)).2;
     let sparse = (info.n_div + info.n_mult_subs_ldl) as f64;
+    let pays = dense <= ratio * sparse;
     if crate::receipt::profile_requested() {
         eprintln!(
-            "LOCAL_BOUNDS dense_flops={dense:.3e} sparse_flops={sparse:.3e} choice={}",
-            if dense <= DENSE_FLOP_RATIO * sparse {
-                "dense"
-            } else {
-                "sparse"
-            }
+            "{label} dense_flops={dense:.3e} sparse_flops={sparse:.3e} choice={}",
+            if pays { "dense" } else { "sparse" }
         );
     }
-    dense <= DENSE_FLOP_RATIO * sparse
+    pays
 }
 
 #[cfg(feature = "faer-sparse")]

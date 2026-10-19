@@ -10,12 +10,12 @@
 //! their variables; a leaf whose cone rows also touch a border variable
 //! couples through all of its rows. This covers standard-form problems
 //! (`Ax = b`, `x ∈ K` with identity cone rows) as well as the specialized
-//! SOC and bound layouts, which are tried first. MPFR only: its border Schur
-//! complement is exact (residue products) and rounded once, while a binary64
-//! border loses the accuracy of the augmented factorization on
-//! ill-conditioned problems. The caller still owns static shifts, their
-//! escalation, and refinement against the original augmented operator. No
-//! equality is dropped.
+//! SOC and bound layouts, which are tried first. MPFR forms the border Schur
+//! complement exactly (residue products, rounded once). Binary64 admits the
+//! layout only when its dense work beats the sparse LDL ([`CONE_FLOP_RATIO`])
+//! and runs each coupling class as stacked BLAS panels ([`ConePanels`]). The
+//! caller still owns static shifts, their escalation, and refinement against
+//! the original augmented operator. No equality is dropped.
 use super::*;
 use crate::solver::cones::{CompositeCone, Cone, SupportedCone};
 
@@ -25,6 +25,11 @@ const LEAF_MAX: usize = 64;
 /// Variables shared by more units stay in the border: merging them into one
 /// leaf took about four times as many refinement solves (journal 2026-10-07).
 const SHARED_UNITS: usize = 4;
+/// Binary64 dense flops (class Schur products plus the border factor) per
+/// sparse LDL flop admitted. Against QDLDL (journal 2026-10-19), nb (0.99x)
+/// ran 59% and nb_L2_bessel (1.34x) 33% faster; sambal (2.3x), nb_L1 (5.4x),
+/// axis_many (7.9x) and three LPs (12-19x) ran 1.5-4.5x slower.
+const CONE_FLOP_RATIO: f64 = 2.0;
 
 impl<T: FloatT> ArrowLDLSolver<T> {
     pub(crate) fn try_local_cones(
@@ -33,10 +38,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         a: &CscMatrix<T>,
         cones: &CompositeCone<T>,
         settings: &CoreSettings<T>,
+        amd: &std::cell::OnceCell<crate::solver::kkt::ldl::AmdOrdering>,
     ) -> Option<Self> {
-        if T::precision_bits() <= 64 {
-            return None;
-        }
         let n = a.n;
         debug_assert!(k.n >= n + a.m && k.m == k.n && signs.len() == k.n);
         // Unit coordinates: cone rows, then a large SOC's two sparse-expansion
@@ -176,19 +179,34 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 debug_assert!(inner < n + a.m);
             }
         }
+        // Binary64 adds the class panels' Y and Z copies (its leaves keep no Z).
+        let copies = if T::precision_bits() <= 64 { 4 } else { 3 };
         let mut cells = 4 * (t as u128).pow(2) + 4 * k.n as u128;
+        let mut schur = 0;
         for (g, link) in groups.iter().zip(&mut links) {
             link.0.sort_unstable();
             link.0.dedup();
             let rows = g.iter().filter(|&&id| id >= n).count();
             let width = if link.2 { g.len() } else { g.len() - rows } as u128;
             let (g, q) = (g.len() as u128, link.0.len() as u128);
-            cells += 2 * g * g + (3 * width).saturating_sub(1) * q + 8 * g;
+            cells += 2 * g * g + (copies * width).saturating_sub(1) * q + 8 * g;
+            schur += width * q * q;
         }
         let entries: u128 = links.iter().map(|link| link.1).sum();
         if cells * std::mem::size_of::<T>() as u128
             > ARROW_MAX_BYTES + k.nzval.len() as u128 * std::mem::size_of::<T>() as u128
             || (t as u128).pow(2) > 8 * entries
+        {
+            return None;
+        }
+        if T::precision_bits() <= 64
+            && !super::local_bounds::dense_border_pays(
+                k,
+                "LOCAL_CONES",
+                schur as f64 + (t as f64).powi(3) / 3.0,
+                CONE_FLOP_RATIO,
+                amd,
+            )
         {
             return None;
         }
@@ -235,5 +253,238 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             trunk,
             Some(LocalStructure::Cones),
         ))
+    }
+}
+
+/// Binary64 coupling classes as stacked column-major panels: a class's leaf
+/// suffixes (rows) over its border columns. The border Schur and both
+/// coupling products become one GEMM per class.
+pub(super) struct ConePanels<T> {
+    panels: Vec<ConePanel<T>>,
+    /// Each leaf's panel and first panel row (`usize::MAX`: uncoupled).
+    slot: Vec<(usize, usize)>,
+}
+
+struct ConePanel<T> {
+    rows: usize,
+    y: Vec<T>,
+    z: Vec<T>,
+    // Solve scratch: rows × cols leaf values, q × cols border values.
+    v: Vec<T>,
+    u: Vec<T>,
+}
+
+impl<T: FloatT> ConePanels<T> {
+    pub(super) fn new(classes: &[CouplingClass], leaves: &[Leaf<T>]) -> Self {
+        let mut slot = vec![(usize::MAX, 0); leaves.len()];
+        let panels = classes
+            .iter()
+            .enumerate()
+            .map(|(p, class)| {
+                let mut rows = 0;
+                for &l in &class.leaves {
+                    slot[l] = (p, rows);
+                    rows += leaves[l].ids.len() - leaves[l].coupling_start;
+                }
+                let q = leaves[class.leaves[0]].coupled.len();
+                ConePanel {
+                    rows,
+                    y: vec![T::zero(); rows * q],
+                    z: vec![T::zero(); rows * q],
+                    v: Vec::new(),
+                    u: Vec::new(),
+                }
+            })
+            .collect();
+        Self { panels, slot }
+    }
+}
+
+impl<T: FloatT> ArrowLDLSolver<T> {
+    /// `S -= Σ YᵀZ` per class panel, Z = D⁻¹Y rounded entrywise as the leaf
+    /// path forms it; only the lower triangle is read, then mirrored.
+    pub(super) fn assemble_cone_schur(&mut self) -> bool {
+        let Some(cp) = self.cone_panels.as_mut() else {
+            return false;
+        };
+        let t = self.trunk.len();
+        let mut g = Vec::new();
+        for (panel, class) in cp.panels.iter_mut().zip(&self.classes) {
+            let columns = &self.leaves[class.leaves[0]].coupled;
+            let (rows, q) = (panel.rows, columns.len());
+            let mut at = 0;
+            for &l in &class.leaves {
+                let leaf = &self.leaves[l];
+                let width = leaf.ids.len() - leaf.coupling_start;
+                let dinv = &leaf.factor.dinv[leaf.coupling_start..];
+                for c in 0..q {
+                    let (y, o) = (&leaf.y[c * width..(c + 1) * width], at + c * rows);
+                    panel.y[o..o + width].copy_from_slice(y);
+                    for ((z, &y), &d) in panel.z[o..o + width].iter_mut().zip(y).zip(dinv) {
+                        *z = y * d;
+                    }
+                }
+                at += width;
+            }
+            g.resize(q * q, T::zero());
+            let (q32, rows32) = (q as i32, rows as i32);
+            T::xgemm(
+                b'T',
+                b'N',
+                q32,
+                q32,
+                rows32,
+                T::one(),
+                &panel.y,
+                rows32,
+                &panel.z,
+                rows32,
+                T::zero(),
+                &mut g,
+                q32,
+            );
+            for (cj, &j) in columns.iter().enumerate() {
+                for (ci, &i) in columns.iter().enumerate().skip(cj) {
+                    self.s[i + j * t] -= g[ci + cj * q];
+                }
+            }
+        }
+        for j in 0..t {
+            for i in j + 1..t {
+                self.s[j + i * t] = self.s[i + j * t];
+            }
+        }
+        true
+    }
+
+    /// `cols` right-hand sides (column c of `b` and `x` at `c * n`) through
+    /// the leaf sweeps, the class panels and the dense border.
+    pub(super) fn solve_cones(&mut self, x: &mut [T], b: &[T], cols: usize) -> bool {
+        let Some(cp) = self.cone_panels.as_mut() else {
+            return false;
+        };
+        let (n, t) = (self.n, self.trunk.len());
+        let leaves = &mut self.leaves;
+        let timer = crate::receipt::start();
+        let forward = |l: &mut Leaf<T>| l.first_many(b, n, cols, 1, false);
+        match &self.pool {
+            Some(pool) => pool.install(|| leaves.par_iter_mut().for_each(forward)),
+            None => leaves.iter_mut().for_each(forward),
+        }
+        crate::receipt::finish("cones.forward", timer);
+        let timer = crate::receipt::start();
+        let tx = &mut self.batch_tx;
+        tx.resize(t * cols, T::zero());
+        for (j, &id) in self.trunk.iter().enumerate() {
+            for c in 0..cols {
+                tx[j * cols + c] = b[c * n + id];
+            }
+        }
+        for (panel, class) in cp.panels.iter_mut().zip(&self.classes) {
+            let columns = &leaves[class.leaves[0]].coupled;
+            let (rows, q) = (panel.rows, columns.len());
+            panel.v.resize(rows * cols, T::zero());
+            panel.u.resize(q * cols, T::zero());
+            let mut at = 0;
+            for &l in &class.leaves {
+                let leaf = &leaves[l];
+                let width = leaf.ids.len() - leaf.coupling_start;
+                for r in 0..width {
+                    for c in 0..cols {
+                        panel.v[at + r + c * rows] = leaf.batch_v[r * cols + c];
+                    }
+                }
+                at += width;
+            }
+            let (q32, rows32, cols32) = (q as i32, rows as i32, cols as i32);
+            T::xgemm(
+                b'T',
+                b'N',
+                q32,
+                cols32,
+                rows32,
+                T::one(),
+                &panel.y,
+                rows32,
+                &panel.v,
+                rows32,
+                T::zero(),
+                &mut panel.u,
+                q32,
+            );
+            for (p, &j) in columns.iter().enumerate() {
+                for c in 0..cols {
+                    tx[j * cols + c] -= panel.u[p + c * q];
+                }
+            }
+        }
+        crate::receipt::finish("cones.couple", timer);
+        let timer = crate::receipt::start();
+        if cols == 1 {
+            self.tf.solve_pooled(tx, self.pool.as_deref());
+        } else {
+            self.tf.solve_many(tx, cols);
+        }
+        crate::receipt::finish("cones.trunk", timer);
+        let timer = crate::receipt::start();
+        for (panel, class) in cp.panels.iter_mut().zip(&self.classes) {
+            let columns = &leaves[class.leaves[0]].coupled;
+            let (rows, q) = (panel.rows, columns.len());
+            for (p, &j) in columns.iter().enumerate() {
+                for c in 0..cols {
+                    panel.u[p + c * q] = tx[j * cols + c];
+                }
+            }
+            let (q32, rows32, cols32) = (q as i32, rows as i32, cols as i32);
+            T::xgemm(
+                b'N',
+                b'N',
+                rows32,
+                cols32,
+                q32,
+                T::one(),
+                &panel.y,
+                rows32,
+                &panel.u,
+                q32,
+                T::zero(),
+                &mut panel.v,
+                rows32,
+            );
+        }
+        let (slot, panels) = (&cp.slot, &cp.panels);
+        let backward = |(l, leaf): (usize, &mut Leaf<T>)| {
+            let (start, (p, at)) = (leaf.coupling_start, slot[l]);
+            for i in 0..leaf.ids.len() {
+                for c in 0..cols {
+                    let s = if i < start || p == usize::MAX {
+                        T::zero()
+                    } else {
+                        panels[p].v[at + i - start + c * panels[p].rows]
+                    };
+                    let w = &mut leaf.batch_w[i * cols + c];
+                    *w = (*w - s) * leaf.factor.dinv[i];
+                }
+            }
+            leaf.factor.backward_many(&mut leaf.batch_w, cols);
+        };
+        match &self.pool {
+            Some(pool) => pool.install(|| leaves.par_iter_mut().enumerate().for_each(backward)),
+            None => leaves.iter_mut().enumerate().for_each(backward),
+        }
+        for leaf in leaves.iter() {
+            for (i, &id) in leaf.ids.iter().enumerate() {
+                for c in 0..cols {
+                    x[c * n + id] = leaf.batch_w[i * cols + c];
+                }
+            }
+        }
+        for (j, &id) in self.trunk.iter().enumerate() {
+            for c in 0..cols {
+                x[c * n + id] = tx[j * cols + c];
+            }
+        }
+        crate::receipt::finish("cones.backward", timer);
+        true
     }
 }

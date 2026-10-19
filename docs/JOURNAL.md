@@ -8,6 +8,33 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-19 — Binary64 local cone arrow with class panels and a cost gate (kept, thermal-ore)
+
+- Hypothesis: SOCP_nb and SOCP_nb_L2_bessel are standard-form SOCPs whose cone rows are identities: 793 SOC3 leaves (plus orthant rows) around a 123-row dense equality border on nb. The local cone arrow fits them, but it was MPFR-only, because a binary64 border had lost accuracy on the crossing SOCP (journal 2026-10-07, before the border-order fix). Run with BLAS panels, its dense work should beat QDLDL when it costs about as many flops as the sparse LDL.
+- Accuracy recheck: crossing (16,021 leaves, t = 272) in binary64 at T=4. The local cone arrow and QDLDL both end AlmostSolved at the 200-iteration cap: r_p/r_d 2.0e-10/5.8e-8 in 16.6 s against 5.2e-9/1.1e-8 in 29.2 s. Neither path solves it, and the arrow is no worse in kind.
+- Change:
+  - `try_local_cones` admits binary64 when the dense work (Σ width·q² class Schur products plus t³/3 for the border factor) is at most `CONE_FLOP_RATIO` = 2 times the AMD sparse LDL flops. The test reuses `dense_border_pays` from the local bounds.
+  - `ConePanels` stack each coupling class's leaf suffixes into column-major Y and Z = D⁻¹Y (rounded entrywise, as before). The leaves keep no Z.
+  - The border Schur is one GEMM YᵀZ per class (lower triangle read, then mirrored).
+  - Single and batched solves gather the leaves' scaled forward values for one Yᵀv GEMM per class, solve the border, and run one Y·x GEMM before the leaf backward sweeps.
+- Gate ratios (dense/sparse) and Mac T=1 medians of 5 interleaved reps. QDLDL is 7e4480b (or the gated arm, which matches it); local cones is this change, with the gate lifted for ratios above 2:
+
+  | case | ratio | QDLDL | local cones |
+  |---|---|---|---|
+  | nb | 0.99 | 182.0 ms | 73.8 ms (−59%) |
+  | nb_L2_bessel | 1.34 | 132.5 ms | 88.3 ms (−33%) |
+  | sambal | 2.3 | 0.4 ms | 0.6 ms |
+  | nb_L1 | 5.4 | 183.0 ms | 829.1 ms |
+  | axis_many | 7.9 | 5.2 ms | 15.6 ms |
+  | afiro, grow7, adlittle | 12–19 | 0.3, 3.0, 0.7 ms | 0.6, 12.3, 2.5 ms |
+
+- T=16: nb 181.7 → 71.4 ms, nb_L2_bessel 132.2 → 82.8 ms. Points are identical at T=1 and T=16.
+- Checks:
+  - Audits pass at unchanged iteration counts: nb Solved/13 (r_p 1.0e-11, r_d 4.7e-11, gap 3.7e-11) and nb_L2_bessel Solved/9 (1.2e-11 / 8.9e-11 / 3.8e-11).
+  - The other 49 local inputs are bitwise identical to 7e4480b.
+  - medium b54b58300d4c, ising11 b971aee3cf2d and csdr3 71603237737a are unchanged; MPFR keeps its exact Schur path.
+- Decision: kept (A22). Provisional on x86, where nb and nb_L2_bessel are 3.3–3.4× MOSEK.
+
 ## 2026-10-19 — x86 job t25: trmm + syr2k congruence rejected (thermal-ore)
 
 - Hypothesis: the binary64 H-apply congruence RᵀXR (two GEMMs) is cheaper on x86 as a TRMM plus a SYR2K, which OpenBLAS might run faster than its GEMM at the PSD block sizes of the scoreboard.

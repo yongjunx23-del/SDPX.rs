@@ -294,7 +294,7 @@ where
             })
             .or_else(|| {
                 crate::solver::kkt::ldl::arrow::ArrowLDLSolver::try_local_cones(
-                    &KKT, &dsigns, A, cones, settings,
+                    &KKT, &dsigns, A, cones, settings, &amd,
                 )
             })
             .map(|solver| Box::new(solver) as BoxedDirectLDLSolver<T>)
