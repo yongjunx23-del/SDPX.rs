@@ -8,6 +8,19 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-19 — Binary64 corrector budget: fewer centrality correctors rejected (thermal-ore)
+
+- Observed: on gpp124-1 (Mac T=1, 278 ms, 24 iterations) the Gondzio correctors take 43% of the solve: corrector right-hand sides 51 ms (dsyev of the trial product), corrector solves 37 ms, corrector step lengths 15 ms. 15 of 35 attempts are rejected, mostly by the cheap admissibility test after the solve. On x86, gpp100's correctors are 41% of 423 ms.
+- Measurements (temporary env switches, 3 interleaved reps, median against the base):
+  - Correctors off: gpp100 −25%, gpp124-1 −23%, gpp250-1 −19%, arch0 −16%, theta2 −10%; qap6 +43%, theta1 +13%, mcp500-1 +5%, hinf3 AlmostSolved.
+  - At most one corrector: SDP geomean 0.960 (gpp124-1 −28%), but hinf3, sched_100_100_orig and sched_50_50_orig end AlmostSolved and agg is +16%.
+  - Acceptance tracks the gain: qap6 23/23, theta1 4/4, mcp250-1 8/8, hinf3 13/15 accepted; gpp100 15/28, gpp124-1 20/35, gpp250-1 23/35, arch0 19/26. The first gain does not predict the second attempt (a 6.5% gain was followed by an accepted corrector, a 32% gain by a rejected one).
+- Rejection-driven rules, all 51 local inputs (geomeans LP / SOCP / SDP):
+  - skip the next iteration's correctors after a rejection: 0.997 / 0.997 / 1.035; sched_50_50_orig InsufficientProgress, hinf3 AlmostSolved, gpp100 +35%;
+  - one corrector per iteration after the first rejection: 0.974 / 0.986 / 0.997; sched_100_100_orig, sched_50_50_orig and arch0 AlmostSolved;
+  - skip after a rejection while over a third were rejected: 0.977 / 1.001 / 0.979 (gpp124-1 −25%); arch0 and sched_50_50_orig AlmostSolved.
+- Decision: rejected. Every rule loses a status for at most a 1.5% geomean gain; the correctors keep their robustness role on sched and arch0. dsyevd (A9) and band eigenpairs (A18) were already rejected for the same sensitivity, so the corrector stays as it is. Patches: `~/.cache/sdpx-e2e/patches/{nocor,maxcor,corpol}-env.patch`.
+
 ## 2026-10-19 — Serial KKT residual sweeps runs of dense constraint columns (kept, thermal-ore)
 
 - Hypothesis: after A22, nb's refinement residual `b − Kx` costs 0.137 ms per call (98 calls, about 13 of 66 ms). About 190k of its 199k KKT entries sit in the 123 dense equality columns (1,560–1,586 rows each). In `_csc_symv_unsafe` each such column's sum is one serial dependency chain, at about one FP-add latency per entry (≈2.4 cycles measured). Sweeping several such columns together makes their sums independent chains with no change in any operation.
