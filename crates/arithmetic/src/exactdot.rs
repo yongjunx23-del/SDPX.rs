@@ -286,9 +286,10 @@ unsafe fn add_chain(dst: *mut u64, limbs: &[u64], shift: u32) {
 /// Broadwell): `mulx` runs at one per cycle on Zen 2 where `mul` takes 1.7,
 /// two carry chains (`adcx`/`adox`) form the product, `shlx`/`shrx` shift it
 /// (the compiler's `shld` is microcoded on Zen), and the shifted product
-/// adds to memory as one `adc` chain. EPYC 7742, dump2223 factor leaf, ns
-/// per term against the portable two-pass kernel: 2 limbs 11.5 -> 6.8,
-/// 4 limbs 24.6 -> 14.8 (8 limbs keep GMP's product: 60.8 -> 59.5).
+/// adds to memory as one `adc` chain; wider products add as 4x4 blocks.
+/// EPYC 7742, dump2223 factor leaf, ns per term against the portable
+/// two-pass kernel: 2 limbs 11.2 -> 6.9, 4 limbs 24.0 -> 13.9, 8 limbs
+/// 59.4 -> 46.6, 12 limbs 106 -> 95, 16 limbs 169 -> 168.
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::arch::asm;
@@ -312,8 +313,14 @@ mod x86 {
         let (a, b) = (a.as_ptr(), b.as_ptr());
         if N == 2 {
             chain(dst, mul2(a, b), shift);
-        } else if N == 4 {
-            chain(dst, mul4(a, b), shift);
+        } else if N % 4 == 0 {
+            // 4-limb blocks add at their own offsets, so the full product is
+            // never stored.
+            for i in (0..N).step_by(4) {
+                for j in (0..N).step_by(4) {
+                    chain(dst.add(i + j), mul4(a.add(i), b.add(j)), shift);
+                }
+            }
         } else {
             let mut prod = [0u64; 2 * super::MAX_N];
             super::mpn_mul_n::<N>(prod.as_mut_ptr(), a, b);
@@ -1363,6 +1370,8 @@ mod tests {
         inline_matches_gmp::<2>();
         inline_matches_gmp::<3>();
         inline_matches_gmp::<4>();
+        inline_matches_gmp::<8>();
+        inline_matches_gmp::<16>();
     }
 
     #[test]
