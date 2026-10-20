@@ -454,12 +454,13 @@ fn residue_split_encode_matches_serial() {
     for bits in [24, 25] {
         let plan = Plan::with_count(bits, plan.count());
         let chunks = chunk_matrix(x, lo, hi - lo, &plan, &Split::Serial);
-        let serial = CachedResidues::from_chunks(&chunks, &plan);
+        let serial = CachedResidues::from_chunks(&chunks, &plan, &Split::Serial);
         for split in [Split::Pool(&pool), Split::Ways(3)] {
-            let parallel =
-                pool.install(|| CachedResidues::from_chunks_split(&chunks, &plan, &split));
+            let parallel = pool.install(|| CachedResidues::from_chunks(&chunks, &plan, &split));
             match (&serial, &parallel) {
-                (CachedResidues::Narrow(a), CachedResidues::Narrow(b)) => assert_eq!(a, b),
+                (CachedResidues::Narrow(a, c), CachedResidues::Narrow(b, d)) => {
+                    assert_eq!((a, c), (b, d))
+                }
                 (CachedResidues::Wide(a), CachedResidues::Wide(b)) => {
                     assert!(a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits()));
                 }
