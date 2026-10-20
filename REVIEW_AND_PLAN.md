@@ -242,6 +242,9 @@ Ranked by the Amdahl-bounded gain on the goal workloads per unit of effort (jour
     - BFSS L11u, 256 bits, 25 iterations, bitwise identical to c80da23: T=32 −23.0% (node7), T=64 −27.6% (node61). Scale cones at T=64 4.91 → 2.00 s/it; the refactor −23%; RSS +5.6% at T=64.
     - Gates: the 128-bit full run reproduces InsufficientProgress/107 bitwise; 512 bits and L10 bitwise; csdr3 identical.
     - Open: at T=64 the n = 38 cone (1.9 s/it) is GEMM compute plus helpers shared with the n = 34 cones; the base-case dot kernels add 0.28 s.
+    - Review of 18b84c5 (2026-10-20). Two defects, both in `rns_blas::gemm`; neither changes the bits. Both fixes are assigned to branch rns-gemm-x86.
+      - The panel-fill prime groups bypass `GROUP_SCRATCH_BYTES`. On tall packed operands this means up to 16 primes of streamed scratch, for example the distributed border product at T=64: about 3.4 → 5.8 GB per call.
+      - `prod` moved from `take_scratch` to `take_zeroed`, which zeroes a reused buffer again even though `prime_columns` writes every entry. This undoes L56.
 
 1. **Resampled Ising inputs (task 17).**
    - Fix the default-start τ chase without regressing old inputs or gravity256.
