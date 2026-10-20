@@ -124,6 +124,15 @@ fn join_if<RA: Send, RB: Send>(
     }
 }
 
+/// Whether an order-`n` cone's step trials split their kernels: its oracle
+/// (about n³ multiply-adds) carries a grain of inner-parallel work. L10's
+/// cones of n ≤ 14 at 128 bits lost 1–2% to splitting theirs (the scale
+/// phase's SVDs slowed too); BFSS's n = 34 and 38 gain.
+fn heavy<T: FloatT>(n: usize) -> bool {
+    use sdpx_arithmetic::inner_parallel as ip;
+    n.pow(3) as u128 * ip::weight(T::precision_bits() as usize) >= ip::grain()
+}
+
 /// Scalar central point (t, x, y) of the relative entropy cone, s = −∇f(s);
 /// refined to the working precision by `central_point`.
 const CENTRAL: [f64; 3] = [0.8278383990656786, 0.8051020015847954, 1.290927709856958];
@@ -943,13 +952,28 @@ impl<T: FloatT> Oracle<T> {
             None => (0..n).collect(),
         };
         let d2 = &self.d2;
-        for &(a, b) in &support {
-            let mut acc = T::zero();
-            for &c in &cs {
-                let t = w[a + c * n] * e1[c + b * n] + e1[a + c * n] * w[c + b * n];
-                acc += d2[a + n * (b + n * c)] * t;
+        if unit.is_none() && tasks::<T>(3 * n * nn, n) > 1 {
+            // by columns: each entry sums in the same order
+            let e1 = &*e1;
+            pieces::<T>(gam, n, 3 * n * nn, |b, col| {
+                for (a, g) in col.iter_mut().enumerate() {
+                    let mut acc = T::zero();
+                    for c in 0..n {
+                        let t = w[a + c * n] * e1[c + b * n] + e1[a + c * n] * w[c + b * n];
+                        acc += d2[a + n * (b + n * c)] * t;
+                    }
+                    *g = acc;
+                }
+            });
+        } else {
+            for &(a, b) in &support {
+                let mut acc = T::zero();
+                for &c in &cs {
+                    let t = w[a + c * n] * e1[c + b * n] + e1[a + c * n] * w[c + b * n];
+                    acc += d2[a + n * (b + n * c)] * t;
+                }
+                gam[a + b * n] = acc;
             }
-            gam[a + b * n] = acc;
         }
         prod(v, h, true, m1); // V H
         prod(w, h, true, m2); // W H
@@ -1208,6 +1232,7 @@ impl<T: FloatT> Oracle<T> {
             return self.schur_norm(w).is_some_and(|q| ok(t + q));
         }
         self.ensure_d2();
+        let split = heavy::<T>(n);
         let mut nm = vec![T::zero(); nn];
         gemm(true, false, n, &self.q, p0, &mut nm);
         let (mut a, mut tmp, mut c) = (
@@ -1223,8 +1248,19 @@ impl<T: FloatT> Oracle<T> {
                 svec(n, &c, &mut v[part * m..(part + 1) * m]);
             }
             // S₀⁻¹ is symmetric: its row i is column i
-            for (i, o) in out.iter_mut().enumerate() {
-                *o = T::dot_slices(&s0i[i * m2..(i + 1) * m2], &v);
+            if split {
+                // rows in pieces (BFSS n = 38 at 256 bits: 2.2M exact
+                // multiply-adds)
+                let v = &*v;
+                pieces::<T>(out, n, m2 * m2, |k, o| {
+                    for (i, o) in (k * n..).zip(o) {
+                        *o = T::dot_slices(&s0i[i * m2..(i + 1) * m2], v);
+                    }
+                });
+            } else {
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o = T::dot_slices(&s0i[i * m2..(i + 1) * m2], &v);
+                }
             }
             for part in 0..2 {
                 smat(n, &out[part * m..(part + 1) * m], &mut a);
@@ -1877,6 +1913,7 @@ where
         let mut cg = self.data.cg;
         // outside a pool (one solver thread) rayon would use its global pool
         let ways = rayon::current_thread_index().map_or(1, |_| rayon::current_num_threads());
+        let split = heavy::<T>(n);
         let this = &*self;
         let mut α = αmax;
         let mut αz = T::zero();
@@ -1907,6 +1944,8 @@ where
             let trials: Vec<(bool, u32)> = batch
                 .par_iter()
                 .map(|&a| {
+                    // workers done with short trials help the long ones
+                    let _inner = split.then(sdpx_arithmetic::inner_parallel::Guard::enter);
                     let mut p = vec![T::zero(); s.len()];
                     p.waxpby(T::one(), s, a, ds);
                     let mut q = vec![T::zero(); z.len()];
