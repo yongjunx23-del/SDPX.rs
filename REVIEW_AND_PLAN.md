@@ -238,6 +238,10 @@ Ranked by the Amdahl-bounded gain on the goal workloads per unit of effort (jour
     - The 128-bit full run reproduces InsufficientProgress/107 bitwise. 512 bits −8.4%, L10 −1.0%, csdr3 −1.9%; binary64 nb within 1%.
     - Rejected: the parallel ORE step search (L10 +3.5%) and the blocked exact Y solve (slower on x86).
     - Open on this case: ORE scaling (Schur inverse and Cholesky, 4.3 s/it at 15.6 busy); step lengths (2.3 s/it at about 4 busy, on the S₀ critical path); the Y solve's exact dots (38% of cycles). T=64 spends 3.4× the CPU of T=16 for 1.3× the speed.
+  - ORE-SCALE (branch ore-scale; journal 2026-10-20). **Kept 2026-10-20:** the residue GEMM copies strided sub-block operands dense and runs its exponent scans, residue decode, chunk residues and large zero fills over its ways. Its prime groups give every way a column panel. The ORE cone's serial O(n²–n³) passes run as items.
+    - BFSS L11u, 256 bits, 25 iterations, bitwise identical to c80da23: T=32 −23.0% (node7), T=64 −27.6% (node61). Scale cones at T=64 4.91 → 2.00 s/it; the refactor −23%; RSS +5.6% at T=64.
+    - Gates: the 128-bit full run reproduces InsufficientProgress/107 bitwise; 512 bits and L10 bitwise; csdr3 identical.
+    - Open: at T=64 the n = 38 cone (1.9 s/it) is GEMM compute plus helpers shared with the n = 34 cones; the base-case dot kernels add 0.28 s.
 
 1. **Resampled Ising inputs (task 17).**
    - Fix the default-start τ chase without regressing old inputs or gravity256.

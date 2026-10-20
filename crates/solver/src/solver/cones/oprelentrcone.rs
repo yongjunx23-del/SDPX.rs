@@ -42,37 +42,71 @@ fn tasks<T: FloatT>(mul_adds: usize, items: usize) -> usize {
     ip::tasks(work, items).max(ip::tasks_if(hint > 1, work, items).min(hint))
 }
 
+/// `f(k)` for `k < count` when [`tasks`] grants a split of `mul_adds`:
+/// posted on the scaling queue's board, whose idle workers only help posts,
+/// else on the pool. Who runs an item never changes it.
+fn items<T: FloatT>(count: usize, mul_adds: usize, f: impl Fn(usize) + Sync) {
+    use sdpx_arithmetic::inner_parallel::board;
+    if tasks::<T>(mul_adds, count) <= 1 {
+        (0..count).for_each(f);
+    } else if board::offered() {
+        board::run(count, &f);
+    } else {
+        (0..count).into_par_iter().for_each(&f);
+    }
+}
+
+/// A buffer whose parallel items write disjoint entries.
+struct Out<T>(*mut T);
+// SAFETY: every user writes each entry from one item alone.
+unsafe impl<T> Sync for Out<T> {}
+
 /// `f(k, piece)` over the `len`-element pieces of `out` (the last may be
-/// shorter) when [`tasks`] grants a split of `mul_adds`: posted on the
-/// scaling queue's board, whose idle workers only help posts, else on the
-/// pool. Who runs a piece never changes it.
+/// shorter), split as [`items`].
 fn pieces<T: FloatT>(
     out: &mut [T],
     len: usize,
     mul_adds: usize,
     f: impl Fn(usize, &mut [T]) + Sync,
 ) {
-    use sdpx_arithmetic::inner_parallel::board;
-    let items = out.len().div_ceil(len);
-    if tasks::<T>(mul_adds, items) <= 1 {
-        out.chunks_mut(len).enumerate().for_each(|(k, p)| f(k, p));
-    } else if board::offered() {
-        struct Out<T>(*mut T);
-        // SAFETY: items write disjoint pieces of `out`.
-        unsafe impl<T> Sync for Out<T> {}
-        let (base, total) = (Out(out.as_mut_ptr()), out.len());
-        board::run(items, &|k| {
-            let (start, base) = (k * len, &base);
-            let end = (start + len).min(total);
-            // SAFETY: piece k is [start, end), owned by item k alone.
-            f(k, unsafe {
-                std::slice::from_raw_parts_mut(base.0.add(start), end - start)
-            });
+    let (base, total) = (Out(out.as_mut_ptr()), out.len());
+    items::<T>(total.div_ceil(len), mul_adds, |k| {
+        let (start, base) = (k * len, &base);
+        let end = (start + len).min(total);
+        // SAFETY: piece k is [start, end), owned by item k alone.
+        f(k, unsafe {
+            std::slice::from_raw_parts_mut(base.0.add(start), end - start)
         });
-    } else {
-        out.par_chunks_mut(len)
-            .enumerate()
-            .for_each(|(k, p)| f(k, p));
+    });
+}
+
+/// `vec![T::zero(); len]` written as [`items`]: a large buffer's first
+/// touch is otherwise a serial pass of its owner.
+fn zeros<T: FloatT>(len: usize) -> Vec<T> {
+    const PIECE: usize = 1 << 14;
+    let mut v: Vec<T> = Vec::with_capacity(len);
+    let base = Out(v.as_mut_ptr());
+    items::<T>(len.div_ceil(PIECE), len, |k| {
+        let base = &base;
+        for e in k * PIECE..(k * PIECE + PIECE).min(len) {
+            // SAFETY: entry e lies within the capacity and is written once.
+            unsafe { base.0.add(e).write(T::zero()) };
+        }
+    });
+    // SAFETY: every entry was written above.
+    unsafe { v.set_len(len) };
+    v
+}
+
+/// Columns `0..cols` of the `rows`-row block at `a` (leading dimension
+/// `ld`) as [`pieces`] of `ld` entries, the last cut at the block's end.
+fn columns<T: FloatT>(
+    a: &mut [T],
+    (rows, cols, ld): (usize, usize, usize),
+    f: impl Fn(usize, &mut [T]) + Sync,
+) {
+    if cols > 0 {
+        pieces::<T>(&mut a[..(cols - 1) * ld + rows], ld, rows * cols, f);
     }
 }
 
@@ -252,7 +286,7 @@ fn cholesky_rec<T: FloatT>(n: usize, a: &mut [T], ld: usize) -> bool {
     let (left, right) = a.split_at_mut(n1 * ld);
     let l21 = &left[n1..];
     // packed (j, i), j ≤ i, is the Schur term (i, j)
-    let mut packed = vec![T::zero(); n2 * (n2 + 1) / 2];
+    let mut packed = zeros::<T>(n2 * (n2 + 1) / 2);
     let ways = tasks::<T>(n2 * n2 * n1 / 2, usize::MAX);
     let upper = crate::algebra::with_split_hint(ways, || {
         T::xgemm_upper_exact(
@@ -271,11 +305,11 @@ fn cholesky_rec<T: FloatT>(n: usize, a: &mut [T], ld: usize) -> bool {
         )
     });
     if upper {
-        for j in 0..n2 {
+        columns(right, (n, n2, ld), |j, c| {
             for i in j..n2 {
-                right[n1 + i + j * ld] -= packed[i * (i + 1) / 2 + j];
+                c[n1 + i] -= packed[i * (i + 1) / 2 + j];
             }
-        }
+        });
     } else {
         let mut s = vec![T::zero(); n2 * n2];
         product((b'N', b'T'), (n2, n2, n1), (l21, ld), (l21, ld), &mut s);
@@ -310,7 +344,7 @@ fn solve_lower_t<T: FloatT>(m: usize, n: usize, l: &[T], ldl: usize, b: &mut [T]
     let (n1, n2) = (n / 2, n - n / 2);
     solve_lower_t(m, n1, l, ldl, b, ldb);
     let (b1, b2) = b.split_at_mut(n1 * ldb);
-    let mut p = vec![T::zero(); m * n2];
+    let mut p = zeros::<T>(m * n2);
     product(
         (b'N', b'T'),
         (m, n2, n1),
@@ -318,11 +352,11 @@ fn solve_lower_t<T: FloatT>(m: usize, n: usize, l: &[T], ldl: usize, b: &mut [T]
         (&l[n1..], ldl),
         &mut p,
     );
-    for j in 0..n2 {
-        for i in 0..m {
-            b2[i + j * ldb] -= p[i + j * m];
+    columns(b2, (m, n2, ldb), |j, c| {
+        for (c, &v) in c.iter_mut().zip(&p[j * m..(j + 1) * m]) {
+            *c -= v;
         }
-    }
+    });
     solve_lower_t(m, n2, &l[n1 + n1 * ldl..], ldl, b2, ldb);
 }
 
@@ -378,7 +412,7 @@ fn lower_inverse_rec<T: FloatT>(n: usize, l: &[T], ldl: usize, x: &mut [T], ldx:
     let (n1, n2) = (n / 2, n - n / 2);
     lower_inverse_rec(n1, l, ldl, x, ldx);
     lower_inverse_rec(n2, &l[n1 + n1 * ldl..], ldl, &mut x[n1 + n1 * ldx..], ldx);
-    let mut t = vec![T::zero(); n2 * n1];
+    let mut t = zeros::<T>(n2 * n1);
     product(
         (b'N', b'N'),
         (n2, n1, n1),
@@ -386,7 +420,7 @@ fn lower_inverse_rec<T: FloatT>(n: usize, l: &[T], ldl: usize, x: &mut [T], ldx:
         (x, ldx),
         &mut t,
     );
-    let mut p = vec![T::zero(); n1 * n2];
+    let mut p = zeros::<T>(n1 * n2);
     product(
         (b'T', b'T'),
         (n1, n2, n2),
@@ -394,18 +428,18 @@ fn lower_inverse_rec<T: FloatT>(n: usize, l: &[T], ldl: usize, x: &mut [T], ldx:
         (&x[n1 + n1 * ldx..], ldx),
         &mut p,
     );
-    for j in 0..n1 {
+    columns(x, (n, n1, ldx), |j, c| {
         for i in 0..n2 {
-            x[n1 + i + j * ldx] = -p[j + i * n1];
+            c[n1 + i] = -p[j + i * n1];
         }
-    }
+    });
 }
 
 /// Inverse of a symmetric positive definite matrix from its lower factor:
 /// L⁻ᵀL⁻¹ (LAPACK's potri: a third of the products of solving against the
 /// identity), each entry one exact dot product of two columns of L⁻¹.
 fn spd_inverse<T: FloatT>(n: usize, l: &[T], out: &mut [T]) -> bool {
-    let mut li = vec![T::zero(); n * n];
+    let mut li = zeros::<T>(n * n);
     lower_inverse(n, l, &mut li);
     if T::precision_bits() <= 53 {
         let ni = n as i32;
@@ -419,20 +453,19 @@ fn spd_inverse<T: FloatT>(n: usize, l: &[T], out: &mut [T]) -> bool {
     }
     // One exact symmetric product (residue operands encoded once), else
     // exact dots: either way each entry is one exact sum rounded once.
-    let mut packed = vec![T::zero(); n * (n + 1) / 2];
+    let mut packed = zeros::<T>(n * (n + 1) / 2);
     let ways = tasks::<T>(n * n * n / 2, usize::MAX);
     let exact = crate::algebra::with_split_hint(ways, || {
         T::xgemm_upper_exact(b'T', b'N', n, n, n, &li, n, &li, n, &mut packed, None, None)
     });
     if exact {
-        for j in 0..n {
-            for i in 0..=j {
-                let v = packed[j * (j + 1) / 2 + i];
-                out[i + j * n] = v;
-                out[j + i * n] = v;
+        pieces::<T>(out, n, n * n, |j, oc| {
+            oc[..=j].copy_from_slice(&packed[j * (j + 1) / 2..j * (j + 1) / 2 + j + 1]);
+            for i in j + 1..n {
+                oc[i] = packed[i * (i + 1) / 2 + j];
             }
-        }
-        return out.iter().all(|v| v.is_finite());
+        });
+        return packed.iter().all(|v| v.is_finite());
     }
     pieces::<T>(out, n, n * n * n / 6, |j, oc| {
         for i in j..n {
@@ -448,14 +481,24 @@ fn spd_inverse<T: FloatT>(n: usize, l: &[T], out: &mut [T]) -> bool {
 }
 
 fn symmetrize<T: FloatT>(n: usize, a: &mut [T]) {
+    // Item k owns the pairs whose larger index lies in its block of W.
+    const W: usize = 16;
     let half: T = (0.5).as_T();
-    for j in 0..n {
-        for i in 0..j {
-            let v = (a[i + j * n] + a[j + i * n]) * half;
-            a[i + j * n] = v;
-            a[j + i * n] = v;
+    let base = Out(a.as_mut_ptr());
+    items::<T>(n.div_ceil(W), n * n / 2, |k| {
+        let (a, j0, j1) = (&base, k * W, (k * W + W).min(n));
+        for i in 0..j1 {
+            for j in j0.max(i + 1)..j1 {
+                // SAFETY: (i, j) and (j, i) belong to item k alone.
+                unsafe {
+                    let (u, l) = (a.0.add(i + j * n), a.0.add(j + i * n));
+                    let v = (*u + *l) * half;
+                    *u = v;
+                    *l = v;
+                }
+            }
         }
-    }
+    });
 }
 
 /// Symmetric eigendecomposition (ascending), vectors in `u`.
@@ -774,25 +817,27 @@ impl<T: FloatT> Oracle<T> {
         if !self.d2.is_empty() {
             return;
         }
+        let (d1, lam) = (&self.d1, &self.lam);
+        let ids: Vec<[usize; 3]> = (0..n)
+            .flat_map(|a| (a..n).flat_map(move |b| (b..n).map(move |c| [a, b, c])))
+            .collect();
+        let mut x = vec![T::zero(); ids.len()];
+        pieces::<T>(&mut x, n, 64 * ids.len(), |k, p| {
+            for (x, &ids) in p.iter_mut().zip(&ids[k * n..]) {
+                *x = divided2(ids.map(|i| lam[i]), |p, q| d1[ids[p] + ids[q] * n]);
+            }
+        });
         let mut d2 = vec![T::zero(); n * n * n];
-        let d1 = &self.d1;
-        for a in 0..n {
-            for b in a..n {
-                for c in b..n {
-                    let ids = [a, b, c];
-                    let v = [self.lam[a], self.lam[b], self.lam[c]];
-                    let x = divided2(v, |p, q| d1[ids[p] + ids[q] * n]);
-                    for (i, j, k) in [
-                        (a, b, c),
-                        (a, c, b),
-                        (b, a, c),
-                        (b, c, a),
-                        (c, a, b),
-                        (c, b, a),
-                    ] {
-                        d2[i + n * (j + n * k)] = x;
-                    }
-                }
+        for (&[a, b, c], &x) in ids.iter().zip(&x) {
+            for (i, j, k) in [
+                (a, b, c),
+                (a, c, b),
+                (b, a, c),
+                (b, c, a),
+                (c, a, b),
+                (c, b, a),
+            ] {
+                d2[i + n * (j + n * k)] = x;
             }
         }
         self.d2 = d2;
@@ -987,7 +1032,7 @@ impl<T: FloatT> Oracle<T> {
     pub(crate) fn schur_inverse(&mut self) -> Option<Vec<T>> {
         let m2 = self.n * (self.n + 1);
         let l = self.schur_factor()?;
-        let mut s0i = vec![T::zero(); m2 * m2];
+        let mut s0i = zeros::<T>(m2 * m2);
         let timer = crate::receipt::start();
         let ok = spd_inverse(m2, &l, &mut s0i) && s0i.iter().all(|v| v.is_finite());
         crate::receipt::finish("ore.schur_inverse", timer);
@@ -1001,7 +1046,7 @@ impl<T: FloatT> Oracle<T> {
         let m = n * (n + 1) / 2;
         let nn = n * n;
         let m2 = 2 * m;
-        let mut s0 = vec![T::zero(); m2 * m2];
+        let mut s0 = zeros::<T>(m2 * m2);
         let pairs: Vec<(usize, usize)> =
             (0..n).flat_map(|j| (0..=j).map(move |i| (i, j))).collect();
         // columns in pieces of n, each piece with its own scratch

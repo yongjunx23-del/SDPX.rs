@@ -8,6 +8,45 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-20 — BFSS L11u: ORE scaling past 32 threads through the residue GEMM's serial parts (kept, ore-scale)
+
+- Case and reference as in the bfss-threads entry below (L11u, 256 bits, 25 iterations). Base: tbN = c80da23.
+- Observed (c80da23 with stage timers, node61, iteration 2):
+  - The n = 38 cone (S₀ of order 1482: Cholesky plus inverse) sets the scale phase. It took 5.0 s at T=64, 4.5 s at T=16 and 11.9 s serial (2.4×). Three n = 34 cones (about 1.8 s) run beside it.
+  - 4.1 s of the 5.0 s was in residue GEMMs:
+    - Operand encode, 1.4 s at both T=16 and T=64. The recursive kernels pass sub-blocks with leading dimension 1482, so encode, residue storage and decode covered 2–16× the stored entries.
+    - Serial residue decode per prime group, 1.35 s.
+    - Prime products, 0.78 s. Large operands had one prime per group, so 24–28 regions ran in sequence with at most n/32 column panels each.
+    - Serial exponent scans, 0.16 s.
+  - ORE-side serial passes: second divided differences 0.18 s, S₀ symmetrize 0.17 s, zero fills and the inverse's scatter 0.13 s.
+  - After the first fixes, the factor and inverse's 70 GEMMs still spent 660 of 1579 ms outside parallel regions. glibc served large zeroed buffers from the heap top and cleared them on the calling thread, and small operands' chunk-matrix residues were serial.
+  - Rejected earlier: page faults as the cause (a large `MALLOC_MMAP_THRESHOLD_` changed nothing).
+- Kept. All of these are bitwise: each entry stays one exact sum rounded once, and the recursion splits are unchanged.
+  - Residue GEMM (`rns_blas::gemm`):
+    - A view whose strided span holds over a quarter more entries than it stores is first copied dense, in parallel.
+    - Exponent scans, residue decode and chunk-matrix residues (by row range) run over the split's ways.
+    - Prime groups are wide enough that every way gets a column panel.
+    - Chunk matrices and prime products are zeroed over the ways. Packed residues are written into uninitialized storage.
+  - ORE cone: the divided differences, symmetrize, the recursive kernels' subtract and negate loops, the inverse's symmetric scatter and the large zero fills run as board or pool items.
+- Result (orsF against tbN, ABBA, release, 256 bits, 25 iterations; x, s, z, status and objectives bitwise identical). Rows are median s (s/it):
+
+  | T | Node | tbN | orsF | Change |
+  |---|---|---|---|---|
+  | 32 | node7 | 388.6 (15.54) | 299.4 (11.97) | −23.0% |
+  | 64 | node61 | 375.6 (15.02) | 271.9 (10.88) | −27.6% |
+
+  - Scale cones: T=64 122.8 → 50.1 s (4.91 → 2.00 s/it); T=32 111.0 → 54.0 s.
+  - The arrow refactor's residue products share the GEMM: refactor 128.1 → 98.9 s at T=64 and 156.0 → 125.3 s at T=32.
+  - Peak RSS: T=64 21.4 → 22.5 GiB (+5.6%), from the dense operand copies and wider prime groups; T=32 15.9 → 16.0 GiB (+0.6%).
+  - With stage timers at T=64, the n = 38 cone fell from 5.02 to 1.94 s per iteration. The n = 34 cones now take 1.4–1.6 s.
+- Gates:
+  - 128 bits, full run: InsufficientProgress/107, bitwise identical (primal 7.046089322701808, dual 7.05180711602981; 1121.6 s at T=16 on node27, reference 1411.7 s on node50).
+  - 512 bits, 10 iterations: bitwise identical (303.0 s on node27; the reference took 378.4 s on node50).
+  - L10: Solved/198, bitwise identical (102.8 s on node27; reference 105.3 s on node50).
+  - csdr3 (Mac, fast build): Solved/36, audit passes, points identical to tbN. A Mac L11u run (3 iterations, T=8) is bitwise identical.
+- Left on the critical path at T=64: about 1.2 s of the n = 38 cone is compute inside the GEMMs' parallel regions, and helpers are shared with the n = 34 cones. The base-case dot kernels add 0.28 s (column-by-column Cholesky regions), and the recursion fixes their structure. GEMM time outside parallel regions is 160 ms.
+- Decision: kept.
+
 ## 2026-10-20 — BFSS L11u thermal bootstrap: MPFR KKT update and arrow leaf phase on all workers (kept, bfss-threads)
 
 - Case: `L11u_T0.5_r2.36_energy_min_g.json` (n 1090, m 14033; 22 PSD blocks and 19 operator relative entropy cones of three blocks each, n ≤ 38; negated arrow, augmented KKT, partitions 1). Reference at 128 bits, T=16: InsufficientProgress/107, primal 7.046089322701808, dual 7.05180711602981. Unless stated, timings are x86 node7, pinned, singlejob, 256 bits, T=16, 25 iterations.
