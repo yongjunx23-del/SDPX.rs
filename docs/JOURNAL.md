@@ -8,6 +8,36 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-21 — ORE cone: derivation verified; BFSS L11u slowness and stall explained (diagnosis, bfss-threads)
+
+- Question: is the operator relative entropy cone derived wrongly, given the poor BFSS results (L11u InsufficientProgress/107 with the dual 5.7e-3 above the primal; L10 198 iterations)?
+- Derivation, checked by hand:
+  - D(X, Y) = P g(Λ) Pᵀ is the operator perspective for any factor X = LLᵀ.
+  - Barrier −logdet Ẑ − 3 logdet X + Σ gᵢ, ν = 3n (Fawzi–Saunders).
+  - Gradient and first divided differences; the coincident-node series for g⁽¹⁾ and g⁽²⁾ (Hermite–Genocchi).
+  - The Dikin dual test ⟨z, s⟩² > (ν − 1)⟨z, ∇²f⁻¹z⟩ (sound: it minimises ‖tz + ∇f(s)‖* over t).
+  - The step equation (Hypatia's combination of predictor and centering).
+  - The Dahl–Andersen corrector (reduces to ΔsΔz/z on the orthant).
+  - The bootstrap exports (βC, A, B) = (T, X, Y). EEB is exact on the harmonic oscillator.
+- Verified numerically (scratch 256-bit test, not committed; `~/.cache/sdpx-e2e/wt-orediag`):
+  - Reference: an independent D from symmetric square roots and two eigendecompositions; points n = 4…12 with X, Y spread to 1e-10/1e-12 and λ_min(T − D) down to 1e-12.
+  - Barrier 6e-77…2e-49; gradient (4th-order differences) 1e-61…1e-31; Hessian including S₀ (Richardson mixed differences) 2e-49…2e-18. The errors track the points' conditioning.
+  - ⟨∇f, s⟩ = −ν, ∇²f s = −∇f, ∇³f[s] = −2∇²f (6e-40 at good points), |f'''| ≤ 2f''^{3/2}, Hs = (μ∇²f)⁻¹ to 1e-55…1e-77.
+  - Nothing is wrong in the cone.
+- Gap of the final 128-bit iterate (f128N, 160-bit audit in original units), qx + bz = −5.718e-3:
+  - x·(q + Aᵀz) = −5.761e-3, s·z = +4.36e-5 (positive in every cone), z·(b − Ax − s) ≈ 0.
+  - So the dual iterate is in K*. It sits above the primal only through a dual residual of 1.6e-9 times |x|∞ = 1.1e9; per-column x·rd terms of ±0.9 cancel.
+  - The primal mass lies on columns that raise X and Y of the k = 1 (n = 38) and (3; 3) KMS sectors with equal coefficients, plus their Gram blocks, with T nearly fixed: (0, W, W), a recession direction of K_ore, the L = 10 x8-ray pattern. The optimum is approached, not attained (τ, κ → 0).
+- Step limiter (`SDPX_DBG_STEPCONE` with a scratch per-cone print; job 227550, node94, 128 bits, T = 32; iterates identical to the reference):
+  - Combined steps: 58 full; 47 cut by an ORE dual certificate (k = 1 43, k = 0 3, k = 2 1); 2 by an ORE primal boundary; PSD cones never.
+  - Affine steps: limited by the k = 1 cone in 104 of 107 iterations (91 dual, 13 primal), median α_aff 0.136 against √(2/ν) = 0.13 for ν = 114. So σ = (1 − α_aff)³ ≈ 0.64, and μ falls about 1.55× per iteration: 23 decades in about 107 iterations.
+  - Per-cone μ stays within [0.99, 1.01]·μ. On the central path the k = 1 ratio r = (ν − 1)⟨z, ∇²f⁻¹z⟩/⟨s, z⟩² is 113/114 = 0.991, below the limit 1. From iteration 94 the current pair's r rises 0.994 → 0.99996 → 1.000000, so no dual step certifies and α_z → 0: InsufficientProgress.
+- Conclusion:
+  - The cone is correct.
+  - The slowness is the primal-only ORE method: a radius-1 Dikin dual certificate caps the predictor at about √(2/ν) for the n = 38 cone, and Mehrotra's σ follows that cap even though most combined steps are full.
+  - The stall is the program: an unattained optimum along (0, W, W) KMS directions, where the certificate's edge is finally reached.
+- Next (not started): pick σ from a step the certificate does not cap, a Newton (conjugate-barrier) dual certificate, or primal–dual ORE scaling. All of these change iterates. On the model side, bound or remove the (0, W, W) directions.
+
 ## 2026-10-20 — BFSS L11u: ORE scaling past 32 threads through the residue GEMM's serial parts (kept, ore-scale)
 
 - Case and reference as in the bfss-threads entry below (L11u, 256 bits, 25 iterations). Base: tbN = c80da23.

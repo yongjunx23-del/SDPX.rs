@@ -245,6 +245,10 @@ Ranked by the Amdahl-bounded gain on the goal workloads per unit of effort (jour
     - Review of 18b84c5 (2026-10-20). Two defects, both in `rns_blas::gemm`; neither changes the bits. Both fixes are assigned to branch rns-gemm-x86.
       - The panel-fill prime groups bypass `GROUP_SCRATCH_BYTES`. On tall packed operands this means up to 16 primes of streamed scratch, for example the distributed border product at T=64: about 3.4 → 5.8 GB per call.
       - `prod` moved from `take_scratch` to `take_zeroed`, which zeroes a reused buffer again even though `prime_columns` writes every entry. This undoes L56.
+  - ORE-DIAG (diagnosis 2026-10-21; journal 2026-10-21). The ORE cone's barrier, derivatives, S₀, dual test and corrector are correct (256-bit check against an independent D). On BFSS L11u:
+    - The k = 1 (n = 38) cone's Dikin dual certificate caps the affine step at a median 0.136 (≈ √(2/ν)) in 91 of 107 iterations, so σ ≈ 0.64 and the solve needs 107 iterations.
+    - The stall is an unattained optimum along (0, W, W) KMS directions: |x| 1e9, dual above primal through x·(q + Aᵀz).
+    - Open (changes iterates): σ from an uncapped step, a Newton conjugate-barrier dual certificate, or primal–dual ORE scaling.
 
 1. **Resampled Ising inputs (task 17).**
    - Fix the default-start τ chase without regressing old inputs or gravity256.
