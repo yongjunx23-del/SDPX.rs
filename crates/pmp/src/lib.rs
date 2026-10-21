@@ -210,21 +210,38 @@ fn write_block<T: Scalar + FromStr>(
     let matrix = if prepared.resample
         && matrix.prefactor.is_none()
         && matrix.sample_points.as_ref().is_some_and(|p| p.len() > 1)
+        && matrix.sample_scalings.is_some()
     {
         let (points, scalings) = (
             matrix.sample_points.as_ref(),
             matrix.sample_scalings.as_ref(),
         );
-        let prefactor = resample::prefactor(
-            points.unwrap(),
-            scalings.ok_or("resampling needs sample scalings")?,
-        )
-        .map_err(|e| format!("block {index}: {e}"))?;
-        resampled = PolynomialMatrix {
-            prefactor: Some(prefactor),
-            ..Default::default()
-        };
-        &resampled
+        require(
+            matrix.reduced_prefactor.is_none(),
+            "reducedPrefactor requires prefactor",
+        )?;
+        let count = polynomials
+            .iter()
+            .flatten()
+            .flatten()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        require(
+            points.unwrap().len() == count,
+            "sample points must match the polynomial degree",
+        )?;
+        let prefactor = resample::prefactor(points.unwrap(), scalings.unwrap())
+            .map_err(|e| format!("block {index}: {e}"))?;
+        if let Some(prefactor) = prefactor {
+            resampled = PolynomialMatrix {
+                prefactor: Some(prefactor),
+                ..Default::default()
+            };
+            &resampled
+        } else {
+            matrix
+        }
     } else {
         matrix
     };
