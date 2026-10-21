@@ -26,6 +26,7 @@ pub use data_updating::*;
 pub use equilibration::*;
 pub use info::*;
 pub use kktsystem::*;
+pub(crate) use original_check::{OriginalData, OriginalProducts};
 pub(crate) use presolver::*;
 pub use problemdata::*;
 pub use residuals::*;

@@ -158,9 +158,10 @@ where
                 super::original_check::OriginalData {
                     P: P.clone(),
                     q: q.to_vec(),
-                    A: A.clone(),
+                    A: sampled.map_or_else(|| A.clone(), |op| op.linear().clone()),
                     b: b.to_vec(),
                     cones: cones.to_vec(),
+                    sampled: sampled.map(|op| std::sync::Arc::new(op.clone())),
                 }
             };
         let mut original = None;
@@ -295,7 +296,73 @@ where
             A,
             b,
             cones: self.cones.clone(),
+            sampled: None,
         })
+    }
+
+    /// Original-coordinate products from the equilibrated operator. Transform
+    /// vectors instead of copying or materializing the sampled coefficients.
+    pub(crate) fn original_products(
+        &self,
+        x: &[T],
+        z: &[T],
+    ) -> super::original_check::OriginalProducts<T> {
+        let eq = &self.equilibration;
+        let cinv = eq.c.recip();
+        let mut xi = x.to_vec();
+        xi.hadamard(&eq.dinv);
+        let mut zi = z.to_vec();
+        zi.hadamard(&eq.einv).scale(eq.c);
+        let mut r = self.b.clone();
+        let mut rd = vec![T::zero(); self.n];
+        if self.P.nnz() > 0 {
+            self.P
+                .sym(MatrixTriangle::Triu)
+                .symv(&mut rd, &xi, T::one(), T::zero());
+        }
+        let xpx = xi.dot(&rd) * cinv;
+        if let Some(op) = &self.sampled {
+            let mut work = crate::solver::sampled::SampledWorkspace::new(op);
+            op.apply(&mut r, &xi, -T::one(), T::one(), &mut work);
+            op.apply_transpose(&mut rd, &zi, T::one(), T::one(), &mut work);
+        } else {
+            self.A.gemv(&mut r, &xi, -T::one(), T::one());
+            self.A.t().gemv(&mut rd, &zi, T::one(), T::one());
+        }
+        r.hadamard(&eq.einv);
+        rd.axpby(T::one(), &self.q, T::one());
+        rd.hadamard(&eq.dinv).scale(cinv);
+        let b = self.b.iter().zip(&eq.einv).map(|(&v, &e)| v * e).collect();
+        let q: Vec<_> = self
+            .q
+            .iter()
+            .zip(&eq.dinv)
+            .map(|(&v, &d)| v * d * cinv)
+            .collect();
+        super::original_check::OriginalProducts::new(b, r, rd, &q, x, z, xpx)
+    }
+
+    pub(crate) fn original_residuals(
+        &self,
+        x: &[T],
+        s: &[T],
+        z: &[T],
+        psd_dual: bool,
+    ) -> super::original_check::OriginalResiduals<T> {
+        if self.sampled.is_some() && self.original.is_none() {
+            self.original_products(x, z)
+                .residuals(s, z, &self.cones, psd_dual)
+        } else {
+            self.original_data().residuals(x, s, z, psd_dual)
+        }
+    }
+
+    pub(crate) fn project_original_slack(&self, x: &[T], s: &mut [T], z: &[T]) {
+        if self.sampled.is_some() && self.original.is_none() {
+            self.original_products(x, z).project_slack(&self.cones, s);
+        } else {
+            self.original_data().project_slack(x, s);
+        }
     }
 
     /// Materialize the equilibrated constraint matrix, including sampled rows.

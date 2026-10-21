@@ -28,7 +28,7 @@ pub struct DefaultSolution<T> {
     /// dual residual
     pub r_dual: T,
     /// The last slack projection: `x`, the slack it replaced, the result.
-    projected: Option<[Vec<T>; 3]>,
+    pub(crate) projected: Option<[Vec<T>; 3]>,
 }
 
 impl<T> DefaultSolution<T>
@@ -97,22 +97,36 @@ where
         // SOCP_sched_100_100_orig).
         // The termination check and the final reconstruction project the
         // same point (a dense eigendecomposition per PSD cone): reuse it.
-        if settings.tol_original.is_some() && !is_infeasible && data.sampled.is_none() {
-            let same = |a: &[T], b: &[T]| {
-                a.len() == b.len()
-                    && a.iter()
-                        .zip(b)
-                        .all(|(x, y)| x == y && x.is_sign_negative() == y.is_sign_negative())
-            };
-            match &self.projected {
-                Some([x, s, out]) if same(x, &self.x) && same(s, &self.s) => {
-                    self.s.copy_from(out);
-                }
-                _ => {
-                    let s = self.s.clone();
-                    data.original_data().project_slack(&self.x, &mut self.s);
-                    self.projected = Some([self.x.clone(), s, self.s.clone()]);
-                }
+        if settings.tol_original.is_some() && !is_infeasible {
+            let z = &self.z;
+            let x = &self.x;
+            let s = &mut self.s;
+            Self::project_slack(&mut self.projected, x, s, |x, s| {
+                data.project_original_slack(x, s, z)
+            });
+        }
+    }
+
+    pub(crate) fn project_slack(
+        projected: &mut Option<[Vec<T>; 3]>,
+        x: &[T],
+        s: &mut [T],
+        project: impl FnOnce(&[T], &mut [T]),
+    ) {
+        let same = |a: &[T], b: &[T]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(x, y)| x == y && x.is_sign_negative() == y.is_sign_negative())
+        };
+        match projected {
+            Some([previous_x, previous_s, out]) if same(previous_x, x) && same(previous_s, s) => {
+                s.copy_from_slice(out);
+            }
+            _ => {
+                let previous_s = s.to_vec();
+                project(x, s);
+                *projected = Some([x.to_vec(), previous_s, s.to_vec()]);
             }
         }
     }
@@ -160,17 +174,13 @@ where
         reduced: bool,
     ) -> Option<T> {
         let tol = settings.tol_original?;
-        if data.sampled.is_some() {
-            return None;
-        }
         let mut scratch = variables.copy_of();
         let status = self.status;
         self.status = SolverStatus::Solved;
         self.reconstruct(data, &mut scratch, settings, false);
         self.status = status;
-        let original = data.original_data();
         let psd_dual = data.chordal_info.is_none() || settings.chordal_decomposition_complete_dual;
-        let residuals = original.residuals(&self.x, &self.s, &self.z, psd_dual);
+        let residuals = data.original_residuals(&self.x, &self.s, &self.z, psd_dual);
         Some(if reduced {
             residuals.ratio(
                 T::max(tol, settings.reduced_tol_feas),

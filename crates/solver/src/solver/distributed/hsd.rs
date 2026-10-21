@@ -33,6 +33,7 @@ pub(crate) struct OwnedData<T: FloatT> {
     pub componentwise_enabled: bool,
     pub internal_cones: Vec<SupportedConeT<T>>,
     pub presolver: Option<Presolver<T>>,
+    pub original: Option<OriginalData<T>>,
     pub chordal_info: Option<ChordalInfo<T>>,
     pub cost: CostRuntimeConfig,
 }
@@ -327,6 +328,7 @@ impl<T: FloatT> OwnedSolver<T> {
             componentwise_enabled,
             internal_cones: state.internal_cones,
             presolver: state.presolver,
+            original: state.original,
             chordal_info: state.chordal_info,
             cost: state.cost,
         };
@@ -417,6 +419,7 @@ impl<T: FloatT> OwnedSolver<T> {
             .map_or(T::zero(), |p| p.objective_offset);
         if collective.rank() != 0 {
             data.presolver = None;
+            data.original = None;
             data.chordal_info = None;
         }
         cones.degree = cones

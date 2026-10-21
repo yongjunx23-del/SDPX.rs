@@ -516,6 +516,66 @@ impl<T: FloatT> Solution<T> for OwnedSolution<T> {
         self.0.r_prim = info.0.res_primal;
         self.0.r_dual = info.0.res_dual;
 
+        self.reconstruct(data, variables, settings, infeasible);
+    }
+
+    fn original_ratio(
+        &mut self,
+        data: &OwnedData<T>,
+        variables: &OwnedVariables<T>,
+        settings: &DefaultSettings<T>,
+        reduced: bool,
+    ) -> Option<T> {
+        let tol = settings.tol_original?;
+        let mut scratch = variables.new_like();
+        scratch.copy_from(variables);
+        let status = self.0.status;
+        self.0.status = SolverStatus::Solved;
+        let products = self.reconstruct(data, &mut scratch, settings, false);
+        let failed = self.0.status == SolverStatus::NumericalError;
+        self.0.status = status;
+        let ratio = if failed {
+            T::infinity()
+        } else if let Some(products) = products {
+            let psd_dual =
+                data.chordal_info.is_none() || settings.chordal_decomposition_complete_dual;
+            let residuals = if let Some(original) = &data.original {
+                original.residuals(&self.0.x, &self.0.s, &self.0.z, psd_dual)
+            } else {
+                products.residuals(&self.0.s, &self.0.z, &data.internal_cones, psd_dual)
+            };
+            if reduced {
+                residuals.ratio(
+                    T::max(tol, settings.reduced_tol_feas),
+                    T::max(tol, settings.reduced_tol_gap_abs),
+                    T::max(tol, settings.reduced_tol_gap_rel),
+                )
+            } else {
+                residuals.ratio(tol, tol, tol)
+            }
+        } else {
+            T::zero()
+        };
+        Some(
+            data.collective
+                .reduce_max(606, &[ratio])
+                .map_or(T::infinity(), |values| values[0]),
+        )
+    }
+
+    fn finalize(&mut self, info: &OwnedInfo<T>) {
+        self.0.solve_time = info.0.solve_time;
+    }
+}
+
+impl<T: FloatT> OwnedSolution<T> {
+    fn reconstruct(
+        &mut self,
+        data: &OwnedData<T>,
+        variables: &mut OwnedVariables<T>,
+        settings: &DefaultSettings<T>,
+        infeasible: bool,
+    ) -> Option<OriginalProducts<T>> {
         let is_root = variables.collective.rank() == 0;
         let (n, m) = if is_root {
             (data.layout.n, data.layout.m)
@@ -650,11 +710,23 @@ impl<T: FloatT> Solution<T> for OwnedSolution<T> {
             }
         }
 
+        let products = if settings.tol_original.is_some() && !infeasible {
+            match self.original_products(data, variables) {
+                Ok(products) => products,
+                Err(_) => {
+                    self.0.status = SolverStatus::NumericalError;
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
         if !is_root {
             self.0.x.clear();
             self.0.s.clear();
             self.0.z.clear();
-            return;
+            return None;
         }
 
         let reversed = data
@@ -670,9 +742,139 @@ impl<T: FloatT> Solution<T> for OwnedSolution<T> {
             self.0.s.copy_from_slice(&point.s);
             self.0.z.copy_from_slice(&point.z);
         }
+        if let Some(products) = &products {
+            let original = &data.original;
+            DefaultSolution::project_slack(
+                &mut self.0.projected,
+                &self.0.x,
+                &mut self.0.s,
+                |x, s| {
+                    if let Some(original) = original {
+                        original.project_slack(x, s);
+                    } else {
+                        products.project_slack(&data.internal_cones, s);
+                    }
+                },
+            );
+        }
+        products
     }
 
-    fn finalize(&mut self, info: &OwnedInfo<T>) {
-        self.0.solve_time = info.0.solve_time;
+    /// Gather products, not coefficients. Border rows sum the owners' partial
+    /// operators; private rows and columns retain their unique owner.
+    fn original_products(
+        &self,
+        data: &OwnedData<T>,
+        variables: &OwnedVariables<T>,
+    ) -> Result<Option<OriginalProducts<T>>, crate::solver::distributed::collective::CollectiveError>
+    {
+        let local: Vec<_> = data
+            .blocks
+            .iter()
+            .zip(&variables.blocks)
+            .map(|(block, point)| block.original_products(&point.x, &point.z))
+            .collect();
+        let mut border = vec![T::zero(); data.global_layout.border_rows.len()];
+        let mut sums = [T::zero(); 3];
+        let mut norms = [T::zero(); 2];
+        for (products, ids) in local.iter().zip(&data.layout.owners) {
+            for (j, &row) in data.global_layout.border_rows.iter().enumerate() {
+                border[j] += products.r[ids.rows.binary_search(&row).unwrap()];
+            }
+            sums[0] += products.qx;
+            sums[1] += products.xpx;
+            sums[2] += products.bz;
+            norms[0] = T::max(norms[0], products.normb);
+            norms[1] = T::max(norms[1], products.normq);
+        }
+        if data.blocks.is_empty() && data.collective.rank() == 0 {
+            for j in 0..border.len() {
+                let b = data.border_b[j] * data.border_einv[j];
+                border[j] = b;
+                sums[2] += b * variables.border_z[j];
+                norms[0] = T::max(norms[0], T::abs(b));
+            }
+        }
+        data.collective.reduce_sum_in_place(601, &mut border)?;
+        let full = &data.global_layout;
+        let mut ranges = Vec::with_capacity(full.owners.len());
+        let mut offset = 0;
+        for ids in &full.owners {
+            let length = ids.columns.len() + 2 * ids.counted_rows.len();
+            ranges.push((offset, length));
+            offset += length;
+        }
+        let mut payload = Vec::new();
+        for &owner in &data.all_owner_ids {
+            if data.collective.size() > 1 && owner != data.collective.rank() {
+                continue;
+            }
+            let ids = &full.owners[owner];
+            let products = data
+                .owner_ids
+                .iter()
+                .position(|&id| id == owner)
+                .map(|i| &local[i]);
+            if let Some(products) = products {
+                payload.extend_from_slice(&products.rd);
+            }
+            for &row in &ids.counted_rows {
+                let global = ids.rows[row];
+                if let Some(j) = full.border_rows.iter().position(|&r| r == global) {
+                    payload.push(if owner == 0 {
+                        data.border_b[j] * data.border_einv[j]
+                    } else {
+                        T::zero()
+                    });
+                } else {
+                    payload.push(products.unwrap().b[row]);
+                }
+            }
+            for &row in &ids.counted_rows {
+                let global = ids.rows[row];
+                payload.push(
+                    if let Some(j) = full.border_rows.iter().position(|&r| r == global) {
+                        border[j]
+                    } else {
+                        products.unwrap().r[row]
+                    },
+                );
+            }
+        }
+        let gathered = if data.collective.size() > 1 {
+            data.collective.gather_root(602, &payload, &ranges, 0)?
+        } else {
+            Some(payload)
+        };
+        let sums = data.collective.reduce_sum(603, &sums)?;
+        let norms = data.collective.reduce_max(604, &norms)?;
+        Ok(gathered.map(|values| {
+            let mut products = OriginalProducts {
+                b: vec![T::zero(); full.m],
+                r: vec![T::zero(); full.m],
+                rd: vec![T::zero(); full.n],
+                qx: sums[0],
+                xpx: sums[1],
+                bz: sums[2],
+                normb: norms[0],
+                normq: norms[1],
+            };
+            for (owner, ids) in full.owners.iter().enumerate() {
+                let mut cursor = ranges[owner].0;
+                for &column in &ids.columns {
+                    products.rd[column] = values[cursor];
+                    cursor += 1;
+                }
+                for &row in &ids.counted_rows {
+                    products.b[ids.rows[row]] = values[cursor];
+                    cursor += 1;
+                }
+                for &row in &ids.counted_rows {
+                    products.r[ids.rows[row]] = values[cursor];
+                    cursor += 1;
+                }
+            }
+            products
+        }))
     }
 }
