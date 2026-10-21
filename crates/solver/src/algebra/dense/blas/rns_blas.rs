@@ -24,6 +24,7 @@ use rayon::prelude::*;
 use sdpx_arithmetic::inner_parallel::board;
 use sdpx_arithmetic::{DyadicKind, MpFloat, Scalar};
 use std::collections::HashMap;
+use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex, OnceLock};
 
 type F<const N: usize> = MpFloat<N>;
@@ -1069,19 +1070,22 @@ impl Store {
             Store::Narrow(lo, hi) => {
                 let (lo, hi) = unsafe {
                     (
-                        std::slice::from_raw_parts_mut(lo.add(at), n),
-                        std::slice::from_raw_parts_mut(hi.add(at), n),
+                        std::slice::from_raw_parts_mut(lo.add(at).cast::<MaybeUninit<u16>>(), n),
+                        std::slice::from_raw_parts_mut(hi.add(at).cast::<MaybeUninit<i8>>(), n),
                     )
                 };
                 for ((lo, hi), &v) in lo.iter_mut().zip(hi).zip(values) {
                     let v = v as i32;
-                    (*lo, *hi) = (v as u16, (v >> 16) as i8);
+                    lo.write(v as u16);
+                    hi.write((v >> 16) as i8);
                 }
             }
             Store::Wide(w) => {
-                let w = unsafe { std::slice::from_raw_parts_mut(w.add(at), n) };
+                let w = unsafe {
+                    std::slice::from_raw_parts_mut(w.add(at).cast::<MaybeUninit<f32>>(), n)
+                };
                 for (w, &v) in w.iter_mut().zip(values) {
-                    *w = v as f32;
+                    w.write(v as f32);
                 }
             }
         }
@@ -1161,27 +1165,27 @@ impl CachedResidues {
     fn extend(&self, range: std::ops::Range<usize>, out: &mut Vec<f64>) {
         let (at, n) = (out.len(), range.len());
         out.reserve(n);
+        self.decode(range.start, &mut out.spare_capacity_mut()[..n]);
         // SAFETY: `decode` writes all n reserved entries before they are exposed.
         unsafe {
-            self.decode(range.start, std::slice::from_raw_parts_mut(out.as_mut_ptr().add(at), n));
             out.set_len(at + n);
         }
     }
 
     /// Stored residues `start..start + out.len()` into `out`.
-    fn decode(&self, start: usize, out: &mut [f64]) {
+    fn decode(&self, start: usize, out: &mut [MaybeUninit<f64>]) {
         #[inline(always)]
-        fn body(res: &CachedResidues, start: usize, out: &mut [f64]) {
+        fn body(res: &CachedResidues, start: usize, out: &mut [MaybeUninit<f64>]) {
             let range = start..start + out.len();
             match res {
                 CachedResidues::Narrow(lo, hi) => {
                     for ((o, &l), &h) in out.iter_mut().zip(&lo[range.clone()]).zip(&hi[range]) {
-                        *o = ((h as i32) << 16 | l as i32) as f64;
+                        o.write(((h as i32) << 16 | l as i32) as f64);
                     }
                 }
                 CachedResidues::Wide(w) => {
                     for (o, &v) in out.iter_mut().zip(&w[range]) {
-                        *o = v as f64;
+                        o.write(v as f64);
                     }
                 }
             }
@@ -1189,7 +1193,7 @@ impl CachedResidues {
         #[cfg(target_arch = "x86_64")]
         if avx2() {
             #[target_feature(enable = "avx2")]
-            unsafe fn wide(res: &CachedResidues, start: usize, out: &mut [f64]) {
+            unsafe fn wide(res: &CachedResidues, start: usize, out: &mut [MaybeUninit<f64>]) {
                 body(res, start, out)
             }
             // SAFETY: the CPU supports AVX2.
@@ -1299,7 +1303,7 @@ impl Operand {
                 let (a, b) = (w * total / ways, (w + 1) * total / ways);
                 // SAFETY: way w alone writes entries a..b of the reserved capacity.
                 res.decode(q0 * len + a, unsafe {
-                    std::slice::from_raw_parts_mut(base.get().add(a), b - a)
+                    std::slice::from_raw_parts_mut(base.get().add(a).cast(), b - a)
                 });
             } else if let Operand::Chunks(m) = self {
                 let (r0, r1) = panel_rows(len, ways, w);

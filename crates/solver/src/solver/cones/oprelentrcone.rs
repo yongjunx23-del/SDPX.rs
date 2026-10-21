@@ -1913,12 +1913,19 @@ where
         let mut cg = self.data.cg;
         // outside a pool (one solver thread) rayon would use its global pool
         let ways = rayon::current_thread_index().map_or(1, |_| rayon::current_num_threads());
+        // Each inconclusive trial can form an S₀ factor. Bound speculative
+        // factor storage, with headroom for its construction and scratch;
+        // a single larger trial still runs, sharing its work with idle lanes.
+        let m2 = n * (n + 1);
+        let trial_bytes = 2 * m2 * m2 * std::mem::size_of::<T>();
+        let ways = ways.min(((512 << 20) / trial_bytes).max(1));
         let split = heavy::<T>(n);
         let this = &*self;
         let mut α = αmax;
         let mut αz = T::zero();
         while α > αmin {
             if α >= αs || ways == 1 {
+                let _inner = split.then(sdpx_arithmetic::inner_parallel::Guard::enter);
                 wz.waxpby(T::one(), z, α, dz);
                 let a = α.min(αs);
                 if at.as_ref().is_none_or(|(b, _)| *b != a) {

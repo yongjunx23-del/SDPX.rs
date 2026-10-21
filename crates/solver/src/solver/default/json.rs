@@ -191,7 +191,7 @@ mod deferred {
         D: Deserializer<'de>,
         T: FloatT + DeserializeOwned,
     {
-        if T::precision_bits() <= 53 {
+        if T::precision_bits() <= 53 || rayon::current_thread_index().is_none() {
             return Vec::<T>::deserialize(deserializer);
         }
         deserializer.deserialize_seq(Values(PhantomData))

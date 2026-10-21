@@ -926,7 +926,7 @@ fn modular_full_row_rank(
             };
             let previous = &basis[pivot];
             if !previous.is_empty() {
-                budget = budget.checked_sub(previous.len())?;
+                budget = budget.checked_sub(row.len() + previous.len())?;
                 // row -= factor·previous, dropping the entries that cancel.
                 merged.clear();
                 let (mut i, mut j) = (0, 0);
@@ -954,6 +954,7 @@ fn modular_full_row_rank(
                 }
                 std::mem::swap(&mut row, &mut merged);
             } else {
+                budget = budget.checked_sub(row.len())?;
                 let inverse = inverse_mersenne31(factor);
                 for (_, value) in row.iter_mut() {
                     *value = *value * inverse % P;
@@ -969,6 +970,12 @@ fn modular_full_row_rank(
 #[cfg(test)]
 mod exact_tests {
     use super::*;
+    #[test]
+    fn modular_budget_counts_long_row_merges() {
+        let rows = vec![vec![(0, 1)], (0..100).map(|j| (j, 1)).collect()];
+        assert_eq!(modular_full_row_rank(rows, 100, 32), None);
+    }
+
     fn check<T: FloatT>() {
         let one = T::one();
         let two = one + one;

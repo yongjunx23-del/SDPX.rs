@@ -606,6 +606,7 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
                 o.t.clone_from(c.rows());
             }
         }
+        let pool = self.residual_pool.as_deref();
         let transform = |o: &OreRows<T>| {
             let (t, rows) = (&o.t, o.rows.len());
             let mut values = vec![T::zero(); o.a.len()];
@@ -613,7 +614,7 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
                 v.copy_from_slice(a);
                 t.to_eigen(v);
             };
-            if self.residual_pool.is_some() {
+            if pool.is_some() {
                 values
                     .par_chunks_exact_mut(rows)
                     .zip(o.a.par_chunks_exact(rows))
@@ -626,20 +627,37 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
             }
             values
         };
-        let timer = crate::receipt::start();
-        let ore_values: Vec<Vec<T>> = match self.residual_pool.as_deref() {
-            Some(pool) if !self.ore.is_empty() => {
-                pool.install(|| self.ore.par_iter().with_max_len(1).map(transform).collect())
+        // Publish serial transforms immediately; parallel waves keep at most
+        // 128 MiB of transformed rows (or one larger cone) alive at once.
+        let ways = pool.map_or(1, |p| p.current_num_threads());
+        let mut first = 0;
+        while first < self.ore.len() {
+            let mut end = first + 1;
+            let mut bytes = self.ore[first].a.len() * std::mem::size_of::<T>();
+            while end < self.ore.len() && end - first < ways {
+                let next = self.ore[end].a.len() * std::mem::size_of::<T>();
+                if bytes + next > 128 << 20 {
+                    break;
+                }
+                bytes += next;
+                end += 1;
             }
-            _ => self.ore.iter().map(transform).collect(),
-        };
-        crate::receipt::finish("kkt.ore_rows", timer);
-        let timer = crate::receipt::start();
-        for (o, values) in zip(&self.ore, &ore_values) {
-            _update_values(&mut self.ldlsolver, &mut self.KKT, &o.pos, values);
+            let wave = &self.ore[first..end];
+            let timer = crate::receipt::start();
+            let values: Vec<Vec<T>> = match pool {
+                Some(pool) => {
+                    pool.install(|| wave.par_iter().with_max_len(1).map(transform).collect())
+                }
+                None => vec![transform(&wave[0])],
+            };
+            crate::receipt::finish("kkt.ore_rows", timer);
+            let timer = crate::receipt::start();
+            for (o, values) in zip(wave, &values) {
+                _update_values(&mut self.ldlsolver, &mut self.KKT, &o.pos, values);
+            }
+            crate::receipt::finish("kkt.ore_values", timer);
+            first = end;
         }
-        drop(ore_values);
-        crate::receipt::finish("kkt.ore_values", timer);
 
         let mut sparse_map_iter = map.sparse_maps.iter();
         let ldl = &mut self.ldlsolver;
