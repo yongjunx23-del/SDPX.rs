@@ -23,6 +23,7 @@ pub(crate) struct OriginalData<T> {
     pub A: CscMatrix<T>,
     pub b: Vec<T>,
     pub cones: Vec<SupportedConeT<T>>,
+    pub sampled: Option<std::sync::Arc<crate::solver::sampled::SampledOperator<T>>>,
 }
 
 /// Original-coordinate residuals, already normalized.
@@ -77,15 +78,13 @@ impl<T: FloatT> OriginalData<T> {
         z: &[T],
         psd_dual: bool,
     ) -> OriginalResiduals<T> {
-        let infbound: T = crate::get_infinity().as_T();
-        let finite = |v: T| T::abs(v) < infbound;
-        let (m, n) = (self.A.m, self.A.n);
-        debug_assert!(x.len() == n && s.len() == m && z.len() == m);
+        self.products(x, z).residuals(s, z, &self.cones, psd_dual)
+    }
 
-        // r = b - A x
-        let mut r: Vec<T> = self.b.clone();
-        self.A.gemv(&mut r, x, -T::one(), T::one());
-        // Px and the objective terms
+    fn products(&self, x: &[T], z: &[T]) -> OriginalProducts<T> {
+        let (m, n) = (self.A.m, self.A.n);
+        debug_assert!(x.len() == n && z.len() == m);
+        let mut r = self.b.clone();
         let mut px = vec![T::zero(); n];
         if self.P.nnz() > 0 {
             self.P
@@ -93,24 +92,68 @@ impl<T: FloatT> OriginalData<T> {
                 .symv(&mut px, x, T::one(), T::zero());
         }
         let xpx = x.dot(&px);
-        let qx = self.q.dot(x);
-        let bz = self
-            .b
+        let mut rd = px;
+        if let Some(op) = &self.sampled {
+            let mut work = crate::solver::sampled::SampledWorkspace::new(op);
+            op.apply(&mut r, x, -T::one(), T::one(), &mut work);
+            op.apply_transpose(&mut rd, z, T::one(), T::one(), &mut work);
+        } else {
+            self.A.gemv(&mut r, x, -T::one(), T::one());
+            self.A.t().gemv(&mut rd, z, T::one(), T::one());
+        }
+        rd.axpby(T::one(), &self.q, T::one());
+        OriginalProducts::new(self.b.clone(), r, rd, &self.q, x, z, xpx)
+    }
+}
+
+/// Products in original coordinates, without retaining another coefficient matrix.
+pub(crate) struct OriginalProducts<T> {
+    pub b: Vec<T>,
+    pub r: Vec<T>,
+    pub rd: Vec<T>,
+    pub qx: T,
+    pub xpx: T,
+    pub bz: T,
+    pub normb: T,
+    pub normq: T,
+}
+
+impl<T: FloatT> OriginalProducts<T> {
+    pub(crate) fn new(b: Vec<T>, r: Vec<T>, rd: Vec<T>, q: &[T], x: &[T], z: &[T], xpx: T) -> Self {
+        let infbound: T = crate::get_infinity().as_T();
+        let finite = |v: T| T::abs(v) < infbound;
+        let bz = b
             .iter()
             .zip(z)
             .filter(|(&bi, _)| finite(bi))
             .fold(T::zero(), |acc, (&bi, &zi)| acc + bi * zi);
-        // dual residual Px + A'z + q
-        let mut rd = px;
-        self.A.t().gemv(&mut rd, z, T::one(), T::one());
-        rd.axpby(T::one(), &self.q, T::one());
-
-        let normb = self
-            .b
+        let normb = b
             .iter()
             .filter(|&&v| finite(v))
             .fold(T::zero(), |acc, &v| T::max(acc, T::abs(v)));
-        let normq = self.q.norm_inf();
+        Self {
+            b,
+            r,
+            rd,
+            qx: q.dot(x),
+            xpx,
+            bz,
+            normb,
+            normq: q.norm_inf(),
+        }
+    }
+
+    pub(crate) fn residuals(
+        &self,
+        s: &[T],
+        z: &[T],
+        cones: &[SupportedConeT<T>],
+        psd_dual: bool,
+    ) -> OriginalResiduals<T> {
+        debug_assert!(s.len() == self.b.len() && z.len() == self.b.len());
+        let infbound: T = crate::get_infinity().as_T();
+        let finite = |v: T| T::abs(v) < infbound;
+        let r = &self.r;
 
         let mut primal = T::zero();
         for (i, (&ri, &si)) in r.iter().zip(s).enumerate() {
@@ -120,7 +163,7 @@ impl<T: FloatT> OriginalData<T> {
         }
         let mut offset = 0;
         let mut dual_cone = T::zero();
-        for cone in &self.cones {
+        for cone in cones {
             let len = cone.nvars();
             let rows = offset..offset + len;
             offset += len;
@@ -134,12 +177,12 @@ impl<T: FloatT> OriginalData<T> {
             }
         }
 
-        let objective = qx + xpx / (2.).as_T();
-        let dual_objective = -bz - xpx / (2.).as_T();
+        let objective = self.qx + self.xpx / (2.).as_T();
+        let dual_objective = -self.bz - self.xpx / (2.).as_T();
         let gap_abs = T::abs(objective - dual_objective);
         OriginalResiduals {
-            primal: primal / (T::one() + normb),
-            dual: T::max(rd.norm_inf(), dual_cone) / (T::one() + normq),
+            primal: primal / (T::one() + self.normb),
+            dual: T::max(self.rd.norm_inf(), dual_cone) / (T::one() + self.normq),
             gap_abs,
             gap_rel: gap_abs / (T::one() + T::abs(objective)),
         }
@@ -154,48 +197,68 @@ impl<T: FloatT> OriginalData<T> {
     /// in binary64 (higher precisions keep the iterate unless `b - Ax` is
     /// already PSD). Other cones and rows with an infinite bound keep `s`.
     pub(crate) fn project_slack(&self, x: &[T], s: &mut [T]) {
-        let infbound: T = crate::get_infinity().as_T();
-        let mut r: Vec<T> = self.b.clone();
-        self.A.gemv(&mut r, x, -T::one(), T::one());
-        let mut offset = 0;
-        for cone in &self.cones {
-            let len = cone.nvars();
-            let rows = offset..offset + len;
-            offset += len;
-            if rows.clone().any(|i| T::abs(self.b[i]) >= infbound) {
-                continue;
+        let mut r = self.b.clone();
+        if let Some(op) = &self.sampled {
+            op.apply(
+                &mut r,
+                x,
+                -T::one(),
+                T::one(),
+                &mut crate::solver::sampled::SampledWorkspace::new(op),
+            );
+        } else {
+            self.A.gemv(&mut r, x, -T::one(), T::one());
+        }
+        project_slack(&r, &self.b, &self.cones, s);
+    }
+}
+
+impl<T: FloatT> OriginalProducts<T> {
+    pub(crate) fn project_slack(&self, cones: &[SupportedConeT<T>], s: &mut [T]) {
+        project_slack(&self.r, &self.b, cones, s);
+    }
+}
+
+fn project_slack<T: FloatT>(r: &[T], b: &[T], cones: &[SupportedConeT<T>], s: &mut [T]) {
+    let infbound: T = crate::get_infinity().as_T();
+    let mut offset = 0;
+    for cone in cones {
+        let len = cone.nvars();
+        let rows = offset..offset + len;
+        offset += len;
+        if rows.clone().any(|i| T::abs(b[i]) >= infbound) {
+            continue;
+        }
+        let (r, s) = (&r[rows.clone()], &mut s[rows]);
+        match cone {
+            SupportedConeT::ZeroConeT(_) => s.fill(T::zero()),
+            SupportedConeT::NonnegativeConeT(_) => {
+                for (si, &ri) in s.iter_mut().zip(r) {
+                    *si = T::max(ri, T::zero());
+                }
             }
-            let (r, s) = (&r[rows.clone()], &mut s[rows]);
-            match cone {
-                SupportedConeT::ZeroConeT(_) => s.fill(T::zero()),
-                SupportedConeT::NonnegativeConeT(_) => {
-                    for (si, &ri) in s.iter_mut().zip(r) {
-                        *si = T::max(ri, T::zero());
+            SupportedConeT::SecondOrderConeT(_) if !r.is_empty() => {
+                let (t, norm) = (r[0], r[1..].norm());
+                if norm <= t {
+                    s.copy_from_slice(r);
+                } else if norm <= -t {
+                    s.fill(T::zero());
+                } else {
+                    let half = (t + norm) / (2.).as_T();
+                    s[0] = half;
+                    for (si, &ri) in s[1..].iter_mut().zip(&r[1..]) {
+                        *si = half * ri / norm;
                     }
                 }
-                SupportedConeT::SecondOrderConeT(_) if !r.is_empty() => {
-                    let (t, norm) = (r[0], r[1..].norm());
-                    if norm <= t {
-                        s.copy_from_slice(r);
-                    } else if norm <= -t {
-                        s.fill(T::zero());
-                    } else {
-                        let half = (t + norm) / (2.).as_T();
-                        s[0] = half;
-                        for (si, &ri) in s[1..].iter_mut().zip(&r[1..]) {
-                            *si = half * ri / norm;
-                        }
-                    }
-                }
-                SupportedConeT::PSDTriangleConeT(dim) => {
-                    if cone_distance(cone, r, false) == T::zero() {
-                        s.copy_from_slice(r);
-                    } else if T::precision_bits() <= 64 {
-                        project_psd_f64(*dim, r, s);
-                    }
-                }
-                _ => {}
             }
+            SupportedConeT::PSDTriangleConeT(dim) => {
+                if cone_distance(cone, r, false) == T::zero() {
+                    s.copy_from_slice(r);
+                } else if T::precision_bits() <= 64 {
+                    project_psd_f64(*dim, r, s);
+                }
+            }
+            _ => {}
         }
     }
 }

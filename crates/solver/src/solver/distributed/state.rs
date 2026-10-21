@@ -28,7 +28,8 @@ pub(crate) struct OwnedState<T: FloatT> {
     pub border_e: Vec<T>,
     pub border_einv: Vec<T>,
     pub componentwise_enabled: bool,
-    // Keep the existing recovery metadata, not the full original matrices.
+    // Keep reconstruction metadata and any existing pre-transformation audit data.
+    pub original: Option<OriginalData<T>>,
     pub internal_cones: Vec<SupportedConeT<T>>,
     pub presolver: Option<Presolver<T>>,
     pub cost: CostRuntimeConfig,
@@ -252,6 +253,7 @@ impl<T: FloatT> OwnedState<T> {
             componentwise_enabled,
             internal_cones: std::mem::take(&mut data.cones),
             presolver: data.presolver.take(),
+            original: data.original.take(),
             cost,
             chordal_info: data.chordal_info.take(),
         })

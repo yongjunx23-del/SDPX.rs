@@ -803,3 +803,115 @@ fn owned_hsd_ising_solve() {
     .unwrap();
     assert_eq!(solution.status, SolverStatus::Solved);
 }
+
+#[test]
+fn original_acceptance_sampled_and_owned() {
+    use crate::solver::core::traits::Solution;
+    let make_sampled = |tol_original| {
+        let settings = DefaultSettings {
+            verbose: false,
+            max_threads: 1,
+            tol_original,
+            direct_solve_method: "qdldl".into(),
+            kkt_form: "condensed".into(),
+            ..DefaultSettings::default()
+        };
+        DefaultSolver::new_sampled(
+            &CscMatrix::zeros((2, 2)),
+            &[1., 1.],
+            &CscMatrix::zeros((3, 2)),
+            &[-1., 0., -1.],
+            &[SupportedConeT::PSDTriangleConeT(2)],
+            vec![SampledBlock {
+                row_start: 0,
+                column_start: 0,
+                dim: 1,
+                basis_rows: 2,
+                basis_cols: 2,
+                basis: vec![1., 0.25, 0.25, 1.],
+                weights: vec![-1.; 2],
+            }],
+            settings,
+        )
+        .unwrap()
+    };
+    let make_owned = |tol_original| {
+        let mut settings = settings::<f64>();
+        settings.max_threads = 1;
+        settings.tol_original = tol_original;
+        DefaultSolver::new(
+            &CscMatrix::zeros((2, 2)),
+            &[1. / 3., 1. / 7.],
+            &CscMatrix::from(&[[1., 1.], [-1., 0.], [0., -1.]]),
+            &[0.7, 0., 0.],
+            &[
+                SupportedConeT::ZeroConeT(1),
+                SupportedConeT::NonnegativeConeT(2),
+            ],
+            settings,
+        )
+        .unwrap()
+    };
+    for tol in [None, Some(1e-6), Some(1e-30)] {
+        let mut reference = make_sampled(tol);
+        reference.solve();
+        let solved = tol != Some(1e-30);
+        assert_eq!(reference.solution.status == SolverStatus::Solved, solved);
+        let mut owned = OwnedSolver::from_default(make_owned(tol), 3).unwrap();
+        owned.solve();
+        assert_eq!(
+            owned.solution.0.status == SolverStatus::Solved,
+            solved,
+            "{tol:?}: {:?}",
+            owned.solution.0.status
+        );
+        // The owned factor path must apply the requested gate even before
+        // iterating; its explicit CSC contains no sampled coefficients.
+        let mut sampled = OwnedSolver::from_default(make_sampled(tol), 3).unwrap();
+        let ratio = sampled.solution.original_ratio(
+            &sampled.data,
+            &sampled.variables,
+            &sampled.settings,
+            false,
+        );
+        assert_eq!(ratio.is_some(), tol.is_some());
+        if let Some(ratio) = ratio {
+            assert!(ratio > 1.);
+        }
+    }
+
+    // A strict requested gate must also reach every rank, including ranks
+    // without a numeric block. The root alone reconstructs the audit point.
+    let handles = MockCollective::<f64>::group(3).unwrap();
+    let joins: Vec<_> = handles
+        .into_iter()
+        .map(|comm| {
+            thread::spawn(move || {
+                let DefaultSolver {
+                    data,
+                    cones,
+                    settings,
+                    solution,
+                    timers,
+                    ..
+                } = make_owned(Some(1e-30));
+                let prepared = PreparedProblem {
+                    data,
+                    cones,
+                    settings,
+                    solution,
+                    timers: timers.unwrap(),
+                    cost_input_fingerprint: None,
+                };
+                let mut solver =
+                    OwnedSolver::from_prepared_rank_local(prepared, Arc::new(comm)).unwrap();
+                solver.solve();
+                solver.solution.0.status
+            })
+        })
+        .collect();
+    for join in joins {
+        assert_ne!(join.join().unwrap(), SolverStatus::Solved);
+    }
+    rank_local_mock_matches_serial::<f64>(0);
+}
