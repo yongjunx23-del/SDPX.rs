@@ -8,6 +8,36 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-21 — BFSS ORE: longer steps from σ or a wider dual certificate (rejected, bfss-ore-sigma)
+
+- Goal: longer interior-point steps on ORE problems under unchanged accuracy gates (follow-up to the ORE diagnosis below). MPFR 128 bits only.
+- Setup:
+  - Branch bfss-ore-sigma from 01fc57f. Experiment commits: 94e54a0 (reverted by 1e27603), dee9ace and 4e619ba (scratch switch `SDPX_ORE_SIGMA`; unset gives the base iterates).
+  - e7cea52 reverts the experiments; its tree equals 01fc57f.
+  - Cluster binary os2H = 4e619ba. Release, T=16. L10 on node33 (load ≈ 30); L11u on node105.
+- Mechanism (L10/128, per-pair proximity δ from `SDPX_DBG_STEPCONE`): the cap is the Dikin dual certificate at the trial s. At δ ≈ 1, the certificate's edge, the primal-scaled centering direction stops reducing δ and α → 0. That is the L11u stall signature from iteration 94. The base survives because Mehrotra's σ stays large: α_aff median 0.168, σ median 0.58, δ ≲ 0.86.
+- Option 1: σ from a step the certificate does not cap, with the actual step still certified. Every variant ends L10 InsufficientProgress:
+  - A, an affine step from ORE primal membership and the symmetric cones only: IP/14.
+  - B1, a greedy σ line search along the σ = 0 direction: IP/18. On L11u, IP/11 at objective 2.17.
+  - B2, B1 without shortening α: IP/19.
+  - C3, keep every pair at δ ≤ ½: IP/14.
+  - D, keep δ ≤ 0.5 or 0.7: IP/10–13.
+  - E, D with a fall-back to the certificate's step: IP/20–24.
+- Option 2: wider sound dual certificates.
+  - Mode 8 also accepts z′ certified at the current s.
+    - α_aff median 0.167 (base 0.168).
+    - L10: Solved/195, 114 against 109 s (+4.6%); its serial extra test doubles the affine search time. Audit passes.
+    - L11u: IP/98 against IP/107, with a wider final gap (primal 7.046092, dual 7.052360), 1171 against 1143 s.
+  - Mode 9 uses a damped-Newton conjugate-barrier certificate.
+    - α_aff median 0.156.
+    - L10: Solved/214, 245 against 109 s (+125%), at about 59 cone scalings per iteration.
+    - Its final z fails the audit's exact Dikin certificate (dual ratio 1.02).
+    - L11u was not run.
+- Audit: thermal `ore.py` in original coordinates, covering residuals, gap, primal ORE/PSD membership and an exact arb/mpmath Dikin certificate of the dual cone, at the case's 1e-9 tolerance. The cluster L10 points are bitwise equal to the Mac runs, so the Mac audits apply. Base: dual ratio 0.978, gap 8.7e-10. csdr3 with os2H (mode 9) is Solved/36 and its audit passes.
+- Conclusion: the dual membership test does not limit the step. A tighter test (mode 9) even lowers α_aff. The limit is the primal-scaled direction at the certificate edge.
+- Decision: rejected; the code is reverted. Remaining lever: a Dahl–Andersen primal–dual ORE scaling. It is only outlined: about +35–70% per L11u iteration and 600–900 lines, so it pays only if iterations fall by more than a third. A scratch probe on L10 is running in its own session.
+- Evidence: Mac `~/.cache/sdpx-e2e/ore-sigma-20261021`; hpc `~/projects/sdpx-bfss-ore-sigma-20261021/runs/{l10m128-227824,l11u128-227823}.node220`.
+
 ## 2026-10-21 — Arrow leaf lanes start together: L10 lane hang fixed (kept, bfss-threads)
 
 - Defect (LANE-HANG, from c80da23): L10/128 at T=16 sometimes deadlocked in the arrow leaf phase. Rayon queues the leaf-lane broadcast job to each worker in turn, and a worker waiting in a join takes its own broadcast job. A worker that had stolen a leaf's split piece (the Y solve's parallel chunks) before its job arrived therefore ran its lane on top of that piece. The lane then waited for every leaf, and the leaf waited for the buried piece.
