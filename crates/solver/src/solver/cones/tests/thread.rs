@@ -347,15 +347,22 @@ fn single_psd_shares_wider_pool_with_condensed_columns() {
 fn psd_steps<T: FloatT>() {
     let num = |n: i32| T::from_i32(n).unwrap();
     let half = T::one() / num(2);
+    // Binary64 PSD cones under 2·F64_LANE_WORK (n³ units) stay serial, so the
+    // f64 case needs cones large enough to keep the pooled step path.
+    let (n1, n2) = if T::precision_bits() <= 64 {
+        (96, 112)
+    } else {
+        (16, 32)
+    };
     // Nonsymmetric descriptors occur before, between and after symmetric
     // cones; their original second-pass order must remain authoritative.
     let kinds = vec![
         SupportedConeT::ExponentialConeT(),
-        SupportedConeT::PSDTriangleConeT(16),
+        SupportedConeT::PSDTriangleConeT(n1),
         SupportedConeT::NonnegativeConeT(2),
         SupportedConeT::ZeroConeT(0),
         SupportedConeT::PowerConeT(half),
-        SupportedConeT::PSDTriangleConeT(32),
+        SupportedConeT::PSDTriangleConeT(n2),
         SupportedConeT::SecondOrderConeT(3),
         SupportedConeT::PSDTriangleConeT(0),
         SupportedConeT::ZeroConeT(1),
@@ -374,7 +381,9 @@ fn psd_steps<T: FloatT>() {
         pooled.configure_threads(width).unwrap();
         assert_eq!(pooled.cone_threads(), width);
         if width > 1 {
-            assert!(pooled.threading.as_ref().unwrap().sym_step_lanes.len() >= 2);
+            let threading = pooled.threading.as_ref().unwrap();
+            assert!(threading.sym_step_lanes.len() >= 2);
+            assert!(threading.cone_workers > 1);
         }
         for case in 0..3 {
             let (mut dz, mut ds) = (vec![T::zero(); m], vec![T::zero(); m]);
