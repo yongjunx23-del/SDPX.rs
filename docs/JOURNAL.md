@@ -8,6 +8,31 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-21 — BFSS ORE: primal–dual (Dahl–Andersen) scaling probe (rejected, bfss-ore-pd)
+
+- Goal: test whether primal–dual ORE scaling removes the step cap that ORE-SIGMA (below) traced to the primal-scaled direction. MPFR 128 bits only.
+- Setup:
+  - Branch bfss-ore-pd from cb444d9: probe c147447 behind the scratch switch `SDPX_ORE_PD`, about 370 lines in `oprelentrcone.rs`.
+  - Revert 0586423; its crates tree equals cb444d9.
+- Probe:
+  - Shadow point x̃ = −∇f*(z) by damped Newton from ν/⟨s,z⟩·s, using S₀ factor solves: mean 5.2 steps, at most 13, never failing on L10.
+  - W = μ∇²f(s) plus the Dahl–Andersen rank-4 update (W s = z, W x̃ = −∇f(s); secant residuals 1e-38–1e-33). It is folded into the cone's dense eigen-coordinate block as Hs = N(D − B E⁻¹ Bᵀ)Nᵀ, so the KKT gets no new rows.
+  - Centering s − σμx̃. The dual bound comes from the Dikin ball at the last Newton iterate, OR-ed with the trial-s certificate.
+- Result (L10/128, Mac fast profile, T=8, same input and settings as the base):
+
+  | Variant | Status/it | Time | α_aff median | σ median | Audit |
+  |---|---|---|---|---|---|
+  | base | Solved/198 | 117.0 s | 0.168 | 0.576 | PASS (dual ratio 0.978, gap 8.7e-10) |
+  | PD | Solved/159 (−19.7%) | 140.0 s (+20%) | 0.244 | 0.432 | PASS (dual ratio 0.994, gap 8.5e-10) |
+
+  - Per iteration 0.59 → 0.88 s (+49%).
+  - Scale cones 4.1 → 18.0 s, from the shadow-point Newton (`ore.schur_cholesky` 1.9 → 11.8 s).
+  - The folded term fills the ORE leaves' T–XY block: refactor 6.3 → 11.4 s.
+  - The combined step is still capped by the dual certificates of the n = 7 and n = 14 cones.
+- Decision: rejected. The iteration drop is below the one-third bar that the added cost requires; the code is reverted.
+- Not tried (each a new probe): a warm-started x̃, true border rows (no T–XY fill), the PD neighbourhood test for σ and the step, and L11u.
+- Evidence: Mac `~/.cache/sdpx-e2e/ore-pd-20261021` (l10pd1; base `ore-sigma-20261021/l10B0`).
+
 ## 2026-10-21 — BFSS ORE: longer steps from σ or a wider dual certificate (rejected, bfss-ore-sigma)
 
 - Goal: longer interior-point steps on ORE problems under unchanged accuracy gates (follow-up to the ORE diagnosis below). MPFR 128 bits only.

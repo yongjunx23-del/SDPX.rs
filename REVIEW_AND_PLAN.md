@@ -248,11 +248,15 @@ Ranked by the Amdahl-bounded gain on the goal workloads per unit of effort (jour
   - ORE-DIAG (diagnosis 2026-10-21; journal 2026-10-21). The ORE cone's barrier, derivatives, S₀, dual test and corrector are correct (256-bit check against an independent D). On BFSS L11u:
     - The k = 1 (n = 38) cone's Dikin dual certificate caps the affine step at a median 0.136 (≈ √(2/ν)) in 91 of 107 iterations, so σ ≈ 0.64 and the solve needs 107 iterations.
     - The stall is an unattained optimum along (0, W, W) KMS directions: |x| 1e9, dual above primal through x·(q + Aᵀz).
-    - Open (changes iterates): primal–dual ORE scaling. A scratch L10 probe is running; the outline estimates +35–70% per L11u iteration, so it pays only if iterations fall by more than a third. σ from an uncapped step and wider dual certificates were rejected (ORE-SIGMA).
+    - Rejected so far: σ from an uncapped step and wider dual certificates (ORE-SIGMA), and primal–dual scaling (ORE-PD). Open on the model side: bound or remove the (0, W, W) directions.
   - ORE-SIGMA (branch bfss-ore-sigma; journal 2026-10-21). **Rejected 2026-10-21.**
     - σ from a step the certificate does not cap (variants A–E): L10 InsufficientProgress at 10–24 iterations.
     - Wider sound dual certificates do not lengthen steps. The Dikin test at the current s gives L10 +4.6% and L11u IP/98 with a wider gap. A Newton certificate gives L10 214 iterations (+125%), and its point fails the audit's Dikin certificate.
     - The cap is the primal-scaled direction at the certificate edge (δ ≈ 1). The tree is reverted to 01fc57f.
+  - ORE-PD (branch bfss-ore-pd; journal 2026-10-21). **Rejected 2026-10-21.** Primal–dual Dahl–Andersen ORE scaling (Newton shadow point, rank-4 W folded into the ORE KKT block).
+    - L10/128: Solved/159 against 198 (−19.7%), but 140 against 117 s (+20%); the audit passes.
+    - The iteration drop is below the one-third bar.
+    - Untried: a warm-started shadow point, true border rows, and the PD neighbourhood test.
   - BFSS-MERGE (2026-10-21; journal 2026-10-21). ORE-STEP (74da6d7), RNS-X86 (036585c) and EXACTDOT-X86 (c64f2a4, aec492a) are merged into bfss-threads (2539893). Every gate is bitwise: 128-bit full run, 512 bits, L10, ising11 and csdr3.
     - BFSS L11u, 256 bits, 25 iterations, node180, against 66e64b7: T=8 −34.2%, T=16 −40.1% (21.82 → 12.91 s/it), T=32 −45.2%, T=64 −45.6%.
     - 128-bit full run: 1411.7 → 928.9 s. Peak RSS +12% at T=64 and +20% on the 128-bit full run (not attributed).
