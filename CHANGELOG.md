@@ -4,6 +4,76 @@ All notable changes to SDPX are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Measurements quote audited full
 solves; the experiment log is [docs/JOURNAL.md](docs/JOURNAL.md).
 
+## [0.9.3] - 2026-10-21
+
+### Release highlights
+
+- MPFR multi-threading for operator relative entropy (ORE) programs. BFSS L11u
+  thermal bootstrap at 256 bits, 25 iterations, x86 EPYC 7742, is bitwise
+  identical to the thermal-ore baseline 66e64b7 at every thread count:
+
+  | Threads | 66e64b7 | 0.9.3 | Change |
+  |---|---|---|---|
+  | 8 | 716.5 s (28.73 s/it) | 471.7 s (18.83 s/it) | −34.2% |
+  | 16 | 545.0 s (21.82 s/it) | 326.2 s (12.91 s/it) | −40.1% |
+  | 32 | 445.1 s (17.98 s/it) | 244.0 s (9.75 s/it) | −45.2% |
+  | 64 | 423.7 s (17.21 s/it) | 230.6 s (9.16 s/it) | −45.6% |
+
+  The full 128-bit run (InsufficientProgress/107) falls from 1411.7 to 928.9 s,
+  and 512 bits from 395.1 to 282.2 s per 10 iterations. Peak memory rises 12% at
+  64 threads.
+- Binary64 LP/SOCP/SDP kernels: supernode-run QDLDL factor and solve sweeps,
+  upper-triangle symmetric products, Cholesky step admission and measured
+  cone lanes. Points are bitwise unchanged except where a factor backend
+  changes, and those cases are audited at unchanged iteration counts.
+
+### Changed
+
+- MPFR KKT update: each cone fills its Hs block in parallel, and the arrow
+  solver caches one value plan per index map.
+- Arrow leaf phase: when the factor is called from outside the pool, leaves
+  run as one lane per worker, largest first. Split work goes on the board, and
+  residue contribution products are formed in-phase within `BATCH_WORK_BYTES`.
+- Residue GEMM (`rns_blas`):
+  - Strided operands are copied dense.
+  - Exponent scans, decode, chunk residues and zero fills run over the ways.
+  - Prime groups give every way a panel and stay within `GROUP_SCRATCH_BYTES`.
+  - Residues are encoded by 32-entry chunk panels (AVX2 when available).
+- Exact dots (`exactdot`): a one-pass fixed-window kernel. On x86 with BMI2+ADX
+  (runtime detection) it uses mulx/adcx/adox term kernels and 4×4 block adds
+  for 8–16-limb terms.
+- ORE cone: serial O(n²–n³) scaling passes run as pool items. Heavy cones split
+  their step trials' S₀ preconditioner and Γ.
+- Binary64:
+  - QDLDL refactors replay the recorded row pattern and sweep supernode runs of
+    up to eight columns; forward and backward solves pair independent columns.
+  - Symmetric products and the H-apply use upper column panels.
+  - Dense-block Schur dots are 16 outputs wide, and G·A uses register blocks.
+  - PSD step admission uses Cholesky, with one slack projection per solve.
+  - The local cone arrow has class panels behind a cost gate.
+  - Refinement residual sweeps cover runs of dense constraint columns.
+  - Cone pools are sized from measured work.
+- `sdpx-pmp` resamples by default (`--keep-samples` opts out) and caps its
+  default threads by memory.
+- Presolve: exact rank images on sorted rows, a GMP-limb budget for rational
+  updates, and equality rows that own a column are peeled first.
+
+### Fixed
+
+- An intermittent deadlock in the arrow leaf lanes (L10/128 at 16 threads).
+  No lane claims a leaf before every worker has entered its lane.
+- Scale-relative Jacobi tests in the 2×2 and 3×3 SVD and eigen kernels.
+- Residue GEMM panel-fill scratch is bounded again, and the product buffer is
+  zeroed only when it grows.
+- The CLI keeps no input pool at one thread.
+
+### Rejected or reverted (see the journal)
+
+- Binary64 PSD corrector right-hand side via dsyevr (it made gpp250-1
+  AlmostSolved on x86).
+- A parallel ORE step search.
+- σ from uncapped ORE steps, and wider ORE dual certificates.
+
 ## [0.9.2] - 2026-10-13
 
 ### Release highlights
