@@ -9,11 +9,12 @@
 //!
 //! This is the contract of the residue (RNS) path: exact accumulation, one
 //! rounding. The result is never less accurate than the FMA chain it replaces
-//! and does not depend on the term order. A non-finite operand, or an exponent
-//! spread wider than [`MAX_ACC_LIMBS`], declines so the caller keeps the chain.
+//! and does not depend on the term order. Wider exponent spreads use exact
+//! products and MPFR summation; non-finite operands keep the caller's chain.
 use crate::MpFloat;
 use gmp_mpfr_sys::{gmp, mpfr};
 use std::cell::RefCell;
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
 /// Accumulator bound per sign, in limbs (about 32k bits of exponent spread).
@@ -47,8 +48,8 @@ thread_local! {
 
 type Pair<'a, const N: usize> = (&'a MpFloat<N>, &'a MpFloat<N>);
 
-/// Exact dot product rounded once. `chain` evaluates the FMA chain and is used
-/// when the exact path declines or the scratch is unavailable (reentrancy).
+/// Exact dot product rounded once. `chain` preserves the caller's handling
+/// of non-finite operands.
 pub(crate) fn dot<'a, const N: usize>(
     pairs: impl IntoIterator<Item = Pair<'a, N>>,
     chain: impl Fn(&mut dyn Iterator<Item = Pair<'a, N>>) -> MpFloat<N>,
@@ -63,14 +64,14 @@ fn dot_with<'a, const N: usize>(
     chain: impl Fn(&mut dyn Iterator<Item = Pair<'a, N>>) -> MpFloat<N>,
     inline: bool,
 ) -> MpFloat<N> {
-    let mut pairs = pairs.into_iter();
+    let pairs = pairs.into_iter();
     if N > MAX_N {
-        return chain(&mut pairs);
+        return dot_mpfr(pairs, chain);
     }
     let scratch =
         SCRATCH.try_with(|s| s.try_borrow_mut().ok().map(|mut s| std::mem::take(&mut *s)));
     let Ok(Some(mut scratch)) = scratch else {
-        return chain(&mut pairs);
+        return dot_mpfr(pairs, chain);
     };
     scratch.terms.clear();
     let (mut emin, mut emax, mut finite) = (i64::MAX, i64::MIN, true);
@@ -106,13 +107,70 @@ fn dot_with<'a, const N: usize>(
         let Scratch { terms, pos, neg } = &mut scratch;
         accumulate(pos, neg, emin, emax, inline, terms.iter().map(view))
     };
-    let out = exact.unwrap_or_else(|| chain(&mut scratch.terms.iter().map(view)));
+    let out = exact.unwrap_or_else(|| dot_mpfr(scratch.terms.iter().map(view), chain));
     let _ = SCRATCH.try_with(|s| {
         if let Ok(mut slot) = s.try_borrow_mut() {
             *slot = scratch;
         }
     });
     out
+}
+
+/// Slow exact path without storage proportional to the exponent spread.
+/// MPFR's `dot` first multiplies at 2P bits, but those products can overflow
+/// or underflow before cancellation. Build their normalized mantissas and
+/// exponents directly instead; `sum` rounds only the final value.
+fn dot_mpfr<'a, const N: usize>(
+    pairs: impl IntoIterator<Item = Pair<'a, N>>,
+    chain: impl Fn(&mut dyn Iterator<Item = Pair<'a, N>>) -> MpFloat<N>,
+) -> MpFloat<N> {
+    let pairs: Vec<_> = pairs.into_iter().collect();
+    let finite = |x: &MpFloat<N>| matches!(x.kind.abs(), mpfr::ZERO_KIND | mpfr::REGULAR_KIND);
+    if pairs.iter().any(|(a, b)| !finite(a) || !finite(b)) {
+        return chain(&mut pairs.into_iter());
+    }
+    let products: Vec<_> = pairs
+        .into_iter()
+        .filter(|(a, b)| !zero_product(a, b))
+        .map(|(a, b)| {
+            let mut limbs = vec![0u64; 2 * N];
+            let mut exponent = a.exponent + b.exponent;
+            let kind = if (a.kind < 0) != (b.kind < 0) {
+                -mpfr::REGULAR_KIND
+            } else {
+                mpfr::REGULAR_KIND
+            };
+            // SAFETY: the product has 2N limbs; each input has N limbs.
+            // Normalized factors give either 2P or 2P-1 significant bits.
+            unsafe {
+                mpn_mul_n::<N>(limbs.as_mut_ptr(), a.limbs.as_ptr(), b.limbs.as_ptr());
+                if limbs[2 * N - 1] >> 63 == 0 {
+                    gmp::mpn_lshift(limbs.as_mut_ptr(), limbs.as_ptr(), (2 * N) as _, 1);
+                    exponent -= 1;
+                }
+                let mut desc = MaybeUninit::uninit();
+                mpfr::custom_init_set(
+                    desc.as_mut_ptr(),
+                    kind,
+                    exponent,
+                    (2 * MpFloat::<N>::PRECISION_BITS) as _,
+                    limbs.as_mut_ptr().cast(),
+                );
+                (limbs, desc.assume_init())
+            }
+        })
+        .collect();
+    let ptrs: Vec<_> = products
+        .iter()
+        .map(|(_, d)| (d as *const mpfr::mpfr_t).cast_mut())
+        .collect();
+    MpFloat::<N>::output(|r| unsafe {
+        // Product descriptors borrow their owned limb buffers. Their exponents
+        // may exceed the active range; only the sum is range-checked. MPFR's
+        // summation visits bounded blocks rather than filling exponent gaps.
+        let inexact = mpfr::sum(r, ptrs.as_ptr(), ptrs.len() as _, mpfr::rnd_t::RNDN);
+        mpfr::check_range(r, inexact, mpfr::rnd_t::RNDN);
+    })
 }
 
 /// Exact dot over two equal-length slices: one exponent scan, one
@@ -124,7 +182,7 @@ pub(crate) fn dot_slices<'a, const N: usize>(
 ) -> MpFloat<N> {
     assert_eq!(a.len(), b.len());
     if N > MAX_N {
-        return chain(&mut a.iter().zip(b));
+        return dot_mpfr(a.iter().zip(b), chain);
     }
     if let Some(v) = window_dot(a, b) {
         return v;
@@ -152,7 +210,7 @@ pub(crate) fn dot_slices<'a, const N: usize>(
     let scratch =
         SCRATCH.try_with(|s| s.try_borrow_mut().ok().map(|mut s| std::mem::take(&mut *s)));
     let Ok(Some(mut scratch)) = scratch else {
-        return chain(&mut a.iter().zip(b));
+        return dot_mpfr(a.iter().zip(b), chain);
     };
     let terms = a
         .iter()
@@ -171,7 +229,7 @@ pub(crate) fn dot_slices<'a, const N: usize>(
             *slot = scratch;
         }
     });
-    exact.unwrap_or_else(|| dot(a.iter().zip(b), chain))
+    exact.unwrap_or_else(|| dot_mpfr(a.iter().zip(b), chain))
 }
 
 /// Exponent-sum reach, in limbs, of [`window_dot`] on each side of a dot's
@@ -787,8 +845,8 @@ fn round_slots<const N: usize>(
 /// `(output, a, b)` for chunks `c < chunks`; `par_for(chunks, f)` may run
 /// the chunks concurrently (calling `f(c)` once for every `c`). An output's
 /// partial sums share one alignment and add exactly, so each value is `dot`
-/// over that output's terms in any order. `None` marks an output `dot`
-/// leaves to the chain: a non-finite term or too wide an exponent spread.
+/// over that output's terms in any order. Non-finite outputs remain `None`;
+/// finite outputs outside the limb window use the MPFR sum path.
 ///
 /// `bounds[k]`, when given, is a range holding the exponent sum of every
 /// finite nonzero term of output k (empty when it has none). The terms are
@@ -805,10 +863,10 @@ pub(crate) fn dot_outputs_chunked<'a, const N: usize, I>(
 where
     I: Iterator<Item = (usize, &'a MpFloat<N>, &'a MpFloat<N>)>,
 {
-    if N > MAX_N {
-        return vec![None; outputs];
-    }
     let chunks = chunks.max(1);
+    if N > MAX_N {
+        return mpfr_outputs(vec![None; outputs], chunks, terms);
+    }
     if let Some(bounds) = bounds {
         assert_eq!(bounds.len(), outputs);
         let range: Vec<_> = bounds.iter().map(|&(lo, hi)| (lo, hi, true)).collect();
@@ -839,8 +897,41 @@ where
             *r = (r.0.min(s.0), r.1.max(s.1), r.2 && s.2);
         }
     }
-    sum_outputs::<N, I, false>(&range, chunks, terms, par_for)
-        .expect("scanned exponent ranges hold every term")
+    let out = sum_outputs::<N, I, false>(&range, chunks, terms, par_for)
+        .expect("scanned exponent ranges hold every term");
+    if out.iter().zip(&range).any(|(v, r)| v.is_none() && r.2) {
+        mpfr_outputs(out, chunks, terms)
+    } else {
+        out
+    }
+}
+
+/// Fill declined finite outputs together, reading the chunk streams once.
+fn mpfr_outputs<'a, const N: usize, I>(
+    mut out: Vec<Option<MpFloat<N>>>,
+    chunks: usize,
+    terms: &(dyn Fn(usize) -> I + Sync),
+) -> Vec<Option<MpFloat<N>>>
+where
+    I: Iterator<Item = (usize, &'a MpFloat<N>, &'a MpFloat<N>)>,
+{
+    let mut pending: Vec<_> = out.iter().map(|v| v.is_none().then(Vec::new)).collect();
+    for c in 0..chunks {
+        for (k, a, b) in terms(c) {
+            if let Some(pairs) = &mut pending[k] {
+                pairs.push((a, b));
+            }
+        }
+    }
+    let finite = |x: &MpFloat<N>| matches!(x.kind.abs(), mpfr::ZERO_KIND | mpfr::REGULAR_KIND);
+    for (value, pairs) in out.iter_mut().zip(pending) {
+        if let Some(pairs) = pairs {
+            if pairs.iter().all(|(a, b)| finite(a) && finite(b)) {
+                *value = Some(dot_mpfr(pairs, |_| unreachable!("finite output")));
+            }
+        }
+    }
+    out
 }
 
 /// Whether `a·b` is an exact zero of finite factors, which adds nothing
@@ -1190,6 +1281,7 @@ impl<const N: usize> MpFloat<N> {
 mod tests {
     use crate::integer::exact_product;
     use crate::MpFloat;
+    use gmp_mpfr_sys::mpfr;
     use num_traits::{FromPrimitive, One, Zero};
 
     // `mul_rows` against GMP over all-ones, one-hot and xorshift operands.
@@ -1303,7 +1395,7 @@ mod tests {
         assert!(MpFloat::<N>::dot_fma(z.iter().zip(&x[..3])).is_zero());
         assert!(super::dot_slices(&z, &x[..3], |t| MpFloat::<N>::dot_fma_chain(t)).is_zero());
         assert!(super::dot_slices(&both, &ones, |t| MpFloat::<N>::dot_fma_chain(t)).is_zero());
-        // An exponent spread wider than the window falls back to the chain.
+        // The exact slow path also preserves a negligible low term.
         let wide = [
             MpFloat::<N>::one(),
             MpFloat::<N>::one().scale_pow2(-100_000),
@@ -1312,6 +1404,95 @@ mod tests {
         assert_eq!(
             MpFloat::<N>::dot_fma(wide.iter().zip(&ones)),
             MpFloat::<N>::dot_fma_chain(wide.iter().zip(&ones))
+        );
+    }
+
+    fn wide_dot<const N: usize>() {
+        use crate::Scalar;
+        let one = MpFloat::<N>::one();
+        let huge = one.scale_pow2(40_000);
+        let p = MpFloat::<N>::PRECISION_BITS as i64;
+        let run = |a: &[MpFloat<N>], b: &[MpFloat<N>], expected| {
+            let chain = |_: &mut dyn Iterator<Item = super::Pair<'_, N>>| {
+                panic!("finite wide dot used the rounded chain")
+            };
+            assert_eq!(super::dot(a.iter().zip(b), chain), expected, "N={N}");
+            assert_eq!(
+                super::dot(a.iter().rev().zip(b.iter().rev()), chain),
+                expected
+            );
+            assert_eq!(super::dot_slices(a, b, chain), expected);
+            let par_for = |n: usize, f: &(dyn Fn(usize) + Sync)| (0..n).for_each(f);
+            assert_eq!(
+                <MpFloat<N> as Scalar>::dot_slices_chunked(a, b, 2, &par_for),
+                expected
+            );
+            let terms = |c| {
+                a.iter()
+                    .zip(b)
+                    .enumerate()
+                    .filter(move |(i, _)| i % 2 == c)
+                    .map(|(_, (a, b))| (0, a, b))
+            };
+            let sum = <MpFloat<N> as Scalar>::dot_outputs_chunked(1, 2, None, &terms, &par_for)[0]
+                .expect("finite output outside the limb window");
+            assert_eq!(sum, expected);
+        };
+        run(&[huge, one, -huge], &[one; 3], one);
+        let three_halves = one + one.scale_pow2(-1);
+        run(
+            &[huge, three_halves, -huge],
+            &[one, three_halves, one],
+            one.scale_pow2(1) + one.scale_pow2(-2),
+        );
+        // Ties round to even; a lower sticky bit takes the next value.
+        let half = one.scale_pow2(-p);
+        run(&[huge, one, half, -huge], &[one; 4], one);
+        run(
+            &[huge, one, half, half.scale_pow2(-1), -huge],
+            &[one; 5],
+            one + one.scale_pow2(1 - p),
+        );
+        // The product itself must remain exact before cancellation.
+        let eps = one.scale_pow2(1 - p);
+        run(
+            &[huge, one + eps, -one, -huge],
+            &[one, one - eps, one, one],
+            -one.scale_pow2(2 - 2 * p),
+        );
+        // Product exponents outside the active MPFR range must survive until
+        // cancellation or combination, without changing that thread's range.
+        let (emin, emax) = unsafe { (mpfr::get_emin(), mpfr::get_emax()) };
+        let large = one.scale_pow2(emax as i64 - 2);
+        let four = one.scale_pow2(2);
+        run(&[large, one, -large], &[four, one, four], one);
+        let tiny = one.scale_pow2(emin as i64 - 1);
+        let half = one.scale_pow2(-1);
+        run(&[huge, tiny, tiny, -huge], &[one, half, half, one], tiny);
+        run(
+            &[huge, tiny, -huge],
+            &[one, half, one],
+            MpFloat::<N>::zero(),
+        );
+        run(
+            &[huge, tiny, -huge],
+            &[one, half + half.scale_pow2(-1), one],
+            tiny,
+        );
+        assert_eq!(
+            unsafe { (mpfr::get_emin(), mpfr::get_emax()) },
+            (emin, emax)
+        );
+    }
+
+    #[test]
+    fn wide_exponent_dot_keeps_exact_cancellation_and_rounding() {
+        macro_rules! widths {
+            ($($n:literal),*) => { $(wide_dot::<$n>();)* };
+        }
+        widths!(
+            2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+            26, 27, 28, 29, 30, 31, 32
         );
     }
 

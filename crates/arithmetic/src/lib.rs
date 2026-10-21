@@ -490,8 +490,7 @@ impl<const N: usize> MpFloat<N> {
     }
 
     /// Dot product accumulated exactly and rounded once at this precision
-    /// (see `exactdot`). Non-finite operands, or an exponent spread too wide
-    /// for the fixed-point window, keep [`Self::dot_fma_chain`].
+    /// (see `exactdot`). Non-finite operands keep [`Self::dot_fma_chain`].
     #[inline]
     pub fn dot_fma<'a>(pairs: impl IntoIterator<Item = (&'a Self, &'a Self)>) -> Self {
         exactdot::dot(pairs, |terms| Self::dot_fma_chain(terms))
