@@ -2520,8 +2520,20 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                     .map(|(leaf, admit)| (std::sync::Mutex::new(leaf), admit))
                     .collect();
                 let (next, failed) = (AtomicUsize::new(0), AtomicBool::new(false));
-                let finished = AtomicUsize::new(0);
+                let (entered, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
                 pool.broadcast(|_| {
+                    // No leaf starts before every worker runs its lane. Rayon
+                    // queues the broadcast job per worker, one after another,
+                    // and a waiting join takes it: a worker that stole a
+                    // leaf's split piece before its job arrived would run its
+                    // lane above that piece and wait for all leaves forever
+                    // (L10/128 at 16 threads: about one run in 30 hung).
+                    // Until then the pool holds no other job, so every lane
+                    // starts at the bottom of its worker's stack.
+                    entered.fetch_add(1, Ordering::AcqRel);
+                    while entered.load(Ordering::Acquire) < threads {
+                        std::thread::yield_now();
+                    }
                     let _offer = sdpx_arithmetic::inner_parallel::board::Offer::enter();
                     while !failed.load(Ordering::Relaxed) {
                         let Some((slot, admit)) = order.get(next.fetch_add(1, Ordering::Relaxed))
