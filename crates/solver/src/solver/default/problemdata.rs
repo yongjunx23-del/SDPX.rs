@@ -93,6 +93,11 @@ where
                 }
                 SupportedConeT::PSDTriangleConeT(_) => 6,
                 SupportedConeT::OpRelEntropyConeT(_) => 7,
+                SupportedConeT::OpRelEntropyLimitConeT(n, m) => {
+                    shape.word(*n as u64);
+                    shape.word(*m as u64);
+                    8
+                }
             };
             shape.words(&[tag, cone.nvars()]);
         }

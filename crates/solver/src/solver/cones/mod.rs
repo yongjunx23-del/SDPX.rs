@@ -13,6 +13,7 @@ mod expcone;
 mod genpowcone;
 mod nonnegativecone;
 mod oprelentrcone;
+mod oprelentrlimitcone;
 mod powcone;
 mod socone;
 mod zerocone;
@@ -23,8 +24,9 @@ mod symmetric_common;
 //re-export everything to appear as one module
 use nonsymmetric_common::*;
 pub use {
-    compositecone::*, expcone::*, genpowcone::*, nonnegativecone::*, oprelentrcone::*, powcone::*,
-    socone::*, supportedcone::*, symmetric_common::*, zerocone::*,
+    compositecone::*, expcone::*, genpowcone::*, nonnegativecone::*, oprelentrcone::*,
+    oprelentrlimitcone::*, powcone::*, socone::*, supportedcone::*, symmetric_common::*,
+    zerocone::*,
 };
 
 // only use PSD cones with SDP/Blas enabled

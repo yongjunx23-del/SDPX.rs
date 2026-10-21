@@ -234,6 +234,63 @@ status and next actions.
 - Cluster: on 2026-10-21 the normal queue would not start jobs (227789 failed to start 25 times), so these jobs ran in the sugon queue.
 - Decision: kept.
 
+## 2026-10-21 — ORE limit cone `OpRelEntropyLimitConeT(n, m)`, phase 1 (kept, ore-limit-cone)
+
+- Why: the BFSS L11u optimum is approached along (0, W, W), a recession direction of K_ore (entry below), so it is not attained. The limit cone K = cl(K_ore + R₊(0, −W, −W)) is passed in reduced coordinates (k = n − m, m = rank W) without its lineality: (T, B, A, C) with T ⪰ [0 B; Bᵀ A − C] + E·N(A, C)·Eᵀ, E = [B; A − C], N(A, C) = ∫₀¹(1 − s)((1 − s)C + sA)⁻¹ds. Plan and mpmath prototype: BFSS project `notes/kms_ray_limit/` (`limit_cone_plan.md`, `limit_cone_barrier.py`).
+- Change (new `cones/oprelentrlimitcone.rs`):
+  - Barrier −logdet(T − G) − logdet A − logdet C, ν = n + 2k, evaluated in the ORE eigenbasis of (A, C). The VV block is the ORE's own oracle (`Oracle::eigen_part` with W = Ŵ_VV).
+  - The B border uses divided differences of g = −log, x log x and x² log x with nodes 1, 1 appended. Each is a fixed-sign Stieltjes integral. They come from a Taylor series in complete homogeneous symmetric polynomials when (hi − lo)·8 ≤ hi + lo; otherwise from the recurrence, then Leibniz with the least node first.
+  - S₀ has order mk + k(k + 1). For BFSS (38, 1) that is 1443, against 1482 for the ORE cone.
+  - Hs = N·D·Nᵀ, with the KKT rows N⁻¹A as for the ORE. `EigenRows` dispatches the direct solver's rows.
+  - Dual test: there is no cheap bound, because S₀'s B block gets no log-det curvature. The T part rejects first; otherwise S₀'s factor decides. The ORE's CG bracket is not carried over.
+  - Integration sites:
+    - `SupportedConeT`, `SupportedCone`, `SupportedConeTag` (tag 8, shared check `is_ore`);
+    - `check_dimensions` (0 ≤ m < n);
+    - checkpoint and cost hashes (8, n, m);
+    - `cone_cost`, `barrier_backtrack`, Δs from the linear rows, and the idle-pool step searches;
+    - direct `OreRows`;
+    - condensed `Scaling::OreLimit`, including the `kkt.rs` arm that was a runtime panic;
+    - FFI kind 8, with m in `reserved`, and the `sdpx.h` comment;
+    - verbose cone counts (the ORE's were missing as well).
+  - ORE file: the shared helpers became `pub(super)` rather than moving to a common module. `first_kernels`, `eigen_part` and `schur_matrix` were split out. ORE behaviour is unchanged.
+- Tests (53 and 128 bits):
+  - Analytic checks:
+    - gradient and Hessian against differences;
+    - ⟨g, s⟩ = −ν and ∇²F s = −g;
+    - μ∇²F·Hs = I and N⁻¹HsN⁻ᵀ = `get_Hs`;
+    - unit S₀ columns equal to the dense product;
+    - a central `unit_initialization`;
+    - `dual_form` = ⟨z, Hs z⟩, with 4ν on the central path;
+    - the `dual_ok` decision at exact·(1 ± ε^¼);
+    - third order against differences.
+  - m = 0 against `OpRelEntropyCone(n)`: F, gradient, Hessian, S₀⁻¹, Hs, D and the rows agree within 1e3 ulp. The iterates are identical: min t over K(1, 0) and over the ORE cone (a = 2, c = 1) both take 39 iterations, with steps capped at 0.79/0.75 by the dual certificate, as in the entry below.
+  - Kernels:
+    - Leibniz identities in each node, and the confluent values at λ = 1.
+    - Against a 1024-bit Lagrange sum: worst 87 ulp at 53 bits and 366 ulp at 128 bits. Both occur at (0.88, 0.88, 1, 1.14), just outside the series radius.
+  - Prototype fixtures (8 points; F, ∇F and two ∇²F products at 50 digits):
+
+    | Point | Max error |
+    |---|---|
+    | generic, mu1 | ≤ 190 ulp |
+    | spread (λ over 1e-3..1e3) | 6e4 ulp |
+    | illA (cond A = 1e10) | 3e9 ulp |
+    | boundary (λ(T − G) down to 1e-12) | 6e12 ulp |
+
+    The errors are alike in ulps at both precisions, so the points' conditioning sets them; the first two of these also apply to the ORE eigenbasis.
+  - End to end at 128 bits: min tr T − b over K(2, 1) with a = 2, c = 1. The optimum is 1 + N − 1/(4N), N = 2 ln 2 − 1. Augmented and condensed both reach Solved in 47 iterations with the cost within 1e-20. The C ABI (kind 8) gives the same, and rejects m = n.
+  - Full suites (`fast`, `sdp-accelerate,faer-sparse`): sdpx-solver integration 252 passed;
+    lib 562 of 568 pass when each test runs alone. The other 6 abort on an Accelerate
+    `cblas_dgemm` parameter error (LDA=0, M=0) and abort the same way on the bfss-threads
+    2539893 binary: `psd_step_lengths_f64` and the condensed `parallel_tests`
+    `overlapping_memory_fallback_f64`, `pooled_condensed_f64`,
+    `pooled_orthant_preserves_fma_f64`, `solve_many_accounting_f64`,
+    `wide_pool_splits_congruence_tiles_f64`. sdpx-ffi (default features) 16 passed.
+- Not done (phase 2):
+  - the BFSS export (reduced basis, replacing the V-relaxation) and the plan's §6 solves (L = 11 E-min, L = 10 E-max, the `lim` re-solves);
+  - one module for the shared ORE numerics;
+  - an upper bound or CG bracket for the dual test, since each certifying trial now factors S₀.
+- Decision: kept on branch `ore-limit-cone` (not pushed).
+
 ## 2026-10-21 — ORE cone: derivation verified; BFSS L11u slowness and stall explained (diagnosis, bfss-threads)
 
 - Question: is the operator relative entropy cone derived wrongly, given the poor BFSS results (L11u InsufficientProgress/107 with the dual 5.7e-3 above the primal; L10 198 iterations)?

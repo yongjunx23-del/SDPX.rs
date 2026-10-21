@@ -64,7 +64,7 @@ struct OreRows<T> {
     /// A on rows × cols (dense, column-major) and the KKT positions
     a: Vec<T>,
     pos: Vec<usize>,
-    t: OpRelEntropyRows<T>,
+    t: EigenRows<T>,
 }
 
 /// A with each operator relative entropy cone's rows dense over the columns
@@ -81,7 +81,7 @@ fn ore_pattern<T: FloatT>(
     let blocks: Vec<_> = cones
         .iter()
         .enumerate()
-        .filter(|(_, c)| matches!(c, SupportedCone::OpRelEntropyCone(_)))
+        .filter(|(_, c)| c.is_ore())
         .map(|(i, _)| (i, cones.rng_cones[i].clone()))
         .collect();
     if blocks.is_empty() {
@@ -602,8 +602,8 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
         // Each operator relative entropy cone's rows N⁻¹A. Columns and cones
         // are independent: the solver pool keeps their bits.
         for o in &mut self.ore {
-            if let Some(SupportedCone::OpRelEntropyCone(c)) = cones.get(o.cone) {
-                o.t.clone_from(c.rows());
+            if let Some(c) = cones.get(o.cone) {
+                o.t.update(c);
             }
         }
         let pool = self.residual_pool.as_deref();

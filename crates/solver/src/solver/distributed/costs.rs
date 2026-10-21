@@ -475,6 +475,11 @@ fn feed_cones<T: crate::algebra::FloatT>(
                 feed_u64(hash, 7);
                 feed_u64(hash, *n as u64);
             }
+            SupportedConeT::OpRelEntropyLimitConeT(n, m) => {
+                feed_u64(hash, 8);
+                feed_u64(hash, *n as u64);
+                feed_u64(hash, *m as u64);
+            }
         }
     }
 }

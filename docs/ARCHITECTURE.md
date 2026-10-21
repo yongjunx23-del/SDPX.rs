@@ -167,6 +167,14 @@ for each cone share a 512 MiB factor-workspace estimate, with at least one
 trial admitted.
 Heavy individual trials share their kernels with spare workers.
 
+The ORE limit cone `OpRelEntropyLimitConeT(n, m)` is the closure of the ORE
+cone plus a rank-m recession ray (0, W, W), in reduced coordinates
+(T, B, A, C), k = n − m: `T ⪰ [0 B; Bᵀ A−C] + E·N(A,C)·Eᵀ`, E = [B; A − C].
+It shares the ORE eigenbasis of (A, C), the barrier form (ν = n + 2k), the
+`N D Nᵀ` rows and every ORE-only KKT and step rule (`SupportedCone::is_ore`).
+Its Schur block S₀ has order mk + k(k+1). There is no cheap dual bound, so a
+trial that the T part does not reject factors S₀. m = 0 is the ORE cone.
+
 ## KKT formulation and backends
 
 `kkt_form` is `auto`, `augmented` or `condensed`.

@@ -532,7 +532,7 @@ where
             return self.fold_step_bounds(αmax, cached, None, |cone, rows, cap| {
                 if let SupportedCone::PSDTriangleCone(cone) = cone {
                     cone.prepare_affine_bounds(&mut dz[rows.clone()], &mut ds[rows], cap)
-                } else if let (Some(pool), SupportedCone::OpRelEntropyCone(_)) = (&idle, &*cone) {
+                } else if let (Some(pool), true) = (&idle, cone.is_ore()) {
                     pool.install(|| {
                         let _inner = sdpx_arithmetic::inner_parallel::Guard::enter();
                         cone.step_length(
@@ -1711,7 +1711,7 @@ where
                     )
                 });
             }
-            if let (Some(pool), SupportedCone::OpRelEntropyCone(_)) = (&idle, &*cone) {
+            if let (Some(pool), true) = (&idle, cone.is_ore()) {
                 return pool.install(|| {
                     let _inner = sdpx_arithmetic::inner_parallel::Guard::enter();
                     cone.step_length(

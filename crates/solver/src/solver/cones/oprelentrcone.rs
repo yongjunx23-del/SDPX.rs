@@ -63,7 +63,7 @@ unsafe impl<T> Sync for Out<T> {}
 
 /// `f(k, piece)` over the `len`-element pieces of `out` (the last may be
 /// shorter), split as [`items`].
-fn pieces<T: FloatT>(
+pub(super) fn pieces<T: FloatT>(
     out: &mut [T],
     len: usize,
     mul_adds: usize,
@@ -82,7 +82,7 @@ fn pieces<T: FloatT>(
 
 /// `vec![T::zero(); len]` written as [`items`]: a large buffer's first
 /// touch is otherwise a serial pass of its owner.
-fn zeros<T: FloatT>(len: usize) -> Vec<T> {
+pub(super) fn zeros<T: FloatT>(len: usize) -> Vec<T> {
     const PIECE: usize = 1 << 14;
     let mut v: Vec<T> = Vec::with_capacity(len);
     let base = Out(v.as_mut_ptr());
@@ -112,7 +112,7 @@ fn columns<T: FloatT>(
 
 /// `rayon::join` when a spare worker can take `b` (the paired gate);
 /// outside a pool rayon would use its global pool.
-fn join_if<RA: Send, RB: Send>(
+pub(super) fn join_if<RA: Send, RB: Send>(
     paired: bool,
     a: impl FnOnce() -> RA + Send,
     b: impl FnOnce() -> RB + Send,
@@ -128,7 +128,7 @@ fn join_if<RA: Send, RB: Send>(
 /// (about n³ multiply-adds) carries a grain of inner-parallel work. L10's
 /// cones of n ≤ 14 at 128 bits lost 1–2% to splitting theirs (the scale
 /// phase's SVDs slowed too); BFSS's n = 34 and 38 gain.
-fn heavy<T: FloatT>(n: usize) -> bool {
+pub(super) fn heavy<T: FloatT>(n: usize) -> bool {
     use sdpx_arithmetic::inner_parallel as ip;
     n.pow(3) as u128 * ip::weight(T::precision_bits() as usize) >= ip::grain()
 }
@@ -143,7 +143,7 @@ const BASE: usize = 128;
 /// `c = op(a)·op(b)` (`m × n`, inner `k`): one exact sum rounded once per
 /// entry, with the spare workers [`tasks`] grants offered to the residue
 /// product.
-fn product<T: FloatT>(
+pub(super) fn product<T: FloatT>(
     (ta, tb): (u8, u8),
     (m, n, k): (usize, usize, usize),
     (a, lda): (&[T], usize),
@@ -172,12 +172,12 @@ fn product<T: FloatT>(
 }
 
 #[inline]
-fn tri(i: usize, j: usize) -> usize {
+pub(super) fn tri(i: usize, j: usize) -> usize {
     // svec index of (i, j), i ≤ j (upper triangle by column)
     j * (j + 1) / 2 + i
 }
 
-fn gemm<T: FloatT>(ta: bool, tb: bool, n: usize, a: &[T], b: &[T], c: &mut [T]) {
+pub(super) fn gemm<T: FloatT>(ta: bool, tb: bool, n: usize, a: &[T], b: &[T], c: &mut [T]) {
     let ni = n as i32;
     let t = |x: bool| if x { b'T' } else { b'N' };
     T::xgemm(
@@ -201,7 +201,7 @@ fn gemm<T: FloatT>(ta: bool, tb: bool, n: usize, a: &[T], b: &[T], c: &mut [T]) 
 /// Wide types go left-looking on rows, each entry one exact dot product
 /// rounded once (3× faster than potrf's FMA chains at order 72); binary64
 /// keeps LAPACK.
-fn cholesky<T: FloatT>(n: usize, a: &mut [T]) -> bool {
+pub(super) fn cholesky<T: FloatT>(n: usize, a: &mut [T]) -> bool {
     if T::precision_bits() <= 53 {
         let mut info = 0;
         T::xpotrf(b'L', n as i32, a, n as i32, &mut info);
@@ -372,7 +372,7 @@ fn solve_lower_t<T: FloatT>(m: usize, n: usize, l: &[T], ldl: usize, b: &mut [T]
 /// L⁻¹ of a lower triangular L by forward substitution (lower triangle),
 /// each entry one exact dot product; binary64 solves against the identity
 /// with TRSM.
-fn lower_inverse<T: FloatT>(n: usize, l: &[T], li: &mut [T]) {
+pub(super) fn lower_inverse<T: FloatT>(n: usize, l: &[T], li: &mut [T]) {
     if T::precision_bits() <= 53 {
         li.fill(T::zero());
         (0..n).for_each(|i| li[i + i * n] = T::one());
@@ -447,7 +447,7 @@ fn lower_inverse_rec<T: FloatT>(n: usize, l: &[T], ldl: usize, x: &mut [T], ldx:
 /// Inverse of a symmetric positive definite matrix from its lower factor:
 /// L⁻ᵀL⁻¹ (LAPACK's potri: a third of the products of solving against the
 /// identity), each entry one exact dot product of two columns of L⁻¹.
-fn spd_inverse<T: FloatT>(n: usize, l: &[T], out: &mut [T]) -> bool {
+pub(super) fn spd_inverse<T: FloatT>(n: usize, l: &[T], out: &mut [T]) -> bool {
     let mut li = zeros::<T>(n * n);
     lower_inverse(n, l, &mut li);
     if T::precision_bits() <= 53 {
@@ -489,7 +489,7 @@ fn spd_inverse<T: FloatT>(n: usize, l: &[T], out: &mut [T]) -> bool {
     out.iter().all(|v| v.is_finite())
 }
 
-fn symmetrize<T: FloatT>(n: usize, a: &mut [T]) {
+pub(super) fn symmetrize<T: FloatT>(n: usize, a: &mut [T]) {
     // Item k owns the pairs whose larger index lies in its block of W.
     const W: usize = 16;
     let half: T = (0.5).as_T();
@@ -511,7 +511,7 @@ fn symmetrize<T: FloatT>(n: usize, a: &mut [T]) {
 }
 
 /// Symmetric eigendecomposition (ascending), vectors in `u`.
-fn sym_eig<T: FloatT>(n: usize, a: &mut [T], w: &mut [T], u: &mut [T]) -> bool {
+pub(super) fn sym_eig<T: FloatT>(n: usize, a: &mut [T], w: &mut [T], u: &mut [T]) -> bool {
     let ni = n as i32;
     let (mut m, mut info) = (0, 0);
     let mut isuppz = vec![0i32; 2 * n.max(1)];
@@ -574,7 +574,7 @@ fn sym_eig<T: FloatT>(n: usize, a: &mut [T], w: &mut [T], u: &mut [T]) -> bool {
     info == 0 && m == ni
 }
 
-fn smat<T: FloatT>(n: usize, x: &[T], out: &mut [T]) {
+pub(super) fn smat<T: FloatT>(n: usize, x: &[T], out: &mut [T]) {
     let r = T::FRAC_1_SQRT_2();
     for j in 0..n {
         for i in 0..j {
@@ -586,7 +586,7 @@ fn smat<T: FloatT>(n: usize, x: &[T], out: &mut [T]) {
     }
 }
 
-fn svec<T: FloatT>(n: usize, a: &[T], out: &mut [T]) {
+pub(super) fn svec<T: FloatT>(n: usize, a: &[T], out: &mut [T]) {
     let r = T::FRAC_1_SQRT_2();
     for j in 0..n {
         for i in 0..j {
@@ -597,7 +597,14 @@ fn svec<T: FloatT>(n: usize, a: &[T], out: &mut [T]) {
 }
 
 /// `out = Bᵀ·M·B` (`left_t`) or `B·M·Bᵀ`, through `tmp`.
-fn congruence<T: FloatT>(n: usize, b: &[T], m: &[T], left_t: bool, tmp: &mut [T], out: &mut [T]) {
+pub(super) fn congruence<T: FloatT>(
+    n: usize,
+    b: &[T],
+    m: &[T],
+    left_t: bool,
+    tmp: &mut [T],
+    out: &mut [T],
+) {
     if left_t {
         gemm(false, false, n, m, b, tmp); // M B
         gemm(true, false, n, b, tmp, out); // Bᵀ M B
@@ -639,7 +646,7 @@ fn mul_unit<T: FloatT>(
 }
 
 /// Sum of rᵏ/(2k+1), k ≥ 0, i.e. atanh(r)/r, for |r| ≤ 1/8.
-fn atanh_ratio<T: FloatT>(r: T) -> T {
+pub(super) fn atanh_ratio<T: FloatT>(r: T) -> T {
     let r2 = r * r;
     let (mut term, mut sum) = (T::one(), T::one());
     let eps = T::epsilon();
@@ -706,17 +713,38 @@ fn divided2<T: FloatT>(v: [T; 3], d1: impl Fn(usize, usize) -> T) -> T {
     sum / (m * m)
 }
 
+/// The first divided differences g⁽¹⁾ of g = −log at λ (logarithms `ln`,
+/// values `g`) and c = (gᵢ+gⱼ)/2 − g⁽¹⁾ᵢⱼ(λᵢ+λⱼ)/2 (n×n).
+fn first_kernels<T: FloatT>(lam: &[T], ln: &[T], g: &[T]) -> (Vec<T>, Vec<T>) {
+    let n = lam.len();
+    let half: T = (0.5).as_T();
+    let mut d1 = vec![T::zero(); n * n];
+    let mut c = vec![T::zero(); n * n];
+    for j in 0..n {
+        for i in 0..n {
+            let v = if i == j {
+                -lam[i].recip()
+            } else {
+                divided1(lam[i], lam[j], ln[i], ln[j])
+            };
+            d1[i + j * n] = v;
+            c[i + j * n] = half * (g[i] + g[j]) - half * v * (lam[i] + lam[j]);
+        }
+    }
+    (d1, c)
+}
+
 /// Barrier oracle at an interior point, in the generalized eigenbasis.
 #[derive(Clone)]
 pub(crate) struct Oracle<T> {
     n: usize,
     q: Vec<T>,
     p: Vec<T>,
-    lam: Vec<T>,
+    pub(super) lam: Vec<T>,
     g: Vec<T>,
     /// g⁽¹⁾ (n×n) and c = (gᵢ+gⱼ)/2 − g⁽¹⁾ᵢⱼ(λᵢ+λⱼ)/2, the X-part of DD.
-    d1: Vec<T>,
-    c: Vec<T>,
+    pub(super) d1: Vec<T>,
+    pub(super) c: Vec<T>,
     /// g⁽²⁾ (n×n×n), built on demand for Hessian products, with the
     /// point's constant Schur operands V = g⁽¹⁾∘W, A = ΛV + VΛ and
     /// A2 = GW + WG (n×n each).
@@ -780,20 +808,7 @@ impl<T: FloatT> Oracle<T> {
         if !spd_inverse(n, &lz, &mut w) {
             return None;
         }
-        let half: T = (0.5).as_T();
-        let mut d1 = vec![T::zero(); nn];
-        let mut c = vec![T::zero(); nn];
-        for j in 0..n {
-            for i in 0..n {
-                let v = if i == j {
-                    -lam[i].recip()
-                } else {
-                    divided1(lam[i], lam[j], ln[i], ln[j])
-                };
-                d1[i + j * n] = v;
-                c[i + j * n] = half * (g[i] + g[j]) - half * v * (lam[i] + lam[j]);
-            }
-        }
+        let (d1, c) = first_kernels(&lam, &ln, &g);
         let two = T::one() + T::one();
         let mut logdet_z = T::zero();
         let mut logdet_x = T::zero();
@@ -821,7 +836,31 @@ impl<T: FloatT> Oracle<T> {
         })
     }
 
-    fn ensure_d2(&mut self) {
+    /// The eigenbasis kernels of λ and W alone, for the products of S₀ (the
+    /// limit cone's VV block, `oprelentrlimitcone`).
+    pub(super) fn eigen_part(lam: Vec<T>, w: Vec<T>) -> Self {
+        let ln: Vec<T> = lam.iter().map(|&l| l.ln()).collect();
+        let g: Vec<T> = ln.iter().map(|&l| -l).collect();
+        let (d1, c) = first_kernels(&lam, &ln, &g);
+        Self {
+            n: lam.len(),
+            q: Vec::new(),
+            p: Vec::new(),
+            lam,
+            g,
+            d1,
+            c,
+            d2: Vec::new(),
+            vaa: Vec::new(),
+            s0l: None,
+            zh: Vec::new(),
+            lz: Vec::new(),
+            w,
+            barrier: T::zero(),
+        }
+    }
+
+    pub(super) fn ensure_d2(&mut self) {
         let n = self.n;
         if !self.d2.is_empty() {
             return;
@@ -902,7 +941,7 @@ impl<T: FloatT> Oracle<T> {
     /// term then vanishes outside rows and columns p, q, so only those
     /// entries are formed, O(n) instead of O(n³).
     #[allow(clippy::too_many_arguments)]
-    fn schur_apply(
+    pub(super) fn schur_apply(
         &self,
         h: &[T],
         k: &[T],
@@ -1065,6 +1104,15 @@ impl<T: FloatT> Oracle<T> {
 
     /// Lower Cholesky factor of S₀ (column-major, size 2m).
     fn schur_factor(&mut self) -> Option<Vec<T>> {
+        let mut s0 = self.schur_matrix();
+        let timer = crate::receipt::start();
+        let ok = cholesky(2 * triangular_number(self.n), &mut s0);
+        crate::receipt::finish("ore.schur_cholesky", timer);
+        ok.then_some(s0)
+    }
+
+    /// S₀ (column-major, size 2m) from its unit columns.
+    pub(super) fn schur_matrix(&mut self) -> Vec<T> {
         self.ensure_d2();
         let n = self.n;
         let m = n * (n + 1) / 2;
@@ -1099,10 +1147,7 @@ impl<T: FloatT> Oracle<T> {
             }
         });
         symmetrize(m2, &mut s0);
-        let timer = crate::receipt::start();
-        let ok = cholesky(m2, &mut s0);
-        crate::receipt::finish("ore.schur_cholesky", timer);
-        ok.then_some(s0)
+        s0
     }
 
     /// ⟨z, (∇²f)⁻¹z⟩ = t + vᵀS₀⁻¹v with t = tr(ẐR̂ẐR̂) = ‖LzᵀR̂Lz‖²,
@@ -1326,7 +1371,7 @@ impl<T: FloatT> Oracle<T> {
 }
 
 /// Largest α ≤ αmax, backtracking by `step`, with `ok(α)`; 0 below αmin.
-fn search<T: FloatT>(αmax: T, αmin: T, step: T, mut ok: impl FnMut(T) -> bool) -> T {
+pub(super) fn search<T: FloatT>(αmax: T, αmin: T, step: T, mut ok: impl FnMut(T) -> bool) -> T {
     let mut α = αmax;
     while α > αmin && !ok(α) {
         α *= step;
@@ -1339,7 +1384,7 @@ fn search<T: FloatT>(αmax: T, αmin: T, step: T, mut ok: impl FnMut(T) -> bool)
 }
 
 /// Scalar central point refined by Newton's method at the working precision.
-fn central_point<T: FloatT>() -> [T; 3] {
+pub(super) fn central_point<T: FloatT>() -> [T; 3] {
     let mut p: [T; 3] = [CENTRAL[0].as_T(), CENTRAL[1].as_T(), CENTRAL[2].as_T()];
     for _ in 0..12 {
         let [t, x, y] = p;
