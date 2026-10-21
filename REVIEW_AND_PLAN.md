@@ -242,13 +242,17 @@ Ranked by the Amdahl-bounded gain on the goal workloads per unit of effort (jour
     - BFSS L11u, 256 bits, 25 iterations, bitwise identical to c80da23: T=32 −23.0% (node7), T=64 −27.6% (node61). Scale cones at T=64 4.91 → 2.00 s/it; the refactor −23%; RSS +5.6% at T=64.
     - Gates: the 128-bit full run reproduces InsufficientProgress/107 bitwise; 512 bits and L10 bitwise; csdr3 identical.
     - Open: at T=64 the n = 38 cone (1.9 s/it) is GEMM compute plus helpers shared with the n = 34 cones; the base-case dot kernels add 0.28 s.
-    - Review of 18b84c5 (2026-10-20). Two defects, both in `rns_blas::gemm`; neither changes the bits. Both fixes are assigned to branch rns-gemm-x86.
+    - Review of 18b84c5 (2026-10-20). Two defects, both in `rns_blas::gemm`; neither changes the bits. Both are fixed in 036585c (RNS-X86, merged 2026-10-21).
       - The panel-fill prime groups bypass `GROUP_SCRATCH_BYTES`. On tall packed operands this means up to 16 primes of streamed scratch, for example the distributed border product at T=64: about 3.4 → 5.8 GB per call.
       - `prod` moved from `take_scratch` to `take_zeroed`, which zeroes a reused buffer again even though `prime_columns` writes every entry. This undoes L56.
   - ORE-DIAG (diagnosis 2026-10-21; journal 2026-10-21). The ORE cone's barrier, derivatives, S₀, dual test and corrector are correct (256-bit check against an independent D). On BFSS L11u:
     - The k = 1 (n = 38) cone's Dikin dual certificate caps the affine step at a median 0.136 (≈ √(2/ν)) in 91 of 107 iterations, so σ ≈ 0.64 and the solve needs 107 iterations.
     - The stall is an unattained optimum along (0, W, W) KMS directions: |x| 1e9, dual above primal through x·(q + Aᵀz).
     - Open (changes iterates): σ from an uncapped step, a Newton conjugate-barrier dual certificate, or primal–dual ORE scaling.
+  - BFSS-MERGE (2026-10-21; journal 2026-10-21). ORE-STEP (74da6d7), RNS-X86 (036585c) and EXACTDOT-X86 (c64f2a4, aec492a) are merged into bfss-threads (2539893). Every gate is bitwise: 128-bit full run, 512 bits, L10, ising11 and csdr3.
+    - BFSS L11u, 256 bits, 25 iterations, node180, against 66e64b7: T=8 −34.2%, T=16 −40.1% (21.82 → 12.91 s/it), T=32 −45.2%, T=64 −45.6%.
+    - 128-bit full run: 1411.7 → 928.9 s. Peak RSS +12% at T=64 and +20% on the 128-bit full run (not attributed).
+    - Known failure LANE-HANG: an intermittent arrow leaf-lane deadlock from c80da23 on L10/128 at T=16 (node55 hung in 2 of 2 runs, node181 in 0 of 5). The proposed start-barrier fix 61fcd50 is not yet verified or merged.
 
 1. **Resampled Ising inputs (task 17).**
    - Fix the default-start τ chase without regressing old inputs or gravity256.

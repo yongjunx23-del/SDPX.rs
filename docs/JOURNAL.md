@@ -8,6 +8,62 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-21 — BFSS L11u: ORE step trials, x86 residue encode and x86 exact dots merged; combined gates and scaling (kept, bfss-threads)
+
+- Merged into bfss-threads (tbX = 2539893). Each branch was bitwise on its own gates:
+  - ORE-STEP (bfss-ore-step, 74da6d7):
+    - Heavy ORE cones split their step trials' S₀ preconditioner row dots and Γ into pieces, and run batched dual trials under the inner-parallel gate. Light cones keep their serial loops.
+    - Branch ABBA (node55, 256 bits, T=16, 25 iterations, against 18b84c5): 436.8 → 414.5 s (−5.1%); steps 2.32 → 1.37 s/it.
+    - Rejected: round-based step folds (−0.3% net).
+  - RNS-X86 (claude/rns-gemm-x86-67122e, 036585c):
+    - Chunk matrices are stored in 32-entry panels, and residues come from a register panel kernel (AVX2). One encoder serves Chunks, Packed and Cached operands. Narrow cached residues are stored planar (u16 + i8).
+    - Includes both review fixes to 18b84c5: panel-fill prime groups stay within `GROUP_SCRATCH_BYTES`, and the product buffer is zeroed only when it grows.
+    - Branch ABBA (node27, release): T=16 404.0 → 382.1 s (−5.4%); T=64 270.2 → 263.1 s (−2.6%); RSS within ±1%.
+    - Rejected: capping the fill by threads (+6% at T=64); OpenBLAS dgemm for the prime products (+5% at T=16, +12% at T=64); 256-column upper strips (no change).
+  - EXACTDOT-X86 (claude/exactdot-x86-923cfc, c64f2a4 and aec492a):
+    - `dot_slices` first tries a fixed window, so there is no exponent scan and one carry chain. A non-finite or out-of-window term falls back to the two-pass kernel.
+    - With BMI2 and ADX (runtime detection), 2- and 4-limb products use mulx/adcx/adox, and products of 8 to 16 limbs add as 4×4 blocks through the fused shift-and-adc chain.
+    - EPYC 7742 factor leaf, ns/term: 128 bits 11.2 → 6.9; 256 bits 24.0 → 13.9; 512 bits 59.4 → 46.6; 768 bits 106 → 95; 1024 bits 169 → 168.
+    - Rejected: a separate shift pass (2–7% slower in block runs).
+- Gates on tbX. Each is bitwise identical in x, s, z, status, iterations and objectives:
+  - Local (Mac, fast profile): ising11 Solved/54 and csdr3 Solved/36; audits pass; points identical to the branch arms.
+  - 128 bits, full run (node10, T=16): InsufficientProgress/107, primal 7.046089322701808, dual 7.05180711602981, identical to f128N.
+    - Time 1411.7 → 928.9 s (−34.2%).
+    - Peak RSS 10.7 → 12.9 GiB (+19.8%), not attributed yet.
+  - 512 bits, 10 iterations (node55, T=16): identical to tbN. 395.1 → 282.2 s (−28.6%); RSS 17.2 → 18.5 GiB (+7.6%).
+  - L10 (node181, 128 bits, T=16; tbX ×3 and tbN ×2 interleaved): Solved/198, identical to the abl10N reference. Medians 105.2 → 100.8 s (−4.2%).
+- Scaling (scX, node180):
+  - 256 bits, 25 iterations, one sequential run per cell.
+  - tb0 = 66e64b7, tbN = c80da23. Every run is identical to tb0.
+  - Rows are s (s/it):
+
+  | T | tb0 | tbN | tbX | tbX vs tb0 | tbX vs tbN |
+  |---|---|---|---|---|---|
+  | 8 | 716.5 (28.73) | 690.8 (27.79) | 471.7 (18.83) | −34.2% | −31.7% |
+  | 16 | 545.0 (21.82) | 502.5 (19.98) | 326.2 (12.91) | −40.1% | −35.1% |
+  | 32 | 445.1 (17.98) | 387.9 (15.28) | 244.0 (9.75) | −45.2% | −37.1% |
+  | 64 | 423.7 (17.21) | 375.9 (14.90) | 230.6 (9.16) | −45.6% | −38.7% |
+
+  - From 8 to 64 threads, tb0 speeds up 1.69× and tbX 2.05×. At T=64, CPU use is 3609% for tb0 and 4345% for tbX.
+  - Peak RSS, tb0 → tbX (GiB): T=8 12.4 → 11.0; T=16 14.2 → 13.0; T=32 16.1 → 17.0; T=64 21.0 → 23.6.
+- Phases (receipts; wall s over 25 iterations; tb0 → tbX):
+  - T=16: solve 541.9 → 323.3.
+    - KKT update 353.2 → 210.4. The refactor fell 285.5 → 159.7: leaves 204.1 → 149.7, the separate contribution phase 70.7 → 2.9.
+    - Scale cones 110.7 → 61.4.
+    - Affine step 34.3 → 19.1; final step 23.3 → 11.9.
+    - KKT solve 12.7 → 12.7; combined rhs 7.2 → 7.2.
+  - T=64: solve 420.6 → 227.4. KKT update 220.0 → 129.9; scale cones 119.3 → 46.1; affine step 36.9 → 19.5; final step 25.5 → 13.1.
+- Known failure LANE-HANG (open; from c80da23, also in tbX): an intermittent deadlock in the arrow leaf lanes on L10/128 at T=16.
+  - Observed:
+    - node55 hung in 2 of 2 runs: tbN after iteration 10, tbX after iteration 142.
+    - node181 hung in 0 of 5 runs, on identical hardware.
+    - The main thread waits on a LockLatch in the `ArrowLDLSolver` factor, while the `factor_arrows` broadcast lanes spin. Two workers sleep in a rayon join under `Leaf::refactor`'s `par_chunks_mut`.
+    - Stacks: hpc `~/projects/sdpx-bfss-threads-20261019/runs/abl10X-227791.node220/hang/`. Earlier cases: `~/projects/sdpx-rns-gemm-20261020/runs/hang-227422`, `hang2-227431`.
+  - Hypothesis (two sessions agree on it; not verified here): a worker steals a leaf's join half before it takes its broadcast job, and a nested join then runs its lane above that half.
+  - Proposed fix: a start barrier in `arrow.rs`, 61fcd50 (duplicate 3d1b3ab). Not merged.
+- Cluster: on 2026-10-21 the normal queue would not start jobs (227789 failed to start 25 times), so these jobs ran in the sugon queue.
+- Decision: kept.
+
 ## 2026-10-21 — ORE cone: derivation verified; BFSS L11u slowness and stall explained (diagnosis, bfss-threads)
 
 - Question: is the operator relative entropy cone derived wrongly, given the poor BFSS results (L11u InsufficientProgress/107 with the dual 5.7e-3 above the primal; L10 198 iterations)?
