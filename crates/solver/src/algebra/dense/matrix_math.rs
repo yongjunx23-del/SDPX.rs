@@ -329,6 +329,11 @@ where
 {
     let (m, n, k) = (a.nrows(), b.ncols(), a.ncols());
     debug_assert!(m == n && T::precision_bits() <= 64);
+    if n == 0 {
+        // No entries; BLAS rejects the leading dimensions 0 an empty panel
+        // would pass (Accelerate exits the process).
+        return;
+    }
     let (ta, tb) = (a.shape().as_blas_char(), b.shape().as_blas_char());
     let lda = if a.shape() == MatrixShape::N { m } else { k };
     let ldb = if b.shape() == MatrixShape::N { k } else { n };
