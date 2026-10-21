@@ -476,7 +476,10 @@ fn join_if<RA: Send, RB: Send>(
             *rb.lock().unwrap() = b.lock().unwrap().take().map(|f| f());
         }
     });
-    (ra.into_inner().unwrap().unwrap(), rb.into_inner().unwrap().unwrap())
+    (
+        ra.into_inner().unwrap().unwrap(),
+        rb.into_inner().unwrap().unwrap(),
+    )
 }
 
 /// Unpivoted dense LDLᵀ with the same per-pivot dynamic regularization
@@ -1144,7 +1147,8 @@ impl<T: FloatT> Leaf<T> {
         let posted = sdpx_arithmetic::inner_parallel::board::offered() && {
             use sdpx_arithmetic::inner_parallel as ip;
             let columns = self.coupled.len();
-            let work = ip::weight(T::precision_bits() as usize) * (width * width / 2 * columns) as u128;
+            let work =
+                ip::weight(T::precision_bits() as usize) * (width * width / 2 * columns) as u128;
             ip::tasks_if(true, work, columns) > 1
         };
         if split && width > 0 && posted {
@@ -2245,7 +2249,10 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     /// positions do not fit the compact plan.
     fn value_plan(&self, index: &[usize]) -> Option<ValuePlan> {
         if index.len() > u32::MAX as usize
-            || self.leaves.iter().any(|l| l.ids.len().pow(2) > u32::MAX as usize)
+            || self
+                .leaves
+                .iter()
+                .any(|l| l.ids.len().pow(2) > u32::MAX as usize)
         {
             return None;
         }
@@ -2452,9 +2459,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             let mut admitted = vec![false; owned.len()];
             if self.local_structure.is_none() {
                 let leaves = &self.leaves[owned.clone()];
-                let mut eligible: Vec<usize> =
-                    (0..leaves.len()).filter(|&k| residue_contribution(&leaves[k], t)).collect();
-                eligible.sort_by(|&a, &b| product_work(&leaves[b]).total_cmp(&product_work(&leaves[a])));
+                let mut eligible: Vec<usize> = (0..leaves.len())
+                    .filter(|&k| residue_contribution(&leaves[k], t))
+                    .collect();
+                eligible.sort_by(|&a, &b| {
+                    product_work(&leaves[b]).total_cmp(&product_work(&leaves[a]))
+                });
                 let mut bytes = 0;
                 for k in eligible {
                     bytes += contribution_bytes(&leaves[k]);
@@ -2512,8 +2522,10 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 // their split work on the board, where lanes out of leaves help
                 // until every leaf is done: a poster never waits in a join.
                 let cost = |l: &Leaf<T>| (l.ids.len() as f64).powi(3) + product_work(l);
-                let mut order: Vec<(&mut Leaf<T>, bool)> =
-                    self.leaves[owned.clone()].iter_mut().zip(admitted).collect();
+                let mut order: Vec<(&mut Leaf<T>, bool)> = self.leaves[owned.clone()]
+                    .iter_mut()
+                    .zip(admitted)
+                    .collect();
                 order.sort_by(|a, b| cost(b.0).total_cmp(&cost(a.0)));
                 let order: Vec<(std::sync::Mutex<&mut Leaf<T>>, bool)> = order
                     .into_iter()
@@ -2557,7 +2569,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         }
                         finished.fetch_add(1, Ordering::Release);
                     }
-                    while finished.load(Ordering::Acquire) < order.len() && !failed.load(Ordering::Relaxed) {
+                    while finished.load(Ordering::Acquire) < order.len()
+                        && !failed.load(Ordering::Relaxed)
+                    {
                         if sdpx_arithmetic::inner_parallel::board::help() {
                             continue;
                         }
@@ -2596,7 +2610,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             self.assemble_local_schur();
         } else {
             let timer = crate::receipt::start();
-            subtract_contributions(&mut self.leaves[owned], &mut self.s, t, self.pool.as_deref());
+            subtract_contributions(
+                &mut self.leaves[owned],
+                &mut self.s,
+                t,
+                self.pool.as_deref(),
+            );
             for j in 0..t {
                 for i in 0..j {
                     self.s[j + i * t] = self.s[i + j * t];

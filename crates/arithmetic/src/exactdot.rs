@@ -1360,7 +1360,11 @@ mod tests {
                 run(&a, &mixed, false),
                 "N={N} mixed {shifts}"
             );
-            assert_eq!(slices(&a, &mixed), run(&a, &mixed, false), "N={N} mixed {shifts}");
+            assert_eq!(
+                slices(&a, &mixed),
+                run(&a, &mixed, false),
+                "N={N} mixed {shifts}"
+            );
         }
     }
 
