@@ -1925,7 +1925,8 @@ where
         let mut αz = T::zero();
         while α > αmin {
             if α >= αs || ways == 1 {
-                let _inner = split.then(sdpx_arithmetic::inner_parallel::Guard::enter);
+                let _inner = (split && rayon::current_thread_index().is_some())
+                    .then(sdpx_arithmetic::inner_parallel::Guard::enter);
                 wz.waxpby(T::one(), z, α, dz);
                 let a = α.min(αs);
                 if at.as_ref().is_none_or(|(b, _)| *b != a) {
