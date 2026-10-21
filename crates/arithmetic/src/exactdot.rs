@@ -126,6 +126,9 @@ pub(crate) fn dot_slices<'a, const N: usize>(
     if N > MAX_N {
         return chain(&mut a.iter().zip(b));
     }
+    if let Some(v) = window_dot(a, b) {
+        return v;
+    }
     let regular = |k: i32| k.abs() == mpfr::REGULAR_KIND;
     let zero = |k: i32| k.abs() == mpfr::ZERO_KIND;
     let (mut emin, mut emax, mut finite) = (i64::MAX, i64::MIN, true);
@@ -169,6 +172,399 @@ pub(crate) fn dot_slices<'a, const N: usize>(
         }
     });
     exact.unwrap_or_else(|| dot(a.iter().zip(b), chain))
+}
+
+/// Exponent-sum reach, in limbs, of [`window_dot`] on each side of a dot's
+/// first nonzero term. BFSS arrow-leaf dots span under 16 limbs; a wider
+/// dot takes the scanned two-pass path.
+const WINDOW: usize = 16;
+
+/// [`dot_slices`] in one pass, without the exponent scan: bit 0 of the
+/// limb accumulators weighs 2^(e0 - 64·WINDOW - 2P) for the first nonzero
+/// term's exponent sum e0, and each product adds by one carry chain. The
+/// sum is the same exact integer at another alignment, so the value is
+/// that of the scanned path. `None` when a term is non-finite or lands
+/// more than `WINDOW` limbs from e0.
+fn window_dot<const N: usize>(a: &[MpFloat<N>], b: &[MpFloat<N>]) -> Option<MpFloat<N>> {
+    // Kinds are 0 (NaN), ±1 (inf), ±2 (zero) and ±3 (regular), signed by
+    // the value. The product of two kinds has the product's sign, and its
+    // square is 81 for regular factors, 16 or 36 for an exact zero of finite
+    // factors and below 16 when a factor is NaN or infinite (no sign to
+    // branch on).
+    const BOTH: i32 = (mpfr::REGULAR_KIND * mpfr::REGULAR_KIND).pow(2);
+    const FINITE: i32 = (mpfr::ZERO_KIND * mpfr::ZERO_KIND).pow(2);
+    let class = |x: &MpFloat<N>, y: &MpFloat<N>| (x.kind * y.kind).pow(2);
+    let Some(first) = a.iter().zip(b).position(|(x, y)| {
+        let k = class(x, y);
+        k == BOTH || k < FINITE
+    }) else {
+        // Every product is an exact zero.
+        return Some(MpFloat::<N>::default());
+    };
+    let (x, y) = (&a[first], &b[first]);
+    if class(x, y) != BOTH {
+        return None;
+    }
+    let base = x.exponent as i64 + y.exponent as i64 - 64 * WINDOW as i64;
+    // The farthest term ends at limb 2·WINDOW + 2N + 1; one limb more holds
+    // the carries of up to 2^64 terms.
+    let len = 2 * WINDOW + 2 * N + 3;
+    #[cfg(target_arch = "x86_64")]
+    let fast = x86::fast();
+    with_window::<N, _>(|acc| {
+        let (pos, neg) = acc.split_at_mut(len);
+        let neg = &mut neg[..len];
+        let accs = [pos.as_mut_ptr(), neg.as_mut_ptr()];
+        for (x, y) in a[first..].iter().zip(&b[first..]) {
+            let kind = x.kind * y.kind;
+            if kind * kind != BOTH {
+                if kind * kind < FINITE {
+                    return None;
+                }
+                continue;
+            }
+            let offset = (x.exponent as i64 + y.exponent as i64 - base) as u64;
+            if offset > 128 * WINDOW as u64 {
+                return None;
+            }
+            // SAFETY: the term ends at limb offset/64 + 2N + 1 < len - 1.
+            unsafe {
+                let dst = accs[(kind < 0) as usize].add((offset / 64) as usize);
+                let shift = (offset % 64) as u32;
+                #[cfg(target_arch = "x86_64")]
+                if fast {
+                    x86::add_term::<N>(dst, &x.limbs, &y.limbs, shift);
+                    continue;
+                }
+                let mut prod = [0u64; 2 * MAX_N];
+                mul_limbs::<N>(&x.limbs, &y.limbs, &mut prod[..2 * N]);
+                add_chain(dst, &prod[..2 * N], shift);
+            }
+        }
+        round_acc(pos, neg, len, base)
+    })
+}
+
+/// Run `f` on a zeroed scratch of at least two [`window_dot`] accumulators
+/// sized to `N`.
+#[inline(always)]
+fn with_window<const N: usize, R>(f: impl FnOnce(&mut [u64]) -> R) -> R {
+    const W: usize = 2 * WINDOW + 3;
+    if N <= 4 {
+        f(&mut [0u64; 2 * (W + 8)])
+    } else if N <= 8 {
+        f(&mut [0u64; 2 * (W + 16)])
+    } else if N <= 16 {
+        f(&mut [0u64; 2 * (W + 32)])
+    } else {
+        f(&mut [0u64; 2 * (W + 2 * MAX_N)])
+    }
+}
+
+/// `dst[0..] += limbs << shift` for `shift < 64`: one carry chain over
+/// `limbs.len() + 1` limbs, then the carry onward.
+///
+/// # Safety
+/// `dst` addresses limbs that hold the carried sum.
+#[inline(always)]
+unsafe fn add_chain(dst: *mut u64, limbs: &[u64], shift: u32) {
+    let (mut below, mut c) = (0u64, false);
+    for (t, &l) in limbs.iter().enumerate() {
+        let piece = (l << shift) | ((below >> 1) >> (63 - shift));
+        (*dst.add(t), c) = adc(*dst.add(t), piece, c);
+        below = l;
+    }
+    let mut t = limbs.len();
+    (*dst.add(t), c) = adc(*dst.add(t), (below >> 1) >> (63 - shift), c);
+    while c {
+        t += 1;
+        (*dst.add(t), c) = (*dst.add(t)).overflowing_add(1);
+    }
+}
+
+/// [`window_dot`] terms with BMI2 and ADX (Zen 2 and later; Intel since
+/// Broadwell): `mulx` runs at one per cycle on Zen 2 where `mul` takes 1.7,
+/// two carry chains (`adcx`/`adox`) form the product, `shlx`/`shrx` shift it
+/// (the compiler's `shld` is microcoded on Zen), and the shifted product
+/// adds to memory as one `adc` chain; wider products add as 4x4 blocks.
+/// EPYC 7742, dump2223 factor leaf, ns per term against the portable
+/// two-pass kernel: 2 limbs 11.2 -> 6.9, 4 limbs 24.0 -> 13.9, 8 limbs
+/// 59.4 -> 46.6, 12 limbs 106 -> 95, 16 limbs 169 -> 168.
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use std::arch::asm;
+
+    pub(super) fn fast() -> bool {
+        std::is_x86_feature_detected!("bmi2") && std::is_x86_feature_detected!("adx")
+    }
+
+    /// `dst[0..] += (a * b) << shift` for `shift < 64`.
+    ///
+    /// # Safety
+    /// The CPU has BMI2 and ADX; `dst` addresses limbs that hold the
+    /// carried sum.
+    #[inline(always)]
+    pub(super) unsafe fn add_term<const N: usize>(
+        dst: *mut u64,
+        a: &[u64; N],
+        b: &[u64; N],
+        shift: u32,
+    ) {
+        let (a, b) = (a.as_ptr(), b.as_ptr());
+        if N == 2 {
+            chain(dst, mul2(a, b), shift);
+        } else if N % 4 == 0 {
+            // 4-limb blocks add at their own offsets, so the full product is
+            // never stored.
+            for i in (0..N).step_by(4) {
+                for j in (0..N).step_by(4) {
+                    chain(dst.add(i + j), mul4(a.add(i), b.add(j)), shift);
+                }
+            }
+        } else {
+            let mut prod = [0u64; 2 * super::MAX_N];
+            super::mpn_mul_n::<N>(prod.as_mut_ptr(), a, b);
+            chain_limbs(dst, &prod[..2 * N], shift);
+        }
+    }
+
+    /// `a * b` for 2-limb `a` and `b`.
+    #[inline(always)]
+    unsafe fn mul2(a: *const u64, b: *const u64) -> [u64; 4] {
+        let mut p = [0u64; 4];
+        asm!(
+            "mov rdx, [{a}]",
+            "mulx {p1}, {p0}, [{b}]",
+            "mulx {p2}, {t}, [{b} + 8]",
+            "add {p1}, {t}",
+            "adc {p2}, 0",
+            "mov rdx, [{a} + 8]",
+            "mulx {u}, {t}, [{b}]",
+            "mulx {p3}, {a}, [{b} + 8]",
+            "add {u}, {a}",
+            "adc {p3}, 0",
+            "add {p1}, {t}",
+            "adc {p2}, {u}",
+            "adc {p3}, 0",
+            a = inout(reg) a => _,
+            b = in(reg) b,
+            p0 = out(reg) p[0], p1 = out(reg) p[1], p2 = out(reg) p[2], p3 = out(reg) p[3],
+            t = out(reg) _,
+            u = out(reg) _,
+            out("rdx") _,
+            options(pure, readonly, nostack),
+        );
+        p
+    }
+
+    /// `a * b` for 4-limb `a` and `b`: row 0 by one chain, rows 1-3 adding
+    /// low halves by `adcx` and high halves by `adox`.
+    #[inline(always)]
+    unsafe fn mul4(a: *const u64, b: *const u64) -> [u64; 8] {
+        let mut r = [0u64; 8];
+        asm!(
+            "mov rdx, [{a}]",
+            "mulx {r1}, {r0}, [{b}]",
+            "mulx {r2}, {l}, [{b} + 8]",
+            "add {r1}, {l}",
+            "mulx {r3}, {l}, [{b} + 16]",
+            "adc {r2}, {l}",
+            "mulx {r4}, {l}, [{b} + 24]",
+            "adc {r3}, {l}",
+            "adc {r4}, 0",
+            "mov rdx, [{a} + 8]",
+            "xor {r5:e}, {r5:e}",
+            "mulx {h}, {l}, [{b}]",
+            "adcx {r1}, {l}",
+            "adox {r2}, {h}",
+            "mulx {h}, {l}, [{b} + 8]",
+            "adcx {r2}, {l}",
+            "adox {r3}, {h}",
+            "mulx {h}, {l}, [{b} + 16]",
+            "adcx {r3}, {l}",
+            "adox {r4}, {h}",
+            "mulx {h}, {l}, [{b} + 24]",
+            "adcx {r4}, {l}",
+            "adox {r5}, {h}",
+            "adc {r5}, 0",
+            "mov rdx, [{a} + 16]",
+            "xor {r6:e}, {r6:e}",
+            "mulx {h}, {l}, [{b}]",
+            "adcx {r2}, {l}",
+            "adox {r3}, {h}",
+            "mulx {h}, {l}, [{b} + 8]",
+            "adcx {r3}, {l}",
+            "adox {r4}, {h}",
+            "mulx {h}, {l}, [{b} + 16]",
+            "adcx {r4}, {l}",
+            "adox {r5}, {h}",
+            "mulx {h}, {l}, [{b} + 24]",
+            "adcx {r5}, {l}",
+            "adox {r6}, {h}",
+            "adc {r6}, 0",
+            "mov rdx, [{a} + 24]",
+            "xor {r7:e}, {r7:e}",
+            "mulx {h}, {l}, [{b}]",
+            "adcx {r3}, {l}",
+            "adox {r4}, {h}",
+            "mulx {h}, {l}, [{b} + 8]",
+            "adcx {r4}, {l}",
+            "adox {r5}, {h}",
+            "mulx {h}, {l}, [{b} + 16]",
+            "adcx {r5}, {l}",
+            "adox {r6}, {h}",
+            "mulx {h}, {l}, [{b} + 24]",
+            "adcx {r6}, {l}",
+            "adox {r7}, {h}",
+            "adc {r7}, 0",
+            a = in(reg) a,
+            b = in(reg) b,
+            r0 = out(reg) r[0], r1 = out(reg) r[1], r2 = out(reg) r[2], r3 = out(reg) r[3],
+            r4 = out(reg) r[4], r5 = out(reg) r[5], r6 = out(reg) r[6], r7 = out(reg) r[7],
+            l = out(reg) _,
+            h = out(reg) _,
+            out("rdx") _,
+            options(pure, readonly, nostack),
+        );
+        r
+    }
+
+    /// `dst[0..] += p << shift` for a 4- or 8-limb product held in
+    /// registers: flagless shifts (`lea` joins the pieces) feed one `adc`
+    /// chain over `M + 2` limbs, then the rare carry onward. A zero shift
+    /// (one term in 64) takes the portable chain.
+    #[inline(always)]
+    unsafe fn chain<const M: usize>(dst: *mut u64, p: [u64; M], shift: u32) {
+        if shift == 0 {
+            return super::add_chain(dst, &p, 0);
+        }
+        let (s, r) = (shift as u64, 64 - shift as u64);
+        if M == 4 {
+            asm!(
+                "shrx {t}, {p0}, {r}",
+                "shlx {p0}, {p0}, {s}",
+                "add [{d}], {p0}",
+                "shrx {u}, {p1}, {r}",
+                "shlx {p1}, {p1}, {s}",
+                "lea {p1}, [{p1} + {t}]",
+                "adc [{d} + 8], {p1}",
+                "shrx {t}, {p2}, {r}",
+                "shlx {p2}, {p2}, {s}",
+                "lea {p2}, [{p2} + {u}]",
+                "adc [{d} + 16], {p2}",
+                "shrx {u}, {p3}, {r}",
+                "shlx {p3}, {p3}, {s}",
+                "lea {p3}, [{p3} + {t}]",
+                "adc [{d} + 24], {p3}",
+                "adc [{d} + 32], {u}",
+                "adc qword ptr [{d} + 40], 0",
+                "jnc 3f",
+                "2:",
+                "lea {d}, [{d} + 8]",
+                "adc qword ptr [{d} + 40], 0",
+                "jc 2b",
+                "3:",
+                d = inout(reg) dst => _,
+                p0 = inout(reg) p[0] => _, p1 = inout(reg) p[1] => _,
+                p2 = inout(reg) p[2] => _, p3 = inout(reg) p[3] => _,
+                s = in(reg) s,
+                r = in(reg) r,
+                t = out(reg) _,
+                u = out(reg) _,
+                options(nostack),
+            );
+        } else {
+            asm!(
+                "shrx {t}, {p0}, {r}",
+                "shlx {p0}, {p0}, {s}",
+                "add [{d}], {p0}",
+                "shrx {u}, {p1}, {r}",
+                "shlx {p1}, {p1}, {s}",
+                "lea {p1}, [{p1} + {t}]",
+                "adc [{d} + 8], {p1}",
+                "shrx {t}, {p2}, {r}",
+                "shlx {p2}, {p2}, {s}",
+                "lea {p2}, [{p2} + {u}]",
+                "adc [{d} + 16], {p2}",
+                "shrx {u}, {p3}, {r}",
+                "shlx {p3}, {p3}, {s}",
+                "lea {p3}, [{p3} + {t}]",
+                "adc [{d} + 24], {p3}",
+                "shrx {t}, {p4}, {r}",
+                "shlx {p4}, {p4}, {s}",
+                "lea {p4}, [{p4} + {u}]",
+                "adc [{d} + 32], {p4}",
+                "shrx {u}, {p5}, {r}",
+                "shlx {p5}, {p5}, {s}",
+                "lea {p5}, [{p5} + {t}]",
+                "adc [{d} + 40], {p5}",
+                "shrx {t}, {p6}, {r}",
+                "shlx {p6}, {p6}, {s}",
+                "lea {p6}, [{p6} + {u}]",
+                "adc [{d} + 48], {p6}",
+                "shrx {u}, {p7}, {r}",
+                "shlx {p7}, {p7}, {s}",
+                "lea {p7}, [{p7} + {t}]",
+                "adc [{d} + 56], {p7}",
+                "adc [{d} + 64], {u}",
+                "adc qword ptr [{d} + 72], 0",
+                "jnc 3f",
+                "2:",
+                "lea {d}, [{d} + 8]",
+                "adc qword ptr [{d} + 72], 0",
+                "jc 2b",
+                "3:",
+                d = inout(reg) dst => _,
+                p0 = inout(reg) p[0] => _, p1 = inout(reg) p[1] => _,
+                p2 = inout(reg) p[2] => _, p3 = inout(reg) p[3] => _,
+                p4 = inout(reg) p[4] => _, p5 = inout(reg) p[5] => _,
+                p6 = inout(reg) p[6] => _, p7 = inout(reg) p[7] => _,
+                s = in(reg) s,
+                r = in(reg) r,
+                t = out(reg) _,
+                u = out(reg) _,
+                options(nostack),
+            );
+        }
+    }
+
+    /// `dst[0..] += p << shift` for any length: per limb one flagless shift
+    /// pair and one `adc` to memory (`lea` and `dec` keep the carry).
+    #[inline(always)]
+    unsafe fn chain_limbs(dst: *mut u64, p: &[u64], shift: u32) {
+        if shift == 0 {
+            return super::add_chain(dst, p, 0);
+        }
+        let (s, r) = (shift as u64, 64 - shift as u64);
+        asm!(
+            "xor {below:e}, {below:e}",
+            "2:",
+            "mov {x}, [{p}]",
+            "shrx {hi}, {x}, {r}",
+            "shlx {x}, {x}, {s}",
+            "lea {x}, [{x} + {below}]",
+            "mov {below}, {hi}",
+            "adc [{d}], {x}",
+            "lea {p}, [{p} + 8]",
+            "lea {d}, [{d} + 8]",
+            "dec {n}",
+            "jnz 2b",
+            "adc [{d}], {below}",
+            "3:",
+            "lea {d}, [{d} + 8]",
+            "adc qword ptr [{d}], 0",
+            "jc 3b",
+            d = inout(reg) dst => _,
+            p = inout(reg) p.as_ptr() => _,
+            n = inout(reg) p.len() => _,
+            s = in(reg) s,
+            r = in(reg) r,
+            x = out(reg) _,
+            hi = out(reg) _,
+            below = out(reg) _,
+            options(nostack),
+        );
+    }
 }
 
 /// Accumulator limbs for exponent sums in `[emin, emax]`, if supported.
@@ -619,7 +1015,6 @@ pub(crate) unsafe fn mpn_mul_n<const N: usize>(rp: *mut u64, up: *const u64, vp:
 }
 
 /// `a + b + c` and its carry.
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 #[inline(always)]
 fn adc(a: u64, b: u64, c: bool) -> (u64, bool) {
     let (s, o1) = a.overflowing_add(b);
@@ -944,11 +1339,15 @@ mod tests {
                 .map(|i| top.scale_pow2(-((i % shifts) as i64)))
                 .collect();
             let b = vec![top; a.len()];
+            let slices = |a: &[MpFloat<N>], b: &[MpFloat<N>]| {
+                super::dot_slices(a, b, |t| MpFloat::<N>::dot_fma_chain(t))
+            };
             assert_eq!(
                 run(&a, &b, true),
                 run(&a, &b, false),
                 "N={N} carry {shifts}"
             );
+            assert_eq!(slices(&a, &b), run(&a, &b, false), "N={N} slices {shifts}");
             let neg: Vec<_> = b.iter().map(|v| -*v).collect();
             let mixed: Vec<_> = b
                 .iter()
@@ -961,6 +1360,7 @@ mod tests {
                 run(&a, &mixed, false),
                 "N={N} mixed {shifts}"
             );
+            assert_eq!(slices(&a, &mixed), run(&a, &mixed, false), "N={N} mixed {shifts}");
         }
     }
 
@@ -970,6 +1370,8 @@ mod tests {
         inline_matches_gmp::<2>();
         inline_matches_gmp::<3>();
         inline_matches_gmp::<4>();
+        inline_matches_gmp::<8>();
+        inline_matches_gmp::<16>();
     }
 
     #[test]
