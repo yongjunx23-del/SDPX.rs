@@ -8,6 +8,613 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-21 — BFSS ORE: primal–dual (Dahl–Andersen) scaling probe (rejected, bfss-ore-pd)
+
+- Goal: test whether primal–dual ORE scaling removes the step cap that ORE-SIGMA (below) traced to the primal-scaled direction. MPFR 128 bits only.
+- Setup:
+  - Branch bfss-ore-pd from cb444d9: probe c147447 behind the scratch switch `SDPX_ORE_PD`, about 370 lines in `oprelentrcone.rs`.
+  - Revert 0586423; its crates tree equals cb444d9.
+- Probe:
+  - Shadow point x̃ = −∇f*(z) by damped Newton from ν/⟨s,z⟩·s, using S₀ factor solves: mean 5.2 steps, at most 13, never failing on L10.
+  - W = μ∇²f(s) plus the Dahl–Andersen rank-4 update (W s = z, W x̃ = −∇f(s); secant residuals 1e-38–1e-33). It is folded into the cone's dense eigen-coordinate block as Hs = N(D − B E⁻¹ Bᵀ)Nᵀ, so the KKT gets no new rows.
+  - Centering s − σμx̃. The dual bound comes from the Dikin ball at the last Newton iterate, OR-ed with the trial-s certificate.
+- Result (L10/128, Mac fast profile, T=8, same input and settings as the base):
+
+  | Variant | Status/it | Time | α_aff median | σ median | Audit |
+  |---|---|---|---|---|---|
+  | base | Solved/198 | 117.0 s | 0.168 | 0.576 | PASS (dual ratio 0.978, gap 8.7e-10) |
+  | PD | Solved/159 (−19.7%) | 140.0 s (+20%) | 0.244 | 0.432 | PASS (dual ratio 0.994, gap 8.5e-10) |
+
+  - Per iteration 0.59 → 0.88 s (+49%).
+  - Scale cones 4.1 → 18.0 s, from the shadow-point Newton (`ore.schur_cholesky` 1.9 → 11.8 s).
+  - The folded term fills the ORE leaves' T–XY block: refactor 6.3 → 11.4 s.
+  - The combined step is still capped by the dual certificates of the n = 7 and n = 14 cones.
+- Decision: rejected. The iteration drop is below the one-third bar that the added cost requires; the code is reverted.
+- Not tried (each a new probe): a warm-started x̃, true border rows (no T–XY fill), the PD neighbourhood test for σ and the step, and L11u.
+- Evidence: Mac `~/.cache/sdpx-e2e/ore-pd-20261021` (l10pd1; base `ore-sigma-20261021/l10B0`).
+
+## 2026-10-21 — BFSS ORE: longer steps from σ or a wider dual certificate (rejected, bfss-ore-sigma)
+
+- Goal: longer interior-point steps on ORE problems under unchanged accuracy gates (follow-up to the ORE diagnosis below). MPFR 128 bits only.
+- Setup:
+  - Branch bfss-ore-sigma from 01fc57f. Experiment commits: 94e54a0 (reverted by 1e27603), dee9ace and 4e619ba (scratch switch `SDPX_ORE_SIGMA`; unset gives the base iterates).
+  - e7cea52 reverts the experiments; its tree equals 01fc57f.
+  - Cluster binary os2H = 4e619ba. Release, T=16. L10 on node33 (load ≈ 30); L11u on node105.
+- Mechanism (L10/128, per-pair proximity δ from `SDPX_DBG_STEPCONE`): the cap is the Dikin dual certificate at the trial s. At δ ≈ 1, the certificate's edge, the primal-scaled centering direction stops reducing δ and α → 0. That is the L11u stall signature from iteration 94. The base survives because Mehrotra's σ stays large: α_aff median 0.168, σ median 0.58, δ ≲ 0.86.
+- Option 1: σ from a step the certificate does not cap, with the actual step still certified. Every variant ends L10 InsufficientProgress:
+  - A, an affine step from ORE primal membership and the symmetric cones only: IP/14.
+  - B1, a greedy σ line search along the σ = 0 direction: IP/18. On L11u, IP/11 at objective 2.17.
+  - B2, B1 without shortening α: IP/19.
+  - C3, keep every pair at δ ≤ ½: IP/14.
+  - D, keep δ ≤ 0.5 or 0.7: IP/10–13.
+  - E, D with a fall-back to the certificate's step: IP/20–24.
+- Option 2: wider sound dual certificates.
+  - Mode 8 also accepts z′ certified at the current s.
+    - α_aff median 0.167 (base 0.168).
+    - L10: Solved/195, 114 against 109 s (+4.6%); its serial extra test doubles the affine search time. Audit passes.
+    - L11u: IP/98 against IP/107, with a wider final gap (primal 7.046092, dual 7.052360), 1171 against 1143 s.
+  - Mode 9 uses a damped-Newton conjugate-barrier certificate.
+    - α_aff median 0.156.
+    - L10: Solved/214, 245 against 109 s (+125%), at about 59 cone scalings per iteration.
+    - Its final z fails the audit's exact Dikin certificate (dual ratio 1.02).
+    - L11u was not run.
+- Audit: thermal `ore.py` in original coordinates, covering residuals, gap, primal ORE/PSD membership and an exact arb/mpmath Dikin certificate of the dual cone, at the case's 1e-9 tolerance. The cluster L10 points are bitwise equal to the Mac runs, so the Mac audits apply. Base: dual ratio 0.978, gap 8.7e-10. csdr3 with os2H (mode 9) is Solved/36 and its audit passes.
+- Conclusion: the dual membership test does not limit the step. A tighter test (mode 9) even lowers α_aff. The limit is the primal-scaled direction at the certificate edge.
+- Decision: rejected; the code is reverted. Remaining lever: a Dahl–Andersen primal–dual ORE scaling. It is only outlined: about +35–70% per L11u iteration and 600–900 lines, so it pays only if iterations fall by more than a third. A scratch probe on L10 is running in its own session.
+- Evidence: Mac `~/.cache/sdpx-e2e/ore-sigma-20261021`; hpc `~/projects/sdpx-bfss-ore-sigma-20261021/runs/{l10m128-227824,l11u128-227823}.node220`.
+
+## 2026-10-21 — Arrow leaf lanes start together: L10 lane hang fixed (kept, bfss-threads)
+
+- Defect (LANE-HANG, from c80da23): L10/128 at T=16 sometimes deadlocked in the arrow leaf phase. Rayon queues the leaf-lane broadcast job to each worker in turn, and a worker waiting in a join takes its own broadcast job. A worker that had stolen a leaf's split piece (the Y solve's parallel chunks) before its job arrived therefore ran its lane on top of that piece. The lane then waited for every leaf, and the leaf waited for the buried piece.
+- Evidence (observed): in each hung process, exactly one worker has its lane, in the end-of-lanes wait, nested above stolen `Leaf::refactor` join frames, with no lane at the bottom of its stack. These are tid 157737 (tbN, two samples 5 s apart) and tid 176013 (tbX). The other lanes spin, and the leaf's owner sleeps in the join. The lane-hang session found the same pattern in its gdb dumps of c80da23, 18b84c5 and the x86 exact-dot and residue GEMM branches.
+- Fix (61fcd50, merged as cb444d9): each lane counts itself in and spins until all `pool.current_num_threads()` workers have entered, and only then claims leaves. The factor is called from outside the pool (the lanes' precondition), and no leaf work exists before the barrier, so every lane starts at the bottom of its worker's stack. This is scheduling only. The arrow factor is the only `broadcast` site.
+- Verification. tbL = cb444d9, byte-identical to the lane-hang session's lh3; all 253 crate sources match.
+  - Hang counts:
+
+    | Binary | node55, L10/128, T=16 | Lane-hang repro (8 streams, T=16 on 8 cores) |
+    |---|---|---|
+    | without the barrier (tbN, tbX, lh0) | 3 of 4 runs hung | 5 of 32 hung |
+    | with the barrier (tbL, lh3) | 0 of 6 | 0 of 32 |
+
+  - L10 (node55, tbL ×6, tbX ×2): every completed run is Solved/198 and bitwise identical to the abl10N reference. tbL median 103.9 s; tbX 103.3 s (its other run hung at iteration 153).
+  - On lh3, from the lane-hang session's runs: the 128-bit full run is InsufficientProgress/107 and bitwise (904.4 s). The L11u 256-bit ABBA against lh0 is bitwise at 326.6 against 325.0 s (neutral).
+  - Mac: csdr3 Solved/36 and ising11 Solved/54; audits pass; points identical to the pre-fix arm.
+- Decision: kept. LANE-HANG is closed.
+
+## 2026-10-21 — BFSS L11u: ORE step trials, x86 residue encode and x86 exact dots merged; combined gates and scaling (kept, bfss-threads)
+
+- Merged into bfss-threads (tbX = 2539893). Each branch was bitwise on its own gates:
+  - ORE-STEP (bfss-ore-step, 74da6d7):
+    - Heavy ORE cones split their step trials' S₀ preconditioner row dots and Γ into pieces, and run batched dual trials under the inner-parallel gate. Light cones keep their serial loops.
+    - Branch ABBA (node55, 256 bits, T=16, 25 iterations, against 18b84c5): 436.8 → 414.5 s (−5.1%); steps 2.32 → 1.37 s/it.
+    - Rejected: round-based step folds (−0.3% net).
+  - RNS-X86 (claude/rns-gemm-x86-67122e, 036585c):
+    - Chunk matrices are stored in 32-entry panels, and residues come from a register panel kernel (AVX2). One encoder serves Chunks, Packed and Cached operands. Narrow cached residues are stored planar (u16 + i8).
+    - Includes both review fixes to 18b84c5: panel-fill prime groups stay within `GROUP_SCRATCH_BYTES`, and the product buffer is zeroed only when it grows.
+    - Branch ABBA (node27, release): T=16 404.0 → 382.1 s (−5.4%); T=64 270.2 → 263.1 s (−2.6%); RSS within ±1%.
+    - Rejected: capping the fill by threads (+6% at T=64); OpenBLAS dgemm for the prime products (+5% at T=16, +12% at T=64); 256-column upper strips (no change).
+  - EXACTDOT-X86 (claude/exactdot-x86-923cfc, c64f2a4 and aec492a):
+    - `dot_slices` first tries a fixed window, so there is no exponent scan and one carry chain. A non-finite or out-of-window term falls back to the two-pass kernel.
+    - With BMI2 and ADX (runtime detection), 2- and 4-limb products use mulx/adcx/adox, and products of 8 to 16 limbs add as 4×4 blocks through the fused shift-and-adc chain.
+    - EPYC 7742 factor leaf, ns/term: 128 bits 11.2 → 6.9; 256 bits 24.0 → 13.9; 512 bits 59.4 → 46.6; 768 bits 106 → 95; 1024 bits 169 → 168.
+    - Rejected: a separate shift pass (2–7% slower in block runs).
+- Gates on tbX. Each is bitwise identical in x, s, z, status, iterations and objectives:
+  - Local (Mac, fast profile): ising11 Solved/54 and csdr3 Solved/36; audits pass; points identical to the branch arms.
+  - 128 bits, full run (node10, T=16): InsufficientProgress/107, primal 7.046089322701808, dual 7.05180711602981, identical to f128N.
+    - Time 1411.7 → 928.9 s (−34.2%).
+    - Peak RSS 10.7 → 12.9 GiB (+19.8%), not attributed yet.
+  - 512 bits, 10 iterations (node55, T=16): identical to tbN. 395.1 → 282.2 s (−28.6%); RSS 17.2 → 18.5 GiB (+7.6%).
+  - L10 (node181, 128 bits, T=16; tbX ×3 and tbN ×2 interleaved): Solved/198, identical to the abl10N reference. Medians 105.2 → 100.8 s (−4.2%).
+- Scaling (scX, node180):
+  - 256 bits, 25 iterations, one sequential run per cell.
+  - tb0 = 66e64b7, tbN = c80da23. Every run is identical to tb0.
+  - Rows are s (s/it):
+
+  | T | tb0 | tbN | tbX | tbX vs tb0 | tbX vs tbN |
+  |---|---|---|---|---|---|
+  | 8 | 716.5 (28.73) | 690.8 (27.79) | 471.7 (18.83) | −34.2% | −31.7% |
+  | 16 | 545.0 (21.82) | 502.5 (19.98) | 326.2 (12.91) | −40.1% | −35.1% |
+  | 32 | 445.1 (17.98) | 387.9 (15.28) | 244.0 (9.75) | −45.2% | −37.1% |
+  | 64 | 423.7 (17.21) | 375.9 (14.90) | 230.6 (9.16) | −45.6% | −38.7% |
+
+  - From 8 to 64 threads, tb0 speeds up 1.69× and tbX 2.05×. At T=64, CPU use is 3609% for tb0 and 4345% for tbX.
+  - Peak RSS, tb0 → tbX (GiB): T=8 12.4 → 11.0; T=16 14.2 → 13.0; T=32 16.1 → 17.0; T=64 21.0 → 23.6.
+- Phases (receipts; wall s over 25 iterations; tb0 → tbX):
+  - T=16: solve 541.9 → 323.3.
+    - KKT update 353.2 → 210.4. The refactor fell 285.5 → 159.7: leaves 204.1 → 149.7, the separate contribution phase 70.7 → 2.9.
+    - Scale cones 110.7 → 61.4.
+    - Affine step 34.3 → 19.1; final step 23.3 → 11.9.
+    - KKT solve 12.7 → 12.7; combined rhs 7.2 → 7.2.
+  - T=64: solve 420.6 → 227.4. KKT update 220.0 → 129.9; scale cones 119.3 → 46.1; affine step 36.9 → 19.5; final step 25.5 → 13.1.
+- Known failure LANE-HANG (open; from c80da23, also in tbX): an intermittent deadlock in the arrow leaf lanes on L10/128 at T=16.
+  - Observed:
+    - node55 hung in 2 of 2 runs: tbN after iteration 10, tbX after iteration 142.
+    - node181 hung in 0 of 5 runs, on identical hardware.
+    - The main thread waits on a LockLatch in the `ArrowLDLSolver` factor, while the `factor_arrows` broadcast lanes spin. Two workers sleep in a rayon join under `Leaf::refactor`'s `par_chunks_mut`.
+    - Stacks: hpc `~/projects/sdpx-bfss-threads-20261019/runs/abl10X-227791.node220/hang/`. Earlier cases: `~/projects/sdpx-rns-gemm-20261020/runs/hang-227422`, `hang2-227431`.
+  - Hypothesis (two sessions agree on it; not verified here): a worker steals a leaf's join half before it takes its broadcast job, and a nested join then runs its lane above that half.
+  - Proposed fix: a start barrier in `arrow.rs`, 61fcd50 (duplicate 3d1b3ab). Not merged.
+- Cluster: on 2026-10-21 the normal queue would not start jobs (227789 failed to start 25 times), so these jobs ran in the sugon queue.
+- Decision: kept.
+
+## 2026-10-21 — ORE cone: derivation verified; BFSS L11u slowness and stall explained (diagnosis, bfss-threads)
+
+- Question: is the operator relative entropy cone derived wrongly, given the poor BFSS results (L11u InsufficientProgress/107 with the dual 5.7e-3 above the primal; L10 198 iterations)?
+- Derivation, checked by hand:
+  - D(X, Y) = P g(Λ) Pᵀ is the operator perspective for any factor X = LLᵀ.
+  - Barrier −logdet Ẑ − 3 logdet X + Σ gᵢ, ν = 3n (Fawzi–Saunders).
+  - Gradient and first divided differences; the coincident-node series for g⁽¹⁾ and g⁽²⁾ (Hermite–Genocchi).
+  - The Dikin dual test ⟨z, s⟩² > (ν − 1)⟨z, ∇²f⁻¹z⟩ (sound: it minimises ‖tz + ∇f(s)‖* over t).
+  - The step equation (Hypatia's combination of predictor and centering).
+  - The Dahl–Andersen corrector (reduces to ΔsΔz/z on the orthant).
+  - The bootstrap exports (βC, A, B) = (T, X, Y). EEB is exact on the harmonic oscillator.
+- Verified numerically (scratch 256-bit test, not committed; `~/.cache/sdpx-e2e/wt-orediag`):
+  - Reference: an independent D from symmetric square roots and two eigendecompositions; points n = 4…12 with X, Y spread to 1e-10/1e-12 and λ_min(T − D) down to 1e-12.
+  - Barrier 6e-77…2e-49; gradient (4th-order differences) 1e-61…1e-31; Hessian including S₀ (Richardson mixed differences) 2e-49…2e-18. The errors track the points' conditioning.
+  - ⟨∇f, s⟩ = −ν, ∇²f s = −∇f, ∇³f[s] = −2∇²f (6e-40 at good points), |f'''| ≤ 2f''^{3/2}, Hs = (μ∇²f)⁻¹ to 1e-55…1e-77.
+  - Nothing is wrong in the cone.
+- Gap of the final 128-bit iterate (f128N, 160-bit audit in original units), qx + bz = −5.718e-3:
+  - x·(q + Aᵀz) = −5.761e-3, s·z = +4.36e-5 (positive in every cone), z·(b − Ax − s) ≈ 0.
+  - So the dual iterate is in K*. It sits above the primal only through a dual residual of 1.6e-9 times |x|∞ = 1.1e9; per-column x·rd terms of ±0.9 cancel.
+  - The primal mass lies on columns that raise X and Y of the k = 1 (n = 38) and (3; 3) KMS sectors with equal coefficients, plus their Gram blocks, with T nearly fixed: (0, W, W), a recession direction of K_ore, the L = 10 x8-ray pattern. The optimum is approached, not attained (τ, κ → 0).
+- Step limiter (`SDPX_DBG_STEPCONE` with a scratch per-cone print; job 227550, node94, 128 bits, T = 32; iterates identical to the reference):
+  - Combined steps: 58 full; 47 cut by an ORE dual certificate (k = 1 43, k = 0 3, k = 2 1); 2 by an ORE primal boundary; PSD cones never.
+  - Affine steps: limited by the k = 1 cone in 104 of 107 iterations (91 dual, 13 primal), median α_aff 0.136 against √(2/ν) = 0.13 for ν = 114. So σ = (1 − α_aff)³ ≈ 0.64, and μ falls about 1.55× per iteration: 23 decades in about 107 iterations.
+  - Per-cone μ stays within [0.99, 1.01]·μ. On the central path the k = 1 ratio r = (ν − 1)⟨z, ∇²f⁻¹z⟩/⟨s, z⟩² is 113/114 = 0.991, below the limit 1. From iteration 94 the current pair's r rises 0.994 → 0.99996 → 1.000000, so no dual step certifies and α_z → 0: InsufficientProgress.
+- Conclusion:
+  - The cone is correct.
+  - The slowness is the primal-only ORE method: a radius-1 Dikin dual certificate caps the predictor at about √(2/ν) for the n = 38 cone, and Mehrotra's σ follows that cap even though most combined steps are full.
+  - The stall is the program: an unattained optimum along (0, W, W) KMS directions, where the certificate's edge is finally reached.
+- Next (not started): pick σ from a step the certificate does not cap, a Newton (conjugate-barrier) dual certificate, or primal–dual ORE scaling. All of these change iterates. On the model side, bound or remove the (0, W, W) directions.
+
+## 2026-10-20 — BFSS L11u: ORE scaling past 32 threads through the residue GEMM's serial parts (kept, ore-scale)
+
+- Case and reference as in the bfss-threads entry below (L11u, 256 bits, 25 iterations). Base: tbN = c80da23.
+- Observed (c80da23 with stage timers, node61, iteration 2):
+  - The n = 38 cone (S₀ of order 1482: Cholesky plus inverse) sets the scale phase. It took 5.0 s at T=64, 4.5 s at T=16 and 11.9 s serial (2.4×). Three n = 34 cones (about 1.8 s) run beside it.
+  - 4.1 s of the 5.0 s was in residue GEMMs:
+    - Operand encode, 1.4 s at both T=16 and T=64. The recursive kernels pass sub-blocks with leading dimension 1482, so encode, residue storage and decode covered 2–16× the stored entries.
+    - Serial residue decode per prime group, 1.35 s.
+    - Prime products, 0.78 s. Large operands had one prime per group, so 24–28 regions ran in sequence with at most n/32 column panels each.
+    - Serial exponent scans, 0.16 s.
+  - ORE-side serial passes: second divided differences 0.18 s, S₀ symmetrize 0.17 s, zero fills and the inverse's scatter 0.13 s.
+  - After the first fixes, the factor and inverse's 70 GEMMs still spent 660 of 1579 ms outside parallel regions. glibc served large zeroed buffers from the heap top and cleared them on the calling thread, and small operands' chunk-matrix residues were serial.
+  - Rejected earlier: page faults as the cause (a large `MALLOC_MMAP_THRESHOLD_` changed nothing).
+- Kept. All of these are bitwise: each entry stays one exact sum rounded once, and the recursion splits are unchanged.
+  - Residue GEMM (`rns_blas::gemm`):
+    - A view whose strided span holds over a quarter more entries than it stores is first copied dense, in parallel.
+    - Exponent scans, residue decode and chunk-matrix residues (by row range) run over the split's ways.
+    - Prime groups are wide enough that every way gets a column panel.
+    - Chunk matrices and prime products are zeroed over the ways. Packed residues are written into uninitialized storage.
+  - ORE cone: the divided differences, symmetrize, the recursive kernels' subtract and negate loops, the inverse's symmetric scatter and the large zero fills run as board or pool items.
+- Result (orsF against tbN, ABBA, release, 256 bits, 25 iterations; x, s, z, status and objectives bitwise identical). Rows are median s (s/it):
+
+  | T | Node | tbN | orsF | Change |
+  |---|---|---|---|---|
+  | 32 | node7 | 388.6 (15.54) | 299.4 (11.97) | −23.0% |
+  | 64 | node61 | 375.6 (15.02) | 271.9 (10.88) | −27.6% |
+
+  - Scale cones: T=64 122.8 → 50.1 s (4.91 → 2.00 s/it); T=32 111.0 → 54.0 s.
+  - The arrow refactor's residue products share the GEMM: refactor 128.1 → 98.9 s at T=64 and 156.0 → 125.3 s at T=32.
+  - Peak RSS: T=64 21.4 → 22.5 GiB (+5.6%), from the dense operand copies and wider prime groups; T=32 15.9 → 16.0 GiB (+0.6%).
+  - With stage timers at T=64, the n = 38 cone fell from 5.02 to 1.94 s per iteration. The n = 34 cones now take 1.4–1.6 s.
+- Gates:
+  - 128 bits, full run: InsufficientProgress/107, bitwise identical (primal 7.046089322701808, dual 7.05180711602981; 1121.6 s at T=16 on node27, reference 1411.7 s on node50).
+  - 512 bits, 10 iterations: bitwise identical (303.0 s on node27; the reference took 378.4 s on node50).
+  - L10: Solved/198, bitwise identical (102.8 s on node27; reference 105.3 s on node50).
+  - csdr3 (Mac, fast build): Solved/36, audit passes, points identical to tbN. A Mac L11u run (3 iterations, T=8) is bitwise identical.
+- Left on the critical path at T=64: about 1.2 s of the n = 38 cone is compute inside the GEMMs' parallel regions, and helpers are shared with the n = 34 cones. The base-case dot kernels add 0.28 s (column-by-column Cholesky regions), and the recursion fixes their structure. GEMM time outside parallel regions is 160 ms.
+- Decision: kept.
+
+## 2026-10-20 — BFSS L11u thermal bootstrap: MPFR KKT update and arrow leaf phase on all workers (kept, bfss-threads)
+
+- Case: `L11u_T0.5_r2.36_energy_min_g.json` (n 1090, m 14033; 22 PSD blocks and 19 operator relative entropy cones of three blocks each, n ≤ 38; negated arrow, augmented KKT, partitions 1). Reference at 128 bits, T=16: InsufficientProgress/107, primal 7.046089322701808, dual 7.05180711602981. Unless stated, timings are x86 node7, pinned, singlejob, 256 bits, T=16, 25 iterations.
+- Baseline (tb0 = 66e64b7): 532.9 s, 21.5 s/it, 1156% CPU.
+  - Thread use: one solve has 17–18 threads and one shared pool, so nothing is nested or oversubscribed. The reported 145 threads were four concurrent solves.
+  - perf (cycles): `dot_slices` 37.5% self, almost all of it the leaf Y solve (`forward_suffix_rows`, 31% inclusive); residue GEMMs 22.8%; ORE `update_scaling` 20.8% (congruences 4.8, `to_eigen` 4.7, `spd_inverse` 3.3); `ldl_rec` 15%. memset and memcpy are 5.8%; allocation does not show (MPFR values own their limbs).
+  - Phases per iteration: arrow refactor 11.2 s (leaves 8.1 at 14.3 busy; contributions 2.7 at 9.7 busy); KKT value update 2.7 s; scale cones 4.3 s at 15.6 busy; affine plus final step 2.3 s at 3–4 busy.
+- Kept (all bitwise: x, s, z and objectives identical to tb0):
+  - KKT update (tb1): each cone fills and negates its own Hs block in parallel, and the ORE rows N⁻¹A transform runs across cones. `ArrowLDLSolver` caches one value plan per index map: the single cached plan had been rebuilt serially for every map (about 17M entries per iteration). `Negated` maps values in place instead of copying them. Value update 67.1 → 51.3 s.
+  - Arrow leaf phase (tb6–tb13): leaves are claimed largest first (g³ plus product work), one lane per worker under a board offer, not by a parallel iterator. Split work (the recursive factor's halves, the Y columns) is posted on the board, where idle lanes help. A large leaf forms its residue contribution product inside the phase, split by its share of all products' work. The recursive factor keeps its larger half on its own worker.
+    - Under a parallel iterator, workers waiting in one leaf's join stole whole leaves: the same 1785 leaf factor took 3.6–13.8 s. On the board it takes 4.6–4.7 s.
+    - Leaves plus contributions 270.3 → 240.9 s, at 15.9 busy; the separate contribution phase fell 67.0 → 2.9 s.
+  - Small-case gates (tbJ–tbM): a leaf posts its Y columns only under a board offer and with a grain of work per extra column (the board is one lock: csdr3's 4200 SOC leaves at four threads lost 2.3% without it). Lanes run only when a leaf splits its factor or the phase forms residue products; balanced leaves keep the parallel iterator (binary64 nb, 797 leaves of g ≤ 6 on two workers, lost 1.7% to lanes). The Hs fill runs in parallel from a grain of work per cone. Review fixes (tbN, bitwise on BFSS): lanes run only when the factor is called from outside the pool. Owner factors inside the pool (an in-process partitioned solve) keep the parallel iterator, because two broadcasts there could wait on each other through the board's spin. In-phase products are admitted largest first while their Y, Z and product estimate fits `BATCH_WORK_BYTES`, so mixed Λ27/1024 keeps its batched peak (BFSS: 22 products, 1.44 GB, all admitted). In-process ising11 with two owners at eight threads is Solved/54, bitwise identical to HEAD. Mac fast profile against 66e64b7: csdr3 (256 bits, T=4, ABBA) 3.317 → 3.253 s (−1.9%), points identical, audits pass; binary64 nb 67.8 → 67.8 ms and nb_L2_bessel 77.7 → 78.4 ms (tbN, T=16, nine interleaved runs, points identical).
+- Rejected:
+  - Parallel ORE step search (tb2–tbH): admit operator relative entropy cones to `nonsym_step_parallel` from two cones (not 64), one cone per task. Almost every search takes one primal and one dual trial. A round's critical path (0.23–0.67 s) is an n = 34/38 cone whose test at αs needs S₀'s bound, followed by a batch of 16 dual trials.
+    - Every cone searches from α₀, not from the cap the earlier cones left, so more tests reach S₀'s factor. Affine step: L11u 34.2 → 35.2 s; L10 (ABBA, node55, 128 bits) `ore.schur_cholesky` 3.4 → 20.0 s, affine 7.9 → 13.2 s, solve +3.5%.
+    - Final step only: L11u 23.2 → 20.4 s (0.5% of the solve); L10 +0.3 s.
+    - Passing the inner-parallel gate to stolen batch trials (tbG): within noise (6 iterations: 105.0 against 105.9 s).
+  - Blocked exact Y solve: row blocks of L times column chunks of Y as residue products, entry for entry the per-entry exact dots. It was bitwise on the dumped 2223 leaf and 2.4× faster serially on the Mac (5.6 → 2.3 s). On x86 the leaf phase took 12.4 s against 9.7 s for the per-entry dots (157 against 125 CPU-s per call): faer's AVX2 residue GEMMs cost about twice Accelerate's share.
+  - Helping posted work before claiming the next leaf: neutral (phase 9.68 against 9.85 s).
+  - Row-block trsm in `ldl_rec`: bitwise, but slower (0.34 against 0.23 s at the 1482 level).
+  - Leaf lanes without the board (tb6, tb9): 793 and 672 s, stalled on big-leaf joins.
+- Options (no code change): kkt_form = condensed is valid (its 128-bit full run reproduces the reference status) and about 2.5% faster at 256 bits, but not bitwise. partitions > 1 is unsupported with ORE cones. MPI 2×8 is 1.7× slower. Chordal options change nothing on this case.
+- Result (tbM; final tbN gated on the same runs). Every check is bitwise identical to tb0: x, s, z, status, iterations and objectives.
+  - Scaling. Node7, 25 iterations, tb0 and tbM interleaved per thread count. Each row is s (s/it):
+
+    | T | tb0 | tbM | Change |
+    |---|---|---|---|
+    | 8 | 711.1 (28.77) | 689.6 (27.73) | −3.0% |
+    | 16 | 537.4 (21.50) | 494.6 (19.75) | −8.0% |
+    | 32 | 452.4 (18.23) | 384.9 (15.38) | −14.9% |
+    | 64 | 415.1 (16.76) | 375.2 (14.83) | −9.6% |
+
+    - Peak RSS: 14.3 → 12.6 GiB at T=16, 20.9 → 21.7 GiB at T=64.
+    - Going from 8 to 64 threads speeds tb0 up 1.71× and tbM 1.84×. tbM uses 3.4× the CPU of T=16 at T=64.
+    - Node55 (tb0 against tbI): −3.2%, −9.3%, −10.7% and −13.0%.
+  - Phases. T=16, 25 iterations, s:
+    - KKT update 348.5 → 304.9: value update 66.3 → 51.4; arrow refactor 282.1 → 253.5 (busy 13.0 → 15.8), of which leaves 203.6 → 239.9 (busy 14.2 → 15.9, products included) and the separate contribution phase 67.9 → 2.9.
+    - Scale cones 107.6 → 108.1. Steps 57.7 → 57.9.
+  - perf after (tbM, node55):
+    - Exact dots 38.5%, residue GEMM kernels about 22%, board `help` 0.9%, rayon epoch 2.3%.
+    - Busy per phase window: leaves 14.6, scale 14.4, factor 15.0, steps 4.1.
+  - 128 bits, full run (node10): InsufficientProgress/107, primal 7.046089322701808, dual 7.05180711602981, bitwise identical to the reference.
+    - Time 1411.7 s (tbN) and 1413.3 s (tbM). The reference took 1494.5 s on node16; tbI took 1364.4 s there (−8.7%).
+  - 512 bits, 10 iterations (node50): bitwise identical. tbN 412.5 → 378.4 s (−8.3%); tbM 413.3 → 378.6 s. RSS 18.9 → 17.3 GiB.
+  - L10 (Solved/198, ABBA): bitwise identical. tbN 106.3 → 105.4 s (node50); tbM 107.4 → 106.4 s (node10).
+  - tbM against tbN at 256 bits (ABBA, node55): bitwise identical, medians 536.5 and 539.2 s (noise).
+- Decision: kept. Next on this case: the Y solve's exact dots (39% of cycles) and the ORE scaling (Schur inverse and Cholesky, 4.3 s/it at 15.6 busy) are work, not idle time; step lengths are 2.3 s/it on the S₀ critical path.
+
+## 2026-10-19 — Binary64 corrector budget: fewer centrality correctors rejected (thermal-ore)
+
+- Observed: on gpp124-1 (Mac T=1, 278 ms, 24 iterations) the Gondzio correctors take 43% of the solve: corrector right-hand sides 51 ms (dsyev of the trial product), corrector solves 37 ms, corrector step lengths 15 ms. 15 of 35 attempts are rejected, mostly by the cheap admissibility test after the solve. On x86, gpp100's correctors are 41% of 423 ms.
+- Measurements (temporary env switches, 3 interleaved reps, median against the base):
+  - Correctors off: gpp100 −25%, gpp124-1 −23%, gpp250-1 −19%, arch0 −16%, theta2 −10%; qap6 +43%, theta1 +13%, mcp500-1 +5%, hinf3 AlmostSolved.
+  - At most one corrector: SDP geomean 0.960 (gpp124-1 −28%), but hinf3, sched_100_100_orig and sched_50_50_orig end AlmostSolved and agg is +16%.
+  - Acceptance tracks the gain: qap6 23/23, theta1 4/4, mcp250-1 8/8, hinf3 13/15 accepted; gpp100 15/28, gpp124-1 20/35, gpp250-1 23/35, arch0 19/26. The first gain does not predict the second attempt (a 6.5% gain was followed by an accepted corrector, a 32% gain by a rejected one).
+- Rejection-driven rules, all 51 local inputs (geomeans LP / SOCP / SDP):
+  - skip the next iteration's correctors after a rejection: 0.997 / 0.997 / 1.035; sched_50_50_orig InsufficientProgress, hinf3 AlmostSolved, gpp100 +35%;
+  - one corrector per iteration after the first rejection: 0.974 / 0.986 / 0.997; sched_100_100_orig, sched_50_50_orig and arch0 AlmostSolved;
+  - skip after a rejection while over a third were rejected: 0.977 / 1.001 / 0.979 (gpp124-1 −25%); arch0 and sched_50_50_orig AlmostSolved.
+- Decision: rejected. Every rule loses a status for at most a 1.5% geomean gain; the correctors keep their robustness role on sched and arch0. dsyevd (A9) and band eigenpairs (A18) were already rejected for the same sensitivity, so the corrector stays as it is. Patches: `~/.cache/sdpx-e2e/patches/{nocor,maxcor,corpol}-env.patch`.
+
+## 2026-10-19 — Serial KKT residual sweeps runs of dense constraint columns (kept, thermal-ore)
+
+- Hypothesis: after A22, nb's refinement residual `b − Kx` costs 0.137 ms per call (98 calls, about 13 of 66 ms). About 190k of its 199k KKT entries sit in the 123 dense equality columns (1,560–1,586 rows each). In `_csc_symv_unsafe` each such column's sum is one serial dependency chain, at about one FP-add latency per entry (≈2.4 cycles measured). Sweeping several such columns together makes their sums independent chains with no change in any operation.
+- Exact patterns do not work: adjacent dense rows of nb share about 99% of their columns, but no two neighbours are identical (39 distinct patterns).
+- Change (`SymvRuns`, `csc_symv_runs`; binary64 serial residuals only):
+  - A run is up to four adjacent KKT columns of at least 64 off-diagonal rows, all above the run, each covering 4/5 of the run's merged row list. Each merged row stores a mask of the columns that hold it.
+  - The run kernel updates y[row] in column order and each column's sum in row order, adding the diagonal last, so the result is bitwise that of the column sweep.
+  - Runs are built once with the KKT. The pooled residual plan and the MPFR exact residual are unchanged.
+- Tuning (Mac T=1, median of 5):
+  - Runs of eight columns matched four (residual 0.069 against 0.070 ms).
+  - A 16-row minimum cost LP_agg 6% (11.8 → 12.5 ms), from runs over its eight rows of 16–19 entries; 64 rows removes that.
+- Result: bitwise identical on all 51 local inputs and medium (b54b58300d4c); ising11 and csdr3 unchanged with the 16-row variant (MPFR does not use the path). nb residual 0.137 → 0.069 ms per call. Mac T=1 medians of 5 interleaved reps against e9f5019:
+  - nb 73.3 → 66.0 ms (−10.0%), nb_L2_bessel 88.7 → 82.6 ms (−6.9%), nb_L1 181.4 → 173.4 ms (−4.4%);
+  - bnl1 −1.6%, agg 12.0 → 12.0 ms.
+- Decision: kept (A23). Provisional on x86 for the gains under 5%.
+
+## 2026-10-19 — Binary64 local cone arrow with class panels and a cost gate (kept, thermal-ore)
+
+- Hypothesis: SOCP_nb and SOCP_nb_L2_bessel are standard-form SOCPs whose cone rows are identities: 793 SOC3 leaves (plus orthant rows) around a 123-row dense equality border on nb. The local cone arrow fits them, but it was MPFR-only, because a binary64 border had lost accuracy on the crossing SOCP (journal 2026-10-07, before the border-order fix). Run with BLAS panels, its dense work should beat QDLDL when it costs about as many flops as the sparse LDL.
+- Accuracy recheck: crossing (16,021 leaves, t = 272) in binary64 at T=4. The local cone arrow and QDLDL both end AlmostSolved at the 200-iteration cap: r_p/r_d 2.0e-10/5.8e-8 in 16.6 s against 5.2e-9/1.1e-8 in 29.2 s. Neither path solves it, and the arrow is no worse in kind.
+- Change:
+  - `try_local_cones` admits binary64 when the dense work (Σ width·q² class Schur products plus t³/3 for the border factor) is at most `CONE_FLOP_RATIO` = 2 times the AMD sparse LDL flops. The test reuses `dense_border_pays` from the local bounds.
+  - `ConePanels` stack each coupling class's leaf suffixes into column-major Y and Z = D⁻¹Y (rounded entrywise, as before). The leaves keep no Z.
+  - The border Schur is one GEMM YᵀZ per class (lower triangle read, then mirrored).
+  - Single and batched solves gather the leaves' scaled forward values for one Yᵀv GEMM per class, solve the border, and run one Y·x GEMM before the leaf backward sweeps.
+- Gate ratios (dense/sparse) and Mac T=1 medians of 5 interleaved reps. QDLDL is 7e4480b (or the gated arm, which matches it); local cones is this change, with the gate lifted for ratios above 2:
+
+  | case | ratio | QDLDL | local cones |
+  |---|---|---|---|
+  | nb | 0.99 | 182.0 ms | 73.8 ms (−59%) |
+  | nb_L2_bessel | 1.34 | 132.5 ms | 88.3 ms (−33%) |
+  | sambal | 2.3 | 0.4 ms | 0.6 ms |
+  | nb_L1 | 5.4 | 183.0 ms | 829.1 ms |
+  | axis_many | 7.9 | 5.2 ms | 15.6 ms |
+  | afiro, grow7, adlittle | 12–19 | 0.3, 3.0, 0.7 ms | 0.6, 12.3, 2.5 ms |
+
+- T=16: nb 181.7 → 71.4 ms, nb_L2_bessel 132.2 → 82.8 ms. Points are identical at T=1 and T=16.
+- Checks:
+  - Audits pass at unchanged iteration counts: nb Solved/13 (r_p 1.0e-11, r_d 4.7e-11, gap 3.7e-11) and nb_L2_bessel Solved/9 (1.2e-11 / 8.9e-11 / 3.8e-11).
+  - The other 49 local inputs are bitwise identical to 7e4480b.
+  - medium b54b58300d4c, ising11 b971aee3cf2d and csdr3 71603237737a are unchanged; MPFR keeps its exact Schur path.
+- Decision: kept (A22). Provisional on x86, where nb and nb_L2_bessel are 3.3–3.4× MOSEK.
+
+## 2026-10-19 — x86 job t25: trmm + syr2k congruence rejected (thermal-ore)
+
+- Hypothesis: the binary64 H-apply congruence RᵀXR (two GEMMs) is cheaper on x86 as a TRMM plus a SYR2K, which OpenBLAS might run faster than its GEMM at the PSD block sizes of the scoreboard.
+- Setup: job 226689, node7, `t25/cong.c` against the scoreboard's OpenBLAS (Zen kernel, 1 thread), k = 16–250, repetitions sized to about 0.2 s.
+- Result: trmm + syr2k is slower at every size, 1.005× (k = 250) to 1.28× (k = 24); k = 124 is 1.08×. Errors are comparable: 0.17–0.42 eps·max|R||X||R| on both.
+- Decision: rejected. The x86 SDP congruences stay two GEMMs.
+
+## 2026-10-19 — x86 job t24: 1e8-flop supernodal floor restored (A13), A17/A19/A20 bitwise (thermal-ore)
+
+- Setup: job 226629, node7 (singlejob, governor conservative), T=1 and T=16, `OPENBLAS_NUM_THREADS=1`, min of reps, `native_oracle` audits of Part F.
+  - Part F: to8g (9d969d3, A13 without the floor) against to8h (to8g + `ldl-floor.patch`) on the five inputs that change backend.
+  - Part G: to8d → to8g (A17, A19, A20), 57 cases.
+- Part F (to8g / to8h):
+  - nb 1.26/1.46 (T=1/T=16), nb_L1 1.23/1.44, nb_L2_bessel 1.33/1.65, axis_wide 2.51/2.42, mcp250-1 0.82/1.09.
+  - Geomean 1.33 (T=1) and 1.56 (T=16). Every audit passes on both arms at the same iteration counts.
+  - On the Mac the floor had lost (nb −8%, nb_L1 −17%, axis_wide −17%, mcp250-1 −37% without it). Below 1e8 flops, x86 faer runs these factors slower than QDLDL.
+  - After the QDLDL run sweeps (A21), the floor is close to neutral on the Mac too (559b9f6 + floor, single runs): nb −8%, nb_L2_bessel −10%, axis_wide −21%, nb_L1 +6%, mcp250-1 +9%.
+- Part G: points bitwise identical on all 57 cases at both thread counts (hinf3, sched_100_50_orig, csdr3 and f64_large stay AlmostSolved).
+  - Geomean to8g/to8d: SDP 0.965 (T=1) and 0.951 (T=16); SOCP 1.020 and 0.934; LP 1.044 and 1.098.
+  - Largest SDP gains: theta1 −24%/−31%, qap5 −10%/−31%, hinf1 −21%, hinf2 −23%, truss2 −16% (T=16).
+  - LP and small SOCP timings remain undecidable on this node: adlittle 0.63, grow7 1.56, share2b 1.54, bnl1 1.15 at T=1 against 0.98 at T=16, agg 0.97 against 1.80.
+- Check: exactly the five Part F inputs change points locally, all audited at unchanged iteration counts; medium (b54b58300d4c) and csdr3 (71603237737a) are unchanged.
+- Decision:
+  - A13 floor restored (faer only from 1e8 flops; the scoreboard runs on x86). A ratio-aware rule would keep only mcp250-1's T=1 gain, which reverses at T=16.
+  - A20 confirmed on x86 (SDP geomean −3.5%/−4.9%).
+  - A17 and A19 stay bitwise; their x86 speed is unresolved at this noise level.
+
+## 2026-10-18 — QDLDL forward solves sweep supernode runs of up to eight columns (kept, thermal-ore)
+
+- Hypothesis: the forward substitution (L + I)x = b is the same column sweep as the refactor replay, so the run sweep of A21 applies to it bitwise. The backward Lᵀ solve cannot fuse a run bitwise, since each column's dot product starts with the previous column's result.
+- Change: `supernode_runs` lists the fundamental runs of L (up to eight columns) once, from etree and Lnz. `_lsolve_rows::<K>` sweeps each listed run with `lsolve_run` and the other columns as before. Single solves (K = 1) and the row-interleaved pairs of `solve_many` (K = 2) both use it.
+- Detecting runs on the fly from Lp/Li instead gave the same gains, but sched_100_100 lost 2.0–3.5% to the per-column test (few runs, small columns).
+- Result: bitwise identical on all 51 local inputs, medium, ising11 and csdr3. Mac T=1, 5 interleaved reps, median against 83b8781:
+  - nql60 180.2 → 167.1 ms (−7.3%), nql30 −6.1%, qssp30 −2.5%, chainsing_1000_2 −2.4%, agg −1.7%, bnl1 −1.3%;
+  - sched_100_100 +0.5%, nb +0.2%.
+- Decision: kept (A21). Provisional on x86 for the gains under 5%.
+
+## 2026-10-18 — QDLDL refactors sweep supernode runs of up to eight columns (kept, thermal-ore)
+
+- Hypothesis: after A21, nql60's refactor is still 70 of 181 ms, and almost all of its terms lie in fundamental supernodes longer than two columns. Sweeping a whole run of columns at once reads and writes each y row once per run instead of once per pair.
+- Change (`_factor_inner`, `sweep_run::<R>`):
+  - The recorded row pattern stores the run length − 1 in the top three bits of the run's first column. A run grows while the previous recorded column of the row is c − 1, its parent is c and Lnz[c − 1] = Lnz[c] + 1.
+  - The replay first applies the run's internal terms to y[c₀ + j] in column order. It then computes y[i] = (…(y[i] − L[i,c₀]·y₀) − …) − L[i,c_{R−1}]·y_{R−1} for each remaining row, and finally the L and D[k] updates in column order: the single sweeps' operations in their order.
+- Run length (Mac T=1, 5 interleaved reps, median against the pair code 18286b2):
+  - 4: nql60 −5.5%, nql30 −4.2%, qssp30 −4.3%.
+  - 8: nql60 196.0 → 177.4 ms (−9.5%), nql30 −6.3%, qssp30 −6.7%, sched_100_100 −1.7%.
+  - 16: nql60 +2.9% and qssp30 +2.9% against 8, likely from register pressure.
+- Neutral (within ±1.7%): bnl1, agg, nb, chainsing_1000_2, sched_50_50.
+- Result: bitwise identical on all 51 local inputs (34 LP/SOCP and 17 SDP), medium (b54b58300d4c), ising11 (b971aee3cf2d) and csdr3 (71603237737a).
+- Decision: kept with runs of up to eight (A21). Provisional on x86 for the gains under 5%.
+
+## 2026-10-18 — QDLDL refactors sweep fundamental supernode pairs together (kept, thermal-ore)
+
+- Hypothesis: the up-looking QDLDL factor scatters each column of row k's pattern into y separately. For a fundamental supernode pair (c + 1 is c's parent, and c has exactly one more nonzero), both columns update the same rows. One sweep could apply c's term, then c + 1's, to each row and touch y once.
+- Change (`_factor_inner`):
+  - The first factorization marks such pairs with a high bit in the recorded row pattern when c directly precedes c + 1 in a row's elimination order.
+  - Refactor replays sweep a marked pair at once. They first take c's term into y[c + 1], then compute y[i] = (y[i] − L[i,c]·y_c) − L[i,c+1]·y_{c+1} per row: the same products and subtractions in the same order.
+  - A first version that tested etree/Lnz for every column visit cost sched_100_100 +3.1% (5% of its terms paired). Recording the bit removes that overhead (+1.0%).
+- Share of paired factor terms: nql60 98.5%, bnl1 71%, qssp30 66%, agg 63%, sched_100_100 5%, nb under 1% (its adjacent columns are rarely parent and child).
+- Result: bitwise identical on all 39 local LP/SOCP inputs, the five 1e8-floor inputs, medium (b54b58300d4c), ising11 (b971aee3cf2d) and csdr3 (71603237737a). Mac T=1, 5 interleaved reps, median against 9d969d3:
+  - nql60 228.4 → 197.8 ms (−13.4%), nql30 −9.6%, qssp30 −5.7%, bnl1 −3.7%, agg −1.7%;
+  - chainsing_1000_2 +0.5%, sched_100_100 +1.0%, nb (floor arm) −1.3%.
+- Decision: kept (A21). Provisional on x86 for the gains under 5%.
+
+## 2026-10-18 — x86 job t23: A16 confirmed, band eigensolve (A18) rejected (thermal-ore)
+
+- Setup: job 226619, node7 (singlejob, governor conservative), T=1 and T=16.
+  - Part U: to8c (27e10aa) → to8d (0d1e5a4, A16), 21 SDPs, 3 reps, min.
+  - Part E: to8d → to8e (+ `band-eigen.patch`), 21 SDPs × 8 jitters of the static regularization (1e-8·(1 + r·1e-6)), plus gpp500-1 × 4 at T=16. `native_oracle` audits of the r0 points.
+- Part U (A16): bitwise on all 21 SDPs; geomean 0.979 (T=1) and 0.968 (T=16). qap6 −9.7%, planted80 −3.1%, arch0 −2.3%, gpp124-1 −1.8%/−4.1%, gpp100 −1.6%/−3.3%. Confirmed.
+- Part E (A18):
+  - Statuses: gpp250-1 ends AlmostSolved in 2 of 8 jitters with the band eigensolve (35 and 41 iterations), 0 of 8 on the base. gpp124-1 is the reverse (base 1 of 8, band 0). The hinf family is AlmostSolved on both arms (hinf1 2/2, hinf2 4/1, hinf3 5/5 of 8).
+  - Audits: identical across arms. truss2, hinf2, hinf3 and gpp500-1 miss only the oracle's strict √eps gate and pass the 1e-6 audit.
+  - Time, jitter geomean: 1.020 (T=1) and 0.984 (T=16). Large blocks gain (gpp100 −11%/−12%, gpp124-1 −11%/−13%, arch0 −7.5%), but gpp250-1 is +7% from its long AlmostSolved runs. Small blocks lose (hinf2 +22%, truss1 +25%, qap5 +7%, control3 +6% at T=1).
+- Decision: A18 rejected, because an accuracy loss on gpp250-1 does not count as a speed win. A retry would need gpp250-1 Solved under jitter; a size gate would only address the small-block loss.
+
+## 2026-10-18 — x86 job t22: A10–A15 confirmed, dgesdd rejected, A13 regresses (thermal-ore)
+
+- Setup: job 226609, node7 (singlejob, governor conservative), T=1 and T=16, `OPENBLAS_NUM_THREADS=1`, point hashes per run.
+  - Part A: to7e → to8a (A10–A14), 55 cases, min of reps.
+  - Part B: to8a → to8b (+ dgesdd from n = 40), 8 SDPs × 5 jitters.
+  - Part C: receipt overhead.
+  - Part D: to8a → to8c (A15 USYM), 21 SDPs, min of reps.
+- Part A: points are bitwise identical except the five inputs A13 moves to the supernodal factor, and hinf3 stays AlmostSolved as before.
+  - SDP geomean 0.974 (T=1) and 0.973 (T=16). Large SDPs: mcp500-1 −14%/−16%, gpp100 −10%/−9%, planted80 −9%/−6%, arch0 −7%/−6%, gpp124-1 −6%/−7%, gpp250-1 −6%/−6%.
+  - SOCP: nql30 −15%, sched_50_50_scaled −12%, qssp30 −8.5%, sched_100_100 −7%.
+  - Tiny LPs spread ±20–100% between reps on this governor (sc205 3.1 → 6.2 ms, agg +23% at T=1 but −29% at T=16), so they decide nothing.
+  - A13 regresses on x86: nb +21%/+38% (T=1/T=16), nb_L1 +13%/+41%, nb_L2_bessel +25%/+52%, axis_wide +138%/+162%. mcp250-1 is −25%/−2%, but that includes A10's projection change. Their fill ratios: mcp250-1 99.7 (2.0e7 flops), the nb family 62 (4–5e7), axis_wide 49.5 (1.4e6).
+- Part B (dgesdd): geomean 0.999 (T=1) and 0.981 (T=16); gpp124-1 +7–11% with one AlmostSolved jitter, theta1 +11–13%, gpp500-1 +8% at T=16, gpp250-1 −12%. Rejected.
+- Part D (A15): bitwise on all 21 SDPs; gpp250-1 −8.6%/−9.2%, arch0 −8.2%/−5.2%, gpp124-1 −6.0%/−4.7%, gpp100 −3.0%/−4.9%; geomean 0.994/0.982. Confirmed.
+- Part C: plain/receipt medians range 0.73–1.25 on small SDPs, i.e. within the run spread. T=16/T=1 without receipts is 1.23–1.51 on theta2, control2 and chainsing_1000_1 (the known small-case thread penalty).
+- Next: job t24 isolates A13 on x86 (to8g = 9d969d3 vs to8g + the 1e8 floor). The Mac keeps the faer advantage on mcp250-1 (106 vs 269 ms with the floor), so a flat floor is not assumed. Part G of t24 checks A17/A19/A20 on x86.
+
+## 2026-10-18 — Register-accumulated G·Aⱼ in the dense Schur transform (kept, thermal-ore)
+
+- Hypothesis: `coefficient_product` (G·Aⱼ by column AXPYs) zero-fills each n×n panel, then read-modify-writes its output column once per term. In the Mac planted80 profile (n = 80, ~300 terms per column; `#[inline(never)]` split) it is the largest piece of the assembly: 779 of 2904 samples, against 588 for the GEMM, 416 for packing and ~1070 for the dot accumulation.
+- Change: the plan is sorted by output column, so each column's terms are contiguous. Each output element now folds the same terms in the same order from +0 in 16-row register blocks and is stored once. The last block overlaps the previous one and rewrites equal values. Blocks with n < 16 fold into their zeroed column, as before. Columns without terms are zero-filled.
+- Result: bitwise identical on 17 local SDPs, medium (b54b58300d4c) and ising11 (b971aee3cf2d, audit PASS). Mac T=1, 5 interleaved reps, median against f51136b:
+  - planted80 53.0 → 50.4 ms (−4.9%), control3 26.9 → 26.2 ms (−2.6%);
+  - gpp100 −0.6%; qap6, mcp250-1, truss2 and theta1 within ±0.5%; theta2 +0.8% (its columns take the sparse Schur path and never call this code).
+- Rejected variants: 32-row blocks (control3 +2.6%: its n = 30 and n = 15 blocks fell to the slow path); a scalar tail that recomputes each term's coefficient per row (control3 +15%).
+- Decision: kept (A20). Mac gains under 5% stay provisional until an x86 run.
+
+## 2026-10-18 — Upper-only dense Schur transform (rejected: gpp250-1 loses its solves)
+
+- Hypothesis: the dense Schur transform forms the full product (G·Aⱼ)·G for each wide column, then packs every off-diagonal pair as (aᵢⱼ + aⱼᵢ)/√2. Packing (aᵢⱼ + aᵢⱼ)/√2 from the upper entry would need only half the GEMM. The transform is 45% of planted80 (Mac 21.3 of 47.3 ms), 18% of control3 and 5.6% of arch0.
+- Change (binary64, blocks from n = 64): 32-column upper panels per stacked block, the last panel stacked across the chunk, the narrow-support kernel restricted to the upper tiles, and upper packing. Below n = 64, per-block calls cost more than they save (qap6, n = 37, got slower) and those blocks stayed bitwise unchanged.
+- Result: all 17 local SDPs pass the audit except gpp250-1, which ends AlmostSolved at 18 iterations. Six jittered static regularizations (1e-8·(1 + r·1e-6)) on gpp250-1:
+  - this change: AlmostSolved 4 of 6 (18–20 iterations);
+  - the base (f51136b): Solved 6 of 6 (21–25 iterations);
+  - the A18 band eigensolve: Solved 6 of 6 (20–23 iterations).
+  Averaging the two independently rounded triangles matters for the late, ill-conditioned Schur complements. Mac timings were not decidable: another process was loading the machine.
+- Decision: rejected. Patch `~/.cache/sdpx-e2e/patches/upper-transform-rejected.patch`. A15/A16 differ: those products are exactly symmetric before rounding and keep each upper entry's own rounding, while this change replaced the pair average.
+
+## 2026-10-18 — Column pairing in the two-RHS QDLDL solve (kept); paired symv dot chains (rejected)
+
+- Change: `_solve_rows::<2>` (`solve_many`) pairs independent adjacent columns of its backward sweep the same way as A19, giving four add chains in flight.
+- Result: points are bitwise identical on 48 local cases and medium (b54b58300d4c). Mac T=1, 5 interleaved reps, median against 829a7a0, two passes in opposite arm order:
+  - chainsing_1000_1 −3.7% / −2.7%, chainsing_1000_2 −3.1%;
+  - bnl1 −2.6% / −2.3%, qssp30 −2.1% / −2.2%, agg −1.1% / −2.4%;
+  - nql60 −1.5%, nql30 −1.4%, bandm −1.6%.
+- Decision: kept (part of A19).
+- Rejected: the same idea in `_csc_symv_unsafe`, with column j+1's dot chain run beside column j's loop and its scatter afterwards. Bitwise identical, but slower: agg +5.7%, bnl1 +4.7%, chainsing +4.2%, bandm +4.6%. That kernel is bound by its scatter and loads, not by the add chain. Patch `~/.cache/sdpx-e2e/patches/symv-pair-rejected.patch`.
+
+## 2026-10-18 — QDLDL backward solve pairs independent columns (kept, thermal-ore; provisional on x86)
+
+- Observed: refinement dominates small LPs. LP_agg ran 436 refinements in 28 iterations, with `ir` 7.45 of 12.84 ms; LP_bnl1's profile puts `refine` at 55%. In the single-column D(L+I)ᵀ solve, each column's dot product `s += Lx·x[Li]` is one serial add chain, latency-bound rather than load-bound. `solve_many` already interleaves two right-hand sides.
+- Change: `_dltsolve_unsafe` checks whether column i−1 uses x[i]. Its rows ascend, so that holds only if its first row is i. When it does not, the two sums run interleaved: two add chains, each in its own order.
+- Result: points are bitwise identical on 48 local cases (all LP, SOCP and SDP but the three largest SDPs) and medium (b54b58300d4c, audit PASS). Mac T=1, 5 interleaved reps, median against 3e27b44: chainsing_1000_1 −6.4%, qssp30 −4.9%, bnl1 −4.8%, agg −4.2%, nql60 −3.1%, bandm −3.0%, sched_100_100_orig −1.7%, nb −0.1%.
+- Decision: kept. Under 5% on the Mac, so x86 confirmation is pending.
+
+## 2026-10-18 — Presolve rank image by sorted rows; 'I'-range eigmin retest (rank kept; eigmin rejected again)
+
+- Observed: a Mac profile of nql60 put `presolver::modular_full_row_rank` at 166 of 4093 samples. It is sparse elimination over F_(2^31−1), with every row and the basis kept in `BTreeMap`s. nql60 setup took 23.9 ms.
+- Change: rows are column-sorted `Vec<(usize, u64)>`s, eliminated by a two-pointer merge. The basis is a `Vec` indexed by pivot column. The arithmetic, the elimination order, the cancellation drops and the budget charge (`previous.len()` per elimination) are unchanged, so the result is unchanged.
+- Result: points are bitwise identical on all 51 local cases; medium hash b54b58300d4c, audit PASS. Setup: nql60 23.9 → 15.1 ms, nql30 5.6 → 4.1 ms; other cases are unchanged. Mac T=1, 5 interleaved reps, median: nql60 246.6 → 239.4 ms (−2.9%), nql30 46.2 → 44.3 (−4.1%).
+- Decision: kept. Exact integer arithmetic, so it gives the same result on any host.
+- Retest of the binary64 step-length λmin by index range (`syevr` RANGE='I', patch `~/.cache/sdpx-e2e/patches/eigmin-irange.patch`), because jitter runs since its rejection show iteration counts move ±20% under 1e-6 perturbations. Mac T=1, 5 reps, median against 0d1e5a4: qap6 30.0 → 46.2 ms (+54%), gpp124-1 272 → 325 (+19%, 27 against 24 iterations), gpp100 129 → 151 (+17%), arch0 −3.9%, theta2 −3.7%. hinf3 becomes AlmostSolved and fails the audit. Rejected again: the slowdown is too large to come from iteration spread alone.
+
+## 2026-10-18 — Binary64 H-apply reads only upper triangles (kept, thermal-ore)
+
+- Observed: a Mac repeat profile of gpp100 at 27e10aa puts `PsdBlock::apply` at about 20% of the solve. Within it, 459 of 812 samples are GEMM and 353 are O(n²) passes: two mirrors inside `pooled_gemm_sym` (112), `symmetrize_svec` (88), `mat_to_svec` (82) and `svec_to_mat` (71). Both consumers of each mirrored product read the pair `(a_ij + a_ji)`, and after the mirror that pair equals `(a_ij + a_ij)`.
+- Change: the binary64 apply calls `gemm_sym_upper` (the A15 panel loop, factored out of `pooled_gemm_sym_cached`) with no mirror. `symmetrize_svec` reads only the upper triangle. The final product is packed by `upper_to_svec`, a contiguous column copy computing `(v + v)·(1/√2)`.
+- Result: points are bitwise identical on all 17 local SDPs; medium is Solved in 15 iterations, audit PASS, hash b54b58300d4c. Mac, T=1, 5 interleaved reps, median vs 27e10aa: gpp100 135.1 → 129.3 ms (−4.3%), gpp124-1 282.1 → 271.2 (−3.9%), arch0 384.8 → 371.6 (−3.4%), qap6 30.6 → 29.7 (−2.9%), gpp250-1 1219.6 → 1190.7 (−2.4%), theta2 61.3 → 59.9 (−2.3%), control3 28.5 → 27.9 (−2.1%).
+- Decision: kept. The same bitwise argument holds on any BLAS. Under 5% on the Mac, so x86 confirmation is pending.
+
+## 2026-10-18 — F64-USYM fix: the last panel takes the remainder (kept)
+
+- Observed: once arch0, gpp250-1, mcp500-1 and hinf3 were fetched locally, arch0 (PSD block n = 161) changed points under A15: same status and 22 iterations, different hash. Its last panel was one column wide, and Accelerate computes a one-column gemm with a kernel that rounds differently. The 10 SDPs checked first had no such narrow panel.
+- Change: `n / 32` panels, the last one taking the remainder (32–63 columns). Below n = 32 there is a single full call.
+- Result: points are bitwise identical to the pre-A15 build on all 17 local SDPs (arch0 included) and medium. Single T=1 runs: gpp250-1 1282 → 1218 ms (−5%), arch0 417 → 402 (−3.6%).
+- Decision: kept. The x86 run builds this version.
+
+## 2026-10-18 — Binary64 symmetric products over upper column panels (kept, provisional on x86; u32 QDLDL indices rejected)
+
+- Observed: the x86 receipts of job 226592 (gpp100, T=1) put the condensed H-apply scalings at 162 of 405 ms. Those are `prepare_rhs.scaling`, `recover_rhs.scaling` and `residual.scale`, at about 255 µs per n = 100 apply, against 49 µs on the Mac. LAPACK phases are only 1.3–1.5× slower on x86. Each binary64 apply runs four n³ GEMMs. The second GEMM of each congruence (`pooled_gemm_sym`) computes the full product and then overwrites the lower triangle with the mirrored upper one.
+- Change: `pooled_gemm_sym_cached` in binary64 calls BLAS gemm on 32-column panels, each only down to its last row, then mirrors in 16×16 tiles. Each upper entry is the same BLAS dot product as in the full call.
+- Result: points are bitwise identical on 10 local SDPs and medium (Accelerate). Mac, T=1, 5 reps, median: gpp100 137.3 → 134.6 ms (−2.0%), gpp124-1 287.8 → 281.7 (−2.1%); theta2 and mcp250-1 unchanged.
+- Decision: kept, provisional until the x86 run confirms OpenBLAS gives bitwise identical points and a larger gain there.
+- Rejected in the same session: a u32 copy of QDLDL's row indices for the replayed factor and the serial solves. Points were bitwise identical, but timings were mixed (nql60 −5.8%, nql30 −2%, LP_bnl1 +2.7%, sched_50_50_scaled +2%, LP_agg +8%) and it cost another 4 B per nnz(L).
+
+## 2026-10-18 — Jittered x86 A/B of dsyevd correction vectors and dgesdd SVDs (dsyevd rejected; dgesdd open)
+
+- Setup (job 226592, node7, governor conservative): 20 binary64 SDPs plus gpp250-1 and gpp500-1, T=1 and T=16. Five reps per case (three for gpp250-1, two for gpp500-1, T=16 only), each at static regularization 1e-8·(1 + r·1e-6), with arm order rotated per rep. `native_oracle` audits the r0 points. Arms:
+  - to7e, the base;
+  - to7f, with dsyevd vectors in the PSD centrality correction;
+  - to7g, with the bitwise A10 rebuild and dgesdd for square binary64 SVDs from n = 40;
+  - to7i, with both.
+- Result:
+  - to7f: geomean time ratio against to7e 1.032 (T=1) and 1.042 (T=16). gpp250-1 takes 29.3 iterations against 23.3, with one AlmostSolved at 45. control1's audit fails at both thread counts (the base passes).
+  - to7i: NumericalError at iteration 1 on gpp500-1 r0, and the same control1 audit loss. Rejected.
+  - to7g: audits identical to the base (24 pass, 19 fail; the failures are the base's labeled control/gpp cases). Geomean 0.973 (T=1) and 1.006 (T=16).
+    - Where dgesdd is active, the receipts' SVD time per call drops by 30–52%: arch0 6.86 → 3.82 ms, gpp250-1 19.4 → 9.3, gpp124-1 3.14 → 2.08, theta2 2.49 → 1.78. That is 1.3–4.2% of each solve.
+    - End to end, the iteration spread dominates: gpp124-1 runs 28.0 iterations against 25.6 (1.18×), while gpp250-1 runs 21.7 against 23.3 (0.80×).
+    - At T=16 the small cases differ by up to ±30% between arms whose code paths are identical (n < 40), so that geomean measures noise.
+- Decision: dsyevd rejected. dgesdd stays open for a focused rerun on HEAD: the cases where it is active, more jitters, and min-of-reps.
+
+## 2026-10-18 — QDLDL refactors replay the recorded row pattern (kept, thermal-ore)
+
+- Observed: every QDLDL numeric refactor walks the elimination tree again to find each row's nonzero columns (`y_markers`, `elim_buffer`, `y_idx`), although the pattern depends only on the KKT structure, which is fixed for the whole solve. On the high-refactor SOCP cases the walk is a visible share of the factor time.
+- Change: the first factorization (logical or numeric) records, for each row, the columns it eliminates in processing order (`row_cols: Vec<u32>`, `row_ptr`). Later numeric factorizations replay that list with the same updates in the same order. A factorization that stops at a zero pivot leaves a partial record, so replay requires a complete one.
+- Result: points are bitwise identical on 15 local LP/SOCP inputs and medium. Mac, T=1, 5 reps, median: SOCP_nql60 253.4 → 239.5 ms (−5.5%), sched_100_100_orig 337.6 → 316.1 (−6.4%), qssp30 82.5 → 78.2 (−5.2%), nql30 46.8 → 44.9 (−4.1%), sched_50_50_scaled 48.5 → 45.5 (−6.2%), LP_bnl1 35.5 → 34.1 (−3.9%); chainsing_1000_1 and LP_agg are unchanged. The cost is 4 bytes per nnz(L): nql60 RSS 69.4 → 72.2 MB (+3.9%).
+- Decision: kept.
+
+## 2026-10-18 — LDL auto rule: no flop floor for the supernodal factor (kept, thermal-ore; contract item, backend selection)
+
+- Observed: `ldl_auto_select` uses faer's fill-ratio rule (flops/nnz(L) ≥ 40 → supernodal), plus a floor of 1e8 flops added in the 0.8 work. The journal of that change ("small factors are faster with QDLDL") records no measurement for the floor. Below it, high-fill factors run on QDLDL at 2–4 Gop/s. mcp250-1 (ratio 100, 2.0e7 flops) spends 53% of its solve in refactors, and SOCP_nb (ratio 63, 3.7e7) 71%.
+- Change: the floor is removed, so the ratio test alone decides.
+- Result: of 47 local inputs, only the five with ratio ≥ 40 and under 1e8 flops change backend. The other 42 points are bitwise identical.
+  - Statuses and iteration counts are unchanged; `native.audit` at 1e-6 passes all ten points, with residuals equal to two digits.
+  - Mac T=1, 5 reps, median: mcp250-1 166.7 → 105.2 ms (−37%), nb_L1 200.4 → 165.6 (−17%), axis_wide 8.8 → 7.3 (−17%), nb 206.6 → 189.8 (−8%), nb_L2_bessel 153.6 → 143.9 (−6%).
+  - T=8 (best of 3) keeps the order: mcp250-1 −31%, nb_L1 −16%, axis_wide −17%, nb −6%.
+- Decision: kept. Confirm on x86 at T=1 and T=16 against the scoreboard binary; the cases are known wins or near-ties against MOSEK (mcp250-1 1.0×, nb 2.8× behind).
+
+## 2026-10-18 — Contiguous svec conversions; fused symmetrization in the binary64 H-apply (kept, thermal-ore)
+
+- Observed: the binary64 condensed H-apply (`PsdBlock::apply`) runs about 650 times per gpp100 solve, at about 48 µs each. Each call converts svec ↔ matrix four times through `M[(i, j)]`, writing or reading the transposed triangle with stride n. The middle `mat_to_svec` / `svec_to_mat` pair only symmetrizes the first congruence's result.
+- Change:
+  - `svec_to_mat` copies the contiguous upper columns, then mirrors them in 16×16 tiles.
+  - `mat_to_svec` takes the same tiled path when `DenseMatrix::plain_data` exposes column-major storage; `Symmetric` and `Adjoint` views keep the indexed loop.
+  - `symmetrize_svec` replaces the middle pair, with the same two roundings by 1/√2 per off-diagonal entry.
+- Result: points are bitwise identical on 7 local SDPs, medium and ising11. Mac, T=1, 5 reps, median: gpp100 141.9 → 138.2 ms (−2.6%), qap6 31.4 → 30.6 (−2.5%), theta1 15.3 → 14.8 (−3.3%). The tiled conversions alone gave gpp100 −1.0% and qap6 −2.5%.
+- Decision: kept. On x86 (L1 smaller than one 101×101 matrix) the strided pass should cost more, so the gain may be larger there.
+
+## 2026-10-18 — Schur dot accumulation 16 outputs wide (kept, thermal-ore)
+
+- Observed: SDP_planted80 (one 80×80 block, 300 constraints with about 150 scattered svec entries each) spends 62% of its Mac solve in dense-block Schur assembly. `schur.dot_fma` takes 11 ms for 8 × 6.75M FMAs, only 2.4 GFMA/s. With four outputs per pass, the vectorized loop keeps one or two dependent FMA chains, which leaves the FMA unit waiting on latency.
+- Change: `fma_rows` accumulates 16 outputs per pass for both the 8-entry and 4-entry groups; each output keeps its ascending-k FMA order. On the Mac, 32 outputs was no better (6.46 vs 6.17 ms), and an extra 4-wide stage before the scalar tail was within noise.
+- Result: points are bitwise identical on 9 local SDPs, medium and ising11. Mac, T=1, 5 reps, median: planted80 59.8 → 54.7 ms (−8.5%; dot_fma 10.97 → 6.20 ms), control3 30.2 → 29.1 (−3.6%), theta2 64.1 → 62.9 (−1.9%). qap5, qap6 and gpp100 are unchanged.
+- Decision: kept. The x86 AVX2 path runs the same loop under its `avx2,fma` wrapper; confirm there, where 32 outputs might pay.
+
+## 2026-10-18 — One slack projection per solve; shared contiguous spectral rebuild (kept, thermal-ore)
+
+- Observed (macOS `sample` of repeated solves; x86 receipts of job 226585): the original-coordinate slack projection (`project_slack`) runs twice per Solved solve, once in the termination check and again in the final reconstruction, on the same point. Its cost is a dense `dsyev` per PSD cone plus a strided triple-loop rebuild. mcp250-1 (chordal, one 250×250 original cone) spends 20% of its samples there. On x86, post-processing alone is 15% of mcp500-1 and 8% of mcp250-1.
+- Change:
+  - `DefaultSolution` keeps its last projection: `x`, the slack it replaced, and the result. A bitwise-equal input (sign of zero included) reuses it.
+  - `svec_eigen_f64` and `svec_spectral_f64` serve both the PSD centrality correction and `project_psd_f64`. The rebuild sums each entry in ascending k from −0, as `Iterator::sum` did, over contiguous scaled columns.
+- Result: points are bitwise identical to HEAD on 13 local SDPs, LP_agg, LP_afiro, SOCP_nb, qssp30 and sched_50_50_orig, plus medium and ising11 (same hashes). Mac, T=1, 5 interleaved reps, median: mcp250-1 190.1 → 165.7 ms (−12.8%), theta2 65.4 → 63.6 (−2.8%), theta1 15.6 → 15.3 (−1.9%), planted80 59.7 → 58.9 (−1.3%).
+- Decision: kept. mcp500-1 should gain more (x86 post-processing alone is 196 ms of 1314).
+
+## 2026-10-18 — Binary64 PSD step admission by Cholesky, capped components, contiguous correction rebuild (kept, thermal-ore)
+
+- Hypothesis: the curve trials and the corrector's 1% gain test only need a yes/no answer. A Cholesky of I + α·Δ̃ gives that answer at a fraction of the cost of the eigensolve (Mac dpotrf against dsyevr: n = 8 0.25 vs 1.4 µs, n = 101 12 vs 263 µs). The same test settles a step-length component whose cap does not bind. Callers only use min(αz, αs), so in binary64 the s component can take αz as its cap.
+- Change:
+  - `Variables::step_admits` (default `None`). `DefaultVariables` answers for binary64 symmetric cones with a PSD block of n ≥ 8, through `CompositeCone::step_admits`; PSD cones run one Cholesky per side. Trials use it in place of `calc_step_length`. The corrector computes its step length only after the test admits the 1% gain.
+  - `step_length_psd_component` (binary64, n > 3) returns αmax after a successful Cholesky at αmax, before the eigensolve.
+  - The serial binary64 `step_length` and `prepare_affine_bounds` cap the s component at αz.
+  - The `centrality_correction` rebuild sums the corrected eigenpairs from contiguous scaled columns, in the same order (bitwise).
+- Size gate: without it, SDP_truss2 (33 blocks of n = 4) lost 6% on the Mac. Its corrector step length went 0.275 → 0.521 ms: at n = 4, the W congruence that the test repeats costs as much as the whole step length, so an accepted corrector paid twice. With n ≥ 8, truss2 and truss4 match HEAD (min of 7: 5.33 vs 5.35 ms, 0.76 vs 0.75 ms).
+- Result: points are bitwise identical to HEAD.
+  - x86, job 226585: node7, release, `to7a` (HEAD) against `to7e` (before the size gate); 21 binary64 SDPs at T=1 and T=16, ABBA, 5 reps (gpp250-1 3); point hashes; r0 audited.
+  - Local: medium (b54b58300d4c) and ising11 (b971aee3cf2d).
+  - Min-of-reps API geomean: 0.953 at T=1 and 0.924 at T=16. Medians give 0.975 and 0.954; within one arm the node spreads ±25% on sub-200 ms cases.
+  - Per-case min ratios at T=1: gpp100 0.90, gpp124-1 0.94, gpp250-1 0.97, arch0 0.96, theta1 0.86, control2 0.73, qap5 0.74, mcp500-1 0.96. The affine + final step-length phases fall to 0.65–0.93 everywhere except the truss cases.
+  - On the Mac, gpp100 eigensolves fall from 204 to 73, plus 41 capped tests.
+- Decision: kept. Open, as job 226592 (jittered static regularization, four arms): dsyevd vectors in the correction, and dgesdd for square binary64 SVDs from n = 40 (Mac n = 501: 15.7 vs 46.5 ms). Both are non-bitwise. Patches are in `~/.cache/sdpx-e2e/patches/evd-dsyevd.patch` and `gesdd.patch`.
+
+## 2026-10-18 — Binary64 PSD: split congruence, static regularization, 'I'-range eigmin (all rejected, thermal-ore)
+
+- Split congruence (`to7b`): op(a)·X·op(a)ᵀ as `trmm` with X's halved lower triangle plus `syr2k`, 3n³ instead of two 4n³ GEMMs, in the condensed H-apply and `mul_Wx`. Job 226577, node7, release, 22 binary64 SDPs, ABBA, 5 reps (gpp250-1 3), r0 audited. Geomean against `to7a` (HEAD): 1.042 at T=1, 1.070 at T=16. Iteration counts move both ways: gpp124-1 31 → 24 (0.69), gpp100 20 → 23 (1.28), gpp250-1 20 → 25 (1.47), hinf1 20 → 22; hinf3 becomes Solved. control3 is 1.33 at equal iterations, so OpenBLAS `dtrmm`/`dsyr2k` are slower per flop than `dgemm` at these sizes. On the Mac, Accelerate's versions lose too at small n (qap6 n = 37: 33 → 44 ms). Rejected; patch `~/.cache/sdpx-e2e/patches/split-admit-full.patch`.
+- Static regularization (contract item; job 226579, node30, `to7a`, 58 cases, T=1, 3 reps, r0 audited by `native_oracle.jl`):
+  - 1e-9: geomean 0.973. hinf3 and sched_100_50_orig become audited solves. nql30, nql60 and sched_100_100_orig become AlmostSolved (three current wins against MOSEK).
+  - 1e-10: geomean 1.011. agg 0.67 and gpp124-1 0.57 (31 → 23 it), but beaconfd 8 → 17 it (2.09). hinf1 becomes AlmostSolved, sched_50_50_orig InsufficientProgress and f64_large NumericalError.
+  - LP refinement counts fall with the constant (agg 436 → 130 refinements), but the iteration paths of several SOCP and LP cases depend on it. No constant beats 1e-8 without new failures. The default stays.
+- 'I'-range eigmin in binary64 (`syevr` index 1 instead of the full spectrum; Mac `syevr` n = 101: 171 against 242 µs). Mac T=1: gpp100 21 → 23 it (+12%), qap6 22 → 23 (+7.5%), gpp124-1 24 → 23 (−8%), theta2 −6%. The ulp-level change in λmin moves iteration counts, as the comment in `eigval_min` says. Rejected; the full-spectrum path stays.
+
+## 2026-10-18 — F64-THR follow-up: no solve pin without a pool (rejected); run-order clock bias
+
+- Hypothesis: a pool-less solve pinned to the first CPU leaves the core its setup warmed.
+- Test (job 226574, node7, `to6y` with `SDPX_X_PIN` first/none, 12 pool-less cases, 9 reps interleaved t1, t16first, t16none): none/first, median ratio:
+
+  | Case | none/first |
+  |---|---|
+  | chainsing_1000_1/2/3 | 0.89 / 0.96 / 0.83 |
+  | qssp30 | 0.91 |
+  | nql60 | 1.03 |
+  | sched_100_50_orig | 0.89 |
+  | nb | 0.98 |
+  | nb_L2_bessel | 0.96 |
+  | arch0 | 1.02 |
+  | control3 | 1.18 |
+  | mcp250-1 | 1.08 |
+  | qap6 | 1.45 |
+
+  The geometric mean is 1.005. Rejected.
+- Run-order bias: `cpus.py` puts both T=1 and the pinned T=16 solves on CPU 0. Every T=16 configuration runs right after another run on CPU 0, so that core is already clocked up. The T=1 run comes after the previous case's unpinned run. LP_agg T=1 takes 54 ms against 25 ms at T=16, with identical counters (29 factorizations, 570 solves) and both serial. So T=16/T=1 ratios of sub-200 ms cases flatter T=16. Pinned "first" also beats "cur" and "none" partly because CPU 0 is the warm core. Configurations compared within one rep run in the same warm position (base and rule in job 226573), so the F64-THR ratios against base stand. A protocol with an idle gap or a rotated order would be needed to settle the pin target.
+
+## 2026-10-18 — B3 F64-THR: binary64 cone lanes and pools from measured work (kept, thermal-ore)
+
+- Observed (x86, conservative governor, 1.5–2.25 GHz nominal, about 3 GHz boost; jobs 226539, 226543 and 226544 on node9): at 16 threads Float64 solves ran up to 2× slower than at one thread.
+  - (a) A single dominant PSD cone ran on a worker woken for short phases, on a core the governor keeps at a low clock. arch0 took 2.76 s against 1.47 s with the cone on the solve thread.
+  - (b) Tiny SOC lanes, and pools the serial QDLDL factor never uses, only wake cold cores (chainsing, qssp30, nql60, sched, nb).
+  - (c) csdr3's arrow KKT really uses its pool.
+  - (d) The serial path under a 16-CPU mask runs at 1.41 GHz against 3.02 GHz under a 1-CPU mask (perf stat: same cycles and instructions).
+- Change: `ConeThreading::build` marks binary64 cones `light` unless the work outside the largest cone is at least a fifth of the total and the cones hold two `F64_LANE_WORK` (2²⁰ `cone_cost` units, about 1 ms). Light PSD phases stay serial. `CompositeCone::release_idle_pool` drops the pool when the KKT factor runs on one thread. QDLDL now reports the pool width only when its elimination tree splits; it reported 1 before. medium and f64_large keep their lanes (their four smaller cones overlap the largest).
+- Result (job 226573, node7, release, 22 cases interleaved, 3 reps, median API ms, `SDPX_RECEIPT` on, ratio to T=1 in brackets):
+
+  | Case | T=1 | T=16 before | T=16 rule |
+  |---|---|---|---|
+  | SDP_arch0 | 1470 | 2977 (2.03) | 1497 (1.02) |
+  | SDP_gpp124-1 | 1535 | 1736 (1.13) | 1526 (0.99) |
+  | SDP_gpp100 | 465 | 572 (1.23) | 477 (1.02) |
+  | SDP_theta2 | 183 | 260 (1.42) | 208 (1.14) |
+  | SDP_control3 | 92 | 128 (1.39) | 89 (0.97) |
+  | SDP_mcp250-1 | 405 | 504 (1.24) | 394 (0.97) |
+  | SDP_mcp500-1 | 1761 | 2103 (1.19) | 1931 (1.10) |
+  | SDP_planted80 | 189 | 146 (0.77) | 139 (0.73) |
+  | f64_medium | 6701 | 3678 (0.55) | 3705 (0.55) |
+  | csdr3 | 2137 | 1368 (0.64) | 1314 (0.61) |
+  | SOCP_chainsing_1000_1/2/3 | 76/124/100 | 115/129/106 | 105/100/99 |
+  | SOCP_qssp30 | 198 | 220 (1.11) | 203 (1.03) |
+  | SOCP_nql60 | 494 | 563 (1.14) | 525 (1.06) |
+  | SOCP_sched_100_50_orig | 351 | 400 (1.14) | 350 (1.00) |
+  | SOCP_nb | 375 | 449 (1.20) | 366 (0.98) |
+  | SOCP_nb_L2_bessel | 291 | 309 (1.06) | 289 (0.99) |
+
+  Statuses and iteration counts are unchanged in every row. theta1 (T=1 50–83 ms over the reps), hinf1 (5 or 10 ms in every configuration) and LP_agg do not resolve at 3 reps. qap6 is 154 against 138 ms, but the rep ranges overlap (127–155 against 135–153).
+- Solve pin target (same job): pinning the solve to its current CPU or not pinning is worse than the first allocated CPU. theta2 1.56 and 2.21 against 1.14; gpp100 1.19 and 1.80 against 1.02. `SolveAffinityGuard` is unchanged.
+- Points: T=4 equals T=1 bitwise on the local SDP, SOCP and LP set, except faer on mcp500 (it differs at HEAD too). Fast-profile E2E medium: Solved/15, audit PASS; at T=4 its time is unchanged.
+- Decision: kept. MOSEK at 16 threads still wins mcp250, mcp500, chainsing and qssp30, now by the T=1 margin.
+- Open:
+  - theta2 1.14 and mcp500 1.10 keep the pool for the condensed or faer factor.
+  - chainsing_1 is 1.37 (102–105 against 74–97 ms). Without a pool, the unpinned solve was faster on 6 of the 8 SOCPs (chainsing_1 80–95 ms), plausibly because setup runs unpinned and the pin then moves the solve to a cold first CPU. Test pinning only when a pool exists.
+
 ## 2026-10-16 — Scale-relative Jacobi tests in the 2×2/3×3 kernels (kept, thermal-ore)
 
 `start_scale::overshooting_start_still_solves` (Bits256, τ₀ 1e-70) had

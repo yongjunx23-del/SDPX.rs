@@ -137,6 +137,8 @@ pub struct PSDTriangleCone<T> {
     pub(crate) n: usize,                  // matrix dimension, i.e. matrix is n × n
     numel: usize, // total number of elements in (lower triangle of) the matrix
     pub(crate) data: Box<PSDConeData<T>>, // Boxed so that the PSDCone enum_dispatch variant isn't huge
+    /// Step lengths only test whether `αmax` is admissible (binary64).
+    pub(crate) admit: bool,
 }
 
 impl<T> PSDTriangleCone<T>
@@ -149,6 +151,7 @@ where
             n,
             numel: triangular_number(n),
             data: Box::new(PSDConeData::<T>::new(n)),
+            admit: false,
         }
     }
 
@@ -493,6 +496,28 @@ where
             self.data.has_scaled_dz = false;
             return out;
         }
+        if self.admit {
+            // A yes/no bound: one Cholesky of I + αmax·Δ per side replaces
+            // the eigensolve, about 20× cheaper at n = 100.
+            let f = &*self.data;
+            let ok = with_work(self.n, |w: &mut PsdWork<T>| {
+                [(dz, false), (ds, true)].into_iter().all(|(d, primal)| {
+                    admits_component(
+                        d,
+                        if primal { &f.Rinv } else { &f.R },
+                        &f.Λisqrt,
+                        primal,
+                        αmax,
+                        &mut w.vector,
+                        &mut w.mat1,
+                        &mut w.mat2,
+                        &mut w.svd.Vt,
+                    )
+                })
+            });
+            let α = if ok { αmax } else { T::zero() };
+            return (α, α);
+        }
         if sdpx_arithmetic::inner_parallel::paired() {
             let (n, f) = (self.n, &*self.data);
             with_work(n, |w: &mut PsdWork<T>| {
@@ -537,8 +562,15 @@ where
                 )
             })
         } else {
+            // Callers use min(αz, αs): binary64 caps the second component at
+            // the first. (The MPFR certificate depends on the cap.)
             let αz = self.step_component(dz, false, αmax);
-            let αs = self.step_component(ds, true, αmax);
+            let cap = if T::precision_bits() <= 53 {
+                αz
+            } else {
+                αmax
+            };
+            let αs = self.step_component(ds, true, cap);
             (αz, αs)
         }
     }
@@ -655,7 +687,7 @@ where
                     &f.Rinv,
                     &f.Λisqrt,
                     true,
-                    αmax,
+                    αz,
                     &mut w.vector,
                     &mut w.mat1,
                     &mut w.mat2,
@@ -786,46 +818,9 @@ impl<T: FloatT> PSDTriangleCone<T> {
         self.mul_W(MatrixShape::N, &mut zz, &trial_z, T::one(), T::zero());
         let mut v = vec![T::zero(); len];
         self.circ_op(&mut v, &ss, &zz);
-        // Unpack svec(V) to a binary64 column-major matrix.
-        let mut a = vec![0f64; n * n];
-        let r = std::f64::consts::FRAC_1_SQRT_2;
-        let mut idx = 0;
-        for j in 0..n {
-            for i in 0..=j {
-                let x = v[idx].to_f64().unwrap_or(f64::NAN);
-                a[i + j * n] = if i == j { x } else { x * r };
-                idx += 1;
-            }
-        }
-        if !a.iter().all(|x| x.is_finite()) {
+        let Some((a, w)) = svec_eigen_f64(&v, n) else {
             return false;
-        }
-        let mut w = vec![0f64; n];
-        let mut info = 0;
-        let mut query = [0f64];
-        unsafe {
-            lapack::dsyev(
-                b'V', b'U', n as i32, &mut a, n as i32, &mut w, &mut query, -1, &mut info,
-            )
         };
-        let lwork = (query[0] as usize).max(3 * n);
-        let mut work = vec![0f64; lwork];
-        unsafe {
-            lapack::dsyev(
-                b'V',
-                b'U',
-                n as i32,
-                &mut a,
-                n as i32,
-                &mut w,
-                &mut work,
-                lwork as i32,
-                &mut info,
-            )
-        };
-        if info != 0 {
-            return false;
-        }
         let (lo, hi) = (lo.to_f64().unwrap_or(0.), hi.to_f64().unwrap_or(0.));
         let t: Vec<f64> = w
             .iter()
@@ -835,21 +830,8 @@ impl<T: FloatT> PSDTriangleCone<T> {
             return false;
         }
         // ds -= svec(Q diag(t) Q').
-        let mut idx = 0;
-        for j in 0..n {
-            for i in 0..=j {
-                let c: f64 = (0..n)
-                    .filter(|&k| t[k] != 0.)
-                    .map(|k| a[i + k * n] * t[k] * a[j + k * n])
-                    .sum();
-                let c = if i == j {
-                    c
-                } else {
-                    c * std::f64::consts::SQRT_2
-                };
-                ds[idx] -= T::from_f64(c).unwrap();
-                idx += 1;
-            }
+        for (d, v) in ds.iter_mut().zip(svec_spectral_f64(&a, n, &t)) {
+            *d -= T::from_f64(v).unwrap();
         }
         true
     }
@@ -1059,6 +1041,112 @@ where
     step_length_psd_component(wm1, eig, wv, Λisqrt, αmax, &mut wm2.data)
 }
 
+/// Binary64 eigendecomposition `mat(v) = A diag(w) Aᵀ` (dsyev, vectors in
+/// the columns of `A`); `None` for a non-finite entry or a LAPACK failure.
+pub(crate) fn svec_eigen_f64<T: FloatT>(v: &[T], n: usize) -> Option<(Vec<f64>, Vec<f64>)> {
+    let mut a = vec![0f64; n * n];
+    let r = std::f64::consts::FRAC_1_SQRT_2;
+    let mut idx = 0;
+    for j in 0..n {
+        for i in 0..=j {
+            let x = v[idx].to_f64().unwrap_or(f64::NAN);
+            a[i + j * n] = if i == j { x } else { x * r };
+            idx += 1;
+        }
+    }
+    if !a.iter().all(|x| x.is_finite()) {
+        return None;
+    }
+    let mut w = vec![0f64; n];
+    let (mut info, mut query) = (0, [0f64]);
+    let ni = n as i32;
+    unsafe {
+        lapack::dsyev(
+            b'V', b'U', ni, &mut a, ni, &mut w, &mut query, -1, &mut info,
+        )
+    };
+    let mut work = vec![0f64; (query[0] as usize).max(3 * n)];
+    let lwork = work.len() as i32;
+    unsafe {
+        lapack::dsyev(
+            b'V', b'U', ni, &mut a, ni, &mut w, &mut work, lwork, &mut info,
+        )
+    };
+    (info == 0).then_some((a, w))
+}
+
+/// svec(A diag(t) Aᵀ) over the k with t[k] ≠ 0. Each entry sums in ascending
+/// k from −0, as `Iterator::sum` does, over contiguous scaled columns.
+pub(crate) fn svec_spectral_f64(a: &[f64], n: usize, t: &[f64]) -> Vec<f64> {
+    let kept: Vec<usize> = (0..n).filter(|&k| t[k] != 0.).collect();
+    let mut scaled = Vec::with_capacity(kept.len() * n);
+    for &k in &kept {
+        scaled.extend(a[k * n..(k + 1) * n].iter().map(|&q| q * t[k]));
+    }
+    let mut out = Vec::with_capacity(n * (n + 1) / 2);
+    let mut c = vec![-0f64; n];
+    for j in 0..n {
+        let c = &mut c[..=j];
+        for (m, &k) in kept.iter().enumerate() {
+            let (u, q) = (&scaled[m * n..m * n + j + 1], a[j + k * n]);
+            if m == 0 {
+                c.iter_mut().zip(u).for_each(|(c, &u)| *c = u * q);
+            } else {
+                c.iter_mut().zip(u).for_each(|(c, &u)| *c += u * q);
+            }
+        }
+        let sq2 = std::f64::consts::SQRT_2;
+        out.extend(
+            c.iter()
+                .enumerate()
+                .map(|(i, &v)| if i == j { v } else { v * sq2 }),
+        );
+    }
+    out
+}
+
+/// Whether I + α·Δ is positive definite for the scaled step matrix Δ that
+/// `step_component_inner` would pass to the eigensolve, i.e. whether α is at
+/// most that component's bound.
+fn admits_component<T: FloatT>(
+    direction: &[T],
+    rx: &Matrix<T>,
+    Λisqrt: &[T],
+    primal: bool,
+    α: T,
+    wv: &mut Vec<T>,
+    wm1: &mut Matrix<T>,
+    wm2: &mut Matrix<T>,
+    wm3: &mut Matrix<T>,
+) -> bool {
+    if direction.is_empty() {
+        return true;
+    }
+    let shape = if primal {
+        MatrixShape::T
+    } else {
+        MatrixShape::N
+    };
+    mul_Wx_scratch(shape, wv, direction, T::one(), T::zero(), rx, wm1, wm2, wm3);
+    svec_to_mat(wm1, wv);
+    lrscale_symmetric(wm1, Λisqrt);
+    admits(wm1, α, &mut wm2.data)
+}
+
+/// Whether I + α·Δ is positive definite (Δ symmetric, full storage), by a
+/// Cholesky of a copy in `buf`.
+fn admits<T: FloatT>(delta: &Matrix<T>, α: T, buf: &mut Vec<T>) -> bool {
+    let n = delta.nrows();
+    buf.clear();
+    buf.extend(delta.data().iter().map(|&v| v * α));
+    for j in 0..n {
+        buf[j * (n + 1)] += T::one();
+    }
+    let mut info = 0;
+    T::xpotrf(b'U', n as i32, buf, n as i32, &mut info);
+    info == 0
+}
+
 fn step_length_psd_component<T>(
     workΔ: &mut Matrix<T>,
     engine: &mut EigEngine<T>,
@@ -1077,6 +1165,12 @@ where
             svec_to_mat(workΔ, d);
             lrscale_symmetric(workΔ, Λisqrt);
             let __ts = std::time::Instant::now();
+            // In binary64 a Cholesky shows a cap that does not bind about
+            // 20× cheaper than the eigensolve.
+            if T::precision_bits() <= 53 && workΔ.nrows() > 3 && admits(workΔ, αmax, work) {
+                crate::receipt::phase("cone_eigmin_capped", __ts.elapsed());
+                return αmax;
+            }
             let fast = if T::precision_bits() > 64 && workΔ.nrows() > 3 {
                 eigval_min_f64(workΔ, αmax)
             } else {

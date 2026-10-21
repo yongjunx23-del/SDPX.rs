@@ -18,7 +18,7 @@ use crate::solver::kkt::direct::{BoxedDirectLDLSolver, DirectLDLSolver};
 use crate::solver::kkt::{HasLinearSolverInfo, LinearSolverInfo};
 use rayon::prelude::*;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -230,35 +230,41 @@ fn ldl_rec<T: FloatT>(
         let tail: Vec<usize> = first[c..].iter().map(|&f| f - c).collect();
         let sign2 = |k: usize| sign(c + k);
         let mut count2 = 0;
-        let (r1, r2) = join_if(
-            ways > 1,
-            || {
-                ldl_rec(
-                    left,
-                    ld,
-                    c,
-                    &first[..c],
-                    sign,
-                    reg,
-                    regularize_count,
-                    ways,
-                    d1,
-                )
-            },
-            || {
-                ldl_rec(
-                    &mut right[c..],
-                    ld,
-                    n - c,
-                    &tail,
-                    &sign2,
-                    reg,
-                    &mut count2,
-                    ways,
-                    d2,
-                )
-            },
-        );
+        let first_side = || {
+            ldl_rec(
+                left,
+                ld,
+                c,
+                &first[..c],
+                sign,
+                reg,
+                regularize_count,
+                ways,
+                d1,
+            )
+        };
+        let second_side = || {
+            ldl_rec(
+                &mut right[c..],
+                ld,
+                n - c,
+                &tail,
+                &sign2,
+                reg,
+                &mut count2,
+                ways,
+                d2,
+            )
+        };
+        // The larger side stays on this worker: a worker waiting for a
+        // stolen larger side would take unrelated work meanwhile (BFSS
+        // L11u: the 2m side of a 3m ORE leaf, after the m side).
+        let (r1, r2) = if 2 * c >= n {
+            join_if(ways > 1, first_side, second_side)
+        } else {
+            let (r2, r1) = join_if(ways > 1, second_side, first_side);
+            (r1, r2)
+        };
         *regularize_count += count2;
         return r1.and(r2);
     }
@@ -446,17 +452,34 @@ fn exact_product<T: FloatT>(
     });
 }
 
-/// `rayon::join` when spare workers may take `b`.
+/// `rayon::join` when spare workers may take `b`; under a board offer `b`
+/// is posted instead, so this thread never waits in a join.
 fn join_if<RA: Send, RB: Send>(
     paired: bool,
     a: impl FnOnce() -> RA + Send,
     b: impl FnOnce() -> RB + Send,
 ) -> (RA, RB) {
-    if paired {
-        rayon::join(a, b)
-    } else {
-        (a(), b())
+    use sdpx_arithmetic::inner_parallel::board;
+    use std::sync::Mutex;
+    if !paired {
+        return (a(), b());
     }
+    if !board::offered() {
+        return rayon::join(a, b);
+    }
+    let (a, b) = (Mutex::new(Some(a)), Mutex::new(Some(b)));
+    let (ra, rb) = (Mutex::new(None), Mutex::new(None));
+    board::run(2, &|i| {
+        if i == 0 {
+            *ra.lock().unwrap() = a.lock().unwrap().take().map(|f| f());
+        } else {
+            *rb.lock().unwrap() = b.lock().unwrap().take().map(|f| f());
+        }
+    });
+    (
+        ra.into_inner().unwrap().unwrap(),
+        rb.into_inner().unwrap().unwrap(),
+    )
 }
 
 /// Unpivoted dense LDLᵀ with the same per-pivot dynamic regularization
@@ -1002,6 +1025,8 @@ struct Leaf<T> {
     v: Vec<T>,
     batch_w: Vec<T>,
     batch_v: Vec<T>,
+    // `contribution_product`, formed in the leaf phase (empty otherwise).
+    product: Vec<T>,
 }
 
 impl<T: FloatT> Leaf<T> {
@@ -1025,6 +1050,7 @@ impl<T: FloatT> Leaf<T> {
             v: Vec::new(),
             batch_w: Vec::new(),
             batch_v: Vec::new(),
+            product: Vec::new(),
         }
     }
 
@@ -1115,7 +1141,30 @@ impl<T: FloatT> Leaf<T> {
                 factor.forward_suffix(column, start)
             }
         };
-        if split && width > 0 {
+        // Posting pays from one grain of work per extra item: the board is
+        // one lock, which thousands of small leaves would contend for (csdr3,
+        // 4200 SOC leaves at 4 threads: +2.3%).
+        let posted = sdpx_arithmetic::inner_parallel::board::offered() && {
+            use sdpx_arithmetic::inner_parallel as ip;
+            let columns = self.coupled.len();
+            let work =
+                ip::weight(T::precision_bits() as usize) * (width * width / 2 * columns) as u128;
+            ip::tasks_if(true, work, columns) > 1
+        };
+        if split && width > 0 && posted {
+            // One posted item per column, so idle workers of the leaf phase
+            // help the longest Y first and no worker waits in a join.
+            let columns: Vec<std::sync::Mutex<&mut [T]>> = self
+                .y
+                .chunks_mut(width)
+                .enumerate()
+                .filter(|(j, _)| packed || couples[*j])
+                .map(|(_, column)| std::sync::Mutex::new(column))
+                .collect();
+            sdpx_arithmetic::inner_parallel::board::run(columns.len(), &|i| {
+                solve(&mut columns[i].lock().unwrap())
+            });
+        } else if split && width > 0 {
             self.y
                 .par_chunks_mut(width)
                 .enumerate()
@@ -1365,8 +1414,55 @@ fn one_wave_chunks(work: &[f64], workers: usize, cap: usize) -> Vec<usize> {
     chunks
 }
 
+/// Leaves whose `YᵀD⁻¹Y` is one residue product ([`contribution_product`]):
+/// substantial products whose result storage is proportional to Y.
+fn residue_contribution<T: FloatT>(leaf: &Leaf<T>, t: usize) -> bool {
+    let (g, q) = (leaf.ids.len(), leaf.coupled.len());
+    T::residue_product_applies(q, q, g) && g * q * q >= 1 << 21 && q * q <= 8 * g * t
+}
+
+/// Working-precision storage of one [`contribution_product`]: Y, Z and the
+/// product (its residues are transient).
+fn contribution_bytes<T: FloatT>(leaf: &Leaf<T>) -> usize {
+    let (g, q) = (leaf.ids.len(), leaf.coupled.len());
+    (2 * g * q + q * q) * std::mem::size_of::<T>()
+}
+
+/// Upper triangle of a factored leaf's `YᵀD⁻¹Y` over its coupled columns,
+/// each entry one exact sum rounded once (Z = D⁻¹Y rounded entrywise).
+fn contribution_product<T: FloatT>(leaf: &Leaf<T>, t: usize) -> Vec<T> {
+    let (g, q) = (leaf.ids.len(), leaf.coupled.len());
+    let mut packed = Vec::new();
+    let y = if q == t {
+        &leaf.y[..]
+    } else {
+        packed.reserve_exact(g * q);
+        for &j in &leaf.coupled {
+            packed.extend_from_slice(&leaf.y[j * g..(j + 1) * g]);
+        }
+        &packed[..]
+    };
+    let mut z = Vec::with_capacity(g * q);
+    for source in y.chunks(g) {
+        z.extend(source.iter().zip(&leaf.factor.dinv).map(|(&a, &d)| a * d));
+    }
+    let mut product = vec![T::zero(); triangular_number(q)];
+    let timer = crate::receipt::start();
+    let exact = T::xgemm_upper_exact(b'T', b'N', q, q, g, y, g, &z, g, &mut product, None, None);
+    crate::receipt::finish("arrow.residue_contribution", timer);
+    if !exact {
+        for c in 0..q {
+            for r in 0..=c {
+                product[r + triangular_number(c)] =
+                    T::dot_fma(y[r * g..(r + 1) * g].iter().zip(&z[c * g..(c + 1) * g]));
+            }
+        }
+    }
+    product
+}
+
 fn subtract_contributions<T: FloatT>(
-    leaves: &[Leaf<T>],
+    leaves: &mut [Leaf<T>],
     s: &mut [T],
     t: usize,
     pool: Option<&rayon::ThreadPool>,
@@ -1381,45 +1477,12 @@ fn subtract_contributions<T: FloatT>(
     // the bits. Short groups batch too: on Λ35 (36 leaves of g ≈ 114,
     // q = 170, 64 threads) residue products cut contribution CPU 2.3× and
     // iterations 3.8%, for 1.5 GB more peak RSS (5.6 → 7.2 GB; residue
-    // workspace of the concurrent products).
+    // workspace of the concurrent products). Products the leaf phase
+    // already formed (`Leaf::product`) are only subtracted here.
     let width = pool.map_or(1, |p| p.current_num_threads());
-    let eligible = |leaf: &Leaf<T>| {
-        let (g, q) = (leaf.ids.len(), leaf.coupled.len());
-        T::residue_product_applies(q, q, g) && g * q * q >= 1 << 21 && q * q <= 8 * g * t
-    };
+    let eligible = |leaf: &Leaf<T>| residue_contribution(leaf, t);
     if leaves.iter().any(eligible) {
-        let build = |leaf: &Leaf<T>| {
-            let (g, q) = (leaf.ids.len(), leaf.coupled.len());
-            let mut packed = Vec::new();
-            let y = if q == t {
-                &leaf.y[..]
-            } else {
-                packed.reserve_exact(g * q);
-                for &j in &leaf.coupled {
-                    packed.extend_from_slice(&leaf.y[j * g..(j + 1) * g]);
-                }
-                &packed[..]
-            };
-            let mut z = Vec::with_capacity(g * q);
-            for source in y.chunks(g) {
-                z.extend(source.iter().zip(&leaf.factor.dinv).map(|(&a, &d)| a * d));
-            }
-            let mut product = vec![T::zero(); triangular_number(q)];
-            let timer = crate::receipt::start();
-            let exact =
-                T::xgemm_upper_exact(b'T', b'N', q, q, g, y, g, &z, g, &mut product, None, None);
-            crate::receipt::finish("arrow.residue_contribution", timer);
-            if !exact {
-                for c in 0..q {
-                    for r in 0..=c {
-                        product[r + triangular_number(c)] =
-                            T::dot_fma(y[r * g..(r + 1) * g].iter().zip(&z[c * g..(c + 1) * g]));
-                    }
-                }
-            }
-            product
-        };
-        for group in leaves.chunk_by(|a, b| eligible(a) == eligible(b)) {
+        for group in leaves.chunk_by_mut(|a, b| eligible(a) == eligible(b)) {
             if !eligible(&group[0]) {
                 // Keep these leaves column-parallel and avoid square result
                 // storage, preserving their position in every entry's sum.
@@ -1433,28 +1496,29 @@ fn subtract_contributions<T: FloatT>(
             // 128-thread peak RSS from 23 to 36 GiB, about this estimate;
             // also counting residues split it into batches of 2–3 leaves
             // and slowed contributions 6.2 → 10.7 s at 64 threads.
-            let bytes: usize = group
-                .iter()
-                .map(|l| {
-                    let (g, q) = (l.ids.len(), l.coupled.len());
-                    (2 * g * q + q * q) * std::mem::size_of::<T>()
-                })
-                .sum();
+            let bytes: usize = group.iter().map(contribution_bytes).sum();
             let count = group
                 .len()
                 .div_ceil(width)
                 .max(bytes.div_ceil(BATCH_WORK_BYTES))
                 .min(group.len());
-            let batches = group.chunks(group.len().div_ceil(count));
-            for batch in batches {
+            let size = group.len().div_ceil(count);
+            for batch in group.chunks_mut(size) {
                 let ways = width.div_ceil(batch.len()).clamp(1, 8);
-                let build = |leaf: &Leaf<T>| crate::algebra::with_split_hint(ways, || build(leaf));
+                let build = |leaf: &mut Leaf<T>| {
+                    if leaf.product.is_empty() {
+                        crate::algebra::with_split_hint(ways, || contribution_product(leaf, t))
+                    } else {
+                        std::mem::take(&mut leaf.product)
+                    }
+                };
                 let products: Vec<Vec<T>> = match pool {
-                    Some(p) => p.install(|| batch.par_iter().map(build).collect()),
-                    None => batch.iter().map(build).collect(),
+                    Some(p) => p.install(|| batch.par_iter_mut().map(build).collect()),
+                    None => batch.iter_mut().map(build).collect(),
                 };
                 // Columns are independent; each entry still subtracts leaves
                 // in the original order before the next batch begins.
+                let batch = &*batch;
                 let scatter = |(j, col): (usize, &mut [T])| {
                     for (leaf, product) in batch.iter().zip(&products) {
                         if !leaf.couples[j] {
@@ -1695,12 +1759,19 @@ pub struct ArrowLDLSolver<T: FloatT> {
     exact_bound_panels: Option<local_bounds::ExactBoundPanels<T>>,
     #[cfg(feature = "faer-sparse")]
     bound_panels: Option<local_bounds::BoundPanels>,
+    cone_panels: Option<local_cones::ConePanels<T>>,
     ranks: Option<LeafRanks>,
-    value_plan: Option<ValuePlan>,
+    /// One plan per index map: an update writes the cone blocks and then
+    /// each operator relative entropy cone's rows, so a single cached plan
+    /// was rebuilt serially for every map (BFSS L11u: about 17M entries per
+    /// iteration).
+    value_plans: Vec<ValuePlan>,
 }
 
 /// Entries from which `update_values` routes through a [`ValuePlan`].
 const VALUE_PLAN_MIN: usize = 1 << 15;
+/// Cached plans beyond which the cache restarts (the KKT has a few fixed maps).
+const VALUE_PLANS_MAX: usize = 64;
 
 /// The routing of one `update_values` index map. The KKT maps are fixed, so
 /// the column search and owner lookup run once; leaf entries are then written
@@ -1717,9 +1788,9 @@ struct ValuePlan {
 #[derive(Clone, Copy)]
 enum LeafSlot {
     /// `h[.0]`, mirrored to `h[.1]`.
-    H(usize, usize),
+    H(u32, u32),
     /// `raw_coupling(row, col)`.
-    Coupling(usize, usize),
+    Coupling(u32, u32),
 }
 
 /// The column of CSC `position`, searched from column `j`. Index maps are
@@ -1867,10 +1938,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let signs: Vec<i8> = signs.iter().map(|&s| -s).collect();
         let mut inner = Self::try_new(&neg, &signs, settings)?;
         inner.fallback_perm = perm;
-        Some(Negated {
-            inner,
-            values: Vec::new(),
-        })
+        Some(Negated { inner })
     }
 
     /// Leaves made of an SOC block followed by one primal column with a
@@ -1972,10 +2040,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                             let q = if width == 0 { 0 } else { columns.len() };
                             leaf.b.resize(width.saturating_sub(1) * q, T::zero());
                             leaf.y.resize(width * q, T::zero());
-                            // MPFR forms Z = D⁻¹Y inside the exact Schur product.
-                            if T::precision_bits() <= 64 {
-                                leaf.z.resize(width * q, T::zero());
-                            }
+                            // MPFR forms Z = D⁻¹Y inside the exact Schur
+                            // product, binary64 in its class panels.
                             leaf.couples = vec![false; t];
                             for &c in &columns[..q] {
                                 leaf.couples[c] = true;
@@ -2026,6 +2092,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 classes[class].leaves.push(l);
             }
         }
+        let cone_panels = (matches!(local_structure, Some(LocalStructure::Cones))
+            && T::precision_bits() <= 64)
+            .then(|| local_cones::ConePanels::new(&classes, &leaves));
         let unshifted = if matches!(local_structure, Some(LocalStructure::SharedSoc)) {
             Self::single_primal_leaf_columns(k, signs, &leaves)
         } else {
@@ -2071,8 +2140,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             } else {
                 None
             },
+            cone_panels,
             ranks: None,
-            value_plan: None,
+            value_plans: Vec::new(),
         };
         #[cfg(feature = "faer-sparse")]
         if let Some(panels) = solver.bound_panels.as_mut() {
@@ -2178,7 +2248,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     /// Route a fixed index map once (see [`ValuePlan`]); `None` when the
     /// positions do not fit the compact plan.
     fn value_plan(&self, index: &[usize]) -> Option<ValuePlan> {
-        if index.len() > u32::MAX as usize {
+        if index.len() > u32::MAX as usize
+            || self
+                .leaves
+                .iter()
+                .any(|l| l.ids.len().pow(2) > u32::MAX as usize)
+        {
             return None;
         }
         let mut panels = self.exact_bound_panels.is_some();
@@ -2197,11 +2272,11 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 (x, y) if x == usize::MAX && y == usize::MAX => None,
                 (x, y) if x != usize::MAX && y != usize::MAX => {
                     let g = self.leaves[x].ids.len();
-                    Some((x, LeafSlot::H(li + lj * g, lj + li * g)))
+                    Some((x, LeafSlot::H((li + lj * g) as u32, (lj + li * g) as u32)))
                 }
                 _ if panels => None,
-                (x, _) if x != usize::MAX => Some((x, LeafSlot::Coupling(li, lj))),
-                (_, y) => Some((y, LeafSlot::Coupling(lj, li))),
+                (x, _) if x != usize::MAX => Some((x, LeafSlot::Coupling(li as u32, lj as u32))),
+                (_, y) => Some((y, LeafSlot::Coupling(lj as u32, li as u32))),
             };
             match slot {
                 Some((leaf, slot)) => leaves[leaf].push((q as u32, slot)),
@@ -2370,23 +2445,144 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             let ample = threads >= SPLIT_FACTOR_THREADS_PER_LEAF * owned.len();
             let split_factor =
                 |g: usize| ample || (g as u128).pow(3) * threads as u128 > factor_work;
+            // A large leaf forms its residue contribution as soon as it is
+            // factored, so products fill the phase's tail instead of a
+            // separate one (BFSS L11u: 2.7 s per iteration at 9.7 of 16
+            // workers). Each product depends on its leaf alone, and
+            // `subtract_contributions` keeps the order of the subtractions.
+            // Products are admitted largest first while their workspace fits
+            // one contribution batch (`BATCH_WORK_BYTES`); the others form in
+            // `subtract_contributions`, batched as before.
+            // A product above a worker's share of all products' work splits
+            // into that many ways (the largest would otherwise end the phase).
+            let product_work = |l: &Leaf<T>| (l.ids.len() * l.coupled.len().pow(2)) as f64;
+            let mut admitted = vec![false; owned.len()];
+            if self.local_structure.is_none() {
+                let leaves = &self.leaves[owned.clone()];
+                let mut eligible: Vec<usize> = (0..leaves.len())
+                    .filter(|&k| residue_contribution(&leaves[k], t))
+                    .collect();
+                eligible.sort_by(|&a, &b| {
+                    product_work(&leaves[b]).total_cmp(&product_work(&leaves[a]))
+                });
+                let mut bytes = 0;
+                for k in eligible {
+                    bytes += contribution_bytes(&leaves[k]);
+                    if bytes > BATCH_WORK_BYTES {
+                        break;
+                    }
+                    admitted[k] = true;
+                }
+            }
+            let products: f64 = self.leaves[owned.clone()]
+                .iter()
+                .zip(&admitted)
+                .filter(|(_, &admit)| admit)
+                .map(|(l, _)| product_work(l))
+                .sum();
+            let share = products / threads as f64;
+            let ways = |l: &Leaf<T>| crate::algebra::measured_ways(product_work(l), share);
             // Counts are diagnostic only; no per-leaf counter buffer is needed.
             let count = AtomicUsize::new(0);
-            let ok = pool.install(|| {
-                self.leaves[owned.clone()]
-                    .par_iter_mut()
-                    .try_for_each(|leaf| {
+            // Lanes serve a leaf that splits its factor (a straggler, whose
+            // joins would let waiting workers steal whole leaves) and the
+            // in-phase products; balanced leaves keep the parallel iterator
+            // (binary64 nb, 797 leaves of g ≤ 6 on two workers: lanes cost
+            // +1.3%). Lanes take every worker, so a factor running inside the
+            // pool (owner blocks of an in-process partitioned solve) keeps the
+            // parallel iterator too: two broadcasts there could wait on each
+            // other through the board.
+            let lanes = pool.current_thread_index().is_none()
+                && (products > 0.0
+                    || self.leaves[owned.clone()]
+                        .iter()
+                        .any(|l| split_factor(l.ids.len())));
+            if !lanes {
+                let ok = pool.install(|| {
+                    self.leaves[owned.clone()]
+                        .par_iter_mut()
+                        .try_for_each(|leaf| {
+                            let mut n = 0;
+                            let result =
+                                leaf.refactor(t, reg, &mut n, split, split_factor(leaf.ids.len()));
+                            if n != 0 {
+                                count.fetch_add(n, Ordering::Relaxed);
+                            }
+                            result
+                        })
+                });
+                self.regularize_count += count.into_inner();
+                ok.is_ok()
+            } else {
+                // One lane per worker claims leaves, largest first. Leaves are
+                // not pool tasks, so a worker waiting inside one leaf's split
+                // work steals other leaves' inner pieces, never a whole leaf
+                // (BFSS L11u: over a parallel iterator, g = 10 leaves spent 4 s
+                // in their Y solves and 1785 leaves' factors 3–9 s). Leaves post
+                // their split work on the board, where lanes out of leaves help
+                // until every leaf is done: a poster never waits in a join.
+                let cost = |l: &Leaf<T>| (l.ids.len() as f64).powi(3) + product_work(l);
+                let mut order: Vec<(&mut Leaf<T>, bool)> = self.leaves[owned.clone()]
+                    .iter_mut()
+                    .zip(admitted)
+                    .collect();
+                order.sort_by(|a, b| cost(b.0).total_cmp(&cost(a.0)));
+                let order: Vec<(std::sync::Mutex<&mut Leaf<T>>, bool)> = order
+                    .into_iter()
+                    .map(|(leaf, admit)| (std::sync::Mutex::new(leaf), admit))
+                    .collect();
+                let (next, failed) = (AtomicUsize::new(0), AtomicBool::new(false));
+                let (entered, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
+                pool.broadcast(|_| {
+                    // No leaf starts before every worker runs its lane. Rayon
+                    // queues the broadcast job per worker, one after another,
+                    // and a waiting join takes it: a worker that stole a
+                    // leaf's split piece before its job arrived would run its
+                    // lane above that piece and wait for all leaves forever
+                    // (L10/128 at 16 threads: about one run in 30 hung).
+                    // Until then the pool holds no other job, so every lane
+                    // starts at the bottom of its worker's stack.
+                    entered.fetch_add(1, Ordering::AcqRel);
+                    while entered.load(Ordering::Acquire) < threads {
+                        std::thread::yield_now();
+                    }
+                    let _offer = sdpx_arithmetic::inner_parallel::board::Offer::enter();
+                    while !failed.load(Ordering::Relaxed) {
+                        let Some((slot, admit)) = order.get(next.fetch_add(1, Ordering::Relaxed))
+                        else {
+                            break;
+                        };
+                        let leaf: &mut Leaf<T> = &mut slot.lock().unwrap();
                         let mut n = 0;
                         let result =
                             leaf.refactor(t, reg, &mut n, split, split_factor(leaf.ids.len()));
                         if n != 0 {
                             count.fetch_add(n, Ordering::Relaxed);
                         }
-                        result
-                    })
-            });
-            self.regularize_count += count.into_inner();
-            ok.is_ok()
+                        if result.is_ok() && *admit {
+                            leaf.product = crate::algebra::with_split_hint(ways(leaf), || {
+                                contribution_product(leaf, t)
+                            });
+                        }
+                        if result.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        finished.fetch_add(1, Ordering::Release);
+                    }
+                    while finished.load(Ordering::Acquire) < order.len()
+                        && !failed.load(Ordering::Relaxed)
+                    {
+                        if sdpx_arithmetic::inner_parallel::board::help() {
+                            continue;
+                        }
+                        if !matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
+                            std::thread::yield_now();
+                        }
+                    }
+                });
+                self.regularize_count += count.into_inner();
+                !failed.into_inner()
+            }
         } else {
             let count = &mut self.regularize_count;
             self.leaves[owned.clone()]
@@ -2400,6 +2596,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             None => leaves_ok,
         };
         if !leaves_ok {
+            for leaf in &mut self.leaves {
+                leaf.product = Vec::new();
+            }
             return false;
         }
         if self.ranks.as_ref().is_some_and(|r| !r.is_root()) {
@@ -2411,7 +2610,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             self.assemble_local_schur();
         } else {
             let timer = crate::receipt::start();
-            subtract_contributions(&self.leaves[owned], &mut self.s, t, self.pool.as_deref());
+            subtract_contributions(
+                &mut self.leaves[owned],
+                &mut self.s,
+                t,
+                self.pool.as_deref(),
+            );
             for j in 0..t {
                 for i in 0..j {
                     self.s[j + i * t] = self.s[i + j * t];
@@ -2496,6 +2700,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     fn solve_arrow(&mut self, x: &mut [T], b: &[T]) {
         #[cfg(feature = "faer-sparse")]
         if self.solve_bounds_faer(x, b, 1) {
+            return;
+        }
+        if self.solve_cones(x, b, 1) {
             return;
         }
         let t = self.trunk.len();
@@ -2614,7 +2821,6 @@ impl<T: FloatT> ArrowLDLSolver<T> {
 /// [`ArrowLDLSolver::try_negated`]: an arrow factor of −K solving K x = b.
 pub struct Negated<T: FloatT> {
     inner: ArrowLDLSolver<T>,
-    values: Vec<T>,
 }
 
 impl<T: FloatT> Negated<T> {
@@ -2635,9 +2841,7 @@ impl<T: FloatT> HasLinearSolverInfo for Negated<T> {
 
 impl<T: FloatT> DirectLDLSolver<T> for Negated<T> {
     fn update_values(&mut self, index: &[usize], values: &[T]) {
-        self.values.clear();
-        self.values.extend(values.iter().map(|&v| -v));
-        self.inner.update_values(index, &self.values);
+        self.inner.update_values_mapped(index, values, |v| -v);
     }
 
     fn scale_values(&mut self, index: &[usize], scale: T) {
@@ -2708,14 +2912,16 @@ impl<T: FloatT> HasLinearSolverInfo for ArrowLDLSolver<T> {
     }
 }
 
-impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
-    fn update_values(&mut self, index: &[usize], values: &[T]) {
+impl<T: FloatT> ArrowLDLSolver<T> {
+    /// `update_values` writing `map(value)` (exact maps only, such as
+    /// negation, so every entry is the value a caller-side map would give).
+    fn update_values_mapped(&mut self, index: &[usize], values: &[T], map: impl Fn(T) -> T + Sync) {
         let index = &index[..index.len().min(values.len())];
         let pool = self.pool.clone().filter(|p| {
             p.current_num_threads() > 1 && self.leaves.len() > 1 && index.len() >= VALUE_PLAN_MIN
         });
         let Some(pool) = pool else {
-            self.update_entries(index.iter().copied(), |q, value| *value = values[q]);
+            self.update_entries(index.iter().copied(), |q, value| *value = map(values[q]));
             return;
         };
         let mut panels = self.exact_bound_panels.is_some();
@@ -2723,9 +2929,10 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
         {
             panels |= self.bound_panels.is_some();
         }
-        let cached = self.value_plan.take().filter(|plan| {
+        let cached = self.value_plans.iter().position(|plan| {
             plan.panels == panels
                 && plan.index.len() == index.len()
+                && plan.index.first() == index.first()
                 && pool.install(|| {
                     plan.index
                         .par_chunks(VALUE_PLAN_MIN)
@@ -2733,9 +2940,15 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
                         .all(|(a, b)| a == b)
                 })
         });
-        let Some(plan) = cached.or_else(|| self.value_plan(index)) else {
-            self.update_entries(index.iter().copied(), |q, value| *value = values[q]);
-            return;
+        let plan = match cached {
+            Some(k) => self.value_plans.swap_remove(k),
+            None => match self.value_plan(index) {
+                Some(plan) => plan,
+                None => {
+                    self.update_entries(index.iter().copied(), |q, value| *value = map(values[q]));
+                    return;
+                }
+            },
         };
         // Each leaf takes its entries in index order, so a repeated position
         // keeps its last value as in the serial route.
@@ -2745,22 +2958,33 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
                 .zip(&plan.leaves)
                 .for_each(|(leaf, slots)| {
                     for &(q, slot) in slots {
-                        let value = values[q as usize];
+                        let value = map(values[q as usize]);
                         match slot {
                             LeafSlot::H(at, mirror) => {
-                                leaf.h[at] = value;
-                                leaf.h[mirror] = value;
+                                leaf.h[at as usize] = value;
+                                leaf.h[mirror as usize] = value;
                             }
-                            LeafSlot::Coupling(row, col) => *leaf.raw_coupling(row, col) = value,
+                            LeafSlot::Coupling(row, col) => {
+                                *leaf.raw_coupling(row as usize, col as usize) = value
+                            }
                         }
                     }
                 })
         });
         let rest = &plan.rest;
         self.update_entries(rest.iter().map(|&q| index[q]), |k, value| {
-            *value = values[rest[k]];
+            *value = map(values[rest[k]]);
         });
-        self.value_plan = Some(plan);
+        if self.value_plans.len() >= VALUE_PLANS_MAX {
+            self.value_plans.clear();
+        }
+        self.value_plans.push(plan);
+    }
+}
+
+impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
+    fn update_values(&mut self, index: &[usize], values: &[T]) {
+        self.update_values_mapped(index, values, |v| v);
     }
 
     fn scale_values(&mut self, index: &[usize], scale: T) {
@@ -2807,6 +3031,9 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
         }
         #[cfg(feature = "faer-sparse")]
         if self.solve_bounds_faer(x, b, cols) {
+            return;
+        }
+        if self.solve_cones(x, b, cols) {
             return;
         }
         self.batch_tx.resize(t * cols, T::zero());

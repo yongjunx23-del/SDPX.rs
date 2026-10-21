@@ -202,56 +202,13 @@ impl<T: FloatT> OriginalData<T> {
 
 /// `s = svec(V max(Λ, 0) V')` for `mat(r) = V Λ V'`, in binary64.
 fn project_psd_f64<T: FloatT>(dim: usize, r: &[T], s: &mut [T]) {
-    let r2 = std::f64::consts::FRAC_1_SQRT_2;
-    let mut a = vec![0f64; dim * dim];
-    let mut idx = 0;
-    for j in 0..dim {
-        for i in 0..=j {
-            let v = r[idx].to_f64().unwrap_or(f64::NAN);
-            a[i + j * dim] = if i == j { v } else { v * r2 };
-            idx += 1;
-        }
-    }
-    if !a.iter().all(|v| v.is_finite()) {
+    use crate::solver::cones::{svec_eigen_f64, svec_spectral_f64};
+    let Some((a, w)) = svec_eigen_f64(r, dim) else {
         return;
-    }
-    let mut w = vec![0f64; dim];
-    let (mut info, mut query) = (0, [0f64]);
-    let n = dim as i32;
-    unsafe { lapack::dsyev(b'V', b'U', n, &mut a, n, &mut w, &mut query, -1, &mut info) };
-    let lwork = (query[0] as usize).max(3 * dim);
-    let mut work = vec![0f64; lwork];
-    unsafe {
-        lapack::dsyev(
-            b'V',
-            b'U',
-            n,
-            &mut a,
-            n,
-            &mut w,
-            &mut work,
-            lwork as i32,
-            &mut info,
-        )
     };
-    if info != 0 {
-        return;
-    }
-    let mut idx = 0;
-    for j in 0..dim {
-        for i in 0..=j {
-            let v: f64 = (0..dim)
-                .filter(|&k| w[k] > 0.)
-                .map(|k| a[i + k * dim] * w[k] * a[j + k * dim])
-                .sum();
-            s[idx] = T::from_f64(if i == j {
-                v
-            } else {
-                v * std::f64::consts::SQRT_2
-            })
-            .unwrap();
-            idx += 1;
-        }
+    let t: Vec<f64> = w.iter().map(|&l| if l > 0. { l } else { 0. }).collect();
+    for (s, v) in s.iter_mut().zip(svec_spectral_f64(&a, dim, &t)) {
+        *s = T::from_f64(v).unwrap();
     }
 }
 

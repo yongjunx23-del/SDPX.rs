@@ -6,5 +6,5 @@ mod block_concatenate;
 mod dense_columns;
 pub(crate) use dense_columns::DenseColumns;
 mod matrix_math;
-pub(crate) use matrix_math::wide_output;
+pub(crate) use matrix_math::{csc_symv_runs, wide_output, SymvRuns};
 mod utils;

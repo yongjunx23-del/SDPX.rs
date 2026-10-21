@@ -182,6 +182,7 @@ where
                     &self.L.rowval,
                     &self.L.nzval,
                     &self.Dinv,
+                    &self.workspace.runs,
                     tmp,
                 );
             }
@@ -225,7 +226,8 @@ where
                 w[K * i + c] = b[c * n + p];
             }
         }
-        _solve_rows::<T, K>(&self.L.colptr, &self.L.rowval, &self.L.nzval, &self.Dinv, w);
+        let (L, runs) = (&self.L, &self.workspace.runs);
+        _solve_rows::<T, K>(&L.colptr, &L.rowval, &L.nzval, &self.Dinv, runs, w);
         for (i, &p) in self.perm.iter().enumerate() {
             for c in 0..K {
                 x[c * n + p] = w[K * i + c];
@@ -295,6 +297,15 @@ where
                 &mut self.workspace,
                 self.is_symbolic,
             ),
+        }
+    }
+
+    /// Threads the factor and solves run on: the pool's, when the
+    /// elimination tree splits.
+    pub fn threads(&self) -> usize {
+        match (&self.plan, &self.pool) {
+            (Some(Some(plan)), Some(pool)) if plan.parallelisable() => pool.current_num_threads(),
+            _ => 1,
         }
     }
 
@@ -427,6 +438,14 @@ struct QDLDLWorkspace<T> {
 
     // number of regularized entries in D
     regularize_count: usize,
+
+    // Columns each row of L eliminates, in elimination order (`row_ptr`
+    // delimits rows), recorded by the first factorization: the pattern is
+    // structural, so refactors replay it instead of walking the etree.
+    row_cols: Vec<u32>,
+    row_ptr: Vec<usize>,
+    // The forward solve's supernode runs (`supernode_runs`).
+    runs: Vec<u32>,
 }
 
 impl<T> QDLDLWorkspace<T>
@@ -457,6 +476,8 @@ where
             &mut etree,
         )?;
 
+        let runs = supernode_runs(&etree, &Lnz);
+
         // positive inertia count.
         let positive_inertia = 0;
 
@@ -478,6 +499,9 @@ where
             regularize_eps,
             regularize_delta,
             regularize_count,
+            row_cols: Vec::new(),
+            row_ptr: Vec::new(),
+            runs,
         })
     }
 }
@@ -519,6 +543,8 @@ fn _factor<T: FloatT>(
         workspace.regularize_eps,
         workspace.regularize_delta,
         &mut workspace.regularize_count,
+        &mut workspace.row_cols,
+        &mut workspace.row_ptr,
     )?;
 
     workspace.positive_inertia = pos_d_count;
@@ -527,6 +553,32 @@ fn _factor<T: FloatT>(
 }
 
 const QDLDL_UNKNOWN: usize = usize::MAX;
+// A recorded column's top three bits hold the length - 1 of the supernode
+// run it starts; the replay sweeps the run's columns at once. Runs longer
+// than eight lost on nql60 and qssp30 (register pressure).
+const RUN_SHIFT: u32 = 29;
+const COLUMN: u32 = (1 << RUN_SHIFT) - 1;
+const MAX_RUN: usize = 8;
+
+// The fundamental supernode runs of L (column c's parent is c + 1 and it has
+// one more entry), split into runs of at most `MAX_RUN` columns and encoded
+// like `row_cols`; single columns are left out.
+fn supernode_runs(etree: &[usize], Lnz: &[usize]) -> Vec<u32> {
+    let link = |c: usize| etree[c] == c + 1 && Lnz[c] == Lnz[c + 1] + 1;
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < etree.len() {
+        let mut r = 1;
+        while r < MAX_RUN && i + r < etree.len() && link(i + r - 1) {
+            r += 1;
+        }
+        if r > 1 {
+            runs.push(i as u32 | ((r as u32 - 1) << RUN_SHIFT));
+        }
+        i += r;
+    }
+    runs
+}
 const QDLDL_USED: bool = true;
 const QDLDL_UNUSED: bool = false;
 
@@ -590,8 +642,17 @@ fn _factor_inner<T: FloatT>(
     regularize_eps: T,
     regularize_delta: T,
     regularize_count: &mut usize,
+    row_cols: &mut Vec<u32>,
+    row_ptr: &mut Vec<usize>,
 ) -> Result<usize, QDLDLError> {
     *regularize_count = 0;
+    // A factorization that stopped at a zero pivot left a partial record.
+    let replay = !logical_factor && row_ptr.len() == n;
+    if !replay {
+        row_cols.clear();
+        row_ptr.clear();
+        row_ptr.push(0);
+    }
     let mut positiveValuesInD = 0;
 
     // partition working memory into pieces
@@ -645,102 +706,171 @@ fn _factor_inner<T: FloatT>(
         // The solution y is then the kth row of L,
         // with an implied '1' at the diagonal entry.
 
-        // number of nonzeros in this row of L
-        let mut nnz_y = 0; // number of elements in this row
-
-        // This loop determines where nonzeros
-        // will go in the kth row of L, but doesn't
-        // compute the actual values
-
-        for i in Ap[k]..Ap[k + 1] {
-            let bidx = Ai[i]; //we are working on this element of b
-
-            // Initialize D[k] as the element of this column
-            // corresponding to the diagonal place.  Don't use
-            // this element as part of the elimination step
-            // that computes the k^th row of L
-            if bidx == k {
-                D[k] = Ax[i];
-                continue;
+        if replay {
+            // The recorded pattern: the same updates in the same order.
+            for i in Ap[k]..Ap[k + 1] {
+                let bidx = Ai[i];
+                if bidx == k {
+                    D[k] = Ax[i];
+                } else {
+                    y_vals[bidx] = Ax[i];
+                }
             }
-
-            y_vals[bidx] = Ax[i]; // initialise y(bidx) = b(bidx)
-
-            // use the forward elimination tree to figure
-            // out which elements must be eliminated after
-            // this element of b
-            let next_idx = bidx;
-
-            if y_markers[next_idx] == QDLDL_UNUSED {
-                //this y term not already visited
-
-                y_markers[next_idx] = QDLDL_USED; //I touched this one
-                elim_buffer[0] = next_idx; // It goes at the start of the current list
-                let mut nnz_e = 1; //length of unvisited elimination path from here
-
-                let mut next_idx = etree[bidx];
-
-                while next_idx != QDLDL_UNKNOWN && next_idx < k {
-                    if y_markers[next_idx] == QDLDL_USED {
-                        break;
+            let mut cols = row_cols[row_ptr[k - 1]..row_ptr[k]].iter();
+            while let Some(&c) = cols.next() {
+                let cidx = (c & COLUMN) as usize;
+                let run = (c >> RUN_SHIFT) as usize + 1;
+                if run > 1 {
+                    for _ in 1..run {
+                        cols.next();
                     }
-
-                    y_markers[next_idx] = QDLDL_USED; // I touched this one
-                    elim_buffer[nnz_e] = next_idx; // It goes in the current list
-                    next_idx = etree[next_idx]; // one step further along tree
-                    nnz_e += 1; // the list is one longer than before
+                    let dk = &mut D[k];
+                    let (y, colspace) = (&mut *y_vals, &mut *next_colspace);
+                    match run {
+                        2 => sweep_run::<T, 2>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
+                        3 => sweep_run::<T, 3>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
+                        4 => sweep_run::<T, 4>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
+                        5 => sweep_run::<T, 5>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
+                        6 => sweep_run::<T, 6>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
+                        7 => sweep_run::<T, 7>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
+                        _ => sweep_run::<T, 8>(cidx, y, Lp, Li, Lx, colspace, Dinv, dk),
+                    }
+                    continue;
                 }
-
-                // now put the buffered elimination list into
-                // my current ordering in reverse order
-                while nnz_e != 0 {
-                    nnz_e -= 1;
-                    y_idx[nnz_y] = elim_buffer[nnz_e];
-                    nnz_y += 1;
-                }
-            }
-        }
-
-        // This for loop places nonzeros values in the k^th row
-        for i in (0..nnz_y).rev() {
-            // which column are we working on?
-            let cidx = y_idx[i];
-
-            // loop along the elements in this
-            // column of L and subtract to solve to y
-            let tmp_idx = next_colspace[cidx];
-
-            // don't compute Lx for logical factorisation
-            // this logic is not implemented in the C version
-            if !logical_factor {
+                let tmp_idx = next_colspace[cidx];
                 let y_vals_cidx = y_vals[cidx];
-
-                let (f, l) = (Lp[cidx], tmp_idx);
+                let f = Lp[cidx];
                 unsafe {
-                    //Safety : Here the Lij index comes from the rowval
-                    //field of the sparse L factor matrix, and should
-                    //always be bounded by the matrix dimension.
-                    for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
+                    //Safety : as below, Lij is a row of L.
+                    for (&Lxj, &Lij) in zip(&Lx[f..tmp_idx], &Li[f..tmp_idx]) {
                         *(y_vals.get_unchecked_mut(Lij)) -= Lxj * y_vals_cidx;
                     }
+                }
+                let Lx_tmp_idx = y_vals_cidx * Dinv[cidx];
+                Lx[tmp_idx] = Lx_tmp_idx;
+                D[k] -= y_vals_cidx * Lx_tmp_idx;
+                next_colspace[cidx] += 1;
+                y_vals[cidx] = T::zero();
+            }
+        } else {
+            // number of nonzeros in this row of L
+            let mut nnz_y = 0; // number of elements in this row
 
-                    // Now I have the cidx^th element of y = L\b.
-                    // so compute the corresponding element of
-                    // this row of L and put it into the right place
-                    let Lx_tmp_idx = y_vals_cidx * *Dinv.get_unchecked(cidx);
-                    *Lx.get_unchecked_mut(tmp_idx) = Lx_tmp_idx;
-                    *D.get_unchecked_mut(k) -= y_vals_cidx * Lx_tmp_idx;
+            // The supernode run the previous recorded column of this row ends.
+            let (mut run_start, mut run_len) = (0, 0);
+
+            // This loop determines where nonzeros
+            // will go in the kth row of L, but doesn't
+            // compute the actual values
+
+            for i in Ap[k]..Ap[k + 1] {
+                let bidx = Ai[i]; //we are working on this element of b
+
+                // Initialize D[k] as the element of this column
+                // corresponding to the diagonal place.  Don't use
+                // this element as part of the elimination step
+                // that computes the k^th row of L
+                if bidx == k {
+                    D[k] = Ax[i];
+                    continue;
+                }
+
+                y_vals[bidx] = Ax[i]; // initialise y(bidx) = b(bidx)
+
+                // use the forward elimination tree to figure
+                // out which elements must be eliminated after
+                // this element of b
+                let next_idx = bidx;
+
+                if y_markers[next_idx] == QDLDL_UNUSED {
+                    //this y term not already visited
+
+                    y_markers[next_idx] = QDLDL_USED; //I touched this one
+                    elim_buffer[0] = next_idx; // It goes at the start of the current list
+                    let mut nnz_e = 1; //length of unvisited elimination path from here
+
+                    let mut next_idx = etree[bidx];
+
+                    while next_idx != QDLDL_UNKNOWN && next_idx < k {
+                        if y_markers[next_idx] == QDLDL_USED {
+                            break;
+                        }
+
+                        y_markers[next_idx] = QDLDL_USED; // I touched this one
+                        elim_buffer[nnz_e] = next_idx; // It goes in the current list
+                        next_idx = etree[next_idx]; // one step further along tree
+                        nnz_e += 1; // the list is one longer than before
+                    }
+
+                    // now put the buffered elimination list into
+                    // my current ordering in reverse order
+                    while nnz_e != 0 {
+                        nnz_e -= 1;
+                        y_idx[nnz_y] = elim_buffer[nnz_e];
+                        nnz_y += 1;
+                    }
                 }
             }
 
-            // record which row it went into
-            Li[tmp_idx] = k;
-            next_colspace[cidx] += 1;
+            // This for loop places nonzeros values in the k^th row
+            for i in (0..nnz_y).rev() {
+                // which column are we working on?
+                let cidx = y_idx[i];
 
-            // reset the y_vals and indices back to zero and QDLDL_UNUSED
-            // once I'm done with them
-            y_vals[cidx] = T::zero();
-            y_markers[cidx] = QDLDL_UNUSED;
+                // loop along the elements in this
+                // column of L and subtract to solve to y
+                let tmp_idx = next_colspace[cidx];
+
+                // don't compute Lx for logical factorisation
+                // this logic is not implemented in the C version
+                if !logical_factor {
+                    let y_vals_cidx = y_vals[cidx];
+
+                    let (f, l) = (Lp[cidx], tmp_idx);
+                    unsafe {
+                        //Safety : Here the Lij index comes from the rowval
+                        //field of the sparse L factor matrix, and should
+                        //always be bounded by the matrix dimension.
+                        for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
+                            *(y_vals.get_unchecked_mut(Lij)) -= Lxj * y_vals_cidx;
+                        }
+
+                        // Now I have the cidx^th element of y = L\b.
+                        // so compute the corresponding element of
+                        // this row of L and put it into the right place
+                        let Lx_tmp_idx = y_vals_cidx * *Dinv.get_unchecked(cidx);
+                        *Lx.get_unchecked_mut(tmp_idx) = Lx_tmp_idx;
+                        *D.get_unchecked_mut(k) -= y_vals_cidx * Lx_tmp_idx;
+                    }
+                }
+
+                // record which row it went into
+                Li[tmp_idx] = k;
+                next_colspace[cidx] += 1;
+                // A fundamental supernode run: the previous column of this
+                // row is c - 1, its parent is c and its pattern is
+                // {c} ∪ pattern(c). Replays sweep up to eight such columns
+                // at once (`sweep_run`).
+                let c = cidx.wrapping_sub(1);
+                if (1..MAX_RUN).contains(&run_len)
+                    && row_cols.last().map(|&v| v & COLUMN) == Some(c as u32)
+                    && etree[c] == cidx
+                    && Lnz[c] == Lnz[cidx] + 1
+                {
+                    run_len += 1;
+                    row_cols[run_start] =
+                        (row_cols[run_start] & COLUMN) | ((run_len as u32 - 1) << RUN_SHIFT);
+                } else {
+                    (run_start, run_len) = (row_cols.len(), 1);
+                }
+                row_cols.push(cidx as u32);
+
+                // reset the y_vals and indices back to zero and QDLDL_UNUSED
+                // once I'm done with them
+                y_vals[cidx] = T::zero();
+                y_markers[cidx] = QDLDL_UNUSED;
+            }
+            row_ptr.push(row_cols.len());
         }
 
         if !logical_factor {
@@ -769,6 +899,57 @@ fn _factor_inner<T: FloatT>(
     } //end for k
 
     Ok(positiveValuesInD)
+}
+
+/// One replayed sweep of the supernode run `c0..c0 + R` for the current row.
+/// Inside a run, pattern(c) = {c + 1} ∪ pattern(c + 1), so column `c0 + m`
+/// stores the run's later columns first, then the last column's rows. Each
+/// y entry takes the run's terms in column order, exactly as R single
+/// sweeps apply them, and D[k] its updates in the same order.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn sweep_run<T: FloatT, const R: usize>(
+    c0: usize,
+    y: &mut [T],
+    Lp: &[usize],
+    Li: &[usize],
+    Lx: &mut [T],
+    next_colspace: &mut [usize],
+    Dinv: &[T],
+    dk: &mut T,
+) {
+    let last = R - 1;
+    let f: [usize; R] = std::array::from_fn(|m| Lp[c0 + m]);
+    let t: [usize; R] = std::array::from_fn(|m| next_colspace[c0 + m]);
+    let len = t[last] - f[last];
+    debug_assert!((0..R).all(|m| t[m] - f[m] == len + last - m));
+    let mut yc = [T::zero(); R];
+    for j in 0..R {
+        let mut v = y[c0 + j];
+        for m in 0..j {
+            v -= Lx[f[m] + j - m - 1] * yc[m];
+        }
+        yc[j] = v;
+    }
+    unsafe {
+        //Safety : the rows come from L's rowval and are below the dimension;
+        //every run column stores `len` entries after its run rows.
+        for p in 0..len {
+            let row = y.get_unchecked_mut(*Li.get_unchecked(f[last] + p));
+            let mut v = *row;
+            for m in 0..R {
+                v -= *Lx.get_unchecked(f[m] + last - m + p) * yc[m];
+            }
+            *row = v;
+        }
+    }
+    for m in 0..R {
+        let l = yc[m] * Dinv[c0 + m];
+        Lx[t[m]] = l;
+        *dk -= yc[m] * l;
+        next_colspace[c0 + m] += 1;
+        y[c0 + m] = T::zero();
+    }
 }
 
 // Solves (L+I)x = b, with x replacing b (with standard bounds checks)
@@ -809,14 +990,97 @@ fn _ltsolve_safe<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], x: &mut [T]) {
 
 // Solves (L+I)x = b, with x replacing b.  Unchecked version
 fn _lsolve_unsafe<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], x: &mut [T]) {
+    _lsolve_rows::<T, 1>(Lp, Li, Lx, &[], x);
+}
+
+// `_lsolve_unsafe` for K row-interleaved right-hand sides, sweeping each
+// recorded supernode run (`supernode_runs`) at once.
+fn _lsolve_rows<T: FloatT, const K: usize>(
+    Lp: &[usize],
+    Li: &[usize],
+    Lx: &[T],
+    runs: &[u32],
+    w: &mut [T],
+) {
+    let n = w.len() / K;
     unsafe {
-        for i in 0..x.len() {
-            let xi = *x.get_unchecked(i);
-            let f = *Lp.get_unchecked(i);
-            let l = *Lp.get_unchecked(i + 1);
-            for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
-                *(x.get_unchecked_mut(Lij)) -= Lxj * xi;
+        let mut i = 0;
+        for &r in runs {
+            let (c0, len) = ((r & COLUMN) as usize, (r >> RUN_SHIFT) as usize + 1);
+            for i in i..c0 {
+                lsolve_column::<T, K>(i, Lp, Li, Lx, w);
             }
+            match len {
+                2 => lsolve_run::<T, 2, K>(c0, Lp, Li, Lx, w),
+                3 => lsolve_run::<T, 3, K>(c0, Lp, Li, Lx, w),
+                4 => lsolve_run::<T, 4, K>(c0, Lp, Li, Lx, w),
+                5 => lsolve_run::<T, 5, K>(c0, Lp, Li, Lx, w),
+                6 => lsolve_run::<T, 6, K>(c0, Lp, Li, Lx, w),
+                7 => lsolve_run::<T, 7, K>(c0, Lp, Li, Lx, w),
+                _ => lsolve_run::<T, 8, K>(c0, Lp, Li, Lx, w),
+            }
+            i = c0 + len;
+        }
+        for i in i..n {
+            lsolve_column::<T, K>(i, Lp, Li, Lx, w);
+        }
+    }
+}
+
+// Safety: as for `lsolve_run`.
+#[inline(always)]
+unsafe fn lsolve_column<T: FloatT, const K: usize>(
+    i: usize,
+    Lp: &[usize],
+    Li: &[usize],
+    Lx: &[T],
+    w: &mut [T],
+) {
+    let xi: [T; K] = std::array::from_fn(|c| *w.get_unchecked(K * i + c));
+    let f = *Lp.get_unchecked(i);
+    let l = *Lp.get_unchecked(i + 1);
+    for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
+        for c in 0..K {
+            *w.get_unchecked_mut(K * Lij + c) -= Lxj * xi[c];
+        }
+    }
+}
+
+// The forward sweeps of the supernode run `c0..c0 + R`, as in `sweep_run`:
+// each entry of w takes the run's column terms in column order.
+//
+// Safety: `c0..c0 + R` is a fundamental supernode run of L and w holds K
+// row-interleaved columns of L's dimension.
+#[inline(always)]
+unsafe fn lsolve_run<T: FloatT, const R: usize, const K: usize>(
+    c0: usize,
+    Lp: &[usize],
+    Li: &[usize],
+    Lx: &[T],
+    w: &mut [T],
+) {
+    let last = R - 1;
+    let f: [usize; R] = std::array::from_fn(|m| *Lp.get_unchecked(c0 + m));
+    let len = *Lp.get_unchecked(c0 + R) - f[last];
+    let mut xc = [[T::zero(); K]; R];
+    for j in 0..R {
+        for c in 0..K {
+            let x = w.get_unchecked_mut(K * (c0 + j) + c);
+            for m in 0..j {
+                *x -= *Lx.get_unchecked(f[m] + j - m - 1) * xc[m][c];
+            }
+            xc[j][c] = *x;
+        }
+    }
+    for p in 0..len {
+        let row = *Li.get_unchecked(f[last] + p);
+        for c in 0..K {
+            let x = w.get_unchecked_mut(K * row + c);
+            let mut v = *x;
+            for m in 0..R {
+                v -= *Lx.get_unchecked(f[m] + last - m + p) * xc[m][c];
+            }
+            *x = v;
         }
     }
 }
@@ -837,12 +1101,42 @@ fn _ltsolve_unsafe<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], x: &mut [T])
 }
 
 // Solves D(L+I)'x = b, with x replacing b.  Unchecked version.
+// Each column's rows ascend (the factor appends them row by row), so column
+// i-1 uses x[i] only if its first row is i. Otherwise the two dot products
+// are independent and run interleaved, each in its own order: two add
+// chains in flight instead of one.
 fn _dltsolve_unsafe<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], Dinv: &[T], x: &mut [T]) {
     unsafe {
-        for i in (0..x.len()).rev() {
-            let mut s = T::zero();
+        let mut i = x.len();
+        while i > 0 {
+            i -= 1;
             let f = *Lp.get_unchecked(i);
             let l = *Lp.get_unchecked(i + 1);
+            let f0 = if i > 0 { *Lp.get_unchecked(i - 1) } else { f };
+            if i > 0 && (f0 == f || *Li.get_unchecked(f0) != i) {
+                debug_assert!(Li[f0..f].windows(2).all(|w| w[0] < w[1]));
+                let (mut s, mut s0) = (T::zero(), T::zero());
+                let m = (l - f).min(f - f0);
+                for t in 0..m {
+                    s += *Lx.get_unchecked(f + t) * *x.get_unchecked(*Li.get_unchecked(f + t));
+                    s0 += *Lx.get_unchecked(f0 + t) * *x.get_unchecked(*Li.get_unchecked(f0 + t));
+                }
+                for j in f + m..l {
+                    s += *Lx.get_unchecked(j) * *x.get_unchecked(*Li.get_unchecked(j));
+                }
+                for j in f0 + m..f {
+                    s0 += *Lx.get_unchecked(j) * *x.get_unchecked(*Li.get_unchecked(j));
+                }
+                let xi = x.get_unchecked_mut(i);
+                *xi *= *Dinv.get_unchecked(i);
+                *xi -= s;
+                i -= 1;
+                let xi = x.get_unchecked_mut(i);
+                *xi *= *Dinv.get_unchecked(i);
+                *xi -= s0;
+                continue;
+            }
+            let mut s = T::zero();
             for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
                 s += Lxj * (*x.get_unchecked(Lij));
             }
@@ -855,12 +1149,12 @@ fn _dltsolve_unsafe<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], Dinv: &[T],
 }
 
 // Solves Ax = b where A has given LDL factors, with x replacing b
-fn _solve<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], Dinv: &[T], b: &mut [T]) {
+fn _solve<T: FloatT>(Lp: &[usize], Li: &[usize], Lx: &[T], Dinv: &[T], runs: &[u32], b: &mut [T]) {
     // We call the `unsafe`d version of the forward and backward substitution
     // functions here, since the matrix data should be well posed and x of
     // compatible dimensions.   For super safety or debugging purposes, there
     // are also `safe` versions implemented above.
-    _lsolve_unsafe(Lp, Li, Lx, b);
+    _lsolve_rows::<T, 1>(Lp, Li, Lx, runs, b);
 
     // combined D and L^T solve in one pass
     _dltsolve_unsafe(Lp, Li, Lx, Dinv, b);
@@ -878,25 +1172,55 @@ fn _solve_rows<T: FloatT, const K: usize>(
     Li: &[usize],
     Lx: &[T],
     Dinv: &[T],
+    runs: &[u32],
     w: &mut [T],
 ) {
     let n = Dinv.len();
     debug_assert_eq!(w.len(), n * K);
+    _lsolve_rows::<T, K>(Lp, Li, Lx, runs, w);
     unsafe {
-        for i in 0..n {
-            let xi: [T; K] = std::array::from_fn(|c| *w.get_unchecked(K * i + c));
-            let f = *Lp.get_unchecked(i);
-            let l = *Lp.get_unchecked(i + 1);
-            for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
-                for c in 0..K {
-                    *w.get_unchecked_mut(K * Lij + c) -= Lxj * xi[c];
-                }
-            }
-        }
-        for i in (0..n).rev() {
+        // As in `_dltsolve_unsafe`, independent adjacent columns interleave.
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
             let mut s = [T::zero(); K];
             let f = *Lp.get_unchecked(i);
             let l = *Lp.get_unchecked(i + 1);
+            let f0 = if i > 0 { *Lp.get_unchecked(i - 1) } else { f };
+            if i > 0 && (f0 == f || *Li.get_unchecked(f0) != i) {
+                let mut s0 = [T::zero(); K];
+                let m = (l - f).min(f - f0);
+                for t in 0..m {
+                    let (Lxj, Lij) = (*Lx.get_unchecked(f + t), *Li.get_unchecked(f + t));
+                    let (Lxk, Lik) = (*Lx.get_unchecked(f0 + t), *Li.get_unchecked(f0 + t));
+                    for c in 0..K {
+                        s[c] += Lxj * (*w.get_unchecked(K * Lij + c));
+                        s0[c] += Lxk * (*w.get_unchecked(K * Lik + c));
+                    }
+                }
+                for j in f + m..l {
+                    let (Lxj, Lij) = (*Lx.get_unchecked(j), *Li.get_unchecked(j));
+                    for c in 0..K {
+                        s[c] += Lxj * (*w.get_unchecked(K * Lij + c));
+                    }
+                }
+                for j in f0 + m..f {
+                    let (Lxj, Lij) = (*Lx.get_unchecked(j), *Li.get_unchecked(j));
+                    for c in 0..K {
+                        s0[c] += Lxj * (*w.get_unchecked(K * Lij + c));
+                    }
+                }
+                for (i, s) in [(i, s), (i - 1, s0)] {
+                    let d = *Dinv.get_unchecked(i);
+                    for c in 0..K {
+                        let xi = w.get_unchecked_mut(K * i + c);
+                        *xi *= d;
+                        *xi -= s[c];
+                    }
+                }
+                i -= 1;
+                continue;
+            }
             for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
                 for c in 0..K {
                     s[c] += Lxj * (*w.get_unchecked(K * Lij + c));

@@ -218,6 +218,11 @@ impl Drop for BufferPool {
 /// block's kernels scaling across threads. Contents never carry over.
 fn take_buffer(len: usize) -> Vec<f64> {
     let mut v = pooled_buffer(len);
+    if v.capacity() < len {
+        // A fresh zeroed allocation: large ones map zero pages instead of
+        // being filled on this thread.
+        return vec![0.0; len];
+    }
     v.clear();
     v.resize(len, 0.0);
     v
@@ -228,12 +233,43 @@ fn take_buffer(len: usize) -> Vec<f64> {
 fn take_scratch(len: usize) -> Vec<f64> {
     let mut v = pooled_buffer(len);
     if v.capacity() < len {
-        // Growth would copy the stale entries.
-        v.clear();
+        // Growth would copy the stale entries (see `take_buffer`).
+        return vec![0.0; len];
     }
     v.resize(len, 0.0);
     v
 }
+
+/// [`take_buffer`] zeroed over `split`'s ways: the fill (or a fresh
+/// buffer's first touch, or glibc's clearing of reused heap) is otherwise
+/// a serial pass of the caller. A `scratch` caller writes every entry
+/// before reading it, so a reused buffer that fits keeps its entries
+/// ([`take_scratch`]).
+fn take_zeroed(len: usize, split: &Split<'_>, scratch: bool) -> Vec<f64> {
+    let ways = split_ways(split).min(len / ZERO_PER_WAY);
+    if ways <= 1 {
+        return if scratch { take_scratch(len) } else { take_buffer(len) };
+    }
+    let mut v = pooled_buffer(len);
+    if v.capacity() < len {
+        v = Vec::with_capacity(len);
+    } else if scratch {
+        v.resize(len, 0.0);
+        return v;
+    }
+    let base = SendValues(v.as_mut_ptr());
+    run_ways(split, ways, |w| {
+        let (a, b) = (w * len / ways, (w + 1) * len / ways);
+        // SAFETY: way w alone writes entries a..b of the capacity.
+        unsafe { std::ptr::write_bytes(base.get().add(a), 0, b - a) };
+    });
+    // SAFETY: every entry was zeroed above.
+    unsafe { v.set_len(len) };
+    v
+}
+
+/// Entries one way zeroes, at least.
+const ZERO_PER_WAY: usize = 1 << 17;
 
 fn pooled_buffer(len: usize) -> Vec<f64> {
     BUFFERS
@@ -590,7 +626,79 @@ impl<const N: usize> View<'_, N> {
         }
         Some((lo, hi))
     }
+
+    /// [`Self::exponent_range`] over `split`'s ways (a minimum and a
+    /// maximum do not depend on the order).
+    fn exponent_range_split(&self, split: &Split<'_>) -> Option<(i64, i64)> {
+        use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::Relaxed};
+        let len = self.len();
+        let ways = split_ways(split).min(len / SCAN_PER_WAY).max(1);
+        if ways <= 1 {
+            return self.exponent_range();
+        }
+        let (lo, hi, finite) = (
+            AtomicI64::new(i64::MAX),
+            AtomicI64::new(i64::MIN),
+            AtomicBool::new(true),
+        );
+        run_ways(split, ways, |w| {
+            let (mut l, mut h) = (i64::MAX, i64::MIN);
+            for e in w * len / ways..(w + 1) * len / ways {
+                if self.stored(e) && scan_exponent(&self.data[e], &mut l, &mut h).is_none() {
+                    finite.store(false, Relaxed);
+                    return;
+                }
+            }
+            lo.fetch_min(l, Relaxed);
+            hi.fetch_max(h, Relaxed);
+        });
+        finite
+            .into_inner()
+            .then(|| (lo.into_inner(), hi.into_inner()))
+    }
 }
+
+/// Entries one way scans for exponents, at least.
+const SCAN_PER_WAY: usize = 1 << 16;
+
+impl<'a, const N: usize> View<'a, N> {
+    /// A dense copy (`ld = rows`) in `store` of a view whose strided span
+    /// holds over a quarter more entries than it stores (a block of a larger
+    /// matrix): residues are then encoded, kept and decoded for stored
+    /// entries only. The values are the same, so the product is too.
+    fn compact<'b>(self, store: &'b mut Vec<F<N>>, split: &Split<'_>) -> View<'b, N>
+    where
+        'a: 'b,
+    {
+        let stored = self.rows * self.cols;
+        if 4 * self.len() <= 5 * stored {
+            return self;
+        }
+        store.clear();
+        store.reserve(stored);
+        let base = SendValues(store.spare_capacity_mut().as_mut_ptr().cast::<F<N>>());
+        let ways = split_ways(split).min(stored / COPY_PER_WAY).max(1);
+        run_ways(split, ways, |w| {
+            for c in w * self.cols / ways..(w + 1) * self.cols / ways {
+                for r in 0..self.rows {
+                    // SAFETY: column c of the copy is written by way w alone.
+                    unsafe { base.get().add(c * self.rows + r).write(self.data[c * self.ld + r]) };
+                }
+            }
+        });
+        // SAFETY: the ways wrote every entry 0..stored.
+        unsafe { store.set_len(stored) };
+        View {
+            data: store,
+            rows: self.rows,
+            cols: self.cols,
+            ld: self.rows,
+        }
+    }
+}
+
+/// Entries one way copies when compacting a view, at least.
+const COPY_PER_WAY: usize = 1 << 14;
 
 /// Primes and derived constants for one product.
 struct Plan {
@@ -659,10 +767,15 @@ fn stream_group_cap(entries: usize) -> usize {
     (GROUP_SCRATCH_BYTES / (entries.max(1) * 8)).clamp(1, STREAM_GROUP)
 }
 
-/// An operand's exact integer image split into `width`-bit chunks, entry-
-/// contiguous (`e[j + r·chunks]`). Residues of any prime group follow from one
-/// small `dgemm` against the weights `2^(width·j) mod p`, so the chunk matrix
-/// is built once and reused by every group.
+/// Entries per chunk panel.
+const PANEL: usize = 32;
+
+/// An operand's exact integer image split into `width`-bit chunks, in panels
+/// of [`PANEL`] entries stored chunk-major: chunk `j` of entry `r` is
+/// `e[(r / PANEL)·PANEL·chunks + j·PANEL + r % PANEL]`. Residues of any prime
+/// group follow from the panels and the weights `2^(width·j) mod p`
+/// ([`panel_residues`]), so the chunk matrix is built once and reused by
+/// every group.
 struct ChunkMatrix {
     e: Vec<f64>,
     chunks: usize,
@@ -670,8 +783,15 @@ struct ChunkMatrix {
     len: usize,
 }
 
+/// Rows `r0..r1` of way `w` of `ways` over `len` rows, cut at whole panels.
+fn panel_rows(len: usize, ways: usize, w: usize) -> (usize, usize) {
+    let panels = len.div_ceil(PANEL);
+    let cut = |w: usize| (w * panels / ways * PANEL).min(len);
+    (cut(w), cut(w + 1))
+}
+
 impl ChunkMatrix {
-    fn new<const N: usize>(len: usize, spread: i64, plan: &Plan) -> Self {
+    fn new<const N: usize>(len: usize, spread: i64, plan: &Plan, split: &Split<'_>) -> Self {
         let int_bits = F::<N>::PRECISION_BITS as i64 + spread;
         let mut width = 30u32;
         let chunks = loop {
@@ -684,7 +804,7 @@ impl ChunkMatrix {
             width -= 1;
         };
         Self {
-            e: take_buffer(len * chunks),
+            e: take_zeroed(len.div_ceil(PANEL) * PANEL * chunks, split, false),
             chunks,
             width,
             len,
@@ -692,17 +812,13 @@ impl ChunkMatrix {
     }
 
     fn view(&self) -> ChunkView<'_> {
-        ChunkView {
-            e: &self.e,
-            len: self.len,
-            chunks: self.chunks,
-            width: self.width,
-        }
+        self.rows(0, self.len)
     }
-    /// Entries `r0..r1`; entry-major storage makes row ranges contiguous.
+    /// Entries `r0..r1`, `r0` at a panel start: whole panels are contiguous.
     fn rows(&self, r0: usize, r1: usize) -> ChunkView<'_> {
+        debug_assert!(r0 % PANEL == 0 && r1 <= self.len);
         ChunkView {
-            e: &self.e[r0 * self.chunks..r1 * self.chunks],
+            e: &self.e[r0 * self.chunks..r1.div_ceil(PANEL) * PANEL * self.chunks],
             len: r1 - r0,
             chunks: self.chunks,
             width: self.width,
@@ -710,7 +826,7 @@ impl ChunkMatrix {
     }
 }
 
-/// Borrowed entry-major chunk view, optionally covering a row range.
+/// Borrowed panel chunk view, optionally covering a row range.
 #[derive(Clone, Copy)]
 struct ChunkView<'a> {
     e: &'a [f64],
@@ -728,8 +844,9 @@ impl Drop for ChunkMatrix {
 /// Rows encoded per way, at least; below this a split costs more than it saves.
 const MIN_ROWS_PER_WAY: usize = 256;
 
+/// Chunks `0..chunks` of `value` into `row[j·PANEL]` (its panel column slot).
 #[inline]
-fn fill_chunk<const N: usize>(value: &F<N>, row: &mut [f64], lo: i64, width: u32) {
+fn fill_chunk<const N: usize>(value: &F<N>, row: &mut [f64], chunks: usize, lo: i64, width: u32) {
     let view = value.dyadic_view();
     let negative = match view.kind {
         DyadicKind::Finite { negative } => negative,
@@ -740,7 +857,7 @@ fn fill_chunk<const N: usize>(value: &F<N>, row: &mut [f64], lo: i64, width: u32
     let j0 = (delta / width as i64) as usize;
     let j1 = ((delta + F::<N>::PRECISION_BITS as i64) as usize)
         .div_ceil(width as usize)
-        .min(row.len());
+        .min(chunks);
     if j0 >= j1 {
         return;
     }
@@ -748,21 +865,27 @@ fn fill_chunk<const N: usize>(value: &F<N>, row: &mut [f64], lo: i64, width: u32
     let mut j = j0;
     // Only the first chunk can start below bit 0.
     if width as i64 * (j as i64) < delta {
-        row[j] = sign * bits_at(limbs, width as i64 * j as i64 - delta, width) as f64;
+        row[j * PANEL] = sign * bits_at(limbs, width as i64 * j as i64 - delta, width) as f64;
         j += 1;
     }
     // Later chunks start at bit s < P, so limb s/64 exists.
     let mask = (1u64 << width) - 1;
     let mut s = width as usize * j - delta as usize;
-    for slot in &mut row[j..j1] {
+    for j in j..j1 {
         let (li, off) = (s / 64, s % 64);
         let mut x = limbs[li] >> off;
         if off != 0 && li + 1 < N {
             x |= limbs[li + 1] << (64 - off);
         }
-        *slot = sign * (x & mask) as f64;
+        row[j * PANEL] = sign * (x & mask) as f64;
         s += width as usize;
     }
+}
+
+/// Chunk slot of entry `r` (its chunk `j` is `j·PANEL` further).
+#[inline]
+fn chunk_slot(r: usize, chunks: usize) -> usize {
+    (r / PANEL) * PANEL * chunks + r % PANEL
 }
 
 fn chunk_matrix<const N: usize>(
@@ -773,25 +896,23 @@ fn chunk_matrix<const N: usize>(
     split: &Split<'_>,
 ) -> ChunkMatrix {
     let len = x.len();
-    let mut matrix = ChunkMatrix::new::<N>(len, spread, plan);
+    let mut matrix = ChunkMatrix::new::<N>(len, spread, plan, split);
     let (chunks, width) = (matrix.chunks, matrix.width);
-    // Rows are independent; a split call encodes them over its ways.
-    let fill = |r0: usize, rows: &mut [f64]| {
-        for (i, row) in rows.chunks_mut(chunks).enumerate() {
-            let r = r0 + i;
-            if !x.stored(r) {
-                continue;
+    // Rows are independent; a split call encodes whole panels over its ways.
+    let fill = |r0: usize, panels: &mut [f64]| {
+        for r in r0..(r0 + panels.len() / chunks).min(len) {
+            if x.stored(r) {
+                fill_chunk(&x.data[r], &mut panels[chunk_slot(r - r0, chunks)..], chunks, lo, width);
             }
-            fill_chunk(&x.data[r], row, lo, width);
         }
     };
     let ways = split_ways(split).min(len / MIN_ROWS_PER_WAY).max(1);
     if ways <= 1 || chunks == 0 {
         fill(0, &mut matrix.e);
     } else {
-        let per = len.div_ceil(ways);
-        ways_chunks(split, &mut matrix.e, per * chunks, |w, rows| {
-            fill(w * per, rows)
+        let per = len.div_ceil(PANEL).div_ceil(ways) * PANEL;
+        ways_chunks(split, &mut matrix.e, per * chunks, |w, panels| {
+            fill(w * per, panels)
         });
     }
     matrix
@@ -817,30 +938,84 @@ fn weights(plan: &Plan, width: u32, chunks: usize) -> Arc<Vec<f64>> {
 
 /// Symmetric residues of primes `q0..q1`, prime-major: `out[(q-q0)·len + e]`.
 fn group_residues(m: ChunkView<'_>, plan: &Plan, q0: usize, q1: usize, out: &mut Vec<f64>) {
-    let g = q1 - q0;
-    // No clearing: the product overwrites every entry (k = 0 is zeroed by
-    // `local_gemm`).
-    out.resize(m.len * g, 0.0);
-    let w = weights(plan, m.width, m.chunks);
-    int_gemm(
-        b'T',
-        b'N',
-        m.len,
-        g,
-        m.chunks,
-        m.e,
-        m.chunks,
-        &w[q0 * m.chunks..q1 * m.chunks],
-        m.chunks,
-        out,
-        m.len,
-    );
-    for (qi, col) in out.chunks_mut(m.len.max(1)).enumerate().take(g) {
-        let q = q0 + qi;
-        for x in col {
-            *x = reduce(*x, plan.p[q], plan.pinv[q]);
+    // No clearing: the kernel writes every entry.
+    out.resize(m.len * (q1 - q0), 0.0);
+    let len = m.len;
+    panel_residues(m, plan, q0, q1, |qi, r0, res| {
+        out[qi * len + r0..][..res.len()].copy_from_slice(res)
+    });
+}
+
+/// Whether the CPU runs AVX2. x86-64 builds target baseline SSE2; the hot
+/// residue loops are exact integer arithmetic in binary64, so their AVX2
+/// instances return the same bits.
+#[cfg(target_arch = "x86_64")]
+fn avx2() -> bool {
+    std::is_x86_feature_detected!("avx2")
+}
+
+/// Reduced residues of `m`'s entries for primes `q0..q1`: `sink(q - q0, r0,
+/// residues)` once per prime and panel, for the panel's entries `r0..` (the
+/// last panel may be short). Each residue is the exact integer dot of an
+/// entry's chunks with the weights `2^(width·j) mod p` (every partial sum is
+/// below 2^53, see [`ChunkMatrix::new`]), reduced once, so it does not depend
+/// on the evaluation order. Panel columns stay in L1 across the primes, and
+/// results come out entry-contiguous, with no packed copy or extra pass.
+fn panel_residues(
+    m: ChunkView<'_>,
+    plan: &Plan,
+    q0: usize,
+    q1: usize,
+    sink: impl FnMut(usize, usize, &[f64]),
+) {
+    #[inline(always)]
+    fn body(
+        m: ChunkView<'_>,
+        plan: &Plan,
+        q0: usize,
+        q1: usize,
+        mut sink: impl FnMut(usize, usize, &[f64]),
+    ) {
+        let (chunks, w) = (m.chunks, weights(plan, m.width, m.chunks));
+        for (i, panel) in m.e.chunks_exact(PANEL * chunks).enumerate() {
+            let r0 = i * PANEL;
+            if r0 >= m.len {
+                break;
+            }
+            let (columns, _) = panel.as_chunks::<PANEL>();
+            for q in q0..q1 {
+                let (p, pinv) = (plan.p[q], plan.pinv[q]);
+                let mut acc = [0.0f64; PANEL];
+                for (column, &wj) in columns.iter().zip(&w[q * chunks..(q + 1) * chunks]) {
+                    for (a, &c) in acc.iter_mut().zip(column) {
+                        *a += c * wj;
+                    }
+                }
+                // A separate result keeps `acc` out of memory on every target.
+                let mut res = [0.0f64; PANEL];
+                for (r, &a) in res.iter_mut().zip(&acc) {
+                    *r = reduce(a, p, pinv);
+                }
+                sink(q - q0, r0, &res[..PANEL.min(m.len - r0)]);
+            }
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    if avx2() {
+        #[target_feature(enable = "avx2")]
+        unsafe fn wide(
+            m: ChunkView<'_>,
+            plan: &Plan,
+            q0: usize,
+            q1: usize,
+            sink: impl FnMut(usize, usize, &[f64]),
+        ) {
+            body(m, plan, q0, q1, sink)
+        }
+        // SAFETY: the CPU supports AVX2.
+        return unsafe { wide(m, plan, q0, q1, sink) };
+    }
+    body(m, plan, q0, q1, sink)
 }
 
 /// Residues of an operand that stays constant across many products (the
@@ -867,46 +1042,97 @@ struct CacheEntry {
 
 #[derive(Debug)]
 enum CachedResidues {
-    // Balanced residues for primes below 2^24 lie strictly inside ±2^23.
-    Narrow(Vec<[u8; 3]>),
+    /// Balanced residues for primes below 2^24 lie strictly inside ±2^23:
+    /// their low 16 bits and signed high byte, kept apart so that storing
+    /// and loading them vectorize.
+    Narrow(Vec<u16>, Vec<i8>),
     Wide(Vec<f32>),
 }
 
-impl CachedResidues {
-    fn from_chunks(chunks: &ChunkMatrix, plan: &Plan) -> Self {
-        let len = chunks.len * plan.count();
-        let mut stored = if plan.bits <= 24 {
-            Self::Narrow(Vec::with_capacity(len))
-        } else {
-            Self::Wide(Vec::with_capacity(len))
-        };
-        // Compress each prime group immediately. A full f64 encoding would
-        // coexist with the cache and multiply the construction memory peak.
-        let mut scratch = Vec::new();
-        for first in (0..plan.count()).step_by(STREAM_GROUP) {
-            group_residues(
-                chunks.view(),
-                plan,
-                first,
-                (first + STREAM_GROUP).min(plan.count()),
-                &mut scratch,
-            );
-            match &mut stored {
-                Self::Narrow(values) => values.extend(scratch.iter().map(|&value| {
-                    let [a, b, c, _] = (value as i32).to_le_bytes();
-                    [a, b, c]
-                })),
-                Self::Wide(values) => values.extend(scratch.iter().map(|&value| value as f32)),
+/// Raw destination of [`CachedResidues`] writers on disjoint entries.
+#[derive(Clone, Copy)]
+enum Store {
+    Narrow(*mut u16, *mut i8),
+    Wide(*mut f32),
+}
+unsafe impl Send for Store {}
+unsafe impl Sync for Store {}
+
+impl Store {
+    /// Residues `values` to entries `at..`.
+    ///
+    /// SAFETY: the entries are allocated and written by this caller alone.
+    #[inline(always)]
+    unsafe fn put(self, at: usize, values: &[f64]) {
+        let n = values.len();
+        match self {
+            Store::Narrow(lo, hi) => {
+                let (lo, hi) = unsafe {
+                    (
+                        std::slice::from_raw_parts_mut(lo.add(at), n),
+                        std::slice::from_raw_parts_mut(hi.add(at), n),
+                    )
+                };
+                for ((lo, hi), &v) in lo.iter_mut().zip(hi).zip(values) {
+                    let v = v as i32;
+                    (*lo, *hi) = (v as u16, (v >> 16) as i8);
+                }
             }
+            Store::Wide(w) => {
+                let w = unsafe { std::slice::from_raw_parts_mut(w.add(at), n) };
+                for (w, &v) in w.iter_mut().zip(values) {
+                    *w = v as f32;
+                }
+            }
+        }
+    }
+}
+
+impl CachedResidues {
+    /// `len` residues of `bits`-bit primes (in `reusable` when given),
+    /// written by `fill` through the raw store; `fill` writes every entry,
+    /// so nothing is cleared first.
+    fn filled(bits: u32, len: usize, reusable: Option<Self>, fill: impl FnOnce(Store)) -> Self {
+        let mut stored = reusable.unwrap_or_else(|| {
+            if bits <= 24 {
+                Self::Narrow(Vec::with_capacity(len), Vec::with_capacity(len))
+            } else {
+                Self::Wide(Vec::with_capacity(len))
+            }
+        });
+        fill(match &mut stored {
+            Self::Narrow(lo, hi) => Store::Narrow(lo.as_mut_ptr(), hi.as_mut_ptr()),
+            Self::Wide(w) => Store::Wide(w.as_mut_ptr()),
+        });
+        // SAFETY: `fill` wrote entries 0..len of the capacity.
+        unsafe {
+            match &mut stored {
+                Self::Narrow(lo, hi) => (lo.set_len(len), hi.set_len(len)),
+                Self::Wide(w) => (w.set_len(len), ()),
+            };
         }
         stored
     }
 
-    /// Contiguous operands, block by block: each block's chunk matrix and one
-    /// prime group are the only transients, and its residues are written in
-    /// place, instead of a whole-operand chunk matrix plus per-way parts that
-    /// are merged afterwards. Every residue comes from the same exact integer
-    /// sum and reduction as [`Self::from_chunks`], so the store is identical.
+    fn len(&self) -> usize {
+        match self {
+            Self::Narrow(lo, _) => lo.len(),
+            Self::Wide(w) => w.len(),
+        }
+    }
+
+    /// Every prime's residues of `chunks`, prime-major.
+    fn from_chunks(chunks: &ChunkMatrix, plan: &Plan, split: &Split<'_>) -> Self {
+        Self::filled(plan.bits, chunks.len * plan.count(), None, |store| {
+            encode_into(chunks, plan, split, store, chunks.len, 0)
+        })
+    }
+
+    /// Contiguous operands, block by block: each block's chunk matrix is the
+    /// only transient, and its residues are written in place, instead of a
+    /// whole-operand chunk matrix. Every residue comes from the same exact
+    /// integer sum and reduction as [`Self::from_chunks`], so the store is
+    /// identical.
     fn from_view_blocked<const N: usize>(
         x: View<'_, N>,
         lo: i64,
@@ -916,114 +1142,81 @@ impl CachedResidues {
         reusable: Option<Self>,
     ) -> Self {
         const BLOCK: usize = 1 << 15;
-        let (len, count) = (x.len(), plan.count());
-        let mut stored = reusable.unwrap_or_else(|| {
-            if plan.bits <= 24 {
-                Self::Narrow(vec![[0u8; 3]; len * count])
-            } else {
-                Self::Wide(vec![0f32; len * count])
+        let len = x.len();
+        Self::filled(plan.bits, len * plan.count(), reusable, |store| {
+            for r0 in (0..len).step_by(BLOCK) {
+                let rows = BLOCK.min(len - r0);
+                let block = View {
+                    data: &x.data[r0..r0 + rows],
+                    rows,
+                    cols: 1,
+                    ld: rows,
+                };
+                let chunks = chunk_matrix(block, lo, spread, plan, split);
+                encode_into(&chunks, plan, split, store, len, r0);
             }
-        });
-        let mut scratch = Vec::new();
-        for r0 in (0..len).step_by(BLOCK) {
-            let r1 = (r0 + BLOCK).min(len);
-            let rows = r1 - r0;
-            let block = View {
-                data: &x.data[r0..r1],
-                rows,
-                cols: 1,
-                ld: rows,
-            };
-            let chunks = chunk_matrix(block, lo, spread, plan, split);
-            for q0 in (0..count).step_by(STREAM_GROUP) {
-                let q1 = (q0 + STREAM_GROUP).min(count);
-                group_residues(chunks.view(), plan, q0, q1, &mut scratch);
-                for (qi, column) in scratch.chunks(rows).enumerate() {
-                    let at = (q0 + qi) * len + r0;
-                    match &mut stored {
-                        Self::Narrow(values) => {
-                            for (slot, &value) in values[at..at + rows].iter_mut().zip(column) {
-                                let [a, b, c, _] = (value as i32).to_le_bytes();
-                                *slot = [a, b, c];
-                            }
-                        }
-                        Self::Wide(values) => {
-                            for (slot, &value) in values[at..at + rows].iter_mut().zip(column) {
-                                *slot = value as f32;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        stored
-    }
-
-    /// Entry-split variant of [`Self::from_chunks`] for streamed callers: each
-    /// way encodes every prime for its own contiguous entry range, so the
-    /// encode is parallel and per-way scratch shrinks with the way count.
-    /// Every stored value is computed by the same `group_residues` GEMM as
-    /// the serial path, so residues are identical bit for bit.
-    fn from_chunks_split(chunks: &ChunkMatrix, plan: &Plan, split: &Split<'_>) -> Self {
-        let len = chunks.len;
-        let ways = split_ways(split).min(len / MIN_ROWS_PER_WAY).max(1);
-        if ways <= 1 {
-            return Self::from_chunks(chunks, plan);
-        }
-        let count = plan.count();
-        fn encode<T: Copy + Send + Sync>(
-            chunks: &ChunkMatrix,
-            plan: &Plan,
-            split: &Split<'_>,
-            out: &mut [T],
-            compress: impl Fn(f64) -> T + Sync,
-        ) {
-            let (len, count) = (chunks.len, plan.count());
-            let ways = split_ways(split).min(len / MIN_ROWS_PER_WAY).max(1);
-            let out = SendValues(out.as_mut_ptr());
-            let work = |w: usize| {
-                let (r0, r1) = (w * len / ways, (w + 1) * len / ways);
-                let view = chunks.rows(r0, r1);
-                let mut scratch = Vec::new();
-                for q0 in (0..count).step_by(STREAM_GROUP) {
-                    let q1 = (q0 + STREAM_GROUP).min(count);
-                    group_residues(view, plan, q0, q1, &mut scratch);
-                    for (qi, column) in scratch.chunks(r1 - r0).enumerate() {
-                        let at = (q0 + qi) * len + r0;
-                        for (i, &value) in column.iter().enumerate() {
-                            // SAFETY: way w owns entries r0..r1 of every prime;
-                            // the destination stays allocated until all ways finish.
-                            unsafe { *out.get().add(at + i) = compress(value) };
-                        }
-                    }
-                }
-            };
-            run_ways(split, ways, work);
-        }
-        let mut stored = if plan.bits <= 24 {
-            Self::Narrow(vec![[0u8; 3]; len * count])
-        } else {
-            Self::Wide(vec![0.0f32; len * count])
-        };
-        match &mut stored {
-            Self::Narrow(values) => encode(chunks, plan, split, values, |value| {
-                let [a, b, c, _] = (value as i32).to_le_bytes();
-                [a, b, c]
-            }),
-            Self::Wide(values) => encode(chunks, plan, split, values, |value| value as f32),
-        }
-        stored
+        })
     }
 
     fn extend(&self, range: std::ops::Range<usize>, out: &mut Vec<f64>) {
-        match self {
-            Self::Narrow(values) => out.extend(values[range].iter().map(|&[a, b, c]| {
-                // Sign-extend the stored 24-bit two's-complement integer.
-                ((u32::from_le_bytes([a, b, c, 0]) << 8) as i32 >> 8) as f64
-            })),
-            Self::Wide(values) => out.extend(values[range].iter().map(|&value| value as f64)),
+        let (at, n) = (out.len(), range.len());
+        out.reserve(n);
+        // SAFETY: `decode` writes all n reserved entries before they are exposed.
+        unsafe {
+            self.decode(range.start, std::slice::from_raw_parts_mut(out.as_mut_ptr().add(at), n));
+            out.set_len(at + n);
         }
     }
+
+    /// Stored residues `start..start + out.len()` into `out`.
+    fn decode(&self, start: usize, out: &mut [f64]) {
+        #[inline(always)]
+        fn body(res: &CachedResidues, start: usize, out: &mut [f64]) {
+            let range = start..start + out.len();
+            match res {
+                CachedResidues::Narrow(lo, hi) => {
+                    for ((o, &l), &h) in out.iter_mut().zip(&lo[range.clone()]).zip(&hi[range]) {
+                        *o = ((h as i32) << 16 | l as i32) as f64;
+                    }
+                }
+                CachedResidues::Wide(w) => {
+                    for (o, &v) in out.iter_mut().zip(&w[range]) {
+                        *o = v as f64;
+                    }
+                }
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if avx2() {
+            #[target_feature(enable = "avx2")]
+            unsafe fn wide(res: &CachedResidues, start: usize, out: &mut [f64]) {
+                body(res, start, out)
+            }
+            // SAFETY: the CPU supports AVX2.
+            return unsafe { wide(self, start, out) };
+        }
+        body(self, start, out)
+    }
+}
+
+/// Every prime's residues of `chunks` to `store[q·len + offset + r]`, over
+/// `split`'s ways by whole panels.
+fn encode_into(
+    chunks: &ChunkMatrix,
+    plan: &Plan,
+    split: &Split<'_>,
+    store: Store,
+    len: usize,
+    offset: usize,
+) {
+    let ways = split_ways(split).min(chunks.len / MIN_ROWS_PER_WAY).max(1);
+    run_ways(split, ways, |w| {
+        let (r0, r1) = panel_rows(chunks.len, ways, w);
+        panel_residues(chunks.rows(r0, r1), plan, 0, plan.count(), |q, r, res| {
+            // SAFETY: way w alone writes entries r0..r1 of every prime.
+            unsafe { store.put(q * len + offset + r0 + r, res) }
+        });
+    });
 }
 
 /// Spare primes encoded beyond the current plan, so later calls whose other
@@ -1055,15 +1248,18 @@ fn fingerprint<const N: usize>(x: View<'_, N>) -> u64 {
 enum Operand {
     Chunks(ChunkMatrix),
     /// Transient compressed residues (this call only): the per-way group
-    /// refill copies scalars instead of re-running the chunk GEMM, which
+    /// refill copies scalars instead of re-running the chunk kernel, which
     /// keeps tall skinny operands cheap at small `stream_group_cap` widths.
     Packed(CachedResidues, usize),
     Cached(Arc<CacheEntry>),
 }
 
 /// Operands streaming at least this many residues go through the packed
-/// store; below it the per-group chunk GEMM is already cheap.
+/// store; below it the per-group chunk kernel is already cheap.
 const PACK_OPERAND_MIN: usize = 1 << 20;
+
+/// Residues one way decodes, at least.
+const DECODE_PER_WAY: usize = 1 << 16;
 
 fn packed_operand<const N: usize>(
     x: View<'_, N>,
@@ -1076,13 +1272,53 @@ fn packed_operand<const N: usize>(
         return Operand::Chunks(chunk_matrix(x, lo, spread, plan, split));
     }
     let chunks = chunk_matrix(x, lo, spread, plan, split);
-    Operand::Packed(
-        CachedResidues::from_chunks_split(&chunks, plan, split),
-        chunks.len,
-    )
+    Operand::Packed(CachedResidues::from_chunks(&chunks, plan, split), chunks.len)
 }
 
 impl Operand {
+    /// [`Self::residues`] for a caller whose split ways are otherwise idle:
+    /// stored residues decode over the ways, a chunk matrix's kernel runs by
+    /// panel ranges (each residue is copied or computed alone, so the split
+    /// never changes it).
+    fn residues_split(&self, plan: &Plan, q0: usize, q1: usize, out: &mut Vec<f64>, split: &Split<'_>) {
+        let (res, len) = match self {
+            Operand::Packed(res, len) => (Some(res), *len),
+            Operand::Cached(c) => (Some(&c.res), c.len),
+            Operand::Chunks(m) => (None, m.len),
+        };
+        let total = (q1 - q0) * len;
+        let ways = split_ways(split).min(total / DECODE_PER_WAY).max(1);
+        if ways <= 1 {
+            return self.residues(plan, q0, q1, out);
+        }
+        out.clear();
+        out.reserve(total);
+        let base = SendValues(out.spare_capacity_mut().as_mut_ptr().cast::<f64>());
+        run_ways(split, ways, |w| {
+            if let Some(res) = res {
+                let (a, b) = (w * total / ways, (w + 1) * total / ways);
+                // SAFETY: way w alone writes entries a..b of the reserved capacity.
+                res.decode(q0 * len + a, unsafe {
+                    std::slice::from_raw_parts_mut(base.get().add(a), b - a)
+                });
+            } else if let Operand::Chunks(m) = self {
+                let (r0, r1) = panel_rows(len, ways, w);
+                panel_residues(m.rows(r0, r1), plan, q0, q1, |qi, r, res| {
+                    // SAFETY: way w alone writes rows r0..r1 of every prime.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            res.as_ptr(),
+                            base.get().add(qi * len + r0 + r),
+                            res.len(),
+                        )
+                    };
+                });
+            }
+        });
+        // SAFETY: the ways wrote every entry 0..total.
+        unsafe { out.set_len(total) };
+    }
+
     fn residues(&self, plan: &Plan, q0: usize, q1: usize, out: &mut Vec<f64>) {
         match self {
             Operand::Chunks(m) => group_residues(m.view(), plan, q0, q1, out),
@@ -1148,28 +1384,16 @@ impl ResidueCache {
             .and_then(|entry| Arc::try_unwrap(entry).ok())
             .map(|entry| entry.res)
             .filter(|res| {
-                if x.ld != x.rows && x.cols != 1 {
-                    return false;
-                }
-                match res {
-                    CachedResidues::Narrow(values) => {
-                        plan.bits <= 24 && values.len() == x.len() * count
-                    }
-                    CachedResidues::Wide(values) => {
-                        plan.bits > 24 && values.len() == x.len() * count
-                    }
-                }
+                (x.ld == x.rows || x.cols == 1)
+                    && matches!(res, CachedResidues::Narrow(..)) == (plan.bits <= 24)
+                    && res.len() == x.len() * count
             });
         {
             let wide = Plan::with_count(plan.bits, count);
             let res = if x.ld == x.rows || x.cols == 1 {
                 CachedResidues::from_view_blocked(x, lo, spread, &wide, split, reusable)
             } else {
-                CachedResidues::from_chunks_split(
-                    &chunk_matrix(x, lo, spread, &wide, split),
-                    &wide,
-                    split,
-                )
+                CachedResidues::from_chunks(&chunk_matrix(x, lo, spread, &wide, split), &wide, split)
             };
             let entry = Arc::new(CacheEntry {
                 fingerprint: fp,
@@ -1399,6 +1623,15 @@ fn split_ways(split: &Split<'_>) -> usize {
     }
 }
 
+/// Threads that run `split`'s ways (a hinted split may grant more ways).
+fn split_threads(split: &Split<'_>) -> usize {
+    match split {
+        Split::Pool(p) => p.current_num_threads(),
+        Split::Ways(w) => (*w).min(rayon::current_num_threads()),
+        Split::Serial => 1,
+    }
+}
+
 /// Run `f(0..ways)` on the calling thread, the current pool (`Ways`) or the
 /// given pool (`Pool`).
 fn run_ways(split: &Split<'_>, ways: usize, f: impl Fn(usize) + Sync + Send) {
@@ -1566,18 +1799,23 @@ fn crt_tiled<const N: usize>(
             let (p, pinv, u) = (plan.p[q], plan.pinv[q], crt.u[q]);
             let row = &prod[q * stride..(q + 1) * stride];
             let dst = &mut local[q * t..(q + 1) * t];
-            // Gather first: the contiguous update below then vectorizes.
+            let update = |d: &mut f64, x: f64, f: &mut f64| {
+                let v = residue_product(x, u, p, pinv);
+                *d = v;
+                *f += v * pinv;
+            };
             if read.is_empty() {
-                dst.copy_from_slice(&row[t0..t0 + t]);
+                for ((d, &x), f) in dst.iter_mut().zip(&row[t0..t0 + t]).zip(&mut frac[..t]) {
+                    update(d, x, f);
+                }
             } else {
+                // Gather first: the contiguous update below then vectorizes.
                 for (d, &r) in dst.iter_mut().zip(&read[t0..t0 + t]) {
                     *d = row[r];
                 }
-            }
-            for (d, f) in dst.iter_mut().zip(&mut frac[..t]) {
-                let v = residue_product(*d, u, p, pinv);
-                *d = v;
-                *f += v * pinv;
+                for (d, f) in dst.iter_mut().zip(&mut frac[..t]) {
+                    update(d, *d, f);
+                }
             }
         }
         for (d, f) in local[kp * t..rows * t].iter_mut().zip(&frac[..t]) {
@@ -1709,22 +1947,24 @@ fn pack(
 ) -> Option<bool> {
     let nbits = width as usize * chunks;
     mag.clear();
-    mag.resize(nbits.div_ceil(64) + 1, 0);
     // |y| < 2^53 and |carry| < 2^(53-width+1): i64 never overflows.
     let mut carry = 0i64;
     let mask = (1i64 << width) - 1;
-    for (l, y) in digits.enumerate() {
+    // Digit `l` fills bits `[l·width, (l+1)·width)`; whole limbs leave `bits`.
+    let (mut bits, mut filled) = (0u128, 0);
+    for y in digits {
         let t = y as i64 + carry;
-        let d = t & mask;
         carry = t >> width;
-        let pos = l * width as usize;
-        let (li, off) = (pos / 64, pos % 64);
-        let v = (d as u128) << off;
-        mag[li] |= v as u64;
-        if off + width as usize > 64 {
-            mag[li + 1] |= (v >> 64) as u64;
+        bits |= ((t & mask) as u128) << filled;
+        filled += width;
+        if filled >= 64 {
+            mag.push(bits as u64);
+            bits >>= 64;
+            filled -= 64;
         }
     }
+    mag.push(bits as u64);
+    mag.resize(nbits.div_ceil(64) + 1, 0);
     match carry {
         0 => {}
         -1 => {
@@ -1796,11 +2036,20 @@ pub(super) fn gemm<const N: usize>(
     };
     let same_operand =
         a.as_ptr() == b.as_ptr() && av.rows == bv.rows && av.cols == bv.cols && av.ld == bv.ld;
-    let range_a = av.exponent_range();
+    // Ways for the copies and scans before the plan fixes the prime count.
+    let scan = split_plan(pool, (m * n * k) as u128 * STREAM_GROUP as u128);
+    let (mut store_a, mut store_b) = (Vec::new(), Vec::new());
+    let av = av.compact(&mut store_a, &scan);
+    let bv = if same_operand {
+        av
+    } else {
+        bv.compact(&mut store_b, &scan)
+    };
+    let range_a = av.exponent_range_split(&scan);
     let range_b = if same_operand {
         range_a
     } else {
-        bv.exponent_range()
+        bv.exponent_range_split(&scan)
     };
     let (Some((lo_a, hi_a)), Some((lo_b, hi_b))) = (range_a, range_b) else {
         return false;
@@ -1858,8 +2107,8 @@ pub(super) fn gemm<const N: usize>(
         m,
         n,
         k,
-        lda,
-        ldb,
+        lda: av.ld,
+        ldb: bv.ld,
     };
     let split = split_plan(pool, (m * n * k) as u128 * plan.count() as u128);
     let reach = inner_reach(&bv, tb_n, k, n);
@@ -1873,7 +2122,11 @@ pub(super) fn gemm<const N: usize>(
     let scalar_fill =
         |o: &Option<Operand>| matches!(o, None | Some(Operand::Packed(..) | Operand::Cached(..)));
     let group_cap = if scalar_fill(&cb) && matches!(ca, Operand::Packed(..) | Operand::Cached(..)) {
-        stream_group_cap(len_a + len_b)
+        // Wide enough that every way gets a column panel of some prime,
+        // within GROUP_SCRATCH_BYTES of operand residues per thread.
+        let fill = split_ways(&split).div_ceil((n / PANEL_COLS).max(1));
+        let bytes = split_threads(&split) * GROUP_SCRATCH_BYTES / ((len_a + len_b).max(1) * 8);
+        stream_group_cap(len_a + len_b).max(fill.min(bytes).min(STREAM_GROUP))
     } else {
         STREAM_GROUP
     };
@@ -1882,13 +2135,14 @@ pub(super) fn gemm<const N: usize>(
         .flatten();
     // Every prime's products, then one output-tiled reconstruction.
     let count = plan.count();
-    let mut prod = take_scratch(count * outputs);
+    // `prime_columns` writes every output of every prime.
+    let mut prod = take_zeroed(count * outputs, &split, true);
     let mut s = Scratch::default();
     for q0 in (0..count).step_by(group_cap) {
         let q1 = (q0 + group_cap).min(count);
-        ca.residues(&plan, q0, q1, &mut s.a);
+        ca.residues_split(&plan, q0, q1, &mut s.a, &split);
         if let Some(cb) = &cb {
-            cb.residues(&plan, q0, q1, &mut s.b);
+            cb.residues_split(&plan, q0, q1, &mut s.b, &split);
         }
         let (sa, sb) = (&s.a, &s.b);
         let product = |qi, prod: &mut [f64], t: &mut Vec<f64>| {
@@ -2015,11 +2269,7 @@ fn column_panels(
     reach: Option<&[(usize, usize)]>,
 ) -> Vec<usize> {
     let (m, n, k) = (shape.m, shape.n, shape.k);
-    let threads = match split {
-        Split::Pool(p) => p.current_num_threads(),
-        _ => rayon::current_num_threads(),
-    };
-    let ways = split_ways(split).min(threads);
+    let ways = split_threads(split);
     let inner = |j: usize| reach.map_or(k, |r| r[j].1 - r[j].0);
     let weight = |j: usize| (if upper_only { (j + 1).min(m) } else { m } * inner(j)) as u128;
     let total: u128 = (0..n).map(weight).sum();
@@ -2305,19 +2555,19 @@ pub(super) fn gemm_blocks_upper<const N: usize>(
             };
             let (cols, kr, plan) = (group.columns.len(), group.rows.len(), &group.plan);
             let len = kr * cols;
-            let mut ca = ChunkMatrix::new::<N>(len, group.spread.0, plan);
-            let mut cb = ChunkMatrix::new::<N>(len, group.spread.1, plan);
+            let mut ca = ChunkMatrix::new::<N>(len, group.spread.0, plan, &Split::Serial);
+            let mut cb = ChunkMatrix::new::<N>(len, group.spread.1, plan, &Split::Serial);
             for (j, &position) in group.positions.iter().enumerate() {
                 for (i, &(b, local)) in group.rows.iter().enumerate() {
                     let (y, d, _) = blocks[b];
                     let at = local + position * width(&blocks[b]);
-                    let (a0, b0) = ((j * kr + i) * ca.chunks, (j * kr + i) * cb.chunks);
+                    let (a0, b0) = (chunk_slot(j * kr + i, ca.chunks), chunk_slot(j * kr + i, cb.chunks));
                     let z = y[at] * d[local];
                     if !z.is_finite() {
                         return None;
                     }
-                    fill_chunk(&z, &mut ca.e[a0..a0 + ca.chunks], group.lo.0, ca.width);
-                    fill_chunk(&y[at], &mut cb.e[b0..b0 + cb.chunks], group.lo.1, cb.width);
+                    fill_chunk(&z, &mut ca.e[a0..], ca.chunks, group.lo.0, ca.width);
+                    fill_chunk(&y[at], &mut cb.e[b0..], cb.chunks, group.lo.1, cb.width);
                 }
             }
             let shape = GemmShape {

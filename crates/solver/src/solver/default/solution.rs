@@ -27,6 +27,8 @@ pub struct DefaultSolution<T> {
     pub r_prim: T,
     /// dual residual
     pub r_dual: T,
+    /// The last slack projection: `x`, the slack it replaced, the result.
+    projected: Option<[Vec<T>; 3]>,
 }
 
 impl<T> DefaultSolution<T>
@@ -50,6 +52,7 @@ where
             iterations: 0,
             r_prim: T::nan(),
             r_dual: T::nan(),
+            projected: None,
         }
     }
 }
@@ -92,8 +95,25 @@ where
         // the projection of b - A x onto the cone (the iterate's slack can
         // differ from b - A x by the internal primal residual, 1e-2 on
         // SOCP_sched_100_100_orig).
+        // The termination check and the final reconstruction project the
+        // same point (a dense eigendecomposition per PSD cone): reuse it.
         if settings.tol_original.is_some() && !is_infeasible && data.sampled.is_none() {
-            data.original_data().project_slack(&self.x, &mut self.s);
+            let same = |a: &[T], b: &[T]| {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|(x, y)| x == y && x.is_sign_negative() == y.is_sign_negative())
+            };
+            match &self.projected {
+                Some([x, s, out]) if same(x, &self.x) && same(s, &self.s) => {
+                    self.s.copy_from(out);
+                }
+                _ => {
+                    let s = self.s.clone();
+                    data.original_data().project_slack(&self.x, &mut self.s);
+                    self.projected = Some([self.x.clone(), s, self.s.clone()]);
+                }
+            }
         }
     }
 }

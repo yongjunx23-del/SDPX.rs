@@ -38,8 +38,10 @@ where
     // let thresh = faer::sparse::linalg::CHOLESKY_SUPERNODAL_RATIO_FACTOR;
     let thresh = 40.0;
 
-    // The supernodal, multithreaded factor pays only for large factors; small
-    // ones (e.g. many tiny cones) are faster with QDLDL.
+    // The supernodal factor pays only for large factors. Below 1e8 flops it
+    // won on the Mac but lost on x86 (node7 job 226629, T=1/T=16: SOCP_nb
+    // +26/+46%, SOCP_nb_L2_bessel +33/+65%, SOCP_axis_wide +151/+142%;
+    // SDP_mcp250-1 −18/+9%).
     const MIN_SUPERNODAL_FLOPS: f64 = 1e8;
     if crate::receipt::profile_requested() {
         eprintln!(

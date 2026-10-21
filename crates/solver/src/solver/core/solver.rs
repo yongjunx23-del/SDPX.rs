@@ -933,9 +933,12 @@ mod internal {
                         continue;
                     }
                     trial.interpolate(affine, &self.step_lhs, t);
-                    let bound = self.variables.calc_step_length(trial, &mut self.cones,
-                        &self.settings, StepDirection::Combined);
-                    if crate::mpi::agreed_branch(t <= bound) {
+                    let admitted = match self.variables.step_admits(trial, &mut self.cones, &self.settings, t) {
+                        Some(ok) => ok,
+                        None => t <= self.variables.calc_step_length(trial, &mut self.cones,
+                            &self.settings, StepDirection::Combined),
+                    };
+                    if crate::mpi::agreed_branch(admitted) {
                         self.step_lhs.copy_from(trial);
                         state.α = t;
                         break;
@@ -1007,16 +1010,21 @@ mod internal {
                 if !crate::mpi::all_succeeded(ok) {
                     return;
                 }
-                let α_new;
+                let (gain, mut α_new) = (α * (1.01).as_T(), T::zero());
                 timeit! {"corrector step len"; {
-                    α_new = self.variables.calc_step_length(
-                        corrected,
-                        &mut self.cones,
-                        &self.settings,
-                        StepDirection::Combined,
-                    );
+                    // Where a cheap admissibility test exists, a rejection
+                    // costs only that test.
+                    if crate::mpi::agreed_branch(self.variables.step_admits(
+                        corrected, &mut self.cones, &self.settings, gain) != Some(false)) {
+                        α_new = self.variables.calc_step_length(
+                            corrected,
+                            &mut self.cones,
+                            &self.settings,
+                            StepDirection::Combined,
+                        );
+                    }
                 }}
-                if !crate::mpi::agreed_branch(α_new >= α * (1.01).as_T()) {
+                if !crate::mpi::agreed_branch(α_new >= gain) {
                     return;
                 }
                 self.step_lhs.copy_from(corrected);

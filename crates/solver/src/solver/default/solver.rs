@@ -283,7 +283,7 @@ impl<T: FloatT> DefaultSolver<T> {
         let _receipt_scope = crate::receipt::Scope::setup();
         let PreparedProblem {
             data,
-            cones,
+            mut cones,
             settings,
             solution,
             mut timers,
@@ -295,6 +295,7 @@ impl<T: FloatT> DefaultSolver<T> {
         timeit! {"kktinit"; {
             kktsystem = DefaultKKTSystem::<T>::new(&data,&cones,&settings);
         }}
+        cones.release_idle_pool(kktsystem.linear_solver_info().threads);
         data.compact_sampled_matrix();
         crate::receipt::memory_mark("kkt system");
         let variables = DefaultVariables::<T>::new(data.n, data.m);

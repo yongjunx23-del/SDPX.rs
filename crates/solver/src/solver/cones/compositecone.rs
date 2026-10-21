@@ -559,6 +559,31 @@ where
         self.step_length(dz, ds, z, s, settings, αmax)
     }
 
+    /// Whether every cone's step bound is at least `α` (symmetric cones in
+    /// binary64). PSD cones answer by Cholesky instead of an eigensolve.
+    pub(crate) fn step_admits(
+        &mut self,
+        dz: &[T],
+        ds: &[T],
+        z: &[T],
+        s: &[T],
+        settings: &CoreSettings<T>,
+        α: T,
+    ) -> bool {
+        debug_assert!(self.is_symmetric());
+        fn set<T: FloatT>(cones: &mut [SupportedCone<T>], on: bool) {
+            for cone in cones {
+                if let SupportedCone::PSDTriangleCone(c) = cone {
+                    c.admit = on;
+                }
+            }
+        }
+        set(&mut self.cones, true);
+        let (αz, αs) = self.step_length(dz, ds, z, s, settings, α);
+        set(&mut self.cones, false);
+        αz >= α && αs >= α
+    }
+
     /// [`Cone::step_length`] of the combined direction the KKT system just
     /// solved: at MPFR precision its PSD cones take W⁻ᵀΔs from the
     /// complementarity row (see `PSDTriangleCone::kkt_bounds`).
@@ -627,6 +652,15 @@ where
     ) -> Result<(), rayon::ThreadPoolBuildError> {
         self.threading = ConeThreading::new(&self.cones, threads, Some((p, a)))?;
         Ok(())
+    }
+
+    /// Drop a pool whose binary64 cone phases are light when the KKT factor
+    /// runs on one thread: its other users (short residual and vector
+    /// phases) only wake cold cores.
+    pub(crate) fn release_idle_pool(&mut self, kkt_threads: usize) {
+        if kkt_threads <= 1 && self.threading.as_ref().is_some_and(|t| t.light) {
+            self.threading = None;
+        }
     }
 
     /// Run this collection's cone lanes on an existing pool (shared with the

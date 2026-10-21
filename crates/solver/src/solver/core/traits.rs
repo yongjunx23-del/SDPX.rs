@@ -158,6 +158,19 @@ pub trait Variables<T: FloatT> {
         step_direction: StepDirection,
     ) -> T;
 
+    /// Whether the combined step `α` stays within the cones
+    /// (`α <= calc_step_length(step, Combined)` up to rounding), when a test
+    /// cheaper than the step length decides it.
+    fn step_admits(
+        &self,
+        _step: &Self,
+        _cones: &mut Self::C,
+        _settings: &Self::SE,
+        _α: T,
+    ) -> Option<bool> {
+        None
+    }
+
     /// Step length of the combined direction the KKT system just solved.
     fn calc_kkt_step_length(&self, step: &Self, cones: &mut Self::C, settings: &Self::SE) -> T {
         self.calc_step_length(step, cones, settings, StepDirection::Combined)

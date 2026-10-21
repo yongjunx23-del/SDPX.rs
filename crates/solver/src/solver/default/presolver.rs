@@ -616,25 +616,26 @@ fn redundant_equalities_impl<T: FloatT>(
     }
     // A full row rank image proves that no exact row can be removed. A
     // singular image proves nothing: only then build the rational rows.
-    let mut images: Vec<BTreeMap<usize, u64>> = (0..ids.len()).map(|_| BTreeMap::new()).collect();
-    for (i, &r) in ids.iter().enumerate() {
-        let value = b[r].mersenne31()?;
-        if value != 0 {
-            images[i].insert(A.n, u64::from(value));
-        }
-    }
+    // Rows of `[A b]` by ascending column (b is column A.n).
+    let mut images: Vec<Vec<(usize, u64)>> = vec![Vec::new(); ids.len()];
     for c in 0..A.n {
         for k in A.colptr[c]..A.colptr[c + 1] {
             let i = lookup[A.rowval[k]];
             if i != usize::MAX {
                 let value = A.nzval[k].mersenne31()?;
                 if value != 0 {
-                    images[i].insert(c, u64::from(value));
+                    images[i].push((c, u64::from(value)));
                 }
             }
         }
     }
-    match modular_full_row_rank(images, work.min(MODULAR_BUDGET)) {
+    for (i, &r) in ids.iter().enumerate() {
+        let value = b[r].mersenne31()?;
+        if value != 0 {
+            images[i].push((A.n, u64::from(value)));
+        }
+    }
+    match modular_full_row_rank(images, A.n + 1, work.min(MODULAR_BUDGET)) {
         Some(true) => return Some(Vec::new()),
         // Out of budget: the costlier rational pass would not finish either.
         None => return None,
@@ -908,35 +909,56 @@ fn inverse_mersenne31(value: u64) -> u64 {
 }
 
 /// `Some(full rank)` over F_(2^31 - 1), or `None` when the budget runs out.
+/// Rows are sorted by column, all columns below `ncols`.
 fn modular_full_row_rank(
-    rows: Vec<std::collections::BTreeMap<usize, u64>>,
+    rows: Vec<Vec<(usize, u64)>>,
+    ncols: usize,
     budget: usize,
 ) -> Option<bool> {
-    use std::collections::BTreeMap;
     const P: u64 = (1 << 31) - 1;
-    let mut basis: BTreeMap<usize, BTreeMap<usize, u64>> = BTreeMap::new();
+    let mut basis: Vec<Vec<(usize, u64)>> = vec![Vec::new(); ncols];
     let mut budget = budget;
+    let mut merged = Vec::new();
     for mut row in rows {
         loop {
-            let Some((&pivot, &factor)) = row.first_key_value() else {
+            let Some(&(pivot, factor)) = row.first() else {
                 return Some(false);
             };
-            if let Some(previous) = basis.get(&pivot) {
-                let rest = budget.checked_sub(previous.len())?;
-                budget = rest;
-                for (&column, &value) in previous {
-                    let entry = row.entry(column).or_default();
-                    *entry = (*entry + P - factor * value % P) % P;
-                    if *entry == 0 {
-                        row.remove(&column);
+            let previous = &basis[pivot];
+            if !previous.is_empty() {
+                budget = budget.checked_sub(previous.len())?;
+                // row -= factor·previous, dropping the entries that cancel.
+                merged.clear();
+                let (mut i, mut j) = (0, 0);
+                while i < row.len() || j < previous.len() {
+                    let (ci, cj) = (
+                        row.get(i).map_or(usize::MAX, |e| e.0),
+                        previous.get(j).map_or(usize::MAX, |e| e.0),
+                    );
+                    if ci < cj {
+                        merged.push(row[i]);
+                        i += 1;
+                        continue;
                     }
+                    let entry = if ci == cj {
+                        i += 1;
+                        row[i - 1].1
+                    } else {
+                        0
+                    };
+                    let entry = (entry + P - factor * previous[j].1 % P) % P;
+                    if entry != 0 {
+                        merged.push((cj, entry));
+                    }
+                    j += 1;
                 }
+                std::mem::swap(&mut row, &mut merged);
             } else {
                 let inverse = inverse_mersenne31(factor);
-                for value in row.values_mut() {
+                for (_, value) in row.iter_mut() {
                     *value = *value * inverse % P;
                 }
-                basis.insert(pivot, row);
+                basis[pivot] = row;
                 break;
             }
         }

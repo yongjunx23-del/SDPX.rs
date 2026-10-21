@@ -258,6 +258,36 @@ where
         self.step_length_in(step, cones, settings, step_direction, false)
     }
 
+    fn step_admits(
+        &self,
+        step: &Self,
+        cones: &mut CompositeCone<T>,
+        settings: &DefaultSettings<T>,
+        α: T,
+    ) -> Option<bool> {
+        // Only PSD cones have a test cheaper than their step length, and
+        // only from n = 8: below, the W congruence the test repeats costs
+        // as much as the eigensolve it saves (SDP_truss2, n = 4: an
+        // accepted corrector paid twice).
+        use crate::solver::cones::SupportedCone;
+        if !cones.is_symmetric()
+            || T::precision_bits() > 53
+            || !cones
+                .iter()
+                .any(|c| matches!(c, SupportedCone::PSDTriangleCone(p) if p.n >= 8))
+        {
+            return None;
+        }
+        // calc_step_length's bound is f·min(ατ, ακ, 1, cone bounds).
+        let a = α / settings.core().max_step_fraction;
+        Some(
+            a <= T::one()
+                && self.τ + a * step.τ >= T::zero()
+                && self.κ + a * step.κ >= T::zero()
+                && cones.step_admits(&step.z, &step.s, &self.z, &self.s, settings.core(), a),
+        )
+    }
+
     fn calc_kkt_step_length(
         &self,
         step: &Self,

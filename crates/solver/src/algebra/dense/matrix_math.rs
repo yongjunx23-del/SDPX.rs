@@ -158,38 +158,97 @@ where
     T: FloatT,
     S: AsRef<[T]> + AsMut<[T]>,
 {
-    let scale = if M.ncols() > 1 {
-        T::FRAC_1_SQRT_2()
-    } else {
-        T::zero()
-    };
+    let n = M.ncols();
+    let scale = if n > 1 { T::FRAC_1_SQRT_2() } else { T::zero() };
+    let a = M.data_mut();
+    // svec and the upper triangle share their column order.
     let mut idx = 0;
-    for col in 0..M.ncols() {
-        for row in 0..=col {
-            if row == col {
-                M[(row, col)] = x[idx];
-            } else {
-                M[(row, col)] = x[idx] * scale;
-                M[(col, row)] = M[(row, col)];
+    for col in 0..n {
+        let (dst, src) = (&mut a[col * n..][..=col], &x[idx..][..=col]);
+        for (d, &v) in dst[..col].iter_mut().zip(&src[..col]) {
+            *d = v * scale;
+        }
+        dst[col] = src[col];
+        idx += col + 1;
+    }
+    for_upper_tiles(n, |rows, j| {
+        for i in rows {
+            a[j + i * n] = a[i + j * n];
+        }
+    });
+}
+
+/// Visit the strict upper triangle (`i < j`) of an `n × n` matrix in square
+/// tiles, so the transposed accesses stay in cache: `f(rows, j)` per tile
+/// column.
+#[inline(always)]
+fn for_upper_tiles(n: usize, mut f: impl FnMut(std::ops::Range<usize>, usize)) {
+    const TILE: usize = 16;
+    for jb in (0..n).step_by(TILE) {
+        for ib in (0..=jb).step_by(TILE) {
+            for j in jb..(jb + TILE).min(n) {
+                f(ib..(ib + TILE).min(j), j);
             }
-            idx += 1;
         }
     }
 }
 
-// Perhaps implementation for Symmetric type would be faster
+/// `svec_to_mat(dst, svec(src))` without the vector: the same two roundings
+/// by 1/√2 per off-diagonal pair. `src` is symmetric and only its upper
+/// triangle is read.
+pub(crate) fn symmetrize_svec<T: FloatT>(dst: &mut Matrix<T>, src: &Matrix<T>) {
+    let n = src.ncols();
+    let scale = if n > 1 { T::FRAC_1_SQRT_2() } else { T::zero() };
+    let (d, a) = (dst.data_mut(), src.data());
+    for_upper_tiles(n, |rows, j| {
+        for i in rows {
+            let v = a[i + j * n];
+            let v = (v + v) * scale * scale;
+            (d[i + j * n], d[j + i * n]) = (v, v);
+        }
+    });
+    for j in 0..n {
+        d[j * (n + 1)] = a[j * (n + 1)];
+    }
+}
+
+/// `mat_to_svec` of a symmetric matrix read from its upper triangle only.
+pub(crate) fn upper_to_svec<T: FloatT>(x: &mut [T], M: &Matrix<T>) {
+    let n = M.ncols();
+    let scale = if n > 1 { T::FRAC_1_SQRT_2() } else { T::zero() };
+    let a = M.data();
+    let mut idx = 0;
+    for col in 0..n {
+        let (dst, src) = (&mut x[idx..][..=col], &a[col * n..][..=col]);
+        for (d, &v) in dst[..col].iter_mut().zip(&src[..col]) {
+            *d = (v + v) * scale;
+        }
+        dst[col] = src[col];
+        idx += col + 1;
+    }
+}
+
 pub(crate) fn mat_to_svec<T, MATM>(x: &mut [T], M: &MATM)
 where
     MATM: DenseMatrix<T>,
     T: FloatT,
 {
-    let scale = if M.ncols() > 1 {
-        T::FRAC_1_SQRT_2()
-    } else {
-        T::zero()
-    };
+    let n = M.ncols();
+    let scale = if n > 1 { T::FRAC_1_SQRT_2() } else { T::zero() };
+    if let Some(a) = M.plain_data() {
+        for_upper_tiles(n, |rows, j| {
+            let base = triangular_number(j);
+            for i in rows {
+                x[base + i] = (a[i + j * n] + a[j + i * n]) * scale;
+            }
+        });
+        for j in 0..n {
+            x[triangular_number(j) + j] = a[j * (n + 1)];
+        }
+        return;
+    }
     let mut idx = 0;
-    for col in 0..M.ncols() {
+    for col in 0..n {
         for row in 0..=col {
             x[idx] = {
                 if row == col {
@@ -259,6 +318,52 @@ pub(crate) fn pooled_gemm_sym<T: FloatT, MATA, MATB>(
     pooled_gemm_sym_cached(c, a, b, gemm, None)
 }
 
+/// Primitive floats: the upper triangle of `a·b` (known symmetric) by BLAS
+/// gemm over column panels, each panel only down to its last row (every
+/// entry is the dot product the full product computes). Entries below the
+/// diagonal are left unspecified.
+pub(crate) fn gemm_sym_upper<T: FloatT, MATA, MATB>(c: &mut Matrix<T>, a: &MATA, b: &MATB)
+where
+    MATA: DenseMatrix<T>,
+    MATB: DenseMatrix<T>,
+{
+    let (m, n, k) = (a.nrows(), b.ncols(), a.ncols());
+    debug_assert!(m == n && T::precision_bits() <= 64);
+    let (ta, tb) = (a.shape().as_blas_char(), b.shape().as_blas_char());
+    let lda = if a.shape() == MatrixShape::N { m } else { k };
+    let ldb = if b.shape() == MatrixShape::N { k } else { n };
+    let (adata, bdata) = (a.data(), b.data());
+    // The last panel takes the remainder: a narrow call (one column on
+    // arch0's n = 161) runs another BLAS kernel and rounds differently.
+    const PANEL: usize = 32;
+    let cdata = c.data_mut();
+    let panels = (n / PANEL).max(1);
+    for p in 0..panels {
+        let j0 = p * PANEL;
+        let j1 = if p + 1 == panels { n } else { j0 + PANEL };
+        let b0 = if b.shape() == MatrixShape::N {
+            j0 * ldb
+        } else {
+            j0
+        };
+        T::xgemm(
+            ta,
+            tb,
+            i32::try_from(j1).unwrap(),
+            i32::try_from(j1 - j0).unwrap(),
+            i32::try_from(k).unwrap(),
+            T::one(),
+            adata,
+            i32::try_from(lda).unwrap(),
+            &bdata[b0..],
+            i32::try_from(ldb).unwrap(),
+            T::zero(),
+            &mut cdata[j0 * m..],
+            i32::try_from(m).unwrap(),
+        );
+    }
+}
+
 /// [`pooled_gemm_sym`] with `b` a constant operand whose residues may be kept
 /// in `cache_b` across calls (the cache checks the operand's exact bits).
 pub(crate) fn pooled_gemm_sym_cached<T: FloatT, MATA, MATB>(
@@ -273,21 +378,22 @@ pub(crate) fn pooled_gemm_sym_cached<T: FloatT, MATA, MATB>(
 {
     let (m, n, k) = (a.nrows(), b.ncols(), a.ncols());
     debug_assert_eq!(m, n);
-    if T::precision_bits() <= 64 {
-        // Primitive floats: exact-arithmetic-symmetric product via BLAS gemm,
-        // then mirror the upper triangle so the result is exactly symmetric.
-        c.mul(a, b, T::one(), T::zero());
-        for j in 0..n {
-            for i in j + 1..n {
-                c[(i, j)] = c[(j, i)];
-            }
-        }
-        return;
-    }
     let (ta, tb) = (a.shape().as_blas_char(), b.shape().as_blas_char());
     let lda = if a.shape() == MatrixShape::N { m } else { k };
     let ldb = if b.shape() == MatrixShape::N { k } else { n };
     let (adata, bdata) = (a.data(), b.data());
+    if T::precision_bits() <= 64 {
+        // Primitive floats: mirror the upper triangle so the result is
+        // exactly symmetric.
+        gemm_sym_upper(c, a, b);
+        let cdata = c.data_mut();
+        for_upper_tiles(n, |rows, j| {
+            for i in rows {
+                cdata[j + i * n] = cdata[i + j * n];
+            }
+        });
+        return;
+    }
     // Exact residue-BLAS product: same correctly rounded values as the
     // per-entry exact dots below.
     if T::xgemm_upper_exact(

@@ -160,6 +160,8 @@ pub struct DirectLDLKKTSolver<T> {
     reg_boost: usize,
     counters: crate::solver::kkt::SolveCounters,
     residual_plan: Option<SparseParallel>,
+    /// Column runs of the serial binary64 residual product.
+    residual_runs: crate::algebra::SymvRuns,
     residual_dense: Option<Matrix<T>>,
     packed_residual: bool,
     /// Incoming symmetric mirrors of the fixed KKT pattern (MPFR exact residuals).
@@ -294,7 +296,7 @@ where
             })
             .or_else(|| {
                 crate::solver::kkt::ldl::arrow::ArrowLDLSolver::try_local_cones(
-                    &KKT, &dsigns, A, cones, settings,
+                    &KKT, &dsigns, A, cones, settings, &amd,
                 )
             })
             .map(|solver| Box::new(solver) as BoxedDirectLDLSolver<T>)
@@ -306,6 +308,11 @@ where
 
         let packed_residual = ldlsolver.linear_solver_info().name == "dense_block"
             && KKT.colptr[n] == triangular_number(n);
+        let residual_runs = if T::precision_bits() <= 64 {
+            crate::algebra::SymvRuns::new(&KKT)
+        } else {
+            Default::default()
+        };
 
         Self {
             m,
@@ -327,6 +334,7 @@ where
             reg_boost: 0,
             counters: Default::default(),
             residual_plan: None,
+            residual_runs,
             residual_dense: None,
             packed_residual,
             exact_rows: None,
@@ -542,46 +550,96 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
     where
         I: Iterator<Item = &'a SupportedCone<T>> + Clone,
     {
+        use rayon::prelude::*;
         let map = &self.map;
+        let cones: Vec<&SupportedCone<T>> = cones.collect();
 
-        // Set the elements the W^tW blocks in the KKT matrix.
-        let mut offset = 0;
-        for cone in cones.clone() {
+        // Set the elements the W^tW blocks in the KKT matrix, negated to
+        // −WᵀW: each cone fills its own block, in parallel when pooled.
+        // Tasks pay from a grain of work each (binary64 nb, 793 SOC blocks:
+        // serial).
+        let parallel = {
+            use sdpx_arithmetic::inner_parallel as ip;
+            let work = ip::weight(T::precision_bits() as usize) * self.Hsblocks.len() as u128;
+            ip::tasks_if(true, work, cones.len()) > 1
+        };
+        let mut blocks: Vec<&mut [T]> = Vec::with_capacity(cones.len());
+        let mut rest = &mut self.Hsblocks[..];
+        for cone in &cones {
             let len = if cone.Hs_is_diagonal() {
                 cone.numel()
             } else {
                 triangular_number(cone.numel())
             };
-            cone.get_Hs(&mut self.Hsblocks[offset..offset + len]);
-            offset += len;
+            let (head, tail) = std::mem::take(&mut rest).split_at_mut(len);
+            blocks.push(head);
+            rest = tail;
         }
-        assert_eq!(offset, self.Hsblocks.len());
+        assert!(rest.is_empty());
+        let timer = crate::receipt::start();
+        let fill = |(cone, block): (&&SupportedCone<T>, &mut &mut [T])| {
+            cone.get_Hs(block);
+            block.negate();
+        };
+        match self.residual_pool.as_deref() {
+            Some(pool) if parallel => pool.install(|| {
+                cones
+                    .par_iter()
+                    .zip(blocks.par_iter_mut())
+                    .with_max_len(1)
+                    .for_each(fill)
+            }),
+            _ => cones.iter().zip(blocks.iter_mut()).for_each(fill),
+        }
+        drop(blocks);
+        crate::receipt::finish("kkt.hs", timer);
 
-        let (values, index) = (&mut self.Hsblocks, &map.Hsblocks);
-        // change signs to get -W^TW
-        values.negate();
+        let timer = crate::receipt::start();
+        let (values, index) = (&self.Hsblocks, &map.Hsblocks);
         _update_values(&mut self.ldlsolver, &mut self.KKT, index, values);
+        crate::receipt::finish("kkt.hs_values", timer);
 
+        // Each operator relative entropy cone's rows N⁻¹A. Columns and cones
+        // are independent: the solver pool keeps their bits.
         for o in &mut self.ore {
-            use rayon::prelude::*;
-            if let Some(SupportedCone::OpRelEntropyCone(c)) = cones.clone().nth(o.cone) {
+            if let Some(SupportedCone::OpRelEntropyCone(c)) = cones.get(o.cone) {
                 o.t.clone_from(c.rows());
             }
-            let mut values = o.a.clone();
-            let (t, rows) = (&o.t, o.rows.len());
-            // Columns are independent: the solver pool keeps their bits.
-            match self.residual_pool.as_deref() {
-                Some(pool) => pool.install(|| {
-                    values
-                        .par_chunks_exact_mut(rows)
-                        .for_each(|column| t.to_eigen(column))
-                }),
-                None => values
-                    .chunks_exact_mut(rows)
-                    .for_each(|column| t.to_eigen(column)),
-            }
-            _update_values(&mut self.ldlsolver, &mut self.KKT, &o.pos, &values);
         }
+        let transform = |o: &OreRows<T>| {
+            let (t, rows) = (&o.t, o.rows.len());
+            let mut values = vec![T::zero(); o.a.len()];
+            let column = |(v, a): (&mut [T], &[T])| {
+                v.copy_from_slice(a);
+                t.to_eigen(v);
+            };
+            if self.residual_pool.is_some() {
+                values
+                    .par_chunks_exact_mut(rows)
+                    .zip(o.a.par_chunks_exact(rows))
+                    .for_each(column);
+            } else {
+                values
+                    .chunks_exact_mut(rows)
+                    .zip(o.a.chunks_exact(rows))
+                    .for_each(column);
+            }
+            values
+        };
+        let timer = crate::receipt::start();
+        let ore_values: Vec<Vec<T>> = match self.residual_pool.as_deref() {
+            Some(pool) if !self.ore.is_empty() => {
+                pool.install(|| self.ore.par_iter().with_max_len(1).map(transform).collect())
+            }
+            _ => self.ore.iter().map(transform).collect(),
+        };
+        crate::receipt::finish("kkt.ore_rows", timer);
+        let timer = crate::receipt::start();
+        for (o, values) in zip(&self.ore, &ore_values) {
+            _update_values(&mut self.ldlsolver, &mut self.KKT, &o.pos, values);
+        }
+        drop(ore_values);
+        crate::receipt::finish("kkt.ore_values", timer);
 
         let mut sparse_map_iter = map.sparse_maps.iter();
         let ldl = &mut self.ldlsolver;
@@ -821,7 +879,7 @@ where
         let plan = self.residual_plan.as_ref();
         {
             let dense = self.residual_dense.as_ref();
-            _get_refine_error_dense(out, rhs, &KKTsym, point, plan, dense)
+            _get_refine_error_dense(out, rhs, &KKTsym, point, plan, &self.residual_runs, dense)
         }
     }
 
@@ -1325,6 +1383,7 @@ where
                 &ksym,
                 &x[column(c)],
                 self.residual_plan.as_ref(),
+                &self.residual_runs,
                 dense,
             );
         }
@@ -1524,6 +1583,7 @@ fn _get_refine_error<T: FloatT>(
     KKTsym: &Symmetric<CscMatrix<T>>,
     ξ: &[T],
     plan: Option<&SparseParallel>,
+    runs: &crate::algebra::SymvRuns,
 ) -> T {
     // Note that K is only triu data, so need to
     // be careful when computing the residual here
@@ -1532,7 +1592,7 @@ fn _get_refine_error<T: FloatT>(
     if let Some(plan) = plan {
         plan.symv(KKTsym.src, KKTsym.uplo, e, ξ, -T::one(), T::one());
     } else {
-        KKTsym.symv(e, ξ, -T::one(), T::one());
+        crate::algebra::csc_symv_runs(KKTsym.src, runs, e, ξ, -T::one(), T::one());
     }
 
     e.norm_inf()
@@ -1544,6 +1604,7 @@ fn _get_refine_error_dense<T: FloatT>(
     KKTsym: &Symmetric<CscMatrix<T>>,
     ξ: &[T],
     plan: Option<&SparseParallel>,
+    runs: &crate::algebra::SymvRuns,
     dense: Option<&Matrix<T>>,
 ) -> T {
     if let Some(dense) = dense {
@@ -1551,7 +1612,7 @@ fn _get_refine_error_dense<T: FloatT>(
         dense.sym(KKTsym.uplo).symv(ξ, e, -T::one(), T::one());
         return e.norm_inf();
     }
-    _get_refine_error(e, b, KKTsym, ξ, plan)
+    _get_refine_error(e, b, KKTsym, ξ, plan, runs)
 }
 
 // update entries of the KKT matrix using the given index into its CSC representation.
@@ -1948,7 +2009,7 @@ mod parallel_residual_tests {
             let mut expected = vec![T::zero(); n];
             let mut actual = expected.clone();
             let k = solver.KKT.sym(solver.KKTuplo);
-            let en = _get_refine_error(&mut expected, &rhs, &k, &mut x, None);
+            let en = _get_refine_error(&mut expected, &rhs, &k, &mut x, None, &Default::default());
             solver.b.copy_from_slice(&rhs);
             solver.x.copy_from_slice(&x);
             assert!(solver.iterative_refinement(&settings));
