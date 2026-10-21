@@ -8,6 +8,24 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-21 — Arrow leaf lanes start together: L10 lane hang fixed (kept, bfss-threads)
+
+- Defect (LANE-HANG, from c80da23): L10/128 at T=16 sometimes deadlocked in the arrow leaf phase. Rayon queues the leaf-lane broadcast job to each worker in turn, and a worker waiting in a join takes its own broadcast job. A worker that had stolen a leaf's split piece (the Y solve's parallel chunks) before its job arrived therefore ran its lane on top of that piece. The lane then waited for every leaf, and the leaf waited for the buried piece.
+- Evidence (observed): in each hung process, exactly one worker has its lane, in the end-of-lanes wait, nested above stolen `Leaf::refactor` join frames, with no lane at the bottom of its stack. These are tid 157737 (tbN, two samples 5 s apart) and tid 176013 (tbX). The other lanes spin, and the leaf's owner sleeps in the join. The lane-hang session found the same pattern in its gdb dumps of c80da23, 18b84c5 and the x86 exact-dot and residue GEMM branches.
+- Fix (61fcd50, merged as cb444d9): each lane counts itself in and spins until all `pool.current_num_threads()` workers have entered, and only then claims leaves. The factor is called from outside the pool (the lanes' precondition), and no leaf work exists before the barrier, so every lane starts at the bottom of its worker's stack. This is scheduling only. The arrow factor is the only `broadcast` site.
+- Verification. tbL = cb444d9, byte-identical to the lane-hang session's lh3; all 253 crate sources match.
+  - Hang counts:
+
+    | Binary | node55, L10/128, T=16 | Lane-hang repro (8 streams, T=16 on 8 cores) |
+    |---|---|---|
+    | without the barrier (tbN, tbX, lh0) | 3 of 4 runs hung | 5 of 32 hung |
+    | with the barrier (tbL, lh3) | 0 of 6 | 0 of 32 |
+
+  - L10 (node55, tbL ×6, tbX ×2): every completed run is Solved/198 and bitwise identical to the abl10N reference. tbL median 103.9 s; tbX 103.3 s (its other run hung at iteration 153).
+  - On lh3, from the lane-hang session's runs: the 128-bit full run is InsufficientProgress/107 and bitwise (904.4 s). The L11u 256-bit ABBA against lh0 is bitwise at 326.6 against 325.0 s (neutral).
+  - Mac: csdr3 Solved/36 and ising11 Solved/54; audits pass; points identical to the pre-fix arm.
+- Decision: kept. LANE-HANG is closed.
+
 ## 2026-10-21 — BFSS L11u: ORE step trials, x86 residue encode and x86 exact dots merged; combined gates and scaling (kept, bfss-threads)
 
 - Merged into bfss-threads (tbX = 2539893). Each branch was bitwise on its own gates:

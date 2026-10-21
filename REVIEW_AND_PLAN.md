@@ -252,7 +252,7 @@ Ranked by the Amdahl-bounded gain on the goal workloads per unit of effort (jour
   - BFSS-MERGE (2026-10-21; journal 2026-10-21). ORE-STEP (74da6d7), RNS-X86 (036585c) and EXACTDOT-X86 (c64f2a4, aec492a) are merged into bfss-threads (2539893). Every gate is bitwise: 128-bit full run, 512 bits, L10, ising11 and csdr3.
     - BFSS L11u, 256 bits, 25 iterations, node180, against 66e64b7: T=8 −34.2%, T=16 −40.1% (21.82 → 12.91 s/it), T=32 −45.2%, T=64 −45.6%.
     - 128-bit full run: 1411.7 → 928.9 s. Peak RSS +12% at T=64 and +20% on the 128-bit full run (not attributed).
-    - Known failure LANE-HANG: an intermittent arrow leaf-lane deadlock from c80da23 on L10/128 at T=16 (node55 hung in 2 of 2 runs, node181 in 0 of 5). The proposed start-barrier fix 61fcd50 is not yet verified or merged.
+    - LANE-HANG (fixed 2026-10-21; journal 2026-10-21): the arrow leaf lanes from c80da23 could deadlock on L10/128 at T=16. With the start barrier (61fcd50, merged as cb444d9), hangs went from 3 of 4 runs on node55 and 5 of 32 in the lane-hang repro to 0 of 6 and 0 of 32. All gates are bitwise and timing is neutral.
 
 1. **Resampled Ising inputs (task 17).**
    - Fix the default-start τ chase without regressing old inputs or gravity256.
