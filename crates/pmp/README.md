@@ -11,8 +11,9 @@ cargo build --locked --release -p sdpx-pmp
 ```
 
 Use `--threads 8` to convert up to eight independent blocks concurrently.
-By default the CLI uses the available cores whose estimated memory, eight
-times the mean input block size each, fits in half the physical RAM. The CLI
+By default the CLI uses the available cores whose largest-block workspace
+fits in half the memory allocation, capped by cgroups and PBS. The estimate
+includes input storage and precision-dependent conversion buffers. The CLI
 reads blocks as workers become available. Each worker holds one input block
 and writes output row by row. Choose fewer workers when memory is limited.
 Output is identical across thread counts. Single-block inputs use one worker.
@@ -20,7 +21,8 @@ Output is identical across thread counts. Single-block inputs use one worker.
 Blocks given as explicit sample points and scalings r^x/Π(x−p),
 r = 3−2√2, with no prefactor (PyCFTBoot, SDPB.m XML) are resampled by
 default: they take SDPB 3.1 sample points and bilinear bases from their
-recovered prefactor, which must reproduce every given scaling.
+recovered prefactor, which must reproduce every given scaling. If this
+prefactor cannot be inferred, the valid supplied samples are retained.
 `--keep-samples` keeps the given points, scalings and bases instead.
 
 Input: SDPB JSON or legacy XML. Output: a new, uncompressed SDP directory.

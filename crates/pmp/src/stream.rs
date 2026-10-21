@@ -135,8 +135,8 @@ fn scan(path: &Path, emit: Emit<'_>) -> Result<Header> {
 /// matrix per worker plus the reader's current matrix. Output matches the
 /// in-memory API; errors join workers before removing this call's directory.
 /// Returns the number of converted blocks and workers. `threads == 0` uses
-/// the available cores whose estimated memory, 8x the mean input block size
-/// each, fits in half the physical RAM. With `resample`, blocks given as
+/// the available cores whose largest-block workspace fits in half the memory
+/// allocation (physical RAM capped by cgroups and PBS). With `resample`, blocks given as
 /// explicit sample points and scalings (PyCFTBoot/SDPB.m XML) take the SDPB
 /// 3.1 points and bases of their recovered prefactor instead.
 pub fn convert_file<T: Scalar + FromStr>(
@@ -146,13 +146,28 @@ pub fn convert_file<T: Scalar + FromStr>(
     resample: bool,
 ) -> Result<(usize, usize)> {
     let (input, destination) = (input.as_ref(), destination.as_ref());
-    let header = scan(input, None)?;
+    let mut largest = 1;
+    let mut estimate = |matrix| {
+        largest = largest.max(workspace_bytes::<T>(&matrix, resample));
+        Ok(())
+    };
+    let header = scan(
+        input,
+        if threads == 0 {
+            Some(&mut estimate)
+        } else {
+            None
+        },
+    )?;
     let workers = if threads > 0 {
         threads
     } else {
-        let per_worker = 8 * std::fs::metadata(input)?.len() / header.count.max(1) as u64;
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        cores.min((physical_memory() / 2 / per_worker.max(1)).max(1) as usize)
+        cores.min(
+            (effective_memory() / 2 / largest)
+                .max(1)
+                .min(usize::MAX as u64) as usize,
+        )
     }
     .min(header.count.max(1));
     write_output::<T>(
@@ -251,6 +266,206 @@ pub fn convert_file<T: Scalar + FromStr>(
     Ok((header.count, workers))
 }
 
+// Input strings and vectors remain live while conversion builds both basis
+// parities and the adjusted polynomial vector for one matrix entry. Recovery
+// also keeps derivative polynomials at 2048 bits. Budget the largest block,
+// not a mean that lets many small blocks hide one large worker allocation.
+fn workspace_bytes<T: Scalar>(m: &PolynomialMatrix, resample: bool) -> u64 {
+    let mut bytes = 0u64;
+    let mut add = |s: &String| bytes = bytes.saturating_add(s.capacity() as u64 + 128);
+    let mut count = 1usize;
+    let mut variables = 0usize;
+    for vector in m.polynomials.iter().flatten() {
+        variables = variables.max(vector.len());
+        for poly in vector {
+            count = count.max(poly.len());
+            poly.iter().for_each(&mut add);
+        }
+    }
+    for p in [m.prefactor.as_ref(), m.reduced_prefactor.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        add(&p.constant);
+        add(&p.base);
+        p.poles.iter().for_each(&mut add);
+    }
+    for v in [
+        &m.sample_points,
+        &m.sample_scalings,
+        &m.reduced_sample_scalings,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        v.iter().for_each(&mut add);
+    }
+    for basis in [
+        &m.bilinear_basis,
+        &m.bilinear_basis_even,
+        &m.bilinear_basis_odd,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        basis.iter().flatten().for_each(&mut add);
+    }
+    count = count.max(m.sample_points.as_ref().map_or(0, Vec::len));
+    count = count.saturating_add(m.reduced_prefactor.as_ref().map_or(0, |p| p.poles.len()));
+    let scalar = if resample && m.prefactor.is_none() && m.sample_points.is_some() {
+        std::mem::size_of::<T>().max(std::mem::size_of::<sdpx_arithmetic::MpFloat<32>>())
+    } else {
+        std::mem::size_of::<T>()
+    } as u64;
+    let n = count as u64;
+    bytes
+        .saturating_mul(2)
+        .saturating_add(
+            scalar.saturating_mul(
+                n.saturating_mul(n)
+                    .saturating_mul(4)
+                    .saturating_add(n.saturating_mul(variables as u64).saturating_mul(4))
+                    .saturating_add(n.saturating_mul(16)),
+            ),
+        )
+        .saturating_add(16 << 20)
+}
+
+fn memory_size(text: &str) -> Option<u64> {
+    let text = text.trim().to_ascii_lowercase();
+    let end = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let n: u64 = text[..end].parse().ok()?;
+    let shift = match text[end..].trim() {
+        "" | "b" => 0,
+        "kb" | "kib" => 10,
+        "mb" | "mib" => 20,
+        "gb" | "gib" => 30,
+        "tb" | "tib" => 40,
+        _ => return None,
+    };
+    n.checked_mul(1 << shift)
+}
+
+fn effective_memory() -> u64 {
+    let mut memory = physical_memory();
+    #[cfg(target_os = "linux")]
+    if let Some(limit) = cgroup_memory_limit() {
+        memory = memory.min(limit);
+    }
+    let pbs = ["PBS_RESC_MEM", "PBS_MEM"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok().and_then(|s| memory_size(&s)))
+        .min();
+    let pbs = pbs.or_else(|| {
+        let job = std::env::var("PBS_JOBID").ok()?;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let mut child = Command::new("qstat")
+            .args(["-f", &job])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+        let out = child.wait_with_output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8(out.stdout)
+            .ok()?
+            .lines()
+            .filter_map(|line| {
+                let (key, value) = line.trim().split_once('=')?;
+                matches!(key.trim(), "Resource_List.mem" | "Resource_List.vmem")
+                    .then(|| memory_size(value))
+                    .flatten()
+            })
+            .min()
+    });
+    if let Some(limit) = pbs {
+        memory = memory.min(limit);
+    } else if std::env::var_os("PBS_JOBID").is_some() {
+        // An unenforced PBS allocation may be smaller than host RAM; when
+        // qstat is unavailable, auto mode conservatively uses one worker.
+        memory = 0;
+    }
+    memory
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_memory_limit() -> Option<u64> {
+    let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let decode = |s: &str| {
+        s.replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+    };
+    let mut limit: Option<u64> = None;
+    for group in groups.lines() {
+        let mut fields = group.splitn(3, ':');
+        fields.next();
+        let (controllers, group) = (fields.next()?, fields.next()?);
+        let (kind, file) = if controllers.is_empty() {
+            ("cgroup2", "memory.max")
+        } else if controllers.split(',').any(|c| c == "memory") {
+            ("cgroup", "memory.limit_in_bytes")
+        } else {
+            continue;
+        };
+        for mount in mounts.lines() {
+            let Some((fields, options)) = mount.split_once(" - ") else {
+                continue;
+            };
+            let mut options = options.split_whitespace();
+            if options.next() != Some(kind) {
+                continue;
+            }
+            options.next();
+            if kind == "cgroup" && !options.next()?.split(',').any(|c| c == "memory") {
+                continue;
+            }
+            let mut fields = fields.split_whitespace();
+            let root = decode(fields.nth(3)?);
+            let mount = decode(fields.next()?);
+            let mount = Path::new(&mount);
+            let Ok(relative) = Path::new(group).strip_prefix(&root) else {
+                continue;
+            };
+            let mut path = mount.join(relative);
+            loop {
+                if let Some(bytes) = std::fs::read_to_string(path.join(file))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                {
+                    limit = Some(limit.map_or(bytes, |old| old.min(bytes)));
+                }
+                if path == mount || !path.pop() {
+                    break;
+                }
+            }
+        }
+    }
+    limit
+}
+
 /// Physical RAM in bytes.
 fn physical_memory() -> u64 {
     extern "C" {
@@ -263,4 +478,23 @@ fn physical_memory() -> u64 {
     // SAFETY: sysconf reads a system constant.
     let [pages, size] = NAMES.map(|name| unsafe { sysconf(name) }.max(0) as u64);
     pages * size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sdpx_arithmetic::{Bits1024, Bits128};
+
+    #[test]
+    fn worker_workspace_tracks_large_blocks_and_precision() {
+        let mut m = PolynomialMatrix::default();
+        m.polynomials = vec![vec![vec![vec!["1".into(); 1000]]]];
+        let low = workspace_bytes::<Bits128>(&m, false);
+        let high = workspace_bytes::<Bits1024>(&m, false);
+        assert!(high > low * 2);
+        let small = workspace_bytes::<Bits128>(&PolynomialMatrix::default(), false);
+        assert!(low > small * 4);
+        assert_eq!(memory_size("32gb"), Some(32 << 30));
+        assert_eq!(memory_size("1048576"), Some(1 << 20));
+    }
 }

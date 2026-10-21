@@ -1,7 +1,7 @@
 use sdpx_pmp::Result;
 use std::path::PathBuf;
 fn usage() {
-    println!("sdpx-pmp2sdp --input PMP.json|PMP.xml --output NEW_DIRECTORY [--precision BITS] [--threads N] [--keep-samples]\n\nBITS: MPFR widths from {} (default 768).\nN: concurrent blocks (default: the available cores whose estimated memory, 8x the mean input block size each, fits in half the physical RAM).\nBlocks with explicit sample points and scalings of the form r^x/prod(x-p), r = 3-2*sqrt(2) (PyCFTBoot, SDPB.m XML), take SDPB 3.1 sample points and bilinear bases; their recovered prefactor must reproduce every given scaling.\n--keep-samples: keep the given sample points, scalings and bases instead.\nWrites uncompressed SDPB sampled JSON. Existing output paths are refused.", sdpx_arithmetic::FRONTEND_PRECISION_HELP);
+    println!("sdpx-pmp2sdp --input PMP.json|PMP.xml --output NEW_DIRECTORY [--precision BITS] [--threads N] [--keep-samples]\n\nBITS: MPFR widths from {} (default 768).\nN: concurrent blocks (default: the available cores whose largest-block workspace fits in half the memory allocation, capped by cgroups and PBS).\nBlocks with explicit sample points and scalings of the form r^x/prod(x-p), r = 3-2*sqrt(2) (PyCFTBoot, SDPB.m XML), take SDPB 3.1 sample points and bilinear bases; their recovered prefactor must reproduce every given scaling, otherwise the supplied samples are retained.\n--keep-samples: keep the given sample points, scalings and bases instead.\nWrites uncompressed SDPB sampled JSON. Existing output paths are refused.", sdpx_arithmetic::FRONTEND_PRECISION_HELP);
 }
 macro_rules! dispatch {
     ( [] (53,$variant:ident,$scalar:ty), $(($bits:literal,$name:ident,$ty:ty),)* ) => {
