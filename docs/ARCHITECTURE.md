@@ -25,6 +25,10 @@ PMP conversion streams blocks and writes rows directly. Each worker releases
 the parsed/generated basis after both parity arrays are written, before
 building normalized `c`/`B` coefficients. Resampling borrows the original
 polynomial coefficients; only the replacement sampling metadata is owned.
+Repeated and nearby prefactor poles are isolated through derivative roots;
+valid supplied samples are retained when inference is unavailable. Automatic
+workers budget the largest block's precision-dependent workspace against
+half the effective host, cgroup or PBS memory allocation.
 
 ## Solver modules
 
@@ -157,6 +161,11 @@ come from the original linear feasibility rows. Trial dual feasibility first
 uses a cheap bound; only inconclusive trials allocate the Schur CG workspace.
 CG bound decisions use a freshly applied Schur residual. Owner backtracking
 uses the same ORE-only barrier rule as the ordinary cone collection.
+Transformed coefficient rows publish in waves of at most 128 MiB, or one
+larger cone; serial transforms publish immediately. Speculative step trials
+for each cone share a 512 MiB factor-workspace estimate, with at least one
+trial admitted.
+Heavy individual trials share their kernels with spare workers.
 
 ## KKT formulation and backends
 
@@ -187,7 +196,7 @@ reported as `linear_solver`.
 | 1 | `local_soc_arrow` | ≥ 8 SOC3 leaves with a nonempty equality border and no cross-leaf coupling; workspace ≤ 512 MiB and a dense border of at most 8 × the coupling entries. |
 | 2 | `shared_soc_arrow` | Zero and ≥ 8 SOC3 cones only (augmented form; condensed eliminates SOC3), shared primal border, workspace ≤ 512 MiB (the arrow memory cap) and a dense border of at most 8 × the `A` entries. A leaf's single primal column follows its SPD cone block and keeps its true diagonal (no static shift) until a factorization fails (approved 2026-10-07). |
 | 3 | `local_bounds_faer` / `local_bounds_arrow` | ≥ 64 variables with one or two local bound rows, diagonal `P` and a nonempty equality/free border, admitted by added storage. Float64 needs `faer-sparse`; MPFR uses exact bound Gram products. |
-| 4 | `local_cone_arrow` | MPFR only: Zero, orthant and SOC cones. Each orthant row or SOC (with its sparse-expansion coordinates) is a unit; variables touching at most four units join them while the leaf stays ≤ 64 coordinates (≥ 8 leaves). Equality rows, other variables and oversized cones form the border, ordered by coupling degree within each sign; workspace and border density as above. Couplings are stored per leaf over its own border columns; the border Schur complement is one exact residue block product with Z = D⁻¹Y formed while encoding. |
+| 4 | `local_cone_arrow` | Zero, orthant and SOC cones. Each orthant row or SOC (with its sparse-expansion coordinates) is a unit; variables touching at most four units join them while the leaf stays ≤ 64 coordinates (≥ 8 leaves). Equality rows, other variables and oversized cones form the border, ordered by coupling degree within each sign; workspace and border density as above. Float64 additionally requires estimated dense work ≤ twice the AMD sparse LDL work and uses BLAS coupling-class panels. MPFR forms the border with exact residue products and encodes Z = D⁻¹Y. |
 | 5 | `dense_block` | Float64: an eligible dense leading positive block, pooled tiled Cholesky. |
 | 6 | `arrow` | Disconnected positive dense leaves around a negative border, estimated workspace ≤ max(512 MiB, 8 × KKT storage) (Float64 and MPFR). Leaf contributions are recomputed in bounded batches. MPFR also forms the arrow of −K (retained cone Hessian rows such as ORE rows as leaves, primal variables as border) and takes the eligible arrow with less estimated dense work. |
 | 7 | `faer` / `qdldl` | General sparse LDL. Float64 with `faer-sparse` uses faer when estimated flops ≥ 1e8 and flops per factor nonzero ≥ 40, else QDLDL. MPFR uses QDLDL. |
@@ -242,9 +251,12 @@ rounding. All other cases call MPFR and produce the same bits.
 Inline power-of-two products copy the other mantissa and adjust its exponent;
 results outside MPFR's exponent range retain MPFR handling.
 
-`exactdot` accumulates the exact sum of products in fixed point and rounds
-once (inline limb products through 256 bits, GMP above). The result does not
-depend on term order, partitioning or thread count. Chunk dispatch verifies
+`exactdot` accumulates finite products exactly and rounds once. Fixed-point
+limb kernels use inline products or GMP; x86 BMI2/ADX kernels accelerate
+128–1024-bit terms when available. Exponent windows beyond the bounded
+accumulator use exact product descriptors and MPFR summation without allocating
+the exponent gap. The result does not depend on term order, partitioning or
+thread count. Chunk dispatch verifies
 completed slots before handing their storage to GMP. Shared product callbacks
 are delisted and joined on normal return or unwinding, keeping borrowed
 callback storage alive until helpers finish. Large dense MPFR

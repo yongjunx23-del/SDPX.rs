@@ -8,6 +8,72 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-22 — Review repairs: exact operators, finite dots and bounded temporary memory
+
+- Source: baseline `682e484`; repaired runtime source `263f027`, version
+  0.9.3. No precision or convergence tolerance changes.
+- Changes:
+  - Residue encoding/decoding initializes spare storage through `MaybeUninit`
+    before typed reads, preserving the no-clear paths.
+  - Requested original-coordinate gates cover sampled and owner-partitioned
+    solves, applying the authoritative sampled factors. Regular distributed
+    checks gather products without retaining another global coefficient copy.
+  - Finite dots beyond the bounded exponent window retain exact limb products
+    and round MPFR's sum once; cancellation does not require storage for the
+    exponent gap. Nonfinite inputs retain the caller's semantics.
+  - Presolve budgets charge complete merges and normalization. ORE coefficient
+    transforms publish immediately in serial or in bounded parallel waves;
+    speculative trials share a workspace estimate. Heavy serial trials cannot
+    enter Rayon's global pool outside a solver worker.
+  - Serial MPFR JSON decoding skips the deferred token buffer. PMP pole
+    recovery handles repeated/nearby poles, retains valid explicit samples
+    when inference is unavailable, and budgets workers from block precision,
+    workspace and the effective cgroup/PBS allocation.
+- Local gates: focused exact-dot (128–2048 bits), original-acceptance,
+  residue, presolve and converter regressions pass. Ising11/512 is Solved/54
+  and passes the independent 1e-30 audit, including explicit `tol_original`.
+- Cluster: release CLI, C ABI and converter built in PBS 228103 with the
+  validated dynamic OpenBLAS, host GMP and FMA configuration. PBS 228121:
+  - Medium Float64: Solved/15, original 1e-6 audit passes, complete point
+    bitwise identical to baseline.
+  - Ising11/512: Solved/54 at one/four threads and two MPI ranks; independent
+    1e-30 audits pass. The same-setting serial/threaded points and the
+    default-gate baseline/candidate points are bitwise identical.
+  - Three-rank equality/bound LP: loose original gate passes; the 1e-30
+    request correctly returns AlmostSolved rather than Solved.
+  - Explicit-sample and repeated-pole PMP conversions solve at 128/256 bits;
+    the analytic optimum agrees within 1e-15. Automatic workers use eight
+    with the allocation and one with a 32 MiB cap; output is byte-identical.
+- PBS 228241: C ABI LP passes with zero residuals. The ORE baseline is
+  Solved/198 and matches its independently audited L10 reference exactly:
+  native 160.707 s, peak RSS 543.1 MiB, 1072.7 CPU s. The serial candidate
+  reaches the runner's 900 s case limit (898.5 CPU s, 215.0 MiB) without a
+  final point; no candidate ORE acceptance or comparison is established.
+  Remaining validation runs in the user-approved PBS 228246, with a 1800 s
+  serial-case budget, passed checks reused, and the large memory pair capped
+  at two iterations.
+- PBS 228246 passes L10/128 at eight threads: Solved/198, full point exactly
+  equal to the audited reference, native 161.033 s and peak RSS 556.8 MiB.
+  The L11u/256 two-iteration baseline/candidate points are identical and both
+  report MaxIterations (38.169/37.557 native s, 10.253/10.275 GiB peak RSS).
+  Scope: capped regression diagnostics. Full-solution acceptance and ABBA
+  timing remain unmeasured for this large-case comparison.
+  The heavy-cone one-iteration probe confirms exactly one OS thread with eight
+  allocated cores available. The one-thread L10 solve is Solved/198, native
+  987.920 s and peak RSS 213.1 MiB; its complete point exactly matches the
+  audited reference and eight-thread solve. Job exit is 0; all scoped gates
+  pass. Deployment reuses the hashed binaries from build source `263f027`,
+  with the final documentation commit's build files verified identical.
+- Runner failures are retained: 228085 omitted the separately packaged audit
+  helpers; 228103 used the wrong allocation-file location; 228121 collided
+  its C ABI executable and log-directory names. They are setup failures, not
+  failed numerical audits. The user approved the repaired final tail.
+- Decision: kept for correctness and bounded temporary storage. Single-run
+  diagnostic timings are not an ABBA performance claim. The known L11u/128 full-solve
+  failure remains labeled; capped runs cannot establish an accepted solution.
+- Evidence: `hpc:~/projects/sdpx-review-repairs-20261021/runs/`, especially
+  `228103`, `228121`, `228241` and `228246`; full job IDs are retained there.
+
 ## 2026-10-21 — BFSS ORE: primal–dual (Dahl–Andersen) scaling probe (rejected, bfss-ore-pd)
 
 - Goal: test whether primal–dual ORE scaling removes the step cap that ORE-SIGMA (below) traced to the primal-scaled direction. MPFR 128 bits only.

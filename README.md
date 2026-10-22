@@ -64,6 +64,14 @@ target/fast/sdpx problem-sdp --precision 768 --threads 8 --output solution.json
 stdin. `--settings FILE` replaces input settings; unspecified fields use
 core defaults. Progress goes to stderr and the result goes to stdout unless
 `--output` is supplied. The converter refuses existing output paths.
+It resamples when a validated prefactor is available and otherwise retains
+valid supplied samples; `--keep-samples` preserves them explicitly. Automatic
+converter workers respect the effective memory allocation. See the
+[converter guide](crates/pmp/README.md).
+
+`tol_original` requests an original-coordinate acceptance check for ordinary,
+sampled and partitioned solves. Sampled checks apply their factor-defined
+operator. The default is `1e-6` for Float64 and off for MPFR.
 
 `--checkpoint FILE [--checkpoint-every N]` saves the accepted iterate
 (default interval: 10 iterations). `--restart FILE` continues the same input
@@ -137,7 +145,9 @@ SOC, updates and callbacks.
 - [Changelog](CHANGELOG.md): release notes.
 
 For a solver edit, build the affected crate and run one matching end-to-end
-case with its original-coordinate audit:
+case with its original-coordinate audit. The maintainer's local
+`benchmark/e2e` directory contains the pinned inputs and audit harness;
+cluster validation packets include these separately from the Git archive:
 
 ```sh
 python3 benchmark/e2e/e2e.py build --arm NAME

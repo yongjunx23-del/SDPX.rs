@@ -1,6 +1,6 @@
 # SDPX development plan
 
-Updated 2026-10-16. [AGENTS.md](AGENTS.md) defines working rules and numerical
+Updated 2026-10-22. [AGENTS.md](AGENTS.md) defines working rules and numerical
 contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 [Journal](docs/JOURNAL.md) holds full timings, job histories, source hashes,
 failed attempts and audit evidence. This file keeps goals, current state,
@@ -44,7 +44,23 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 - Ising ABBA `t14abba.pbs` / `t15abba.pbs`, with audit `audit_point.jl` (`t4dgate.pbs`'s Λ27 audit call is broken; use `t14aud.pbs`).
 - Small-case timing across nodes is bimodal: the conservative governor, a cold process, and MOSEK's warm minimum-of-3. Decide small Float64 timing with same-node interleaved A/B (`t13/abfam.py`).
 
-## Current state (2026-10-13)
+## Current state (2026-10-22)
+
+Version 0.9.3 includes the measured Float64 kernels and BFSS ORE parallel
+work recorded below. Its 25-iteration BFSS scaling table measures kernel
+progress; the L11u/128 full run still ends InsufficientProgress. The scoreboard
+below retains its dated source versions and is not a fresh 0.9.3 comparison.
+
+Review repairs are integrated: initialized residue storage, factor-authoritative
+original acceptance for sampled/owned solves, exact wide-exponent dot fallback,
+charged row merges, bounded ORE temporaries, serial MPFR decoding and general
+PMP pole/memory handling (`263f027`). Local regressions and Linux release
+builds pass. PBS 228121 passes medium, Ising512 at one/four threads and MPI,
+strict-gate rejection and converted PMP solves; 228241 passes the C ABI.
+PBS 228246 reproduces the audited ORE point at one/eight threads, preserves
+the large two-iteration point, and confirms exactly one OS thread for a serial
+heavy-cone run. All scoped gates pass at unchanged tolerances. Evidence and
+runner history are in the journal.
 
 ### Scoreboard against the goals
 
@@ -74,6 +90,9 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
   completed chunk dispatch, bounded/disjoint MPI keepers, packed upper
   congruence residues and reused SVD output storage. Local Ising512 points
   remain exactly unchanged; the journal records the matching gates.
+- The 2×2/3×3 Jacobi tests are scale-relative, fixing the former
+  `overshooting_start_still_solves` failure without a regularization change
+  (journal 2026-10-16).
 - Float64 uses original-coordinate acceptance, condensed slack recovery and
   continuation refinement after residual growth. Old small-case setup overhead
   repairs are retained; remaining presolve/pool/receipt costs need current profiles.
@@ -89,10 +108,12 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 
 - **Λ35 conditioning:** the dual has no Slater point and both solvers retain a long gap plateau. Task 17 resolved the former 768-bit floor: Solved and audited at 768/1024 bits (scoreboard above). Shortening the plateau remains performance work.
 - **Mixed Lambda27 MPFR1024 (frozen 0.9.1):** `Solved`/42 but fails the 1e-30 original-coordinate audit: dual 1.475e-23, primal 3.73e-28, PSD link 2.73e-26, componentwise dual 0.84355. The resampled input (2026-10-10) also fails (dual 2.34e-23) and takes 57 iterations.
-- **Fixed on thermal-ore (2026-10-16):** `overshooting_start_still_solves` (NumericalError from τ₀ 1e-70, failing CI since v0.9.2). Root cause: the 2×2/3×3 Jacobi SVD/eigen kernels used absolute-ε tests, so a 2×2 NT block with entries below ε (1e-78 at 256 bits) got a 45° rotation and a wrong λ. The tests are now scale-relative below unit scale; there is no regularization change (journal 2026-10-16). The chordal fixture tests were updated for `5b9980e`.
   - Primal variables reach 5.8e118.
   - The explicit-gate pilot is prepared but not run (decision below).
   - Not the same input as the 768-bit Λ27 above, which passes its audit.
+- **BFSS L11u/128:** InsufficientProgress/107. Its unchanged point and
+  capped 256/512-bit timings are kernel evidence; they do not establish an
+  accepted full solution (journal 2026-10-21).
 - **Large SU(2) Float64 (n 7054):** every PSD block has a kernel shared by all A_j and b (30/30/30/30/60/12/14 of 95/92/94/92/186/74/71).
   - SDPX is AlmostSolved, and MOSEK's "optimal" points fail the 1e-6 audit (r_d about 1e-4).
   - Medium SU(2) is now Solved and audited after task 16; the large case still fails.
@@ -112,57 +133,14 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 
 | Task | Branch | Scope | Gate |
 |---|---|---|---|
-| 17 | `perf-l35b` | Merged `368ffe7` (no MPFR shifts, GMP basecase, opt-in host GMP). Remaining, not merged: (F) a start rule for SDPB 3.1 resampled inputs (Λ27-rs is a τ chase at the default start: 345 it vs 145 at τ₀ 1e-30); (G) `sdpx-pmp2sdp` resamples verified PyCFTBoot/SDPB.m blocks by default (`--keep-samples` opts out), with threads defaulting to the cores within a memory cap; then Λ35-rs at 1024 | Default solve on resampled inputs no worse than today on old inputs (Λ19 ≤121, Λ27 ≤183, Λ35 ≤683 it, audited); ising11, gravity256 and the old inputs no worse |
+| 17 | `perf-l35b` | MPFR arithmetic/start changes and default PMP resampling are merged. Remaining: shorten the Λ35 gap plateau and measure matched peak memory. | Audited full solves with matched precision, settings and inputs; preserve the pinned and gravity gates. |
 | 21 | `perf-mc` | Multi-core scaling (user, 2026-10-09): 8–128-thread curves against SDPB on Λ27, Λ35 and mixed Λ27/1024 (`sdpx-mpi-20261004/inputs/mixed-L27-sdp-1024`, n 18703, the SDPB-benchmark-scale case; SDPB 2 paper: Λ43 mixed 2861 s → 59 s per iteration from 4 to 448 cores), with perf stat/record, lock, allocation and NUMA data. Then evidence-chosen fixes: persistent block ownership (SDPB-style affinity), per-socket layout for 128 cores, phase overlap, distributed border/Schur for mixed problems | Ising ABBA at 64 and 128 threads with audits; Λ35 pace; mixed Λ27 2nd-iteration time vs SDPB; Float64 scoreboard unchanged |
 | 22 | `perf-f64mc` | Binary64 and non-PSD cone multi-thread scaling on large cases (user, 2026-10-09: small cases are too small for threads): gravity-large (n 20202, m 20299), SU(2) medium/large, gpp500, arch0, large LPs, against MOSEK at 1–32 threads; small cases only need a measured-work guard so 16 threads never loses to 1. Also owns lock-free receipts and the process-wide pool cache (the per-call pool sites are test-only). Phase 1: serial phases run about 2× slower at t>1 under the conservative governor because the unpinned main thread hops cores | 58-case scoreboard at 1 and 16 threads unchanged; same-node A/B; large cases audited; ising11 bitwise |
 
-Task 21 first fixes (journal 2026-10-10, branch `perf-mc-impl`): 128-thread Λ27 −13%, Λ35-rs −14%, mixed Λ27/1024 −12% per iteration (64 threads −2…−9%), audited; the τ-chase restart is now on by default for MPFR unit starts (Λ27-rs 345 → 210 it). Mixed at 128 threads trades +13 GiB peak RSS for its gain.
-
-Automatic τ rule (journal 2026-10-10, perf-mc-impl mci19, convergence contract, audited): large KKT start scales start at eps^(1/8); a start that still chases restarts once at eps^(1/3). Λ35-rs/1024 680 → 423 it, Λ35/1024 688 → 435, Λ27-rs 210 → 138; Λ27, Λ19-rs, ising11 unchanged. gravity256 (MPFR256, 4 threads) Solved 19 it, no restart; Float64 is untouched (wide types only). Not merged.
-
-Levers L1–L9 and wave balance (journal 2026-10-11, perf-mc-impl, 64 threads, Λ35-rs):
-- Kept:
-  - exact-dot Y-solve rows (−3.1%; mixrs −7.9%, audited);
-  - host GMP for cluster builds (−3.7%);
-  - LPT-planned cone-lane ways (`2dff54b`, −2.5%, bitwise).
-- Rejected:
-  - planned ways for the KKT phases;
-  - power-of-two balancing;
-  - cached R residues;
-  - full Newton step;
-  - directed SVD sweep;
-  - τ fall-rate chase detection.
-- Next: the solve pipeline (about 45% of wall at f50); the SVD lever is done (below).
-
-L8, chase restart keeps the side that did not grow (journal 2026-10-11, perf-mc-impl, convergence contract): Λ35-rs/1024 423 → 372 it (1511 → 1195 s); the other Ising inputs are bitwise unchanged. Audit 224854 accepted.
-
-Step limits L10/L11 (journal 2026-10-11): the steady phase is limited by primal centrality in the largest cones (α_aff 0.65, step 0.90). MPFR curve search and split steps were rejected; split steps diverge on Λ27. The MPFR PSD Gondzio corrector cuts iterations 15–17% but costs 3–14% more time, so it was also rejected. Diagnostic: `SDPX_DBG_STEPCONE`. Next: cheaper KKT solves (the solve pipeline is 1.4 of 3.19 s per Λ35-rs iteration, 41–48 of 64 cores busy), which would also make the corrector pay.
-
-Queues, cone SVD and tiled CRT (journal 2026-10-11, perf-mc-impl, now defaults). Each change is measured on Λ35-rs, 64 threads:
-- largest-first job queues for the KKT block passes, residual products and step bounds: −6.2%, bitwise;
-- queued border contributions: −2.6%, bitwise;
-- dqds values with inverse-iteration vectors for the V-only cone SVD: −4.1% and −3.0%, audited;
-- an output-tiled CRT for the RNS gemm and congruences: −8.4% per iteration, bitwise.
-
-The f50 full solves with all of them are audited: Λ35-rs takes 372 iterations in 900 s (1216 s at mci41, −26%); Λ27 −8.5%, Λ27-rs −5.7%, Λ19-rs −6.6% against f46.
-Kept since:
-- residue products for short arrow-leaf groups (Λ35-rs −3.8% per iteration, bitwise, peak RSS 5.6 → 7.2 GB);
-- cone SVD vectors from the shifted normal form within a factor two, with windowed Gram–Schmidt (Λ35-rs −5.5% per iteration; full solves −2.2 to −3.9%; audited);
-- step bounds of KKT directions from one congruence, with W⁻ᵀΔs = −WΔz − W⁻ᵀc from the complementarity row (Λ35-rs −3.8% per iteration; full solves −2.2 to −6.0% at unchanged iteration counts; audited);
-- the combined shift as one exact symmetric square (Λ35-rs −2.7% per iteration), and WΔz from the condensed recovery's pre-image when refinement made no correction (−2.1%; Λ27-rs −3.5%). Together the full solves are −1.9 to −6.2% at unchanged iteration counts, audited.
-Rejected since: residue-major i32 congruence (gains only for n ≥ 96 under full load); reciprocal pivots in inverse iteration (+12%); blocked exact leaf LDL from order 96 (Λ27-rs +2.8%); board items inside cone SVD/Cholesky (−0.7%); queue help with board items in unsplit congruences and gemms (−1.2%, and its idle wait can livelock when a stolen join half starts a queue item); compact-WY V back-transform (+0.4% under full load). Their patches are kept in `~/.cache/sdpx-e2e/patches`.
-
-Next:
-- the solve pipeline: residual 0.246, recover 0.148, prepare 0.113 of 1.85 s per Λ35-rs iteration at mci60 (3.1 solves per iteration, three exact congruences per block and solve);
-- refinement corrections in late iterations (f63): prepare + recover + residual take 44% of Λ35 (1586 corrections in 435 iterations), 41% of Λ27 and 37% of Λ35-rs. First find which rows exceed the ε^(3/4) tolerance and why, then make the raw solve more accurate or each correction cheaper. The tolerance itself stays;
-- cone kernels under full load (n = 63, 64 copies, per cone): bidiagonalization 85 ms, reflectors 59, R/R⁻¹ 50, inverse iteration 43, Cholesky 24, dqds 19, L2ᵀL1 13 ms. A blocked triangular solve cuts R/R⁻¹ by 10.6 ms (−2.9% of the cone); panel bidiagonalization saves 5 ms. Neither yet reaches 2% of an iteration;
-- Λ35-rs iterations: 169 iterations before the chase restart and about 120 to deflate the restarted primal scale (L1 detection is closed: no general early signal, at most about 25 iterations to gain).
-
-Step-length stop (journal 2026-10-10, perf-mc-impl, convergence contract): only a zero step ends a solve; an unconverged end reports its best iterate; the exp/pow backtracking floor is eps^(1/4) in MPFR. Goldstone unitarity K4 case: InsufficientProgress/141 at gap 6.5e-6 → gap 4.5e-12 at 300; Float64 46/46 and csdr3 unchanged. Not merged.
-
-Task 17 items D/E passed their gates and are merged. The normalized 2×2 PMP is Solved/24. Resampling remains opt-in, and converter threads default to one; the proposed new defaults require the remaining start-rule gate.
-
-Review repairs (2026-10-09): preserve sampled factors through singleton presolve, defer unused audit copies, bound split residue caches, reject overflow before result publication, use the existing pool for faer, and isolate complete receipts. Local audited checks preserve baseline points for medium/faer, ising11 and csdr3 at one/four threads. Linux affinity, owner assembly and MPI checks are recorded in the journal.
+The task 17/21 start, step-limit, cone and residue changes are merged.
+Their measurements and rejected alternatives are recorded in the journal
+(2026-10-10 through 2026-10-13). Current kernel and iteration priorities are
+listed below; the historical branch states do not require another merge.
 
 ### Current performance changes (2026-10-09)
 

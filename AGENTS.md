@@ -18,8 +18,9 @@ Float64 and every MPFR width. BLAS/LAPACK are always linked (no SDP-less build).
 - `crates/arithmetic` — `MpFloat<N>` (MPFR storage, owned limbs). Products and
   sums of regular values round inline to nearest-even (multiply through 1280
   bits, add/sub through 512; MPFR otherwise, bitwise equal). `exactdot`:
-  every dot product is the exact sum rounded once (inlined limb kernel through
-  256 bits, GMP above). Wire/serde formats.
+  every finite dot product is the exact sum rounded once (inline/GMP limb
+  kernels, runtime BMI2/ADX on x86; exact MPFR summation beyond the bounded
+  exponent window). Wire/serde formats.
 - `crates/solver/src/algebra` — CSC and dense matrices, `BlasFloatT` (system
   BLAS/LAPACK for f64; MPFR kernels for wide types), exact residue GEMMs
   (`rns_blas`: products, congruences, `Aᵀdiag(d)A`, with constant-operand

@@ -1,8 +1,25 @@
 # Changelog
 
 All notable changes to SDPX are recorded here. Versions follow
-[Semantic Versioning](https://semver.org/). Measurements quote audited full
-solves; the experiment log is [docs/JOURNAL.md](docs/JOURNAL.md).
+[Semantic Versioning](https://semver.org/). Measurements identify full solves,
+iteration-limited runs and diagnostics; evidence is in
+[docs/JOURNAL.md](docs/JOURNAL.md).
+
+## Unreleased
+
+- Residue writers initialize spare capacity through `MaybeUninit`, retaining
+  the no-clear encoding and decoding paths.
+- Requested original-coordinate acceptance checks apply to sampled and
+  owner-partitioned solves through the authoritative factors.
+- Finite exact dots beyond the bounded accumulator use exact products and
+  MPFR summation, including cancellation across wide exponent ranges.
+- Presolve budgets count complete row merges. ORE row transforms publish in
+  bounded waves; speculative step trials share a factor-workspace allowance.
+- Serial MPFR JSON loading decodes values without retaining a token buffer.
+- PMP prefactor recovery handles repeated and nearby poles. Valid explicit
+  samples remain usable when a prefactor cannot be inferred. Automatic
+  workers use the largest block's precision-dependent workspace and respect
+  cgroup/PBS memory allocations.
 
 ## [0.9.3] - 2026-10-21
 
