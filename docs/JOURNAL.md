@@ -8,6 +8,37 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-23 — Correct clustered MPFR singular vectors at central PSD points
+
+- Failure: for a central PSD pair `Z = mu S^-1`, the shifted-normal SVD
+  returned nonorthogonal right vectors. A 4-by-4 positive definite example
+  gave a 0.1976 relative discrepancy between the NT Newton direction and
+  finite differences of the log-det gradient at 512 bits. The linear KKT
+  residual was small; it did not detect the incorrect scaling matrix.
+- Change: retain `sigma_max^2`, the unshifted normal-matrix scale, for
+  eigenvalue clustering, pivot floors and shift separation in
+  `normal_vectors`. Shifting the matrix does not improve the absolute
+  accuracy of the supplied singular values. The growth test remains on
+  the shifted matrix. Precision and acceptance thresholds are unchanged.
+- Evidence: the discrepancy falls to 8.654e-63. The complete diagnostic
+  primal-barrier solve takes 62 iterations and passes an independent
+  592-bit original-coordinate audit: objective -2.437127699525857916...,
+  gap 2.5000202e-13 and raw dual residual 8.2957048e-19. Its fixture is
+  `min x` subject to `L L^T + x I >= 0`, with rows of L equal to
+  `(2,0,0,0)`, `(1,3,0,0)`, `(2,-1,4,0)`, `(1,2,1,5)`.
+- The production CLI built from the current main branch plus this fix also
+  solves the fixture at 512 bits (Solved/9). Its independent 592-bit audit
+  passes the input's raw 1e-16 feasibility and 1e-12 gap gates: primal
+  residual 9.802e-17, dual residual 1.952e-17, gap 3.224e-16 and analytic
+  optimum error 9.697e-17. Local fast-profile solve time is 17.1 ms.
+- The full BFSS L11 direction check also improves from 4.339e-7 to
+  1.012e-65. L11 convergence remains unresolved; neither this correction
+  nor the separately verified auxiliary-face projection establishes an
+  accepted L11 bound. Experimental primal continuation is not included
+  in this production change.
+- Decision: keep the SVD correction for correctness. These checks establish
+  no performance claim.
+
 ## 2026-10-22 — Review repairs: exact operators, finite dots and bounded temporary memory
 
 - Source: baseline `682e484`; repaired runtime source `263f027`, version
