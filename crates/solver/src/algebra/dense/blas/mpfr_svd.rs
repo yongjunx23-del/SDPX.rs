@@ -791,10 +791,10 @@ pub(super) fn inverse_vectors<const N: usize>(
 /// within a factor two (`σmin ≥ σmax/2`), as eigenvectors of the shifted
 /// normal tridiagonal `F = BᵀB − c²I` (`c` the mid value) of order `n`.
 /// Same inverse iteration as [`inverse_vectors`] (pivoted LU, growth test,
-/// Gram–Schmidt within `1e-3·‖F‖`, one extra solve), with the growth test
-/// taken on `F/‖F‖`. Against `‖F‖` the gaps are `c/spread` times wider than
-/// against `‖T‖`, so a nearly centred cone (all values equal to 15 digits)
-/// needs no Gram–Schmidt instead of one cluster of `n`. Within the factor two, forming `BᵀB` keeps the vectors'
+/// Gram–Schmidt within `1e-3·σmax²`, one extra solve), with the growth test
+/// taken on `F/‖F‖`. Clustering and pivot floors retain the unshifted scale:
+/// the input singular values do not gain absolute accuracy when shifted.
+/// Within the factor two, forming `BᵀB` keeps the vectors'
 /// error at the bidiagonalization's backward error over the gap, as for the
 /// Golub–Kahan form.
 fn normal_vectors<const N: usize>(
@@ -851,9 +851,14 @@ fn normal_vectors<const N: usize>(
         return true;
     }
     let eps = F::epsilon();
-    let ortol = fnorm / num::<N>(1000);
-    let tiny = eps * fnorm;
-    let pertol = eps * num::<N>(10) * fnorm;
+    // The singular values supplied by dqds have absolute uncertainty on
+    // the scale of B^T B, not of the shifted F. Near a central PSD point,
+    // F can be at roundoff scale. Using its norm here separates numerically
+    // indistinguishable eigenvalues and returns nonorthogonal vectors.
+    let original_norm = hi * hi;
+    let ortol = original_norm / num::<N>(1000);
+    let tiny = eps * original_norm;
+    let pertol = eps * num::<N>(10) * original_norm;
     let crit = (<F<N> as num_traits::FromPrimitive>::from_f64(0.1).unwrap() / num::<N>(n)).sqrt();
     order.clear();
     order.extend(0..n);

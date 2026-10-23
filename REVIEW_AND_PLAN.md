@@ -1,6 +1,6 @@
 # SDPX development plan
 
-Updated 2026-10-22. [AGENTS.md](AGENTS.md) defines working rules and numerical
+Updated 2026-10-23. [AGENTS.md](AGENTS.md) defines working rules and numerical
 contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 [Journal](docs/JOURNAL.md) holds full timings, job histories, source hashes,
 failed attempts and audit evidence. This file keeps goals, current state,
@@ -61,6 +61,13 @@ PBS 228246 reproduces the audited ORE point at one/eight threads, preserves
 the large two-iteration point, and confirms exactly one OS thread for a serial
 heavy-cone run. All scoped gates pass at unchanged tolerances. Evidence and
 runner history are in the journal.
+
+The central-PSD MPFR SVD correction retains the unshifted matrix scale for
+clustering and pivot thresholds. A complete 512-bit four-by-four PSD probe
+passes its independent 592-bit audit; the direction discrepancy falls from
+0.1976 to 8.654e-63. The BFSS L11 convergence failure remains open. Its
+experimental limit cone and primal continuation are separate from this
+production correction; see the 2026-10-23 journal entry.
 
 ### Scoreboard against the goals
 
