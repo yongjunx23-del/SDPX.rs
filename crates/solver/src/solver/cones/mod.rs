@@ -14,6 +14,8 @@ mod genpowcone;
 mod nonnegativecone;
 mod oprelentrcone;
 mod oprelentrlimitcone;
+#[cfg(feature = "serde")]
+pub mod primal_probe;
 mod powcone;
 mod socone;
 mod zerocone;

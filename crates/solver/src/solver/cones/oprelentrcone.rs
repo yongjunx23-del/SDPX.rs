@@ -906,7 +906,6 @@ impl<T: FloatT> Oracle<T> {
     }
 
     /// Primal gradient ∇f(s) (svec, stacked T, X, Y).
-    #[cfg(test)]
     pub(crate) fn gradient(&self, out: &mut [T]) {
         let n = self.n;
         let m = n * (n + 1) / 2;

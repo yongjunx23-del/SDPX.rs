@@ -544,3 +544,6 @@ are in [the journal](docs/JOURNAL.md).
   L-X3; the √2-split quadratic congruence (two CRTs at about 3P bits cost more
   than the 25% fewer prime products save); pre-image step bounds through
   corrections and skipping the dead affine z congruence (≤1.7%).
+
+
+QICS comparison (2026-10-24): the experimental feasible-primal frontend uses projected local-norm contraction near a center, with unchanged precision and acceptance gates. Small limit-cone and retained L11 restart audits pass; the exact original-trajectory comparison and current-main port gate are pending. See the QICS journal entry.

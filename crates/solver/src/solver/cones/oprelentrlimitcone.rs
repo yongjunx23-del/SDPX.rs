@@ -742,7 +742,6 @@ impl<T: FloatT> Oracle<T> {
     }
 
     /// Primal gradient ∇F(s).
-    #[cfg(test)]
     pub(crate) fn gradient(&self, out: &mut [T]) {
         let rows = &self.rows;
         let (m, k) = (rows.m, rows.k());

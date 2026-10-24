@@ -12262,3 +12262,32 @@ scratch saved another 66 MiB on the synthetic but cost 8% time; reverted.
 
 ising11 (`c7491bd8594d4320`) and medium (`fd1437ee79ac39e0`) points are
 unchanged; all audits pass.
+
+
+### 2026-10-24 — QICS-inspired feasible-primal centering (validation in progress)
+
+QICS `be18e5ef07258dec9e5db6bb18c1ee9b2003d545` uses inverse-Hessian
+proximity for nonsymmetric step acceptance, prediction/centering fallbacks,
+and full-system iterative refinement. The projected proximity construction
+is described in He, Saunderson and Fawzi, arXiv:2410.17803, Section 3.5.
+
+The explicit `sdpx-primal-probe` frontend now tests a strict feasible Newton
+step near a center using the projected local norm. Reusing the current KKT
+factor and the self-concordant Hessian comparison bounds the trial decrement;
+accept only a contraction by at least one half. Other steps retain Armijo.
+It preserves the requested arithmetic, residual and gap thresholds, reports
+`CandidateConverged` rather than `Solved`, and saves `LineSearchFailed` at the
+latest accepted point if Armijo fails. This is an experimental feasible-primal
+initializer; it does not replace the HSD algorithm or remove recession rays.
+The previously local ORE limit-cone implementation is its BFSS prerequisite.
+
+A native512 scalar limit-cone solve passes the independent592 audit. The
+retained T=.55,r=2.382 checkpoint reaches the original1e-20 initialization
+target in two local-norm steps (weighted residual1.09e-52); fresh native
+acceptance, the uncapped rational592 audit and all41 original cones at11264
+audit-only bits pass. Its original mu4.33576136e-25 is unchanged. The old
+binary also converges after restart (four steps), so this is not yet evidence
+that the original continuous trajectory is repaired. The first full replay
+was stopped after detecting an extra damping change absent from the frozen
+binary. The corrected full replay changes only local-norm acceptance and
+starts from the exact original point and mu; its result remains pending.
