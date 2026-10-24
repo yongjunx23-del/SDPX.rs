@@ -12264,12 +12264,14 @@ ising11 (`c7491bd8594d4320`) and medium (`fd1437ee79ac39e0`) points are
 unchanged; all audits pass.
 
 
-### 2026-10-24 — QICS-inspired feasible-primal centering (validation in progress)
+### 2026-10-25 — QICS-inspired feasible-primal centering (kept)
 
 QICS `be18e5ef07258dec9e5db6bb18c1ee9b2003d545` uses inverse-Hessian
 proximity for nonsymmetric step acceptance, prediction/centering fallbacks,
 and full-system iterative refinement. The projected proximity construction
-is described in He, Saunderson and Fawzi, arXiv:2410.17803, Section 3.5.
+is described in [He, Saunderson and Fawzi](https://arxiv.org/abs/2410.17803),
+Section 3.5; see the pinned
+[nonsymmetric stepper](https://github.com/kerry-he/qics/blob/be18e5ef07258dec9e5db6bb18c1ee9b2003d545/qics/_stepper/nonsym.py).
 
 The explicit `sdpx-primal-probe` frontend now tests a strict feasible Newton
 step near a center using the projected local norm. Reusing the current KKT
@@ -12281,13 +12283,40 @@ latest accepted point if Armijo fails. This is an experimental feasible-primal
 initializer; it does not replace the HSD algorithm or remove recession rays.
 The previously local ORE limit-cone implementation is its BFSS prerequisite.
 
-A native512 scalar limit-cone solve passes the independent592 audit. The
-retained T=.55,r=2.382 checkpoint reaches the original1e-20 initialization
-target in two local-norm steps (weighted residual1.09e-52); fresh native
-acceptance, the uncapped rational592 audit and all41 original cones at11264
-audit-only bits pass. Its original mu4.33576136e-25 is unchanged. The old
-binary also converges after restart (four steps), so this is not yet evidence
-that the original continuous trajectory is repaired. The first full replay
-was stopped after detecting an extra damping change absent from the frozen
-binary. The corrected full replay changes only local-norm acceptance and
-starts from the exact original point and mu; its result remains pending.
+The controlled full replay of the failed L11 energy minimum at T = 0.55,
+r = 2.382 (PBS 229488) changes only local-norm acceptance. Both arms use
+native 512-bit arithmetic, the exact original starting point, initial mu,
+barrier schedule and tolerances, and 32 threads each on one node. Their
+printed numerical traces agree through iteration 266. At iteration 267:
+
+| Frozen baseline | Local-norm safeguard |
+|---|---|
+| Armijo takes alpha = 0.0625, then fails | Full centering step accepted |
+| Last logged weighted stationarity 8.258e-16 | Weighted stationarity 4.892e-52 |
+| Saved point fails the independent weighted-dual gate | CandidateConverged; all original-model audits pass |
+
+The candidate satisfies the original 1e-20 initialization target with gap
+2.5e-21 and unchanged final mu = 4.33576136e-25. Fresh native acceptance,
+removal of every temporary bound, the rational 592-bit audit and all 41
+original cones at 11264 audit-only bits pass at the unchanged final 1e-16
+tolerance. The uncapped weighted residual is 1.010e-22 and the energy is
+7.18122039139736550347096953867401430271908408. Audit precision never feeds
+back into the native solve. These are numerical checks of this finite
+program, not interval or continuum certificates.
+
+The current-main port also passes a small native 512-bit limit-cone solve
+with an independent 592-bit audit. On the retained L11 checkpoint, the
+current-main build (PBS 229489, commit 6d630fd) reaches the original target
+in two steps, weighted residual 1.090e-52, and passes the same uncapped and
+original-cone audits. The baseline also succeeds after a restart (four
+steps); the uninterrupted replay above establishes the failure and repair.
+
+Provenance: baseline binary SHA-256 769d1c088260b89178124b2cf7947f9654fa3d7f8f9877096fab9023cfd26995;
+controlled candidate 5eb62acae2642f65fb6a91776885a12eb3c8d956c82ff5d61d7f0d8e73f208fe;
+current-main build 1e4d0aa113b7211aea86fd0eea4ab8cfa150cbace842abc260e5a6354619a805.
+The controlled evidence archive hashes to
+764c9f5c3e5086f8cc6338cde778af71d66de09568fd389c3d82d14a8e95b7be.
+The superseded PBS 229487 replay contained extra damping, was cancelled,
+and is excluded from the comparison. This repairs the demonstrated late
+line-search failure; exact recession reductions remain part of the model
+pipeline. The paper source and previously accepted results were not edited.

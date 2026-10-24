@@ -546,4 +546,10 @@ are in [the journal](docs/JOURNAL.md).
   corrections and skipping the dead affine z congruence (≤1.7%).
 
 
-QICS comparison (2026-10-24): the experimental feasible-primal frontend uses projected local-norm contraction near a center, with unchanged precision and acceptance gates. Small limit-cone and retained L11 restart audits pass; the exact original-trajectory comparison and current-main port gate are pending. See the QICS journal entry.
+QICS centering (2026-10-25, kept): the experimental feasible-primal frontend
+uses projected local-norm contraction near a center. The exact original-start
+L11 comparison reproduces the old Armijo failure at iteration 267 and the
+modified solve passes every uncapped/original-cone audit at unchanged
+512-bit precision and tolerances. The current-main port passes the small
+limit-cone and retained L11 checkpoint gates. See the QICS journal entry and
+PR #11 for the run inventory; the default HSD algorithm is unchanged.
