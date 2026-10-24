@@ -824,7 +824,7 @@ fn output_dots_match<const N: usize>() {
         }
     };
     // Output k takes terms i ≡ k (mod 5); output 3 has a NaN, output 4 only
-    // zero products and output 5 a spread beyond the accumulator bound.
+    // zero products and output 5 a spread handled by the exact MPFR path.
     let outputs = 6;
     let mut terms: Vec<(usize, MpFloat<N>, MpFloat<N>)> = (0..997)
         .map(|i| (i % 5, value(i), value(i * 3 + 1)))
@@ -880,7 +880,7 @@ fn output_dots_match<const N: usize>() {
             );
             for (k, sum) in sums.iter().enumerate() {
                 match k {
-                    3 | 5 => assert!(sum.is_none(), "N={N} chunks={chunks} k={k}"),
+                    3 => assert!(sum.is_none(), "N={N} chunks={chunks} k={k}"),
                     _ => {
                         let sum = sum.unwrap();
                         assert_eq!(
