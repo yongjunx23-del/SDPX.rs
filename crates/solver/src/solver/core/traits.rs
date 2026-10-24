@@ -52,9 +52,7 @@ impl<T: FloatT> ConeCollection<T> for crate::solver::cones::CompositeCone<T> {
         self.is_symmetric()
     }
     fn barrier_backtrack(&self) -> bool {
-        use crate::solver::cones::SupportedCone;
-        self.iter()
-            .any(|c| !c.is_symmetric() && !matches!(c, SupportedCone::OpRelEntropyCone(_)))
+        self.iter().any(|c| !c.is_symmetric() && !c.is_ore())
     }
     fn supports_primal_dual(&self) -> bool {
         self.allows_primal_dual_scaling()

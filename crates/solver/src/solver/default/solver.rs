@@ -382,6 +382,20 @@ fn check_dimensions<T: FloatT>(
                 .and_then(|twice| (twice / 2).checked_mul(3))
                 .filter(|_| *n > 0)
                 .ok_or_else(invalid)?,
+            SupportedConeT::OpRelEntropyLimitConeT(n, m) => {
+                // 0 ≤ m < n; t(n) + mk + 2t(k), k = n − m
+                let t = |x: usize| {
+                    x.checked_add(1)
+                        .and_then(|y| x.checked_mul(y))
+                        .map(|v| v / 2)
+                };
+                let k = n.checked_sub(*m).filter(|&k| k > 0).ok_or_else(invalid)?;
+                t(*n)
+                    .zip(m.checked_mul(k))
+                    .zip(t(k).and_then(|v| v.checked_mul(2)))
+                    .and_then(|((a, b), c)| a.checked_add(b)?.checked_add(c))
+                    .ok_or_else(invalid)?
+            }
         };
         p = p.checked_add(size).ok_or_else(invalid)?;
     }

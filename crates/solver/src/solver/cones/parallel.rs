@@ -56,6 +56,11 @@ fn cone_cost<T: FloatT>(cone: &SupportedCone<T>) -> u128 {
         SupportedCone::PSDTriangleCone(k) => (k.n as u128).saturating_pow(3),
         // S₀'s factor and inverse, order 2m = n(n+1)
         SupportedCone::OpRelEntropyCone(k) => ((k.n * (k.n + 1)) as u128).saturating_pow(3) / 2,
+        // S₀ of order mk + 2t(k), k = n − m
+        SupportedCone::OpRelEntropyLimitCone(c) => {
+            let k = c.n - c.m;
+            ((c.m * k + k * (k + 1)) as u128).saturating_pow(3) / 2
+        }
         _ => cone.numel() as u128,
     };
     let words = ((T::precision_bits() + 63) / 64) as u128;

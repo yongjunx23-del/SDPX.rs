@@ -103,6 +103,8 @@ where
         _print_conedims_by_type(out, cones, SupportedConeTag::PowerCone)?;
         _print_conedims_by_type(out, cones, SupportedConeTag::GenPowerCone)?;
         _print_conedims_by_type(out, cones, SupportedConeTag::PSDTriangleCone)?;
+        _print_conedims_by_type(out, cones, SupportedConeTag::OpRelEntropyCone)?;
+        _print_conedims_by_type(out, cones, SupportedConeTag::OpRelEntropyLimitCone)?;
 
         writeln!(out,)?;
 

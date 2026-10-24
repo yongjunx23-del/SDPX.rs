@@ -518,3 +518,70 @@ fn panic_poisons_and_busy_rejects() {
         assert_eq!(sdpx_destroy(h), 0);
     }
 }
+
+#[test]
+fn limit_cone_kind_carries_rank_in_reserved() {
+    let cone = |kind, reserved, dim| Cone {
+        kind,
+        reserved,
+        dim,
+        alpha: arr(&[]),
+    };
+    unsafe {
+        assert_eq!(
+            cones::<f64>(&[cone(8, 1, 2)]).unwrap(),
+            vec![SupportedConeT::OpRelEntropyLimitConeT(2, 1)]
+        );
+        assert!(cones::<f64>(&[cone(7, 1, 2)]).is_err());
+        // min tr T − b over K(2, 1) with a = 2, c = 1: 1 + N − 1/(4N),
+        // N = 2 ln 2 − 1; x = svec T | b | a | c, rows a, c, then −x + s = 0
+        let p = Csc {
+            rows: 6,
+            cols: 6,
+            nnz: 0,
+            colptr: [0; 7].as_ptr(),
+            rowval: ptr::null(),
+            values: arr(&[]),
+        };
+        let a = Csc {
+            rows: 8,
+            cols: 6,
+            nnz: 8,
+            colptr: [0, 1, 2, 3, 4, 6, 8].as_ptr(),
+            rowval: [2, 3, 4, 5, 0, 6, 1, 7].as_ptr(),
+            values: arr(&[-1.0, -1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0]),
+        };
+        let b = [2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let q = [1.0, 0.0, 1.0, -1.0, 0.0, 0.0];
+        let mut settings = defaults();
+        settings.precision_bits = 128;
+        // rank 2 = n is rejected
+        for rank in [2, 1] {
+            let cs = [cone(0, 0, 2), cone(8, rank, 2)];
+            let mut h = ptr::null_mut();
+            let code = sdpx_prepare(
+                &p,
+                &arr(&q),
+                &a,
+                &arr(&b),
+                cs.as_ptr(),
+                2,
+                &settings,
+                &mut h,
+            );
+            if rank == 2 {
+                assert!(code != 0 && h.is_null());
+                continue;
+            }
+            assert_eq!(code, 0);
+            assert_eq!(sdpx_solve(h), 0);
+            let mut info = std::mem::MaybeUninit::<Info>::uninit();
+            assert_eq!(sdpx_get_info(h, info.as_mut_ptr()), 0);
+            let info = info.assume_init();
+            assert_eq!(info.status, 1);
+            let n = 2.0 * 2f64.ln() - 1.0;
+            assert!((info.objective - (1.0 + n - 0.25 / n)).abs() <= 1e-8);
+            assert_eq!(sdpx_destroy(h), 0);
+        }
+    }
+}
