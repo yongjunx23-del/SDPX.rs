@@ -4,6 +4,66 @@ use sdpx_arithmetic::MpFloat;
 
 type Mp2 = MpFloat<2>;
 
+#[test]
+fn projected_entropy_derivatives_native512() {
+    use num_traits::{Num, One, Zero};
+    use sdpx_arithmetic::Scalar;
+    type F = MpFloat<8>;
+    let two: F = (2.0).as_T();
+    let eight: F = (8.0).as_T();
+    let h = two.powi(-100);
+    let tol = F::from_str_radix("1e-50", 10).unwrap();
+    let tight = F::from_str_radix("1e-120", 10).unwrap();
+    for (n, m, rank) in [(2, 0, 1), (3, 1, 2), (4, 2, 1), (3, 1, 0), (3, 1, 3)] {
+        let s = cast::<F>(&point(n, m, 83 + n as u64));
+        let d = cast::<F>(&direction(s.len(), 301 + m as u64));
+        let p: Vec<F> = (0..n * rank)
+            .map(|e| {
+                let (i, j) = (e % n, e / n);
+                if i == j {
+                    F::one()
+                } else if rank == n {
+                    F::zero()
+                } else {
+                    F::one() / eight
+                }
+            })
+            .collect();
+        let mut o = ProjectedOracle::new(n, m, &s, rank, &p).unwrap();
+        let mut g = vec![F::zero(); s.len()];
+        o.gradient(&mut g);
+        let at = |t: F| {
+            let v: Vec<_> = s.iter().zip(&d).map(|(s, d)| *s + t * *d).collect();
+            ProjectedOracle::new(n, m, &v, rank, &p).unwrap()
+        };
+        let fd = (at(h).barrier() - at(-h).barrier()) / (two * h);
+        assert!((fd - F::dot_slices(&g, &d)).abs() < tol);
+        let mut gp = g.clone();
+        let mut gm = g.clone();
+        at(h).gradient(&mut gp);
+        at(-h).gradient(&mut gm);
+        let hd: Vec<_> = gp
+            .iter()
+            .zip(gm)
+            .map(|(a, b)| (*a - b) / (two * h))
+            .collect();
+        let mut analytic = vec![F::zero(); s.len()];
+        o.hess_prod(&d, &mut analytic);
+        assert!(rel(&hd, &analytic) < tol);
+        let degree: F = (rank + 2 * (n - m)).as_T();
+        assert!((F::dot_slices(&s, &g) + degree).abs() < tight);
+        o.hess_prod(&s, &mut analytic);
+        assert!(analytic
+            .iter()
+            .zip(&g)
+            .all(|(a, g)| (*a + *g).abs() < tight));
+        if rank == n {
+            let ordinary = Oracle::new(n, m, &s).unwrap();
+            assert!((o.barrier() - ordinary.barrier).abs() < tight);
+        }
+    }
+}
+
 const SHAPES: [(usize, usize); 6] = [(1, 0), (2, 1), (3, 1), (3, 2), (4, 1), (5, 2)];
 
 fn lcg(seed: u64) -> impl FnMut() -> f64 {

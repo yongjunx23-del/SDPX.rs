@@ -6,6 +6,8 @@ pub(crate) mod cones;
 pub(crate) mod core;
 #[cfg(feature = "serde")]
 pub use cones::primal_probe;
+#[cfg(feature = "serde")]
+pub use cones::projected_primal;
 pub mod default;
 pub(crate) mod distributed;
 pub(crate) mod kkt;

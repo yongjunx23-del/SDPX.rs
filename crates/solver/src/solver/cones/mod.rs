@@ -17,6 +17,8 @@ mod oprelentrlimitcone;
 mod powcone;
 #[cfg(feature = "serde")]
 pub mod primal_probe;
+#[cfg(feature = "serde")]
+pub mod projected_primal;
 mod socone;
 mod zerocone;
 // partially specialized traits and blanket implementataions

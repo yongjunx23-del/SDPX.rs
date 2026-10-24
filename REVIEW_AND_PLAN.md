@@ -553,3 +553,7 @@ modified solve passes every uncapped/original-cone audit at unchanged
 512-bit precision and tolerances. The current-main port passes the small
 limit-cone and retained L11 checkpoint gates. See the QICS journal entry and
 PR #11 for the run inventory; the default HSD algorithm is unchanged.
+
+2026-10-25: Validate the experimental projected-entropy frontend on the all-size BFSS moment relaxation. Local native512 derivative and two known-optimum gates pass; exact T-only projection removes12 redundant variables. Keep the default solver unchanged, remove all temporary phase-I bounds before energy optimization, and require the original rational constraints and independent dual audit before accepting physical bounds.
+
+2026-10-25: Compare the full-input projected L10 formulation with the weaker earlier input-compressed family. Both retain483 effective variables. Keep each frozen pilot separate, audit original constraints before removing phase-I additions, and leave global energy claims pending original-model dual certification.

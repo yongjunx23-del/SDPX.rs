@@ -560,9 +560,37 @@ pub(crate) struct Oracle<T> {
     pub barrier: T,
 }
 
+/// Barrier on a projected entropy epigraph. Only primal derivatives are
+/// exposed: the full-cone inverse and dual tests require a nonsingular W.
+pub(crate) struct ProjectedOracle<T>(Oracle<T>);
+
+impl<T: FloatT> ProjectedOracle<T> {
+    /// P is n-by-r, column-major. The slack is P' (T' - G) P; A and C
+    /// retain their full k-by-k dimensions. The caller validates P's rank.
+    pub(crate) fn new(n: usize, m: usize, s: &[T], r: usize, p: &[T]) -> Option<Self> {
+        Oracle::new_impl(n, m, s, Some((r, p))).map(Self)
+    }
+
+    pub(crate) fn barrier(&self) -> T {
+        self.0.barrier
+    }
+
+    pub(crate) fn gradient(&self, out: &mut [T]) {
+        self.0.gradient(out);
+    }
+
+    pub(crate) fn hess_prod(&mut self, d: &[T], out: &mut [T]) {
+        self.0.hess_prod(d, out);
+    }
+}
+
 impl<T: FloatT> Oracle<T> {
     /// None unless s is interior.
     pub(crate) fn new(n: usize, m: usize, s: &[T]) -> Option<Self> {
+        Self::new_impl(n, m, s, None)
+    }
+
+    fn new_impl(n: usize, m: usize, s: &[T], projection: Option<(usize, &[T])>) -> Option<Self> {
         let k = n - m;
         let (tn, mk, tk, kk) = (triangular_number(n), m * k, triangular_number(k), k * k);
         let (st, rest) = s.split_at(tn);
@@ -629,25 +657,57 @@ impl<T: FloatT> Oracle<T> {
                 }
             }
         }
-        let mut ls = sh.clone();
-        if !cholesky(n, &mut ls) {
-            return None;
-        }
-        let mut w = vec![T::zero(); n * n];
-        if !spd_inverse(n, &ls, &mut w) {
-            return None;
-        }
         let two = T::one() + T::one();
         let mut logdet_s = T::zero();
         let mut logdet_a = T::zero();
-        for i in 0..n {
-            logdet_s += two * ls[i + i * n].ln();
-        }
         for i in 0..k {
             logdet_a += two * la[i + i * k].ln();
         }
-        let three: T = (3.0).as_T();
-        let barrier = -logdet_s - three * logdet_a + g.iter().fold(T::zero(), |a, &v| a + v);
+        let (ls, w, logdet_factor) = if let Some((rank, projection)) = projection {
+            // sh = Pi' S Pi, Pi=I_m (+) Q. In physical coordinates the
+            // projected slack is R' sh R, R=Pi^-1 P, Pi^-1=I_m (+) p'.
+            let mut r = projection.to_vec();
+            let pv: Vec<T> = (0..rank * k)
+                .map(|e| projection[m + e % k + (e / k) * n])
+                .collect();
+            let rv = mul((b'T', b'N'), (k, rank, k), (&p, k), (&pv, k));
+            for j in 0..rank {
+                for i in 0..k {
+                    r[m + i + j * n] = rv[i + j * k];
+                }
+            }
+            let sr = mul((b'N', b'N'), (n, rank, n), (&sh, n), (&r, n));
+            let mut ls = mul((b'T', b'N'), (rank, rank, n), (&r, n), (&sr, n));
+            let mut inv = vec![T::zero(); rank * rank];
+            if rank > 0 {
+                if !cholesky(rank, &mut ls) || !spd_inverse(rank, &ls, &mut inv) {
+                    return None;
+                }
+                for i in 0..rank {
+                    logdet_s += two * ls[i + i * rank].ln();
+                }
+            }
+            let ri = mul((b'N', b'N'), (n, rank, rank), (&r, n), (&inv, rank));
+            let w = mul((b'N', b'T'), (n, n, rank), (&ri, n), (&r, n));
+            // The projected slack was evaluated in physical coordinates.
+            // Only -logdet A-logdet C remains, with det C=det A*prod lam.
+            (ls, w, two)
+        } else {
+            let mut ls = sh.clone();
+            if !cholesky(n, &mut ls) {
+                return None;
+            }
+            let mut w = vec![T::zero(); n * n];
+            if !spd_inverse(n, &ls, &mut w) {
+                return None;
+            }
+            for i in 0..n {
+                logdet_s += two * ls[i + i * n].ln();
+            }
+            (ls, w, (3.0).as_T())
+        };
+        let barrier =
+            -logdet_s - logdet_factor * logdet_a + g.iter().fold(T::zero(), |a, &v| a + v);
         let mut wvv = vec![T::zero(); kk];
         for j in 0..k {
             for i in 0..k {
