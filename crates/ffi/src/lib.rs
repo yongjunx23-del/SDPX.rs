@@ -261,7 +261,8 @@ unsafe fn cones<T: Scalar>(input: &[Cone]) -> Result<Vec<SupportedConeT<T>>> {
     use SupportedConeT::*;
     let mut out = Vec::new();
     for c in input {
-        if c.reserved != 0 {
+        // the operator relative entropy limit cone's rank m rides in `reserved`
+        if c.reserved != 0 && c.kind != 8 {
             return Err(invalid("nonzero cone reserved field"));
         }
         let d = usize::try_from(c.dim).map_err(|_| invalid("cone dimension overflow"))?;
@@ -278,6 +279,7 @@ unsafe fn cones<T: Scalar>(input: &[Cone]) -> Result<Vec<SupportedConeT<T>>> {
             5 if d == 3 && a.len() == 1 => PowerConeT(a[0]),
             6 => GenPowerConeT(a, d),
             7 => OpRelEntropyConeT(d),
+            8 => OpRelEntropyLimitConeT(d, c.reserved as usize),
             _ => return Err(invalid("invalid cone kind/dimension/parameters")),
         };
         if c.kind != 5 && c.kind != 6 && c.alpha.count != 0 {

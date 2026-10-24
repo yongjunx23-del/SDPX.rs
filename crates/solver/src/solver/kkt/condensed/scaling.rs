@@ -173,6 +173,12 @@ pub(super) fn apply_block<T: FloatT>(
                 with_split_hint(block.ways[a], || c.mul_Hs(y, x, &mut []));
                 block.cost[a] = start.elapsed().as_secs_f64() * block.ways[a] as f64;
             }
+            Scaling::OreLimit(c) => {
+                let a = action_index(&action);
+                let start = std::time::Instant::now();
+                with_split_hint(block.ways[a], || c.mul_Hs(y, x, &mut []));
+                block.cost[a] = start.elapsed().as_secs_f64() * block.ways[a] as f64;
+            }
             Scaling::Dense3(h) => {
                 let mut p = 0;
                 for j in 0..3 {
@@ -572,7 +578,10 @@ pub(super) fn scaling_jobs<'a, T: FloatT>(
         rest = tail;
         at = block.rows.end;
         let xs = &x[block.rows.start - offset..block.rows.end - offset];
-        let alone = matches!(block.scaling, Scaling::Psd(_) | Scaling::Ore(_));
+        let alone = matches!(
+            block.scaling,
+            Scaling::Psd(_) | Scaling::Ore(_) | Scaling::OreLimit(_)
+        );
         if alone {
             flush(&mut group, &mut jobs);
         }

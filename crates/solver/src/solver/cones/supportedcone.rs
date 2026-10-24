@@ -54,6 +54,16 @@ pub enum SupportedConeT<T> {
     /// The parameter is the matrix dimension n; the variable stacks the
     /// triangles of T, X and Y (each in `PSDTriangleConeT(n)` form).
     OpRelEntropyConeT(usize),
+
+    /// The limit of the operator relative entropy cone along a recession
+    /// ray of rank m, in reduced coordinates:
+    /// cl{(T, B, A, C) : A, C ≻ 0, T ⪰ Δ + E·N(A, C)·Eᵀ},
+    /// Δ = [0 B; Bᵀ A − C], E = [B; A − C], N(A, C) = ∫₀¹ (1−s)((1−s)C + sA)⁻¹ds.
+    ///
+    /// The parameters are (n, m), 0 ≤ m < n, k = n − m; the variable stacks
+    /// T's n×n triangle, B (m×k, column-major) and the k×k triangles of A
+    /// and C. m = 0 is `OpRelEntropyConeT(n)`.
+    OpRelEntropyLimitConeT(usize, usize),
 }
 
 impl<T> SupportedConeT<T> {
@@ -71,6 +81,9 @@ impl<T> SupportedConeT<T> {
             SupportedConeT::PSDTriangleConeT(dim) => triangular_number(*dim),
             SupportedConeT::GenPowerConeT(α, dim2) => α.len() + *dim2,
             SupportedConeT::OpRelEntropyConeT(dim) => 3 * triangular_number(*dim),
+            SupportedConeT::OpRelEntropyLimitConeT(n, m) => {
+                OpRelEntropyLimitCone::<f64>::size(*n, *m)
+            }
         }
     }
 }
@@ -100,6 +113,9 @@ pub fn make_cone<T: FloatT>(cone: &SupportedConeT<T>) -> SupportedCone<T> {
         }
         SupportedConeT::PSDTriangleConeT(dim) => PSDTriangleCone::<T>::new(*dim).into(),
         SupportedConeT::OpRelEntropyConeT(dim) => OpRelEntropyCone::<T>::new(*dim).into(),
+        SupportedConeT::OpRelEntropyLimitConeT(n, m) => {
+            OpRelEntropyLimitCone::<T>::new(*n, *m).into()
+        }
     }
 }
 
@@ -188,6 +204,18 @@ where
     GenPowerCone(GenPowerCone<T>),
     PSDTriangleCone(PSDTriangleCone<T>),
     OpRelEntropyCone(OpRelEntropyCone<T>),
+    OpRelEntropyLimitCone(OpRelEntropyLimitCone<T>),
+}
+
+impl<T: FloatT> SupportedCone<T> {
+    /// An operator relative entropy cone or its limit: the cones whose KKT
+    /// rows take the eigen transform (`EigenRows`).
+    pub(crate) fn is_ore(&self) -> bool {
+        matches!(
+            self,
+            SupportedCone::OpRelEntropyCone(_) | SupportedCone::OpRelEntropyLimitCone(_)
+        )
+    }
 }
 
 // -------------------------------------
@@ -213,6 +241,7 @@ pub(crate) enum SupportedConeTag {
     GenPowerCone,
     PSDTriangleCone,
     OpRelEntropyCone,
+    OpRelEntropyLimitCone,
 }
 
 pub(crate) trait SupportedConeAsTag {
@@ -231,6 +260,7 @@ impl<T> SupportedConeAsTag for SupportedConeT<T> {
             SupportedConeT::PSDTriangleConeT(_) => SupportedConeTag::PSDTriangleCone,
             SupportedConeT::GenPowerConeT(_, _) => SupportedConeTag::GenPowerCone,
             SupportedConeT::OpRelEntropyConeT(_) => SupportedConeTag::OpRelEntropyCone,
+            SupportedConeT::OpRelEntropyLimitConeT(..) => SupportedConeTag::OpRelEntropyLimitCone,
         }
     }
 }
@@ -247,6 +277,7 @@ impl<T: FloatT> SupportedConeAsTag for SupportedCone<T> {
             SupportedCone::PSDTriangleCone(_) => SupportedConeTag::PSDTriangleCone,
             SupportedCone::GenPowerCone(_) => SupportedConeTag::GenPowerCone,
             SupportedCone::OpRelEntropyCone(_) => SupportedConeTag::OpRelEntropyCone,
+            SupportedCone::OpRelEntropyLimitCone(_) => SupportedConeTag::OpRelEntropyLimitCone,
         }
     }
 }
@@ -263,6 +294,7 @@ impl SupportedConeTag {
             SupportedConeTag::PSDTriangleCone => "PSDTriangleCone",
             SupportedConeTag::GenPowerCone => "GenPowerCone",
             SupportedConeTag::OpRelEntropyCone => "OpRelEntropyCone",
+            SupportedConeTag::OpRelEntropyLimitCone => "OpRelEntropyLimitCone",
         }
     }
 }

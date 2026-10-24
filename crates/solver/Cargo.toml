@@ -206,6 +206,11 @@ name = "sdpx"
 path = "src/bin/sdpx.rs"
 required-features = ["serde"]
 
+[[bin]]
+name = "sdpx-primal-probe"
+path = "src/bin/sdpx-primal-probe.rs"
+required-features = ["serde"]
+
 
 # ------------------------------
 # enable latex in docs 

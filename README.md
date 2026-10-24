@@ -88,6 +88,22 @@ budget. Keepers fill idle time between parallel regions and yield to solver
 threads. `SDPX_KEEP_CORES=0` disables them; any other value forces startup,
 capped by the worker budget. While keepers run, receipts record wall times only.
 
+The experimental `sdpx-primal-probe` executable follows a feasible-primal
+barrier path for explicit linear programs with PSD, nonnegative, ORE and ORE
+limit cones. Build it with `-p sdpx-solver --bin sdpx-primal-probe` and the
+platform's usual features. Its arguments are
+`CASE START OUTPUT BITS MAX_ITER MU THREADS`; `START` contains original-coordinate
+`x` and the same `precision_bits` as `BITS`. The starting point must be strictly
+feasible. Near a center, QICS-inspired projected local-norm contraction avoids
+cancellation in the Armijo objective comparison.
+
+The probe disables presolve and chordal decomposition and writes a candidate
+point, not a certificate. `CandidateConverged` requires the input's gap and
+feasibility tolerances plus weighted stationarity; verify the point against
+the original program before using it as a bound. Temporary initialization
+constraints must be removed and the resulting program audited separately.
+See the QICS entry in [the journal](docs/JOURNAL.md) for the BFSS validation.
+
 ## Reducing explicit SDP inputs
 
 For Float64 equality/PSD models such as SU(2), reduce the input before

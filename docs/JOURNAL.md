@@ -234,6 +234,63 @@ status and next actions.
 - Cluster: on 2026-10-21 the normal queue would not start jobs (227789 failed to start 25 times), so these jobs ran in the sugon queue.
 - Decision: kept.
 
+## 2026-10-21 — ORE limit cone `OpRelEntropyLimitConeT(n, m)`, phase 1 (kept, ore-limit-cone)
+
+- Why: the BFSS L11u optimum is approached along (0, W, W), a recession direction of K_ore (entry below), so it is not attained. The limit cone K = cl(K_ore + R₊(0, −W, −W)) is passed in reduced coordinates (k = n − m, m = rank W) without its lineality: (T, B, A, C) with T ⪰ [0 B; Bᵀ A − C] + E·N(A, C)·Eᵀ, E = [B; A − C], N(A, C) = ∫₀¹(1 − s)((1 − s)C + sA)⁻¹ds. Plan and mpmath prototype: BFSS project `notes/kms_ray_limit/` (`limit_cone_plan.md`, `limit_cone_barrier.py`).
+- Change (new `cones/oprelentrlimitcone.rs`):
+  - Barrier −logdet(T − G) − logdet A − logdet C, ν = n + 2k, evaluated in the ORE eigenbasis of (A, C). The VV block is the ORE's own oracle (`Oracle::eigen_part` with W = Ŵ_VV).
+  - The B border uses divided differences of g = −log, x log x and x² log x with nodes 1, 1 appended. Each is a fixed-sign Stieltjes integral. They come from a Taylor series in complete homogeneous symmetric polynomials when (hi − lo)·8 ≤ hi + lo; otherwise from the recurrence, then Leibniz with the least node first.
+  - S₀ has order mk + k(k + 1). For BFSS (38, 1) that is 1443, against 1482 for the ORE cone.
+  - Hs = N·D·Nᵀ, with the KKT rows N⁻¹A as for the ORE. `EigenRows` dispatches the direct solver's rows.
+  - Dual test: there is no cheap bound, because S₀'s B block gets no log-det curvature. The T part rejects first; otherwise S₀'s factor decides. The ORE's CG bracket is not carried over.
+  - Integration sites:
+    - `SupportedConeT`, `SupportedCone`, `SupportedConeTag` (tag 8, shared check `is_ore`);
+    - `check_dimensions` (0 ≤ m < n);
+    - checkpoint and cost hashes (8, n, m);
+    - `cone_cost`, `barrier_backtrack`, Δs from the linear rows, and the idle-pool step searches;
+    - direct `OreRows`;
+    - condensed `Scaling::OreLimit`, including the `kkt.rs` arm that was a runtime panic;
+    - FFI kind 8, with m in `reserved`, and the `sdpx.h` comment;
+    - verbose cone counts (the ORE's were missing as well).
+  - ORE file: the shared helpers became `pub(super)` rather than moving to a common module. `first_kernels`, `eigen_part` and `schur_matrix` were split out. ORE behaviour is unchanged.
+- Tests (53 and 128 bits):
+  - Analytic checks:
+    - gradient and Hessian against differences;
+    - ⟨g, s⟩ = −ν and ∇²F s = −g;
+    - μ∇²F·Hs = I and N⁻¹HsN⁻ᵀ = `get_Hs`;
+    - unit S₀ columns equal to the dense product;
+    - a central `unit_initialization`;
+    - `dual_form` = ⟨z, Hs z⟩, with 4ν on the central path;
+    - the `dual_ok` decision at exact·(1 ± ε^¼);
+    - third order against differences.
+  - m = 0 against `OpRelEntropyCone(n)`: F, gradient, Hessian, S₀⁻¹, Hs, D and the rows agree within 1e3 ulp. The iterates are identical: min t over K(1, 0) and over the ORE cone (a = 2, c = 1) both take 39 iterations, with steps capped at 0.79/0.75 by the dual certificate, as in the entry below.
+  - Kernels:
+    - Leibniz identities in each node, and the confluent values at λ = 1.
+    - Against a 1024-bit Lagrange sum: worst 87 ulp at 53 bits and 366 ulp at 128 bits. Both occur at (0.88, 0.88, 1, 1.14), just outside the series radius.
+  - Prototype fixtures (8 points; F, ∇F and two ∇²F products at 50 digits):
+
+    | Point | Max error |
+    |---|---|
+    | generic, mu1 | ≤ 190 ulp |
+    | spread (λ over 1e-3..1e3) | 6e4 ulp |
+    | illA (cond A = 1e10) | 3e9 ulp |
+    | boundary (λ(T − G) down to 1e-12) | 6e12 ulp |
+
+    The errors are alike in ulps at both precisions, so the points' conditioning sets them; the first two of these also apply to the ORE eigenbasis.
+  - End to end at 128 bits: min tr T − b over K(2, 1) with a = 2, c = 1. The optimum is 1 + N − 1/(4N), N = 2 ln 2 − 1. Augmented and condensed both reach Solved in 47 iterations with the cost within 1e-20. The C ABI (kind 8) gives the same, and rejects m = n.
+  - Full suites (`fast`, `sdp-accelerate,faer-sparse`): sdpx-solver integration 252 passed;
+    lib 562 of 568 pass when each test runs alone. The other 6 abort on an Accelerate
+    `cblas_dgemm` parameter error (LDA=0, M=0) and abort the same way on the bfss-threads
+    2539893 binary: `psd_step_lengths_f64` and the condensed `parallel_tests`
+    `overlapping_memory_fallback_f64`, `pooled_condensed_f64`,
+    `pooled_orthant_preserves_fma_f64`, `solve_many_accounting_f64`,
+    `wide_pool_splits_congruence_tiles_f64`. sdpx-ffi (default features) 16 passed.
+- Not done (phase 2):
+  - the BFSS export (reduced basis, replacing the V-relaxation) and the plan's §6 solves (L = 11 E-min, L = 10 E-max, the `lim` re-solves);
+  - one module for the shared ORE numerics;
+  - an upper bound or CG bracket for the dual test, since each certifying trial now factors S₀.
+- Decision: kept on branch `ore-limit-cone` (not pushed).
+
 ## 2026-10-21 — ORE cone: derivation verified; BFSS L11u slowness and stall explained (diagnosis, bfss-threads)
 
 - Question: is the operator relative entropy cone derived wrongly, given the poor BFSS results (L11u InsufficientProgress/107 with the dual 5.7e-3 above the primal; L10 198 iterations)?
@@ -12205,3 +12262,61 @@ scratch saved another 66 MiB on the synthetic but cost 8% time; reverted.
 
 ising11 (`c7491bd8594d4320`) and medium (`fd1437ee79ac39e0`) points are
 unchanged; all audits pass.
+
+
+### 2026-10-25 — QICS-inspired feasible-primal centering (kept)
+
+QICS `be18e5ef07258dec9e5db6bb18c1ee9b2003d545` uses inverse-Hessian
+proximity for nonsymmetric step acceptance, prediction/centering fallbacks,
+and full-system iterative refinement. The projected proximity construction
+is described in [He, Saunderson and Fawzi](https://arxiv.org/abs/2410.17803),
+Section 3.5; see the pinned
+[nonsymmetric stepper](https://github.com/kerry-he/qics/blob/be18e5ef07258dec9e5db6bb18c1ee9b2003d545/qics/_stepper/nonsym.py).
+
+The explicit `sdpx-primal-probe` frontend now tests a strict feasible Newton
+step near a center using the projected local norm. Reusing the current KKT
+factor and the self-concordant Hessian comparison bounds the trial decrement;
+accept only a contraction by at least one half. Other steps retain Armijo.
+It preserves the requested arithmetic, residual and gap thresholds, reports
+`CandidateConverged` rather than `Solved`, and saves `LineSearchFailed` at the
+latest accepted point if Armijo fails. This is an experimental feasible-primal
+initializer; it does not replace the HSD algorithm or remove recession rays.
+The previously local ORE limit-cone implementation is its BFSS prerequisite.
+
+The controlled full replay of the failed L11 energy minimum at T = 0.55,
+r = 2.382 (PBS 229488) changes only local-norm acceptance. Both arms use
+native 512-bit arithmetic, the exact original starting point, initial mu,
+barrier schedule and tolerances, and 32 threads each on one node. Their
+printed numerical traces agree through iteration 266. At iteration 267:
+
+| Frozen baseline | Local-norm safeguard |
+|---|---|
+| Armijo takes alpha = 0.0625, then fails | Full centering step accepted |
+| Last logged weighted stationarity 8.258e-16 | Weighted stationarity 4.892e-52 |
+| Saved point fails the independent weighted-dual gate | CandidateConverged; all original-model audits pass |
+
+The candidate satisfies the original 1e-20 initialization target with gap
+2.5e-21 and unchanged final mu = 4.33576136e-25. Fresh native acceptance,
+removal of every temporary bound, the rational 592-bit audit and all 41
+original cones at 11264 audit-only bits pass at the unchanged final 1e-16
+tolerance. The uncapped weighted residual is 1.010e-22 and the energy is
+7.18122039139736550347096953867401430271908408. Audit precision never feeds
+back into the native solve. These are numerical checks of this finite
+program, not interval or continuum certificates.
+
+The current-main port also passes a small native 512-bit limit-cone solve
+with an independent 592-bit audit. On the retained L11 checkpoint, the
+current-main build (PBS 229489, commit 6d630fd) reaches the original target
+in two steps, weighted residual 1.090e-52, and passes the same uncapped and
+original-cone audits. The baseline also succeeds after a restart (four
+steps); the uninterrupted replay above establishes the failure and repair.
+
+Provenance: baseline binary SHA-256 769d1c088260b89178124b2cf7947f9654fa3d7f8f9877096fab9023cfd26995;
+controlled candidate 5eb62acae2642f65fb6a91776885a12eb3c8d956c82ff5d61d7f0d8e73f208fe;
+current-main build 1e4d0aa113b7211aea86fd0eea4ab8cfa150cbace842abc260e5a6354619a805.
+The controlled evidence archive hashes to
+764c9f5c3e5086f8cc6338cde778af71d66de09568fd389c3d82d14a8e95b7be.
+The superseded PBS 229487 replay contained extra damping, was cancelled,
+and is excluded from the comparison. This repairs the demonstrated late
+line-search failure; exact recession reductions remain part of the model
+pipeline. The paper source and previously accepted results were not edited.
