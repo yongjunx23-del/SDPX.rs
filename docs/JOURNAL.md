@@ -12326,3 +12326,80 @@ pipeline. The paper source and previously accepted results were not edited.
 2026-10-25: The projected frontend now validates output-map rank and cone dimensions, honors the input wall-time limit, and preserves MaxTime checkpoints. The two native512 analytic ordinary/limit cases still pass in86/93 iterations after sparse orthant assembly; the timeout gate saves iteration0 with MaxTime. Stronger L10 cap removal projects only entropy outputs, retaining all original A,C,B:9288 exact coefficient identities and14 exact amplified projection maps pass; the final quotient has483 variables and9261 rows. This is a construction result, not a BFSS energy bound. The first cluster pilot remains in phase I.
 
 2026-10-25: Full projected entropy closure reaches15 variables and excludes every q.d=0 ray in the necessary Jensen cone by exact RREF. At initialmu1e-3, both native512 objectives hit250 iterations; independent592 finite differences verify the actual BFSS Newton equation to5.03e-90. Changing only initialmu to0.1 gives minimum CandidateConverged/205 in PBS229536, independent592 audit passing, E=3.3750000000000000000014484. Exact rational polynomial entropy supports plus stationarity repair and rational LDL prove the outward lower bound3.374999999999. The certificate initially hit Python's4300-digit serialization limit; allowing generated long rationals repairs the verifier without another solve. A rational strict primal certificate bounds the entropy integration residual by delta^-1 times its exact polynomial Gram integral, with delta=min(1/tr(A^-1),1/tr(C^-1)). Together with an exact common-input ray of energy slope27/16, this proves the relaxed maximum unbounded. This is a weakness of the finite global moment relaxation, not physical BFSS divergence. Native512 analytic gates and all five PR12 CI jobs pass. Job229537 (32cores/96GB/3h) strengthens L10 to momentorder2 with normalization(1+u)^4 and constructs fullL11 using a coefficientwise-verified shared row basis. Size-domain localizers are being checked to avoid a global loss of information. The1325 requested finite paper rows remain complete; paper unchanged.
+
+## 2026-10-25 — preserve finite conic RHS entries above the infinity sentinel
+
+**Kept; correctness repair, no timing claim.** The BFSS half-line entropy
+support SDP contained finite PSD offsets up to 3.95e24. The native HSD solve
+returned `PrimalInfeasible`, but its dual had b'z = +3.220968384144136e-7
+against the exported data, including after rounding every input and dual
+entry to native 512 bits. The exact certificate verifier correctly rejected
+it. `DefaultProblemData` had silently capped every positive RHS entry at
+1e20, including PSD diagonals, while leaving large negative off-diagonals
+unchanged. The solver was solving a different problem.
+
+The infinity contract now applies only to the declared nonnegative-cone
+bounds, with their existing removal/capping behavior. Those bounds are
+capped before structural transformations. When large structured offsets
+could be mistaken for unbounded scalar rows, singleton collapse is delayed
+until after presolve and the original cone types are retained for auditing.
+Finite PSD, SOC and equality entries are never capped. The original audit
+includes those entries and large negative orthant bounds, checks finite
+orthant rows individually, and requires zero dual on unbounded rows. This
+changes neither arithmetic precision nor convergence tolerances.
+
+The minimal reproducer is min x with -1 <= x <= 1 and the constant PSD
+matrix 1e24 * [[1, -1/2], [-1/2, 1]]. Its exact optimum is -1 and its matrix
+eigenvalues are 5e23 and 1.5e24. The frozen baseline reports
+`PrimalInfeasible` in 30 iterations, with original b'z = +340.54701609477.
+The candidate reports `Solved` in 21 iterations. A separate 592-bit audit
+against the uncapped input gives primal residual 2.13e-155, dual residual
+7.50e-155, absolute gap 3.67e-17 and |x+1| = 1.06e-17, all below 1e-16.
+
+A second small problem exercises a finite PSD singleton, SOC singleton,
+constant SOC tail, equality, negative orthant bound and positive unbounded
+orthant row. Native 512-bit solves pass with presolve enabled (22 iterations)
+and disabled (23); the independent 592-bit absolute-gap errors are 1.04e-18
+and 1.76e-18, with coordinate errors below 1.84e-19. This multi-term check
+requests tighter 1e-18 gap tolerances to satisfy the same independent
+absolute 1e-16 gate; no gate is relaxed. Earlier diagnostic runs satisfied
+the solver's relative-gap criterion but missed that additional absolute
+gate and remain archived. No reduced-accuracy status is promoted.
+
+Frozen baseline binary SHA-256:
+cbd82b606fc9da968a37b73eba93ebd3df118c65fd6bd485158e8c7c28661f90.
+Final macOS fast-profile candidate (sdp-accelerate,faer-sparse):
+6824bad44e8086a4089acff2d352dff06e18cff0da99bbb48c2b070bcfd9c408.
+Identical minimal input SHA-256:
+5c303a8052323989e48189a1ef2c67b2bf477141ae5a5ff410aa108c2ea8192c.
+Transformation inputs with/without presolve:
+b3bad51a0a7fb02b12cff2d1b0c6f9896c8b3504f48c1d467d9224ed1dd64a04,
+a1201b3b1c84ef52df935398b22623873050b8382b28875fccdaf76c73be73bf.
+The BFSS affected cases require rerunning with this repair. Previously
+accepted exact certificates remain valid because they were checked against
+the original rational data. No half-line exclusion is inferred from a
+native status, and the paper has not been edited.
+
+2026-10-25: The stronger order-two global L10 entropy relaxation now closes
+all objective-neutral recession images exactly: nine additional rational
+reductions leave 253 effective variables, and an exact positive-definite
+Jensen dual annihilator certifies completion. PBS 229620 minimizes it in
+450 native 512-bit iterations, with primal energy
+7.03102183527699261184189210507, gap 2.5e-21 and weighted stationarity
+3.351e-24. The independent original-coordinate 592-bit audit passes the
+unchanged 1e-16 gate. PBS 229625 proves the all-size outward lower bound
+7.031021835276 using 17 exact polynomial entropy supports, rational
+stationarity and all 82 rational PSD dual blocks. Direct integer transfer
+repairs a Python 4300-digit conversion failure without repeating the solve.
+Certificate SHA-256:
+4f36e980b31cae60d96fa36bece52618b4a81edecad04d487d137c5969d98c39.
+PBS 229623 proves this relaxation's maximum unbounded by an exact feasible
+common-input ray of energy slope 27/16 and a strict rational base point.
+This does not prove physical BFSS unboundedness. Continuous interval bounds
+and a separate full-L11 tail formulation remain necessary for an all-size
+upper bound; the paper remains unchanged. The projected branch incorporates
+merged main 7fcbb8f, including the finite structured RHS correction, with
+only an append-only journal merge conflict.
+The combined branch passes the two native 512-bit noncommuting analytic
+ordinary/limit cases in 86/93 iterations. Independent 592-bit gradient
+errors remain 1.16e-134 and 7.70e-134, with the unchanged 1e-16 final gate.

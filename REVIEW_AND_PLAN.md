@@ -6,6 +6,14 @@ contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 failed attempts and audit evidence. This file keeps goals, current state,
 open work, decisions and closed directions only; history goes to the journal.
 
+Finite conic RHS (2026-10-25, kept): the infinity sentinel now applies only
+to declared nonnegative-cone bounds. Finite PSD, SOC and equality offsets
+are preserved through singleton collapse and presolve, and included in the
+original-coordinate audit. A feasible large-PSD reproducer changes from
+false `PrimalInfeasible` to audited `Solved` at 512 bits; the singleton/SOC
+tail/equality checks also pass with presolve enabled and disabled. See the
+journal for the unchanged 1e-16 audit gate and evidence hashes.
+
 ## Goals
 
 **Minimize time and peak memory to reach an audited solution at the requested
@@ -559,3 +567,11 @@ PR #11 for the run inventory; the default HSD algorithm is unchanged.
 2026-10-25: Compare the full-input projected L10 formulation with the weaker earlier input-compressed family. Both retain483 effective variables. Keep each frozen pilot separate, audit original constraints before removing phase-I additions, and leave global energy claims pending original-model dual certification.
 
 2026-10-25: Projected frontend passes the15-variable global BFSS minimum at native512 with independent592 and exact rational-support checks; all PR12 CI jobs pass. The weak minimum27/8 and exactly unbounded relaxed maximum diagnose model strength, not an unresolved Hessian defect. Continue higher-order and size-domain refinements in the research campaign; retain the experimental frontend and unchanged default HSD behavior.
+
+2026-10-25: The projected frontend converges on the 253-variable order-two
+BFSS minimum at native 512 bits with original-coordinate audit and exact
+rational lower certificate E >= 7.031021835276 for every nonnegative size
+at T=0.5. All neutral recession images are exactly eliminated. Its maximum
+is exactly unbounded as a relaxation; pursue the separate L11 half-line
+exclusion together with existing continuous interval bounds. Preserve the
+experimental status and unchanged native accuracy gates.

@@ -66,9 +66,9 @@ impl<T: FloatT> OriginalResiduals<T> {
 }
 
 impl<T: FloatT> OriginalData<T> {
-    /// Residuals of the point `(x, s, z)` against these data. Rows whose `b`
-    /// is at or above the solver's infinity are unbounded and carry no
-    /// primal residual. Without `psd_dual`, PSD duals are not checked for
+    /// Residuals of the point `(x, s, z)` against these data. Orthant rows
+    /// whose `b` is at or above the solver's infinity are unbounded and carry
+    /// no primal residual. Without `psd_dual`, PSD duals are not checked for
     /// cone membership: chordal decomposition without dual completion
     /// returns only the entries on the sparsity pattern.
     pub(crate) fn residuals(
@@ -102,7 +102,7 @@ impl<T: FloatT> OriginalData<T> {
             self.A.t().gemv(&mut rd, z, T::one(), T::one());
         }
         rd.axpby(T::one(), &self.q, T::one());
-        OriginalProducts::new(self.b.clone(), r, rd, &self.q, x, z, xpx)
+        OriginalProducts::new(self.b.clone(), r, rd, &self.q, x, z, xpx, &self.cones)
     }
 }
 
@@ -119,18 +119,28 @@ pub(crate) struct OriginalProducts<T> {
 }
 
 impl<T: FloatT> OriginalProducts<T> {
-    pub(crate) fn new(b: Vec<T>, r: Vec<T>, rd: Vec<T>, q: &[T], x: &[T], z: &[T], xpx: T) -> Self {
+    pub(crate) fn new(
+        b: Vec<T>,
+        r: Vec<T>,
+        rd: Vec<T>,
+        q: &[T],
+        x: &[T],
+        z: &[T],
+        xpx: T,
+        cones: &[SupportedConeT<T>],
+    ) -> Self {
         let infbound: T = crate::get_infinity().as_T();
-        let finite = |v: T| T::abs(v) < infbound;
-        let bz = b
-            .iter()
-            .zip(z)
-            .filter(|(&bi, _)| finite(bi))
-            .fold(T::zero(), |acc, (&bi, &zi)| acc + bi * zi);
-        let normb = b
-            .iter()
-            .filter(|&&v| finite(v))
-            .fold(T::zero(), |acc, &v| T::max(acc, T::abs(v)));
+        let (mut bz, mut normb) = (T::zero(), T::zero());
+        let mut rows = b.iter().zip(z);
+        for cone in cones {
+            let orthant = matches!(cone, SupportedConeT::NonnegativeConeT(_));
+            for (&bi, &zi) in rows.by_ref().take(cone.nvars()) {
+                if !orthant || bi < infbound {
+                    bz += bi * zi;
+                    normb = T::max(normb, T::abs(bi));
+                }
+            }
+        }
         Self {
             b,
             r,
@@ -152,23 +162,29 @@ impl<T: FloatT> OriginalProducts<T> {
     ) -> OriginalResiduals<T> {
         debug_assert!(s.len() == self.b.len() && z.len() == self.b.len());
         let infbound: T = crate::get_infinity().as_T();
-        let finite = |v: T| T::abs(v) < infbound;
         let r = &self.r;
 
         let mut primal = T::zero();
-        for (i, (&ri, &si)) in r.iter().zip(s).enumerate() {
-            if finite(self.b[i]) {
-                primal = T::max(primal, T::abs(ri - si));
-            }
-        }
         let mut offset = 0;
         let mut dual_cone = T::zero();
         for cone in cones {
             let len = cone.nvars();
             let rows = offset..offset + len;
             offset += len;
-            if rows.clone().any(|i| !finite(self.b[i])) {
+            if matches!(cone, SupportedConeT::NonnegativeConeT(_)) {
+                for i in rows {
+                    if self.b[i] >= infbound {
+                        dual_cone = T::max(dual_cone, T::abs(z[i]));
+                    } else {
+                        primal = T::max(primal, T::abs(r[i] - s[i]));
+                        primal = T::max(primal, T::max(-r[i], -s[i]));
+                        dual_cone = T::max(dual_cone, -z[i]);
+                    }
+                }
                 continue;
+            }
+            for i in rows.clone() {
+                primal = T::max(primal, T::abs(r[i] - s[i]));
             }
             primal = T::max(primal, cone_distance(cone, &s[rows.clone()], false));
             primal = T::max(primal, cone_distance(cone, &r[rows.clone()], false));
@@ -226,15 +242,14 @@ fn project_slack<T: FloatT>(r: &[T], b: &[T], cones: &[SupportedConeT<T>], s: &m
         let len = cone.nvars();
         let rows = offset..offset + len;
         offset += len;
-        if rows.clone().any(|i| T::abs(b[i]) >= infbound) {
-            continue;
-        }
-        let (r, s) = (&r[rows.clone()], &mut s[rows]);
+        let (r, b, s) = (&r[rows.clone()], &b[rows.clone()], &mut s[rows]);
         match cone {
             SupportedConeT::ZeroConeT(_) => s.fill(T::zero()),
             SupportedConeT::NonnegativeConeT(_) => {
-                for (si, &ri) in s.iter_mut().zip(r) {
-                    *si = T::max(ri, T::zero());
+                for ((si, &ri), &bi) in s.iter_mut().zip(r).zip(b) {
+                    if bi < infbound {
+                        *si = T::max(ri, T::zero());
+                    }
                 }
             }
             SupportedConeT::SecondOrderConeT(_) if !r.is_empty() => {
