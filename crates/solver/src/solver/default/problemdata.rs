@@ -152,9 +152,23 @@ where
     ) -> Self {
         use std::borrow::Cow;
         let (mut P, mut q, mut A, mut b) = (P_in, q_in, A_in, b_in);
-        // Collapse repeated orthants, drop empty cones and turn singletons
-        // into orthant rows, except for PSD factors in sampled input.
-        let mut cones = SupportedConeT::new_collapsed(cones, sampled.is_none());
+        // The infinity sentinel applies only to input orthant bounds. Delay
+        // singleton collapse when it could turn a finite structured-cone RHS
+        // into an unbounded orthant row during presolve.
+        let infbound: T = crate::get_infinity().as_T();
+        let presolve_infbound = (T::one() - T::epsilon() * (10.).as_T()) * infbound;
+        let mut rhs = b.iter();
+        let preserve_cones = cones.iter().any(|cone| {
+            let rows = rhs.by_ref().take(cone.nvars());
+            let large = rows.fold(false, |large, &v| large || v > presolve_infbound);
+            !matches!(cone, SupportedConeT::NonnegativeConeT(_)) && large
+        });
+        let input_cones = cones;
+        let mut cones = if preserve_cones {
+            cones.to_vec()
+        } else {
+            SupportedConeT::new_collapsed(cones, sampled.is_none())
+        };
         if !P.is_triu() {
             P = Cow::Owned(P.to_triu());
         }
@@ -169,13 +183,33 @@ where
                     sampled: sampled.map(|op| std::sync::Arc::new(op.clone())),
                 }
             };
-        let mut original = None;
+        let mut original = if preserve_cones && settings.tol_original.is_some() {
+            Some(copy_original(&P, &q, &A, &b, input_cones))
+        } else {
+            None
+        };
+
+        // Cap only declared orthant bounds, before presolve can create new
+        // orthant rows from SOC tails. Finite matrix and equality entries
+        // must retain their values, even above the infinity sentinel.
+        let mut offset = 0;
+        for cone in input_cones {
+            let rows = offset..offset + cone.nvars();
+            offset = rows.end;
+            if matches!(cone, SupportedConeT::NonnegativeConeT(_))
+                && b[rows.clone()].iter().any(|&v| v > infbound)
+            {
+                for v in &mut b.to_mut()[rows] {
+                    *v = T::min(*v, infbound);
+                }
+            }
+        }
 
         // Each stage replaces only what it changes, so borrowed API data is
         // copied at most once.
         let presolver = try_presolver(&P, &q, &A, &b, &cones, settings, sampled);
         if let Some(presolver) = &presolver {
-            if settings.tol_original.is_some() {
+            if original.is_none() && settings.tol_original.is_some() {
                 original = Some(copy_original(&P, &q, &A, &b, &cones));
             }
             let (A_new, b_new, cones_new, objective) = presolver.presolve(&P, &q, &A, &b, &cones);
@@ -183,6 +217,10 @@ where
             if let Some((P_new, q_new)) = objective {
                 (P, q) = (Cow::Owned(P_new), Cow::Owned(q_new));
             }
+        }
+
+        if preserve_cones {
+            cones = SupportedConeT::new_collapsed(&cones, sampled.is_none());
         }
 
         // ChordalInfo must be built on the *reduced* problem: its init_cones
@@ -210,20 +248,13 @@ where
         }
 
         // Scaling owns its inputs; borrowed API data is copied only here.
-        let (mut P_new, q_new, mut A_new, mut b_new) = (
+        let (mut P_new, q_new, mut A_new, b_new) = (
             P.into_owned(),
             q.into_owned(),
             A.into_owned(),
             b.into_owned(),
         );
         let cones_new = cones;
-
-        //cap entries in b at INFINITY.  This is important
-        //for inf values that were not in a reduced cone
-        //this is not considered part of the "presolve", so
-        //can always happen regardless of user settings
-        let infbound = crate::get_infinity().as_T();
-        b_new.scalarop(|x| T::min(x, infbound));
 
         // this ensures m is the *reduced* size m
         let (m, n) = A_new.size();
@@ -344,7 +375,7 @@ where
             .zip(&eq.dinv)
             .map(|(&v, &d)| v * d * cinv)
             .collect();
-        super::original_check::OriginalProducts::new(b, r, rd, &q, x, z, xpx)
+        super::original_check::OriginalProducts::new(b, r, rd, &q, x, z, xpx, &self.cones)
     }
 
     pub(crate) fn original_residuals(

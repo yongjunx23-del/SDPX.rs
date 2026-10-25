@@ -6,6 +6,14 @@ contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 failed attempts and audit evidence. This file keeps goals, current state,
 open work, decisions and closed directions only; history goes to the journal.
 
+Finite conic RHS (2026-10-25, kept): the infinity sentinel now applies only
+to declared nonnegative-cone bounds. Finite PSD, SOC and equality offsets
+are preserved through singleton collapse and presolve, and included in the
+original-coordinate audit. A feasible large-PSD reproducer changes from
+false `PrimalInfeasible` to audited `Solved` at 512 bits; the singleton/SOC
+tail/equality checks also pass with presolve enabled and disabled. See the
+journal for the unchanged 1e-16 audit gate and evidence hashes.
+
 ## Goals
 
 **Minimize time and peak memory to reach an audited solution at the requested

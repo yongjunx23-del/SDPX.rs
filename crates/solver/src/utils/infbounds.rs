@@ -3,8 +3,9 @@ use crate::utils::atomic::{AtomicF64, Ordering};
 /// Constant indicating that an inequality bound is to be treated as infinite.
 ///
 /// If the setting [`presolve_enable`](crate::solver::DefaultSettings::presolve_enable)
-/// is `true`, any such constraints are removed.   Bounds for all other cones with
-/// values greater than this are capped at this value.
+/// is `true`, nonnegative-cone bounds at or above this value are removed.
+/// Otherwise those bounds are capped at this value. Finite RHS entries in
+/// other cones, including equalities and PSD matrices, are never capped.
 /// A custom constant for this bound can be specified using [`set_infinity`].
 ///
 /// Setting the infinity bound to a custom constant applies at module level.
