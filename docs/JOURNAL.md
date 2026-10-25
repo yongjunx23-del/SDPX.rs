@@ -12320,3 +12320,56 @@ The superseded PBS 229487 replay contained extra damping, was cancelled,
 and is excluded from the comparison. This repairs the demonstrated late
 line-search failure; exact recession reductions remain part of the model
 pipeline. The paper source and previously accepted results were not edited.
+
+## 2026-10-25 — preserve finite conic RHS entries above the infinity sentinel
+
+**Kept; correctness repair, no timing claim.** The BFSS half-line entropy
+support SDP contained finite PSD offsets up to 3.95e24. The native HSD solve
+returned `PrimalInfeasible`, but its dual had b'z = +3.220968384144136e-7
+against the exported data, including after rounding every input and dual
+entry to native 512 bits. The exact certificate verifier correctly rejected
+it. `DefaultProblemData` had silently capped every positive RHS entry at
+1e20, including PSD diagonals, while leaving large negative off-diagonals
+unchanged. The solver was solving a different problem.
+
+The infinity contract now applies only to the declared nonnegative-cone
+bounds, with their existing removal/capping behavior. Those bounds are
+capped before structural transformations. When large structured offsets
+could be mistaken for unbounded scalar rows, singleton collapse is delayed
+until after presolve and the original cone types are retained for auditing.
+Finite PSD, SOC and equality entries are never capped. The original audit
+includes those entries and large negative orthant bounds, checks finite
+orthant rows individually, and requires zero dual on unbounded rows. This
+changes neither arithmetic precision nor convergence tolerances.
+
+The minimal reproducer is min x with -1 <= x <= 1 and the constant PSD
+matrix 1e24 * [[1, -1/2], [-1/2, 1]]. Its exact optimum is -1 and its matrix
+eigenvalues are 5e23 and 1.5e24. The frozen baseline reports
+`PrimalInfeasible` in 30 iterations, with original b'z = +340.54701609477.
+The candidate reports `Solved` in 21 iterations. A separate 592-bit audit
+against the uncapped input gives primal residual 2.13e-155, dual residual
+7.50e-155, absolute gap 3.67e-17 and |x+1| = 1.06e-17, all below 1e-16.
+
+A second small problem exercises a finite PSD singleton, SOC singleton,
+constant SOC tail, equality, negative orthant bound and positive unbounded
+orthant row. Native 512-bit solves pass with presolve enabled (22 iterations)
+and disabled (23); the independent 592-bit absolute-gap errors are 1.04e-18
+and 1.76e-18, with coordinate errors below 1.84e-19. This multi-term check
+requests tighter 1e-18 gap tolerances to satisfy the same independent
+absolute 1e-16 gate; no gate is relaxed. Earlier diagnostic runs satisfied
+the solver's relative-gap criterion but missed that additional absolute
+gate and remain archived. No reduced-accuracy status is promoted.
+
+Frozen baseline binary SHA-256:
+cbd82b606fc9da968a37b73eba93ebd3df118c65fd6bd485158e8c7c28661f90.
+Final macOS fast-profile candidate (sdp-accelerate,faer-sparse):
+6824bad44e8086a4089acff2d352dff06e18cff0da99bbb48c2b070bcfd9c408.
+Identical minimal input SHA-256:
+5c303a8052323989e48189a1ef2c67b2bf477141ae5a5ff410aa108c2ea8192c.
+Transformation inputs with/without presolve:
+b3bad51a0a7fb02b12cff2d1b0c6f9896c8b3504f48c1d467d9224ed1dd64a04,
+a1201b3b1c84ef52df935398b22623873050b8382b28875fccdaf76c73be73bf.
+The BFSS affected cases require rerunning with this repair. Previously
+accepted exact certificates remain valid because they were checked against
+the original rational data. No half-line exclusion is inferred from a
+native status, and the paper has not been edited.
