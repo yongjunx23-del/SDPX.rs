@@ -68,6 +68,9 @@ const SPLIT_FACTOR_THREADS_PER_LEAF: usize = 4;
 const SPLIT_BORDER_FACTOR_MIN: usize = 64;
 /// Row block of the split trunk sweeps.
 const FORWARD_BLOCK: usize = 32;
+/// Columns per exact-dot Y solve of a packed leaf: each staged row of L is
+/// read once per block (BFSS L13 t5: a 234 MB L once per column of 13155).
+const Y_BLOCK: usize = 16;
 /// Leaf sweeps split with smaller blocks: Λ27 leaves of order 88-113 on
 /// ranks with two leaves and 16 workers ran their sweeps serially.
 const LEAF_BLOCK: usize = 16;
@@ -313,21 +316,23 @@ fn ldl_rec<T: FloatT>(
         ways,
         d1,
     )?;
-    let l11: Vec<T> = (0..n1 * n1).map(|e| left[e % n1 + e / n1 * ld]).collect();
+    let l11 = {
+        let left = &*left;
+        collect_ways(n1 * n1, ways, |e| left[e % n1 + e / n1 * ld])
+    };
     let low: Vec<usize> = first[n1..].iter().map(|&f| f.min(n1)).collect();
     solve_unit_lower_t(n2, n1, &l11, n1, &mut left[n1..], ld, &low, ways);
     // W21 before scaling; L21 = W21·D1⁻¹ in place
-    let mut w = vec![T::zero(); n2 * n1];
-    for j in 0..n1 {
-        for i in 0..n2 {
-            let v = &mut left[n1 + i + j * ld];
-            w[i + j * n2] = *v;
-            *v *= d1[j];
-        }
-    }
+    let w = {
+        let left = &*left;
+        collect_ways(n2 * n1, ways, |e| left[n1 + e % n2 + e / n2 * ld])
+    };
+    columns_ways(left, ld, n1, ways, |j, column| {
+        column[n1..n].iter_mut().for_each(|v| *v *= d1[j])
+    });
     let l21 = &left[n1..];
     // packed (a, b), a ≤ b, is the Schur term (b, a)
-    let mut packed = vec![T::zero(); n2 * (n2 + 1) / 2];
+    let mut packed = collect_ways(n2 * (n2 + 1) / 2, ways, |_| T::zero());
     let upper = crate::algebra::with_split_hint(ways, || {
         T::xgemm_upper_exact(
             b'N',
@@ -345,13 +350,13 @@ fn ldl_rec<T: FloatT>(
         )
     });
     if upper {
-        for a in 0..n2 {
+        columns_ways(right, ld, n2, ways, |a, column| {
             for b in a..n2 {
-                right[n1 + b + a * ld] -= packed[b * (b + 1) / 2 + a];
+                column[n1 + b] -= packed[b * (b + 1) / 2 + a];
             }
-        }
+        });
     } else {
-        let mut s = vec![T::zero(); n2 * n2];
+        let mut s = collect_ways(n2 * n2, ways, |_| T::zero());
         exact_product(
             (b'N', b'T'),
             (n2, n2, n1),
@@ -360,11 +365,11 @@ fn ldl_rec<T: FloatT>(
             &mut s,
             ways,
         );
-        for a in 0..n2 {
+        columns_ways(right, ld, n2, ways, |a, column| {
             for b in a..n2 {
-                right[n1 + b + a * ld] -= s[a + b * n2];
+                column[n1 + b] -= s[a + b * n2];
             }
-        }
+        });
     }
     let tail: Vec<usize> = first[n1..].iter().map(|&f| f.saturating_sub(n1)).collect();
     let sign2 = |k: usize| sign(n1 + k);
@@ -400,7 +405,10 @@ fn solve_unit_lower_t<T: FloatT>(
     use sdpx_arithmetic::inner_parallel as ip;
     if n <= REC_BASE {
         let lr: Vec<T> = (0..n * n).map(|e| l[e / n + e % n * ldl]).collect();
-        let mut rows: Vec<T> = (0..m * n).map(|e| b[e / n + e % n * ldb]).collect();
+        let mut rows = {
+            let b = &*b;
+            collect_ways(m * n, ways, |e| b[e / n + e % n * ldb])
+        };
         let solve = |(i, x): (usize, &mut [T])| {
             for j in low[i]..n {
                 let lo = low[i];
@@ -418,9 +426,11 @@ fn solve_unit_lower_t<T: FloatT>(
         } else {
             rows.chunks_mut(n).enumerate().for_each(solve);
         }
-        for (e, v) in rows.into_iter().enumerate() {
-            b[e / n + e % n * ldb] = v;
-        }
+        columns_ways(b, ldb, n, ways, |j, column| {
+            for (i, v) in column[..m].iter_mut().enumerate() {
+                *v = rows[i * n + j];
+            }
+        });
         return;
     }
     let (n1, n2) = (n / 2, n - n / 2);
@@ -435,7 +445,7 @@ fn solve_unit_lower_t<T: FloatT>(
         ways,
     );
     let (b1, b2) = b.split_at_mut(n1 * ldb);
-    let mut p = vec![T::zero(); m * n2];
+    let mut p = collect_ways(m * n2, ways, |_| T::zero());
     exact_product(
         (b'N', b'T'),
         (m, n2, n1),
@@ -444,13 +454,51 @@ fn solve_unit_lower_t<T: FloatT>(
         &mut p,
         ways,
     );
-    for j in 0..n2 {
-        for i in 0..m {
-            b2[i + j * ldb] -= p[i + j * m];
+    columns_ways(b2, ldb, n2, ways, |j, column| {
+        for (v, &q) in column[..m].iter_mut().zip(&p[j * m..(j + 1) * m]) {
+            *v -= q;
         }
-    }
+    });
     let low2: Vec<usize> = low.iter().map(|&f| f.saturating_sub(n1)).collect();
     solve_unit_lower_t(m, n2, &l[n1 + n1 * ldl..], ldl, b2, ldb, &low2, ways);
+}
+
+/// `(0..len).map(f)`, over the ambient pool when `ways > 1` (the copies and
+/// clears beside a recursive factor's products).
+fn collect_ways<T: Send>(len: usize, ways: usize, f: impl Fn(usize) -> T + Sync + Send) -> Vec<T> {
+    if ways > 1 {
+        let mut v = Vec::new();
+        (0..len)
+            .into_par_iter()
+            .with_min_len(1 << 12)
+            .map(f)
+            .collect_into_vec(&mut v);
+        v
+    } else {
+        (0..len).map(f).collect()
+    }
+}
+
+/// `f(j, column j)` for the first `cols` columns (leading dimension `ld`) of
+/// `a`, over the ambient pool when `ways > 1`.
+fn columns_ways<T: Send>(
+    a: &mut [T],
+    ld: usize,
+    cols: usize,
+    ways: usize,
+    f: impl Fn(usize, &mut [T]) + Sync + Send,
+) {
+    if ways > 1 {
+        a.par_chunks_mut(ld)
+            .take(cols)
+            .enumerate()
+            .for_each(|(j, c)| f(j, c));
+    } else {
+        a.chunks_mut(ld)
+            .take(cols)
+            .enumerate()
+            .for_each(|(j, c)| f(j, c));
+    }
 }
 
 /// `c = op(a)·op(b)` (`m × n`, inner `k`): one exact sum rounded once per
@@ -704,7 +752,7 @@ impl<T: FloatT> DenseLeaf<T> {
         regularize_count: &mut usize,
         split: bool,
     ) -> Result<(), &'static str> {
-        self.envelope(a);
+        self.envelope(a, split);
         if T::precision_bits() > 64 {
             if self.n >= REC_FACTOR_MIN {
                 return self.factor_rec(a, signs, reg, regularize_count, split);
@@ -715,11 +763,19 @@ impl<T: FloatT> DenseLeaf<T> {
     }
 
     /// Each row's first nonzero column of `a` (`first`).
-    fn envelope(&mut self, a: &[T]) {
+    fn envelope(&mut self, a: &[T], split: bool) {
         let n = self.n;
+        let first = |i: usize| (0..i).find(|&k| !a[i + k * n].is_zero()).unwrap_or(i);
         self.first.clear();
-        self.first
-            .extend((0..n).map(|i| (0..i).find(|&k| !a[i + k * n].is_zero()).unwrap_or(i)));
+        if split {
+            (0..n)
+                .into_par_iter()
+                .with_min_len(64)
+                .map(first)
+                .collect_into_vec(&mut self.first);
+        } else {
+            self.first.extend((0..n).map(first));
+        }
     }
 
     /// Left-looking [`Self::factor_signed`] for wide types: entry (i, j) is
@@ -764,7 +820,12 @@ impl<T: FloatT> DenseLeaf<T> {
         split: bool,
     ) -> Result<(), &'static str> {
         let n = self.n;
-        self.l.copy_from_slice(a);
+        if split {
+            let (l, a) = (self.l.par_chunks_mut(n), a.par_chunks(n));
+            l.zip(a).for_each(|(l, a)| l.copy_from_slice(a));
+        } else {
+            self.l.copy_from_slice(a);
+        }
         let sign = |k: usize| T::from_i8(signs[if signs.len() == 1 { 0 } else { k }]).unwrap();
         let ways = if split {
             rayon::current_num_threads()
@@ -846,16 +907,21 @@ impl<T: FloatT> DenseLeaf<T> {
         }
     }
 
-    /// [`Self::forward_suffix`] after [`Self::stage_rows`]: each entry is
-    /// `x[i] - Σ L x` as one exact dot product rounded once. Never less
-    /// accurate than the FMA chain, but not bitwise equal to it.
+    /// [`Self::forward_suffix`] after [`Self::stage_rows`] for the columns of
+    /// `x` (`n - start` entries each): each entry is `x[i] - Σ L x` as one
+    /// exact dot product rounded once. Never less accurate than the FMA
+    /// chain, but not bitwise equal to it. Each staged row is read once for
+    /// all columns.
     fn forward_suffix_rows(&self, x: &mut [T], start: usize) {
         let n = self.n;
-        for i in 0..x.len() {
+        let width = n - start;
+        for i in 0..width {
             let r = i + start;
             let lo = self.first.get(r).map_or(start, |&f| f.max(start));
-            let v = T::dot_slices(&self.l[r * n + lo..=r * n + r], &x[lo - start..=i]);
-            x[i] = v;
+            let row = &self.l[r * n + lo..=r * n + r];
+            for column in x.chunks_mut(width) {
+                column[i] = T::dot_slices(row, &column[lo - start..=i]);
+            }
         }
     }
 
@@ -1006,6 +1072,16 @@ impl<T: FloatT> DenseLeaf<T> {
         self.backward(x);
     }
 
+    /// [`Self::solve`] with both sweeps split over the ambient pool (the
+    /// serial order).
+    fn solve_blocked(&self, x: &mut [T]) {
+        self.forward_blocked(x, FORWARD_BLOCK);
+        for (x, d) in x.iter_mut().zip(&self.dinv) {
+            *x *= *d;
+        }
+        self.backward_blocked(x);
+    }
+
     /// `solve` with the forward sweep split over `pool`. Rows are processed
     /// in blocks: once a block is final, every later row applies that
     /// block's columns in ascending order (rows are independent), then the
@@ -1015,13 +1091,7 @@ impl<T: FloatT> DenseLeaf<T> {
         match pool.filter(|p| {
             p.current_num_threads() > 1 && self.n >= f64_scaled::<T>(2 * FORWARD_BLOCK, 16)
         }) {
-            Some(pool) => pool.install(|| {
-                self.forward_blocked(x, FORWARD_BLOCK);
-                for (x, d) in x.iter_mut().zip(&self.dinv) {
-                    *x *= *d;
-                }
-                self.backward_blocked(x);
-            }),
+            Some(pool) => pool.install(|| self.solve_blocked(x)),
             None => {
                 self.forward(x);
                 for (x, d) in x.iter_mut().zip(&self.dinv) {
@@ -1115,6 +1185,78 @@ impl<T: FloatT> Leaf<T> {
         }
     }
 
+    /// The value-plan slot of coupling entry (`row`, `col`): its index in a
+    /// plainly stored B.
+    fn coupling_slot(&self, row: usize, col: usize) -> LeafSlot {
+        if self.b.len() >= self.y.len() && self.b.len() <= u32::MAX as usize {
+            LeafSlot::B(self.coupling_index(row, col) as u32)
+        } else {
+            LeafSlot::Coupling(row as u32, col as u32)
+        }
+    }
+
+    /// Write `value(q)` to each `(q, slot)` in order. Many `ordered` slots
+    /// split into runs over disjoint ranges of B (a repeated index stays in
+    /// one run), which write in parallel (ORE rows: one leaf per cone).
+    fn write_slots(
+        &mut self,
+        slots: &[(u32, LeafSlot)],
+        ordered: bool,
+        value: &(dyn Fn(u32) -> T + Sync),
+    ) {
+        if !ordered || slots.len() < 2 * SPLIT_SLOTS_MIN {
+            for &(q, slot) in slots {
+                let v = value(q);
+                match slot {
+                    LeafSlot::H(at, mirror) => {
+                        self.h[at as usize] = v;
+                        self.h[mirror as usize] = v;
+                    }
+                    LeafSlot::Coupling(row, col) => {
+                        *self.raw_coupling(row as usize, col as usize) = v
+                    }
+                    LeafSlot::B(i) => self.b[i as usize] = v,
+                }
+            }
+            return;
+        }
+        let at = |k: usize| match slots[k].1 {
+            LeafSlot::B(i) => i as usize,
+            _ => unreachable!(),
+        };
+        let parts = (slots.len() / SPLIT_SLOTS_MIN).min(4 * rayon::current_num_threads());
+        let mut cuts = vec![0];
+        for p in 1..parts {
+            let mut k = (p * slots.len() / parts).max(cuts[cuts.len() - 1] + 1);
+            while k < slots.len() && at(k) == at(k - 1) {
+                k += 1;
+            }
+            if k < slots.len() {
+                cuts.push(k);
+            }
+        }
+        cuts.push(slots.len());
+        let mut runs = Vec::with_capacity(cuts.len() - 1);
+        let (mut rest, mut offset) = (&mut self.b[..], 0);
+        for w in cuts.windows(2) {
+            let end = if w[1] == slots.len() {
+                offset + rest.len()
+            } else {
+                at(w[1])
+            };
+            let (head, tail) = std::mem::take(&mut rest).split_at_mut(end - offset);
+            runs.push((head, offset, &slots[w[0]..w[1]]));
+            (rest, offset) = (tail, end);
+        }
+        runs.into_par_iter().for_each(|(b, offset, slots)| {
+            for &(q, slot) in slots {
+                if let LeafSlot::B(i) = slot {
+                    b[i as usize - offset] = value(q);
+                }
+            }
+        });
+    }
+
     fn coupling_values(&self) -> &[T] {
         if self.y.is_empty() {
             &self.b
@@ -1149,6 +1291,9 @@ impl<T: FloatT> Leaf<T> {
         }
         let start = self.coupling_start;
         let width = g - start;
+        // Large panels copy and scale over the pool (BFSS L13 t5: 5e7
+        // entries per ORE leaf ran serially on the leaf phase's tail).
+        let wide = split && width > 0 && self.y.len() >= 1 << 16;
         if self.b.len() < self.y.len() {
             // The suffix's first row has L=1 and stays raw in Y.
             if width > 1 {
@@ -1156,6 +1301,9 @@ impl<T: FloatT> Leaf<T> {
                     column[1..].copy_from_slice(raw);
                 }
             }
+        } else if wide {
+            let (y, b) = (self.y.par_chunks_mut(width), self.b.par_chunks(width));
+            y.zip(b).for_each(|(y, b)| y.copy_from_slice(b));
         } else {
             self.y.copy_from_slice(&self.b);
         }
@@ -1165,11 +1313,12 @@ impl<T: FloatT> Leaf<T> {
             self.factor.stage_rows(start);
         }
         let (factor, couples, packed) = (&self.factor, &self.couples, self.packed);
-        let solve = |column: &mut [T]| {
+        let block = if rows && packed { Y_BLOCK } else { 1 };
+        let solve = |columns: &mut [T]| {
             if rows {
-                factor.forward_suffix_rows(column, start)
+                factor.forward_suffix_rows(columns, start)
             } else {
-                factor.forward_suffix(column, start)
+                factor.forward_suffix(columns, start)
             }
         };
         // Posting pays from one grain of work per extra item: the board is
@@ -1183,11 +1332,11 @@ impl<T: FloatT> Leaf<T> {
             ip::tasks_if(true, work, columns) > 1
         };
         if split && width > 0 && posted {
-            // One posted item per column, so idle workers of the leaf phase
-            // help the longest Y first and no worker waits in a join.
+            // One posted item per column block, so idle workers of the leaf
+            // phase help the longest Y first and no worker waits in a join.
             let columns: Vec<std::sync::Mutex<&mut [T]>> = self
                 .y
-                .chunks_mut(width)
+                .chunks_mut(width * block)
                 .enumerate()
                 .filter(|(j, _)| packed || couples[*j])
                 .map(|(_, column)| std::sync::Mutex::new(column))
@@ -1197,25 +1346,34 @@ impl<T: FloatT> Leaf<T> {
             });
         } else if split && width > 0 {
             self.y
-                .par_chunks_mut(width)
+                .par_chunks_mut(width * block)
                 .enumerate()
                 .filter(|(j, _)| packed || couples[*j])
                 .for_each(|(_, column)| solve(column));
         } else if packed {
-            for column in self.y.chunks_mut(width) {
-                solve(column);
+            for columns in self.y.chunks_mut(width * block) {
+                solve(columns);
             }
         } else {
             for &j in &self.coupled {
                 solve(&mut self.y[j * width..(j + 1) * width]);
             }
         }
-        if !self.z.is_empty() {
+        if !self.z.is_empty() && width > 0 {
             let columns = if packed { self.coupled.len() } else { t };
-            for j in 0..columns {
-                for i in 0..width {
-                    self.z[i + j * width] = self.y[i + j * width] * self.factor.dinv[i + start];
+            let dinv = &self.factor.dinv[start..];
+            let scale = |(z, y): (&mut [T], &[T])| {
+                for ((z, y), d) in z.iter_mut().zip(y).zip(dinv) {
+                    *z = *y * *d;
                 }
+            };
+            let (z, y) = (&mut self.z[..columns * width], &self.y[..columns * width]);
+            if wide {
+                z.par_chunks_mut(width)
+                    .zip(y.par_chunks(width))
+                    .for_each(scale);
+            } else {
+                z.chunks_mut(width).zip(y.chunks(width)).for_each(scale);
             }
         }
         Ok(())
@@ -1479,12 +1637,29 @@ fn contribution_bytes<T: FloatT>(leaf: &Leaf<T>) -> usize {
 fn contribution_product<T: FloatT>(leaf: &Leaf<T>, pool: Option<&rayon::ThreadPool>) -> Vec<T> {
     let (g, q) = (leaf.ids.len(), leaf.coupled.len());
     debug_assert!(leaf.packed && leaf.y.len() == g * q);
-    let y = &leaf.y[..];
-    let mut z = Vec::with_capacity(g * q);
-    for source in y.chunks(g) {
-        z.extend(source.iter().zip(&leaf.factor.dinv).map(|(&a, &d)| a * d));
+    let (y, dinv) = (&leaf.y[..], &leaf.factor.dinv);
+    let (mut z, mut product) = (Vec::new(), Vec::new());
+    match pool {
+        // Z and the cleared product of a wide product also take the pool.
+        Some(pool) => pool.install(|| {
+            (0..g * q)
+                .into_par_iter()
+                .with_min_len(g)
+                .map(|e| y[e] * dinv[e % g])
+                .collect_into_vec(&mut z);
+            (0..triangular_number(q))
+                .into_par_iter()
+                .map(|_| T::zero())
+                .collect_into_vec(&mut product);
+        }),
+        None => {
+            z.reserve_exact(g * q);
+            for source in y.chunks(g) {
+                z.extend(source.iter().zip(dinv).map(|(&a, &d)| a * d));
+            }
+            product = vec![T::zero(); triangular_number(q)];
+        }
     }
-    let mut product = vec![T::zero(); triangular_number(q)];
     let timer = crate::receipt::start();
     let exact = T::xgemm_upper_exact(b'T', b'N', q, q, g, y, g, &z, g, &mut product, pool, None);
     crate::receipt::finish("arrow.residue_contribution", timer);
@@ -1694,6 +1869,33 @@ fn queued_contribution_columns<T: FloatT>(
     pool.install(|| crate::algebra::run_queue(jobs, workers));
 }
 
+/// Copy the strict upper triangle of the order-`t` column-major `s` into its
+/// lower triangle, in blocks of 64 rows over `pool`, 64 columns at a time.
+fn mirror_upper<T: FloatT>(s: &mut [T], t: usize, pool: Option<&rayon::ThreadPool>) {
+    const B: usize = 64;
+    struct Base<T>(*mut T);
+    // SAFETY: blocks touch disjoint entries (see below).
+    unsafe impl<T: Send> Sync for Base<T> {}
+    let base = Base(s.as_mut_ptr());
+    let block = |b: usize| {
+        let base = &base;
+        let rows = b * B..((b + 1) * B).min(t);
+        for i0 in (0..rows.end).step_by(B) {
+            for j in rows.clone() {
+                for i in i0..(i0 + B).min(j) {
+                    // SAFETY: block `rows` alone reads (i, j) for i < j in
+                    // its columns and writes (j, i) in its rows.
+                    unsafe { *base.0.add(j + i * t) = *base.0.add(i + j * t) };
+                }
+            }
+        }
+    };
+    match pool {
+        Some(pool) => pool.install(|| (0..t.div_ceil(B)).into_par_iter().for_each(block)),
+        None => (0..t.div_ceil(B)).for_each(block),
+    }
+}
+
 /// Generic leaves shared over MPI ranks. Each rank factors and solves one
 /// contiguous, cost-balanced range of leaves; border partial sums are added
 /// in rank order, so one rank reproduces the serial arithmetic exactly and a
@@ -1835,6 +2037,8 @@ struct ValuePlan {
     index: Vec<usize>,
     panels: bool,
     leaves: Vec<Vec<(u32, LeafSlot)>>,
+    /// Per leaf: every slot is a [`LeafSlot::B`], in non-decreasing order.
+    ordered: Vec<bool>,
     rest: Vec<usize>,
 }
 
@@ -1844,7 +2048,12 @@ enum LeafSlot {
     H(u32, u32),
     /// `raw_coupling(row, col)`.
     Coupling(u32, u32),
+    /// `b[.0]`: a coupling entry of a leaf that stores B plainly.
+    B(u32),
 }
+
+/// Ordered `B` slots of one leaf from which its writes split into runs.
+const SPLIT_SLOTS_MIN: usize = 1 << 16;
 
 /// The column of CSC `position`, searched from column `j`. Index maps are
 /// mostly increasing: step forward a few columns before falling back to a
@@ -2354,18 +2563,32 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                     Some((x, LeafSlot::H((li + lj * g) as u32, (lj + li * g) as u32)))
                 }
                 _ if panels => None,
-                (x, _) if x != usize::MAX => Some((x, LeafSlot::Coupling(li as u32, lj as u32))),
-                (_, y) => Some((y, LeafSlot::Coupling(lj as u32, li as u32))),
+                (x, _) if x != usize::MAX => Some((x, self.leaves[x].coupling_slot(li, lj))),
+                (_, y) => Some((y, self.leaves[y].coupling_slot(lj, li))),
             };
             match slot {
                 Some((leaf, slot)) => leaves[leaf].push((q as u32, slot)),
                 None => rest.push(q),
             }
         }
+        let ordered = leaves
+            .iter()
+            .map(|slots| {
+                let mut last = 0;
+                slots.iter().all(|&(_, slot)| match slot {
+                    LeafSlot::B(i) if i >= last => {
+                        last = i;
+                        true
+                    }
+                    _ => false,
+                })
+            })
+            .collect();
         Some(ValuePlan {
             index: index.to_vec(),
             panels,
             leaves,
+            ordered,
             rest,
         })
     }
@@ -2685,6 +2908,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         if self.ranks.as_ref().is_some_and(|r| !r.is_root()) {
             self.s.fill(T::zero());
+        } else if let Some(pool) = &self.pool {
+            let (s, c) = (&mut self.s, &self.c);
+            pool.install(|| {
+                s.par_chunks_mut(t.max(1))
+                    .zip(c.par_chunks(t.max(1)))
+                    .for_each(|(s, c)| s.copy_from_slice(c))
+            });
         } else {
             self.s.copy_from_slice(&self.c);
         }
@@ -2698,11 +2928,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 t,
                 self.pool.as_deref(),
             );
-            for j in 0..t {
-                for i in 0..j {
-                    self.s[j + i * t] = self.s[i + j * t];
-                }
-            }
+            mirror_upper(&mut self.s, t, self.pool.as_deref());
             crate::receipt::finish("arrow.contribution", timer);
         }
         if let Some(ranks) = &self.ranks {
@@ -3034,24 +3260,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         };
         // Each leaf takes its entries in index order, so a repeated position
         // keeps its last value as in the serial route.
+        let value = |q: u32| map(values[q as usize]);
         pool.install(|| {
             self.leaves
                 .par_iter_mut()
                 .zip(&plan.leaves)
-                .for_each(|(leaf, slots)| {
-                    for &(q, slot) in slots {
-                        let value = map(values[q as usize]);
-                        match slot {
-                            LeafSlot::H(at, mirror) => {
-                                leaf.h[at as usize] = value;
-                                leaf.h[mirror as usize] = value;
-                            }
-                            LeafSlot::Coupling(row, col) => {
-                                *leaf.raw_coupling(row as usize, col as usize) = value
-                            }
-                        }
-                    }
-                })
+                .zip(&plan.ordered)
+                .for_each(|((leaf, slots), &ordered)| leaf.write_slots(slots, ordered, &value))
         });
         let rest = &plan.rest;
         self.update_entries(rest.iter().map(|&q| index[q]), |k, value| {
@@ -3206,38 +3421,24 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
         }
         crate::receipt::finish("many.couple", prof);
         let prof = crate::receipt::start();
-        // A single trunk column splits its sweeps over the pool.
+        // Fewer trunk columns than workers: each column also splits its
+        // sweeps over the pool (BFSS L13 t5: two columns of 13156 took 13.6 s
+        // on two workers). Otherwise independent column chunks share the
+        // pool. Every column keeps the serial per-column order.
+        let tf = &self.tf;
         match self
             .pool
             .as_ref()
-            .filter(|_| cols == 1 && t >= f64_scaled::<T>(2 * FORWARD_BLOCK, 16))
+            .filter(|p| p.current_num_threads() > 1 && t >= f64_scaled::<T>(2 * FORWARD_BLOCK, 16))
         {
+            Some(pool) if cols < pool.current_num_threads() => {
+                pool.install(|| tf.chunked(tx, cols, cols, |tf, x, _| tf.solve_blocked(x)))
+            }
             Some(pool) => {
-                let tf = &self.tf;
-                pool.install(|| {
-                    tf.forward_blocked(tx, FORWARD_BLOCK);
-                    for (x, d) in tx.iter_mut().zip(&tf.dinv) {
-                        *x *= *d;
-                    }
-                    tf.backward_blocked(tx);
-                });
+                let chunks = pool.current_num_threads();
+                pool.install(|| tf.chunked(tx, cols, chunks, DenseLeaf::solve_many))
             }
-            None => {
-                // Several trunk columns: independent column chunks share the
-                // pool, each with the serial per-column order.
-                match self.pool.as_ref().filter(|p| {
-                    cols > 1
-                        && p.current_num_threads() > 1
-                        && t >= f64_scaled::<T>(2 * FORWARD_BLOCK, 16)
-                }) {
-                    Some(pool) => {
-                        let chunks = pool.current_num_threads().min(cols);
-                        let tf = &self.tf;
-                        pool.install(|| tf.chunked(tx, cols, chunks, DenseLeaf::solve_many));
-                    }
-                    None => self.tf.solve_many(tx, cols),
-                }
-            }
+            None => tf.solve_many(tx, cols),
         }
         crate::receipt::finish("many.trunk", prof);
         let prof = crate::receipt::start();
@@ -3601,7 +3802,7 @@ mod tests {
         let reg = Some((T::from_f64(1e-20).unwrap(), T::one()));
         let (mut c0, mut c1, mut c2) = (0, 0, 0);
         let mut dots = DenseLeaf::<T>::new(n, LEAF_BLOCK);
-        dots.envelope(&a);
+        dots.envelope(&a, false);
         dots.factor_dots(&a, &signs, reg, &mut c0, false).unwrap();
         let mut serial = DenseLeaf::<T>::new(n, LEAF_BLOCK);
         serial.factor_leaf(&a, &signs, reg, &mut c1, false).unwrap();

@@ -1125,19 +1125,14 @@ impl CachedResidues {
         }
     }
 
-    /// Every prime's residues of `chunks`, prime-major.
-    fn from_chunks(chunks: &ChunkMatrix, plan: &Plan, split: &Split<'_>) -> Self {
-        Self::filled(plan.bits, chunks.len * plan.count(), None, |store| {
-            encode_into(chunks, plan, split, store, chunks.len, 0)
-        })
-    }
-
-    /// Contiguous operands, block by block: each block's chunk matrix is the
-    /// only transient, and its residues are written in place, instead of a
-    /// whole-operand chunk matrix. Every residue comes from the same exact
-    /// integer sum and reduction as [`Self::from_chunks`], so the store is
-    /// identical.
-    fn from_view_blocked<const N: usize>(
+    /// Every prime's residues of `x` (prime-major, each prime's entries in
+    /// the view's layout; in `reusable` when given) over `split`'s ways by
+    /// whole panels, a block of each way's entries at a time: the block's
+    /// chunks stay in the core's cache, and no chunk matrix of the whole
+    /// operand is written, read back and unmapped (BFSS L13 t5: 4 GB per
+    /// leaf Y). Each residue is its entry's exact chunk sum reduced once,
+    /// so blocks and ways do not change the store.
+    fn from_view<const N: usize>(
         x: View<'_, N>,
         lo: i64,
         spread: i64,
@@ -1145,20 +1140,31 @@ impl CachedResidues {
         split: &Split<'_>,
         reusable: Option<Self>,
     ) -> Self {
-        const BLOCK: usize = 1 << 15;
+        const BLOCK: usize = 64 * PANEL;
         let len = x.len();
         Self::filled(plan.bits, len * plan.count(), reusable, |store| {
-            for r0 in (0..len).step_by(BLOCK) {
-                let rows = BLOCK.min(len - r0);
-                let block = View {
-                    data: &x.data[r0..r0 + rows],
-                    rows,
-                    cols: 1,
-                    ld: rows,
-                };
-                let chunks = chunk_matrix(block, lo, spread, plan, split);
-                encode_into(&chunks, plan, split, store, len, r0);
-            }
+            let ways = split_ways(split).min(len / MIN_ROWS_PER_WAY).max(1);
+            run_ways(split, ways, |w| {
+                let (r0, r1) = panel_rows(len, ways, w);
+                let mut m = ChunkMatrix::new::<N>(BLOCK.min(r1 - r0), spread, plan, &Split::Serial);
+                let (chunks, width) = (m.chunks, m.width);
+                for b0 in (r0..r1).step_by(BLOCK) {
+                    let rows = BLOCK.min(r1 - b0);
+                    if b0 > r0 {
+                        m.e.fill(0.0);
+                    }
+                    for r in b0..b0 + rows {
+                        if x.stored(r) {
+                            let slot = chunk_slot(r - b0, chunks);
+                            fill_chunk(&x.data[r], &mut m.e[slot..], chunks, lo, width);
+                        }
+                    }
+                    panel_residues(m.rows(0, rows), plan, 0, plan.count(), |q, r, res| {
+                        // SAFETY: way w alone writes entries r0..r1 of every prime.
+                        unsafe { store.put(q * len + b0 + r, res) }
+                    });
+                }
+            });
         })
     }
 
@@ -1170,6 +1176,12 @@ impl CachedResidues {
         unsafe {
             out.set_len(at + n);
         }
+    }
+
+    /// [`Self::decode`] into initialized storage.
+    fn decode_to(&self, start: usize, out: &mut [f64]) {
+        // SAFETY: `decode` overwrites every entry with an initialized value.
+        self.decode(start, unsafe { &mut *(out as *mut [f64] as *mut [MaybeUninit<f64>]) });
     }
 
     /// Stored residues `start..start + out.len()` into `out`.
@@ -1201,26 +1213,6 @@ impl CachedResidues {
         }
         body(self, start, out)
     }
-}
-
-/// Every prime's residues of `chunks` to `store[q·len + offset + r]`, over
-/// `split`'s ways by whole panels.
-fn encode_into(
-    chunks: &ChunkMatrix,
-    plan: &Plan,
-    split: &Split<'_>,
-    store: Store,
-    len: usize,
-    offset: usize,
-) {
-    let ways = split_ways(split).min(chunks.len / MIN_ROWS_PER_WAY).max(1);
-    run_ways(split, ways, |w| {
-        let (r0, r1) = panel_rows(chunks.len, ways, w);
-        panel_residues(chunks.rows(r0, r1), plan, 0, plan.count(), |q, r, res| {
-            // SAFETY: way w alone writes entries r0..r1 of every prime.
-            unsafe { store.put(q * len + offset + r0 + r, res) }
-        });
-    });
 }
 
 /// Spare primes encoded beyond the current plan, so later calls whose other
@@ -1275,11 +1267,21 @@ fn packed_operand<const N: usize>(
     if plan.bits > CACHE_MAX_BITS || x.len().saturating_mul(plan.count()) < PACK_OPERAND_MIN {
         return Operand::Chunks(chunk_matrix(x, lo, spread, plan, split));
     }
-    let chunks = chunk_matrix(x, lo, spread, plan, split);
-    Operand::Packed(CachedResidues::from_chunks(&chunks, plan, split), chunks.len)
+    Operand::Packed(CachedResidues::from_view(x, lo, spread, plan, split, None), x.len())
 }
 
 impl Operand {
+    /// The compact residue store (prime-major, each prime's entries in the
+    /// operand view's layout) and its entries per prime; `None` for a chunk
+    /// matrix, whose residues are computed per prime group.
+    fn stored(&self) -> Option<(&CachedResidues, usize)> {
+        match self {
+            Operand::Packed(res, len) => Some((res, *len)),
+            Operand::Cached(c) => Some((&c.res, c.len)),
+            Operand::Chunks(_) => None,
+        }
+    }
+
     /// [`Self::residues`] for a caller whose split ways are otherwise idle:
     /// stored residues decode over the ways, a chunk matrix's kernel runs by
     /// panel ranges (each residue is copied or computed alone, so the split
@@ -1381,24 +1383,19 @@ impl ResidueCache {
             entry.take()
         };
         let count = (plan.count() + CACHE_SPARE_PRIMES).min(primes(plan.bits).len());
-        // Reuse only a sole-owned, equal-sized payload: the contiguous encoder
-        // overwrites every residue. Release other invalid storage before encoding,
+        // Reuse only a sole-owned, equal-sized payload: the encoder overwrites
+        // every residue. Release other invalid storage before encoding,
         // outside the lock; active products retain their own Arc.
         let reusable = stale
             .and_then(|entry| Arc::try_unwrap(entry).ok())
             .map(|entry| entry.res)
             .filter(|res| {
-                (x.ld == x.rows || x.cols == 1)
-                    && matches!(res, CachedResidues::Narrow(..)) == (plan.bits <= 24)
+                matches!(res, CachedResidues::Narrow(..)) == (plan.bits <= 24)
                     && res.len() == x.len() * count
             });
         {
             let wide = Plan::with_count(plan.bits, count);
-            let res = if x.ld == x.rows || x.cols == 1 {
-                CachedResidues::from_view_blocked(x, lo, spread, &wide, split, reusable)
-            } else {
-                CachedResidues::from_chunks(&chunk_matrix(x, lo, spread, &wide, split), &wide, split)
-            };
+            let res = CachedResidues::from_view(x, lo, spread, &wide, split, reusable);
             let entry = Arc::new(CacheEntry {
                 fingerprint: fp,
                 bits: plan.bits,
@@ -2121,97 +2118,10 @@ pub(super) fn gemm<const N: usize>(
         Some(cache) => cache.operand(bv, lo_b, db, &plan, &split),
         None => packed_operand(bv, lo_b, db, &plan, &split),
     });
-    // A small group cap bounds per-way residue scratch only when both operand
-    // fills are scalar copies; a chunk-matrix source needs fat GEMM groups.
-    let scalar_fill =
-        |o: &Option<Operand>| matches!(o, None | Some(Operand::Packed(..) | Operand::Cached(..)));
-    let group_cap = if scalar_fill(&cb) && matches!(ca, Operand::Packed(..) | Operand::Cached(..)) {
-        // Wide enough that every way gets a column panel of some prime,
-        // within GROUP_SCRATCH_BYTES of operand residues per thread.
-        let fill = split_ways(&split).div_ceil((n / PANEL_COLS).max(1));
-        let bytes = split_threads(&split) * GROUP_SCRATCH_BYTES / ((len_a + len_b).max(1) * 8);
-        stream_group_cap(len_a + len_b).max(fill.min(bytes).min(STREAM_GROUP))
-    } else {
-        STREAM_GROUP
-    };
     let timer = (split_ways(&split) > 1)
         .then(crate::receipt::start)
         .flatten();
-    // Every prime's products, then one output-tiled reconstruction.
     let count = plan.count();
-    // `prime_columns` writes every output of every prime.
-    let mut prod = take_zeroed(count * outputs, &split, true);
-    let mut s = Scratch::default();
-    for q0 in (0..count).step_by(group_cap) {
-        let q1 = (q0 + group_cap).min(count);
-        ca.residues_split(&plan, q0, q1, &mut s.a, &split);
-        if let Some(cb) = &cb {
-            cb.residues_split(&plan, q0, q1, &mut s.b, &split);
-        }
-        let (sa, sb) = (&s.a, &s.b);
-        let product = |qi, prod: &mut [f64], t: &mut Vec<f64>| {
-            shape.prime_columns(
-                &plan,
-                q0 + qi,
-                &sa[qi * len_a..(qi + 1) * len_a],
-                if same_operand {
-                    &sa[qi * len_a..(qi + 1) * len_a]
-                } else {
-                    &sb[qi * len_b..(qi + 1) * len_b]
-                },
-                prod,
-                t,
-                upper_only,
-                0..n,
-                reach.as_deref(),
-            );
-        };
-        let group = &mut prod[q0 * outputs..q1 * outputs];
-        let panels = column_panels(&shape, upper_only, q1 - q0, &split, reach.as_deref());
-        if panels.len() > 2 {
-            // Fewer primes than ways: each prime's columns are shared too.
-            let parts = panels.len() - 1;
-            let base = SendValues(group.as_mut_ptr());
-            run_ways(&split, (q1 - q0) * parts, |item| {
-                let (qi, columns) = (item / parts, panels[item % parts]..panels[item % parts + 1]);
-                let (start, end) = (
-                    shape.column_offset(columns.start, upper_only),
-                    shape.column_offset(columns.end, upper_only),
-                );
-                // SAFETY: item (qi, panel) alone owns these outputs of prime qi.
-                let cq = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        base.get().add(qi * outputs + start),
-                        end - start,
-                    )
-                };
-                let (aq, bq) = (
-                    &sa[qi * len_a..(qi + 1) * len_a],
-                    if same_operand {
-                        &sa[qi * len_a..(qi + 1) * len_a]
-                    } else {
-                        &sb[qi * len_b..(qi + 1) * len_b]
-                    },
-                );
-                let mut t = take_buffer(0);
-                let reach = reach.as_deref();
-                shape.prime_columns(
-                    &plan,
-                    q0 + qi,
-                    aq,
-                    bq,
-                    cq,
-                    &mut t,
-                    upper_only,
-                    columns,
-                    reach,
-                );
-                release_buffer(t);
-            });
-            continue;
-        }
-        prime_products(&split, outputs, group, &mut s.t, product);
-    }
     let optr = SendValues(out.as_mut_ptr());
     let write = |i: usize, v: F<N>| {
         let o = if selected.is_empty() { i } else { selected[i] };
@@ -2219,6 +2129,108 @@ pub(super) fn gemm<const N: usize>(
         unsafe { *optr.get().add(o) = v };
     };
     let scale = lo_a + lo_b;
+    let stored_b = cb.as_ref().map_or_else(|| ca.stored(), Operand::stored);
+    if let (Some(sa), Some(sb)) = (ca.stored(), stored_b) {
+        // Column blocks of every prime's products, each reconstructed before
+        // the next reuses the storage. Every task overwrites its outputs, so
+        // nothing is cleared.
+        let offset = |j: usize| shape.column_offset(j, upper_only);
+        let blocks = shape.column_blocks(count, upper_only);
+        let largest = blocks.windows(2).map(|b| offset(b[1]) - offset(b[0])).max();
+        let mut prod: Vec<MaybeUninit<f64>> = Vec::with_capacity(count * largest.unwrap_or(0));
+        // SAFETY: uninitialized entries are valid `MaybeUninit`s.
+        unsafe { prod.set_len(prod.capacity()) };
+        let ok = blocks.windows(2).all(|b| {
+            let (first, outputs) = (offset(b[0]), offset(b[1]) - offset(b[0]));
+            let prod = &mut prod[..count * outputs];
+            let reach = reach.as_deref();
+            shape.stored_products(&plan, sa, sb, prod, outputs, b[0]..b[1], upper_only, reach, &split);
+            // SAFETY: the block's tasks wrote every entry.
+            let prod = unsafe { &*(prod as *const [MaybeUninit<f64>] as *const [f64]) };
+            let write = |i: usize, v: F<N>| write(first + i, v);
+            crt_tiled_split(&plan, prod, outputs, &[], outputs, scale, &split, &write)
+        });
+        crate::receipt::finish("rns.gemm.shared_crt", timer);
+        return ok;
+    }
+    // Every prime's products, then one output-tiled reconstruction.
+    // `prime_columns` writes every output of every prime.
+    let mut prod = take_zeroed(count * outputs, &split, true);
+    {
+        // A chunk-matrix operand computes each group's residues once for all
+        // its column panels.
+        let mut s = Scratch::default();
+        for q0 in (0..count).step_by(STREAM_GROUP) {
+            let q1 = (q0 + STREAM_GROUP).min(count);
+            ca.residues_split(&plan, q0, q1, &mut s.a, &split);
+            if let Some(cb) = &cb {
+                cb.residues_split(&plan, q0, q1, &mut s.b, &split);
+            }
+            let (sa, sb) = (&s.a, &s.b);
+            let product = |qi, prod: &mut [f64], t: &mut Vec<f64>| {
+                shape.prime_columns(
+                    &plan,
+                    q0 + qi,
+                    &sa[qi * len_a..(qi + 1) * len_a],
+                    if same_operand {
+                        &sa[qi * len_a..(qi + 1) * len_a]
+                    } else {
+                        &sb[qi * len_b..(qi + 1) * len_b]
+                    },
+                    prod,
+                    t,
+                    upper_only,
+                    0..n,
+                    reach.as_deref(),
+                );
+            };
+            let group = &mut prod[q0 * outputs..q1 * outputs];
+            let panels = column_panels(&shape, upper_only, q1 - q0, &split, reach.as_deref());
+            if panels.len() > 2 {
+                // Fewer primes than ways: each prime's columns are shared too.
+                let parts = panels.len() - 1;
+                let base = SendValues(group.as_mut_ptr());
+                run_ways(&split, (q1 - q0) * parts, |item| {
+                    let (qi, columns) = (item / parts, panels[item % parts]..panels[item % parts + 1]);
+                    let (start, end) = (
+                        shape.column_offset(columns.start, upper_only),
+                        shape.column_offset(columns.end, upper_only),
+                    );
+                    // SAFETY: item (qi, panel) alone owns these outputs of prime qi.
+                    let cq = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            base.get().add(qi * outputs + start),
+                            end - start,
+                        )
+                    };
+                    let (aq, bq) = (
+                        &sa[qi * len_a..(qi + 1) * len_a],
+                        if same_operand {
+                            &sa[qi * len_a..(qi + 1) * len_a]
+                        } else {
+                            &sb[qi * len_b..(qi + 1) * len_b]
+                        },
+                    );
+                    let mut t = take_buffer(0);
+                    let reach = reach.as_deref();
+                    shape.prime_columns(
+                        &plan,
+                        q0 + qi,
+                        aq,
+                        bq,
+                        cq,
+                        &mut t,
+                        upper_only,
+                        columns,
+                        reach,
+                    );
+                    release_buffer(t);
+                });
+                continue;
+            }
+            prime_products(&split, outputs, group, &mut s.t, product);
+        }
+    }
     let ok = crt_tiled_split(&plan, &prod, outputs, &[], outputs, scale, &split, &write);
     release_buffer(prod);
     crate::receipt::finish("rns.gemm.shared_crt", timer);
@@ -2299,6 +2311,26 @@ fn column_panels(
 
 /// Narrowest column panel of a shared prime product.
 const PANEL_COLS: usize = 32;
+
+/// Residue products (one per prime and output) of one column block of a
+/// stored-operand product (1 GiB): a block still holds about a thousand
+/// tile tasks (BFSS L13 t5: a 13155² contribution held 13 GB, zeroed and
+/// unmapped on the caller's thread).
+const STORED_BLOCK: usize = 1 << 27;
+
+/// Residue sums per row block of a product tile (1 MiB).
+const TILE_BLOCK: usize = 1 << 17;
+
+/// Output tile and inner slice of a stored-operand product task. Each task
+/// decodes its own rows of A and columns of B, so no prime group waits for
+/// its slowest column panel and no way repacks whole operand panels from
+/// memory for a narrow column range (BFSS L13 t5 on 64 threads: one prime's
+/// column panels at a time ran the kernel at 25% of its one-thread rate). A
+/// task's decoded slices, the kernel's packing and its sums fit in a core's
+/// share of L3.
+const TILE_ROWS: usize = 512;
+const TILE_COLS: usize = 256;
+const TILE_DEPTH: usize = 256;
 
 fn spread_probe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2965,33 +2997,48 @@ impl GemmShape {
         );
         let (m, k) = (self.m, self.k);
         let (first, n) = (columns.start, columns.len());
-        let b_col = if tb_n { first * self.ldb } else { first };
-        let outputs = m * n;
         let tile_reach = |j0: usize, cols: usize| match reach {
             None => (0, k),
             Some(r) => tile_reach(&r[j0..j0 + cols]),
         };
-        if upper_only {
-            // Rectangle tiles cover the requested triangle; only selected
-            // residues survive into CRT, in column-major packed order.
-            let base = self.column_offset(first, true);
-            part.clear();
-            part.resize(m * TILE.min(n), 0.0);
-            for j0 in (first..columns.end).step_by(TILE) {
-                let cols = TILE.min(columns.end - j0);
-                let height = m.min(j0 + cols);
-                let (k_lo, k_hi) = tile_reach(j0, cols);
-                if k_lo == k_hi {
-                    let (start, end) = (
-                        self.column_offset(j0, true) - base,
-                        self.column_offset(j0 + cols, true) - base,
-                    );
-                    cq[start..end].fill(0.0);
-                    continue;
-                }
+        // Rectangle tiles cover the requested columns (with `upper_only`,
+        // only residues on or above the diagonal survive into CRT, in
+        // column-major packed order). Every tile streams its rows of A once,
+        // so a tall product without a reach takes wider tiles (up to 256
+        // columns; a triangle computes at most about 1/32 of itself again
+        // above the diagonal), in row blocks whose partial sums stay in cache
+        // across the kernel's depth passes and the k chunks (BFSS L13 t5:
+        // whole 13155-row tiles of 256 columns ran from memory, 50% slower
+        // than 32-column tiles).
+        let tile = match reach {
+            None => (m / (TILE * TILE)).clamp(1, 8) * TILE,
+            Some(_) => TILE,
+        };
+        let block = TILE_BLOCK / tile;
+        let base = self.column_offset(first, upper_only);
+        part.clear();
+        part.resize(block.min(m) * tile.min(n), 0.0);
+        for j0 in (first..columns.end).step_by(tile) {
+            let cols = tile.min(columns.end - j0);
+            let height = if upper_only { m.min(j0 + cols) } else { m };
+            let (k_lo, k_hi) = tile_reach(j0, cols);
+            if k_lo == k_hi {
+                let (start, end) = (
+                    self.column_offset(j0, upper_only) - base,
+                    self.column_offset(j0 + cols, upper_only) - base,
+                );
+                cq[start..end].fill(0.0);
+                continue;
+            }
+            for i0 in (0..height).step_by(block) {
+                let rows = block.min(height - i0);
                 for k0 in (k_lo..k_hi).step_by(plan.k_chunk) {
                     let kc = plan.k_chunk.min(k_hi - k0);
-                    let a_off = if ta_n { k0 * self.lda } else { k0 };
+                    let a_off = if ta_n {
+                        i0 + k0 * self.lda
+                    } else {
+                        k0 + i0 * self.lda
+                    };
                     let b_off = if tb_n {
                         k0 + j0 * self.ldb
                     } else {
@@ -3000,21 +3047,26 @@ impl GemmShape {
                     int_gemm(
                         self.ta,
                         self.tb,
-                        height,
+                        rows,
                         cols,
                         kc,
                         &aq[a_off..],
                         self.lda,
                         &bq[b_off..],
                         self.ldb,
-                        &mut part[..height * cols],
-                        height,
+                        &mut part[..rows * cols],
+                        rows,
                     );
                     for j in 0..cols {
                         let column = j0 + j;
-                        let offset = self.column_offset(column, true) - base;
-                        for i in 0..m.min(column + 1) {
-                            let value = reduce(part[i + j * height], plan.p[q], plan.pinv[q]);
+                        let offset = self.column_offset(column, upper_only) - base;
+                        let end = if upper_only {
+                            (i0 + rows).min(column + 1)
+                        } else {
+                            i0 + rows
+                        };
+                        for i in i0..end {
+                            let value = reduce(part[i - i0 + j * rows], plan.p[q], plan.pinv[q]);
                             let dest = &mut cq[offset + i];
                             *dest = if k0 == k_lo {
                                 value
@@ -3025,94 +3077,149 @@ impl GemmShape {
                     }
                 }
             }
-            return;
         }
-        if reach.is_some() {
-            for j0 in (first..columns.end).step_by(TILE) {
-                let cols = TILE.min(columns.end - j0);
-                let c = &mut cq[(j0 - first) * m..(j0 - first + cols) * m];
-                let (k_lo, k_hi) = tile_reach(j0, cols);
+    }
+
+    /// Column bounds of blocks of whole tile columns holding at most
+    /// [`STORED_BLOCK`] residue products of `primes` primes (one tile column
+    /// at least).
+    fn column_blocks(&self, primes: usize, upper_only: bool) -> Vec<usize> {
+        let mut bounds = vec![0];
+        while let Some(&j0) = bounds.last().filter(|&&j| j < self.n) {
+            let first = self.column_offset(j0, upper_only);
+            let mut j1 = (j0 + TILE_COLS).min(self.n);
+            while j1 < self.n {
+                let next = (j1 + TILE_COLS).min(self.n);
+                if primes * (self.column_offset(next, upper_only) - first) > STORED_BLOCK {
+                    break;
+                }
+                j1 = next;
+            }
+            bounds.push(j1);
+        }
+        bounds
+    }
+
+    /// [`Self::prime_columns`] for every prime and the outputs of `columns`
+    /// from the operands' compact residue stores (prime-major, each prime's
+    /// entries in the views' layouts) into `prod` (`outputs` per prime, from
+    /// the first column's offset). Every (output tile, prime) is one task
+    /// taken in turn by the split's ways, largest tiles first, which decodes
+    /// only its rows of A and columns of B, a depth slice at a time, and
+    /// writes every output of its tile.
+    #[allow(clippy::too_many_arguments)]
+    fn stored_products(
+        &self,
+        plan: &Plan,
+        (ra, len_a): (&CachedResidues, usize),
+        (rb, len_b): (&CachedResidues, usize),
+        prod: &mut [MaybeUninit<f64>],
+        outputs: usize,
+        columns: std::ops::Range<usize>,
+        upper_only: bool,
+        reach: Option<&[(usize, usize)]>,
+        split: &Split<'_>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let (ta_n, tb_n) = (
+            self.ta.to_ascii_uppercase() == b'N',
+            self.tb.to_ascii_uppercase() == b'N',
+        );
+        let (m, n, k) = (self.m, self.n, self.k);
+        // (first column, columns, first row, rows, inner range)
+        let mut tiles = Vec::new();
+        for j0 in columns.clone().step_by(TILE_COLS) {
+            let cols = TILE_COLS.min(columns.end - j0);
+            let height = if upper_only { m.min(j0 + cols) } else { m };
+            let inner = reach.map_or((0, k), |r| tile_reach(&r[j0..j0 + cols]));
+            for i0 in (0..height).step_by(TILE_ROWS) {
+                tiles.push((j0, cols, i0, TILE_ROWS.min(height - i0), inner));
+            }
+        }
+        tiles.sort_by_key(|&(_, cols, _, rows, (lo, hi))| std::cmp::Reverse(rows * cols * (hi - lo)));
+        let (count, first) = (plan.count(), self.column_offset(columns.start, upper_only));
+        let tasks = count * tiles.len();
+        let (next, base) = (AtomicUsize::new(0), SendValues(prod.as_mut_ptr().cast::<f64>()));
+        let (rows_max, cols_max, depth_max) = (TILE_ROWS.min(m), TILE_COLS.min(n), TILE_DEPTH.min(k));
+        run_ways(split, split_threads(split).min(tasks), |_| {
+            let mut part = take_scratch(rows_max * cols_max);
+            let mut a = take_scratch(rows_max * depth_max);
+            let mut b = take_scratch(cols_max * depth_max);
+            loop {
+                let task = next.fetch_add(1, Relaxed);
+                if task >= tasks {
+                    break;
+                }
+                let q = task % count;
+                let (j0, cols, i0, rows, (k_lo, k_hi)) = tiles[task / count];
+                let (p, pinv) = (plan.p[q], plan.pinv[q]);
+                let out = |j: usize| q * outputs + self.column_offset(j0 + j, upper_only) - first;
+                let end = |j: usize| {
+                    if upper_only {
+                        (i0 + rows).min(j0 + j + 1)
+                    } else {
+                        i0 + rows
+                    }
+                };
                 if k_lo == k_hi {
-                    c.fill(0.0);
+                    for j in 0..cols {
+                        for i in i0..end(j) {
+                            // SAFETY: task (q, tile) alone writes these outputs of prime q.
+                            unsafe { *base.get().add(out(j) + i) = 0.0 };
+                        }
+                    }
                     continue;
                 }
+                let part = &mut part[..rows * cols];
                 for k0 in (k_lo..k_hi).step_by(plan.k_chunk) {
                     let kc = plan.k_chunk.min(k_hi - k0);
-                    let a_off = if ta_n { k0 * self.lda } else { k0 };
-                    let b_off = if tb_n {
-                        k0 + j0 * self.ldb
-                    } else {
-                        j0 + k0 * self.ldb
-                    };
-                    let (a, b) = (&aq[a_off..], &bq[b_off..]);
-                    let (p, pinv) = (plan.p[q], plan.pinv[q]);
-                    if k0 == k_lo {
-                        int_gemm(
-                            self.ta, self.tb, m, cols, kc, a, self.lda, b, self.ldb, c, m,
-                        );
-                        c.iter_mut().for_each(|x| *x = reduce(*x, p, pinv));
-                    } else {
-                        part.clear();
-                        part.resize(m * cols, 0.0);
-                        int_gemm(
-                            self.ta, self.tb, m, cols, kc, a, self.lda, b, self.ldb, part, m,
-                        );
-                        for (x, y) in c.iter_mut().zip(part.iter()) {
-                            *x = reduce(*x + reduce(*y, p, pinv), p, pinv);
+                    for d0 in (k0..k0 + kc).step_by(TILE_DEPTH) {
+                        let d = TILE_DEPTH.min(k0 + kc - d0);
+                        let (a, b) = (&mut a[..rows * d], &mut b[..cols * d]);
+                        if ta_n {
+                            for (t, a) in a.chunks_mut(rows).enumerate() {
+                                ra.decode_to(q * len_a + i0 + (d0 + t) * self.lda, a);
+                            }
+                        } else {
+                            for (i, a) in a.chunks_mut(d).enumerate() {
+                                ra.decode_to(q * len_a + d0 + (i0 + i) * self.lda, a);
+                            }
+                        }
+                        if tb_n {
+                            for (j, b) in b.chunks_mut(d).enumerate() {
+                                rb.decode_to(q * len_b + d0 + (j0 + j) * self.ldb, b);
+                            }
+                        } else {
+                            for (t, b) in b.chunks_mut(cols).enumerate() {
+                                rb.decode_to(q * len_b + j0 + (d0 + t) * self.ldb, b);
+                            }
+                        }
+                        let (lda, ldb) = (if ta_n { rows } else { d }, if tb_n { d } else { cols });
+                        let kernel = if d0 == k0 { int_gemm } else { int_gemm_acc };
+                        kernel(self.ta, self.tb, rows, cols, d, a, lda, b, ldb, part, rows);
+                    }
+                    for j in 0..cols {
+                        let o = out(j);
+                        for i in i0..end(j) {
+                            let value = reduce(part[i - i0 + j * rows], p, pinv);
+                            // SAFETY: task (q, tile) alone writes these outputs of prime
+                            // q, and reads only what its earlier inner chunks wrote.
+                            unsafe {
+                                let dest = base.get().add(o + i);
+                                *dest = if k0 == k_lo {
+                                    value
+                                } else {
+                                    reduce(*dest + value, p, pinv)
+                                };
+                            }
                         }
                     }
                 }
             }
-            return;
-        }
-        let mut k0 = 0;
-        while k0 < k {
-            let kc = plan.k_chunk.min(k - k0);
-            let a_off = if ta_n { k0 * self.lda } else { k0 };
-            let b_off = b_col + if tb_n { k0 } else { k0 * self.ldb };
-            if k0 == 0 {
-                int_gemm(
-                    self.ta,
-                    self.tb,
-                    m,
-                    n,
-                    kc,
-                    &aq[a_off..],
-                    self.lda,
-                    &bq[b_off..],
-                    self.ldb,
-                    cq,
-                    m,
-                );
-                for x in cq.iter_mut() {
-                    *x = reduce(*x, plan.p[q], plan.pinv[q]);
-                }
-            } else {
-                part.clear();
-                part.resize(outputs, 0.0);
-                int_gemm(
-                    self.ta,
-                    self.tb,
-                    m,
-                    n,
-                    kc,
-                    &aq[a_off..],
-                    self.lda,
-                    &bq[b_off..],
-                    self.ldb,
-                    part,
-                    m,
-                );
-                for (x, y) in cq.iter_mut().zip(part.iter()) {
-                    *x = reduce(
-                        *x + reduce(*y, plan.p[q], plan.pinv[q]),
-                        plan.p[q],
-                        plan.pinv[q],
-                    );
-                }
-            }
-            k0 += kc;
-        }
+            release_buffer(part);
+            release_buffer(a);
+            release_buffer(b);
+        });
     }
 }
 
