@@ -167,7 +167,15 @@ fn ldl_dots<T: FloatT>(
         for j in p..pe {
             let fj = first[j];
             let (rj, wj) = (&r[row(j) + fj..row(j) + j], &w[row(j) + fj..row(j) + j]);
-            let dj = a[j + j * ld] - T::dot_slices(rj, wj);
+            let mut dj = a[j + j * ld] - T::dot_slices(rj, wj);
+            if dj.is_zero() && !rj.is_empty() {
+                // Rounding the dot before the difference can cancel a tiny
+                // pivot to zero (BFSS L11 and L13 trunks: a = round(dot),
+                // a ≠ 0, so QDLDL took over); the exact difference rounded
+                // once is that pivot. Nonzero pivots keep their bits.
+                let minus_one = -T::one();
+                dj = -T::dot_fma(rj.iter().zip(wj).chain([(&a[j + j * ld], &minus_one)]));
+            }
             let dj = DenseLeaf::<T>::pivot(dj, sign(j), reg, regularize_count)?;
             d[j] = dj;
             dinv[j] = T::one() / dj;
@@ -1438,10 +1446,23 @@ fn one_wave_chunks(work: &[f64], workers: usize, cap: usize) -> Vec<usize> {
 }
 
 /// Leaves whose `YᵀD⁻¹Y` is one residue product ([`contribution_product`]):
-/// substantial products whose result storage is proportional to Y.
-fn residue_contribution<T: FloatT>(leaf: &Leaf<T>, t: usize) -> bool {
+/// substantial products. Batches bound their result storage, so a product
+/// may exceed Y (BFSS L13 t5: the leaves a `q² ≤ 8gt` storage gate left to
+/// exact dots took 86% of the phase).
+fn residue_contribution<T: FloatT>(leaf: &Leaf<T>) -> bool {
     let (g, q) = (leaf.ids.len(), leaf.coupled.len());
-    T::residue_product_applies(q, q, g) && g * q * q >= 1 << 21 && q * q <= 8 * g * t
+    T::residue_product_applies(q, q, g) && g * q * q >= 1 << 21
+}
+
+/// Multiply-adds of a leaf's [`contribution_product`].
+fn product_work<T: FloatT>(leaf: &Leaf<T>) -> f64 {
+    (leaf.ids.len() * leaf.coupled.len().pow(2)) as f64
+}
+
+/// A product that eight ways cannot balance against `total` work on
+/// `workers` (more than an eighth of it) splits over the whole pool instead.
+fn wide_product(work: f64, total: f64, workers: usize) -> bool {
+    workers > 1 && work * workers as f64 > 8.0 * total
 }
 
 /// Working-precision storage of one [`contribution_product`]: Y, Z and the
@@ -1453,7 +1474,9 @@ fn contribution_bytes<T: FloatT>(leaf: &Leaf<T>) -> usize {
 
 /// Upper triangle of a factored leaf's `YᵀD⁻¹Y` over its coupled columns,
 /// each entry one exact sum rounded once (Z = D⁻¹Y rounded entrywise).
-fn contribution_product<T: FloatT>(leaf: &Leaf<T>) -> Vec<T> {
+/// `pool`: a call from outside it splits the residue product over all of
+/// its workers.
+fn contribution_product<T: FloatT>(leaf: &Leaf<T>, pool: Option<&rayon::ThreadPool>) -> Vec<T> {
     let (g, q) = (leaf.ids.len(), leaf.coupled.len());
     debug_assert!(leaf.packed && leaf.y.len() == g * q);
     let y = &leaf.y[..];
@@ -1463,7 +1486,7 @@ fn contribution_product<T: FloatT>(leaf: &Leaf<T>) -> Vec<T> {
     }
     let mut product = vec![T::zero(); triangular_number(q)];
     let timer = crate::receipt::start();
-    let exact = T::xgemm_upper_exact(b'T', b'N', q, q, g, y, g, &z, g, &mut product, None, None);
+    let exact = T::xgemm_upper_exact(b'T', b'N', q, q, g, y, g, &z, g, &mut product, pool, None);
     crate::receipt::finish("arrow.residue_contribution", timer);
     if !exact {
         for c in 0..q {
@@ -1495,7 +1518,7 @@ fn subtract_contributions<T: FloatT>(
     // workspace of the concurrent products). Products the leaf phase
     // already formed (`Leaf::product`) are only subtracted here.
     let width = pool.map_or(1, |p| p.current_num_threads());
-    let eligible = |leaf: &Leaf<T>| residue_contribution(leaf, t);
+    let eligible = |leaf: &Leaf<T>| residue_contribution(leaf);
     if leaves.iter().any(eligible) {
         for group in leaves.chunk_by_mut(|a, b| eligible(a) == eligible(b)) {
             if !eligible(&group[0]) {
@@ -1519,10 +1542,25 @@ fn subtract_contributions<T: FloatT>(
                 .min(group.len());
             let size = group.len().div_ceil(count);
             for batch in group.chunks_mut(size) {
-                let ways = width.div_ceil(batch.len()).clamp(1, 8);
+                // Wide products take every worker, one at a time; the others
+                // share the workers.
+                let pending: f64 = batch
+                    .iter()
+                    .filter(|l| l.product.is_empty())
+                    .map(product_work)
+                    .sum();
+                for leaf in batch.iter_mut() {
+                    if leaf.product.is_empty() && wide_product(product_work(leaf), pending, width) {
+                        leaf.product = crate::algebra::with_split_hint(width, || {
+                            contribution_product(leaf, pool)
+                        });
+                    }
+                }
+                let narrow = batch.iter().filter(|l| l.product.is_empty()).count();
+                let ways = width.div_ceil(narrow.max(1)).clamp(1, 8);
                 let build = |leaf: &mut Leaf<T>| {
                     if leaf.product.is_empty() {
-                        crate::algebra::with_split_hint(ways, || contribution_product(leaf))
+                        crate::algebra::with_split_hint(ways, || contribution_product(leaf, None))
                     } else {
                         std::mem::take(&mut leaf.product)
                     }
@@ -2496,13 +2534,16 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             // `subtract_contributions`, batched as before.
             // A product above a worker's share of all products' work splits
             // into that many ways (the largest would otherwise end the phase).
-            let product_work = |l: &Leaf<T>| (l.ids.len() * l.coupled.len().pow(2)) as f64;
+            // Wide products wait for `subtract_contributions`, which gives
+            // them every worker.
             let mut admitted = vec![false; owned.len()];
             if self.local_structure.is_none() {
                 let leaves = &self.leaves[owned.clone()];
                 let mut eligible: Vec<usize> = (0..leaves.len())
-                    .filter(|&k| residue_contribution(&leaves[k], t))
+                    .filter(|&k| residue_contribution(&leaves[k]))
                     .collect();
+                let total: f64 = eligible.iter().map(|&k| product_work(&leaves[k])).sum();
+                eligible.retain(|&k| !wide_product(product_work(&leaves[k]), total, threads));
                 eligible.sort_by(|&a, &b| {
                     product_work(&leaves[b]).total_cmp(&product_work(&leaves[a]))
                 });
@@ -2602,7 +2643,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         }
                         if result.is_ok() && *admit {
                             leaf.product = crate::algebra::with_split_hint(ways(leaf), || {
-                                contribution_product(leaf)
+                                contribution_product(leaf, None)
                             });
                         }
                         if result.is_err() {
@@ -2694,12 +2735,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let timer = crate::receipt::start();
         // Every pool thread is idle during the border factor.
         let (tf, s) = (&mut self.tf, &self.s);
-        // Wide types take exact dots, as leaves do.
+        // Wide types factor as leaves do: exact dots, recursive residue
+        // products from `REC_FACTOR_MIN` (BFSS L13 t5: 13156 border columns).
         let signs = &self.border_signs;
         let factor = |tf: &mut DenseLeaf<T>, count: &mut usize, split: bool| {
             if T::precision_bits() > 64 {
-                tf.envelope(s);
-                tf.factor_dots(s, signs, reg, count, split)
+                tf.factor_leaf(s, signs, reg, count, split)
             } else {
                 tf.factor_signed(s, signs, reg, count, split)
             }
