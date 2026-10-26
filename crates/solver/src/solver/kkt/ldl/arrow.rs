@@ -1906,12 +1906,17 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 g.len() >= SINGLE_LEAF_MIN && 2 * positive_entries >= g.len() * (g.len() + 1) / 2
             });
         // Leaves store B and Y over the border columns they couple to, and
-        // their Y solves and Schur products touch only those. Wide types,
-        // whose sparse alternative is serial scalar LDL, admit on these sizes
-        // when the full-border bound rejects (BFSS L13 t5: 63 cone leaves
-        // over 13156 primal columns, 42% coupled; QDLDL ran one thread). The
-        // returned estimate, which orients the arrow, keeps the full form.
+        // their Y solves and Schur products touch only those. A dense leaf's
+        // products over its coupled columns are updates any sparse
+        // elimination of it performs too (fill passes the leaf's coupled set
+        // to each of its rows), so only the dense trunk is at risk, bounded
+        // as above. Wide types, whose sparse alternative is serial scalar
+        // LDL, admit on these sizes when the full-border bound rejects (BFSS
+        // L13 t5: 63 cone leaves over 13156 primal columns, 42% coupled;
+        // QDLDL ran one thread). The returned estimate, which orients the
+        // arrow, keeps the full form.
         let mut cells = cells;
+        let mut coupled_work = 0u128;
         if T::precision_bits() > 64
             && leaves_ok
             && (t as u128).pow(3) <= 24 * leaf_work.max(1)
@@ -1924,7 +1929,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             }
             trunk.iter().enumerate().for_each(|(p, &id)| local[id] = p);
             let couples = group_couples(k, &owner, &local, groups.len(), t);
-            let (mut coupled_cells, mut coupled_work) = (0u128, 0u128);
+            let mut coupled_cells = 0u128;
             for (g, flags) in groups.iter().zip(&couples) {
                 let (g, q) = (
                     g.len() as u128,
@@ -1934,7 +1939,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 coupled_work += g * q * q;
             }
             cells = coupled_cells + 4 * (t as u128).pow(2) + 8 * n as u128;
-            work_ok = coupled_work + (t as u128).pow(3) <= 24 * leaf_work.max(1);
+            work_ok = true;
         }
         if crate::receipt::profile_requested() {
             // Observation-only grouping stats (plan PR-06): positive-sign
@@ -1947,7 +1952,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 .filter(|&(i, j)| signs[i] != signs[j])
                 .count();
             eprintln!(
-                "GROUP_STATS n={n} components={} leaf_min={} leaf_med={} leaf_max={} border={t} coupling_nnz={coupling} dense_mib={:.1} leaf_work={leaf_work} border_work={border_work} eligible={}",
+                "GROUP_STATS n={n} components={} leaf_min={} leaf_med={} leaf_max={} border={t} coupling_nnz={coupling} dense_mib={:.1} leaf_work={leaf_work} border_work={border_work} coupled_work={coupled_work} eligible={}",
                 groups.len(),
                 sizes.first().copied().unwrap_or(0),
                 sizes.get(sizes.len() / 2).copied().unwrap_or(0),
