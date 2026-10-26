@@ -596,7 +596,12 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
 
         let timer = crate::receipt::start();
         let (values, index) = (&self.Hsblocks, &map.Hsblocks);
-        _update_values(&mut self.ldlsolver, &mut self.KKT, index, values);
+        // The blocks' positions are distinct KKT entries.
+        match self.residual_pool.as_deref() {
+            Some(pool) if parallel => scatter_distinct(&mut self.KKT.nzval, index, values, pool),
+            _ => _update_values_KKT(&mut self.KKT, index, values),
+        }
+        self.ldlsolver.update_values(index, values);
         crate::receipt::finish("kkt.hs_values", timer);
 
         // Each operator relative entropy cone's rows N⁻¹A. Columns and cones
@@ -1661,7 +1666,7 @@ fn _update_values_KKT<T: FloatT>(KKT: &mut CscMatrix<T>, index: &[usize], values
 }
 
 /// `nzval[index[k]] = values[k]` over `pool` for distinct in-bounds
-/// positions (one ORE cone's rows: distinct A entries).
+/// positions (Hs blocks; one ORE cone's rows: distinct A entries).
 fn scatter_distinct<T: FloatT>(
     nzval: &mut [T],
     index: &[usize],

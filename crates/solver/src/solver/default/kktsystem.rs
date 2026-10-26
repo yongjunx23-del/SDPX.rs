@@ -8,8 +8,10 @@ use crate::solver::{
     kkt::{direct::*, *},
 };
 
+use crate::algebra::sparse_parallel::SparseParallel;
 use crate::algebra::*;
 use crate::mpi::all_succeeded;
+use std::iter::zip;
 
 // We require Send/Sync here to allow pyo3 builds to share
 // solver objects between threads.
@@ -37,6 +39,9 @@ pub struct DefaultKKTSystem<T> {
     const_terms: Option<HsdTerms<T>>,
     // The next affine step takes prepared cone bounds.
     prepared_affine: bool,
+    // Operator relative entropy rows of A and a row plan over the cone
+    // workers, built at the first solve that takes their Δs from AΔx.
+    ore_rows: Option<(Vec<usize>, SparseParallel)>,
 }
 
 impl<T> DefaultKKTSystem<T>
@@ -106,6 +111,7 @@ where
             fixed_tau: false,
             const_terms: None,
             prepared_affine: false,
+            ore_rows: None,
         }
     }
 }
@@ -400,7 +406,20 @@ where
         // as the binary64 condensed rows above do.
         if cones.iter().any(|c| c.is_ore()) {
             workz.waxpby(-T::one(), &rhs.z, lhs.τ, &data.b);
-            data.A.gemv(workz, &lhs.x, -T::one(), T::one());
+            // Only these rows are read: each equals the full product's, and
+            // the workers take them (BFSS L13 t5: 1.5 s serial per solve).
+            let (rows, plan) = self.ore_rows.get_or_insert_with(|| {
+                let ranges = zip(cones.iter(), cones.rng_cones.iter());
+                let rows = ranges
+                    .filter(|(cone, _)| cone.is_ore())
+                    .flat_map(|(_, rng)| rng.clone())
+                    .collect();
+                let mut plan = SparseParallel::new(&data.A);
+                let pool = crate::solver::core::traits::ConeCollection::worker_pool(&*cones);
+                plan.configure(&data.A, pool);
+                (rows, plan)
+            });
+            plan.forward_rows_local(&data.A, rows, workz, &lhs.x, -T::one(), T::one());
             for (cone, rng) in cones.iter().zip(cones.rng_cones.iter()) {
                 if cone.is_ore() {
                     lhs.s[rng.clone()].copy_from(&workz[rng.clone()]);

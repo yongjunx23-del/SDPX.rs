@@ -889,19 +889,57 @@ fn chunk_slot(r: usize, chunks: usize) -> usize {
     (r / PANEL) * PANEL * chunks + r % PANEL
 }
 
+/// Encoding origins of an operand: entry `r` of its view (stored row
+/// `r % ld`, column `r / ld`) is encoded from bit `lo + row[r % ld] +
+/// col[r / ld]`; an empty list adds nothing. A plain operand has one origin.
+struct Windows {
+    lo: i64,
+    row: Vec<i64>,
+    col: Vec<i64>,
+    ld: usize,
+}
+
+impl From<i64> for Windows {
+    fn from(lo: i64) -> Self {
+        Self {
+            lo,
+            row: Vec::new(),
+            col: Vec::new(),
+            ld: usize::MAX,
+        }
+    }
+}
+
+impl Windows {
+    /// Origins of entries `r0, r0 + 1, …`.
+    fn from_entry(&self, r0: usize) -> impl Iterator<Item = i64> + '_ {
+        let (mut r, mut c) = (r0 % self.ld, r0 / self.ld);
+        std::iter::repeat_with(move || {
+            let at = |v: &[i64], i: usize| v.get(i).copied().unwrap_or(0);
+            let lo = self.lo + at(&self.row, r) + at(&self.col, c);
+            r += 1;
+            if r == self.ld {
+                (r, c) = (0, c + 1);
+            }
+            lo
+        })
+    }
+}
+
 fn chunk_matrix<const N: usize>(
     x: View<'_, N>,
-    lo: i64,
+    lo: impl Into<Windows>,
     spread: i64,
     plan: &Plan,
     split: &Split<'_>,
 ) -> ChunkMatrix {
-    let len = x.len();
+    let (len, lo) = (x.len(), lo.into());
     let mut matrix = ChunkMatrix::new::<N>(len, spread, plan, split);
     let (chunks, width) = (matrix.chunks, matrix.width);
     // Rows are independent; a split call encodes whole panels over its ways.
     let fill = |r0: usize, panels: &mut [f64]| {
-        for r in r0..(r0 + panels.len() / chunks).min(len) {
+        let entries = r0..(r0 + panels.len() / chunks).min(len);
+        for (r, lo) in entries.zip(lo.from_entry(r0)) {
             if x.stored(r) {
                 fill_chunk(&x.data[r], &mut panels[chunk_slot(r - r0, chunks)..], chunks, lo, width);
             }
@@ -1134,14 +1172,14 @@ impl CachedResidues {
     /// so blocks and ways do not change the store.
     fn from_view<const N: usize>(
         x: View<'_, N>,
-        lo: i64,
+        lo: impl Into<Windows>,
         spread: i64,
         plan: &Plan,
         split: &Split<'_>,
         reusable: Option<Self>,
     ) -> Self {
         const BLOCK: usize = 64 * PANEL;
-        let len = x.len();
+        let (len, lo) = (x.len(), lo.into());
         Self::filled(plan.bits, len * plan.count(), reusable, |store| {
             let ways = split_ways(split).min(len / MIN_ROWS_PER_WAY).max(1);
             run_ways(split, ways, |w| {
@@ -1153,7 +1191,7 @@ impl CachedResidues {
                     if b0 > r0 {
                         m.e.fill(0.0);
                     }
-                    for r in b0..b0 + rows {
+                    for (r, lo) in (b0..b0 + rows).zip(lo.from_entry(b0)) {
                         if x.stored(r) {
                             let slot = chunk_slot(r - b0, chunks);
                             fill_chunk(&x.data[r], &mut m.e[slot..], chunks, lo, width);
@@ -1259,7 +1297,7 @@ const DECODE_PER_WAY: usize = 1 << 16;
 
 fn packed_operand<const N: usize>(
     x: View<'_, N>,
-    lo: i64,
+    lo: Windows,
     spread: i64,
     plan: &Plan,
     split: &Split<'_>,
@@ -2076,18 +2114,21 @@ pub(super) fn gemm<const N: usize>(
     // |S| <= k·2^(P+da)·2^(P+db); a CRT modulus above 4|S| keeps the signed
     // lift's fractional estimate inside (-1/4, 1/4).
     let p_bits = F::<N>::PRECISION_BITS as f64;
-    let needed = 2.0 * p_bits + (da + db) as f64 + (k.max(1) as f64).log2() + 3.0;
-    let Some(plan) = Plan::new(k, needed) else {
+    let needed = |da: i64, db: i64| 2.0 * p_bits + (da + db) as f64 + (k.max(1) as f64).log2() + 3.0;
+    let Some(mut plan) = Plan::new(k, needed(da, db)) else {
         return false;
     };
-    if packed_output && m >= 300 && !ta_n && tb_n && spread_probe() {
-        let (da2, db2, cola, colb) = balanced_spreads(&av, &bv, k);
-        let after = 2.0 * p_bits + (da2 + db2) as f64 + (k.max(1) as f64).log2() + 3.0;
-        eprintln!(
-            "RNSSPREAD m {m} k {k} da {da} db {db} col_a {cola} col_b {colb} balanced {da2} {db2} primes {} -> {}",
-            plan.count(),
-            Plan::new(k, after).map_or(0, |p| p.count())
-        );
+    // Widely spread large operands: per-output windows may take fewer primes
+    // (BFSS L13 t5 trunk products: 25 instead of 28).
+    let mut balanced = None;
+    let fewest = Plan::new(k, needed(0, 0)).map_or(0, |p| p.count());
+    // The same operand must take equal windows: only AᵀA or AAᵀ.
+    let gram = !same_operand || ta_n != tb_n;
+    if cache_b.is_none() && gram && m.min(n).min(k) >= BALANCE_MIN && plan.count() >= fewest + 2 {
+        let b = balance(&av, ta_n, &bv, tb_n, &scan);
+        if let Some(p) = Plan::new(k, needed(b.spread.0, b.spread.1)).filter(|p| p.count() < plan.count()) {
+            (plan, balanced) = (p, Some(b));
+        }
     }
     let (len_a, len_b) = (av.len(), bv.len());
     let selected = if upper_only && !packed_output {
@@ -2113,10 +2154,14 @@ pub(super) fn gemm<const N: usize>(
     };
     let split = split_plan(pool, (m * n * k) as u128 * plan.count() as u128);
     let reach = inner_reach(&bv, tb_n, k, n);
-    let ca = packed_operand(av, lo_a, da, &plan, &split);
+    let (wa, wb, spread, scales) = match balanced {
+        Some(b) => (b.a, b.b, b.spread, Some((b.rows, b.cols))),
+        None => (lo_a.into(), lo_b.into(), (da, db), None),
+    };
+    let ca = packed_operand(av, wa, spread.0, &plan, &split);
     let cb = (!same_operand).then(|| match cache_b {
         Some(cache) => cache.operand(bv, lo_b, db, &plan, &split),
-        None => packed_operand(bv, lo_b, db, &plan, &split),
+        None => packed_operand(bv, wb, spread.1, &plan, &split),
     });
     let timer = (split_ways(&split) > 1)
         .then(crate::receipt::start)
@@ -2125,10 +2170,17 @@ pub(super) fn gemm<const N: usize>(
     let optr = SendValues(out.as_mut_ptr());
     let write = |i: usize, v: F<N>| {
         let o = if selected.is_empty() { i } else { selected[i] };
+        let v = match &scales {
+            Some((rows, cols)) => {
+                let (r, c) = if packed_output { packed_entry(o) } else { (o % m, o / m) };
+                v.scale_pow2(rows[r] + cols[c])
+            }
+            None => v,
+        };
         // SAFETY: every output index is written by exactly one tile.
         unsafe { *optr.get().add(o) = v };
     };
-    let scale = lo_a + lo_b;
+    let scale = if scales.is_some() { 0 } else { lo_a + lo_b };
     let stored_b = cb.as_ref().map_or_else(|| ca.stored(), Operand::stored);
     if let (Some(sa), Some(sb)) = (ca.stored(), stored_b) {
         // Column blocks of every prime's products, each reconstructed before
@@ -2237,6 +2289,149 @@ pub(super) fn gemm<const N: usize>(
     ok
 }
 
+/// Smallest product dimension whose operands [`balance`] scans.
+const BALANCE_MIN: usize = 256;
+
+/// Per-output windows of op(A)·op(B) (`m × k` times `k × n`): row i of
+/// op(A) and column j of op(B) are encoded from their own least bits, after
+/// inner index l moves 2^s_l from A to B (s_l halves the gap between the
+/// row-normalized inner maxima of A and B). Every product term is kept, so
+/// output (i, j) is the same exact sum times 2^(rows[i] + cols[j]), rounded
+/// once: bitwise equal to one global window. Unlike the reverted global
+/// rescaling (`18241a5`), the scans run over the split and each row keeps
+/// its own least bit.
+struct Balanced {
+    a: Windows,
+    b: Windows,
+    spread: (i64, i64),
+    rows: Vec<i64>,
+    cols: Vec<i64>,
+}
+
+fn balance<const N: usize>(
+    a: &View<'_, N>,
+    ta_n: bool,
+    b: &View<'_, N>,
+    tb_n: bool,
+    split: &Split<'_>,
+) -> Balanced {
+    // An operand's outer index (rows of op(A), columns of op(B)) is its
+    // stored row when `outer_rows`, else its stored column. Bounds come back
+    // as (outer, inner).
+    let bounds = |x: &View<'_, N>, outer_rows: bool, outer: &[i64], inner: &[i64]| {
+        if outer_rows {
+            let [rows, cols] = exponent_bounds(x, outer, inner, split);
+            (rows, cols)
+        } else {
+            let [rows, cols] = exponent_bounds(x, inner, outer, split);
+            (cols, rows)
+        }
+    };
+    let (ra, rb) = (ta_n, !tb_n);
+    let top = |v: &[(i64, i64)]| -> Vec<i64> {
+        v.iter().map(|b| if b.1 == i64::MIN { 0 } else { b.1 }).collect()
+    };
+    let (outer_a, _) = bounds(a, ra, &[], &[]);
+    let (outer_b, _) = bounds(b, rb, &[], &[]);
+    let (_, inner_a) = bounds(a, ra, &top(&outer_a), &[]);
+    let (_, inner_b) = bounds(b, rb, &top(&outer_b), &[]);
+    let shift: Vec<i64> = std::iter::zip(&inner_a, &inner_b)
+        .map(|(x, y)| {
+            if x.1 == i64::MIN || y.1 == i64::MIN {
+                0
+            } else {
+                (x.1 - y.1).div_euclid(2)
+            }
+        })
+        .collect();
+    let negated: Vec<i64> = shift.iter().map(|s| -s).collect();
+    let (window_a, _) = bounds(a, ra, &[], &shift);
+    let (window_b, _) = bounds(b, rb, &[], &negated);
+    let least = |v: &[(i64, i64)]| -> Vec<i64> {
+        v.iter().map(|b| if b.0 == i64::MAX { 0 } else { b.0 }).collect()
+    };
+    let widest = |v: &[(i64, i64)]| {
+        let spreads = v.iter().filter(|b| b.0 != i64::MAX).map(|b| b.1 - b.0);
+        spreads.max().unwrap_or(0)
+    };
+    let (rows, cols) = (least(&window_a), least(&window_b));
+    // A's entry (i, l) starts at rows[i] + s_l, B's (l, j) at cols[j] − s_l.
+    let windows = |x: &View<'_, N>, outer_rows: bool, outer: &[i64], inner: Vec<i64>| {
+        let (row, col) = if outer_rows {
+            (outer.to_vec(), inner)
+        } else {
+            (inner, outer.to_vec())
+        };
+        Windows {
+            lo: 0,
+            row,
+            col,
+            ld: x.ld,
+        }
+    };
+    Balanced {
+        a: windows(a, ra, &rows, shift),
+        b: windows(b, rb, &cols, negated),
+        spread: (widest(&window_a), widest(&window_b)),
+        rows,
+        cols,
+    }
+}
+
+/// Least and greatest `exponent − P − row_off[r] − col_off[c]` over the
+/// non-zero entries of each stored row `r` and column `c` of `x` (an empty
+/// offset list adds nothing; `(MAX, MIN)` where there are none), by column
+/// ranges over `split`'s ways.
+fn exponent_bounds<const N: usize>(
+    x: &View<'_, N>,
+    row_off: &[i64],
+    col_off: &[i64],
+    split: &Split<'_>,
+) -> [Vec<(i64, i64)>; 2] {
+    const NONE: (i64, i64) = (i64::MAX, i64::MIN);
+    let rows = Mutex::new(vec![NONE; x.rows]);
+    let mut cols = vec![NONE; x.cols];
+    let ways = split_ways(split).min(x.rows * x.cols / SCAN_PER_WAY).max(1);
+    let per = x.cols.div_ceil(ways).max(1);
+    let scan = |w: usize, cols: &mut [(i64, i64)]| {
+        let mut local = vec![NONE; x.rows];
+        for (c, bound) in (w * per..).zip(cols.iter_mut()) {
+            let shift = col_off.get(c).copied().unwrap_or(0);
+            let column = &x.data[c * x.ld..c * x.ld + x.rows];
+            for (r, (row, value)) in local.iter_mut().zip(column).enumerate() {
+                let (mut lo, mut hi) = NONE;
+                if scan_exponent(value, &mut lo, &mut hi) == Some(true) {
+                    let e = hi - shift - row_off.get(r).copied().unwrap_or(0);
+                    *row = (row.0.min(e), row.1.max(e));
+                    *bound = (bound.0.min(e), bound.1.max(e));
+                }
+            }
+        }
+        let mut rows = rows.lock().unwrap();
+        for (a, b) in rows.iter_mut().zip(&local) {
+            *a = (a.0.min(b.0), a.1.max(b.1));
+        }
+    };
+    if ways <= 1 {
+        scan(0, &mut cols);
+    } else {
+        ways_chunks(split, &mut cols, per, scan);
+    }
+    [rows.into_inner().unwrap(), cols]
+}
+
+/// `(row, column)` of entry `o` of a column-major packed upper triangle.
+fn packed_entry(o: usize) -> (usize, usize) {
+    let mut c = (((8 * o + 1) as f64).sqrt() as usize).saturating_sub(1) / 2;
+    while c * (c + 1) / 2 > o {
+        c -= 1;
+    }
+    while (c + 1) * (c + 2) / 2 <= o {
+        c += 1;
+    }
+    (o - c * (c + 1) / 2, c)
+}
+
 /// Inner range `[lo, hi)` of `op(B)` (`k × n`) outside which column `j` is
 /// zero, as a triangular factor's columns are: residue terms there are exact
 /// zeros. `None` when every column spans the whole inner dimension.
@@ -2331,68 +2526,6 @@ const TILE_BLOCK: usize = 1 << 17;
 const TILE_ROWS: usize = 512;
 const TILE_COLS: usize = 256;
 const TILE_DEPTH: usize = 256;
-
-fn spread_probe() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SDPX_RNS_SPREAD").is_some())
-}
-
-/// Diagnostic: spreads of `Aᵀ·B` operands (`k` rows each) after exact
-/// power-of-two column scaling and balanced row scaling (2^-s on A's row,
-/// 2^s on B's), and the largest single-column spreads.
-fn balanced_spreads<const N: usize>(a: &View<'_, N>, b: &View<'_, N>, k: usize) -> (i64, i64, i64, i64) {
-    let exponents = |v: &View<'_, N>| -> Vec<Option<i64>> {
-        let mut e = vec![None; k * v.cols];
-        for j in 0..v.cols {
-            for i in 0..k {
-                let (mut lo, mut hi) = (i64::MAX, i64::MIN);
-                if scan_exponent(&v.data[i + j * v.ld], &mut lo, &mut hi) == Some(true) {
-                    e[i + j * k] = Some(hi);
-                }
-            }
-        }
-        e
-    };
-    let normalize = |e: &mut Vec<Option<i64>>, cols: usize| -> i64 {
-        let mut widest = 0;
-        for j in 0..cols {
-            let column = &mut e[j * k..(j + 1) * k];
-            let hi = column.iter().flatten().copied().max();
-            let lo = column.iter().flatten().copied().min();
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                widest = widest.max(hi - lo);
-                column.iter_mut().flatten().for_each(|x| *x -= hi);
-            }
-        }
-        widest
-    };
-    let (mut ea, mut eb) = (exponents(a), exponents(b));
-    let cola = normalize(&mut ea, a.cols);
-    let colb = normalize(&mut eb, b.cols);
-    let row_max = |e: &Vec<Option<i64>>, cols: usize, i: usize| {
-        (0..cols).filter_map(|j| e[i + j * k]).max()
-    };
-    let shift: Vec<i64> = (0..k)
-        .map(|i| match (row_max(&ea, a.cols, i), row_max(&eb, b.cols, i)) {
-            (Some(x), Some(y)) => (x - y).div_euclid(2),
-            _ => 0,
-        })
-        .collect();
-    let spread = |e: &Vec<Option<i64>>, cols: usize, sign: i64| {
-        let (mut lo, mut hi) = (i64::MAX, i64::MIN);
-        for j in 0..cols {
-            for i in 0..k {
-                if let Some(x) = e[i + j * k] {
-                    let x = x - sign * shift[i];
-                    lo = lo.min(x);
-                    hi = hi.max(x);
-                }
-            }
-        }
-        if lo == i64::MAX { 0 } else { hi - lo }
-    };
-    (spread(&ea, a.cols, 1), spread(&eb, b.cols, -1), cola, colb)
-}
 
 /// Upper triangle of `Σ_b Z_bᵀ·Y_b` with `Z_b = diag(d_b)·Y_b` rounded
 /// entrywise, summed exactly across every block and rounded once into
