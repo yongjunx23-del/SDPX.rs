@@ -93,6 +93,29 @@ fn f64_scaled<T: FloatT>(order: usize, scale: usize) -> usize {
     }
 }
 
+/// Border positions each group couples to through a stored entry: `owner`
+/// maps leaf ids to groups (`usize::MAX` on the border), `local` border ids
+/// to their positions.
+fn group_couples<T: FloatT>(
+    k: &CscMatrix<T>,
+    owner: &[usize],
+    local: &[usize],
+    groups: usize,
+    t: usize,
+) -> Vec<Vec<bool>> {
+    let mut couples = vec![vec![false; t]; groups];
+    for j in 0..k.n {
+        for &i in &k.rowval[k.colptr[j]..k.colptr[j + 1]] {
+            match (owner[i], owner[j]) {
+                (x, usize::MAX) if x != usize::MAX => couples[x][local[j]] = true,
+                (usize::MAX, y) if y != usize::MAX => couples[y][local[i]] = true,
+                _ => {}
+            }
+        }
+    }
+    couples
+}
+
 fn find(parent: &mut [usize], mut i: usize) -> usize {
     while parent[i] != i {
         parent[i] = parent[parent[i]];
@@ -1012,8 +1035,8 @@ struct Leaf<T> {
     // Other Y columns stay exactly zero, so they are skipped everywhere.
     coupled: Vec<usize>,
     couples: Vec<bool>,
-    // Local leaves store B/Y/Z over `coupled` only (column c of the suffix
-    // at `c * width`); generic leaves keep all t border columns.
+    // B/Y/Z hold `coupled` columns only (column c of the suffix at
+    // `c * width`): generic leaves and the unpanelled local leaves.
     packed: bool,
     h: Vec<T>,
     b: Vec<T>,
@@ -1030,19 +1053,19 @@ struct Leaf<T> {
 }
 
 impl<T: FloatT> Leaf<T> {
-    fn new(ids: Vec<usize>, t: usize) -> Self {
+    fn new(ids: Vec<usize>) -> Self {
         let g = ids.len();
         Self {
             ids,
             signs: Vec::new(),
             coupling_start: 0,
-            coupled: (0..t).collect(),
-            couples: vec![true; t],
+            coupled: Vec::new(),
+            couples: Vec::new(),
             packed: false,
             h: vec![T::zero(); g * g],
-            b: vec![T::zero(); g * t],
+            b: Vec::new(),
             factor: DenseLeaf::new(g, LEAF_BLOCK),
-            y: vec![T::zero(); g * t],
+            y: Vec::new(),
             // Generic leaves form Z = D⁻¹Y one column at a time while the
             // border Schur is assembled; only local structures store it.
             z: Vec::new(),
@@ -1430,18 +1453,10 @@ fn contribution_bytes<T: FloatT>(leaf: &Leaf<T>) -> usize {
 
 /// Upper triangle of a factored leaf's `YᵀD⁻¹Y` over its coupled columns,
 /// each entry one exact sum rounded once (Z = D⁻¹Y rounded entrywise).
-fn contribution_product<T: FloatT>(leaf: &Leaf<T>, t: usize) -> Vec<T> {
+fn contribution_product<T: FloatT>(leaf: &Leaf<T>) -> Vec<T> {
     let (g, q) = (leaf.ids.len(), leaf.coupled.len());
-    let mut packed = Vec::new();
-    let y = if q == t {
-        &leaf.y[..]
-    } else {
-        packed.reserve_exact(g * q);
-        for &j in &leaf.coupled {
-            packed.extend_from_slice(&leaf.y[j * g..(j + 1) * g]);
-        }
-        &packed[..]
-    };
+    debug_assert!(leaf.packed && leaf.y.len() == g * q);
+    let y = &leaf.y[..];
     let mut z = Vec::with_capacity(g * q);
     for source in y.chunks(g) {
         z.extend(source.iter().zip(&leaf.factor.dinv).map(|(&a, &d)| a * d));
@@ -1507,7 +1522,7 @@ fn subtract_contributions<T: FloatT>(
                 let ways = width.div_ceil(batch.len()).clamp(1, 8);
                 let build = |leaf: &mut Leaf<T>| {
                     if leaf.product.is_empty() {
-                        crate::algebra::with_split_hint(ways, || contribution_product(leaf, t))
+                        crate::algebra::with_split_hint(ways, || contribution_product(leaf))
                     } else {
                         std::mem::take(&mut leaf.product)
                     }
@@ -1561,9 +1576,9 @@ fn subtract_contributions_columns<T: FloatT>(
             let g = leaf.ids.len();
             let (y, dinv) = (&leaf.y, &leaf.factor.dinv);
             let c = leaf.coupled.binary_search(&j).unwrap();
-            let z: Vec<T> = (0..g).map(|k| y[k + j * g] * dinv[k]).collect();
-            for &i in &leaf.coupled[..=c] {
-                col[i] -= T::dot_fma(y[i * g..(i + 1) * g].iter().zip(&z));
+            let z: Vec<T> = (0..g).map(|k| y[k + c * g] * dinv[k]).collect();
+            for (r, &i) in leaf.coupled[..=c].iter().enumerate() {
+                col[i] -= T::dot_fma(y[r * g..(r + 1) * g].iter().zip(&z));
             }
         }
     };
@@ -1629,9 +1644,9 @@ fn queued_contribution_columns<T: FloatT>(
                     }
                     let g = leaf.ids.len();
                     let (y, dinv) = (&leaf.y, &leaf.factor.dinv);
-                    let z: Vec<T> = (0..g).map(|k| y[k + j * g] * dinv[k]).collect();
-                    for &i in &coupled[lo..hi] {
-                        part[i - r0] -= T::dot_fma(y[i * g..(i + 1) * g].iter().zip(&z));
+                    let z: Vec<T> = (0..g).map(|k| y[k + c * g] * dinv[k]).collect();
+                    for (r, &i) in (lo..hi).zip(&coupled[lo..hi]) {
+                        part[i - r0] -= T::dot_fma(y[r * g..(r + 1) * g].iter().zip(&z));
                     }
                 }
             };
@@ -1881,7 +1896,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         // lose to sparse QDLDL by an order of magnitude.
         let leaf_work: u128 = groups.iter().map(|g| (g.len() as u128).pow(3)).sum();
         let border_work = n_pos * (t as u128).pow(2) + (t as u128).pow(3);
-        let work_ok = border_work <= 24 * leaf_work.max(1);
+        let mut work_ok = border_work <= 24 * leaf_work.max(1);
         // A single leaf pays only when it is a large dense block (an owner
         // rank holding one sampled PSD block): the dense, pool-parallel leaf
         // factor then replaces scalar sparse LDL. Sparse single components
@@ -1890,6 +1905,37 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             || groups.first().is_some_and(|g| {
                 g.len() >= SINGLE_LEAF_MIN && 2 * positive_entries >= g.len() * (g.len() + 1) / 2
             });
+        // Leaves store B and Y over the border columns they couple to, and
+        // their Y solves and Schur products touch only those. Wide types,
+        // whose sparse alternative is serial scalar LDL, admit on these sizes
+        // when the full-border bound rejects (BFSS L13 t5: 63 cone leaves
+        // over 13156 primal columns, 42% coupled; QDLDL ran one thread). The
+        // returned estimate, which orients the arrow, keeps the full form.
+        let mut cells = cells;
+        if T::precision_bits() > 64
+            && leaves_ok
+            && (t as u128).pow(3) <= 24 * leaf_work.max(1)
+            && (!work_ok || cells * std::mem::size_of::<T>() as u128 > max_bytes)
+        {
+            let mut owner = vec![usize::MAX; n];
+            let mut local = vec![0usize; n];
+            for (gi, g) in groups.iter().enumerate() {
+                g.iter().for_each(|&id| owner[id] = gi);
+            }
+            trunk.iter().enumerate().for_each(|(p, &id)| local[id] = p);
+            let couples = group_couples(k, &owner, &local, groups.len(), t);
+            let (mut coupled_cells, mut coupled_work) = (0u128, 0u128);
+            for (g, flags) in groups.iter().zip(&couples) {
+                let (g, q) = (
+                    g.len() as u128,
+                    flags.iter().filter(|&&c| c).count() as u128,
+                );
+                coupled_cells += 2 * g * g + 2 * g * q + 8 * g;
+                coupled_work += g * q * q;
+            }
+            cells = coupled_cells + 4 * (t as u128).pow(2) + 8 * n as u128;
+            work_ok = coupled_work + (t as u128).pow(3) <= 24 * leaf_work.max(1);
+        }
         if crate::receipt::profile_requested() {
             // Observation-only grouping stats (plan PR-06): positive-sign
             // components, leaf size spread, border size, leaf-border coupling
@@ -2013,12 +2059,18 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         } else {
             Vec::new()
         };
+        // Generic leaves keep B and Y over their coupled border columns only.
+        let mut couples = if local_structure.is_none() {
+            group_couples(k, &owner, &local, groups.len(), t)
+        } else {
+            Vec::new()
+        };
         let leaves: Vec<Leaf<T>> = groups
             .into_iter()
             .enumerate()
             .map(|(gi, g)| {
                 // Local constraints may have a zero prefix in their border coupling.
-                let mut leaf = Leaf::new(g, if local_structure.is_some() { 0 } else { t });
+                let mut leaf = Leaf::new(g);
                 if let Some(kind) = local_structure {
                     let width = match kind {
                         LocalStructure::Soc => 2,
@@ -2065,6 +2117,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                     }
                 } else {
                     leaf.signs = vec![1];
+                    leaf.couples = std::mem::take(&mut couples[gi]);
+                    leaf.coupled = (0..t).filter(|&j| leaf.couples[j]).collect();
+                    leaf.packed = true;
+                    let cells = leaf.ids.len() * leaf.coupled.len();
+                    leaf.b = vec![T::zero(); cells];
+                    leaf.y = vec![T::zero(); cells];
                 }
                 leaf
             })
@@ -2160,28 +2218,6 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         panels.residual_entries.push((q, i, j));
                     }
                 }
-            }
-        }
-        if local_structure.is_none() {
-            for leaf in &mut solver.leaves {
-                leaf.couples.fill(false);
-            }
-            for j in 0..k.n {
-                for q in k.colptr[j]..k.colptr[j + 1] {
-                    let i = k.rowval[q];
-                    match (solver.owner[i], solver.owner[j]) {
-                        (x, usize::MAX) if x != usize::MAX => {
-                            solver.leaves[x].couples[solver.local[j]] = true
-                        }
-                        (usize::MAX, y) if y != usize::MAX => {
-                            solver.leaves[y].couples[solver.local[i]] = true
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            for leaf in &mut solver.leaves {
-                leaf.coupled = (0..t).filter(|&j| leaf.couples[j]).collect();
             }
         }
         solver.update_entries(0..k.nzval.len(), |q, value| *value = k.nzval[q]);
@@ -2561,7 +2597,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         }
                         if result.is_ok() && *admit {
                             leaf.product = crate::algebra::with_split_hint(ways(leaf), || {
-                                contribution_product(leaf, t)
+                                contribution_product(leaf)
                             });
                         }
                         if result.is_err() {
@@ -2749,9 +2785,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 *v -= T::dot_fma(class_terms(&self.classes, leaves, j, |leaf, i| &leaf.v[i]));
             } else {
                 for leaf in leaves[owned.clone()].iter().filter(|l| l.couples[j]) {
-                    let g = leaf.ids.len();
+                    let (g, p) = (leaf.ids.len(), leaf.column(j));
                     *v -= T::dot_fma(
-                        (0..g).map(|i| (&leaf.coupling_values()[i + j * g], &leaf.v[i])),
+                        (0..g).map(|i| (&leaf.coupling_values()[i + p * g], &leaf.v[i])),
                     );
                 }
             }
@@ -3100,11 +3136,11 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
                 }
             } else {
                 for leaf in leaves[owned.clone()].iter().filter(|l| l.couples[j]) {
-                    let g = leaf.ids.len();
+                    let (g, p) = (leaf.ids.len(), leaf.column(j));
                     for (c, v) in row.iter_mut().enumerate() {
                         *v -= T::dot_fma((0..g).map(|i| {
                             (
-                                &leaf.coupling_values()[i + j * g],
+                                &leaf.coupling_values()[i + p * g],
                                 &leaf.batch_v[i * cols + c],
                             )
                         }));
