@@ -8,6 +8,127 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-27 — BFSS L13 t5/128: parallel arrow path replaces serial QDLDL (kept, bfss-l13-threads)
+
+- Case: `bfss-rough-20261026/s128_L13t5_5/r2.365/energy_min.json` (13,156
+  variables, 39,255 rows, nnz(A) 3.98e7; 31 PSD, 30 ORE and 2 orthant
+  cones), 128 bits, 64 threads, gap 1e-9, feasibility 1e-12,
+  `auto_start_scale` off.
+- Release before (`031467b`, `finiteRhsTail-229557`):
+  - The arrow gates reject t5: border work is 49× the leaf work (gate 24×)
+    and the dense form needs 57 GB. The KKT therefore goes to serial QDLDL.
+  - PBS 230290: iteration 0 prints at 122 s. One thread then stays in
+    `__factor_inner`, with the Rayon workers asleep, for the rest of the
+    6 h walltime; iteration 1 never prints.
+- Forced release arrow before (`sdpx-cap`, the production build: the release
+  plus environment gate overrides and the cancelled-pivot fix):
+  - Same node as v7 (PBS 230542, node179): iteration 1 386.5 s, iteration
+    2 453.5 s, peak RSS 125.4 GiB.
+  - Iteration 2: refactor 408.3 s. Contribution products take 300.9 s at
+    24 of 64 busy threads (their residue products run at 8.2, with serial
+    CRT); the border factor takes 54.4 s and the leaves 50.2 s.
+  - trsv 16.6 s (trunk solve 12.4 s at 9.7 busy threads), ir 4.0 s. The
+    user's production run (PBS 230366) averages about 525 s per iteration.
+- Changes, `aa0c82b`..`25d4286`. Every product is still an exact sum
+  rounded once (RNS, exactdot). No precision, tolerance, refinement or
+  acceptance change.
+  - Wide types admit the arrow on the coupled border columns only. Leaves
+    store only their coupled columns, and the coupled admission bounds only
+    the dense trunk.
+  - Trunk and contributions: a cancelled trunk pivot is retried exactly,
+    the trunk factors recursively, and contribution products no longer need
+    the q² ≤ 8gt gate.
+  - RNS products: stored-operand products are tiled, with bounded residue
+    sums, and bookkeeping runs in parallel.
+  - RNS gemm uses per-output exponent windows. ORE Δs rows use a cached row
+    plan, and the Hs scatter runs in parallel.
+- After (v7, `25d4286`, same node):
+  - Iteration 1 takes 90.9 s and iteration 2 89.3 s.
+  - Iteration 2: refactor 68.1 s. Contribution products take 28.9 s at 56
+    busy threads, the border factor 25.1 s and the leaves 13.2 s.
+  - trsv 4.6 s (trunk solve 0.8 s), ir 2.9 s.
+  - Over the IP iterations, 47 of 64 threads are busy on average (31 for
+    `sdpx-cap`). Peak RSS is 96.0 GiB.
+  - Per iteration this is 5.1× faster than the forced arrow (refactor 6.0×)
+    and more than 230× faster than the release.
+  - The full solve (PBS 230543) averages 94.3 s per iteration over
+    iterations 2–21, so 300 iterations take about 8 h.
+- Balancing ABBA, PBS 230540 (node163, two iterations, iteration-2 wall):
+
+  | Build | a | b |
+  |---|---|---|
+  | v6 | 97.3 s | 98.3 s |
+  | v7 without balancing | 96.5 s | 94.9 s |
+  | v7 | 93.1 s | 92.3 s |
+
+  Balancing saves 3.1%: the border factor takes 26.2–26.3 s instead of
+  27.8–29.2 s. Against v6, v7 saves 5.2%. All six points are identical.
+  This reopens the global balancing reverted in `18241a5` on new probe
+  evidence: in PBS 230521 the largest trunk product drops from 28 to 25
+  primes. The new windows are per row and column, and they engage only
+  when they save primes. On the Ising-scaling mixed and Λ35 cases (PBS
+  230546, v7 without balancing vs v7), balancing is neutral: mixrs takes
+  10.52 vs 10.47 s per iteration and l35rs 1.497 vs 1.495 s (means of two
+  legs), with identical points.
+- Parity:
+  - L11, 128 bits (PBS 230536):
+    - Bitwise identical to `305fd9d` (PBS 230312).
+    - Against the release (PBS 230294): both end InsufficientProgress at
+      89 iterations. s and z agree within 1.5e-16 and 4.1e-18 relative;
+      the objectives within 6.6e-22 and 2.5e-19.
+    - The original-coordinate residuals are identical: |Ax+s−b|∞ 4.018e-3
+      and |A'z+q|∞ 109.4.
+    - x differs only along null(A): |dx| 1.7e5, |A dx|/max(|A||dx|)
+      1.2e-26, q'dx 4.7e-21.
+  - L11, 512 bits (PBS 230537, 32 threads):
+    - Bitwise identical to `305fd9d` (PBS 230313).
+    - Against the release (PBS 230314): both end InsufficientProgress at
+      115 iterations. x, s and z agree within 8.3e-59, 3.7e-61 and 2.1e-62
+      relative (max |x| 6.9e39); the objectives within 1.0e-66 and 4.2e-64.
+  - t5, 128 bits, two iterations, same node as `sdpx-cap`:
+    - s agrees to 1.4e-21, z to 2.0e-23, the objectives to 1.5e-23 and
+      5.8e-28.
+    - The residuals are the same: |Ax+s−b|∞ 3.115e8 and |A'z+q|∞ 2.834e12.
+    - x differs along null(A): |dx| 1.1e6, ratio 1.3e-32.
+    - Through iteration 20, the iteration rows of v6 (≡ v7) and the
+      production run agree in cost, gap, κ/τ, μ and step to every printed
+      digit. pres and dres differ: both are divided by ‖x‖, which carries
+      the null-space component.
+  - t5, 512 bits, one iteration: no reference from the current code fits a
+    node. `sdpx-cap` fails a 37.4 GB allocation in its first refactor (PBS
+    230542: 231 GiB peak at the 248 GB limit). The release's serial QDLDL
+    (PBS 230323, 4 threads) is still in its first factor after 4.8 h. v7
+    finishes the iteration in 8.4 min at a 187.5 GiB peak (PBS 230538).
+- Observation: x is not identified along null(A). At 512 bits, t5's first
+  step puts 1e42–8.6e48 into x. The normalized residuals then read 3.2e-41
+  and 4.4e-37, although the unnormalized primal residual is about 2.8e8.
+  This changes the meaning of the feasibility test at 512 bits. It is a
+  property of the problem and the residual normalization, and this work
+  does not change it.
+- Memory (v7):
+  - t5 at 128 bits: the KKT holds 56 GiB after assembly (77.7 GiB peak
+    while assembling). Two iterations peak at 96.0 GiB, and the full solve
+    reaches 109.1 GiB by iteration 24. `sdpx-cap` peaks at 125.4 GiB. Over
+    iterations 9–25 the existing `SDPX_MALLOC_TRIM=1` lowers the mean RSS
+    from 99.1 to 86.7 GiB (PBS 230544 vs 230543), with no visible time
+    cost.
+  - t5 at 512 bits: 187.5 GiB, one solve per node. `sdpx-cap` does not fit.
+  - Two 128-bit solves per node (PBS 230547, node157): each is bound to one
+    socket (CPUs and memory, about 125 GiB) with 64 threads. They take 94.9
+    and 104.3 s per iteration over iterations 2–3, against 89–94 s for one
+    solve alone. Each peaks at 97.6 GiB, and the points are identical. Three
+    solves do not fit.
+  - Full L13 (ORE up to n = 136, about 30k variables): the arrow storage
+    model gives 562–852 GiB at 128 bits (coupling 0.47–1.0) and
+    1.33–2.00 TiB at 512 bits. t5 measures 2.0× the model at 128 bits over
+    two iterations (2.25× by iteration 24) and 1.6× at 512 bits over one
+    iteration. Scaled the same way, the full program needs about 1.1–1.9 TiB
+    at 128 bits and 2.1–3.2 TiB at 512 bits, more over a long solve. The
+    dense trunk alone (4t² cells) takes 107 GiB at 128 bits and 268 GiB at
+    512 bits, so it fits one rank only at 128 bits.
+- Decision: kept. Evidence is in
+  `hpc:~/projects/sdpx-bfss-l13-20261026/runs/`.
+
 ## 2026-10-23 — Correct clustered MPFR singular vectors at central PSD points
 
 - Failure: for a central PSD pair `Z = mu S^-1`, the shifted-normal SVD

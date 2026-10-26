@@ -77,6 +77,13 @@ passes its independent 592-bit audit; the direction discrepancy falls from
 experimental limit cone and primal continuation are separate from this
 production correction; see the 2026-10-23 journal entry.
 
+BFSS L13 t5/128 (`bfss-l13-threads`, `25d4286`, 2026-10-27): the parallel
+arrow path replaces the release's serial QDLDL, whose first factor runs
+longer than 6 h. At 64 threads an iteration takes 89–94 s, 5.1× faster than
+the forced release arrow, so a 300-iteration solve takes about 8 h. Points
+agree with the release and the forced arrow. At 512 bits v7 peaks at
+187.5 GiB, where the forced arrow does not fit a node (journal 2026-10-27).
+
 ### Scoreboard against the goals
 
 | Case (64 threads, 768 bits, 1e-42 unless noted) | SDPX | Reference |
@@ -129,6 +136,10 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 - **BFSS L11u/128:** InsufficientProgress/107. Its unchanged point and
   capped 256/512-bit timings are kernel evidence; they do not establish an
   accepted full solution (journal 2026-10-21).
+- **BFSS null(A) in x:** the L11 and t5 primal variables are not identified
+  along null(A). At 512 bits, t5's first step puts up to 8.6e48 into x, so
+  the ‖x‖-normalized residuals (3e-41) no longer measure feasibility
+  (journal 2026-10-27).
 - **Large SU(2) Float64 (n 7054):** every PSD block has a kernel shared by all A_j and b (30/30/30/30/60/12/14 of 95/92/94/92/186/74/71).
   - SDPX is AlmostSolved, and MOSEK's "optimal" points fail the 1e-6 audit (r_d about 1e-4).
   - Medium SU(2) is now Solved and audited after task 16; the large case still fails.
