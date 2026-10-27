@@ -152,6 +152,12 @@ status and next actions.
     factors recursively again.
   - Factors that succeed recursively are unchanged, so v8 points equal
     v7's whenever no retry occurs.
+  - The same stall then hit 356max on v7 at iteration 99, where it spent
+    40 min in serial QDLDL. Restarted on v8 from iteration 95, it ended at
+    105.
+- Outcome: all seven moved cases ended InsufficientProgress, at iterations
+  89–105 with gaps 1.6e-3 to 9.7e-2, 20–46 min after their last restart.
+  This matches the four cases that ended on `sdpx-cap`.
 - Decision: kept. Evidence is in
   `hpc:~/projects/sdpx-bfss-l13-20261026/runs/`.
 
