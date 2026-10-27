@@ -126,6 +126,32 @@ status and next actions.
     at 128 bits and 2.1–3.2 TiB at 512 bits, more over a long solve. The
     dense trunk alone (4t² cells) takes 107 GiB at 128 bits and 268 GiB at
     512 bits, so it fits one rank only at 128 bits.
+- Production restarts: the seven t5b cases still running on `sdpx-cap`
+  moved to v7 with `--restart` from their checkpoints; four others had
+  already ended InsufficientProgress.
+  - A restart reloads the iterate exactly: restart iteration 0 reprints the
+    checkpoint row in every column. Its first iteration still takes the
+    first-iteration rules (reduced Mehrotra correction, unprepared affine
+    step), so it is not an uninterrupted continuation. From 371max's
+    iteration 70 (PBS 230630), the restart steps 0.406 where the
+    uninterrupted run stepped 0.634, and it then trails by about one
+    iteration.
+  - `sdpx-cap` restarts the same way (PBS 230643): rows 1–2 equal v7's in
+    cost, gap, κ/τ, μ and step. pres and dres differ in the last digit.
+  - On the user's shared nodes the restarted jobs take 110–185 s per
+    iteration; `sdpx-cap` took about 10 min there.
+- v8 (`46d1558`): restarted from 368max's iteration 85, v7's recursive
+  trunk produced an exact zero pivot. Dynamic regularization is off, so the
+  arrow failed and the KKT fell back to serial QDLDL: for 45 min only the
+  main thread ran, in `qdldl::__factor_inner`.
+  - `sdpx-cap`'s left-looking exact-dot trunk factors the same matrix (PBS
+    230671).
+  - A wide leaf whose recursive factor fails now refactors by exact dots.
+    In PBS 230676, v8 prints one `ARROW_REC_RETRY n=13156` (the trunk), and
+    restart row 1 equals `sdpx-cap`'s in every printed column. Row 2
+    factors recursively again.
+  - Factors that succeed recursively are unchanged, so v8 points equal
+    v7's whenever no retry occurs.
 - Decision: kept. Evidence is in
   `hpc:~/projects/sdpx-bfss-l13-20261026/runs/`.
 

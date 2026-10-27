@@ -83,6 +83,11 @@ longer than 6 h. At 64 threads an iteration takes 89–94 s, 5.1× faster than
 the forced release arrow, so a 300-iteration solve takes about 8 h. Points
 agree with the release and the forced arrow. At 512 bits v7 peaks at
 187.5 GiB, where the forced arrow does not fit a node (journal 2026-10-27).
+v8 (`46d1558`) refactors a wide leaf by exact dots when its recursive factor
+fails; on v7, a restart of r2.368 max from iteration 85 fell back to serial
+QDLDL. A restart reloads the iterate exactly, but its first iteration uses
+the first-iteration corrector, so it trails an uninterrupted run by about one
+iteration.
 
 ### Scoreboard against the goals
 
