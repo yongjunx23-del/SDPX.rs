@@ -755,7 +755,18 @@ impl<T: FloatT> DenseLeaf<T> {
         self.envelope(a, split);
         if T::precision_bits() > 64 {
             if self.n >= REC_FACTOR_MIN {
-                return self.factor_rec(a, signs, reg, regularize_count, split);
+                // One rounding per level can cancel a pivot to an exact zero
+                // that exact dots keep nonzero (BFSS L13 t5 r2.368 max,
+                // iteration 85: the trunk fell back to serial QDLDL). Such a
+                // leaf refactors by exact dots.
+                let mut count = 0;
+                if self.factor_rec(a, signs, reg, &mut count, split).is_ok() {
+                    *regularize_count += count;
+                    return Ok(());
+                }
+                if crate::receipt::profile_requested() {
+                    eprintln!("ARROW_REC_RETRY n={}", self.n);
+                }
             }
             return self.factor_dots(a, signs, reg, regularize_count, split);
         }
