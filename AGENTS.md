@@ -84,8 +84,8 @@ change and its evidence. Never weaken an accuracy gate to pass a check.
   `tol_feas_componentwise` stays off by default.
 - Keep original-coordinate outputs and accepted-iterate recovery. Sampled
   factors define their operator; never swap in rounded materializations.
-- Direct solves default to Ruiz + presolve + chordal; prepared handles keep
-  Ruiz and disable structural preprocessing.
+- Direct solves default to Ruiz + presolve + chordal, C ABI handles included;
+  data updates need presolve and chordal off (Ruiz may stay on).
 - No benchmark-name branches. Never weaken an accuracy gate to pass a check.
   Known failures stay labeled as failures (see the plan).
 

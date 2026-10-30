@@ -57,8 +57,10 @@ equilibration. Presolve removes infinite orthant bounds and exactly dependent
 equalities, merges SOC tail coordinates with zero rows of `A` (a constant
 tail makes the cone an orthant row), and fixes variables whose only nonzero is
 a single-entry orthant or equality row (objective constant reported in both
-costs); postsolve lifts `x`, `s`, `z` and certificates. Prepared handles keep Ruiz but disable structural
-preprocessing so later data updates keep the prepared structure. Consumed
+costs); postsolve lifts `x`, `s`, `z` and certificates. C ABI handles take
+all three by default; clearing `SDPX_PREPROCESS_PRESOLVE` and
+`SDPX_PREPROCESS_CHORDAL` before prepare keeps the structure for later
+`sdpx_update` calls (Ruiz may stay on). Consumed
 JSON problems move their owned P, q, b and A into setup instead of copying.
 Explicit, automatic and MPI owner partitions use one setup route; MPI derives
 the local owner from its communicator. Cost-history input fingerprints are

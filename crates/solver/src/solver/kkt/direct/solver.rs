@@ -596,7 +596,12 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
 
         let timer = crate::receipt::start();
         let (values, index) = (&self.Hsblocks, &map.Hsblocks);
-        _update_values(&mut self.ldlsolver, &mut self.KKT, index, values);
+        // The blocks' positions are distinct KKT entries.
+        match self.residual_pool.as_deref() {
+            Some(pool) if parallel => scatter_distinct(&mut self.KKT.nzval, index, values, pool),
+            _ => _update_values_KKT(&mut self.KKT, index, values),
+        }
+        self.ldlsolver.update_values(index, values);
         crate::receipt::finish("kkt.hs_values", timer);
 
         // Each operator relative entropy cone's rows N⁻¹A. Columns and cones
@@ -653,7 +658,11 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
             crate::receipt::finish("kkt.ore_rows", timer);
             let timer = crate::receipt::start();
             for (o, values) in zip(wave, &values) {
-                _update_values(&mut self.ldlsolver, &mut self.KKT, &o.pos, values);
+                match pool {
+                    Some(pool) => scatter_distinct(&mut self.KKT.nzval, &o.pos, values, pool),
+                    None => _update_values_KKT(&mut self.KKT, &o.pos, values),
+                }
+                self.ldlsolver.update_values(&o.pos, values);
             }
             crate::receipt::finish("kkt.ore_values", timer);
             first = end;
@@ -1654,6 +1663,34 @@ fn _update_values_KKT<T: FloatT>(KKT: &mut CscMatrix<T>, index: &[usize], values
     for (idx, v) in zip(index, values) {
         KKT.nzval[*idx] = *v;
     }
+}
+
+/// `nzval[index[k]] = values[k]` over `pool` for distinct in-bounds
+/// positions (Hs blocks; one ORE cone's rows: distinct A entries).
+fn scatter_distinct<T: FloatT>(
+    nzval: &mut [T],
+    index: &[usize],
+    values: &[T],
+    pool: &rayon::ThreadPool,
+) {
+    use rayon::prelude::*;
+    struct Base<T>(*mut T);
+    // SAFETY: the positions are distinct, so chunks write disjoint entries.
+    unsafe impl<T: Send> Sync for Base<T> {}
+    debug_assert!(index.iter().all(|&p| p < nzval.len()));
+    let base = Base(nzval.as_mut_ptr());
+    pool.install(|| {
+        index
+            .par_chunks(1 << 14)
+            .zip(values.par_chunks(1 << 14))
+            .for_each(|(index, values)| {
+                let base = &base;
+                for (&p, &v) in zip(index, values) {
+                    // SAFETY: p is in bounds and written by this chunk alone.
+                    unsafe { *base.0.add(p) = v };
+                }
+            })
+    });
 }
 
 fn _scale_values<T: FloatT>(

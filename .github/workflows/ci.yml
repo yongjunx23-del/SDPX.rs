@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   fmt:
@@ -30,11 +31,13 @@ jobs:
       - name: Native dependencies
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev m4
       - uses: Swatinem/rust-cache@v2
+      # Tests build with `fast` (release optimizations without LTO): the
+      # single-unit thin-LTO test binaries exhausted the runner's memory.
       - name: Workspace tests (system OpenBLAS)
-        run: cargo test --locked --release --workspace
+        run: cargo test --locked --profile fast --workspace
       - name: Solver tests (faer)
         run: >
-          cargo test --locked --release -p sdpx-solver
+          cargo test --locked --profile fast -p sdpx-solver
           --features faer-sparse
       - name: CLI build
         run: >
@@ -52,7 +55,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Solver tests (faer, Accelerate)
         run: >
-          cargo test --locked --release -p sdpx-solver
+          cargo test --locked --profile fast -p sdpx-solver
           --features sdp-accelerate,faer-sparse
 
   build-variants:

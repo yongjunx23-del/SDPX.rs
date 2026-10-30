@@ -133,18 +133,18 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 })
                 .collect();
             // Upper ZᵀY selects the same products as lower YᵀZ below.
-            if T::xgemm_blocks_upper_exact(t, &blocks, &mut self.s, self.pool.as_deref()) {
+            if T::xgemm_blocks_upper_exact(t, &blocks, &mut self.tf.l, self.pool.as_deref()) {
                 for j in 0..t {
                     for i in 0..=j {
-                        let value = self.c[i + j * t] - self.s[i + j * t];
-                        self.s[i + j * t] = value;
-                        self.s[j + i * t] = value;
+                        let value = self.c[i + j * t] - self.tf.l[i + j * t];
+                        self.tf.l[i + j * t] = value;
+                        self.tf.l[j + i * t] = value;
                     }
                 }
                 crate::receipt::finish("arrow.local_schur", timer);
                 return;
             }
-            self.s.copy_from_slice(&self.c);
+            self.tf.l.copy_from_slice(&self.c);
         }
         if T::precision_bits() <= 53 {
             self.assemble_local_schur_f64();
@@ -187,13 +187,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             }
         };
         if let Some(pool) = &self.pool {
-            pool.install(|| self.s.par_chunks_mut(t).enumerate().for_each(column));
+            pool.install(|| self.tf.l.par_chunks_mut(t).enumerate().for_each(column));
         } else {
-            self.s.chunks_mut(t).enumerate().for_each(column);
+            self.tf.l.chunks_mut(t).enumerate().for_each(column);
         }
         for j in 0..t {
             for i in j + 1..t {
-                self.s[j + i * t] = self.s[i + j * t];
+                self.tf.l[j + i * t] = self.tf.l[i + j * t];
             }
         }
         crate::receipt::finish("arrow.local_schur", timer);
@@ -235,9 +235,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         for j in 0..t {
             for i in j..t {
                 let total = parts.iter().fold(T::zero(), |v, p| v + p[at]);
-                let value = self.s[i + j * t] - total;
-                self.s[i + j * t] = value;
-                self.s[j + i * t] = value;
+                let value = self.tf.l[i + j * t] - total;
+                self.tf.l[i + j * t] = value;
+                self.tf.l[j + i * t] = value;
                 at += 1;
             }
         }

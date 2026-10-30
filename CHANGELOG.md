@@ -5,8 +5,48 @@ All notable changes to SDPX are recorded here. Versions follow
 iteration-limited runs and diagnostics; evidence is in
 [docs/JOURNAL.md](docs/JOURNAL.md).
 
-## Unreleased
+## [0.9.4] - 2026-10-30
 
+### Release highlights
+
+- Wide-precision bootstrap programs whose dense border was rejected now use
+  the parallel arrow factor instead of serial QDLDL. BFSS L13 t5 at 128 bits
+  on 64 threads takes 89–94 s per iteration, where the 0.9.3 first factor ran
+  past 6 h; at 512 bits an iteration takes 8.4 min at a 187.5 GiB peak.
+  Points agree with 0.9.3.
+- PMP resampling also covers repeated or nearby poles and PMPs written with
+  fewer digits: Λ19 written with 154 digits takes 89 iterations at 512 bits
+  instead of 105 on its kept samples.
+- The ORE limit cone `OpRelEntropyLimitConeT(n, m)` in the Rust API, CLI JSON
+  and C ABI (kind 8).
+
+### Added
+
+- `OpRelEntropyLimitConeT(n, m)`: the closure of the ORE cone plus
+  R+(0, −W, −W) in reduced coordinates. m = 0 reproduces the ORE cone and its
+  iterates.
+- `sdpx-primal-probe` (feature `serde`): an experimental feasible-primal
+  continuation with QICS-inspired projected centering. The solver does not
+  use it.
+
+### Changed
+
+- Arrow factor for wide types:
+  - Generic leaves store only their coupled border columns. Admission is
+    re-checked on the coupled sizes and bounds only the dense trunk.
+  - A trunk pivot that cancels in rounding is recomputed as the exact
+    difference rounded once. Wide trunks factor recursively, and a wide leaf
+    whose recursive factor fails refactors by exact dots before the arrow
+    gives up.
+  - Contribution products no longer need the q² ≤ 8gt storage gate; a large
+    product takes the whole pool.
+  - The border Schur complement is assembled and factored in place: one t²
+    array less (5.2 GiB at 128 bits and 12.9 GiB at 512 on BFSS L13 t5).
+- Residue GEMM: stored-operand products run as output-tile × inner-slice
+  tasks with bounded residue sums. Widely spread products use per-output
+  exponent windows, bitwise equal to one global window.
+- ORE systems: Δs rows run on a cached row plan over the cone workers, and
+  the Hs and ORE row values scatter over the pool.
 - Residue writers initialize spare capacity through `MaybeUninit`, retaining
   the no-clear encoding and decoding paths.
 - Requested original-coordinate acceptance checks apply to sampled and
@@ -15,11 +55,34 @@ iteration-limited runs and diagnostics; evidence is in
   MPFR summation, including cancellation across wide exponent ranges.
 - Presolve budgets count complete row merges. ORE row transforms publish in
   bounded waves; speculative step trials share a factor-workspace allowance.
+  Heavy serial ORE trials stay outside Rayon's global pool.
 - Serial MPFR JSON loading decodes values without retaining a token buffer.
 - PMP prefactor recovery handles repeated and nearby poles. Valid explicit
   samples remain usable when a prefactor cannot be inferred. Automatic
   workers use the largest block's precision-dependent workspace and respect
   cgroup/PBS memory allocations.
+
+### Fixed
+
+- Finite PSD, SOC and equality offsets above the 1e20 infinity sentinel are
+  preserved through singleton collapse and presolve and enter the
+  original-coordinate audit (a feasible large PSD program was reported
+  `PrimalInfeasible`). b must be finite, except +inf in `NonnegativeConeT`
+  rows.
+- Data updates rewrite the stored original-coordinate copy; an `update_q`
+  re-solve ended `InsufficientProgress`. The original gate treats orthant
+  bounds at presolve's sentinel contraction as infinite.
+- PMP resampling kept every block of a PMP written with fewer digits (Λ19
+  with 154): the degree cut now follows the input's noise level.
+- Clustered MPFR SVD vectors at central PSD points: clustering and pivot
+  thresholds keep the unshifted matrix scale.
+- The ORE limit cone's batched dual trials share the ORE cone's 512 MiB
+  allowance.
+- The PMP qstat memory probe drains its pipe while waiting; CLI stdin decodes
+  MPFR arrays on the pool; MPFR `xpotrf` 'U' splits only the trailing
+  columns.
+- An empty PSD block no longer calls BLAS from the symmetric upper product
+  (Accelerate exits on LDA = 0).
 
 ## [0.9.3] - 2026-10-21
 

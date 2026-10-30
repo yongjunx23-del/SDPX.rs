@@ -233,6 +233,28 @@ fn test_update_q_tuple() {
 }
 
 #[test]
+fn test_update_q_with_stored_original() {
+    // An equality RHS above the infinity sentinel keeps an original-coordinate
+    // copy without presolve or chordal changes; updates must refresh it.
+    // x0 = 2e20, -1 <= x1 <= 1.
+    let P = CscMatrix::<f64>::zeros((2, 2));
+    let A = CscMatrix::new(3, 2, vec![0, 1, 3], vec![0, 1, 2], vec![1., 1., -1.]);
+    let b = vec![2e20, 1., 1.];
+    let cones = vec![ZeroConeT(1), NonnegativeConeT(2)];
+    let settings = DefaultSettings {
+        presolve_enable: false,
+        ..DefaultSettings::default()
+    };
+    let mut solver = DefaultSolver::new(&P, &[0., 1.], &A, &b, &cones, settings).unwrap();
+    solver.solve();
+    assert_eq!(solver.solution.status, SolverStatus::Solved);
+    assert!(solver.update_q(&vec![0., -1.]).is_ok());
+    solver.solve();
+    assert_eq!(solver.solution.status, SolverStatus::Solved);
+    assert!((solver.solution.x[1] - 1.).abs() <= 1e-6);
+}
+
+#[test]
 fn test_update_b() {
     // original problem
     let (P, q, A, b, cones, settings) = updating_test_data();

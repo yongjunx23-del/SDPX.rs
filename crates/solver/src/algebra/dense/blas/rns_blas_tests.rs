@@ -418,7 +418,8 @@ fn residue_blas_congruence_is_exact_rounded_once() {
 #[test]
 fn residue_split_encode_matches_serial() {
     let mut rng = Lcg(31);
-    let (rows, cols) = (50, 45);
+    // Large enough for several encoder blocks per way.
+    let (rows, cols) = (200, 60);
     let data = random::<12>(&mut rng, rows * cols, 60);
     // Leading dimension above `rows`: padding entries must stay zero.
     let ld = rows + 3;
@@ -451,21 +452,21 @@ fn residue_split_encode_matches_serial() {
             .zip(&serial.e)
             .all(|(a, b)| a.to_bits() == b.to_bits()));
     }
+    // The blocked store holds the whole operand's chunk residues.
+    let len = x.len();
     for bits in [24, 25] {
         let plan = Plan::with_count(bits, plan.count());
         let chunks = chunk_matrix(x, lo, hi - lo, &plan, &Split::Serial);
-        let serial = CachedResidues::from_chunks(&chunks, &plan, &Split::Serial);
-        for split in [Split::Pool(&pool), Split::Ways(3)] {
-            let parallel = pool.install(|| CachedResidues::from_chunks(&chunks, &plan, &split));
-            match (&serial, &parallel) {
-                (CachedResidues::Narrow(a, c), CachedResidues::Narrow(b, d)) => {
-                    assert_eq!((a, c), (b, d))
-                }
-                (CachedResidues::Wide(a), CachedResidues::Wide(b)) => {
-                    assert!(a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits()));
-                }
-                _ => panic!("cache widths differ"),
-            }
+        let mut expected = Vec::new();
+        group_residues(chunks.view(), &plan, 0, plan.count(), &mut expected);
+        for split in [Split::Serial, Split::Pool(&pool), Split::Ways(3)] {
+            let store =
+                pool.install(|| CachedResidues::from_view(x, lo, hi - lo, &plan, &split, None));
+            assert_eq!(matches!(store, CachedResidues::Narrow(..)), bits <= 24);
+            let mut decoded = Vec::new();
+            store.extend(0..len * plan.count(), &mut decoded);
+            assert!(decoded.iter().zip(&expected).all(|(a, b)| a.to_bits() == b.to_bits()));
+            assert_eq!(decoded.len(), expected.len());
         }
     }
 }

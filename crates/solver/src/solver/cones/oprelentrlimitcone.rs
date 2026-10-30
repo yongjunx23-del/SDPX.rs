@@ -1479,8 +1479,13 @@ where
             at.is_some()
         });
         // dual: z + α dz certified at the trial primal point s + min(α, αs) ds,
-        // trials below αs batched on idle pool workers (as for the ORE cone)
+        // trials below αs batched on idle pool workers (as for the ORE cone),
+        // within the ORE cone's 512 MiB allowance: most trials factor S₀
         let ways = rayon::current_thread_index().map_or(1, |_| rayon::current_num_threads());
+        let k = n - m;
+        let ny = m * k + k * (k + 1);
+        let trial_bytes = 2 * ny * ny * std::mem::size_of::<T>();
+        let ways = ways.min(((512 << 20) / trial_bytes).max(1));
         let split = heavy::<T>(n);
         let this = &*self;
         let mut α = αmax;

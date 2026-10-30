@@ -1,6 +1,6 @@
 # SDPX
 
-SDPX v0.9.3 is a Rust conic solver derived from Clarabel.rs, with one homogeneous
+SDPX v0.9.4 is a Rust conic solver derived from Clarabel.rs, with one homogeneous
 self-dual interior-point engine for Float64 and fixed-precision MPFR arithmetic.
 It solves
 
@@ -10,9 +10,9 @@ $$
 $$
 
 Supported cones are zero, nonnegative, second-order, exponential, power,
-generalized power, PSD triangle and operator relative entropy. Sampled bootstrap
-SDPs retain their PSD coefficients as bases and sample weights through presolve;
-these factors remain the operator used by the solver.
+generalized power, PSD triangle, operator relative entropy and its limit cone.
+Sampled bootstrap SDPs retain their PSD coefficients as bases and sample
+weights through presolve; these factors remain the operator used by the solver.
 
 Use the native Rust API, the `sdpx` CLI or the C ABI in
 [`include/sdpx.h`](include/sdpx.h). The separate `sdpx-pmp2sdp` converter

@@ -777,6 +777,9 @@ impl<const N: usize> XpotrfScalar for F<N> {
                     });
             } else if tasks > 1 {
                 let (head, right) = a.split_at_mut((j + 1) * ld);
+                // columns j+1..n only: a longer buffer holds no matrix entries
+                let len = (tail * ld).min(right.len());
+                let right = &mut right[..len];
                 right.par_chunks_mut(ld).with_min_len(tail.div_ceil(tasks)).for_each(|col| {
                     let mut v = col[j];
                     for k in 0..j {

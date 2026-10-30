@@ -102,3 +102,19 @@ fn api_noncanonical_A_unsorted_rejected() {
         Err(SolverError::BadInputData(_))
     ));
 }
+
+#[test]
+fn api_infinite_rhs_only_in_orthant() {
+    // +inf is an absent orthant bound; elsewhere it would stay in the solve.
+    let (P, q, A, mut b, cones) = api_dim_check_data();
+    b[1] = f64::INFINITY;
+    assert!(DefaultSolver::new(&P, &q, &A, &b, &cones, DefaultSettings::default()).is_ok());
+    for (row, v) in [(0, f64::INFINITY), (1, f64::NAN), (1, f64::NEG_INFINITY)] {
+        let mut b = vec![0.; 6];
+        b[row] = v;
+        assert!(matches!(
+            DefaultSolver::new(&P, &q, &A, &b, &cones, DefaultSettings::default()),
+            Err(SolverError::BadInputData(_))
+        ));
+    }
+}

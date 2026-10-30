@@ -345,13 +345,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             );
             for (cj, &j) in columns.iter().enumerate() {
                 for (ci, &i) in columns.iter().enumerate().skip(cj) {
-                    self.s[i + j * t] -= g[ci + cj * q];
+                    self.tf.l[i + j * t] -= g[ci + cj * q];
                 }
             }
         }
         for j in 0..t {
             for i in j + 1..t {
-                self.s[j + i * t] = self.s[i + j * t];
+                self.tf.l[j + i * t] = self.tf.l[i + j * t];
             }
         }
         true

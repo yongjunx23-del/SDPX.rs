@@ -1,6 +1,6 @@
 # SDPX development plan
 
-Updated 2026-10-23. [AGENTS.md](AGENTS.md) defines working rules and numerical
+Updated 2026-10-30. [AGENTS.md](AGENTS.md) defines working rules and numerical
 contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 [Journal](docs/JOURNAL.md) holds full timings, job histories, source hashes,
 failed attempts and audit evidence. This file keeps goals, current state,
@@ -52,7 +52,15 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 - Ising ABBA `t14abba.pbs` / `t15abba.pbs`, with audit `audit_point.jl` (`t4dgate.pbs`'s Λ27 audit call is broken; use `t14aud.pbs`).
 - Small-case timing across nodes is bimodal: the conservative governor, a cold process, and MOSEK's warm minimum-of-3. Decide small Float64 timing with same-node interleaved A/B (`t13/abfam.py`).
 
-## Current state (2026-10-22)
+## Current state (2026-10-30)
+
+Version 0.9.4 adds the BFSS L13 parallel arrow path, the ORE limit cone and
+the 2026-10-30 review repairs: data updates rewrite the stored original copy,
+b admits +inf only in orthant rows, the limit cone's trials share the ORE
+allowance, the border Schur complement is factored in place (one t² array
+less) and PMP resampling works again on the Ising blocks (Λ19/512: 89 instead
+of 105 iterations; `d2b1fb5` had resampled no block). Open review findings
+are listed under next work.
 
 Version 0.9.3 includes the measured Float64 kernels and BFSS ORE parallel
 work recorded below. Its 25-iteration BFSS scaling table measures kernel
@@ -76,6 +84,18 @@ passes its independent 592-bit audit; the direction discrepancy falls from
 0.1976 to 8.654e-63. The BFSS L11 convergence failure remains open. Its
 experimental limit cone and primal continuation are separate from this
 production correction; see the 2026-10-23 journal entry.
+
+BFSS L13 t5/128 (`bfss-l13-threads`, `25d4286`, 2026-10-27): the parallel
+arrow path replaces the release's serial QDLDL, whose first factor runs
+longer than 6 h. At 64 threads an iteration takes 89–94 s, 5.1× faster than
+the forced release arrow, so a 300-iteration solve takes about 8 h. Points
+agree with the release and the forced arrow. At 512 bits v7 peaks at
+187.5 GiB, where the forced arrow does not fit a node (journal 2026-10-27).
+v8 (`46d1558`) refactors a wide leaf by exact dots when its recursive factor
+fails; on v7, a restart of r2.368 max from iteration 85 fell back to serial
+QDLDL. A restart reloads the iterate exactly, but its first iteration uses
+the first-iteration corrector, so it trails an uninterrupted run by about one
+iteration.
 
 ### Scoreboard against the goals
 
@@ -129,6 +149,10 @@ These Ising figures include task 15. The Float64 figures are from t16b (int5 `a5
 - **BFSS L11u/128:** InsufficientProgress/107. Its unchanged point and
   capped 256/512-bit timings are kernel evidence; they do not establish an
   accepted full solution (journal 2026-10-21).
+- **BFSS null(A) in x:** the L11 and t5 primal variables are not identified
+  along null(A). At 512 bits, t5's first step puts up to 8.6e48 into x, so
+  the ‖x‖-normalized residuals (3e-41) no longer measure feasibility
+  (journal 2026-10-27).
 - **Large SU(2) Float64 (n 7054):** every PSD block has a kernel shared by all A_j and b (30/30/30/30/60/12/14 of 95/92/94/92/186/74/71).
   - SDPX is AlmostSolved, and MOSEK's "optimal" points fail the 1e-6 audit (r_d about 1e-4).
   - Medium SU(2) is now Solved and audited after task 16; the large case still fails.
@@ -192,6 +216,27 @@ changed crate to rebuild after cache reuse, and verify binary hashes and
 execution plans. The journal preserves all failed evidence and final decisions.
 
 ## Next work, in order
+
+### Open review findings (2026-10-30)
+
+From the max-effort review of `crates/` at `7737088` (journal 2026-10-30);
+the BFSS figures are for L13 t5 (t = 13,156).
+
+- Arrow failures fall back to serial QDLDL silently (`arrow.rs`
+  `use_arrow || factor_fallback()`), which takes hours per factor on t5.
+  Triggers left after `46d1558`: the non-finite precheck, `factor_bounds`
+  (no exact retry), exact-duplicate rows in `factor_dots` and the border
+  factor. Returning the failure to regularization escalation changes a
+  contract: measure it first.
+- Owner/MPI Float64 recovery lacks the retained-row rule of `04442ef`, so
+  owner solves of qap6/gpp may stall AlmostSolved. Needs owner Float64 runs.
+- Arrow admission uses fixed 24× work ratios that were never calibrated; t5
+  is at 12.3×, and a 25% larger trunk flips it to serial QDLDL.
+- Leaves keep h and b after loading y and l: 9.3 GiB at 128 bits and 23 GiB
+  at 512 on t5. Rebuild them from the KKT passed to refactor.
+- ORE rows store a dense copy of A (6.25 GiB at 128 bits, 15.6 at 512 on
+  t5; sparse about 1.1/2.6), and the eigenbasis congruences run through zero
+  parts (37% of their products on L10u; ORE rows are 1–1.4% of an iteration).
 
 ### Performance plan (2026-10-16)
 
