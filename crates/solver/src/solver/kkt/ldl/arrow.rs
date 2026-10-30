@@ -777,8 +777,9 @@ impl<T: FloatT> DenseLeaf<T> {
 
     /// [`Self::factor_leaf`] of the matrix already in `l`; its exact-dots
     /// retry reloads `a`. Without `a` (the border assembles its symmetric
-    /// Schur complement in `l`), the strict upper triangle, which no factor
-    /// writes, and the saved diagonal restore the matrix.
+    /// Schur complement in `l`, generic leaves load theirs from the KKT), the
+    /// strict upper triangle, which no factor writes, and the saved diagonal
+    /// restore the matrix.
     fn factor_loaded(
         &mut self,
         a: Option<&[T]>,
@@ -810,7 +811,7 @@ impl<T: FloatT> DenseLeaf<T> {
                 match a {
                     Some(a) => self.l.copy_from_slice(a),
                     None => {
-                        mirror_upper(&mut self.l, n, None);
+                        mirror_upper(&mut self.l, n, false);
                         for (v, d) in self.l.iter_mut().step_by(n + 1).zip(diagonal) {
                             *v = d;
                         }
@@ -1154,6 +1155,27 @@ impl<T: FloatT> DenseLeaf<T> {
     }
 }
 
+/// The values an arrow factors, read from the KKT at each refactor (negated
+/// for [`Negated`]): generic leaves and their border keep no copy.
+struct Source<'a, T> {
+    kkt: &'a CscMatrix<T>,
+    owner: &'a [usize],
+    local: &'a [usize],
+    trunk: &'a [usize],
+    negate: bool,
+}
+
+impl<T: FloatT> Source<'_, T> {
+    fn value(&self, q: usize) -> T {
+        let v = self.kkt.nzval[q];
+        if self.negate {
+            -v
+        } else {
+            v
+        }
+    }
+}
+
 struct Leaf<T> {
     ids: Vec<usize>,
     signs: Vec<i8>,
@@ -1167,6 +1189,8 @@ struct Leaf<T> {
     // B/Y/Z hold `coupled` columns only (column c of the suffix at
     // `c * width`): generic leaves and the unpanelled local leaves.
     packed: bool,
+    // Local structures only: generic leaves load H into the factor and B
+    // into Y from the KKT at each refactor ([`Self::load`]).
     h: Vec<T>,
     b: Vec<T>,
     factor: DenseLeaf<T>,
@@ -1191,7 +1215,7 @@ impl<T: FloatT> Leaf<T> {
             coupled: Vec::new(),
             couples: Vec::new(),
             packed: false,
-            h: vec![T::zero(); g * g],
+            h: Vec::new(),
             b: Vec::new(),
             factor: DenseLeaf::new(g, LEAF_BLOCK),
             y: Vec::new(),
@@ -1316,6 +1340,68 @@ impl<T: FloatT> Leaf<T> {
         }
     }
 
+    /// Load a generic leaf from the `Triu` KKT: H into the factor (its upper
+    /// triangle and diagonal, then mirrored) and the raw couplings B into Y.
+    /// A coupling to a lower border id sits in the leaf's column, to a
+    /// higher one in the border's. `split`: over the ambient pool.
+    fn load(&mut self, source: &Source<'_, T>, split: bool) {
+        let g = self.ids.len();
+        let (kkt, owner, local) = (source.kkt, source.owner, source.local);
+        let (first, last, me) = (self.ids[0], self.ids[g - 1], owner[self.ids[0]]);
+        let (ids, coupled) = (&self.ids, &self.coupled);
+        // Each border column clears its column of Y and fills its entries
+        // from the leaf's rows.
+        let border = |(p, y): (usize, &mut [T])| {
+            y.fill(T::zero());
+            let col = source.trunk[coupled[p]];
+            if col < first {
+                return;
+            }
+            let span = kkt.colptr[col]..kkt.colptr[col + 1];
+            let rows = &kkt.rowval[span.clone()];
+            let begin = rows.partition_point(|&i| i < first);
+            let end = begin + rows[begin..].partition_point(|&i| i <= last);
+            for (q, &i) in (span.start + begin..).zip(&rows[begin..end]) {
+                if owner[i] == me {
+                    y[local[i]] = source.value(q);
+                }
+            }
+        };
+        if split {
+            self.y.par_chunks_mut(g).enumerate().with_min_len(64).for_each(border);
+        } else {
+            self.y.chunks_mut(g).enumerate().for_each(border);
+        }
+        let (l, y) = (Base(self.factor.l.as_mut_ptr()), Base(self.y.as_mut_ptr()));
+        let column = |lj: usize| {
+            let (l, y) = (&l, &y);
+            let col = ids[lj];
+            // SAFETY: leaf column lj alone writes entries (i ≤ lj, lj) of the
+            // factor and row lj of Y. A diagonal outside the pattern stays 0.
+            unsafe { *l.0.add(lj + lj * g) = T::zero() };
+            let mut p = 0;
+            for q in kkt.colptr[col]..kkt.colptr[col + 1] {
+                let i = kkt.rowval[q];
+                if owner[i] == me {
+                    debug_assert!(local[i] <= lj);
+                    unsafe { *l.0.add(local[i] + lj * g) = source.value(q) };
+                } else {
+                    // Border rows ascend, and each is a coupled column.
+                    while coupled[p] < local[i] {
+                        p += 1;
+                    }
+                    unsafe { *y.0.add(lj + p * g) = source.value(q) };
+                }
+            }
+        };
+        if split {
+            (0..g).into_par_iter().with_min_len(64).for_each(column);
+        } else {
+            (0..g).for_each(column);
+        }
+        mirror_upper(&mut self.factor.l, g, split);
+    }
+
     /// H = LDLᵀ and Y = L⁻¹B; the border Schur S = C - ΣYᵀD⁻¹Y is formed by
     /// `subtract_contribution`. `split`: the pool has more threads than
     /// leaves, so the border columns of Y also run in parallel (each column's
@@ -1327,6 +1413,7 @@ impl<T: FloatT> Leaf<T> {
         regularize_count: &mut usize,
         split: bool,
         split_factor: bool,
+        source: Option<&Source<'_, T>>,
     ) -> Result<(), &'static str> {
         let g = self.ids.len();
         // A scalar primal suffix has L=1: Y=B. Packed bound panels own Z,
@@ -1335,28 +1422,34 @@ impl<T: FloatT> Leaf<T> {
         if self.signs.is_empty() {
             return self.factor.factor_bounds(&self.h, reg, regularize_count);
         }
-        self.factor
-            .factor_leaf(&self.h, &self.signs, reg, regularize_count, split_factor)?;
-        if self.y.is_empty() {
-            return Ok(());
-        }
         let start = self.coupling_start;
         let width = g - start;
         // Large panels copy and scale over the pool (BFSS L13 t5: 5e7
         // entries per ORE leaf ran serially on the leaf phase's tail).
         let wide = split && width > 0 && self.y.len() >= 1 << 16;
-        if self.b.len() < self.y.len() {
-            // The suffix's first row has L=1 and stays raw in Y.
-            if width > 1 {
-                for (column, raw) in self.y.chunks_mut(width).zip(self.b.chunks(width - 1)) {
-                    column[1..].copy_from_slice(raw);
-                }
-            }
-        } else if wide {
-            let (y, b) = (self.y.par_chunks_mut(width), self.b.par_chunks(width));
-            y.zip(b).for_each(|(y, b)| y.copy_from_slice(b));
+        if let Some(source) = source {
+            self.load(source, split_factor || wide);
+            self.factor
+                .factor_loaded(None, &self.signs, reg, regularize_count, split_factor)?;
         } else {
-            self.y.copy_from_slice(&self.b);
+            self.factor
+                .factor_leaf(&self.h, &self.signs, reg, regularize_count, split_factor)?;
+            if self.b.len() < self.y.len() {
+                // The suffix's first row has L=1 and stays raw in Y.
+                if width > 1 {
+                    for (column, raw) in self.y.chunks_mut(width).zip(self.b.chunks(width - 1)) {
+                        column[1..].copy_from_slice(raw);
+                    }
+                }
+            } else if wide {
+                let (y, b) = (self.y.par_chunks_mut(width), self.b.par_chunks(width));
+                y.zip(b).for_each(|(y, b)| y.copy_from_slice(b));
+            } else {
+                self.y.copy_from_slice(&self.b);
+            }
+        }
+        if self.y.is_empty() {
+            return Ok(());
         }
         // Exactly accumulated types solve Y by rows: one exact dot per entry.
         let rows = T::precision_bits() > 64;
@@ -1920,13 +2013,16 @@ fn queued_contribution_columns<T: FloatT>(
     pool.install(|| crate::algebra::run_queue(jobs, workers));
 }
 
+/// Shared base of a buffer whose parallel writers touch disjoint entries.
+struct Base<T>(*mut T);
+// SAFETY: every user writes disjoint entries (see each use).
+unsafe impl<T: Send> Sync for Base<T> {}
+
 /// Copy the strict upper triangle of the order-`t` column-major `s` into its
-/// lower triangle, in blocks of 64 rows over `pool`, 64 columns at a time.
-fn mirror_upper<T: FloatT>(s: &mut [T], t: usize, pool: Option<&rayon::ThreadPool>) {
+/// lower triangle, in blocks of 64 rows (over the ambient pool when
+/// `parallel`), 64 columns at a time.
+fn mirror_upper<T: FloatT>(s: &mut [T], t: usize, parallel: bool) {
     const B: usize = 64;
-    struct Base<T>(*mut T);
-    // SAFETY: blocks touch disjoint entries (see below).
-    unsafe impl<T: Send> Sync for Base<T> {}
     let base = Base(s.as_mut_ptr());
     let block = |b: usize| {
         let base = &base;
@@ -1941,9 +2037,10 @@ fn mirror_upper<T: FloatT>(s: &mut [T], t: usize, pool: Option<&rayon::ThreadPoo
             }
         }
     };
-    match pool {
-        Some(pool) => pool.install(|| (0..t.div_ceil(B)).into_par_iter().for_each(block)),
-        None => (0..t.div_ceil(B)).for_each(block),
+    if parallel {
+        (0..t.div_ceil(B)).into_par_iter().for_each(block);
+    } else {
+        (0..t.div_ceil(B)).for_each(block);
     }
 }
 
@@ -2032,8 +2129,9 @@ struct CouplingClass {
 }
 
 pub struct ArrowLDLSolver<T: FloatT> {
-    // Only the fixed sparse pattern is global. Numerical entries live in
-    // their leaf H/B or border C; the parent retains the original KKT for IR.
+    // Only the fixed sparse pattern is global. Local structures keep their
+    // entries in leaf H/B and border C; generic arrows read theirs from the
+    // KKT passed to `refactor` (the caller's synchronized operator).
     colptr: Vec<usize>,
     rowval: Vec<usize>,
     signs: Vec<i8>,
@@ -2053,6 +2151,8 @@ pub struct ArrowLDLSolver<T: FloatT> {
     fallback: Option<BoxedDirectLDLSolver<T>>,
     // the caller's ordering for the fallback (None: QDLDL's own AMD)
     fallback_perm: Option<Vec<usize>>,
+    // Factors −K ([`Negated`]).
+    negated: bool,
     use_arrow: bool,
     // Shared-SOC leaf primal columns: eliminated after their SPD cone block,
     // their pivot P_jj + aᵀH⁻¹a is positive without the static shift.
@@ -2174,6 +2274,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         groups.sort_by_key(|g| g[0]);
         let t = trunk.len();
         let n_pos = (n - t) as u128;
+        // Generic arrows no longer store h, b or C (they read the KKT), but
+        // admission still counts them: the backend choice is unchanged.
         let cells: u128 = groups
             .iter()
             .map(|g| {
@@ -2283,11 +2385,11 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         settings: &CoreSettings<T>,
         perm: Option<Vec<usize>>,
     ) -> Option<Negated<T>> {
-        let mut neg = k.clone();
-        neg.nzval.iter_mut().for_each(|v| *v = -*v);
+        // A generic arrow reads only the pattern here: refactors negate.
         let signs: Vec<i8> = signs.iter().map(|&s| -s).collect();
-        let mut inner = Self::try_new(&neg, &signs, settings)?;
+        let mut inner = Self::try_new(k, &signs, settings)?;
         inner.fallback_perm = perm;
+        inner.negated = true;
         Some(Negated { inner })
     }
 
@@ -2376,6 +2478,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 // Local constraints may have a zero prefix in their border coupling.
                 let mut leaf = Leaf::new(g);
                 if let Some(kind) = local_structure {
+                    leaf.h = vec![T::zero(); leaf.ids.len().pow(2)];
                     let width = match kind {
                         LocalStructure::Soc => 2,
                         LocalStructure::SharedSoc => leaf.ids.len(),
@@ -2424,9 +2527,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                     leaf.couples = std::mem::take(&mut couples[gi]);
                     leaf.coupled = (0..t).filter(|&j| leaf.couples[j]).collect();
                     leaf.packed = true;
-                    let cells = leaf.ids.len() * leaf.coupled.len();
-                    leaf.b = vec![T::zero(); cells];
-                    leaf.y = vec![T::zero(); cells];
+                    leaf.y = vec![T::zero(); leaf.ids.len() * leaf.coupled.len()];
                 }
                 leaf
             })
@@ -2473,7 +2574,10 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             owner,
             local,
             leaves,
-            c: vec![T::zero(); t * t],
+            c: match local_structure {
+                Some(_) => vec![T::zero(); t * t],
+                None => Vec::new(),
+            },
             tf: DenseLeaf::new(t, FORWARD_BLOCK),
             tx: vec![T::zero(); t],
             batch_tx: Vec::new(),
@@ -2481,6 +2585,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             regularize_count: 0,
             fallback: None,
             fallback_perm: None,
+            negated: false,
             use_arrow: false,
             unshifted,
             shift_exempt: false,
@@ -2523,7 +2628,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 }
             }
         }
-        solver.update_entries(0..k.nzval.len(), |q, value| *value = k.nzval[q]);
+        if local_structure.is_some() {
+            solver.update_entries(0..k.nzval.len(), |q, value| *value = k.nzval[q]);
+        }
         solver
     }
 
@@ -2644,63 +2751,6 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         })
     }
 
-    /// The existing QDLDL fallback needs a CSC input. Reconstruct it only
-    /// when Arrow fails, including the caller's current static shifts.
-    fn materialize(&self) -> CscMatrix<T> {
-        let t = self.trunk.len();
-        let coupling = |id: usize, row: usize, col: usize| {
-            if let Some(panels) = &self.exact_bound_panels {
-                return panels.y[id + col * self.leaves.len()];
-            }
-            #[cfg(feature = "faer-sparse")]
-            if let Some(panels) = &self.bound_panels {
-                return T::from_f64(panels.y[id + col * self.leaves.len()]).unwrap();
-            }
-            let leaf = &self.leaves[id];
-            if leaf.b.len() < leaf.y.len() {
-                let width = leaf.ids.len() - leaf.coupling_start;
-                let (r, c) = (row - leaf.coupling_start, leaf.column(col));
-                if r == 0 {
-                    leaf.y[c * width]
-                } else {
-                    leaf.b[r - 1 + c * (width - 1)]
-                }
-            } else {
-                leaf.b[leaf.coupling_index(row, col)]
-            }
-        };
-        let mut values = Vec::with_capacity(self.rowval.len());
-        for j in 0..self.n {
-            for q in self.colptr[j]..self.colptr[j + 1] {
-                let i = self.rowval[q];
-                let (li, lj) = (self.local[i], self.local[j]);
-                values.push(match (self.owner[i], self.owner[j]) {
-                    (x, y) if x == usize::MAX && y == usize::MAX => self.c[li + lj * t],
-                    (x, y) if x != usize::MAX && y != usize::MAX => {
-                        debug_assert_eq!(x, y);
-                        let leaf = &self.leaves[x];
-                        leaf.h[li + lj * leaf.ids.len()]
-                    }
-                    (x, y) => {
-                        let (id, row, col) = if x != usize::MAX {
-                            (x, li, lj)
-                        } else {
-                            (y, lj, li)
-                        };
-                        coupling(id, row, col)
-                    }
-                });
-            }
-        }
-        CscMatrix::new(
-            self.n,
-            self.n,
-            self.colptr.clone(),
-            self.rowval.clone(),
-            values,
-        )
-    }
-
     /// `x = K⁻¹b` for a trunk-free arrow (`K` block diagonal over its
     /// leaves), column by column with exact-dot rows: every forward and
     /// backward entry is one exact dot rounded once. Never less accurate than
@@ -2760,21 +2810,23 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             .map_or(0..self.leaves.len(), LeafRanks::owned)
     }
 
-    fn factor_arrow(&mut self) -> bool {
-        if !self.c.is_finite()
-            || self.leaves.iter().any(|leaf| {
-                !leaf.h.is_finite()
-                    || !leaf.b.is_finite()
-                    || (leaf.b.len() < leaf.y.len()
-                        && leaf
-                            .y
-                            .iter()
-                            .step_by(leaf.ids.len() - leaf.coupling_start)
-                            .any(|v| !v.is_finite()))
-            })
-        {
+    fn factor_arrow(&mut self, kkt: &CscMatrix<T>) -> bool {
+        // Every value the arrow factors is a KKT entry.
+        let finite = match &self.pool {
+            Some(pool) => pool.install(|| kkt.nzval.par_chunks(1 << 16).all(|v| v.is_finite())),
+            None => kkt.nzval.is_finite(),
+        };
+        if !finite {
             return false;
         }
+        let source = self.local_structure.is_none().then(|| Source {
+            kkt,
+            owner: &self.owner,
+            local: &self.local,
+            trunk: &self.trunk,
+            negate: self.negated,
+        });
+        let source = source.as_ref();
         let reg = self.settings.dynamic_regularization_enable.then_some((
             self.settings.dynamic_regularization_eps,
             self.settings.dynamic_regularization_delta,
@@ -2859,8 +2911,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         .par_iter_mut()
                         .try_for_each(|leaf| {
                             let mut n = 0;
-                            let result =
-                                leaf.refactor(t, reg, &mut n, split, split_factor(leaf.ids.len()));
+                            let split_factor = split_factor(leaf.ids.len());
+                            let result = leaf.refactor(t, reg, &mut n, split, split_factor, source);
                             if n != 0 {
                                 count.fetch_add(n, Ordering::Relaxed);
                             }
@@ -2910,8 +2962,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                         };
                         let leaf: &mut Leaf<T> = &mut slot.lock().unwrap();
                         let mut n = 0;
-                        let result =
-                            leaf.refactor(t, reg, &mut n, split, split_factor(leaf.ids.len()));
+                        let split_factor = split_factor(leaf.ids.len());
+                        let result = leaf.refactor(t, reg, &mut n, split, split_factor, source);
                         if n != 0 {
                             count.fetch_add(n, Ordering::Relaxed);
                         }
@@ -2943,7 +2995,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             let count = &mut self.regularize_count;
             self.leaves[owned.clone()]
                 .iter_mut()
-                .try_for_each(|leaf| leaf.refactor(t, reg, count, false, false))
+                .try_for_each(|leaf| leaf.refactor(t, reg, count, false, false, source))
                 .is_ok()
         };
         crate::receipt::finish("arrow.leaves", timer);
@@ -2959,6 +3011,27 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         if self.ranks.as_ref().is_some_and(|r| !r.is_root()) {
             self.tf.l.fill(T::zero());
+        } else if let Some(source) = source {
+            // C's upper triangle from the border columns; the lower one is
+            // mirrored after the contributions.
+            let (kkt, owner, local) = (source.kkt, source.owner, source.local);
+            let column = |(c, s): (usize, &mut [T])| {
+                s[..=c].fill(T::zero());
+                let j = source.trunk[c];
+                for q in kkt.colptr[j]..kkt.colptr[j + 1] {
+                    let i = kkt.rowval[q];
+                    if owner[i] == usize::MAX {
+                        s[local[i]] = source.value(q);
+                    }
+                }
+            };
+            let s = &mut self.tf.l;
+            match &self.pool {
+                Some(pool) => {
+                    pool.install(|| s.par_chunks_mut(t.max(1)).enumerate().for_each(column))
+                }
+                None => s.chunks_mut(t.max(1)).enumerate().for_each(column),
+            }
         } else if let Some(pool) = &self.pool {
             let (s, c) = (&mut self.tf.l, &self.c);
             pool.install(|| {
@@ -2979,7 +3052,10 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 t,
                 self.pool.as_deref(),
             );
-            mirror_upper(&mut self.tf.l, t, self.pool.as_deref());
+            match &self.pool {
+                Some(pool) => pool.install(|| mirror_upper(&mut self.tf.l, t, true)),
+                None => mirror_upper(&mut self.tf.l, t, false),
+            }
             crate::receipt::finish("arrow.contribution", timer);
         }
         if let Some(ranks) = &self.ranks {
@@ -3035,8 +3111,16 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         ok
     }
 
-    fn factor_fallback(&mut self) -> bool {
-        let matrix = self.materialize();
+    fn factor_fallback(&mut self, kkt: &CscMatrix<T>) -> bool {
+        // The caller's KKT holds every value the arrow factors (with its
+        // current static shifts), negated for −K.
+        let matrix = if self.negated {
+            let mut matrix = kkt.clone();
+            matrix.nzval.iter_mut().for_each(|v| *v = -*v);
+            std::borrow::Cow::Owned(matrix)
+        } else {
+            std::borrow::Cow::Borrowed(kkt)
+        };
         if self.fallback.is_none() {
             let solver: BoxedDirectLDLSolver<T> =
                 Box::new(super::qdldl::QDLDLDirectLDLSolver::new(
@@ -3048,9 +3132,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             self.fallback = Some(solver);
         }
         let solver = self.fallback.as_mut().unwrap();
-        // The fallback's internal permuted copy must observe the same values
-        // the caller has written into the owned blocks, including its
-        // temporary regularization shifts.
+        // The fallback's internal permuted copy must observe the current
+        // values, including the caller's temporary regularization shifts.
         let indices: Vec<usize> = (0..self.rowval.len()).collect();
         solver.update_values(&indices, &matrix.nzval);
         solver.set_pool(self.pool.clone());
@@ -3199,14 +3282,12 @@ impl<T: FloatT> HasLinearSolverInfo for Negated<T> {
     }
 }
 
+// The inner generic arrow reads −K from the KKT at each refactor, so the
+// caller's value updates need no routing.
 impl<T: FloatT> DirectLDLSolver<T> for Negated<T> {
-    fn update_values(&mut self, index: &[usize], values: &[T]) {
-        self.inner.update_values_mapped(index, values, |v| -v);
-    }
+    fn update_values(&mut self, _index: &[usize], _values: &[T]) {}
 
-    fn scale_values(&mut self, index: &[usize], scale: T) {
-        self.inner.scale_values(index, scale);
-    }
+    fn scale_values(&mut self, _index: &[usize], _scale: T) {}
 
     fn solve(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T]) {
         self.negated_solve(b, |s, b| s.solve(kkt, x, b));
@@ -3272,16 +3353,19 @@ impl<T: FloatT> HasLinearSolverInfo for ArrowLDLSolver<T> {
     }
 }
 
-impl<T: FloatT> ArrowLDLSolver<T> {
-    /// `update_values` writing `map(value)` (exact maps only, such as
-    /// negation, so every entry is the value a caller-side map would give).
-    fn update_values_mapped(&mut self, index: &[usize], values: &[T], map: impl Fn(T) -> T + Sync) {
+impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
+    /// Routes local structures' entries; generic arrows read the KKT at
+    /// refactor instead.
+    fn update_values(&mut self, index: &[usize], values: &[T]) {
+        if self.local_structure.is_none() {
+            return;
+        }
         let index = &index[..index.len().min(values.len())];
         let pool = self.pool.clone().filter(|p| {
             p.current_num_threads() > 1 && self.leaves.len() > 1 && index.len() >= VALUE_PLAN_MIN
         });
         let Some(pool) = pool else {
-            self.update_entries(index.iter().copied(), |q, value| *value = map(values[q]));
+            self.update_entries(index.iter().copied(), |q, value| *value = values[q]);
             return;
         };
         let mut panels = self.exact_bound_panels.is_some();
@@ -3305,14 +3389,14 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             None => match self.value_plan(index) {
                 Some(plan) => plan,
                 None => {
-                    self.update_entries(index.iter().copied(), |q, value| *value = map(values[q]));
+                    self.update_entries(index.iter().copied(), |q, value| *value = values[q]);
                     return;
                 }
             },
         };
         // Each leaf takes its entries in index order, so a repeated position
         // keeps its last value as in the serial route.
-        let value = |q: u32| map(values[q as usize]);
+        let value = |q: u32| values[q as usize];
         pool.install(|| {
             self.leaves
                 .par_iter_mut()
@@ -3322,22 +3406,18 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         });
         let rest = &plan.rest;
         self.update_entries(rest.iter().map(|&q| index[q]), |k, value| {
-            *value = map(values[rest[k]]);
+            *value = values[rest[k]];
         });
         if self.value_plans.len() >= VALUE_PLANS_MAX {
             self.value_plans.clear();
         }
         self.value_plans.push(plan);
     }
-}
-
-impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
-    fn update_values(&mut self, index: &[usize], values: &[T]) {
-        self.update_values_mapped(index, values, |v| v);
-    }
 
     fn scale_values(&mut self, index: &[usize], scale: T) {
-        self.update_entries(index.iter().copied(), |_, value| *value *= scale);
+        if self.local_structure.is_some() {
+            self.update_entries(index.iter().copied(), |_, value| *value *= scale);
+        }
     }
 
     fn residual(&self, kkt: &CscMatrix<T>, out: &mut [T], rhs: &[T], point: &[T]) -> Option<T> {
@@ -3349,14 +3429,14 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
         None
     }
 
-    fn refactor(&mut self, _kkt: &CscMatrix<T>) -> bool {
-        self.use_arrow = self.factor_arrow();
+    fn refactor(&mut self, kkt: &CscMatrix<T>) -> bool {
+        self.use_arrow = self.factor_arrow(kkt);
         // A general fallback ordering needs every static shift: report the
         // failure so the caller escalates, which also ends the exemption.
         if !self.use_arrow && self.shift_exempt && !self.unshifted.is_empty() {
             return false;
         }
-        self.use_arrow || self.factor_fallback()
+        self.use_arrow || self.factor_fallback(kkt)
     }
 
     fn unshifted_columns(&self) -> &[usize] {
@@ -3811,9 +3891,10 @@ mod tests {
             }
         }
         // Force the existing fallback, and verify the multi-column call follows it.
+        let mut k = k;
         let diag = k.colptr[0];
         solver.settings.dynamic_regularization_enable = false;
-        solver.update_values(&[diag], &[T::zero()]);
+        k.nzval[diag] = T::zero();
         assert!(solver.refactor(&k));
         assert!(!solver.use_arrow);
         let rhs = vec![T::one(); k.n * 2];
@@ -4222,11 +4303,11 @@ mod tests {
         let (k1, s1) = arrow_kkt_merged(true);
         assert!(ArrowLDLSolver::try_new(&k1, &s1, &settings).is_none());
         // QDLDL parity: a wrong-sign leaf pivot is regularized, not rejected.
-        // Solver-side updates go through update_values into owned blocks.
-        let (k2, s2) = arrow_kkt();
+        // A generic arrow reads its values from the KKT it refactors.
+        let (mut k2, s2) = arrow_kkt();
         let diag0 = k2.colptr[1] - 1; // (0,0) is the last entry of column 0
         let mut solver = ArrowLDLSolver::try_new(&k2, &s2, &settings).unwrap();
-        solver.update_values(&[diag0], &[-100.0]);
+        k2.nzval[diag0] = -100.0;
         assert!(solver.refactor(&k2));
         assert!(solver.use_arrow);
         assert!(solver.regularize_count > 0);
@@ -4237,11 +4318,11 @@ mod tests {
         settings3.dynamic_regularization_enable = false;
         let diag4 = k3.colptr[5] - 1; // (4,4)
         let mut solver = ArrowLDLSolver::try_new(&k3, &s3, &settings3).unwrap();
-        solver.update_values(&[diag4], &[0.0]);
-        assert!(!solver.refactor(&k3));
+        let mut zero = k3.clone();
+        zero.nzval[diag4] = 0.0;
+        assert!(!solver.refactor(&zero));
         assert!(!solver.use_arrow);
         assert!(solver.fallback.is_some());
-        solver.update_values(&[diag4], &[k3.nzval[diag4]]);
         assert!(solver.refactor(&k3));
         assert!(solver.use_arrow);
         let mut rhs = b.clone();
