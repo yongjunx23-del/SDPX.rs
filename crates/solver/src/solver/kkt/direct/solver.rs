@@ -61,10 +61,21 @@ struct OreRows<T> {
     cone: usize,
     rows: std::ops::Range<usize>,
     cols: Vec<usize>,
-    /// A on rows × cols (dense, column-major) and the KKT positions
+    /// A's stored entries on rows × cols by column (`start`; offsets in
+    /// `rows`); the dense column is +0 elsewhere.
+    start: Vec<usize>,
+    row: Vec<u32>,
     a: Vec<T>,
+    /// KKT positions of the dense rows × cols block (column-major)
     pos: Vec<usize>,
     t: EigenRows<T>,
+}
+
+impl<T> OreRows<T> {
+    /// Entries of the dense rows × cols block.
+    fn dense(&self) -> usize {
+        self.rows.len() * self.cols.len()
+    }
 }
 
 /// A with each operator relative entropy cone's rows dense over the columns
@@ -205,13 +216,21 @@ where
         let (ore, a_index) = match ore {
             None => (Vec::new(), Vec::new()),
             Some((ref ak, ref index, ref blocks)) => {
+                // The padding of the dense cone rows is not stored.
+                let mut stored = vec![false; ak.nnz()];
+                index.iter().for_each(|&p| stored[p] = true);
                 let rows = blocks.iter().map(|(cone, rows)| {
-                    let (mut cols, mut a, mut pos) = (Vec::new(), Vec::new(), Vec::new());
+                    let (mut cols, mut start, mut row) = (Vec::new(), vec![0], Vec::new());
+                    let (mut a, mut pos) = (Vec::new(), Vec::new());
                     for col in 0..ak.n {
                         let span = ak.colptr[col]..ak.colptr[col + 1];
                         if let Some(p) = span.clone().find(|&p| rows.contains(&ak.rowval[p])) {
                             cols.push(col);
-                            a.extend_from_slice(&ak.nzval[p..p + rows.len()]);
+                            for r in (0..rows.len()).filter(|&r| stored[p + r]) {
+                                row.push(r as u32);
+                                a.push(ak.nzval[p + r]);
+                            }
+                            start.push(a.len());
                             pos.extend_from_slice(&map.A[p..p + rows.len()]);
                         }
                     }
@@ -219,6 +238,8 @@ where
                         cone: *cone,
                         rows: rows.clone(),
                         cols,
+                        start,
+                        row,
                         a,
                         pos,
                         t: Default::default(),
@@ -499,15 +520,15 @@ where
         _update_values(&mut self.ldlsolver, &mut self.KKT, &index, &A.nzval);
         // the next cone update writes these rows transformed
         for o in &mut self.ore {
-            let d = o.rows.len();
             for (c, &col) in o.cols.iter().enumerate() {
-                let dst = &mut o.a[c * d..(c + 1) * d];
-                dst.fill(T::zero());
+                let mut k = o.start[c];
                 for p in A.colptr[col]..A.colptr[col + 1] {
                     if o.rows.contains(&A.rowval[p]) {
-                        dst[A.rowval[p] - o.rows.start] = A.nzval[p];
+                        o.a[k] = A.nzval[p];
+                        k += 1;
                     }
                 }
+                debug_assert_eq!(k, o.start[c + 1]);
             }
         }
     }
@@ -614,21 +635,20 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
         let pool = self.residual_pool.as_deref();
         let transform = |o: &OreRows<T>| {
             let (t, rows) = (&o.t, o.rows.len());
-            let mut values = vec![T::zero(); o.a.len()];
-            let column = |(v, a): (&mut [T], &[T])| {
-                v.copy_from_slice(a);
+            let mut values = vec![T::zero(); o.dense()];
+            let column = |(c, v): (usize, &mut [T])| {
+                for k in o.start[c]..o.start[c + 1] {
+                    v[o.row[k] as usize] = o.a[k];
+                }
                 t.to_eigen(v);
             };
             if pool.is_some() {
                 values
                     .par_chunks_exact_mut(rows)
-                    .zip(o.a.par_chunks_exact(rows))
+                    .enumerate()
                     .for_each(column);
             } else {
-                values
-                    .chunks_exact_mut(rows)
-                    .zip(o.a.chunks_exact(rows))
-                    .for_each(column);
+                values.chunks_exact_mut(rows).enumerate().for_each(column);
             }
             values
         };
@@ -638,9 +658,9 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
         let mut first = 0;
         while first < self.ore.len() {
             let mut end = first + 1;
-            let mut bytes = self.ore[first].a.len() * std::mem::size_of::<T>();
+            let mut bytes = self.ore[first].dense() * std::mem::size_of::<T>();
             while end < self.ore.len() && end - first < ways {
-                let next = self.ore[end].a.len() * std::mem::size_of::<T>();
+                let next = self.ore[end].dense() * std::mem::size_of::<T>();
                 if bytes + next > 128 << 20 {
                     break;
                 }
