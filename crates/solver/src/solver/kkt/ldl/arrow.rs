@@ -322,6 +322,7 @@ fn ldl_rec<T: FloatT>(
     };
     let low: Vec<usize> = first[n1..].iter().map(|&f| f.min(n1)).collect();
     solve_unit_lower_t(n2, n1, &l11, n1, &mut left[n1..], ld, &low, ways);
+    drop(l11);
     // W21 before scaling; L21 = W21·D1⁻¹ in place
     let w = {
         let left = &*left;
@@ -371,6 +372,8 @@ fn ldl_rec<T: FloatT>(
             }
         });
     }
+    // the temporaries would otherwise stay alive through the tail recursion
+    drop((w, packed));
     let tail: Vec<usize> = first[n1..].iter().map(|&f| f.saturating_sub(n1)).collect();
     let sign2 = |k: usize| sign(n1 + k);
     ldl_rec(
@@ -654,6 +657,7 @@ impl<T: FloatT> DenseLeaf<T> {
         self.factor_signed(a, &[sign], reg, regularize_count, split)
     }
 
+    #[cfg(test)]
     fn factor_signed(
         &mut self,
         a: &[T],
@@ -663,6 +667,17 @@ impl<T: FloatT> DenseLeaf<T> {
         split: bool,
     ) -> Result<(), &'static str> {
         self.l.copy_from_slice(a);
+        self.factor_signed_loaded(signs, reg, regularize_count, split)
+    }
+
+    /// [`Self::factor_signed`] of the matrix already in `l`.
+    fn factor_signed_loaded(
+        &mut self,
+        signs: &[i8],
+        reg: Option<(T, T)>,
+        regularize_count: &mut usize,
+        split: bool,
+    ) -> Result<(), &'static str> {
         let n = self.n;
         if split && n > f64_scaled::<T>(SPLIT_FACTOR_MIN, 8) {
             return self.factor_panels(signs, reg, regularize_count);
@@ -741,9 +756,7 @@ impl<T: FloatT> DenseLeaf<T> {
     }
 
     /// A leaf's [`Self::factor_signed`]: large wide-type leaves factor
-    /// recursively, the others by exact dots. The border takes exact dots
-    /// (mixed Λ27/1024: a blocked exact form took 2.0 s instead of 0.58 s per
-    /// iteration for the scalar panels).
+    /// recursively, the others by exact dots.
     fn factor_leaf(
         &mut self,
         a: &[T],
@@ -752,30 +765,66 @@ impl<T: FloatT> DenseLeaf<T> {
         regularize_count: &mut usize,
         split: bool,
     ) -> Result<(), &'static str> {
-        self.envelope(a, split);
+        if split {
+            let n = self.n;
+            let (l, a) = (self.l.par_chunks_mut(n), a.par_chunks(n));
+            l.zip(a).for_each(|(l, a)| l.copy_from_slice(a));
+        } else {
+            self.l.copy_from_slice(a);
+        }
+        self.factor_loaded(Some(a), signs, reg, regularize_count, split)
+    }
+
+    /// [`Self::factor_leaf`] of the matrix already in `l`; its exact-dots
+    /// retry reloads `a`. Without `a` (the border assembles its symmetric
+    /// Schur complement in `l`), the strict upper triangle, which no factor
+    /// writes, and the saved diagonal restore the matrix.
+    fn factor_loaded(
+        &mut self,
+        a: Option<&[T]>,
+        signs: &[i8],
+        reg: Option<(T, T)>,
+        regularize_count: &mut usize,
+        split: bool,
+    ) -> Result<(), &'static str> {
+        self.envelope(split);
         if T::precision_bits() > 64 {
-            if self.n >= REC_FACTOR_MIN {
+            let n = self.n;
+            if n >= REC_FACTOR_MIN {
                 // One rounding per level can cancel a pivot to an exact zero
                 // that exact dots keep nonzero (BFSS L13 t5 r2.368 max,
                 // iteration 85: the trunk fell back to serial QDLDL). Such a
                 // leaf refactors by exact dots.
+                let diagonal: Vec<T> = match a {
+                    Some(_) => Vec::new(),
+                    None => self.l.iter().step_by(n + 1).copied().collect(),
+                };
                 let mut count = 0;
-                if self.factor_rec(a, signs, reg, &mut count, split).is_ok() {
+                if self.factor_rec(signs, reg, &mut count, split).is_ok() {
                     *regularize_count += count;
                     return Ok(());
                 }
                 if crate::receipt::profile_requested() {
-                    eprintln!("ARROW_REC_RETRY n={}", self.n);
+                    eprintln!("ARROW_REC_RETRY n={n}");
+                }
+                match a {
+                    Some(a) => self.l.copy_from_slice(a),
+                    None => {
+                        mirror_upper(&mut self.l, n, None);
+                        for (v, d) in self.l.iter_mut().step_by(n + 1).zip(diagonal) {
+                            *v = d;
+                        }
+                    }
                 }
             }
-            return self.factor_dots(a, signs, reg, regularize_count, split);
+            return self.factor_dots(signs, reg, regularize_count, split);
         }
-        self.factor_signed(a, signs, reg, regularize_count, split)
+        self.factor_signed_loaded(signs, reg, regularize_count, split)
     }
 
-    /// Each row's first nonzero column of `a` (`first`).
-    fn envelope(&mut self, a: &[T], split: bool) {
-        let n = self.n;
+    /// Each row's first nonzero column of `l` (`first`).
+    fn envelope(&mut self, split: bool) {
+        let (n, a) = (self.n, &self.l);
         let first = |i: usize| (0..i).find(|&k| !a[i + k * n].is_zero()).unwrap_or(i);
         self.first.clear();
         if split {
@@ -794,14 +843,12 @@ impl<T: FloatT> DenseLeaf<T> {
     /// rounded once, instead of j fused updates ([`ldl_dots`]).
     fn factor_dots(
         &mut self,
-        a: &[T],
         signs: &[i8],
         reg: Option<(T, T)>,
         regularize_count: &mut usize,
         split: bool,
     ) -> Result<(), &'static str> {
         let n = self.n;
-        self.l.copy_from_slice(a);
         let sign = |k: usize| T::from_i8(signs[if signs.len() == 1 { 0 } else { k }]).unwrap();
         ldl_dots(
             &mut self.l,
@@ -824,19 +871,12 @@ impl<T: FloatT> DenseLeaf<T> {
     /// `split`: the leaf may use the pool's spare workers.
     fn factor_rec(
         &mut self,
-        a: &[T],
         signs: &[i8],
         reg: Option<(T, T)>,
         regularize_count: &mut usize,
         split: bool,
     ) -> Result<(), &'static str> {
         let n = self.n;
-        if split {
-            let (l, a) = (self.l.par_chunks_mut(n), a.par_chunks(n));
-            l.zip(a).for_each(|(l, a)| l.copy_from_slice(a));
-        } else {
-            self.l.copy_from_slice(a);
-        }
         let sign = |k: usize| T::from_i8(signs[if signs.len() == 1 { 0 } else { k }]).unwrap();
         let ways = if split {
             rayon::current_num_threads()
@@ -2004,7 +2044,7 @@ pub struct ArrowLDLSolver<T: FloatT> {
     local: Vec<usize>,
     leaves: Vec<Leaf<T>>,
     c: Vec<T>,
-    s: Vec<T>,
+    // The border Schur complement is assembled in `tf.l` and factored there.
     tf: DenseLeaf<T>,
     tx: Vec<T>,
     batch_tx: Vec<T>,
@@ -2142,7 +2182,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 2 * g * g + 2 * g * t as u128 + 8 * g
             })
             .sum::<u128>()
-            + 4 * (t as u128).pow(2)
+            // C and the border factor, plus the exact-dots retry's rows
+            + 3 * (t as u128).pow(2)
             + 8 * n as u128;
         let max_bytes = ARROW_MAX_BYTES
             .max(ARROW_KKT_FACTOR * k.nnz() as u128 * std::mem::size_of::<T>() as u128);
@@ -2433,7 +2474,6 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             local,
             leaves,
             c: vec![T::zero(); t * t],
-            s: vec![T::zero(); t * t],
             tf: DenseLeaf::new(t, FORWARD_BLOCK),
             tx: vec![T::zero(); t],
             batch_tx: Vec::new(),
@@ -2918,16 +2958,16 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return false;
         }
         if self.ranks.as_ref().is_some_and(|r| !r.is_root()) {
-            self.s.fill(T::zero());
+            self.tf.l.fill(T::zero());
         } else if let Some(pool) = &self.pool {
-            let (s, c) = (&mut self.s, &self.c);
+            let (s, c) = (&mut self.tf.l, &self.c);
             pool.install(|| {
                 s.par_chunks_mut(t.max(1))
                     .zip(c.par_chunks(t.max(1)))
                     .for_each(|(s, c)| s.copy_from_slice(c))
             });
         } else {
-            self.s.copy_from_slice(&self.c);
+            self.tf.l.copy_from_slice(&self.c);
         }
         if self.local_structure.is_some() {
             self.assemble_local_schur();
@@ -2935,26 +2975,27 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             let timer = crate::receipt::start();
             subtract_contributions(
                 &mut self.leaves[owned],
-                &mut self.s,
+                &mut self.tf.l,
                 t,
                 self.pool.as_deref(),
             );
-            mirror_upper(&mut self.s, t, self.pool.as_deref());
+            mirror_upper(&mut self.tf.l, t, self.pool.as_deref());
             crate::receipt::finish("arrow.contribution", timer);
         }
         if let Some(ranks) = &self.ranks {
             let timer = crate::receipt::start();
+            let s = &mut self.tf.l;
             let mut upper: Vec<T> = (0..t)
                 .flat_map(|j| (0..=j).map(move |i| (i, j)))
-                .map(|(i, j)| self.s[i + j * t])
+                .map(|(i, j)| s[i + j * t])
                 .collect();
             let local = upper.clone();
             ranks.sum(&local, &mut upper);
             let mut p = 0;
             for j in 0..t {
                 for i in 0..=j {
-                    self.s[i + j * t] = upper[p];
-                    self.s[j + i * t] = upper[p];
+                    s[i + j * t] = upper[p];
+                    s[j + i * t] = upper[p];
                     p += 1;
                 }
             }
@@ -2971,15 +3012,15 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let mut border_count = 0usize;
         let timer = crate::receipt::start();
         // Every pool thread is idle during the border factor.
-        let (tf, s) = (&mut self.tf, &self.s);
+        let tf = &mut self.tf;
         // Wide types factor as leaves do: exact dots, recursive residue
         // products from `REC_FACTOR_MIN` (BFSS L13 t5: 13156 border columns).
         let signs = &self.border_signs;
         let factor = |tf: &mut DenseLeaf<T>, count: &mut usize, split: bool| {
             if T::precision_bits() > 64 {
-                tf.factor_leaf(s, signs, reg, count, split)
+                tf.factor_loaded(None, signs, reg, count, split)
             } else {
-                tf.factor_signed(s, signs, reg, count, split)
+                tf.factor_signed_loaded(signs, reg, count, split)
             }
         };
         let ok = match &self.pool {
@@ -3813,8 +3854,9 @@ mod tests {
         let reg = Some((T::from_f64(1e-20).unwrap(), T::one()));
         let (mut c0, mut c1, mut c2) = (0, 0, 0);
         let mut dots = DenseLeaf::<T>::new(n, LEAF_BLOCK);
-        dots.envelope(&a, false);
-        dots.factor_dots(&a, &signs, reg, &mut c0, false).unwrap();
+        dots.l.copy_from_slice(&a);
+        dots.envelope(false);
+        dots.factor_dots(&signs, reg, &mut c0, false).unwrap();
         let mut serial = DenseLeaf::<T>::new(n, LEAF_BLOCK);
         serial.factor_leaf(&a, &signs, reg, &mut c1, false).unwrap();
         let pool = rayon::ThreadPoolBuilder::new()
@@ -3844,6 +3886,40 @@ mod tests {
     #[test]
     fn recursive_leaf_factor_mpfr128() {
         recursive_leaf_factor::<sdpx_arithmetic::Bits128>();
+    }
+    #[test]
+    fn border_retry_restores_in_place() {
+        border_retry::<sdpx_arithmetic::Bits128>();
+    }
+    fn border_retry<T: FloatT>() {
+        // The recursive factor subtracts the rounded Σx² and stops on an
+        // exact zero pivot that exact dots keep: the border's in-place retry
+        // must restore the matrix as a leaf's reload does.
+        let n = REC_FACTOR_MIN + 1;
+        let p = n / 2;
+        let mut a = vec![T::zero(); n * n];
+        for i in 0..n {
+            a[i + i * n] = T::one();
+        }
+        let x = vec![T::one() / T::from_f64(3.0).unwrap(); 3];
+        for (k, &v) in x.iter().enumerate() {
+            a[p + k * n] = v;
+            a[k + p * n] = v;
+        }
+        a[p + p * n] = T::dot_slices(&x, &x);
+        let mut rec = DenseLeaf::<T>::new(n, LEAF_BLOCK);
+        rec.l.copy_from_slice(&a);
+        rec.envelope(false);
+        assert!(rec.factor_rec(&[1], None, &mut 0, false).is_err());
+        let mut leaf = DenseLeaf::<T>::new(n, LEAF_BLOCK);
+        leaf.factor_leaf(&a, &[1], None, &mut 0, false).unwrap();
+        let mut border = DenseLeaf::<T>::new(n, LEAF_BLOCK);
+        border.l.copy_from_slice(&a);
+        border
+            .factor_loaded(None, &[1], None, &mut 0, false)
+            .unwrap();
+        assert_eq!(leaf.l, border.l);
+        assert_eq!(leaf.dinv, border.dinv);
     }
     fn split_factor_parity<T: FloatT>() {
         let n = 80;

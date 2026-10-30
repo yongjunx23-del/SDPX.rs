@@ -466,7 +466,10 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             // BoundPanels exists only for T=f64. Every lower Gram entry
             // overwrites S before the shifted C subtraction below.
             let gram = unsafe {
-                std::slice::from_raw_parts_mut(self.s.as_mut_ptr().cast::<f64>(), self.s.len())
+                std::slice::from_raw_parts_mut(
+                    self.tf.l.as_mut_ptr().cast::<f64>(),
+                    self.tf.l.len(),
+                )
             };
             match &self.pool {
                 Some(pool) if n * t * t >= 262144 => pool.install(|| {
@@ -489,9 +492,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         for j in 0..t {
             for i in j..t {
-                let value = self.c[i + j * t] - self.s[i + j * t];
-                self.s[i + j * t] = value;
-                self.s[j + i * t] = value;
+                let value = self.c[i + j * t] - self.tf.l[i + j * t];
+                self.tf.l[i + j * t] = value;
+                self.tf.l[j + i * t] = value;
             }
         }
         true
@@ -757,15 +760,15 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             n,
             &panels.y,
             &panels.vs[..n],
-            &mut self.s,
+            &mut self.tf.l,
             self.pool.as_deref(),
             &mut panels.y_residues,
         ) {
             for j in 0..t {
                 for i in 0..=j {
-                    let v = self.c[j + i * t] - self.s[i + j * t];
-                    self.s[j + i * t] = v;
-                    self.s[i + j * t] = v;
+                    let v = self.c[j + i * t] - self.tf.l[i + j * t];
+                    self.tf.l[j + i * t] = v;
+                    self.tf.l[i + j * t] = v;
                 }
             }
             return true;
@@ -812,7 +815,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             let mut store = |cols: Vec<(usize, Vec<T>)>| {
                 for (j, col) in cols {
                     for (i, v) in col.into_iter().enumerate() {
-                        self.s[i + j * t] = v;
+                        self.tf.l[i + j * t] = v;
                     }
                 }
             };
@@ -834,9 +837,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
         for j in 0..t {
             for i in 0..=j {
-                let v = self.c[j + i * t] - self.s[i + j * t];
-                self.s[j + i * t] = v;
-                self.s[i + j * t] = v;
+                let v = self.c[j + i * t] - self.tf.l[i + j * t];
+                self.tf.l[j + i * t] = v;
+                self.tf.l[i + j * t] = v;
             }
         }
         true
