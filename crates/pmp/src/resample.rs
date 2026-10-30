@@ -55,41 +55,55 @@ fn fit<W: Scalar + FromStr>(points: &[String], scalings: &[String]) -> Result<Op
         product *= (x[n - 1] - x[j]).abs() + W::one();
     }
     let big = scale.iter().fold(W::zero(), |a, &b| a.max(b));
-    let tiny = big * decimal::<W>("1e-150")?;
+    // Terms past the degree are input noise, which the last term bounds when
+    // a sample is left over (otherwise the degree stays undetermined below).
+    // Fewer input digits raise it: L19 written with 154 digits puts it near
+    // 1e-131 of the largest term, above a fixed 1e-150 cut.
+    let tiny = (big * decimal::<W>("1e-150")?).max(scale[n - 1] * decimal::<W>("1e20")?);
     let m = (0..n).rev().find(|&j| scale[j] > tiny).unwrap_or(0);
     if m + 1 >= n {
         return Ok(None); // No unused sample remains to determine the pole count.
     }
-    // Convert the Newton interpolant to monomial coefficients. Derivative
-    // roots split a real-rooted polynomial into monotone intervals; a root
-    // shared with its derivative retains its full multiplicity.
-    let mut coeff = vec![dd[m]];
-    for j in (0..m).rev() {
-        coeff.push(W::zero());
-        for k in (1..coeff.len()).rev() {
-            coeff[k] = coeff[k - 1] - x[j] * coeff[k];
-        }
-        coeff[0] = dd[j] - x[j] * coeff[0];
-    }
-    let Some(mut poles) = real_roots(&coeff, decimal::<W>("1e-150")?) else {
-        return Ok(None);
-    };
-    poles.reverse();
-    // A pole within rounding of 0 is the unitarity-bound pole at 0.
-    let zero = decimal::<W>("1e-30")?;
-    if poles.iter().any(|q| !q.is_finite() || *q > zero) {
-        return Ok(None);
-    }
+    // A pole within rounding of 0 is the unitarity-bound pole at 0; the
+    // poles must reproduce every given scaling.
     let constant = dd[m].recip();
+    let zero = decimal::<W>("1e-30")?;
     let tolerance = decimal::<W>("1e-60")?;
-    for (&xk, &sk) in x.iter().zip(&s) {
-        let model = poles
-            .iter()
-            .fold(constant * base.powf(xk), |a, &q| a / (xk - q));
-        if !model.is_finite() || (model / sk - W::one()).abs() > tolerance {
-            return Ok(None);
+    let reproduces = |poles: &[W]| {
+        poles.iter().all(|q| q.is_finite() && *q <= zero)
+            && x.iter().zip(&s).all(|(&xk, &sk)| {
+                let model = poles
+                    .iter()
+                    .fold(constant * base.powf(xk), |a, &q| a / (xk - q));
+                model.is_finite() && (model / sk - W::one()).abs() <= tolerance
+            })
+    };
+    let poles = match grid_poles(&dd[..=m], &x).filter(|poles| reproduces(poles)) {
+        Some(poles) => poles,
+        None => {
+            // Repeated or nearby poles: convert the Newton interpolant to
+            // monomial coefficients. Derivative roots split a real-rooted
+            // polynomial into monotone intervals; a root shared with its
+            // derivative retains its full multiplicity. (High derivatives of
+            // the L19 Ising blocks lose roots in this basis.)
+            let mut coeff = vec![dd[m]];
+            for j in (0..m).rev() {
+                coeff.push(W::zero());
+                for k in (1..coeff.len()).rev() {
+                    coeff[k] = coeff[k - 1] - x[j] * coeff[k];
+                }
+                coeff[0] = dd[j] - x[j] * coeff[0];
+            }
+            let Some(mut poles) = real_roots(&coeff, decimal::<W>("1e-150")?) else {
+                return Ok(None);
+            };
+            poles.reverse();
+            if !reproduces(&poles) {
+                return Ok(None);
+            }
+            poles
         }
-    }
+    };
     // The given scalings are reproduced with the recovered poles; the new
     // prefactor writes a rounded-up pole at 0. Scalings only weight the
     // sampled constraints, so this never changes the program's solution.
@@ -101,6 +115,55 @@ fn fit<W: Scalar + FromStr>(points: &[String], scalings: &[String]) -> Result<Op
             .map(|&q| q.min(W::zero()).decimal_string())
             .collect(),
     }))
+}
+
+/// Simple poles at least 1/8 apart (PyCFTBoot and SDPB.m Ising blocks), in
+/// decreasing order: sign changes of the Newton form `dd` on nodes `x`, on a
+/// 1/8 grid downwards from below the first sample point, bisected and
+/// polished with Newton steps. Starting above 0 also brackets a pole at 0
+/// that the generator rounded upwards (2^-124 in mixed Ising PyCFTBoot
+/// output).
+fn grid_poles<W: Scalar>(dd: &[W], x: &[W]) -> Option<Vec<W>> {
+    let number = |n: f64| W::from_f64(n).unwrap();
+    let (m, n) = (dd.len() - 1, x.len());
+    let value = |z: W| {
+        let (mut p, mut dp) = (dd[m], W::zero());
+        for j in (0..m).rev() {
+            dp = dp * (z - x[j]) + p;
+            p = p * (z - x[j]) + dd[j];
+        }
+        (p, dp)
+    };
+    let step = number(0.125);
+    let lowest = -(x[n - 1] + number(4.0 * n as f64 + 200.0));
+    let mut poles = Vec::with_capacity(m);
+    let start = x[0] / number(2.0);
+    let (mut hi, mut fhi) = (start, value(start).0);
+    while poles.len() < m && hi > lowest {
+        let lo = hi - step;
+        let flo = value(lo).0;
+        if fhi == W::zero() {
+            poles.push(hi);
+        } else if (flo < W::zero()) != (fhi < W::zero()) && flo != W::zero() {
+            let (mut a, mut b, fb) = (lo, hi, fhi);
+            for _ in 0..64 {
+                let c = (a + b) / number(2.0);
+                if (value(c).0 < W::zero()) == (fb < W::zero()) {
+                    b = c;
+                } else {
+                    a = c;
+                }
+            }
+            let mut q = (a + b) / number(2.0);
+            for _ in 0..8 {
+                let (p, dp) = value(q);
+                q -= p / dp;
+            }
+            poles.push(q);
+        }
+        (hi, fhi) = (lo, flo);
+    }
+    (poles.len() == m).then_some(poles)
 }
 
 // Real roots, including multiplicities, in increasing order. A numerical
