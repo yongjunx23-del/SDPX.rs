@@ -1368,7 +1368,11 @@ impl<T: FloatT> Leaf<T> {
             }
         };
         if split {
-            self.y.par_chunks_mut(g).enumerate().with_min_len(64).for_each(border);
+            self.y
+                .par_chunks_mut(g)
+                .enumerate()
+                .with_min_len(64)
+                .for_each(border);
         } else {
             self.y.chunks_mut(g).enumerate().for_each(border);
         }
