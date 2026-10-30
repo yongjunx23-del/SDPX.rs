@@ -8,6 +8,58 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-30 — Deep review of `crates/`: repairs, in-place border Schur, PMP resampling restored (kept, review-fixes-20261030)
+
+- Scope: a max-effort review of `crates/` at `7737088` (bfss-l13-threads).
+  Fixed findings are below; the open ones are in the plan. No precision,
+  tolerance, refinement or acceptance change.
+- Repairs (`371dffb`):
+  - Data updates also rewrite the stored original-coordinate copy. Since
+    `031467b` a structured-cone RHS above 1e20 keeps that copy without
+    presolve; `update_q` left the gate auditing the old q, so the re-solve
+    ended InsufficientProgress (new test; Solved with the fix).
+  - b must be finite, except +inf in `NonnegativeConeT` rows: `031467b`
+    stopped capping +inf elsewhere, which then reached the solve.
+  - The original gate treats orthant bounds at or above presolve's sentinel
+    contraction as infinite (a capped 1e20 rebuilt through the Ruiz factors
+    can round a few ulps below 1e20).
+  - The ORE-limit cone's batched dual trials take the ORE cone's 512 MiB
+    allowance (BFSS (38,1) at 512 bits: 20.8 GB transient on 64 threads).
+  - The PMP qstat probe drains its pipe while waiting (a dump above the
+    pipe buffer blocked qstat until the timeout and left one worker); CLI
+    stdin decodes MPFR arrays on the pool; MPFR xpotrf 'U' splits only the
+    trailing columns (latent).
+  - Evidence: medium Solved/15, audit PASS. L19.xml with a 200 KB qstat
+    dump: 10 workers, output identical to a small dump.
+- Border Schur complement in its factor (`11b5b8d`): the border kept C, a
+  full copy S and the factor `tf.l`, and S was only copied into `tf.l`. S is
+  now assembled and factored in `tf.l`; a failed recursive factor restores
+  it from the strict upper triangle and a saved diagonal. `ldl_rec` frees
+  L11, W21 and the packed Schur term before its tail recursion, and the
+  admission estimate counts three t² arrays instead of four.
+  - Saves one t² array on BFSS L13 t5 (t = 13,156): 5.2 GiB at 128 bits and
+    12.9 GiB at 512 (cell count; not measured on the cluster), plus about
+    0.45t² transient at the border factor.
+  - Points bitwise unchanged: L10u at 256 bits on 8 threads (6 iterations),
+    csdr3 and medium. A unit test forces the in-place retry.
+- PMP resampling regression (`5e29080`): `d2b1fb5` replaced the 1/8-grid
+  pole bracketing with monomial real roots, which lose roots in the high
+  derivatives of the L19 Ising blocks. No block resampled (0/14), and
+  Λ19-xml lost A6's 105 → 89 iteration gain (2026-10-16). The fixed 1e-150
+  degree cut also kept every block of PMPs written with fewer digits: at
+  154 digits the noise term sits near 1e-131 of the largest.
+  - Change: grid bracketing first, monomial roots for repeated or nearby
+    poles; either must reproduce every scaling to 1e-60. The degree cut also
+    stays 1e20 above the last (noise) term.
+  - L19.xml converts byte-identical to the frozen `L19-rs-512` (14/14
+    blocks). A 154-digit copy now resamples 14/14 (was 0/14).
+  - Λ19 at 512 bits, 4 threads, tol 1e-42, fast profile on the Mac:
+    resampled 154-digit Solved 89 it / 46.2 s; kept samples Solved
+    105 it / 64.8 s; resampled 230-digit 89 it / 45.2 s. The objectives
+    agree within 4.9e-51 relative (the kept solve's own gap is 6.1e-51), and
+    the two resampled copies within 1.1e-108.
+- Decision: all kept.
+
 ## 2026-10-27 — BFSS L13 t5/128: parallel arrow path replaces serial QDLDL (kept, bfss-l13-threads)
 
 - Case: `bfss-rough-20261026/s128_L13t5_5/r2.365/energy_min.json` (13,156
