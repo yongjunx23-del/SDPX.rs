@@ -362,7 +362,9 @@ fn run<T: FloatT + Serialize + DeserializeOwned + FromStr>(
                 if mpi.size() > 1 {
                     return Err("MPI stdin is not supported; use a shared input file".into());
                 }
-                JsonProblem::<T>::read(io::stdin().lock())?
+                within_threads(options.threads, || {
+                    JsonProblem::<T>::read(io::stdin().lock())
+                })??
             } else {
                 // High-precision arrays decode on the pool after the read.
                 let file = BufReader::new(File::open(path)?);

@@ -112,6 +112,11 @@ where
         let d = &self.data.equilibration.d;
         let c = self.data.equilibration.c;
         data.update_matrix(&mut self.data.P, d, d, Some(c))?;
+        // the stored original-coordinate copy takes the unscaled values
+        if let Some(o) = &mut self.data.original {
+            let one = vec![T::one(); o.P.n];
+            data.update_matrix(&mut o.P, &one, &one, None)?;
+        }
         // overwrite KKT data
         self.kktsystem.update_P(&self.data.P);
         Ok(())
@@ -142,6 +147,10 @@ where
         let d = &self.data.equilibration.d;
         let e = &self.data.equilibration.e;
         data.update_matrix(&mut self.data.A, e, d, None)?;
+        if let Some(o) = &mut self.data.original {
+            let (rows, cols) = (vec![T::one(); o.A.m], vec![T::one(); o.A.n]);
+            data.update_matrix(&mut o.A, &rows, &cols, None)?;
+        }
         self.residuals.a_panel = None;
         // overwrite KKT data
         self.kktsystem.update_A(&self.data.A);
@@ -157,6 +166,10 @@ where
         let d = &self.data.equilibration.d;
         let c = self.data.equilibration.c;
         data.update_vector(&mut self.data.q, d, Some(c))?;
+        if let Some(o) = &mut self.data.original {
+            let one = vec![T::one(); o.q.len()];
+            data.update_vector(&mut o.q, &one, None)?;
+        }
 
         // flush unscaled norm. Will be recalculated during solve
         self.data.clear_normq();
@@ -172,6 +185,10 @@ where
         self.check_data_update_allowed()?;
         let e = &self.data.equilibration.e;
         data.update_vector(&mut self.data.b, e, None)?;
+        if let Some(o) = &mut self.data.original {
+            let one = vec![T::one(); o.b.len()];
+            data.update_vector(&mut o.b, &one, None)?;
+        }
 
         // flush unscaled norm. Will be recalculated during solve
         self.data.clear_normb();

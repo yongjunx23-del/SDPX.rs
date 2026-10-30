@@ -56,7 +56,9 @@ pub struct DefaultProblemData<T> {
     pub(crate) chordal_info: Option<ChordalInfo<T>>,
 
     /// Problem data before presolve and chordal decomposition, kept for the
-    /// original-coordinate acceptance test when either changed the problem.
+    /// original-coordinate acceptance test when either changed the problem
+    /// or a structured-cone RHS exceeds the infinity sentinel. Data updates
+    /// write the copy too.
     pub(crate) original: Option<super::original_check::OriginalData<T>>,
 }
 

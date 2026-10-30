@@ -15,7 +15,8 @@ use crate::solver::SupportedConeT;
 
 /// Copy of the problem data before presolve, chordal decomposition and
 /// equilibration. Kept only when presolve or chordal decomposition changed
-/// the problem; otherwise the original data are recovered by unscaling.
+/// the problem, or a structured-cone RHS exceeds the infinity sentinel;
+/// otherwise the original data are recovered by unscaling.
 #[derive(Clone)]
 pub(crate) struct OriginalData<T> {
     pub P: CscMatrix<T>,
@@ -129,7 +130,7 @@ impl<T: FloatT> OriginalProducts<T> {
         xpx: T,
         cones: &[SupportedConeT<T>],
     ) -> Self {
-        let infbound: T = crate::get_infinity().as_T();
+        let infbound: T = infinite_bound();
         let (mut bz, mut normb) = (T::zero(), T::zero());
         let mut rows = b.iter().zip(z);
         for cone in cones {
@@ -161,7 +162,7 @@ impl<T: FloatT> OriginalProducts<T> {
         psd_dual: bool,
     ) -> OriginalResiduals<T> {
         debug_assert!(s.len() == self.b.len() && z.len() == self.b.len());
-        let infbound: T = crate::get_infinity().as_T();
+        let infbound: T = infinite_bound();
         let r = &self.r;
 
         let mut primal = T::zero();
@@ -235,8 +236,15 @@ impl<T: FloatT> OriginalProducts<T> {
     }
 }
 
+/// Orthant bounds at or above this are infinite: presolve's contraction of
+/// the sentinel, so a capped bound rebuilt through the Ruiz factors (a few
+/// ulps below it) stays infinite, as do the rows presolve removed.
+fn infinite_bound<T: FloatT>() -> T {
+    (T::one() - T::epsilon() * (10.).as_T()) * crate::get_infinity().as_T()
+}
+
 fn project_slack<T: FloatT>(r: &[T], b: &[T], cones: &[SupportedConeT<T>], s: &mut [T]) {
-    let infbound: T = crate::get_infinity().as_T();
+    let infbound: T = infinite_bound();
     let mut offset = 0;
     for cone in cones {
         let len = cone.nvars();

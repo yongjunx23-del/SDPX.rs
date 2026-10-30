@@ -369,10 +369,17 @@ fn effective_memory() -> u64 {
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
+        // Drain the pipe while waiting: a dump beyond its buffer (a long
+        // `qsub -V` Variable_List) would otherwise block qstat until killed.
+        let mut stdout = child.stdout.take()?;
+        let reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut stdout, &mut text).map(|_| text)
+        });
         let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
+        let status = loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20))
                 }
@@ -382,14 +389,12 @@ fn effective_memory() -> u64 {
                     return None;
                 }
             }
-        }
-        let out = child.wait_with_output().ok()?;
-        if !out.status.success() {
+        };
+        let text = reader.join().ok()?.ok()?;
+        if !status.success() {
             return None;
         }
-        String::from_utf8(out.stdout)
-            .ok()?
-            .lines()
+        text.lines()
             .filter_map(|line| {
                 let (key, value) = line.trim().split_once('=')?;
                 matches!(key.trim(), "Resource_List.mem" | "Resource_List.vmem")

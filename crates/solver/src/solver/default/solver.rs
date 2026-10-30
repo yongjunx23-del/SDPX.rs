@@ -397,6 +397,18 @@ fn check_dimensions<T: FloatT>(
                     .ok_or_else(invalid)?
             }
         };
+        // +inf marks an absent orthant bound; other cones keep their RHS
+        // uncapped, so it must be finite there.
+        let orthant = matches!(cone, SupportedConeT::NonnegativeConeT(_));
+        let rows = b.get(p..p.saturating_add(size)).unwrap_or_default();
+        if rows
+            .iter()
+            .any(|&v| !(v.is_finite() || (orthant && v == T::infinity())))
+        {
+            return Err(SolverError::BadInputData(
+                "b must be finite, except +inf in NonnegativeConeT rows",
+            ));
+        }
         p = p.checked_add(size).ok_or_else(invalid)?;
     }
 
