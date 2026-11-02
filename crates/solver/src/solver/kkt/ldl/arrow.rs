@@ -39,9 +39,11 @@ enum LocalStructure {
 
 /// Dense working-set cap of the local arrow structures, and the size up to
 /// which generic leaves are always admitted. Beyond it a generic arrow must
-/// stay within `ARROW_KKT_FACTOR` times the stored KKT, so sparse structure
-/// is never densified without bound; a dense border coupling (as in sampled
-/// bootstrap problems) fills QDLDL's factor just as much.
+/// stay within `ARROW_KKT_FACTOR` times the stored KKT or its sparse LDL
+/// factor (QDLDL's AMD fill, when the caller supplies it), whichever is
+/// larger, so sparse structure is never densified without bound; a dense
+/// border coupling (as in sampled bootstrap problems) fills QDLDL's factor
+/// just as much.
 const ARROW_MAX_BYTES: u128 = 512 * 1024 * 1024;
 const ARROW_KKT_FACTOR: u128 = 8;
 /// Smallest single dense leaf admitted to the arrow backend.
@@ -1814,19 +1816,29 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     /// Eligibility is structural only: connected components of the
     /// positive-sign subgraph become leaves, negative-sign variables become
     /// the border.  Returns `None` when the shape is not exploitable, so the
-    /// caller transparently keeps QDLDL.
-    pub fn try_new(k: &CscMatrix<T>, signs: &[i8], settings: &CoreSettings<T>) -> Option<Self> {
-        let (groups, trunk, _) = Self::plan(k, signs)?;
+    /// caller transparently keeps QDLDL. `ldl_nnz` is the sparse LDL factor
+    /// size of `k` (0 when unknown); see [`ARROW_MAX_BYTES`].
+    pub fn try_new(
+        k: &CscMatrix<T>,
+        signs: &[i8],
+        settings: &CoreSettings<T>,
+        ldl_nnz: usize,
+    ) -> Option<Self> {
+        let (groups, trunk, _) = Self::plan(k, signs, ldl_nnz)?;
         Some(Self::from_groups(k, signs, settings, groups, trunk, None))
     }
 
     /// Dense work estimate of the arrow of `signs`; `None` when ineligible.
-    pub fn work(k: &CscMatrix<T>, signs: &[i8]) -> Option<u128> {
-        Self::plan(k, signs).map(|(_, _, work)| work)
+    pub fn work(k: &CscMatrix<T>, signs: &[i8], ldl_nnz: usize) -> Option<u128> {
+        Self::plan(k, signs, ldl_nnz).map(|(_, _, work)| work)
     }
 
     /// [`Self::try_new`]'s leaves, border and dense work estimate.
-    fn plan(k: &CscMatrix<T>, signs: &[i8]) -> Option<(Vec<Vec<usize>>, Vec<usize>, u128)> {
+    fn plan(
+        k: &CscMatrix<T>,
+        signs: &[i8],
+        ldl_nnz: usize,
+    ) -> Option<(Vec<Vec<usize>>, Vec<usize>, u128)> {
         let n = k.n;
         debug_assert!(k.m == n && signs.len() == n && signs.iter().all(|&s| s == 1 || s == -1));
         if n == 0 {
@@ -1871,8 +1883,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             .sum::<u128>()
             + 4 * (t as u128).pow(2)
             + 8 * n as u128;
-        let max_bytes = ARROW_MAX_BYTES
-            .max(ARROW_KKT_FACTOR * k.nnz() as u128 * std::mem::size_of::<T>() as u128);
+        let max_bytes = ARROW_MAX_BYTES.max(
+            ARROW_KKT_FACTOR * k.nnz().max(ldl_nnz) as u128 * std::mem::size_of::<T>() as u128,
+        );
         // Dense work estimates: leaf factorizations ~ sum(g^3)/3, coupling
         // transforms ~ n_pos*t^2/2, trunk factor ~ t^3/3.  Arrow only pays
         // when real dense leaf blocks exist to amortize that dense
@@ -1901,12 +1914,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 .filter(|&(i, j)| signs[i] != signs[j])
                 .count();
             eprintln!(
-                "GROUP_STATS n={n} components={} leaf_min={} leaf_med={} leaf_max={} border={t} coupling_nnz={coupling} dense_mib={:.1} leaf_work={leaf_work} border_work={border_work} eligible={}",
+                "GROUP_STATS n={n} components={} leaf_min={} leaf_med={} leaf_max={} border={t} coupling_nnz={coupling} dense_mib={:.1} kkt_nnz={} ldl_nnz={ldl_nnz} leaf_work={leaf_work} border_work={border_work} eligible={}",
                 groups.len(),
                 sizes.first().copied().unwrap_or(0),
                 sizes.get(sizes.len() / 2).copied().unwrap_or(0),
                 sizes.last().copied().unwrap_or(0),
                 cells as f64 * std::mem::size_of::<T>() as f64 / 1048576.0,
+                k.nnz(),
                 leaves_ok && work_ok && cells * std::mem::size_of::<T>() as u128 <= max_bytes,
             );
         }
@@ -1932,11 +1946,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         signs: &[i8],
         settings: &CoreSettings<T>,
         perm: Option<Vec<usize>>,
+        ldl_nnz: usize,
     ) -> Option<Negated<T>> {
         let mut neg = k.clone();
         neg.nzval.iter_mut().for_each(|v| *v = -*v);
         let signs: Vec<i8> = signs.iter().map(|&s| -s).collect();
-        let mut inner = Self::try_new(&neg, &signs, settings)?;
+        let mut inner = Self::try_new(&neg, &signs, settings, ldl_nnz)?;
         inner.fallback_perm = perm;
         Some(Negated { inner })
     }
@@ -3442,7 +3457,7 @@ mod tests {
                 .collect(),
         );
         let settings = CoreSettings::<T>::default();
-        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings).unwrap();
+        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings, 0).unwrap();
         assert!(solver.refactor(&k));
         // 16 workers over 3 leaves split the refactor's border columns and
         // chunk the 8/16-column panels; every result must stay bitwise equal.
@@ -3653,7 +3668,7 @@ mod tests {
         let k = CscMatrix::new(n, n, colptr, rowval, nzval);
         let signs: Vec<i8> = (0..n).map(|i| if i < g { 1 } else { -1 }).collect();
         let settings = CoreSettings::<f64>::default();
-        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings).unwrap();
+        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings, 0).unwrap();
         assert!(solver.refactor(&k) && solver.use_arrow);
         let b: Vec<f64> = (0..n).map(|i| (i as f64 - 7.0) / 5.0).collect();
         let mut x = vec![0.0; n];
@@ -3708,7 +3723,7 @@ mod tests {
         let k = CscMatrix::new(n, n, colptr, rowval, nzval);
         let signs = vec![1i8; n];
         let mut solver =
-            ArrowLDLSolver::try_new(&k, &signs, &CoreSettings::<T>::default()).unwrap();
+            ArrowLDLSolver::try_new(&k, &signs, &CoreSettings::<T>::default(), 0).unwrap();
         assert!(solver.refactor(&k) && solver.use_arrow && solver.trunk.is_empty());
         let b: Vec<T> = (0..n * cols)
             .map(|e| T::from_f64(((e * 13) % 17) as f64 / 17.0 - 0.3).unwrap())
@@ -3835,7 +3850,7 @@ mod tests {
     fn arrow_solves_quasidefinite_and_falls_back() {
         let (k, signs) = arrow_kkt();
         let settings = CoreSettings::<f64>::default();
-        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings).unwrap();
+        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings, 0).unwrap();
         assert_eq!(solver.leaves.len(), 3);
         assert_eq!(solver.trunk, vec![5, 6]);
         assert!(solver.refactor(&k));
@@ -3850,12 +3865,12 @@ mod tests {
         }
         // single connected positive component: not eligible
         let (k1, s1) = arrow_kkt_merged(true);
-        assert!(ArrowLDLSolver::try_new(&k1, &s1, &settings).is_none());
+        assert!(ArrowLDLSolver::try_new(&k1, &s1, &settings, 0).is_none());
         // QDLDL parity: a wrong-sign leaf pivot is regularized, not rejected.
         // Solver-side updates go through update_values into owned blocks.
         let (k2, s2) = arrow_kkt();
         let diag0 = k2.colptr[1] - 1; // (0,0) is the last entry of column 0
-        let mut solver = ArrowLDLSolver::try_new(&k2, &s2, &settings).unwrap();
+        let mut solver = ArrowLDLSolver::try_new(&k2, &s2, &settings, 0).unwrap();
         solver.update_values(&[diag0], &[-100.0]);
         assert!(solver.refactor(&k2));
         assert!(solver.use_arrow);
@@ -3866,7 +3881,7 @@ mod tests {
         let mut settings3 = CoreSettings::<f64>::default();
         settings3.dynamic_regularization_enable = false;
         let diag4 = k3.colptr[5] - 1; // (4,4)
-        let mut solver = ArrowLDLSolver::try_new(&k3, &s3, &settings3).unwrap();
+        let mut solver = ArrowLDLSolver::try_new(&k3, &s3, &settings3, 0).unwrap();
         solver.update_values(&[diag4], &[0.0]);
         assert!(!solver.refactor(&k3));
         assert!(!solver.use_arrow);
@@ -3906,7 +3921,7 @@ mod tests {
             .collect();
         let expect = reference_solve(&k64, &b64);
         let settings = CoreSettings::<MpFloat<2>>::default();
-        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings).unwrap();
+        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings, 0).unwrap();
         assert!(solver.refactor(&k));
         assert!(solver.use_arrow);
         let mut rhs = b.clone();
@@ -3952,7 +3967,7 @@ mod tests {
             .into_iter()
             .chain(vec![-1i8; t])
             .collect::<Vec<_>>();
-        assert!(ArrowLDLSolver::try_new(&k, &signs, &CoreSettings::<f64>::default()).is_none());
+        assert!(ArrowLDLSolver::try_new(&k, &signs, &CoreSettings::<f64>::default(), 0).is_none());
     }
     include!("arrow_storage_tests.rs");
 }
