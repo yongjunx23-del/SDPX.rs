@@ -62,8 +62,11 @@ const FACTOR_PANEL: usize = 8;
 const REC_FACTOR_MIN: usize = 256;
 const REC_BASE: usize = 128;
 /// Y columns per panel of a split wide leaf's blocked forward solve
-/// ([`DenseLeaf::forward_panel_rows`]); each panel is one serial work item.
-const Y_PANEL: usize = 64;
+/// ([`DenseLeaf::forward_panel_rows`]). Panels run in turn with the pool in
+/// their products: 64-column panels as concurrent serial items each encoded
+/// the same factor blocks (+21 GiB peak at 113 sites; at 545 sites an
+/// allocation failed at 195 GB RSS).
+const Y_PANEL: usize = 1024;
 /// Estimated workspace of one batch of exact leaf contributions.
 const BATCH_WORK_BYTES: usize = 4 << 30;
 /// Per-step factor tasks are small: split a leaf factor only with at least
@@ -837,12 +840,21 @@ impl<T: FloatT> DenseLeaf<T> {
     /// columns (`x`, `n - start` rows per column): row halves with one exact
     /// product update of the lower half between them, so a panel reads L once
     /// instead of once per column; blocks up to `REC_BASE` rows take the
-    /// staged-row dots. One rounding per level, as in [`ldl_rec`].
-    fn forward_panel_rows(&self, x: &mut [T], start: usize, rows: std::ops::Range<usize>) {
+    /// staged-row dots. One rounding per level, as in [`ldl_rec`]. `ways`:
+    /// workers granted to the products and to the columns of the blocks and
+    /// updates; every entry is computed alike, so the bits do not depend on it.
+    fn forward_panel_rows(
+        &self,
+        x: &mut [T],
+        start: usize,
+        rows: std::ops::Range<usize>,
+        ways: usize,
+    ) {
+        use sdpx_arithmetic::inner_parallel as ip;
         let (n, width) = (self.n, self.n - start);
         let (r0, r1) = (rows.start, rows.end);
         if r1 - r0 <= REC_BASE {
-            for column in x.chunks_mut(width) {
+            let solve = |column: &mut [T]| {
                 for i in r0..r1 {
                     let r = i + start;
                     let lo = self
@@ -853,11 +865,20 @@ impl<T: FloatT> DenseLeaf<T> {
                     let v = T::dot_slices(&self.l[r * n + lo..=r * n + r], &column[lo - start..=i]);
                     column[i] = v;
                 }
+            };
+            if ways > 1 {
+                // columns per task: one grain of dot work
+                let work = ip::weight(T::precision_bits() as usize)
+                    * ((r1 - r0) * (r1 - r0) / 2).max(1) as u128;
+                let tile = (ip::grain() / work).max(1) as usize;
+                x.par_chunks_mut(width).with_min_len(tile).for_each(solve);
+            } else {
+                x.chunks_mut(width).for_each(solve);
             }
             return;
         }
         let h = (r0 + r1) / 2;
-        self.forward_panel_rows(x, start, r0..h);
+        self.forward_panel_rows(x, start, r0..h, ways);
         let (m, cols) = (r1 - h, x.len() / width);
         let mut p = vec![T::zero(); m * cols];
         exact_product(
@@ -866,14 +887,21 @@ impl<T: FloatT> DenseLeaf<T> {
             (&self.l[start + h + (start + r0) * n..], n),
             (&x[r0..], width),
             &mut p,
-            1,
+            ways,
         );
-        for (column, update) in x.chunks_mut(width).zip(p.chunks(m)) {
+        let update = |(column, update): (&mut [T], &[T])| {
             for (v, &u) in column[h..r1].iter_mut().zip(update) {
                 *v -= u;
             }
+        };
+        if ways > 1 {
+            x.par_chunks_mut(width)
+                .zip(p.par_chunks(m))
+                .for_each(update);
+        } else {
+            x.chunks_mut(width).zip(p.chunks(m)).for_each(update);
         }
-        self.forward_panel_rows(x, start, h..r1);
+        self.forward_panel_rows(x, start, h..r1, ways);
     }
 
     /// [`Self::backward`] after [`Self::stage_rows`]`(0)`: each entry is
@@ -1205,38 +1233,26 @@ impl<T: FloatT> Leaf<T> {
         };
         if rows && split_factor && width >= REC_FACTOR_MIN {
             // Per-column dots read the whole factor once per coupled column;
-            // a panel reads it once. One posted item per panel.
-            let columns: Vec<&mut [T]> = self
+            // a panel reads it once. Panels run in turn, each with the pool's
+            // workers, as the factor's own products do.
+            let ways = rayon::current_num_threads();
+            let mut columns: Vec<&mut [T]> = self
                 .y
                 .chunks_mut(width)
                 .enumerate()
                 .filter(|(j, _)| packed || couples[*j])
                 .map(|(_, column)| column)
                 .collect();
-            let mut panels = Vec::new();
-            let mut rest = columns;
-            while !rest.is_empty() {
-                let tail = rest.split_off(rest.len().min(Y_PANEL));
-                panels.push(std::sync::Mutex::new(rest));
-                rest = tail;
-            }
-            let solve_panel = |i: usize| {
-                let mut panel = panels[i].lock().unwrap();
-                let mut x = Vec::with_capacity(width * panel.len());
+            let mut x = Vec::with_capacity(width * columns.len().min(Y_PANEL));
+            for panel in columns.chunks_mut(Y_PANEL) {
+                x.clear();
                 for column in panel.iter() {
                     x.extend_from_slice(column);
                 }
-                factor.forward_panel_rows(&mut x, start, 0..width);
+                factor.forward_panel_rows(&mut x, start, 0..width, ways);
                 for (column, solved) in panel.iter_mut().zip(x.chunks(width)) {
                     column.copy_from_slice(solved);
                 }
-            };
-            if sdpx_arithmetic::inner_parallel::board::offered() {
-                sdpx_arithmetic::inner_parallel::board::run(panels.len(), &solve_panel);
-            } else if split {
-                (0..panels.len()).into_par_iter().for_each(solve_panel);
-            } else {
-                (0..panels.len()).for_each(solve_panel);
             }
         } else if split && width > 0 && posted {
             // One posted item per column, so idle workers of the leaf phase
@@ -3648,7 +3664,7 @@ mod tests {
             }
         }
         // The blocked panel forward solve of a staged suffix matches the
-        // per-column dots to rounding.
+        // per-column dots to rounding, with the same bits on a pool.
         let (start, cols) = (7, 5);
         let width = n - start;
         serial.stage_rows(start);
@@ -3656,7 +3672,10 @@ mod tests {
             .map(|e| T::from_f64(((e * 7) % 23) as f64 / 23.0 - 0.4).unwrap())
             .collect();
         let mut blocked = panel.clone();
-        serial.forward_panel_rows(&mut blocked, start, 0..width);
+        serial.forward_panel_rows(&mut blocked, start, 0..width, 1);
+        let mut pooled = panel.clone();
+        pool.install(|| serial.forward_panel_rows(&mut pooled, start, 0..width, 8));
+        assert_eq!(blocked, pooled);
         let mut per_column = panel;
         for column in per_column.chunks_mut(width) {
             serial.forward_suffix_rows(column, start);
