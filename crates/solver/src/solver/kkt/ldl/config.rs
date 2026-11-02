@@ -134,10 +134,34 @@ impl<const N: usize> LDLConfiguration for MpFloat<N> {
         amd: Option<super::AmdOrdering>,
     ) -> BoxedDirectLDLSolver<Self> {
         use super::arrow::ArrowLDLSolver as Arrow;
-        // One AMD ordering (QDLDL's own default) serves QDLDL and the arrow's
-        // storage test against QDLDL's factor size.
-        let (perm, _, info) =
-            amd.unwrap_or_else(|| crate::qdldl::get_amd_ordering(matrix, 1.5));
+        let flipped: Vec<i8> = signs.iter().map(|&s| -s).collect();
+        // `ldl_nnz`: QDLDL's factor size when an ordering is known, else 0.
+        let arrow = |ldl_nnz: usize, perm: Option<&Vec<usize>>| {
+            let negated = || {
+                Arrow::try_negated(matrix, signs, settings, perm.cloned(), ldl_nnz)
+                    .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
+            };
+            // When both arrows are eligible, the one with less dense work
+            // (two_L6: K's border of 186 ORE rows against −K's 81 primal columns).
+            let negated_first = Arrow::work(matrix, &flipped, ldl_nnz)
+                .is_some_and(|w| Arrow::work(matrix, signs, ldl_nnz).is_none_or(|p| w < p));
+            if negated_first {
+                negated()
+            } else {
+                Arrow::try_new(matrix, signs, settings, ldl_nnz)
+                    .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
+                    .or_else(negated)
+            }
+        };
+        let ordered = amd.is_some();
+        let known = amd.as_ref().map_or(0, |(_, _, info)| info.lnz);
+        if let Some(solver) = arrow(known, amd.as_ref().map(|(perm, _, _)| perm)) {
+            return solver;
+        }
+        // No arrow fits the stored KKT's storage bound: QDLDL's own AMD
+        // ordering, which the QDLDL fallback needs anyway, gives its factor
+        // size for a second storage test.
+        let (perm, _, info) = amd.unwrap_or_else(|| crate::qdldl::get_amd_ordering(matrix, 1.5));
         if crate::receipt::profile_requested() {
             eprintln!(
                 "MP_LDL n={} lnz={} flops={:.3e}",
@@ -146,29 +170,16 @@ impl<const N: usize> LDLConfiguration for MpFloat<N> {
                 (info.n_div + info.n_mult_subs_ldl) as f64
             );
         }
-        let negated = || {
-            Arrow::try_negated(matrix, signs, settings, Some(perm.clone()), info.lnz)
-                .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
-        };
-        // When both arrows are eligible, the one with less dense work
-        // (two_L6: K's border of 186 ORE rows against −K's 81 primal columns).
-        let flipped: Vec<i8> = signs.iter().map(|&s| -s).collect();
-        let negated_first = Arrow::work(matrix, &flipped, info.lnz)
-            .is_some_and(|w| Arrow::work(matrix, signs, info.lnz).is_none_or(|p| w < p));
-        let arrow = if negated_first {
-            negated()
-        } else {
-            Arrow::try_new(matrix, signs, settings, info.lnz)
-                .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
-                .or_else(negated)
-        };
-        arrow.unwrap_or_else(|| {
-            Box::new(QDLDLDirectLDLSolver::new(
-                matrix,
-                signs,
-                settings,
-                Some(perm),
-            ))
-        })
+        if !ordered {
+            if let Some(solver) = arrow(info.lnz, Some(&perm)) {
+                return solver;
+            }
+        }
+        Box::new(QDLDLDirectLDLSolver::new(
+            matrix,
+            signs,
+            settings,
+            Some(perm),
+        ))
     }
 }
