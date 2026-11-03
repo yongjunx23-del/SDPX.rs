@@ -836,7 +836,8 @@ struct RowPanel<T> {
     cells: Vec<(usize, usize)>,
     panel: Matrix<T>,
     gram: Matrix<T>,
-    out: Vec<usize>,
+    /// `(Gram index, Schur position)` of every pair sharing a member row.
+    out: Vec<(usize, usize)>,
 }
 
 impl<T: FloatT> RowPanel<T> {
@@ -870,12 +871,23 @@ impl<T: FloatT> RowPanel<T> {
             slot[j] = s;
         }
         let mut cells = Vec::new();
+        // Orthant rows are the Schur pattern's cliques: only pairs sharing a
+        // member row are structural, and every other Gram entry is zero.
+        let words = k.div_ceil(64);
+        let mut mask = vec![0u64; d * words];
         for (r, (&(start, end), _)) in rows.iter().zip(&member).filter(|(_, &m)| m).enumerate() {
-            cells.extend((start..end).map(|e| (r + slot[cols[e]] * k, e)));
+            for e in start..end {
+                let s = slot[cols[e]];
+                cells.push((r + s * k, e));
+                mask[s * words + r / 64] |= 1 << (r % 64);
+            }
         }
+        let shares =
+            |i: usize, c: usize| (0..words).any(|w| mask[i * words + w] & mask[c * words + w] != 0);
         let out = (0..d)
             .flat_map(|c| (0..=c).map(move |i| (i, c)))
-            .map(|(i, c)| position(union[i], union[c]))
+            .filter(|&(i, c)| shares(i, c))
+            .map(|(i, c)| (i + c * d, position(union[i], union[c])))
             .collect();
         Some(Self {
             member,
@@ -894,12 +906,9 @@ impl<T: FloatT> RowPanel<T> {
         }
         self.gram
             .syrk(&self.panel.t(), T::one(), T::zero(), MatrixTriangle::Triu);
-        let mut p = 0;
-        for c in 0..self.gram.ncols() {
-            for i in 0..=c {
-                schur[self.out[p]] += self.gram[(i, c)];
-                p += 1;
-            }
+        let gram = self.gram.data();
+        for &(g, p) in &self.out {
+            schur[p] += gram[g];
         }
     }
 }
