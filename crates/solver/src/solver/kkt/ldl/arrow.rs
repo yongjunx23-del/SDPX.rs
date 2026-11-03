@@ -768,30 +768,38 @@ impl<T: FloatT> DenseLeaf<T> {
         self.forward_suffix(x, 0);
     }
 
-    /// [`Self::forward`] split over the ambient pool: once a row block is
-    /// final, every later row applies that block's columns in ascending order
-    /// (rows are independent), then the next block finishes serially. Each
-    /// entry sees the serial FMA order, so results are bitwise identical.
-    fn forward_blocked(&self, x: &mut [T], block: usize) {
+    /// [`Self::forward_many`] split over the ambient pool (`cols`
+    /// row-interleaved columns, entry (i, c) at `i * cols + c`): once a row
+    /// block is final, every later row applies that block's columns in
+    /// ascending order (rows are independent), then the next block finishes
+    /// serially. Each entry sees the serial FMA order, so results are
+    /// bitwise identical.
+    fn forward_blocked(&self, x: &mut [T], cols: usize, block: usize) {
         let n = self.n;
         let mut r0 = 0;
         while r0 < n {
             let r1 = (r0 + block).min(n);
             for i in r0..r1 {
                 for k in r0..i {
-                    x[i] = (-self.l[i + k * n]).mul_add(x[k], x[i]);
+                    let l = -self.l[i + k * n];
+                    for c in 0..cols {
+                        x[i * cols + c] = l.mul_add(x[k * cols + c], x[i * cols + c]);
+                    }
                 }
             }
-            let (head, tail) = x.split_at_mut(r1);
-            let done = &head[r0..r1];
+            let (head, tail) = x.split_at_mut(r1 * cols);
+            let done = &head[r0 * cols..r1 * cols];
             let rows_per = (block / 2).max(1);
-            tail.par_chunks_mut(rows_per)
+            tail.par_chunks_mut(rows_per * cols)
                 .enumerate()
-                .for_each(|(c, rows)| {
-                    for (j, v) in rows.iter_mut().enumerate() {
-                        let i = r1 + c * rows_per + j;
-                        for (k, &xk) in (r0..r1).zip(done) {
-                            *v = (-self.l[i + k * n]).mul_add(xk, *v);
+                .for_each(|(p, rows)| {
+                    for (j, row) in rows.chunks_mut(cols).enumerate() {
+                        let i = r1 + p * rows_per + j;
+                        for (k, xk) in (r0..r1).zip(done.chunks(cols)) {
+                            let l = -self.l[i + k * n];
+                            for (v, &xk) in row.iter_mut().zip(xk) {
+                                *v = l.mul_add(xk, *v);
+                            }
                         }
                     }
                 });
@@ -920,12 +928,13 @@ impl<T: FloatT> DenseLeaf<T> {
         }
     }
 
-    /// [`Self::backward`] split over the ambient pool: the bottom row block
+    /// [`Self::backward_many`] split over the ambient pool (row-interleaved
+    /// columns as in [`Self::forward_blocked`]): the bottom row block
     /// finishes serially, then every earlier row applies that block's columns
     /// in parallel. A row sums its terms block by block from the bottom,
     /// ascending within a block: the `back` order of the serial sweep, so
     /// the bits are identical.
-    fn backward_blocked(&self, x: &mut [T]) {
+    fn backward_blocked(&self, x: &mut [T], cols: usize) {
         let n = self.n;
         let block = self.back;
         let mut r1 = n;
@@ -933,20 +942,25 @@ impl<T: FloatT> DenseLeaf<T> {
             let r0 = r1.saturating_sub(block);
             for i in (r0..r1).rev() {
                 for k in i + 1..r1 {
-                    x[i] = (-self.l[k + i * n]).mul_add(x[k], x[i]);
+                    let l = -self.l[k + i * n];
+                    for c in 0..cols {
+                        x[i * cols + c] = l.mul_add(x[k * cols + c], x[i * cols + c]);
+                    }
                 }
             }
-            let (head, tail) = x.split_at_mut(r0);
-            let done = &tail[..r1 - r0];
+            let (head, tail) = x.split_at_mut(r0 * cols);
+            let done = &tail[..(r1 - r0) * cols];
             let rows_per = (block / 2).max(1);
-            head.par_chunks_mut(rows_per)
+            head.par_chunks_mut(rows_per * cols)
                 .enumerate()
-                .for_each(|(c, rows)| {
-                    for (j, v) in rows.iter_mut().enumerate() {
-                        let i = c * rows_per + j;
+                .for_each(|(p, rows)| {
+                    for (j, row) in rows.chunks_mut(cols).enumerate() {
+                        let i = p * rows_per + j;
                         let column = &self.l[r0 + i * n..r1 + i * n];
-                        for (&lk, &xk) in column.iter().zip(done) {
-                            *v = (-lk).mul_add(xk, *v);
+                        for (&lk, xk) in column.iter().zip(done.chunks(cols)) {
+                            for (v, &xk) in row.iter_mut().zip(xk) {
+                                *v = (-lk).mul_add(xk, *v);
+                            }
                         }
                     }
                 });
@@ -1061,11 +1075,11 @@ impl<T: FloatT> DenseLeaf<T> {
             p.current_num_threads() > 1 && self.n >= f64_scaled::<T>(2 * FORWARD_BLOCK, 16)
         }) {
             Some(pool) => pool.install(|| {
-                self.forward_blocked(x, FORWARD_BLOCK);
+                self.forward_blocked(x, 1, FORWARD_BLOCK);
                 for (x, d) in x.iter_mut().zip(&self.dinv) {
                     *x *= *d;
                 }
-                self.backward_blocked(x);
+                self.backward_blocked(x, 1);
             }),
             None => {
                 self.forward(x);
@@ -1314,9 +1328,11 @@ impl<T: FloatT> Leaf<T> {
         if chunks > 1 {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::forward_many);
-        } else if cols == 1 && split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
-            // One column has the single-RHS layout and order.
-            self.factor.forward_blocked(&mut self.batch_w, LEAF_BLOCK);
+        } else if split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
+            // Too few columns to split them (the constant and affine pair):
+            // rows split instead, each column in the serial order.
+            self.factor
+                .forward_blocked(&mut self.batch_w, cols, LEAF_BLOCK);
         } else {
             self.factor.forward_many(&mut self.batch_w, cols);
         }
@@ -1360,8 +1376,8 @@ impl<T: FloatT> Leaf<T> {
         if chunks > 1 {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::backward_many);
-        } else if cols == 1 && split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
-            self.factor.backward_blocked(&mut self.batch_w);
+        } else if split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
+            self.factor.backward_blocked(&mut self.batch_w, cols);
         } else {
             self.factor.backward_many(&mut self.batch_w, cols);
         }
@@ -1385,7 +1401,7 @@ impl<T: FloatT> Leaf<T> {
             *w = rhs[id];
         }
         if split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
-            self.factor.forward_blocked(&mut self.w, LEAF_BLOCK);
+            self.factor.forward_blocked(&mut self.w, 1, LEAF_BLOCK);
         } else {
             self.factor.forward(&mut self.w);
         }
@@ -1424,7 +1440,7 @@ impl<T: FloatT> Leaf<T> {
             self.w.iter_mut().enumerate().for_each(update);
         }
         if split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
-            self.factor.backward_blocked(&mut self.w);
+            self.factor.backward_blocked(&mut self.w, 1);
         } else {
             self.factor.backward(&mut self.w);
         }
@@ -1470,8 +1486,8 @@ impl<T: FloatT> Leaf<T> {
         if chunks > 1 {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::backward_many);
-        } else if cols == 1 && split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
-            self.factor.backward_blocked(&mut self.batch_w);
+        } else if split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
+            self.factor.backward_blocked(&mut self.batch_w, cols);
         } else {
             self.factor.backward_many(&mut self.batch_w, cols);
         }
@@ -3269,20 +3285,23 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
         }
         crate::receipt::finish("many.couple", prof);
         let prof = crate::receipt::start();
-        // A single trunk column splits its sweeps over the pool.
-        match self
-            .pool
-            .as_ref()
-            .filter(|_| cols == 1 && t >= f64_scaled::<T>(2 * FORWARD_BLOCK, 16))
-        {
+        // Fewer trunk columns than workers split their sweeps' rows over the
+        // pool (the constant and affine pair took 1.3 s on two of 128
+        // workers for the 85-site Ising border at 128 bits).
+        match self.pool.as_ref().filter(|p| {
+            (cols == 1 || cols < p.current_num_threads())
+                && t >= f64_scaled::<T>(2 * FORWARD_BLOCK, 16)
+        }) {
             Some(pool) => {
                 let tf = &self.tf;
                 pool.install(|| {
-                    tf.forward_blocked(tx, FORWARD_BLOCK);
-                    for (x, d) in tx.iter_mut().zip(&tf.dinv) {
-                        *x *= *d;
+                    tf.forward_blocked(tx, cols, FORWARD_BLOCK);
+                    for (row, d) in tx.chunks_mut(cols).zip(&tf.dinv) {
+                        for x in row {
+                            *x *= *d;
+                        }
                     }
-                    tf.backward_blocked(tx);
+                    tf.backward_blocked(tx, cols);
                 });
             }
             None => {
@@ -3469,20 +3488,28 @@ mod tests {
             // Forward: bitwise identical.
             let (mut s, mut b) = (rhs.clone(), rhs.clone());
             leaf.forward(&mut s);
-            pool.install(|| leaf.forward_blocked(&mut b, LEAF_BLOCK));
+            pool.install(|| leaf.forward_blocked(&mut b, 1, LEAF_BLOCK));
             assert_eq!(s, b);
+            let pair: Vec<T> = rhs.iter().flat_map(|&v| [v, -v]).collect();
+            let (mut s2, mut b2) = (pair.clone(), pair.clone());
+            leaf.forward_many(&mut s2, 2);
+            pool.install(|| leaf.forward_blocked(&mut b2, 2, LEAF_BLOCK));
+            assert_eq!(s2, b2);
             // Backward: the shared block order, bitwise identical, and equal to
             // the batched sweep column by column.
             let (mut s, mut b) = (rhs.clone(), rhs.clone());
             leaf.backward(&mut s);
-            pool.install(|| leaf.backward_blocked(&mut b));
+            pool.install(|| leaf.backward_blocked(&mut b, 1));
             assert_eq!(s, b);
-            let mut many: Vec<T> = rhs.iter().flat_map(|&v| [v, -v]).collect();
+            let mut many = pair.clone();
             leaf.backward_many(&mut many, 2);
             for (i, &v) in s.iter().enumerate() {
                 assert_eq!(many[2 * i], v);
                 assert_eq!(many[2 * i + 1], -v);
             }
+            let mut blocked = pair.clone();
+            pool.install(|| leaf.backward_blocked(&mut blocked, 2));
+            assert_eq!(many, blocked);
         }
     }
     use sdpx_arithmetic::MpFloat;
