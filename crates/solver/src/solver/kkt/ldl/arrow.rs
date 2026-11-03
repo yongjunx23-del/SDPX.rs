@@ -2479,7 +2479,10 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             // one contribution batch (`BATCH_WORK_BYTES`); the others form in
             // `subtract_contributions`, batched as before.
             // A product above a worker's share of all products' work splits
-            // into that many ways (the largest would otherwise end the phase).
+            // into that many ways (the largest would otherwise end the phase),
+            // up to the whole pool rather than `MAX_WAYS`: one dense leaf's
+            // product is the phase's tail (Ising 85-site at 128 bits: 8 of
+            // 128 workers formed it in 11 s per iteration, the rest waited).
             let product_work = |l: &Leaf<T>| (l.ids.len() * l.coupled.len().pow(2)) as f64;
             let mut admitted = vec![false; owned.len()];
             if self.local_structure.is_none() {
@@ -2506,7 +2509,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 .map(|(l, _)| product_work(l))
                 .sum();
             let share = products / threads as f64;
-            let ways = |l: &Leaf<T>| crate::algebra::measured_ways(product_work(l), share);
+            let ways = |l: &Leaf<T>| ((product_work(l) / share).floor() as usize).clamp(1, threads);
             // Counts are diagnostic only; no per-leaf counter buffer is needed.
             let count = AtomicUsize::new(0);
             // Lanes serve a leaf that splits its factor (a straggler, whose
