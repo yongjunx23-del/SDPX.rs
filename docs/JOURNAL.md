@@ -8,6 +8,148 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-03 — Float64 2D Ising bootstrap (41/85 sites): Schur assembly, dense admission, reduced inputs
+
+- Question: what limits the selected no-GKS critical-Ising SDPs (RP, loop,
+  TI, local Gibbs and compressed filter blocks as built by the Ising
+  project; slacks 1e-8/1e-9), and what makes larger diamonds affordable.
+  Float64, condensed KKT, `tol_gap_abs/rel`, `tol_feas` and `tol_original`
+  1e-6; refinement and acceptance settings unchanged. Results are numerical
+  estimates, not certificates. AlmostSolved is never read as a tighter
+  bound.
+- Models (lower side; the upper side has the same shape). There are 4701
+  variables at 41 sites and 6399 at 85. The condensed KKT dimension is
+  variables + equalities.
+
+  | model | rows | nnz(A) | equalities | nonneg | PSD blocks (n) | KKT |
+  |---|---|---|---|---|---|---|
+  | orig41 | 50609 | 6.39M | 4033 | 5196 | 4×128, 4×64, 6×3 | 8734 |
+  | red41 | 48855 | 5.51M | 2279 | 5196 | as orig41 | 6980 |
+  | sym41 | 30321 | 4.27M | 4033 | 5196 | 2×(72,56), 2×(64,64), 4×(36,28), 6×3 | 8734 |
+  | symred41 | 28567 | 3.39M | 2279 | 5196 | as sym41 | 6980 |
+  | orig85 | 230343 | 9.50M | 3796 | 8592 | 253, 223, 218, 188, 130, 4×128, 16 of 66–119, 4×64, 6×3 | 10195 |
+  | red85 | 229922 | 7.74M | 3375 | 8592 | as orig85 | 9774 |
+  | symred85 | 213666 | 7.74M | 3375 | 8592 | 128s split as at 41 sites (38 blocks) | 9774 |
+
+  The KKT factor fills 79–81% of the triangle (AMD). AMD flops are 6.2e10
+  for orig41, 1.05e11 for orig85 and 8.8e10 for red85 (0.57 of dense).
+- Construction (outside SDPX):
+  - `reduce_eq.py` drops numerically dependent TI rows by pivoted QR (41
+    sites: 4033 → 2279; 85: 3796 → 3375). Every dropped row is a
+    combination of kept rows, with row and right-hand-side residuals of at
+    most 2.6e-13; the QR pivot gap is 2e-3 → 4e-14. `mapback_eq.py`
+    restores their duals as zero for the audits. SDPX presolve cannot prove
+    these dependencies (Float64 a+b√2 coefficients).
+  - Combined with the Ising project's exact character-basis symmetry split.
+  - Times, 41/85 sites (all JSON-bound): export 22.9/30.2 s, symmetry split
+    15.4/31.1 s, reduction per side 13.6 s (Mac) / 43–46 s (cluster).
+- Baseline (920b11f, orig41, 8 threads, node177): lower 182.1 s / 18 it,
+  upper 219.0 s / 23 it, 15.0 GB. Time went to:
+  - the first KKT update, 48.9 s (54 long orthant rows formed pair by
+    pair);
+  - PSD Schur assembly, 108.8 s;
+  - the faer factor, 54.2 s, using 1.35 of 8 cores.
+- Changes (branch `ising-perf`):
+  1. Kept, row panel (`5659ebb`, `5477e60`): eliminated orthant rows with
+     at least 64 entries form one dense rows×union panel and one SYRK; only
+     pairs that share a member row are scattered.
+  2. Kept, dot panels (`ed42e1e`): the dense Schur dots walk the dense axis
+     in 1 MiB panels; bitwise identical.
+  3. Kept, dense admission (`e59fc81`): with at least 2 workers and fill of
+     at least 0.1, dense_block also takes systems whose AMD sparse factor
+     needs at least half the dense multiply-subtracts.
+  4. Rejected, pooled dense_block solves: 128-row tiles of the triangular
+     sweeps and Y products on the pool (worker-count independent).
+     - Mac, 4 threads: 26.4 → 24.7 s.
+     - Zen2 release ABBA, symred41 lower: 8 threads 38.07 → 37.88 s,
+       32 threads 29.29 → 29.57 s. The solve phase kept 7 and 26 cores busy
+       for unchanged wall time.
+     - 85 sites, 32 threads: solve phase 11.3 → 13.0 s.
+     - Cause: the tiles stream 1 KiB column segments 37 KiB apart, while
+       `dtrsv` streams whole columns. A retry needs column-contiguous
+       chunks (a left-looking forward sweep split by columns, a transposed
+       factor for the backward sweep).
+     - The serial refinement residual on these inputs is the direct
+       solver's dense `dsymv` copy (the leading block is not fully dense).
+       The generic BLAS trait has no `gemv` to split it with.
+- 41 sites, 8 threads. Every run is Solved in 18 (lower) / 23 (upper)
+  iterations and passes the audit gate:
+
+  | model / binary | lower s | upper s | RSS | asm s | factor s |
+  |---|---|---|---|---|---|
+  | orig41 / 920b11f | 182.1 | 219.0 | 15.0 GB | 108.8 | 54.2 |
+  | orig41 / 5477e60 | 111.0 | 141.1 | 4.6 GB | 37.8 | 53.9 |
+  | orig41 / e59fc81 | 54.7 | 70.3 | 4.4 GB | 16.5 | 18.4 |
+  | red41 / 5477e60 | 61.8 | 80.2 | 4.5 GB | 37.0 | 10.8 |
+  | sym41 / 5477e60 | 86.6 | 113.9 | 4.7 GB | 15.7 | 53.7 |
+  | symred41 / 5477e60 | 39.9 | 50.0 | 4.6 GB | 16.0 | 10.9 |
+  | symred41 / e59fc81 | 37.7 | 47.4 | 4.6 GB | 13.7 | 10.9 |
+
+  - Endpoints from the original input: [0.6897422315, 0.7234765772]
+    (920b11f).
+  - Endpoints from symred41: [0.6897414796, 0.7234765479]. The
+    original-coordinate mapback gives the same values (stationarity
+    residual ≤ 1.1e-5, relative original PSD ≥ −6.7e-10).
+  - Same-node ABBA (node170) for e59fc81: 38.1/38.0 s.
+- 85 sites. Every run needs 37–44 iterations. Late iterations stall on a
+  zero step, so the status flips between Solved and AlmostSolved with
+  rounding. On the upper side the dense Cholesky refuses a clearly
+  negative pivot late, and faer takes over.
+
+  | model / binary / threads | lower | upper | s | RSS | gate |
+  |---|---|---|---|---|---|
+  | orig85 / 920b11f / 64 | Solved 0.6971211209 | Almost 0.7168815797 | 337/336 | 19.3 GB | pass/pass |
+  | orig85 / 5477e60 / 64 | Almost 0.6970692979 | Almost 0.7168574706 | 244/216 | 10.4 GB | pass/pass |
+  | red85 / 5477e60 / 64 | Almost 0.6970450014 | Almost 0.7168533871 | 206/226 | 10.0 GB | pass/pass |
+  | symred85 / 5477e60 / 64 | Almost 0.6970710368 | Almost 0.7168866237 | 216/220 | 9.8 GB | fail/fail |
+  | symred85 / e59fc81 / 64 | Almost 0.6970822651 | Solved 0.7168463621 | 141/137 | 10.5 GB | fail/fail |
+  | orig85 / e59fc81 / 32 | Almost 0.6970846386 | Solved 0.7168288521 | 129/133 | 9.5 GB | pass/pass |
+  | red85 / e59fc81 / 32 | Almost 0.6969822775 | Almost 0.7185400722 | 132/169 | 9.2 GB | pass/pass |
+
+  - The rejected pooled-solve binary at 32 threads: orig85 lower Solved
+    0.6970903610, red85 lower Solved 0.6971151786 (both on dense_block
+    throughout); both uppers Almost.
+  - Split 85-site audits fail on relative primal PSD (−1.7e-6 to −5.8e-6).
+    The Ising project's mapback to the original cones gives PSD ≥ −7.6e-8
+    but a stationarity residual of 0.27–0.48 (1e-5 at 41 sites). The split
+    85-site model is therefore not validated in original coordinates.
+  - Same-node A/B (node170, symred85 lower, 64 threads): 5477e60 220.2 s →
+    e59fc81 140.9 s (asm 66.4 → 25.0 s, factor 90.6 → 50.0 s), both
+    AlmostSolved in 39 iterations.
+- Scaling (symred lower, e59fc81, whole sugon nodes):
+  - 41 sites: T=1 112.1 s (asm 42.9, factor 55.3, 2.7 GB); T=8 37.9; T=16
+    32.2; T=32 29.2; T=64 31.2; T=128 41.4 (6.1 GB). Refinement (5.3 s) and
+    the corrector/step phase (3 s) stay serial.
+  - 85 sites: T=16 140.0 s (Almost); T=32 134.0 (Solved); T=64 145.1;
+    T=128 184.4 (12.6 GB). Refinement takes 27–32 s and step+corrector
+    20–26 s.
+  - MPI replicates the condensed Schur and factor, so more nodes do not
+    help yet.
+- Decision: keep 1–3, reject 4. Best configuration:
+  - 41 sites: symmetry split + TI reduction on e59fc81, 32 threads.
+  - 85 sites: the original input on e59fc81, 32 threads; the split model's
+    audits fail.
+  - Largest result (numerical estimate): 85-site lower 0.6971211209
+    (Solved, 920b11f) and upper 0.7168288521 (Solved, e59fc81), both
+    gate-passing. Solved 85-site endpoints spread by 3e-5 across binaries.
+  - 113 sites is not justified until the 85-site end game is reliable.
+- Next:
+  - 85-site end game: late dense pivot refusal, zero steps, and the status
+    flipping with rounding.
+  - Column-contiguous pooled solves and residual: refinement is about 18%
+    of the 32-thread solves.
+  - Split the outer 85-site RP blocks (253, 223, 218, 188 hold about 62% of
+    the transform work).
+  - A distributed dense Schur and factor for multi-node.
+- Reproduction:
+  - Cluster `~/projects/tb-ising-perf-20261103`: `cases/`,
+    `runs/TAG-JOBID`, `tb-i41.pbs` (lower/upper and audits), `tb-legs.pbs`
+    (ABBA), `tb-scale.pbs`, `tb-mapback.pbs`, `audit/` (`reduce_eq.py`,
+    `mapback_eq.py`, `tb_table.py`, `tb_legs.py`, `tb_scale.py`).
+  - Binaries in `~/projects/sdpx-ising11-scaling-20261007/bin`: `sdpx-tbJB`
+    (920b11f), `-tbJR2` (5477e60), `-tbJD` (e59fc81), `-tbTS` (rejected).
+  - Local inputs and scripts: `~/.cache/sdpx-e2e/ising-perf-20261103`.
+
 ## 2026-10-22 — Review repairs: exact operators, finite dots and bounded temporary memory
 
 - Source: baseline `682e484`; repaired runtime source `263f027`, version
