@@ -1941,6 +1941,31 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         Some(Negated { inner })
     }
 
+    /// One dense leaf of every positive-sign variable, the negative-sign
+    /// ones as border, when the serial sparse factor would cost more than the
+    /// dense one spread over the pool (`super::dense_factor`): the pooled
+    /// dense kernels then replace serial sparse LDL (Ising 85-site condensed
+    /// KKT at 128 bits: QDLDL took about 30 minutes per factorization on
+    /// 3–5 busy cores of 128). Same element cap as `dense_block`.
+    pub fn try_dense(
+        k: &CscMatrix<T>,
+        signs: &[i8],
+        settings: &CoreSettings<T>,
+        amd: &mut Option<super::AmdOrdering>,
+    ) -> Option<Self> {
+        let (leaf, trunk): (Vec<usize>, Vec<usize>) = (0..k.n).partition(|&i| signs[i] > 0);
+        let (g, t) = (leaf.len() as u128, trunk.len() as u128);
+        if g < 128 || g * g + g * t + t * t > 256 * 1024 * 1024 {
+            return None;
+        }
+        if !super::dense_factor(k, settings, amd, true) {
+            return None;
+        }
+        let mut solver = Self::from_groups(k, signs, settings, vec![leaf], trunk, None);
+        solver.fallback_perm = amd.as_ref().map(|o| o.0.clone());
+        Some(solver)
+    }
+
     /// Leaves made of an SOC block followed by one primal column with a
     /// nonzero coupling to it (upper-triangle entries in the cone columns).
     fn single_primal_leaf_columns(

@@ -134,7 +134,7 @@ impl<const N: usize> LDLConfiguration for MpFloat<N> {
         matrix: &CscMatrix<Self>,
         signs: &[i8],
         settings: &CoreSettings<Self>,
-        amd: Option<super::AmdOrdering>,
+        mut amd: Option<super::AmdOrdering>,
     ) -> BoxedDirectLDLSolver<Self> {
         use super::arrow::ArrowLDLSolver as Arrow;
         let negated = || {
@@ -154,6 +154,12 @@ impl<const N: usize> LDLConfiguration for MpFloat<N> {
                 .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
                 .or_else(negated)
         };
+        // No arrow structure: one pooled dense leaf when serial QDLDL would
+        // cost more.
+        let arrow = arrow.or_else(|| {
+            Arrow::try_dense(matrix, signs, settings, &mut amd)
+                .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
+        });
         arrow.unwrap_or_else(|| {
             Box::new(QDLDLDirectLDLSolver::new(
                 matrix,

@@ -54,31 +54,11 @@ impl DenseBlockSolver {
         let leading_fill = k.colptr[n] as f64 / ((n * (n + 1) / 2) as f64);
         let total_fill = k.colptr[k.n] as f64 / ((k.n as f64) * (k.n as f64 + 1.) / 2.);
         if !(total_fill >= 0.4 || (m <= 256 && m <= n / 4 && leading_fill >= 0.8))
-            && !(total_fill >= 0.1 && Self::dense_factor(k, settings, amd))
+            && !super::dense_factor(k, settings, amd, false)
         {
             return None;
         }
         Some(Self::new(k, signs, settings, n))
-    }
-
-    /// A sparse factor that still needs half of the dense elimination's
-    /// arithmetic saves too little once several workers are available: the
-    /// tiled kernels use the whole pool, the supernodal factor far less of it
-    /// (Ising 41/85-site condensed systems: faer ran 1.3 of 8 and 7.6 of 64
-    /// workers). The ordering stays with the caller for the sparse solver.
-    fn dense_factor(
-        k: &CscMatrix<f64>,
-        settings: &CoreSettings<f64>,
-        amd: &mut Option<super::AmdOrdering>,
-    ) -> bool {
-        if crate::solver::core::worker_budget(settings.max_threads as usize) < 2 {
-            return false;
-        }
-        let info = &amd
-            .get_or_insert_with(|| crate::qdldl::get_amd_ordering(k, 1.5))
-            .2;
-        // Multiply-subtract pairs, as the AMD statistics count them.
-        (info.n_div + info.n_mult_subs_ldl) as f64 >= 0.5 * (k.n as f64).powi(3) / 6.
     }
 
     fn new(k: &CscMatrix<f64>, signs: &[i8], settings: &CoreSettings<f64>, n: usize) -> Self {
