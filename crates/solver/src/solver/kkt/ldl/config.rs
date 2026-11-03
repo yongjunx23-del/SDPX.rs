@@ -67,14 +67,17 @@ macro_rules! primitive_configuration {
                 matrix: &CscMatrix<Self>,
                 signs: &[i8],
                 settings: &CoreSettings<Self>,
-                amd: Option<super::AmdOrdering>,
+                mut amd: Option<super::AmdOrdering>,
             ) -> BoxedDirectLDLSolver<Self> {
+                // The dense test may order the pattern; the sparse solver
+                // then reuses that ordering.
                 let dense: fn(
                     &CscMatrix<Self>,
                     &[i8],
                     &CoreSettings<Self>,
+                    &mut Option<super::AmdOrdering>,
                 ) -> Option<BoxedDirectLDLSolver<Self>> = $dense;
-                if let Some(solver) = dense(matrix, signs, settings) {
+                if let Some(solver) = dense(matrix, signs, settings, &mut amd) {
                     return solver;
                 }
                 #[cfg(feature = "faer-sparse")]
@@ -97,9 +100,9 @@ macro_rules! primitive_configuration {
 
 // Single precision is configured only so the dense BLAS suites can exercise
 // the `s`-prefixed kernels; the solver itself runs at f64 and MPFR.
-primitive_configuration!(f32, |_, _, _| None);
-primitive_configuration!(f64, |matrix, signs, settings| {
-    super::dense_block::DenseBlockSolver::try_new(matrix, signs, settings)
+primitive_configuration!(f32, |_, _, _, _| None);
+primitive_configuration!(f64, |matrix, signs, settings, amd| {
+    super::dense_block::DenseBlockSolver::try_new(matrix, signs, settings, amd)
         .map(|s| Box::new(s) as BoxedDirectLDLSolver<f64>)
         .or_else(|| {
             super::arrow::ArrowLDLSolver::try_new(matrix, signs, settings)
