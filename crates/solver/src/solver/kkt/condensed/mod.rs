@@ -453,13 +453,15 @@ fn eliminated_soc(dim: usize) -> bool {
 /// Eliminated rows `B` of orthants (`A_r/w_r`) and small second-order cones
 /// (`W⁻¹A_k`), whose Schur contribution is `BᵀB`. Columns present in at least
 /// half of the rows form a dense panel handled by one SYRK; every other
-/// product goes through a precomputed per-position plan.
+/// product goes through a precomputed per-position plan. Binary64 long rows
+/// may instead form their own row panel (`RowPanel`).
 struct EliminatedRows<T> {
     /// Per source block: orthant rows or one SOC; entries index `values`.
     sources: Vec<Source>,
     values: Vec<T>,
     /// Virtual rows as `values` ranges, with their columns.
     rows: Vec<(usize, usize)>,
+    wide: Option<RowPanel<T>>,
     dense: Vec<usize>,
     /// Panel cells `(row + slot·rows, value index)` of the dense entries of
     /// rows that also have sparse entries (their values feed the plan too)
@@ -560,11 +562,20 @@ impl<T: FloatT> EliminatedRows<T> {
             }
         }
         let n = cols.iter().max().map_or(0, |&j| j + 1);
+        // Row-panel rows take part in neither the column panel nor the plan.
+        let wide = RowPanel::select(&rows, &cols, n, &position);
+        let is_wide = |i: usize| wide.as_ref().is_some_and(|w| w.member[i]);
         let mut count = vec![0usize; n];
-        for &j in &cols {
-            count[j] += 1;
+        let mut narrow = 0;
+        for (i, &(start, end)) in rows.iter().enumerate() {
+            if !is_wide(i) {
+                narrow += 1;
+                for &j in &cols[start..end] {
+                    count[j] += 1;
+                }
+            }
         }
-        let threshold = (rows.len() / 2).max(16);
+        let threshold = (narrow / 2).max(16);
         let dense: Vec<usize> = (0..n).filter(|&j| count[j] >= threshold).collect();
         let mut slot = vec![usize::MAX; n];
         for (d, &j) in dense.iter().enumerate() {
@@ -576,7 +587,7 @@ impl<T: FloatT> EliminatedRows<T> {
             .collect();
         // Every product with at least one non-panel column.
         let mut triples = Vec::new();
-        for &(start, end) in &rows {
+        for (_, &(start, end)) in rows.iter().enumerate().filter(|&(i, _)| !is_wide(i)) {
             for b in start..end {
                 for a in start..=b {
                     let (i, j) = (cols[a], cols[b]);
@@ -590,7 +601,10 @@ impl<T: FloatT> EliminatedRows<T> {
         let in_panel = |e: usize| slot[cols[e]] != usize::MAX;
         let panel_only: Vec<bool> = rows
             .iter()
-            .map(|&(start, end)| !dense.is_empty() && (start..end).all(in_panel))
+            .enumerate()
+            .map(|(i, &(start, end))| {
+                !is_wide(i) && !dense.is_empty() && (start..end).all(in_panel)
+            })
             .collect();
         let fixed_row: Vec<bool> = (0..rows.len())
             .map(|i| T::precision_bits() > 64 && panel_only[i] && orthant_of[i].is_some())
@@ -599,7 +613,7 @@ impl<T: FloatT> EliminatedRows<T> {
         let mut index = vec![usize::MAX; rows.len()];
         let (mut k, mut k_fixed) = (0, 0);
         for i in 0..rows.len() {
-            if dense.is_empty() {
+            if dense.is_empty() || is_wide(i) {
                 continue;
             }
             if fixed_row[i] {
@@ -612,6 +626,9 @@ impl<T: FloatT> EliminatedRows<T> {
         }
         let mut cell_of = vec![usize::MAX; cols.len()];
         for (i, &(start, end)) in rows.iter().enumerate() {
+            if is_wide(i) {
+                continue;
+            }
             let height = if fixed_row[i] { k_fixed } else { k };
             for e in start..end {
                 if in_panel(e) {
@@ -645,6 +662,7 @@ impl<T: FloatT> EliminatedRows<T> {
             sources,
             values: vec![T::zero(); cols.len()],
             rows,
+            wide,
             panel: Matrix::zeros((k, dense.len())),
             gram: Matrix::zeros((dense.len(), dense.len())),
             dense,
@@ -793,10 +811,95 @@ impl<T: FloatT> EliminatedRows<T> {
                 }
             }
         }
+        if let Some(wide) = self.wide.as_mut() {
+            wide.accumulate(schur, &self.values);
+        }
         if T::precision_bits() <= 53 {
             self.plan.accumulate_rounded(schur, &self.values);
         } else {
             self.plan.accumulate(schur, &self.values, pool);
+        }
+    }
+}
+
+/// Shortest eliminated row a `RowPanel` considers.
+const WIDE_ROW: usize = 64;
+
+/// Binary64 long eliminated rows: one SYRK of their dense `rows × union`
+/// panel forms all their products. The pair plan grows with Σ L(L+1)/2 and
+/// is summed serially: the 41-site Ising model's 54 dense loop/probability
+/// rows (~4,300 entries) gave 494M plan terms, built in the first assembly
+/// (48 s, ~12 GB) and summed on every iteration.
+struct RowPanel<T> {
+    member: Vec<bool>,
+    /// `(row + slot·rows, value index)` of every entry of a member row.
+    cells: Vec<(usize, usize)>,
+    panel: Matrix<T>,
+    gram: Matrix<T>,
+    out: Vec<usize>,
+}
+
+impl<T: FloatT> RowPanel<T> {
+    fn select(
+        rows: &[(usize, usize)],
+        cols: &[usize],
+        n: usize,
+        position: &impl Fn(usize, usize) -> usize,
+    ) -> Option<Self> {
+        if T::precision_bits() > 53 {
+            return None;
+        }
+        let member: Vec<bool> = rows.iter().map(|&(s, e)| e - s >= WIDE_ROW).collect();
+        let (mut k, mut pairs) = (0, 0u128);
+        let mut slot = vec![usize::MAX; n];
+        for (&(start, end), _) in rows.iter().zip(&member).filter(|(_, &m)| m) {
+            k += 1;
+            let l = (end - start) as u128;
+            pairs += l * (l + 1) / 2;
+            for &j in &cols[start..end] {
+                slot[j] = 0;
+            }
+        }
+        let union: Vec<usize> = (0..n).filter(|&j| slot[j] == 0).collect();
+        let d = union.len();
+        // The SYRK may take a few times the flops of the products it replaces.
+        if k == 0 || (k * d) as u128 * (d as u128 + 1) / 2 > 8 * pairs {
+            return None;
+        }
+        for (s, &j) in union.iter().enumerate() {
+            slot[j] = s;
+        }
+        let mut cells = Vec::new();
+        for (r, (&(start, end), _)) in rows.iter().zip(&member).filter(|(_, &m)| m).enumerate() {
+            cells.extend((start..end).map(|e| (r + slot[cols[e]] * k, e)));
+        }
+        let out = (0..d)
+            .flat_map(|c| (0..=c).map(move |i| (i, c)))
+            .map(|(i, c)| position(union[i], union[c]))
+            .collect();
+        Some(Self {
+            member,
+            cells,
+            panel: Matrix::zeros((k, d)),
+            gram: Matrix::zeros((d, d)),
+            out,
+        })
+    }
+
+    /// `schur += PᵀP` for the panel `P` of the current scaled `values`.
+    fn accumulate(&mut self, schur: &mut [T], values: &[T]) {
+        let panel = self.panel.data_mut();
+        for &(cell, e) in &self.cells {
+            panel[cell] = values[e];
+        }
+        self.gram
+            .syrk(&self.panel.t(), T::one(), T::zero(), MatrixTriangle::Triu);
+        let mut p = 0;
+        for c in 0..self.gram.ncols() {
+            for i in 0..=c {
+                schur[self.out[p]] += self.gram[(i, c)];
+                p += 1;
+            }
         }
     }
 }
