@@ -211,14 +211,23 @@ impl<T: FloatT, F: FnMut(usize, usize, usize, T)> SchurSink<'_, F, T> {
     }
 }
 
-/// Accumulate one left column's coefficient dot into row `t` of a tile buffer.
+/// Bytes of source rows that one dense-axis panel of a tile keeps in cache
+/// (256 KiB to 4 MiB were within 1% on Zen2 and the M4).
+const DOT_PANEL_BYTES: usize = 1 << 20;
+
+/// Accumulate the coefficient dots of left columns `[a0, a1)` into the rows of
+/// a tile buffer, one dense-axis panel at a time: each panel of the source
+/// rows stays in cache while every column of the tile reads it, instead of
+/// every column streaming whole rows (23 MB for the 41-site Ising blocks).
+/// Each accumulator folds its entries in the same order whatever the panel
+/// width, so values are bitwise unchanged.
 ///
-/// Returns true when the column reaches the end of the dense axis, which means
+/// Returns true when a column reaches the end of the dense axis, which means
 /// no later column can produce a store either. Shared by the serial and tiled
 /// paths so both fold every accumulator in exactly the same order.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn accumulate_column<T: FloatT>(
+fn accumulate_tile<T: FloatT>(
     acc: &mut [T],
     columns: &[Column],
     dense_indices: &[usize],
@@ -228,63 +237,73 @@ fn accumulate_column<T: FloatT>(
     values: &[T],
     width: usize,
     a0: usize,
-    a: usize,
+    a1: usize,
 ) -> bool {
-    let t = a - a0;
-    let left = &columns[a];
-    let dmin = dense_indices.partition_point(|&c| c < a);
-    if dmin == width {
-        return true;
-    }
-    // Exact coefficient aliases share their left dot products too. Earlier rows
-    // have a superset of this row's live suffix, so reuse within the existing
-    // tile without another large cache.
-    let representative = dense_representatives[a];
-    if let Some(previous) = (a0..a).find(|&p| dense_representatives[p] == representative) {
-        let source = (previous - a0) * width + dmin;
-        acc.copy_within(source..source + width - dmin, t * width + dmin);
-        return false;
-    }
-    // All live slices share one provable length so the inner loops carry no
-    // per-element bounds checks. The FMA order per accumulator is unchanged,
-    // keeping Schur values bitwise identical.
-    let len = width - dmin;
-    let row = &mut acc[t * width + dmin..][..len];
-    row.iter_mut().for_each(|x| *x = T::zero());
-    // Four independent source streams share one accumulator load/store,
-    // retaining the entry-wise FMA order exactly.
-    let mut wide_groups = left.entries.chunks_exact(8);
-    for group in &mut wide_groups {
-        let rows: [&[T]; 8] = std::array::from_fn(|k| {
-            let e = &group[k];
-            let pos = triangular_number(e.j) + e.i;
-            let end = dense_row_offsets[pos + 1];
-            &dense_vectors[end - len..][..len]
-        });
-        let v: [T; 8] = std::array::from_fn(|k| values[group[k].position]);
-        fma_rows(row, &rows, &v);
-    }
-    let mut groups = wide_groups.remainder().chunks_exact(4);
-    for group in &mut groups {
-        let rows: [&[T]; 4] = std::array::from_fn(|k| {
-            let e = &group[k];
-            let pos = triangular_number(e.j) + e.i;
-            let end = dense_row_offsets[pos + 1];
-            &dense_vectors[end - len..][..len]
-        });
-        let v: [T; 4] = std::array::from_fn(|k| values[group[k].position]);
-        fma_rows(row, &rows, &v);
-    }
-    for e in groups.remainder() {
-        let v = values[e.position];
-        let pos = triangular_number(e.j) + e.i;
-        let end = dense_row_offsets[pos + 1];
-        let source = &dense_vectors[end - len..][..len];
-        for i in 0..len {
-            row[i] = v.mul_add(source[i], row[i]);
+    // Each column's live suffix start, and the earlier tile row an exact
+    // coefficient alias copies: earlier rows have a superset of its suffix.
+    let mut live = Vec::with_capacity(a1 - a0);
+    let mut exhausted = false;
+    for a in a0..a1 {
+        let dmin = dense_indices.partition_point(|&c| c < a);
+        if dmin == width {
+            exhausted = true;
+            break;
         }
+        let representative = dense_representatives[a];
+        let alias = (a0..a).find(|&p| dense_representatives[p] == representative);
+        live.push((dmin, alias));
     }
-    false
+    let rows = dense_row_offsets.len() - 1;
+    let panel = (DOT_PANEL_BYTES / (std::mem::size_of::<T>() * rows.max(1)) / 16 * 16).max(64);
+    let mut c0 = live.iter().map(|&(dmin, _)| dmin).min().unwrap_or(width);
+    while c0 < width {
+        let c1 = (c0 + panel).min(width);
+        for (t, &(dmin, alias)) in live.iter().enumerate() {
+            let lo = dmin.max(c0);
+            if lo >= c1 {
+                continue;
+            }
+            let len = c1 - lo;
+            if let Some(previous) = alias {
+                let source = (previous - a0) * width + lo;
+                acc.copy_within(source..source + len, t * width + lo);
+                continue;
+            }
+            // A position's source row ends at the end of the dense axis.
+            let source = |e: &Entry| {
+                let end = dense_row_offsets[triangular_number(e.j) + e.i + 1] - (width - c1);
+                &dense_vectors[end - len..end]
+            };
+            // All live slices share one provable length so the inner loops
+            // carry no per-element bounds checks.
+            let row = &mut acc[t * width + lo..][..len];
+            row.iter_mut().for_each(|x| *x = T::zero());
+            // Several independent source streams share one accumulator
+            // load/store, retaining the entry-wise FMA order exactly.
+            let entries = &columns[a0 + t].entries;
+            let mut wide_groups = entries.chunks_exact(8);
+            for group in &mut wide_groups {
+                let rows: [&[T]; 8] = std::array::from_fn(|k| source(&group[k]));
+                let v: [T; 8] = std::array::from_fn(|k| values[group[k].position]);
+                fma_rows(row, &rows, &v);
+            }
+            let mut groups = wide_groups.remainder().chunks_exact(4);
+            for group in &mut groups {
+                let rows: [&[T]; 4] = std::array::from_fn(|k| source(&group[k]));
+                let v: [T; 4] = std::array::from_fn(|k| values[group[k].position]);
+                fma_rows(row, &rows, &v);
+            }
+            for e in groups.remainder() {
+                let v = values[e.position];
+                let source = source(e);
+                for i in 0..len {
+                    row[i] = v.mul_add(source[i], row[i]);
+                }
+            }
+        }
+        c0 = c1;
+    }
+    exhausted
 }
 
 /// `row[i] = fma(v[K-1], rows[K-1][i], ... fma(v[0], rows[0][i], row[i]))`:
@@ -334,22 +353,18 @@ fn dot_tile<T: FloatT>(
     a1: usize,
     packed: &PackedSchur<T>,
 ) {
-    for a in a0..a1 {
-        if accumulate_column(
-            acc,
-            columns,
-            dense_indices,
-            dense_representatives,
-            dense_row_offsets,
-            dense_vectors,
-            values,
-            width,
-            a0,
-            a,
-        ) {
-            break;
-        }
-    }
+    accumulate_tile(
+        acc,
+        columns,
+        dense_indices,
+        dense_representatives,
+        dense_row_offsets,
+        dense_vectors,
+        values,
+        width,
+        a0,
+        a1,
+    );
     // An alias b uses a representative r >= b. Every required (a, b) therefore
     // has a computed (a, r); publish only a <= b.
     // One bounds check per tile keeps the packed publish honest in release
@@ -1521,33 +1536,25 @@ impl<T: FloatT> PsdBlock<T> {
                 return;
             }
         }
-        // No clearing: `accumulate_column` initializes every live suffix.
+        // No clearing: `accumulate_tile` initializes every live suffix.
         // Parallel packed tiles use worker scratch instead of this buffer.
         self.dense_acc.resize(tile * width, T::zero());
         let mut a0 = 0;
         while a0 < column_count {
             let a1 = (a0 + tile).min(column_count);
-            let mut exhausted = false;
             let fma_timer = crate::receipt::start();
-            for a in a0..a1 {
-                if accumulate_column(
-                    &mut self.dense_acc,
-                    &self.columns,
-                    &self.dense_indices,
-                    &self.dense_representatives,
-                    &self.dense_row_offsets,
-                    &self.dense_vectors,
-                    values,
-                    width,
-                    a0,
-                    a,
-                ) {
-                    // The column reaches the end of the dense axis, so no
-                    // later column produces a store either.
-                    exhausted = true;
-                    break;
-                }
-            }
+            let exhausted = accumulate_tile(
+                &mut self.dense_acc,
+                &self.columns,
+                &self.dense_indices,
+                &self.dense_representatives,
+                &self.dense_row_offsets,
+                &self.dense_vectors,
+                values,
+                width,
+                a0,
+                a1,
+            );
             crate::receipt::finish("schur.dot_fma", fma_timer);
             let store_timer = crate::receipt::start();
             {
