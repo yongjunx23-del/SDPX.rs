@@ -980,12 +980,22 @@ fn check_exact_fma<const N: usize>(spread: u64) {
         let ulp = MpFloat::<N>::epsilon() * cancel.abs();
         check(&w[0], &w[1], &(cancel + ulp));
         check(&w[0], &w[1], &(cancel - ulp));
+        // One zero side (signed): the rounded product or the addend.
+        let zero = MpFloat::<N>::default();
+        for z in [zero, -zero] {
+            check(&w[0], &w[1], &z);
+            check(&z, &w[1], &w[2]);
+            check(&w[0], &z, &w[2]);
+            check(&z, &z, &w[2]);
+            check(&z, &w[1], &z);
+        }
     }
 }
 
 #[test]
 fn exact_fma_matches_mpfr_bitwise() {
     for spread in [4, 64, 600] {
+        check_exact_fma::<2>(spread);
         check_exact_fma::<4>(spread);
         check_exact_fma::<8>(spread);
         check_exact_fma::<12>(spread);
