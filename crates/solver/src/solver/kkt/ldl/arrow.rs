@@ -290,21 +290,25 @@ fn ldl_rec<T: FloatT>(
         ways,
         d1,
     )?;
-    let l11: Vec<T> = (0..n1 * n1).map(|e| left[e % n1 + e / n1 * ld]).collect();
+    let mut l11 = zeros(n1 * n1, ways);
+    for_columns(&mut l11, n1, n1, n1, ways, |j, column| {
+        column.copy_from_slice(&left[j * ld..j * ld + n1])
+    });
     let low: Vec<usize> = first[n1..].iter().map(|&f| f.min(n1)).collect();
     solve_unit_lower_t(n2, n1, &l11, n1, &mut left[n1..], ld, &low, ways);
     // W21 before scaling; L21 = W21·D1⁻¹ in place
-    let mut w = vec![T::zero(); n2 * n1];
-    for j in 0..n1 {
-        for i in 0..n2 {
-            let v = &mut left[n1 + i + j * ld];
-            w[i + j * n2] = *v;
+    let mut w = zeros(n2 * n1, ways);
+    for_columns(&mut w, n2, n1, n2, ways, |j, column| {
+        column.copy_from_slice(&left[n1 + j * ld..n1 + j * ld + n2])
+    });
+    for_columns(left, ld, n1, n2, ways, |j, column| {
+        for v in &mut column[n1..n1 + n2] {
             *v *= d1[j];
         }
-    }
+    });
     let l21 = &left[n1..];
     // packed (a, b), a ≤ b, is the Schur term (b, a)
-    let mut packed = vec![T::zero(); n2 * (n2 + 1) / 2];
+    let mut packed = zeros(n2 * (n2 + 1) / 2, ways);
     let upper = crate::algebra::with_split_hint(ways, || {
         T::xgemm_upper_exact(
             b'N',
@@ -322,13 +326,13 @@ fn ldl_rec<T: FloatT>(
         )
     });
     if upper {
-        for a in 0..n2 {
+        for_columns(right, ld, n2, n2, ways, |a, column| {
             for b in a..n2 {
-                right[n1 + b + a * ld] -= packed[b * (b + 1) / 2 + a];
+                column[n1 + b] -= packed[b * (b + 1) / 2 + a];
             }
-        }
+        });
     } else {
-        let mut s = vec![T::zero(); n2 * n2];
+        let mut s = zeros(n2 * n2, ways);
         exact_product(
             (b'N', b'T'),
             (n2, n2, n1),
@@ -337,11 +341,11 @@ fn ldl_rec<T: FloatT>(
             &mut s,
             ways,
         );
-        for a in 0..n2 {
+        for_columns(right, ld, n2, n2, ways, |a, column| {
             for b in a..n2 {
-                right[n1 + b + a * ld] -= s[a + b * n2];
+                column[n1 + b] -= s[a + b * n2];
             }
-        }
+        });
     }
     let tail: Vec<usize> = first[n1..].iter().map(|&f| f.saturating_sub(n1)).collect();
     let sign2 = |k: usize| sign(n1 + k);
@@ -377,8 +381,13 @@ fn solve_unit_lower_t<T: FloatT>(
     use sdpx_arithmetic::inner_parallel as ip;
     if n <= REC_BASE {
         let lr: Vec<T> = (0..n * n).map(|e| l[e / n + e % n * ldl]).collect();
-        let mut rows: Vec<T> = (0..m * n).map(|e| b[e / n + e % n * ldb]).collect();
+        let mut rows = zeros(m * n, ways);
+        let source = &*b;
+        // each row gathers its own entries of B
         let solve = |(i, x): (usize, &mut [T])| {
+            for (j, v) in x.iter_mut().enumerate() {
+                *v = source[i + j * ldb];
+            }
             for j in low[i]..n {
                 let lo = low[i];
                 x[j] -= T::dot_slices(&x[lo..j], &lr[j * n + lo..j * n + j]);
@@ -395,9 +404,11 @@ fn solve_unit_lower_t<T: FloatT>(
         } else {
             rows.chunks_mut(n).enumerate().for_each(solve);
         }
-        for (e, v) in rows.into_iter().enumerate() {
-            b[e / n + e % n * ldb] = v;
-        }
+        for_columns(b, ldb, n, m, ways, |j, column| {
+            for (i, v) in column[..m].iter_mut().enumerate() {
+                *v = rows[i * n + j];
+            }
+        });
         return;
     }
     let (n1, n2) = (n / 2, n - n / 2);
@@ -412,7 +423,7 @@ fn solve_unit_lower_t<T: FloatT>(
         ways,
     );
     let (b1, b2) = b.split_at_mut(n1 * ldb);
-    let mut p = vec![T::zero(); m * n2];
+    let mut p = zeros(m * n2, ways);
     exact_product(
         (b'N', b'T'),
         (m, n2, n1),
@@ -421,11 +432,11 @@ fn solve_unit_lower_t<T: FloatT>(
         &mut p,
         ways,
     );
-    for j in 0..n2 {
-        for i in 0..m {
-            b2[i + j * ldb] -= p[i + j * m];
+    for_columns(b2, ldb, n2, m, ways, |j, column| {
+        for (v, &pv) in column[..m].iter_mut().zip(&p[j * m..(j + 1) * m]) {
+            *v -= pv;
         }
-    }
+    });
     let low2: Vec<usize> = low.iter().map(|&f| f.saturating_sub(n1)).collect();
     solve_unit_lower_t(m, n2, &l[n1 + n1 * ldl..], ldl, b2, ldb, &low2, ways);
 }
@@ -458,6 +469,47 @@ fn exact_product<T: FloatT>(
             mi,
         )
     });
+}
+
+/// `len` zeros, written by the pool when `ways > 1`.
+fn zeros<T: FloatT>(len: usize, ways: usize) -> Vec<T> {
+    if ways > 1 {
+        rayon::iter::repeatn(T::zero(), len).collect()
+    } else {
+        vec![T::zero(); len]
+    }
+}
+
+/// `f(j, x[j·ld..])` for the first `cols` columns of `x` (leading dimension
+/// `ld`, `rows` elements each touched), split over the pool when `ways > 1`.
+/// The recursive factor's and solve's copies, scalings and updates: each
+/// element is rounded once by its own column, so the split never changes a
+/// bit (Ising 85-site, 128 bits: serial, they held the leaf factor's thread
+/// for 4–5 s of 10 while the pool waited).
+fn for_columns<T: FloatT>(
+    x: &mut [T],
+    ld: usize,
+    cols: usize,
+    rows: usize,
+    ways: usize,
+    f: impl Fn(usize, &mut [T]) + Sync + Send,
+) {
+    use sdpx_arithmetic::inner_parallel as ip;
+    if ways > 1 {
+        // columns per task: one grain of element work
+        let work = ip::weight(T::precision_bits() as usize) * rows.max(1) as u128;
+        let tile = (ip::grain() / work).max(1) as usize;
+        x.par_chunks_mut(ld)
+            .take(cols)
+            .enumerate()
+            .with_min_len(tile)
+            .for_each(|(j, column)| f(j, column));
+    } else {
+        x.chunks_mut(ld)
+            .take(cols)
+            .enumerate()
+            .for_each(|(j, column)| f(j, column));
+    }
 }
 
 /// `rayon::join` when spare workers may take `b`; under a board offer `b`
