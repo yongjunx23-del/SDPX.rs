@@ -8,6 +8,90 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-04 — Float64 Ising 85-site end game: NaN escalated shift (fixed), depth-aware pivot bound (rejected)
+
+- Question: why the 85-site solves of 2026-11-03 end AlmostSolved after a
+  zero step, and what makes them Solved. Tolerances, refinement and
+  acceptance are unchanged.
+- Diagnosis. Env-gated probes ran in a scratch copy on orig85 lower and
+  red85 upper (32 threads, whole sugon nodes).
+  - Late KKT accuracy decays with μ even while the dense factor succeeds.
+    The outer condensed refinement ends after 1–2 corrections at relative
+    residual 1e-13 (iterations 1–11), 1e-10 (12–18), 1e-8 to 1e-7 (19–28)
+    and 1e-6 to 1e-5 (29–37). The KKT diagonal grows from 1e7 to 1.3e12
+    (lower) and 1.6e13 (upper).
+  - From iteration 36 the dense_block Cholesky of S = εI + YᵀY meets
+    clearly negative pivots: −6.1e-8 at diagonal 2.8e-5, −4.9e-5 at 2.0e7.
+    faer factors those refactors.
+  - At iteration 38 (lower), faer reports success but its solve is NaN in
+    every entry. The constant solve fails, so update_affine escalates the
+    static shift.
+  - All three escalated shifts were NaN. `factor_with_shift` took
+    `norm_inf` over the whole `work1`, which refinement leaves at cols·n
+    with the failed solve's residual in the second column. The first
+    non-finite entry was at index KKT.n; the KKT values were clean. The
+    result was NumericalError, then AlmostSolved.
+- Kept `3e82127`: the diagonal buffers are sliced to their n entries.
+  Runs without escalation are unchanged:
+  - medium Float64: Solved in 15 iterations, audit PASS, same residuals.
+  - 41-site symred41 and orig41: points bitwise equal to e59fc81 (Solved
+    in 18/23 iterations).
+- Rejected: a depth-aware dense pivot bound, 64·u·depth with depth n for H
+  and n + m for S instead of the 128-wide tile. The trajectory was the
+  same. Past the old bound the factor reaches pivots far outside rounding
+  (−8.6 at diagonal 2.0e7, −6.1e-2 at 2.6e7, −6.1e-8 at 2.8e-5). Late S is
+  numerically indefinite, not marginally rejected.
+- 85 sites with `3e82127` (binary tbEF, whole sugon nodes, audit85):
+
+  | model / threads | lower | upper | s |
+  |---|---|---|---|
+  | orig85 / 8 | Solved 42, 0.6971175023 | Solved 46, 0.7167903362 | 252/277 |
+  | orig85 / 16 | Solved 40, 0.6971548645 | Solved 41, 0.7168205672 | 156/163 |
+  | orig85 / 32 | Solved 39, 0.6971321638 | Solved 40, 0.7168033771 | 133/131 |
+  | orig85 / 64 | Solved 40, 0.6971129363 | Solved 41, 0.7168276174 | 144/171 |
+  | orig85 / 128 | Solved 44, 0.6971771702 | Solved 43, 0.7168105874 | 290/249 |
+  | red85 / 16 | Solved 39 | Solved 41 | 144/153 |
+  | red85 / 32 | Solved 39 | AlmostSolved 49 | 147/213 |
+  | red85 / 64 | Solved 41 | Solved 41 | 142/169 |
+
+  - Values are primal objectives, which are numerical estimates. Every
+    audit passes its gate.
+  - The boost-1 shift (1e-6) fires once near the end of each lower solve.
+  - Solved points still differ by up to 6e-5 across thread counts. The
+    cause is 1e-6 feasibility times equality multipliers of order 1e3; the
+    audit's corrected endpoints carry 6e-6 to 1.2e-4 of residual correction.
+  - At 128 threads both solves finish on the faer fallback.
+- red85 upper at 32 threads:
+  - From about iteration 45, the gap (3.1e-8) and the internal residuals
+    pass. The original dual residual ‖Aᵀz+q‖∞ stays at 1.26e-5 (original
+    ratio 3.3–7), so the original-coordinate check keeps it AlmostSolved.
+  - Its equality multipliers reach 2.0e4, against 2.9e3 for orig85. In
+    the worst column Σ|A_ij z_i| ≈ 2e3, so the residual is a 6e-9
+    cancellation.
+  - Dropping the 421 dependent TI rows moves those multipliers onto
+    nearly dependent kept rows (QR pivots down to 2e-3). At 85 sites the
+    reduction saves no time, so orig85 is the 85-site input.
+- Decision:
+  - Keep `3e82127`.
+  - orig85 reaches Solved on both sides at 8, 16, 32, 64 and 128 threads
+    (10/10) with passing audits. This is the end-game prerequisite for 113
+    sites.
+  - Do not TI-reduce inputs at 85 sites and above unless the reduction
+    keeps the multipliers small.
+- Open:
+  - faer's all-NaN solve after the S fallback. A cascade of ±2e-7 pivot
+    substitutions is likely but not verified.
+  - Late KKT accuracy still limits the margin (orig85 upper original
+    ratio about 0.5): the squared-Ginv assembly against the 1e-8 shift.
+- Evidence:
+  - Cluster `~/projects/tb-ising-perf-20261103/runs/`: `dhLo-233904`,
+    `dhRu-233905` (probes), `diLo-233908`, `diRu-233909` (fix),
+    `djLo-233910`, `djRu-233911` (depth bound), `ef{8,16,32,64,128}-*` and
+    `ef41-233919` (tbEF with audits), `resid-dj.txt` and `zinfo-*.txt`.
+  - Scripts: `audit/orig_resid.py` (original-coordinate residual parts)
+    and `audit/zinfo.py` (dual location).
+  - Binaries: `sdpx-tbEF` (3e82127), `-tbDI` and `-tbDJ` (probe copies).
+
 ## 2026-11-03 — Float64 2D Ising bootstrap (41/85 sites): Schur assembly, dense admission, reduced inputs
 
 - Question: what limits the selected no-GKS critical-Ising SDPs (RP, loop,
