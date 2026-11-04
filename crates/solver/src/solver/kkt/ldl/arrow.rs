@@ -2852,8 +2852,11 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             // Products are admitted largest first while their workspace fits
             // one contribution batch (`BATCH_WORK_BYTES`); the others form in
             // `subtract_contributions`, batched as before.
-            // A product above a worker's share of all products' work splits
-            // into that many ways (the largest would otherwise end the phase).
+            // A product of at least a worker's share of all products' work
+            // may take every worker. The largest leaves are claimed first but
+            // finish last, so their products end the phase while lanes out of
+            // leaves help (Hubbard cubic3 at 16 threads: 1.45 shares rounded
+            // down to one way formed the last product serially in 2.2 s).
             // Wide products wait for `subtract_contributions`, which gives
             // them every worker.
             let mut admitted = vec![false; owned.len()];
@@ -2883,7 +2886,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 .map(|(l, _)| product_work(l))
                 .sum();
             let share = products / threads as f64;
-            let ways = |l: &Leaf<T>| crate::algebra::measured_ways(product_work(l), share);
+            let ways = |l: &Leaf<T>| if product_work(l) >= share { threads } else { 1 };
             // Counts are diagnostic only; no per-leaf counter buffer is needed.
             let count = AtomicUsize::new(0);
             // Lanes serve a leaf that splits its factor (a straggler, whose
