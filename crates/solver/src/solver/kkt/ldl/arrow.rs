@@ -1274,7 +1274,8 @@ impl<T: FloatT> Leaf<T> {
         } else {
             self.y.copy_from_slice(&self.b);
         }
-        // Exactly accumulated types solve Y by rows: one exact dot per entry.
+        // Exactly accumulated types solve Y by rows: one exact dot per entry,
+        // or one rounding per level of a wide leaf's panel solve.
         let rows = T::precision_bits() > 64;
         if rows {
             self.factor.stage_rows(start);
@@ -1297,11 +1298,18 @@ impl<T: FloatT> Leaf<T> {
                 ip::weight(T::precision_bits() as usize) * (width * width / 2 * columns) as u128;
             ip::tasks_if(true, work, columns) > 1
         };
-        if rows && split_factor && width >= REC_FACTOR_MIN {
+        if rows && width >= REC_FACTOR_MIN {
             // Per-column dots read the whole factor once per coupled column;
-            // a panel reads it once. Panels run in turn, each with the pool's
-            // workers, as the factor's own products do.
-            let ways = rayon::current_num_threads();
+            // a panel reads it once. Panels run in turn, with the pool's
+            // workers for a split leaf (as the factor's own products) or
+            // alone. A column's bits depend on neither its panel nor the
+            // workers, so the choice is by width alone: Y keeps its bits at
+            // every thread count.
+            let ways = if split_factor {
+                rayon::current_num_threads()
+            } else {
+                1
+            };
             let mut columns: Vec<&mut [T]> = self
                 .y
                 .chunks_mut(width)
@@ -2003,6 +2011,36 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         Self::plan(k, signs, ldl_nnz).map(|(_, _, work)| work)
     }
 
+    /// Dense values of leaves of sizes `leaves` and a `t`-wide border (per
+    /// leaf h and L, b and y, solve vectors; the border's C, S and factor),
+    /// and whether their bytes fit [`ARROW_MAX_BYTES`] or `ARROW_KKT_FACTOR`
+    /// times the larger of the stored KKT and `ldl_nnz`.
+    fn storage(
+        k: &CscMatrix<T>,
+        leaves: impl IntoIterator<Item = usize>,
+        t: usize,
+        ldl_nnz: usize,
+    ) -> (u128, bool) {
+        let t = t as u128;
+        let cells = leaves
+            .into_iter()
+            .map(|g| 2 * (g as u128).pow(2) + 2 * g as u128 * t + 8 * g as u128)
+            .sum::<u128>()
+            + 4 * t * t
+            + 8 * k.n as u128;
+        let size = std::mem::size_of::<T>() as u128;
+        let max_bytes = ARROW_MAX_BYTES.max(ARROW_KKT_FACTOR * k.nnz().max(ldl_nnz) as u128 * size);
+        (cells, cells * size <= max_bytes)
+    }
+
+    /// A single leaf pays only as a large dense block (an owner rank holding
+    /// one sampled PSD block): the dense, pool-parallel leaf factor then
+    /// replaces scalar sparse LDL. `positive_entries`: its stored upper
+    /// entries.
+    fn dense_leaf(g: usize, positive_entries: usize) -> bool {
+        g >= SINGLE_LEAF_MIN && 2 * positive_entries >= g * (g + 1) / 2
+    }
+
     /// [`Self::try_new`]'s leaves, border and dense work estimate.
     fn plan(
         k: &CscMatrix<T>,
@@ -2043,19 +2081,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         groups.sort_by_key(|g| g[0]);
         let t = trunk.len();
         let n_pos = (n - t) as u128;
-        let cells: u128 = groups
-            .iter()
-            .map(|g| {
-                let g = g.len() as u128;
-                // h and L; b and y; solve vectors.
-                2 * g * g + 2 * g * t as u128 + 8 * g
-            })
-            .sum::<u128>()
-            + 4 * (t as u128).pow(2)
-            + 8 * n as u128;
-        let max_bytes = ARROW_MAX_BYTES.max(
-            ARROW_KKT_FACTOR * k.nnz().max(ldl_nnz) as u128 * std::mem::size_of::<T>() as u128,
-        );
+        let (cells, storage_ok) = Self::storage(k, groups.iter().map(|g| g.len()), t, ldl_nnz);
         // Dense work estimates: leaf factorizations ~ sum(g^3)/3, coupling
         // transforms ~ n_pos*t^2/2, trunk factor ~ t^3/3.  Arrow only pays
         // when real dense leaf blocks exist to amortize that dense
@@ -2065,14 +2091,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let leaf_work: u128 = groups.iter().map(|g| (g.len() as u128).pow(3)).sum();
         let border_work = n_pos * (t as u128).pow(2) + (t as u128).pow(3);
         let work_ok = border_work <= 24 * leaf_work.max(1);
-        // A single leaf pays only when it is a large dense block (an owner
-        // rank holding one sampled PSD block): the dense, pool-parallel leaf
-        // factor then replaces scalar sparse LDL. Sparse single components
-        // (e.g. a connected LP) stay on the sparse backend.
+        // Sparse single components (e.g. a connected LP) stay on the sparse
+        // backend.
         let leaves_ok = groups.len() >= 2
-            || groups.first().is_some_and(|g| {
-                g.len() >= SINGLE_LEAF_MIN && 2 * positive_entries >= g.len() * (g.len() + 1) / 2
-            });
+            || groups
+                .first()
+                .is_some_and(|g| Self::dense_leaf(g.len(), positive_entries));
         if crate::receipt::profile_requested() {
             // Observation-only grouping stats (plan PR-06): positive-sign
             // components, leaf size spread, border size, leaf-border coupling
@@ -2091,7 +2115,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 sizes.last().copied().unwrap_or(0),
                 cells as f64 * std::mem::size_of::<T>() as f64 / 1048576.0,
                 k.nnz(),
-                leaves_ok && work_ok && cells * std::mem::size_of::<T>() as u128 <= max_bytes,
+                leaves_ok && work_ok && storage_ok,
             );
         }
         if !leaves_ok {
@@ -2100,7 +2124,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         if !work_ok {
             return None;
         }
-        if cells * std::mem::size_of::<T>() as u128 > max_bytes {
+        if !storage_ok {
             return None;
         }
         Some((groups, trunk, leaf_work + border_work))
@@ -2131,7 +2155,11 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     /// dense one spread over the pool (`super::dense_factor`): the pooled
     /// dense kernels then replace serial sparse LDL (Ising 85-site condensed
     /// KKT at 128 bits: QDLDL took about 30 minutes per factorization on
-    /// 3–5 busy cores of 128). Same element cap as `dense_block`.
+    /// 3–5 busy cores of 128). Same element cap as `dense_block`; like a
+    /// natural single leaf, the positive block must be half dense (a sparse
+    /// one, such as an LP's zero P, would pivot on exact zeros: MPFR has no
+    /// static shift) and the dense storage must stay within the arrow bound
+    /// for QDLDL's factor size.
     pub fn try_dense(
         k: &CscMatrix<T>,
         signs: &[i8],
@@ -2139,11 +2167,19 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         amd: &mut Option<super::AmdOrdering>,
     ) -> Option<Self> {
         let (leaf, trunk): (Vec<usize>, Vec<usize>) = (0..k.n).partition(|&i| signs[i] > 0);
-        let (g, t) = (leaf.len() as u128, trunk.len() as u128);
-        if g < 128 || g * g + g * t + t * t > 256 * 1024 * 1024 {
+        let (g, t) = (leaf.len(), trunk.len());
+        if g < 128 || (g * g + g * t + t * t) as u128 > 256 * 1024 * 1024 {
             return None;
         }
-        if !super::dense_factor(k, settings, amd, true) {
+        let positive_entries = (0..k.n)
+            .flat_map(|j| (k.colptr[j]..k.colptr[j + 1]).map(move |q| (k.rowval[q], j)))
+            .filter(|&(i, j)| signs[i] > 0 && signs[j] > 0)
+            .count();
+        if !Self::dense_leaf(g, positive_entries) || !super::dense_factor(k, settings, amd, true) {
+            return None;
+        }
+        let lnz = amd.as_ref().map_or(0, |o| o.2.lnz);
+        if !Self::storage(k, [g], t, lnz).1 {
             return None;
         }
         let mut solver = Self::from_groups(k, signs, settings, vec![leaf], trunk, None);
