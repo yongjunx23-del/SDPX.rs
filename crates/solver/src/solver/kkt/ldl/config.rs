@@ -67,14 +67,17 @@ macro_rules! primitive_configuration {
                 matrix: &CscMatrix<Self>,
                 signs: &[i8],
                 settings: &CoreSettings<Self>,
-                amd: Option<super::AmdOrdering>,
+                mut amd: Option<super::AmdOrdering>,
             ) -> BoxedDirectLDLSolver<Self> {
+                // The dense test may order the pattern; the sparse solver
+                // then reuses that ordering.
                 let dense: fn(
                     &CscMatrix<Self>,
                     &[i8],
                     &CoreSettings<Self>,
+                    &mut Option<super::AmdOrdering>,
                 ) -> Option<BoxedDirectLDLSolver<Self>> = $dense;
-                if let Some(solver) = dense(matrix, signs, settings) {
+                if let Some(solver) = dense(matrix, signs, settings, &mut amd) {
                     return solver;
                 }
                 #[cfg(feature = "faer-sparse")]
@@ -97,12 +100,12 @@ macro_rules! primitive_configuration {
 
 // Single precision is configured only so the dense BLAS suites can exercise
 // the `s`-prefixed kernels; the solver itself runs at f64 and MPFR.
-primitive_configuration!(f32, |_, _, _| None);
-primitive_configuration!(f64, |matrix, signs, settings| {
-    super::dense_block::DenseBlockSolver::try_new(matrix, signs, settings)
+primitive_configuration!(f32, |_, _, _, _| None);
+primitive_configuration!(f64, |matrix, signs, settings, amd| {
+    super::dense_block::DenseBlockSolver::try_new(matrix, signs, settings, amd)
         .map(|s| Box::new(s) as BoxedDirectLDLSolver<f64>)
         .or_else(|| {
-            super::arrow::ArrowLDLSolver::try_new(matrix, signs, settings)
+            super::arrow::ArrowLDLSolver::try_new(matrix, signs, settings, 0)
                 .map(|a| Box::new(a) as BoxedDirectLDLSolver<f64>)
         })
 });
@@ -134,30 +137,59 @@ impl<const N: usize> LDLConfiguration for MpFloat<N> {
         amd: Option<super::AmdOrdering>,
     ) -> BoxedDirectLDLSolver<Self> {
         use super::arrow::ArrowLDLSolver as Arrow;
-        let negated = || {
-            let order = amd.as_ref().map(|o| o.0.clone());
-            Arrow::try_negated(matrix, signs, settings, order)
-                .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
-        };
-        // When both arrows are eligible, the one with less dense work
-        // (two_L6: K's border of 186 ORE rows against −K's 81 primal columns).
         let flipped: Vec<i8> = signs.iter().map(|&s| -s).collect();
-        let negated_first = Arrow::work(matrix, &flipped)
-            .is_some_and(|w| Arrow::work(matrix, signs).is_none_or(|p| w < p));
-        let arrow = if negated_first {
-            negated()
-        } else {
-            Arrow::try_new(matrix, signs, settings)
-                .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
-                .or_else(negated)
+        // `ldl_nnz`: QDLDL's factor size when an ordering is known, else 0.
+        let arrow = |ldl_nnz: usize, perm: Option<&Vec<usize>>| {
+            let negated = || {
+                Arrow::try_negated(matrix, signs, settings, perm.cloned(), ldl_nnz)
+                    .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
+            };
+            // When both arrows are eligible, the one with less dense work
+            // (two_L6: K's border of 186 ORE rows against −K's 81 primal columns).
+            let negated_first = Arrow::work(matrix, &flipped, ldl_nnz)
+                .is_some_and(|w| Arrow::work(matrix, signs, ldl_nnz).is_none_or(|p| w < p));
+            if negated_first {
+                negated()
+            } else {
+                Arrow::try_new(matrix, signs, settings, ldl_nnz)
+                    .map(|a| Box::new(a) as BoxedDirectLDLSolver<Self>)
+                    .or_else(negated)
+            }
         };
-        arrow.unwrap_or_else(|| {
-            Box::new(QDLDLDirectLDLSolver::new(
-                matrix,
-                signs,
-                settings,
-                amd.map(|o| o.0),
-            ))
-        })
+        let ordered = amd.is_some();
+        let known = amd.as_ref().map_or(0, |(_, _, info)| info.lnz);
+        if let Some(solver) = arrow(known, amd.as_ref().map(|(perm, _, _)| perm)) {
+            return solver;
+        }
+        // No arrow fits the stored KKT's storage bound: QDLDL's own AMD
+        // ordering, which the QDLDL fallback needs anyway, gives its factor
+        // size for a second storage test.
+        let ordering = amd.unwrap_or_else(|| crate::qdldl::get_amd_ordering(matrix, 1.5));
+        let info = &ordering.2;
+        if crate::receipt::profile_requested() {
+            eprintln!(
+                "MP_LDL n={} lnz={} flops={:.3e}",
+                matrix.n,
+                info.lnz,
+                (info.n_div + info.n_mult_subs_ldl) as f64
+            );
+        }
+        if !ordered {
+            if let Some(solver) = arrow(info.lnz, Some(&ordering.0)) {
+                return solver;
+            }
+        }
+        // No arrow structure: one pooled dense leaf when serial QDLDL would
+        // cost more.
+        let mut amd = Some(ordering);
+        if let Some(solver) = Arrow::try_dense(matrix, signs, settings, &mut amd) {
+            return Box::new(solver);
+        }
+        Box::new(QDLDLDirectLDLSolver::new(
+            matrix,
+            signs,
+            settings,
+            amd.map(|o| o.0),
+        ))
     }
 }

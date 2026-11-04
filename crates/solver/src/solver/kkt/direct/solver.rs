@@ -740,8 +740,10 @@ where
         let map = &self.map;
         let KKT = &mut self.KKT;
         let dsigns = &self.dsigns;
-        let diag_kkt = &mut self.work1;
-        let diag_shifted = &mut self.work2;
+        // Refinement leaves the work buffers at cols·n; only the leading n
+        // entries hold this diagonal.
+        let diag_kkt = &mut self.work1[..map.diag_full.len()];
+        let diag_shifted = &mut self.work2[..map.diag_full.len()];
 
         let applied_shift = if settings.static_regularization_enable {
             let eps = match shift {

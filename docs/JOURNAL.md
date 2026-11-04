@@ -132,6 +132,460 @@ status and next actions.
 - The campaign was resubmitted on v0.9.4 (`tmO0`, PBS 234237/234238; 16
   or 32 threads per solve, two whole nodes) with the ORE audit.
 
+## 2026-11-04 — 128-bit Ising (85/113 sites): dense arrow leaf, leaf-phase parallelism, exact Schur dots, NUMA first-touch spread, tiled Schur left sums; 113-site bounds
+
+- Question: solve the 85- and 113-site Ising inputs at 128 bits in
+  practical time, and 113 sites in Float64 (user, 2026-11-03/04). The
+  tolerances (1e-6, as in Float64), refinement and acceptance are
+  unchanged. Values are numerical estimates; no AlmostSolved run is read
+  as a bound.
+- 128 bits needs the reduced-equality inputs. The jd85o equalities have
+  3796 rows of rank 3375 (eqrank-233989, at 1e-10 and 1e-13). With
+  binary64-rounded coefficients and no MPFR static regularization, the
+  original input ends PrimalInfeasible after 21 iterations: pres stays at
+  0.81 while the dual objective grows 100× per iteration (ma128lo-233960;
+  mf128lo with auto_start_scale off diverges the same way). red85 and
+  red113 keep an independent equality subset and solve.
+- Kept `f732df7`, an MPFR dense arrow leaf. Before QDLDL, the MPFR
+  `auto_ldlsolver` tries one dense leaf of all positive-sign variables
+  with the negative-sign ones as border. It does so when serial QDLDL flops
+  × workers ≥ n³/6, under the dense_block element cap. local_113 at 128
+  bits: 62 s per iteration against about 1197 s with QDLDL (the QDLDL
+  solve took 68 iterations, 81406 s). 85 sites: 70–100 s per iteration
+  against 28–30 min. medium is unaffected; its KKT already takes the
+  negated arrow (leaf 1887, border 33).
+- Leaf-phase changes, red85 lower at 128 bits, 128 threads, 3 iterations,
+  whole nodes (per-call medians):
+  - `3fd9648`: admitted contribution products take ways up to the pool
+    instead of 8. Iteration 58.5 → 48.5 s, residue_contribution 12.97 →
+    2.87 s. Bitwise.
+  - `1096039`: merge of perf/mp128-dense-arrow (Y panels with exact
+    products, arrow admission within 8× the QDLDL factor, AMD reuse).
+    Leaves 27.75 → 12.8 s, iteration about 48.5 → 35 s. Changes rounding.
+  - `06450d2`: multi-column blocked sweeps for one-chunk leaves and narrow
+    trunks. Per iteration, many.first 1.7 → 0.13 s, trunk 1.15 → 0.10,
+    second 1.35 → 0.16 (−3.8 s). Bitwise.
+  - `c0d8b06`: the O(n²) element loops of ldl_rec and solve_unit_lower_t
+    run on the pool. leaf_factor 5.3–5.9 → 4.15–4.23 s. Bitwise.
+  - `78fbf1a`, MPFR FMAs with a zero side rounding inline, is reverted
+    (`bf6bd80`). It showed no gain: under interleave on node177, four runs
+    per arm (234135), solve 148.45 → 148.85 s and assemble 6.12 → 6.15 s
+    per call. Its zero-start chains are exact dots after `d10c1ad`.
+  - `d10c1ad`: each wide condensed Schur entry is one exact dot (the
+    exact sum rounded once) instead of an FMA chain from zero, as
+    `wide_dense_work` already assumed. At 128 bits a k-term chain costs
+    about 15 + 20.7k ns and the exact dot 58 + 4.2k ns. Sums on the
+    41-site input average 75 terms (up to 484). medium at 128 bits (10
+    threads, local, full solve): Solved in 19 iterations with both
+    binaries, native audit PASS with the same f64 residuals, points within
+    2.3e-26; assemble 11.44 → 10.26 s. Without tiling the cluster A/B
+    was lost in placement noise (abxd41-234154, red41, 4 iterations:
+    2f6745d 208–246 s, 78fbf1a 189–244 s). Kept on top of tiling:
+    abtk-234182 (node178, ABBAABBA, red85 lower, 128 bits, T=128, 3
+    iterations, default policy), solve median 115.6 s with the FMA chain
+    (tbTK, 114.3–118.3) → 106.7 s exact (tbTJ, 104.3–108.4), −7.7%;
+    assemble per factorization 7.8 → 5.6 s.
+- NUMA placement (EPYC 7742, NPS4: 8 nodes of 16 CPUs, kernel 3.10,
+  THP always, NUMA balancing on). At 128 bits the assemble median under
+  the default policy was bimodal, and iterations ran 60–92 s against 46 s
+  under `numactl --interleave=all` (234136, MAXIT 3). The default runs did
+  about 28M PTE updates and 2M page migrations; interleave did 0.4M and 0.1M.
+  - Cause: serial first touch. The constructing thread zeroes the arrow
+    leaf and trunk storage, the per-block contribution buffers and the
+    reduced KKT values, and wanders between nodes during setup. Under
+    `--membind=all` (no migration), after one iteration of tbPP (234150),
+    one 12.4 GiB region sat 45% on node 4, most of the rest on nodes 6 and
+    0. The parallel plan and other pool-built arrays were spread (at most
+    20–27% on one node).
+  - A blanket policy is rejected. Interleave helps at 128 bits but costs
+    Float64 4.6% (234139: red85 Float64, T=32, membind +5.5%), since it
+    also moves each worker's private scratch off its node.
+  - Change (`47179fa`): arrays the whole pool works on are written by the
+    pool's workers when they are fresh mappings (32 MiB and up, the CLI's
+    mmap threshold), so first touch spreads them. These are the arrow
+    leaf/trunk storage (on the first pool given), contribution buffers and
+    reduced KKT values. Values are copied unchanged; medium at 128 bits is
+    bitwise.
+  - Kept. red85 lower at 128 bits, T=128, 3 iterations, default policy
+    (abpq-234159, node182, ABBAABBA): solve median 227.7 → 154.5 s (−32%;
+    tbPP 188–280 s, tbPQ 146–157 s), bitwise. red85 lower in Float64, T=32,
+    full solve (abpqf-234160, node185, ABBA): 144.0/145.3 → 144.1/146.5 s,
+    bitwise, so neutral. Under `--membind=all` (numapq-234158) assemble
+    per call fell from 18.2/16.7 to 14.5 s, and no large region kept more
+    than 27% on one node.
+- `752c478`: tiled wide Schur left sums. On red85 at 128 bits, two n=64
+  blocks (4260 columns, 1.8M entries each) hold 7.0e9 of the 8.39e9
+  left-sum terms of one assembly (blkstats-234169). Column by column,
+  each dense right column dotted its packed vector with every earlier
+  column, so it re-read up to 96 MB of left entries and values (about
+  390 GB per assembly). The assembly was bound by memory bandwidth and
+  followed page placement: per call, membind 14.5 s, default 15.6–26.7 s,
+  interleave 6.1 s.
+  - Change: a worker takes up to 16 consecutive right columns whose
+    packed vectors fit in 2 MiB (16 at n=64 and 128 bits) and reads each
+    left column once for all of them. Each pair keeps its own dot and one
+    store, so every leg below has the same point (hash 3de578f64377).
+  - red85 lower at 128 bits, T=128, 3 iterations. tileN-234173 ran under
+    the default policy (node186), tileI-234174 under interleave (node185).
+    Solve s / assemble s per factorization; the tile budget came from
+    `SDPX_TILE_BYTES`, a temporary override that is not committed:
+
+    | arm (columns at n=64) | default | interleave |
+    |---|---|---|
+    | 47179fa | 200.6, 193.7 / 28.6, 27.2 | 108.3, 111.7 / 7.7, 8.1 |
+    | 1 byte (1) | 141.9, 160.4 / 14.5, 18.6 | 113.4, 111.3 / 8.0, 8.1 |
+    | 256 KiB (3) | 124.8, 123.0 / 9.9, 10.1 | 96.9, 98.6 / 4.7, 4.9 |
+    | 512 KiB (7) | 109.3, 110.9 / 5.8, 5.9 | 97.3, 97.7 / 4.2, 4.3 |
+    | 2 MiB (16) | 106.4, 107.5 / 5.5, 5.5 | 96.8, 97.0 / 4.5, 4.5 |
+
+  - Kept with 2 MiB. Against 512 KiB, the solve median is 2.9% lower
+    under the default policy (both legs) and 0.6% lower under interleave.
+    Assemble is 5% lower under the default policy and 5% higher under
+    interleave, and RSS is up to 0.2 GB higher. The default policy now
+    runs within 10% of interleave, against 79% before.
+  - Max-effort review of the diff: all four finders flagged that fixed
+    tiles cut a block's pool tasks by up to 16×, where HEAD ran one task
+    per right column. The verifiers confirmed it; one rated it plausible,
+    since it bites only where a block has the pool alone (add_schur,
+    inner_schur). Example: a 768-bit block with n=46 and 92 columns
+    would get 6 tasks for 64 threads. Tiles are now capped at two per
+    worker, which keeps the last (densest) tile near one worker's share;
+    red85's n=64 blocks still get 16 columns at T=128. The review found
+    no double store, ordering change or reentrancy problem, and a
+    derivable tuple field was removed.
+  - The same cleanup dropped `tile_columns`' guard against n = 0, and a
+    verifier refuted that: CompositeCone::new keeps empty PSD cones, and
+    the serial tile loop calls tile_columns(0). Without the guard five
+    condensed parallel tests panic on the division (observed). `e824e93`
+    restores it, and the 46 condensed tests pass.
+  - The review's sweep found that the cap counted every column. In
+    inner_schur mode a sparse-dominated block's sparse columns are split
+    over the pool and skipped here, so its dense representatives, sorted
+    last, could share a few tiles. `38f381c` counts only the columns that
+    do work (medium at 128 bits bitwise, tests pass). The cap assumes the
+    block has the pool alone, so in the shared assembly it also narrows the
+    tiles of blocks under 32 working columns per worker. On red85 at T=128
+    that touches only blocks with at most 3 MB of left data (blk-234169);
+    the 96 MB and 13 MB blocks keep 16 columns.
+  - Float64 red85 takes the batched dense path, so it is unaffected
+    (tilef-234198, node185, T=32, full solve, ABCCBA): 47179fa 146.9/143.9 s,
+    512 KiB 144.9/145.0 s, 2 MiB 146.5/146.2 s, all bitwise equal.
+  - Final code (2 MiB, capped tiles): medium at 128 bits, 10 threads,
+    local: Solved in 19 iterations, bitwise equal to 47179fa, native audit
+    PASS.
+- `44a4014`: the border factor's dot scratch is spread too. ldl_dots
+  allocates r and w (182 MB each for the 3375-row border at 128 bits) on
+  every call, and the calling thread wrote them, so all 128 workers read
+  pages on one node. border_factor took 1.6 s per factorization under the
+  default policy and 0.84 s under interleave. A split factor now has the
+  pool write them first. red85 lower at 128 bits, T=128, 3 iterations,
+  default policy (abub-234214, node185, ABBAABBA): border_factor 1.58–1.68
+  → 0.80–0.81 s, solve median 106.1 → 102.65 s (−3.3%; 3 of 4 pairs gain
+  3.6–4.9%, the first is flat), all points bitwise equal. Kept.
+- Measured, not built:
+  - Equality substitution is rejected. Gauss–Jordan with threshold
+    Markowitz pivoting on the red85 equalities (3375 rows over 6399
+    positive variables, nnz 2.90M), x_dep = x0 + M x_free, fills the
+    active rows to 4.22M after 1000 pivots and 6.36M after 1500
+    (elim-234185, cancelled after 1500 of 3375 pivots; pivots 1000–1500
+    took 14 min). M tends to a dense 3375 × 3024 matrix, and
+    A_new = A_free + A_dep·M would make the PSD columns dense.
+  - Staircase border order for Y (stair-234176). The 3375 border rows
+    meet the 5566 coupled positive variables in a staircase. Skipping each
+    border column's zero prefix leaves 0.772 of the dense forward work and
+    0.674 of the contribution work in natural order, and 0.604/0.528 under
+    a greedy fewest-new order. The residue GEMM already skips zero
+    prefixes in 32-column tiles, which takes part of the natural-order
+    gain. The greedy order is the open candidate, worth about 3.7 s per
+    iteration if its rounding change passes the audits.
+- Solves. All are Solved and every audit passes its quality gate. Values
+  are corrected numerical endpoints (estimates).
+
+  | input / bits / threads | lower | upper | s | RSS GB |
+  |---|---|---|---|---|
+  | orig113 / 53 / 32 | 43 it, 0.6987629554 | 47 it, 0.7155497030 | 269/247 | 10.6 |
+  | red113 / 53 / 32 | 43 it, 0.6987157098 | 45 it, 0.7154837500 | 222/231 | 10.1 |
+  | red85 / 128 / 128 | 52 it, 0.6973301492 | 56 it, 0.7166894158 | 3517/4248 | 37.3/39.7 |
+  | red85 / 128 / 128, tbTJ | 52 it, 0.6973301492 | 56 it, 0.7166894159 | 1278/1357 | 46.0/45.4 |
+  | red113 / 128 / 128 | 56 it, 0.6991445532 | 56 it, 0.7151527440 | 5069/4703 | 50.2/46.3 |
+
+  - Float64 runs: tbEF (`3e82127`) on node178. 128-bit runs: tbMB
+    (`f732df7` plus the 85-site fix; red85 on node177/node181), except
+    the tbTJ row.
+  - tbTJ has the 128-bit changes above except `44a4014`. It is the tiled
+    code before the review's tile cap, which leaves red85's n=64 tiles at
+    16 columns, with the 2 MiB budget set through `SDPX_TILE_BYTES`.
+    rt128lo-234201 (node186) and rt128up-234202 (node178) ran on whole
+    nodes of the same model under the default policy. Iteration counts
+    are tbMB's, at 24.6/24.2 s per iteration against 67.6/75.9 s
+    (2.8/3.1× faster).
+    Primal objectives are equal in binary64, and corrected endpoints
+    move by 3.2e-11/6.6e-11. Audit maxima: TI 9.0e-12, equalities
+    1.3e-13, PSD −4.5e-8, dual 1.7e-7.
+  - Peak RSS grew from 37.3/39.7 to 46.0/45.4 GB. After 3 iterations both
+    binaries peak at 26.3–26.9 GB (ab4-234011, tileN-234173), so the
+    extra memory accumulates during the solve. It is not attributed. The
+    tiling's per-thread work holds at most 16 columns, under 1 GB over
+    128 threads.
+  - Audit maxima. Float64: TI 1.7e-7, all equalities 4.6e-8, relative
+    primal PSD −3.7e-8, original dual 1.7e-6. 128 bits: TI 3.9e-11,
+    equalities 2.3e-13, PSD −4.5e-8, dual 1.7e-7.
+  - At the same 1e-6 tolerances, the Float64 endpoints carry residual
+    corrections of 3.5e-5 to 2.0e-4, against 3e-7 to 4e-7 at 128 bits. The
+    128-bit 113-site interval [0.6991446, 0.7151527] lies inside the
+    Float64 one [0.6987157, 0.7154838].
+  - local_113 at 128 bits (tbMB, 233988): Solved in 67 iterations, 3705 s.
+- `c325c6f`: the eliminated-row plan is built on the pool. Its triples
+  are distinct, so a parallel sort gives the serial plan, and its pages
+  spread over the pool's NUMA nodes. red85 has 4.94e8 triples (7.9 GB as
+  16-byte tuples). When contribution buffers exceed the parallel assembly
+  budget (memory/8), wide dense PSD columns add straight into the Schur on
+  the pool, one addition per position and block, so blocks in turn keep
+  the serial bits. Before, one thread did this, about 50 s per call.
+  41-site at 128 bits, 10 threads, 2 iterations, 16 GB Mac idle:
+  bitwise equal output; assemble per call 69–104 → 31.5–33 s; wall
+  419.6 → 293.4 s; peak RSS 9.12 → 8.30 GB.
+- Review of the arrow diff (max effort; `ba317bc`). Three defects were
+  fixed:
+  - Y's panel choice followed the thread count. It now goes by width
+    alone, and qpf300 is identical at 1, 2 and 8 threads.
+  - try_dense skipped the storage bound. It now applies it with QDLDL's
+    factor size.
+  - try_dense accepted an LP's zero P, whose dense leaf pivots on exact
+    zeros. It now requires a half-dense positive block, and LPs take
+    QDLDL, bitwise equal to forced QDLDL.
+  - A single oversized leaf on eight ways was left: speed only.
+- Evidence: the jobs named above, under
+  `~/projects/tb-ising-perf-20261103/runs/` (a directory or log per job);
+  binaries and sources in
+  `~/projects/sdpx-ising11-scaling-20261007/{bin,incoming}`.
+
+## 2026-11-04 — Float64 Ising 85-site end game: NaN escalated shift (fixed), depth-aware pivot bound (rejected)
+
+- Question: why the 85-site solves of 2026-11-03 end AlmostSolved after a
+  zero step, and what makes them Solved. Tolerances, refinement and
+  acceptance are unchanged.
+- Diagnosis. Env-gated probes ran in a scratch copy on orig85 lower and
+  red85 upper (32 threads, whole sugon nodes).
+  - Late KKT accuracy decays with μ even while the dense factor succeeds.
+    The outer condensed refinement ends after 1–2 corrections at relative
+    residual 1e-13 (iterations 1–11), 1e-10 (12–18), 1e-8 to 1e-7 (19–28)
+    and 1e-6 to 1e-5 (29–37). The KKT diagonal grows from 1e7 to 1.3e12
+    (lower) and 1.6e13 (upper).
+  - From iteration 36 the dense_block Cholesky of S = εI + YᵀY meets
+    clearly negative pivots: −6.1e-8 at diagonal 2.8e-5, −4.9e-5 at 2.0e7.
+    faer factors those refactors.
+  - At iteration 38 (lower), faer reports success but its solve is NaN in
+    every entry. The constant solve fails, so update_affine escalates the
+    static shift.
+  - All three escalated shifts were NaN. `factor_with_shift` took
+    `norm_inf` over the whole `work1`, which refinement leaves at cols·n
+    with the failed solve's residual in the second column. The first
+    non-finite entry was at index KKT.n; the KKT values were clean. The
+    result was NumericalError, then AlmostSolved.
+- Kept `3e82127`: the diagonal buffers are sliced to their n entries.
+  Runs without escalation are unchanged:
+  - medium Float64: Solved in 15 iterations, audit PASS, same residuals.
+  - 41-site symred41 and orig41: points bitwise equal to e59fc81 (Solved
+    in 18/23 iterations).
+- Rejected: a depth-aware dense pivot bound, 64·u·depth with depth n for H
+  and n + m for S instead of the 128-wide tile. The trajectory was the
+  same. Past the old bound the factor reaches pivots far outside rounding
+  (−8.6 at diagonal 2.0e7, −6.1e-2 at 2.6e7, −6.1e-8 at 2.8e-5). Late S is
+  numerically indefinite, not marginally rejected.
+- 85 sites with `3e82127` (binary tbEF, whole sugon nodes, audit85):
+
+  | model / threads | lower | upper | s |
+  |---|---|---|---|
+  | orig85 / 8 | Solved 42, 0.6971175023 | Solved 46, 0.7167903362 | 252/277 |
+  | orig85 / 16 | Solved 40, 0.6971548645 | Solved 41, 0.7168205672 | 156/163 |
+  | orig85 / 32 | Solved 39, 0.6971321638 | Solved 40, 0.7168033771 | 133/131 |
+  | orig85 / 64 | Solved 40, 0.6971129363 | Solved 41, 0.7168276174 | 144/171 |
+  | orig85 / 128 | Solved 44, 0.6971771702 | Solved 43, 0.7168105874 | 290/249 |
+  | red85 / 16 | Solved 39 | Solved 41 | 144/153 |
+  | red85 / 32 | Solved 39 | AlmostSolved 49 | 147/213 |
+  | red85 / 64 | Solved 41 | Solved 41 | 142/169 |
+
+  - Values are primal objectives, which are numerical estimates. Every
+    audit passes its gate.
+  - The boost-1 shift (1e-6) fires once near the end of each lower solve.
+  - Solved points still differ by up to 6e-5 across thread counts. The
+    cause is 1e-6 feasibility times equality multipliers of order 1e3; the
+    audit's corrected endpoints carry 6e-6 to 1.2e-4 of residual correction.
+  - At 128 threads both solves finish on the faer fallback.
+- red85 upper at 32 threads:
+  - From about iteration 45, the gap (3.1e-8) and the internal residuals
+    pass. The original dual residual ‖Aᵀz+q‖∞ stays at 1.26e-5 (original
+    ratio 3.3–7), so the original-coordinate check keeps it AlmostSolved.
+  - Its equality multipliers reach 2.0e4, against 2.9e3 for orig85. In
+    the worst column Σ|A_ij z_i| ≈ 2e3, so the residual is a 6e-9
+    cancellation.
+  - Dropping the 421 dependent TI rows moves those multipliers onto
+    nearly dependent kept rows (QR pivots down to 2e-3). At 85 sites the
+    reduction saves no time, so orig85 is the 85-site input.
+- Decision:
+  - Keep `3e82127`.
+  - orig85 reaches Solved on both sides at 8, 16, 32, 64 and 128 threads
+    (10/10) with passing audits. This is the end-game prerequisite for 113
+    sites.
+  - Do not TI-reduce inputs at 85 sites and above unless the reduction
+    keeps the multipliers small.
+- Open:
+  - faer's all-NaN solve after the S fallback. A cascade of ±2e-7 pivot
+    substitutions is likely but not verified.
+  - Late KKT accuracy still limits the margin (orig85 upper original
+    ratio about 0.5): the squared-Ginv assembly against the 1e-8 shift.
+- Evidence:
+  - Cluster `~/projects/tb-ising-perf-20261103/runs/`: `dhLo-233904`,
+    `dhRu-233905` (probes), `diLo-233908`, `diRu-233909` (fix),
+    `djLo-233910`, `djRu-233911` (depth bound), `ef{8,16,32,64,128}-*` and
+    `ef41-233919` (tbEF with audits), `resid-dj.txt` and `zinfo-*.txt`.
+  - Scripts: `audit/orig_resid.py` (original-coordinate residual parts)
+    and `audit/zinfo.py` (dual location).
+  - Binaries: `sdpx-tbEF` (3e82127), `-tbDI` and `-tbDJ` (probe copies).
+
+## 2026-11-03 — Float64 2D Ising bootstrap (41/85 sites): Schur assembly, dense admission, reduced inputs
+
+- Question: what limits the selected no-GKS critical-Ising SDPs (RP, loop,
+  TI, local Gibbs and compressed filter blocks as built by the Ising
+  project; slacks 1e-8/1e-9), and what makes larger diamonds affordable.
+  Float64, condensed KKT, `tol_gap_abs/rel`, `tol_feas` and `tol_original`
+  1e-6; refinement and acceptance settings unchanged. Results are numerical
+  estimates, not certificates. AlmostSolved is never read as a tighter
+  bound.
+- Models (lower side; the upper side has the same shape). There are 4701
+  variables at 41 sites and 6399 at 85. The condensed KKT dimension is
+  variables + equalities.
+
+  | model | rows | nnz(A) | equalities | nonneg | PSD blocks (n) | KKT |
+  |---|---|---|---|---|---|---|
+  | orig41 | 50609 | 6.39M | 4033 | 5196 | 4×128, 4×64, 6×3 | 8734 |
+  | red41 | 48855 | 5.51M | 2279 | 5196 | as orig41 | 6980 |
+  | sym41 | 30321 | 4.27M | 4033 | 5196 | 2×(72,56), 2×(64,64), 4×(36,28), 6×3 | 8734 |
+  | symred41 | 28567 | 3.39M | 2279 | 5196 | as sym41 | 6980 |
+  | orig85 | 230343 | 9.50M | 3796 | 8592 | 253, 223, 218, 188, 130, 4×128, 16 of 66–119, 4×64, 6×3 | 10195 |
+  | red85 | 229922 | 7.74M | 3375 | 8592 | as orig85 | 9774 |
+  | symred85 | 213666 | 7.74M | 3375 | 8592 | 128s split as at 41 sites (38 blocks) | 9774 |
+
+  The KKT factor fills 79–81% of the triangle (AMD). AMD flops are 6.2e10
+  for orig41, 1.05e11 for orig85 and 8.8e10 for red85 (0.57 of dense).
+- Construction (outside SDPX):
+  - `reduce_eq.py` drops numerically dependent TI rows by pivoted QR (41
+    sites: 4033 → 2279; 85: 3796 → 3375). Every dropped row is a
+    combination of kept rows, with row and right-hand-side residuals of at
+    most 2.6e-13; the QR pivot gap is 2e-3 → 4e-14. `mapback_eq.py`
+    restores their duals as zero for the audits. SDPX presolve cannot prove
+    these dependencies (Float64 a+b√2 coefficients).
+  - Combined with the Ising project's exact character-basis symmetry split.
+  - Times, 41/85 sites (all JSON-bound): export 22.9/30.2 s, symmetry split
+    15.4/31.1 s, reduction per side 13.6 s (Mac) / 43–46 s (cluster).
+- Baseline (920b11f, orig41, 8 threads, node177): lower 182.1 s / 18 it,
+  upper 219.0 s / 23 it, 15.0 GB. Time went to:
+  - the first KKT update, 48.9 s (54 long orthant rows formed pair by
+    pair);
+  - PSD Schur assembly, 108.8 s;
+  - the faer factor, 54.2 s, using 1.35 of 8 cores.
+- Changes (branch `ising-perf`):
+  1. Kept, row panel (`5659ebb`, `5477e60`): eliminated orthant rows with
+     at least 64 entries form one dense rows×union panel and one SYRK; only
+     pairs that share a member row are scattered.
+  2. Kept, dot panels (`ed42e1e`): the dense Schur dots walk the dense axis
+     in 1 MiB panels; bitwise identical.
+  3. Kept, dense admission (`e59fc81`): with at least 2 workers and fill of
+     at least 0.1, dense_block also takes systems whose AMD sparse factor
+     needs at least half the dense multiply-subtracts.
+  4. Rejected, pooled dense_block solves: 128-row tiles of the triangular
+     sweeps and Y products on the pool (worker-count independent).
+     - Mac, 4 threads: 26.4 → 24.7 s.
+     - Zen2 release ABBA, symred41 lower: 8 threads 38.07 → 37.88 s,
+       32 threads 29.29 → 29.57 s. The solve phase kept 7 and 26 cores busy
+       for unchanged wall time.
+     - 85 sites, 32 threads: solve phase 11.3 → 13.0 s.
+     - Cause: the tiles stream 1 KiB column segments 37 KiB apart, while
+       `dtrsv` streams whole columns. A retry needs column-contiguous
+       chunks (a left-looking forward sweep split by columns, a transposed
+       factor for the backward sweep).
+     - The serial refinement residual on these inputs is the direct
+       solver's dense `dsymv` copy (the leading block is not fully dense).
+       The generic BLAS trait has no `gemv` to split it with.
+- 41 sites, 8 threads. Every run is Solved in 18 (lower) / 23 (upper)
+  iterations and passes the audit gate:
+
+  | model / binary | lower s | upper s | RSS | asm s | factor s |
+  |---|---|---|---|---|---|
+  | orig41 / 920b11f | 182.1 | 219.0 | 15.0 GB | 108.8 | 54.2 |
+  | orig41 / 5477e60 | 111.0 | 141.1 | 4.6 GB | 37.8 | 53.9 |
+  | orig41 / e59fc81 | 54.7 | 70.3 | 4.4 GB | 16.5 | 18.4 |
+  | red41 / 5477e60 | 61.8 | 80.2 | 4.5 GB | 37.0 | 10.8 |
+  | sym41 / 5477e60 | 86.6 | 113.9 | 4.7 GB | 15.7 | 53.7 |
+  | symred41 / 5477e60 | 39.9 | 50.0 | 4.6 GB | 16.0 | 10.9 |
+  | symred41 / e59fc81 | 37.7 | 47.4 | 4.6 GB | 13.7 | 10.9 |
+
+  - Endpoints from the original input: [0.6897422315, 0.7234765772]
+    (920b11f).
+  - Endpoints from symred41: [0.6897414796, 0.7234765479]. The
+    original-coordinate mapback gives the same values (stationarity
+    residual ≤ 1.1e-5, relative original PSD ≥ −6.7e-10).
+  - Same-node ABBA (node170) for e59fc81: 38.1/38.0 s.
+- 85 sites. Every run needs 37–44 iterations. Late iterations stall on a
+  zero step, so the status flips between Solved and AlmostSolved with
+  rounding. On the upper side the dense Cholesky refuses a clearly
+  negative pivot late, and faer takes over.
+
+  | model / binary / threads | lower | upper | s | RSS | gate |
+  |---|---|---|---|---|---|
+  | orig85 / 920b11f / 64 | Solved 0.6971211209 | Almost 0.7168815797 | 337/336 | 19.3 GB | pass/pass |
+  | orig85 / 5477e60 / 64 | Almost 0.6970692979 | Almost 0.7168574706 | 244/216 | 10.4 GB | pass/pass |
+  | red85 / 5477e60 / 64 | Almost 0.6970450014 | Almost 0.7168533871 | 206/226 | 10.0 GB | pass/pass |
+  | symred85 / 5477e60 / 64 | Almost 0.6970710368 | Almost 0.7168866237 | 216/220 | 9.8 GB | fail/fail |
+  | symred85 / e59fc81 / 64 | Almost 0.6970822651 | Solved 0.7168463621 | 141/137 | 10.5 GB | fail/fail |
+  | orig85 / e59fc81 / 32 | Almost 0.6970846386 | Solved 0.7168288521 | 129/133 | 9.5 GB | pass/pass |
+  | red85 / e59fc81 / 32 | Almost 0.6969822775 | Almost 0.7185400722 | 132/169 | 9.2 GB | pass/pass |
+
+  - The rejected pooled-solve binary at 32 threads: orig85 lower Solved
+    0.6970903610, red85 lower Solved 0.6971151786 (both on dense_block
+    throughout); both uppers Almost.
+  - Split 85-site audits fail on relative primal PSD (−1.7e-6 to −5.8e-6).
+    The Ising project's mapback to the original cones gives PSD ≥ −7.6e-8
+    but a stationarity residual of 0.27–0.48 (1e-5 at 41 sites). The split
+    85-site model is therefore not validated in original coordinates.
+  - Same-node A/B (node170, symred85 lower, 64 threads): 5477e60 220.2 s →
+    e59fc81 140.9 s (asm 66.4 → 25.0 s, factor 90.6 → 50.0 s), both
+    AlmostSolved in 39 iterations.
+- Scaling (symred lower, e59fc81, whole sugon nodes):
+  - 41 sites: T=1 112.1 s (asm 42.9, factor 55.3, 2.7 GB); T=8 37.9; T=16
+    32.2; T=32 29.2; T=64 31.2; T=128 41.4 (6.1 GB). Refinement (5.3 s) and
+    the corrector/step phase (3 s) stay serial.
+  - 85 sites: T=16 140.0 s (Almost); T=32 134.0 (Solved); T=64 145.1;
+    T=128 184.4 (12.6 GB). Refinement takes 27–32 s and step+corrector
+    20–26 s.
+  - MPI replicates the condensed Schur and factor, so more nodes do not
+    help yet.
+- Decision: keep 1–3, reject 4. Best configuration:
+  - 41 sites: symmetry split + TI reduction on e59fc81, 32 threads.
+  - 85 sites: the original input on e59fc81, 32 threads; the split model's
+    audits fail.
+  - Largest result (numerical estimate): 85-site lower 0.6971211209
+    (Solved, 920b11f) and upper 0.7168288521 (Solved, e59fc81), both
+    gate-passing. Solved 85-site endpoints spread by 3e-5 across binaries.
+  - 113 sites is not justified until the 85-site end game is reliable.
+- Next:
+  - 85-site end game: late dense pivot refusal, zero steps, and the status
+    flipping with rounding.
+  - Column-contiguous pooled solves and residual: refinement is about 18%
+    of the 32-thread solves.
+  - Split the outer 85-site RP blocks (253, 223, 218, 188 hold about 62% of
+    the transform work).
+  - A distributed dense Schur and factor for multi-node.
+- Reproduction:
+  - Cluster `~/projects/tb-ising-perf-20261103`: `cases/`,
+    `runs/TAG-JOBID`, `tb-i41.pbs` (lower/upper and audits), `tb-legs.pbs`
+    (ABBA), `tb-scale.pbs`, `tb-mapback.pbs`, `audit/` (`reduce_eq.py`,
+    `mapback_eq.py`, `tb_table.py`, `tb_legs.py`, `tb_scale.py`).
+  - Binaries in `~/projects/sdpx-ising11-scaling-20261007/bin`: `sdpx-tbJB`
+    (920b11f), `-tbJR2` (5477e60), `-tbJD` (e59fc81), `-tbTS` (rejected).
+  - Local inputs and scripts: `~/.cache/sdpx-e2e/ising-perf-20261103`.
+
 ## 2026-10-30 — Deep review of `crates/`: repairs, in-place border Schur, PMP resampling restored (kept, review-fixes-20261030)
 
 - Scope: a max-effort review of `crates/` at `7737088` (bfss-l13-threads).

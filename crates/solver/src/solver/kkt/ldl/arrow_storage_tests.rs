@@ -78,7 +78,7 @@ fn storage_check_solve<T: FloatT>(
     signs: &[i8],
     check_residual: bool,
 ) {
-    let mut fresh = ArrowLDLSolver::try_new(k, signs, &solver.settings).unwrap();
+    let mut fresh = ArrowLDLSolver::try_new(k, signs, &solver.settings, 0).unwrap();
     assert!(solver.refactor(k));
     assert!(fresh.refactor(k));
     assert_eq!(solver.use_arrow, fresh.use_arrow);
@@ -119,7 +119,7 @@ fn storage_update_parity<T: FloatT>() {
     let untouched = input.clone();
     let mut expected = input.clone();
     let settings = CoreSettings::<T>::default();
-    let mut solver = ArrowLDLSolver::try_new(&input, &signs, &settings).unwrap();
+    let mut solver = ArrowLDLSolver::try_new(&input, &signs, &settings, 0).unwrap();
     assert_eq!(solver.trunk, vec![1, 3]);
     assert_eq!(
         solver
@@ -211,7 +211,7 @@ fn storage_update_parity<T: FloatT>() {
     assert!(!solver.use_arrow);
     assert!(solver.fallback.is_some());
     storage_matrix_same(&solver.materialize(), &expected);
-    let mut fresh = ArrowLDLSolver::try_new(&expected, &signs, &solver.settings).unwrap();
+    let mut fresh = ArrowLDLSolver::try_new(&expected, &signs, &solver.settings, 0).unwrap();
     assert!(!fresh.refactor(&expected));
     solver.update_values(&[singleton], &[original]);
     expected.nzval[singleton] = original;
