@@ -1802,6 +1802,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
 
     fn assemble(&mut self) -> bool {
         let parallel_publication = self.scaling_workers > 1 && self.n > 1;
+        let timer = crate::receipt::start();
         // Each PSD block owns its contribution buffer. After joining, each
         // destination column publishes the blocks in their original cone order.
         if self.parallel_assembly {
@@ -1869,6 +1870,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 }
             });
         }
+        crate::receipt::finish("assemble.psd", timer);
+        let timer = crate::receipt::start();
         let pool = self.pool.clone();
         let schur = self.reduced.kkt_matrix_mut();
         match pool.as_deref().filter(|p| p.current_num_threads() > 1) {
@@ -1947,6 +1950,9 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 }
             }
         }
+        // Publication, or the whole PSD Schur without contribution buffers.
+        crate::receipt::finish("assemble.publish", timer);
+        let timer = crate::receipt::start();
         // Orthant and eliminated SOC rows form one Gram BᵀB.
         let elim = self.eliminated.get_or_insert_with(|| {
             EliminatedRows::new(&self.blocks, |i, j| position(schur, i, j), pool.as_deref())
@@ -1957,6 +1963,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             &self.A.nzval,
             pool.as_deref(),
         );
+        crate::receipt::finish("assemble.elim", timer);
         schur.nzval[..self.schur_nnz].is_finite()
     }
 
