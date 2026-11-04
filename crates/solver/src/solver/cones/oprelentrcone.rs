@@ -447,18 +447,38 @@ fn lower_inverse_rec<T: FloatT>(n: usize, l: &[T], ldl: usize, x: &mut [T], ldx:
 /// Inverse of a symmetric positive definite matrix from its lower factor:
 /// L⁻ᵀL⁻¹ (LAPACK's potri: a third of the products of solving against the
 /// identity), each entry one exact dot product of two columns of L⁻¹.
-pub(super) fn spd_inverse<T: FloatT>(n: usize, l: &[T], out: &mut [T]) -> bool {
+/// `None` if an entry is not finite. Each buffer is freed after its last
+/// use: the four order-2652 S₀ of Hubbard all3, inverted together, held L,
+/// L⁻¹, the inverse and the product's residues at once (1.67 GB each).
+pub(super) fn spd_inverse<T: FloatT>(n: usize, l: Vec<T>) -> Option<Vec<T>> {
     let mut li = zeros::<T>(n * n);
-    lower_inverse(n, l, &mut li);
-    if T::precision_bits() <= 53 {
-        let ni = n as i32;
-        T::xsyrk(b'L', b'T', ni, ni, T::one(), &li, ni, T::zero(), out, ni);
+    lower_inverse(n, &l, &mut li);
+    drop(l);
+    let finite = |v: &[T]| v.iter().all(|v| v.is_finite());
+    let mirror = |out: &mut [T]| {
         for j in 0..n {
             for i in j + 1..n {
                 out[j + i * n] = out[i + j * n];
             }
         }
-        return out.iter().all(|v| v.is_finite());
+    };
+    if T::precision_bits() <= 53 {
+        let mut out = zeros::<T>(n * n);
+        let ni = n as i32;
+        T::xsyrk(
+            b'L',
+            b'T',
+            ni,
+            ni,
+            T::one(),
+            &li,
+            ni,
+            T::zero(),
+            &mut out,
+            ni,
+        );
+        mirror(&mut out);
+        return finite(&out).then_some(out);
     }
     // One exact symmetric product (residue operands encoded once), else
     // exact dots: either way each entry is one exact sum rounded once.
@@ -468,25 +488,25 @@ pub(super) fn spd_inverse<T: FloatT>(n: usize, l: &[T], out: &mut [T]) -> bool {
         T::xgemm_upper_exact(b'T', b'N', n, n, n, &li, n, &li, n, &mut packed, None, None)
     });
     if exact {
-        pieces::<T>(out, n, n * n, |j, oc| {
+        drop(li);
+        let mut out = zeros::<T>(n * n);
+        pieces::<T>(&mut out, n, n * n, |j, oc| {
             oc[..=j].copy_from_slice(&packed[j * (j + 1) / 2..j * (j + 1) / 2 + j + 1]);
             for i in j + 1..n {
                 oc[i] = packed[i * (i + 1) / 2 + j];
             }
         });
-        return packed.iter().all(|v| v.is_finite());
+        return finite(&packed).then_some(out);
     }
-    pieces::<T>(out, n, n * n * n / 6, |j, oc| {
+    drop(packed);
+    let mut out = zeros::<T>(n * n);
+    pieces::<T>(&mut out, n, n * n * n / 6, |j, oc| {
         for i in j..n {
             oc[i] = T::dot_slices(&li[i + i * n..(i + 1) * n], &li[i + j * n..(j + 1) * n]);
         }
     });
-    for j in 0..n {
-        for i in j + 1..n {
-            out[j + i * n] = out[i + j * n];
-        }
-    }
-    out.iter().all(|v| v.is_finite())
+    mirror(&mut out);
+    finite(&out).then_some(out)
 }
 
 pub(super) fn symmetrize<T: FloatT>(n: usize, a: &mut [T]) {
@@ -804,10 +824,7 @@ impl<T: FloatT> Oracle<T> {
         if !cholesky(n, &mut lz) {
             return None;
         }
-        let mut w = vec![T::zero(); nn];
-        if !spd_inverse(n, &lz, &mut w) {
-            return None;
-        }
+        let w = spd_inverse(n, lz.clone())?;
         let (d1, c) = first_kernels(&lam, &ln, &g);
         let two = T::one() + T::one();
         let mut logdet_z = T::zero();
@@ -1094,11 +1111,10 @@ impl<T: FloatT> Oracle<T> {
     pub(crate) fn schur_inverse(&mut self) -> Option<Vec<T>> {
         let m2 = self.n * (self.n + 1);
         let l = self.schur_factor()?;
-        let mut s0i = zeros::<T>(m2 * m2);
         let timer = crate::receipt::start();
-        let ok = spd_inverse(m2, &l, &mut s0i) && s0i.iter().all(|v| v.is_finite());
+        let s0i = spd_inverse(m2, l);
         crate::receipt::finish("ore.schur_inverse", timer);
-        ok.then_some(s0i)
+        s0i
     }
 
     /// Lower Cholesky factor of S₀ (column-major, size 2m).
@@ -1788,6 +1804,11 @@ where
         μ: T,
         _scaling_strategy: ScalingStrategy,
     ) -> bool {
+        // Nothing reads the previous S₀⁻¹ or oracle while they are rebuilt
+        // (a failed update ends the solve), and they would otherwise coexist
+        // with the new inverse's buffers.
+        self.data.s0i = Vec::new();
+        self.data.at_s = None;
         let Some(mut oracle) = Oracle::new(self.n, s) else {
             return false;
         };
