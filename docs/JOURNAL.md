@@ -8,6 +8,82 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-04 — Hubbard ORE arrow: all3 −39% time and −31% peak RSS from sweeps, memory, product ways and sparse ORE rows (kept, ore-mt-qdldl-20261104)
+
+- Cases: Hubbard thermal all3 (KKT n 42,445, largest leaf 3,978) and cubic3
+  (n 29,461) at 128 bits. Release ABBAs on node22 (EPYC 7742), 3 iterations
+  of all3 at 32 threads and 4 of cubic3 at 16. "Bitwise" means equal
+  sha256 of x, s and z.
+- Two-column leaf sweeps split by rows (`dc6435e`, kept). This ports the
+  leaf part of 06450d2 (ising-perf-arrow) to v0.9.4. Before it, the KKT
+  update's two-column solve swept each dense leaf on one thread.
+  - abP1 (PBS 234261): all3 159.0/160.7 → 118.6/121.9 s (−25%); cubic3
+    53.3/53.1 → 48.4/48.4 s (−9%). Points bitwise.
+  - all3 peak RSS rose from 37.8/38.0 to 41.0/40.7 GB. The +2.4 GB at
+    iteration 1's KKT update sits outside the glibc arenas (mmapped
+    chunks); the cause was not found. The memory fixes below remove more
+    than this.
+- Regularization reset (rejected). Resetting the escalation boost at
+  every KKT update (cubic3, 6 iterations, 8 threads, local) gave the same
+  iterates, 12 factor attempts against 7, and 116.3 s against 78.7 s.
+  Every base-shift factor fails on the exactly zero Zero-cone pivots, so
+  a reset only adds failed attempts.
+- Memory (`63ae7dd`, `d9cb2ab`, `b9676f5`, `938eb4e`, kept):
+  - Zero-cone singleton pivots (300 in cubic3, 306 in all3) are exactly
+    zero at the base shift, which doomed the first factor. It now fails
+    before the leaf phase. Its QDLDL fallback meets the same pivot first
+    in the z-first order, so it is no longer built. A failed fallback is
+    dropped; it used to stay for the whole solve (all3: 6.2 GiB).
+  - Wide types build ExactRows at the first update and skip the
+    SparseParallel residual plan, which they never read (all3: 2.0 GiB).
+    ExactRows entries are now u32 pairs (all3: 0.5 GiB).
+  - ORE S₀⁻¹ frees each buffer after its last use: L after L⁻¹, L⁻¹
+    before the output, and the previous S₀⁻¹ and oracle before
+    rescaling. This saves about 2.5 GiB at all3's old scale-phase peak.
+  - A review found a regression in `63ae7dd`, fixed in `938eb4e`. The
+    symmetric default start solves even after a failed update, and with
+    the fallback dropped that solve panicked. A failed factor now keeps
+    no fallback, and a solve without a factor returns NaN.
+  - abP2 (PBS 234299, tmP1 → tmP2): all3 peak 40.5/39.8 → 29.1/28.7 GB
+    (−28%) and 122.4/122.7 → 101.7/101.7 s. cubic3 peak 11.8/11.8 →
+    9.3/9.3 GB (−22%) and 48.5/48.7 → 44.4/44.4 s. Points bitwise. The
+    time saved is mostly the skipped first factor, once per solve (about
+    17 s on all3, 3 s on cubic3).
+  - all3 now peaks during the KKT update's refactor: 29.1 GB, against
+    23.0 GB resident afterwards. Retained heap grows each iteration
+    (heap_free 5.2 GB at the end).
+- Allocator (no default change):
+  - MALLOC_ARENA_MAX=4 (abP1m, PBS 234272) cut the all3 peak by 3.0 GB
+    (tmO0) and 3.7 GB (tmP1), at +1.7% and +4.0% time.
+  - SDPX_MALLOC_TRIM=1 (abP1t, PBS 234277) lowered RSS between iterations,
+    but moved the peak by only −0.9 GB on average (40.6/40.2 → 38.9/40.0
+    GB), at equal time.
+- Product ways (`0fa7cc5`, kept). A leaf's in-phase residue product of at
+  least one worker's share of all products' work now posts one way per
+  worker, instead of its shares rounded down and capped at 8. The largest
+  leaves are claimed first but finish last, so their products ended the
+  leaf phase serially.
+  - abP3 (PBS 234301, tmP2 → tmP3): cubic3 44.3/44.4 → 40.9/40.9 s
+    (−7.8%); all3 100.5/102.0 → 99.9/100.3 s (−1.1%), peak 29.1/28.8 →
+    27.4/27.6 GB. Points bitwise.
+- Sparse ORE rows (`13d36ad`, kept). The KKT update kept a dense copy of
+  A's ORE rows per column and transformed every svec entry. It now keeps
+  the block sparse and forms the congruence only on the touched indices
+  (Float64 keeps the dense transform).
+  - abP5 (PBS 234316, tmP3 → tmP5): all3 100.2/100.4 → 97.5/97.9 s
+    (−2.6%), kkt.ore_rows 4.43 → 3.03 s summed; cubic3 40.9/40.8 →
+    40.4/40.4 s (−1.1%), 2.10 → 1.57 s summed. Peak at "kkt built": all3 17.2 →
+    16.3 GB, cubic3 4.52 → 4.26 GB. Points bitwise.
+- Concurrent S₀ inverse halves (rejected). Running X11 = L11⁻¹ and X22 =
+  L22⁻¹ of `lower_inverse_rec` as two board items, with T = L21·X11 next
+  to X22, cut summed ore.schur_inverse from 57.1 to 54.0 s but left the
+  scale-cones wall unchanged (23.9 → 23.7 s). abP4 (PBS 234307, all3):
+  101.2/101.2 → 100.2/101.5 s (−0.4%, noise), peak 26.1/26.5 → 27.9/27.5
+  GB. A 1.4 GB rise for no gain.
+- Net, across these ABBAs on node22 (tmO0 → tmP5): all3 at 32 threads
+  159.9 → 97.7 s for 3 iterations (−39%), peak 37.9 → 26.2 GB (−31%);
+  cubic3 at 16 threads 53.2 → 40.4 s for 4 iterations (−24%).
+
 ## 2026-11-04 — Hubbard thermal ORE campaign: v0.9.4 runs it on the parallel arrow; QDLDL plan admitted by work (kept, ore-mt-qdldl-20261104)
 
 - Cases: `hubbard1d-campaign-20261104-EeI8yS` at 128 bits, 13 solves over
