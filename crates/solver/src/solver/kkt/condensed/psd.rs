@@ -862,7 +862,8 @@ const SCHUR_TILE_BYTES: usize = 2 << 20;
 
 /// Right columns per Schur tile of an `n`-sided block.
 fn tile_columns<T>(n: usize) -> usize {
-    (SCHUR_TILE_BYTES / (triangular_number(n) * std::mem::size_of::<T>())).clamp(1, 16)
+    // n = 0: CompositeCone::new keeps empty PSD cones.
+    (SCHUR_TILE_BYTES / (triangular_number(n) * std::mem::size_of::<T>()).max(1)).clamp(1, 16)
 }
 
 impl<T: FloatT> PsdBlock<T> {
@@ -1274,7 +1275,7 @@ impl<T: FloatT> PsdBlock<T> {
     fn tiles(&self) -> impl ParallelIterator<Item = Range<usize>> {
         let columns = self.columns.len();
         let tile = tile_columns::<T>(self.Ginv.nrows())
-            .min(columns.div_ceil(2 * rayon::current_num_threads()).max(1));
+            .min(columns.div_ceil(2 * rayon::current_num_threads()));
         (0..columns.div_ceil(tile))
             .into_par_iter()
             .map(move |t| t * tile..(t * tile + tile).min(columns))
