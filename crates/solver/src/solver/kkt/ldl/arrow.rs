@@ -3423,6 +3423,8 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
             return false;
         }
         if zero && self.fallback_meets_zero() {
+            // As after a failed fallback, no older factor stays in use.
+            self.fallback = None;
             return false;
         }
         self.use_arrow || self.factor_fallback()
@@ -3438,7 +3440,13 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
 
     fn solve_many(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T], cols: usize) {
         if !self.use_arrow {
-            self.fallback.as_mut().unwrap().solve_many(kkt, x, b, cols);
+            // A failed factor keeps no fallback; a caller that solves
+            // anyway (the symmetric default start) gets NaN, as from a
+            // failed QDLDL factor.
+            match self.fallback.as_mut() {
+                Some(f) => f.solve_many(kkt, x, b, cols),
+                None => x.fill(T::nan()),
+            }
             return;
         }
         let (n, t) = (self.n, self.trunk.len());
@@ -3643,7 +3651,10 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
 
     fn solve(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T]) {
         if !self.use_arrow {
-            self.fallback.as_mut().unwrap().solve(kkt, x, b);
+            match self.fallback.as_mut() {
+                Some(f) => f.solve(kkt, x, b),
+                None => x.fill(T::nan()),
+            }
             return;
         }
         self.solve_arrow(x, b);
@@ -4308,7 +4319,9 @@ mod tests {
         assert!(solver.use_arrow);
         assert!(solver.regularize_count > 0);
         // Both backends must reject a zero singleton pivot when dynamic
-        // regularization is disabled, then recover after restoring it.
+        // regularization is disabled (the fallback ordering meets it first,
+        // so no fallback is built and a solve gives NaN), then recover after
+        // restoring it.
         let (k3, s3) = arrow_kkt();
         let mut settings3 = CoreSettings::<f64>::default();
         settings3.dynamic_regularization_enable = false;
@@ -4317,7 +4330,10 @@ mod tests {
         solver.update_values(&[diag4], &[0.0]);
         assert!(!solver.refactor(&k3));
         assert!(!solver.use_arrow);
-        assert!(solver.fallback.is_some());
+        assert!(solver.fallback.is_none());
+        let mut x = vec![0.0; k3.n];
+        solver.solve(&k3, &mut x, &mut b.clone());
+        assert!(x.iter().all(|v| v.is_nan()));
         solver.update_values(&[diag4], &[k3.nzval[diag4]]);
         assert!(solver.refactor(&k3));
         assert!(solver.use_arrow);
