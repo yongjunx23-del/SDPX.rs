@@ -8,6 +8,50 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-04 — Hubbard thermal ORE campaign: v0.9.4 runs it on the parallel arrow; QDLDL plan admitted by work (kept, ore-mt-qdldl-20261104)
+
+- Cases: `hubbard1d-campaign-20261104-EeI8yS` at 128 bits, 13 solves over
+  12 inputs (cubic3, full, all3, all3-hops, dedup and seven irrep/irrep2
+  cut variants; KKT n 26,817–42,445; 9–25 ORE cones, border 2,204). The
+  campaign used `031467b`, which kept 8 of the 13 solves on serial QDLDL
+  (cubic3: the full-border arrow form needs 5.1 GB against a 3.9 GB bound).
+  v0.9.4's coupled leaves (`aa0c82b`, `b1ac05d`) admit every input as
+  `negated_arrow` (coupled form 2.2–2.5 GB), so no admission change is
+  needed. The trunk-only memory bound tried first changed no input and was
+  dropped.
+- cubic3, one iteration (release, PBS 234231 and 234235): serial QDLDL
+  504 s (refactor 450 s); arrow at 1 thread 70 s, then 13.3 / 10.0 / 9.3 /
+  16 s at 16 / 32 / 64 / 128 threads. all3: 55 s at 32 threads and 49 s at
+  64. Points are bitwise identical across thread counts. Beyond 32 threads
+  the residue contribution products stay busy but barely shorten.
+- Every arrow solve's first factor at the base static shift fails after the
+  leaves. The QDLDL fallback is then built and fails at once, and the
+  escalated shift succeeds. This happens once per solve, because the boost
+  stays raised. The failed fallback keeps its storage, which is bounded by
+  the 3.3 GB that a whole serial QDLDL solve of cubic3 peaks at. cubic3's
+  4.2 → 8.0 GB step at iteration 1 includes the arrow's own 2.3 GB factor.
+- QDLDL plan, forced QDLDL: removing the 500k cap gave cubic3 1.21× per
+  iteration on 16 threads (504 → 416 s, refactor busy 1.8) for 2.6 GB more
+  RSS. The 1,305-row group and the serial trunk bound it. Under v0.9.4's
+  plan, forced-QDLDL medium (condensed Schur, trunk 1,880 of 1,920)
+  factored 7× slower on 4 threads than serially (19.6 vs 2.8 s, and 30 vs
+  4.2 s under load).
+- Change (`df4c7bd`):
+  - The plan's group scratch is sized to the group.
+  - Admission now uses a symbolic work estimate instead of the cap:
+    - Serial work: trunk columns, plus leaf updates of trunk rows (lnz²).
+    - Parallel work: the rest, spread over the groups, with the largest
+      group as the critical path.
+    - The plan is kept only for an estimated speedup of at least 2.
+  - Medium estimates 1.00 and cubic3 1.66, so both run serially.
+- Evidence:
+  - Points are bitwise identical at 1 and 4/16 threads.
+  - medium E2E: Solved/15, audit PASS.
+  - Unit tests: admitted shapes stay bitwise identical, and a trunk-heavy
+    arrow is rejected.
+- The campaign was resubmitted on v0.9.4 (`tmO0`, PBS 234237/234238; 16
+  or 32 threads per solve, two whole nodes) with the ORE audit.
+
 ## 2026-10-30 — Deep review of `crates/`: repairs, in-place border Schur, PMP resampling restored (kept, review-fixes-20261030)
 
 - Scope: a max-effort review of `crates/` at `7737088` (bfss-l13-threads).
