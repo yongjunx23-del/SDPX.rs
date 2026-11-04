@@ -1120,7 +1120,7 @@ impl<T: FloatT> PsdBlock<T> {
             Some(pool) => {
                 let (this, n, target) = (&*self, self.Ginv.nrows(), PackedSchur::new(schur));
                 pool.install(|| {
-                    this.tiles().for_each(|tile| {
+                    this.tiles(false).for_each(|tile| {
                         with_block_work(n, |w: &mut BlockWork<T>| {
                             this.schur_tile(values, false, tile, w, &mut |_, _, position, v| {
                                 target.add(position, v)
@@ -1271,11 +1271,18 @@ impl<T: FloatT> PsdBlock<T> {
 
     /// The Schur tiles of this block's columns, on the current pool. A right
     /// column's left sums grow with its index, so the last tile is the
-    /// longest task; two tiles per worker keep it near one worker's share.
-    fn tiles(&self) -> impl ParallelIterator<Item = Range<usize>> {
+    /// longest task. Two tiles per worker, counting only the right columns
+    /// [`Self::schur_tile`] works on, keep it near one worker's share when
+    /// the block has the pool alone.
+    fn tiles(&self, skip_sparse: bool) -> impl ParallelIterator<Item = Range<usize>> {
         let columns = self.columns.len();
+        let working = (0..columns)
+            .filter(|&b| {
+                self.dense_representatives[b] == b && !(skip_sparse && self.columns[b].sparse)
+            })
+            .count();
         let tile = tile_columns::<T>(self.Ginv.nrows())
-            .min(columns.div_ceil(2 * rayon::current_num_threads()));
+            .min(working.div_ceil(2 * rayon::current_num_threads()));
         (0..columns.div_ceil(tile))
             .into_par_iter()
             .map(move |t| t * tile..(t * tile + tile).min(columns))
@@ -1494,17 +1501,17 @@ impl<T: FloatT> PsdBlock<T> {
             self.compute_schur_dense_dispatch(values, skip_sparse, &mut sink, pool);
             return;
         }
-        // Sampled and wide-precision blocks keep the closure path; only the
-        // f64 batched dense path tiles over the pool.
+        // Sampled and wide-precision blocks keep the closure path.
         let packed = PackedSchur::new(out);
-        // Wide dense columns: one n³ congruence each, run on the pool. Each
-        // representative writes its own pairs, so values are unchanged.
+        // Wide dense columns: one n³ congruence each, in Schur tiles on the
+        // pool. Each representative writes its own pairs, so values are
+        // unchanged.
         if let Some(pool) = pool
             .filter(|p| self.sampled.is_none() && dense_count > 0 && p.current_num_threads() > 1)
         {
             let (this, n) = (&*self, self.Ginv.nrows());
             pool.install(|| {
-                this.tiles().for_each(|tile| {
+                this.tiles(skip_sparse).for_each(|tile| {
                     with_block_work(n, |w: &mut BlockWork<T>| {
                         this.schur_tile(values, skip_sparse, tile, w, &mut |t, a, _, v| {
                             packed.write(t, a, v)
