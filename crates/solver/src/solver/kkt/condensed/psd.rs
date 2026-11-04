@@ -1265,10 +1265,14 @@ impl<T: FloatT> PsdBlock<T> {
                 let mut v = T::zero();
                 if right.sparse {
                     v = sparse_schur_value(left, right, &self.Ginv, values, self.sqrt2);
-                } else {
+                } else if T::precision_bits() <= 64 {
                     for e in &left.entries {
+                        v = values[e.position].mul_add(w.vector[triangular_number(e.j) + e.i], v);
+                    }
+                } else {
+                    for e in left.entries.iter().filter(|_| lazy) {
                         let p = triangular_number(e.j) + e.i;
-                        if lazy && w.stamp[p] != w.generation {
+                        if w.stamp[p] != w.generation {
                             // The upper entry and packing of `pooled_gemm_sym`
                             // and `mat_to_svec`.
                             w.stamp[p] = w.generation;
@@ -1281,8 +1285,12 @@ impl<T: FloatT> PsdBlock<T> {
                                 (m + m) * T::FRAC_1_SQRT_2()
                             };
                         }
-                        v = values[e.position].mul_add(w.vector[p], v);
                     }
+                    // One exact dot per entry, the left dots of `wide_dense_work`.
+                    v =
+                        T::dot_fma(left.entries.iter().map(|e| {
+                            (&values[e.position], &w.vector[triangular_number(e.j) + e.i])
+                        }));
                 }
                 store(target, a, column.schur_position(left, a), v);
             }
