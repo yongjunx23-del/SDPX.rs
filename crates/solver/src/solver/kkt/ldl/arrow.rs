@@ -2770,6 +2770,39 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
     }
 
+    fn reg(&self) -> Option<(T, T)> {
+        self.settings.dynamic_regularization_enable.then_some((
+            self.settings.dynamic_regularization_eps,
+            self.settings.dynamic_regularization_delta,
+        ))
+    }
+
+    /// Whether the QDLDL fallback meets a zero pivot as well: its ordering
+    /// eliminates a singleton leaf before every border column, so that pivot
+    /// is the leaf's unmodified diagonal entry, under the same dynamic
+    /// regularization.
+    fn fallback_meets_zero(&self) -> bool {
+        let Some(perm) = &self.fallback_perm else {
+            return false;
+        };
+        let mut pos = vec![0; perm.len()];
+        perm.iter().enumerate().for_each(|(i, &k)| pos[k] = i);
+        let border = self
+            .trunk
+            .iter()
+            .map(|&k| pos[k])
+            .min()
+            .unwrap_or(perm.len());
+        let reg = self.reg();
+        self.leaves.iter().any(|leaf| {
+            let &[row] = leaf.ids.as_slice() else {
+                return false;
+            };
+            let sign = T::from_i8(self.signs[row]).unwrap();
+            pos[row] < border && DenseLeaf::pivot(leaf.h[0], sign, reg, &mut 0) == Err("zero_pivot")
+        })
+    }
+
     fn owned_leaves(&self) -> std::ops::Range<usize> {
         self.ranks
             .as_ref()
@@ -2791,10 +2824,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         {
             return false;
         }
-        let reg = self.settings.dynamic_regularization_enable.then_some((
-            self.settings.dynamic_regularization_eps,
-            self.settings.dynamic_regularization_delta,
-        ));
+        let reg = self.reg();
         let t = self.trunk.len();
         let owned = self.owned_leaves();
         let timer = crate::receipt::start();
@@ -3021,10 +3051,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     }
 
     fn factor_border(&mut self) -> bool {
-        let reg = self.settings.dynamic_regularization_enable.then_some((
-            self.settings.dynamic_regularization_eps,
-            self.settings.dynamic_regularization_delta,
-        ));
+        let reg = self.reg();
         let mut border_count = 0usize;
         let timer = crate::receipt::start();
         // Every pool thread is idle during the border factor.
@@ -3070,7 +3097,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let indices: Vec<usize> = (0..self.rowval.len()).collect();
         solver.update_values(&indices, &matrix.nzval);
         solver.set_pool(self.pool.clone());
-        solver.refactor(&matrix)
+        // A failed fallback would keep its whole sparse factor for the rest
+        // of the solve (Hubbard all3 at 128 bits: 6.2 GiB).
+        let ok = solver.refactor(&matrix);
+        if !ok {
+            self.fallback = None;
+        }
+        ok
     }
 
     fn solve_arrow(&mut self, x: &mut [T], b: &[T]) {
@@ -3366,10 +3399,27 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
     }
 
     fn refactor(&mut self, _kkt: &CscMatrix<T>) -> bool {
-        self.use_arrow = self.factor_arrow();
+        // A leaf's first pivot is its unmodified (0, 0) entry. When that is
+        // zero the leaf phase fails as well, but only after every other
+        // leaf's factor and product (the Zero-cone singletons of an ORE −K
+        // before the MPFR shift escalates).
+        let reg = self.reg();
+        let zero = self.leaves.iter().any(|leaf| {
+            let sign = leaf
+                .signs
+                .first()
+                .map_or(-T::one(), |&s| T::from_i8(s).unwrap());
+            leaf.h
+                .first()
+                .is_some_and(|&d| DenseLeaf::pivot(d, sign, reg, &mut 0) == Err("zero_pivot"))
+        });
+        self.use_arrow = !zero && self.factor_arrow();
         // A general fallback ordering needs every static shift: report the
         // failure so the caller escalates, which also ends the exemption.
         if !self.use_arrow && self.shift_exempt && !self.unshifted.is_empty() {
+            return false;
+        }
+        if zero && self.fallback_meets_zero() {
             return false;
         }
         self.use_arrow || self.factor_fallback()
