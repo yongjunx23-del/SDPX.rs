@@ -579,7 +579,9 @@ impl<T: FloatT> EliminatedRows<T> {
                 }
             }
         }
-        let threshold = (narrow / 2).max(16);
+        // A strict majority: any two panel columns share a row, so every
+        // pair `out` scatters is a structural Schur entry.
+        let threshold = (narrow / 2 + 1).max(16);
         let dense: Vec<usize> = (0..n).filter(|&j| count[j] >= threshold).collect();
         let mut slot = vec![usize::MAX; n];
         for (d, &j) in dense.iter().enumerate() {

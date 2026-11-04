@@ -8,6 +8,42 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-05 — Integration of the Hubbard ORE and 128-bit Ising lines; review repairs (perf/hubbard-ising-20261105)
+
+- Scope: `ore-mt-qdldl-20261104` (v0.9.4 + Hubbard ORE work) merged with
+  `ising-perf-arrow` (`db56de4`, 30 commits on 920b11f) and its heap trim
+  (`d28a469`). Both lines had parallelized `ldl_rec` and
+  `solve_unit_lower_t`; the merge keeps the Ising helpers (`zeros`,
+  `for_columns`), one row-split sweep, the exact-type Y panels beside
+  v0.9.4's column blocks, and v0.9.4's in-place border Schur in the
+  admission estimate.
+- Points: Hubbard cubic3 (2 iterations, 128 bits) moves from 0dde98981b5e
+  to 9e9cd96e5917, equal at 3 and 8 threads. The Y panels form each
+  off-diagonal block as one exact product, so Y rounds once per panel
+  product rather than once per row dot. ising11 Solved/54 and medium
+  Solved/15, audits PASS.
+- Review (my 10 commits, the Ising branch, open PR #15; finders ran, most
+  verifiers were cut off by a usage limit, so each kept item was checked
+  by hand):
+  - Fixed: the storage-parity tests still expected a failed fallback to
+    be kept (`63ae7dd`/`938eb4e` drop it), so 3 arrow tests failed. A
+    test comment claimed no fallback is built, but `try_new` has no
+    fallback order, so one is built, fails and is dropped.
+  - Fixed (latent since 0.9.0): the condensed column panel admitted
+    columns in half of the narrow rows, so two panel columns could share
+    no row and `schur_position` would panic on the missing pair. Panel
+    columns now need a strict majority.
+  - PR #15 (open, not merged here): for MPFR generic leaves `Leaf::load`
+    rewrites only the KKT-pattern slots of the upper triangle, which
+    `stage_rows` filled with −Lᵀ after the previous factor; `mirror_upper`
+    then copies stale fill into H. Its evidence used dense leaves only.
+    Clear the strict upper triangle in `load` before merging it.
+  - Not changed: the QDLDL plan's speedup-2 admission (never on 2
+    threads, by design: the plan copies L); per-row `pool.install` and
+    per-row delta Vecs in the admitted plan; condensed reduced solvers
+    keeping the residual plan after ExactRows exists; serial zero fills
+    and panel copies around the Y panels and contribution products.
+
 ## 2026-11-04 — Hubbard ORE arrow: all3 −39% time and −31% peak RSS from sweeps, memory, product ways and sparse ORE rows (kept, ore-mt-qdldl-20261104)
 
 - Cases: Hubbard thermal all3 (KKT n 42,445, largest leaf 3,978) and cubic3

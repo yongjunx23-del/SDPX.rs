@@ -194,8 +194,8 @@ fn storage_update_parity<T: FloatT>() {
     storage_check_solve(&mut solver, &expected, &signs, true);
 
     // A zero singleton pivot fails in both backends when regularization is
-    // disabled. Lazy fallback reconstruction must preserve every update,
-    // and restoring the pivot must recover a valid solve.
+    // disabled, and the failed fallback is dropped. Every update must
+    // survive, and restoring the pivot must recover a valid solve.
     let before_fallback_shift = expected.clone();
     let restore_diag: Vec<_> = diagonal.iter().map(|&p| expected.nzval[p]).collect();
     solver.update_values(&diagonal, &shifted(&expected, &diagonal, shift, &signs));
@@ -209,7 +209,7 @@ fn storage_update_parity<T: FloatT>() {
     expected.nzval[singleton] = T::zero();
     assert!(!solver.refactor(&expected));
     assert!(!solver.use_arrow);
-    assert!(solver.fallback.is_some());
+    assert!(solver.fallback.is_none());
     storage_matrix_same(&solver.materialize(), &expected);
     let mut fresh = ArrowLDLSolver::try_new(&expected, &signs, &solver.settings, 0).unwrap();
     assert!(!fresh.refactor(&expected));

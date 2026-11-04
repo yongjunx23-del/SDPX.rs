@@ -4556,9 +4556,8 @@ mod tests {
         assert!(solver.use_arrow);
         assert!(solver.regularize_count > 0);
         // Both backends must reject a zero singleton pivot when dynamic
-        // regularization is disabled (the fallback ordering meets it first,
-        // so no fallback is built and a solve gives NaN), then recover after
-        // restoring it.
+        // regularization is disabled (the failed fallback is dropped and a
+        // solve gives NaN), then recover after restoring it.
         let (k3, s3) = arrow_kkt();
         let mut settings3 = CoreSettings::<f64>::default();
         settings3.dynamic_regularization_enable = false;
