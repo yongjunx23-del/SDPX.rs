@@ -134,8 +134,11 @@ fn ldl_dots<T: FloatT>(
 ) -> Result<(), &'static str> {
     use sdpx_arithmetic::inner_parallel as ip;
     let row = |i: usize| i * (i + 1) / 2;
-    let mut r = vec![T::zero(); row(n)];
-    let mut w = vec![T::zero(); row(n)];
+    // Every entry of r and w is written before it is read. A split factor's
+    // workers all read them, so the pool writes them first and their pages
+    // spread over its NUMA nodes.
+    let mut r = crate::algebra::scratch::spread_here(row(n), |_| T::zero(), split);
+    let mut w = crate::algebra::scratch::spread_here(row(n), |_| T::zero(), split);
     let mut d = vec![T::zero(); n];
     let a = &*l;
     // entry (i, j) from row i's first j entries and row j of W

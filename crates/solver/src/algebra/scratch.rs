@@ -40,3 +40,21 @@ pub(crate) fn spread_vec<T: Send>(
     (pool.current_num_threads() > 1 && len * std::mem::size_of::<T>() >= FIRST_TOUCH_BYTES)
         .then(|| pool.install(|| (0..len).into_par_iter().map(f).collect()))
 }
+
+/// [`spread_vec`] on the current pool when `spread`; otherwise the calling
+/// thread writes it.
+pub(crate) fn spread_here<T: Send>(
+    len: usize,
+    f: impl Fn(usize) -> T + Sync + Send,
+    spread: bool,
+) -> Vec<T> {
+    use rayon::prelude::*;
+    if spread
+        && rayon::current_num_threads() > 1
+        && len * std::mem::size_of::<T>() >= FIRST_TOUCH_BYTES
+    {
+        (0..len).into_par_iter().map(f).collect()
+    } else {
+        (0..len).map(f).collect()
+    }
+}
