@@ -66,6 +66,10 @@ status and next actions.
   - abP3 (PBS 234301, tmP2 → tmP3): cubic3 44.3/44.4 → 40.9/40.9 s
     (−7.8%); all3 100.5/102.0 → 99.9/100.3 s (−1.1%), peak 29.1/28.8 →
     27.4/27.6 GB. Points bitwise.
+  - Many small leaves (PBS 234366): Λ35-rs at 1024 bits has 36 leaves of
+    96–126 rows, so at 64 threads every product is above one share and
+    now posts 64 ways. 30 iterations: 52.1/52.5 → 50.5/50.7 s (−3.1%),
+    peak 6.0 GB both, points bitwise. The split costs nothing there.
 - Sparse ORE rows (`13d36ad`, kept). The KKT update kept a dense copy of
   A's ORE rows per column and transformed every svec entry. It now keeps
   the block sparse and forms the congruence only on the touched indices
