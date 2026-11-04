@@ -91,6 +91,10 @@ longer than 6 h. At 64 threads an iteration takes 89–94 s, 5.1× faster than
 the forced release arrow, so a 300-iteration solve takes about 8 h. Points
 agree with the release and the forced arrow. At 512 bits v7 peaks at
 187.5 GiB, where the forced arrow does not fit a node (journal 2026-10-27).
+Since `21bb0b8` (journal 2026-10-30) the generic arrow reads its values from
+the KKT and ORE rows store A sparse: t5 peaks at 63.3 GiB at 128 bits (two
+iterations, v0.9.4 88.9) and 116.5 GiB at 512 bits (one iteration, v0.9.4
+171.0), with identical points and an IP iteration 11% faster at 128 bits.
 v8 (`46d1558`) refactors a wide leaf by exact dots when its recursive factor
 fails; on v7, a restart of r2.368 max from iteration 85 fell back to serial
 QDLDL. A restart reloads the iterate exactly, but its first iteration uses
@@ -232,11 +236,9 @@ the BFSS figures are for L13 t5 (t = 13,156).
   owner solves of qap6/gpp may stall AlmostSolved. Needs owner Float64 runs.
 - Arrow admission uses fixed 24× work ratios that were never calibrated; t5
   is at 12.3×, and a 25% larger trunk flips it to serial QDLDL.
-- Leaves keep h and b after loading y and l: 9.3 GiB at 128 bits and 23 GiB
-  at 512 on t5. Rebuild them from the KKT passed to refactor.
-- ORE rows store a dense copy of A (6.25 GiB at 128 bits, 15.6 at 512 on
-  t5; sparse about 1.1/2.6), and the eigenbasis congruences run through zero
-  parts (37% of their products on L10u; ORE rows are 1–1.4% of an iteration).
+- Fixed 2026-10-30 (`21bb0b8`): leaf h/b, the border C and the dense ORE
+  rows are gone (t5 peak −25.6 GiB at 128 bits, −54.5 GiB at 512). Closed:
+  skipping zero parts in the ORE congruences (about 0.4% of an L10u solve).
 
 ### Performance plan (2026-10-16)
 

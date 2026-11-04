@@ -8,6 +8,64 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-10-30 — Generic arrows read the KKT; ORE rows stored sparse (kept, bfss-arrow-memory)
+
+- Hypothesis: the generic (here negated) arrow keeps copies that every
+  refactor rebuilds: each leaf's block h (g²) and couplings b (g·q), and the
+  border's C (t²). ORE rows keep a dense rows × cols copy of A. Reading the
+  KKT passed to `refactor` instead drops them with the same arithmetic, so
+  the points stay bitwise.
+- Change (`21bb0b8`, on v0.9.4 `82996b8`):
+  - Each refactor loads a leaf's block into its factor, its couplings into
+    y and the trunk into the border factor straight from that KKT (negated
+    for −K); `DirectLDLKKTSolver` already writes every value update there.
+    For generic arrows `update_values` and `scale_values` become no-ops, the
+    fallback factors the KKT itself, the non-finite precheck scans the KKT,
+    and `try_negated` no longer clones the KKT. Local structures (SOC,
+    shared SOC, bounds, cones) keep their stored blocks. Admission still
+    counts the old storage, so the backend choice is unchanged.
+  - ORE rows keep only A's stored entries; each transform scatters a column
+    into a zeroed dense column before `to_eigen`.
+  - No precision, tolerance, refinement or acceptance change.
+- t5 (`s128_L13t5_5/r2.365/energy_min.json`), release, 64 threads, 128 bits,
+  two iterations, ABBA on node154 (PBS 232129):
+
+  | Leg | Build | Peak RSS | Setup | IP iterations | Refactor | kkt.ore_values |
+  |---|---|---|---|---|---|---|
+  | 1 | v0.9.4 | 88.66 GiB | 69.7 s | 191.1 s | 126.8 s | 12.7 s |
+  | 2 | new | 63.15 GiB | 52.5 s | 170.4 s | 122.5 s | 1.3 s |
+  | 3 | new | 63.36 GiB | 52.2 s | 166.7 s | 119.5 s | 1.4 s |
+  | 4 | v0.9.4 | 89.08 GiB | 68.9 s | 187.9 s | 124.6 s | 13.1 s |
+
+  - Peak RSS 88.9 → 63.3 GiB (−28.8%, means of two legs). The dropped arrays
+    hold 19.7 GiB by cell count (h and b 9.3, C 5.2, dense minus sparse ORE
+    rows 5.2). The other 5.9 GiB, about 6 GiB at both precisions, matches
+    the per-map value plans that routed KKT updates into h and b and are no
+    longer built (hypothesis, not measured separately).
+  - Solve (setup plus iterations) 258.9 → 220.9 s (−14.7%). An IP iteration
+    takes 84.3 s instead of 94.7 s (−11.1%), mostly because ORE value updates
+    no longer copy into the arrow (12.9 → 1.35 s). Setup saves 17 s: no KKT
+    clone, no initial arrow copy, no dense ORE rows.
+  - All four points are identical (every output field except version and
+    timings).
+- t5 at 512 bits, one iteration, one leg each on node178 (PBS 232130): peak
+  171.01 → 116.53 GiB (−31.9%; 48.9 GiB by cell count), setup 136.5 →
+  75.2 s, IP iteration 324.7 → 246.9 s. Refactor 221.1 → 166.4 s is not
+  attributed; single legs, so the timing is preliminary. Points identical.
+- Local (fast profile, Mac): L10u (condensed negated arrow, 256 bits,
+  8 threads, 6 iterations) is identical in every output field except version
+  and timings. Peak RSS 500.2 → 467.2 MB with the arrow change, 456.6 MB with
+  the ORE rows. csdr3 (Solved/36) and medium (Solved/15) pass their audits
+  with unchanged points (arrow change; neither has ORE cones). The 24 arrow
+  unit tests pass.
+- Rejected: skipping the zero parts of the ORE eigenbasis congruences (37%
+  of their products on L10u). It saves about 0.4% of an L10u solve, and the
+  skipped products would have to reproduce signed zeros exactly.
+- Evidence: hpc `~/projects/sdpx-bfss-threads-20261019/runs/`
+  `tb-abAM-232129.node220` and `tb-ab512-232130.node220`; binaries
+  `004eb415` (v0.9.4) and `dec2243f` (`21bb0b8`); input sha256 `453c5f80`.
+- Decision: kept.
+
 ## 2026-10-30 — Deep review of `crates/`: repairs, in-place border Schur, PMP resampling restored (kept, review-fixes-20261030)
 
 - Scope: a max-effort review of `crates/` at `7737088` (bfss-l13-threads).

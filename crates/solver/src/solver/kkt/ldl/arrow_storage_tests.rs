@@ -82,7 +82,6 @@ fn storage_check_solve<T: FloatT>(
     assert!(solver.refactor(k));
     assert!(fresh.refactor(k));
     assert_eq!(solver.use_arrow, fresh.use_arrow);
-    storage_matrix_same(&solver.materialize(), k);
     for cols in [1, 3] {
         let rhs: Vec<T> = (0..k.n * cols)
             .map(|i| storage_number::<T>((i as f64 - 3.) / 8.))
@@ -114,6 +113,20 @@ fn storage_check_solve<T: FloatT>(
     }
 }
 
+/// The caller's update: the KKT changes, and the backend is told (a generic
+/// arrow ignores it and reads the KKT at refactor).
+fn storage_update<T: FloatT>(
+    solver: &mut ArrowLDLSolver<T>,
+    k: &mut CscMatrix<T>,
+    indices: &[usize],
+    values: &[T],
+) {
+    for (&p, &v) in indices.iter().zip(values) {
+        k.nzval[p] = v;
+    }
+    solver.update_values(indices, values);
+}
+
 fn storage_update_parity<T: FloatT>() {
     let (input, signs) = storage_fixture::<T>();
     let untouched = input.clone();
@@ -129,13 +142,14 @@ fn storage_update_parity<T: FloatT>() {
             .collect::<Vec<_>>(),
         vec![vec![0, 4], vec![2, 6], vec![5]]
     );
-    storage_matrix_same(&solver.materialize(), &expected);
+    // A generic arrow keeps no copy of the KKT values.
+    assert!(solver.c.is_empty());
+    assert!(solver.leaves.iter().all(|l| l.h.is_empty() && l.b.is_empty()));
     let pointers: Vec<_> = solver
         .leaves
         .iter()
-        .map(|l| (l.h.as_ptr(), l.b.as_ptr(), l.factor.l.as_ptr()))
+        .map(|l| (l.y.as_ptr(), l.factor.l.as_ptr()))
         .collect();
-    let c_pointer = solver.c.as_ptr();
     // Sparse arbitrary/reversed updates and repeated positions: last write wins.
     let last = expected.nzval.len() - 1;
     let indices = [last, 0, last / 2, 1, last, 0];
@@ -144,11 +158,7 @@ fn storage_update_parity<T: FloatT>() {
         .enumerate()
         .map(|(j, &p)| expected.nzval[p] + storage_number::<T>((j + 1) as f64 / 128.))
         .collect();
-    solver.update_values(&indices, &values);
-    for (&p, &v) in indices.iter().zip(&values) {
-        expected.nzval[p] = v;
-    }
-    storage_matrix_same(&solver.materialize(), &expected);
+    storage_update(&mut solver, &mut expected, &indices, &values);
     storage_check_solve(&mut solver, &expected, &signs, true);
 
     let indices = [last, 1, last / 2, 1];
@@ -159,100 +169,72 @@ fn storage_update_parity<T: FloatT>() {
     }
     let offset_signs = [-1, 1, 1, -1];
     let offset = storage_number::<T>(0.03125);
-    solver.update_values(&indices, &shifted(&expected, &indices, offset, &offset_signs));
-    for (&p, &sign) in indices.iter().zip(&offset_signs) {
-        expected.nzval[p] += offset * T::from_i8(sign).unwrap();
-    }
-    storage_matrix_same(&solver.materialize(), &expected);
+    let values = shifted(&expected, &indices, offset, &offset_signs);
+    storage_update(&mut solver, &mut expected, &indices, &values);
     storage_check_solve(&mut solver, &expected, &signs, true);
 
     let zero = storage_position(&expected, 0, 1);
-    solver.update_values(&[zero, zero], &[T::zero(), -T::zero()]);
-    expected.nzval[zero] = -T::zero();
-    storage_matrix_same(&solver.materialize(), &expected);
+    storage_update(&mut solver, &mut expected, &[zero, zero], &[T::zero(), -T::zero()]);
     solver.scale_values(&[zero], -T::one());
     expected.nzval[zero] *= -T::one();
-    storage_matrix_same(&solver.materialize(), &expected);
 
     // Model DirectLDL's signed static shift and explicit restoration. The
     // caller's original unshifted KKT is never used as mutable backend storage.
     let diagonal: Vec<_> = (0..expected.n)
         .map(|i| storage_position(&expected, i, i))
         .collect();
-    let unshifted = expected.clone();
     let old_diag: Vec<_> = diagonal.iter().map(|&p| expected.nzval[p]).collect();
     let shift = storage_number::<T>(0.0625);
-    solver.update_values(&diagonal, &shifted(&expected, &diagonal, shift, &signs));
-    for (i, &p) in diagonal.iter().enumerate() {
-        expected.nzval[p] += shift * T::from_i8(signs[i]).unwrap();
-    }
-    storage_matrix_same(&solver.materialize(), &expected);
+    let values = shifted(&expected, &diagonal, shift, &signs);
+    storage_update(&mut solver, &mut expected, &diagonal, &values);
     storage_check_solve(&mut solver, &expected, &signs, true);
-    solver.update_values(&diagonal, &old_diag);
-    expected = unshifted;
-    storage_matrix_same(&solver.materialize(), &expected);
+    storage_update(&mut solver, &mut expected, &diagonal, &old_diag);
     storage_check_solve(&mut solver, &expected, &signs, true);
 
     // A zero singleton pivot fails in both backends when regularization is
-    // disabled. Lazy fallback reconstruction must preserve every update,
-    // and restoring the pivot must recover a valid solve.
-    let before_fallback_shift = expected.clone();
+    // disabled. The lazy fallback factors the KKT it is given, and restoring
+    // the pivot must recover a valid solve.
     let restore_diag: Vec<_> = diagonal.iter().map(|&p| expected.nzval[p]).collect();
-    solver.update_values(&diagonal, &shifted(&expected, &diagonal, shift, &signs));
-    for (i, &p) in diagonal.iter().enumerate() {
-        expected.nzval[p] += shift * T::from_i8(signs[i]).unwrap();
-    }
+    let values = shifted(&expected, &diagonal, shift, &signs);
+    storage_update(&mut solver, &mut expected, &diagonal, &values);
     solver.settings.dynamic_regularization_enable = false;
     let singleton = storage_position(&expected, 5, 5);
     let original = expected.nzval[singleton];
-    solver.update_values(&[singleton], &[T::zero()]);
-    expected.nzval[singleton] = T::zero();
+    storage_update(&mut solver, &mut expected, &[singleton], &[T::zero()]);
     assert!(!solver.refactor(&expected));
     assert!(!solver.use_arrow);
     assert!(solver.fallback.is_some());
-    storage_matrix_same(&solver.materialize(), &expected);
     let mut fresh = ArrowLDLSolver::try_new(&expected, &signs, &solver.settings).unwrap();
     assert!(!fresh.refactor(&expected));
-    solver.update_values(&[singleton], &[original]);
-    expected.nzval[singleton] = original;
+    storage_update(&mut solver, &mut expected, &[singleton], &[original]);
     storage_check_solve(&mut solver, &expected, &signs, true);
     assert!(solver.use_arrow);
-    solver.update_values(&diagonal, &restore_diag);
-    expected = before_fallback_shift;
-    storage_matrix_same(&solver.materialize(), &expected);
+    storage_update(&mut solver, &mut expected, &diagonal, &restore_diag);
 
     // Wrong-sign pivot follows the same dynamic regularization as a fresh
-    // same-valued solver; materialize must still return the unmodified input.
+    // same-valued solver.
     solver.settings.dynamic_regularization_enable = true;
-    solver.update_values(&[singleton], &[-T::one()]);
-    expected.nzval[singleton] = -T::one();
+    storage_update(&mut solver, &mut expected, &[singleton], &[-T::one()]);
     storage_check_solve(&mut solver, &expected, &signs, false);
     assert!(solver.use_arrow);
     assert!(solver.regularize_count > 0);
-    storage_matrix_same(&solver.materialize(), &expected);
     storage_matrix_same(&input, &untouched);
-    // The old CSC scan rejected any nonfinite H/B/C input. Exercise the
-    // leaf path directly so this check does not depend on QDLDL's NaN policy.
+    // Any nonfinite H, B or C entry rejects the arrow. Exercise the arrow
+    // directly so this check does not depend on QDLDL's NaN policy.
     for p in [
         storage_position(&expected, 0, 0),
         storage_position(&expected, 0, 1),
         storage_position(&expected, 1, 1),
     ] {
-        let held = expected.nzval[p];
         for bad in [T::nan(), T::infinity(), -T::infinity()] {
-            solver.update_values(&[p], &[bad]);
-            assert!(!solver.factor_arrow());
-            solver.update_values(&[p], &[held]);
-            assert!(solver.factor_arrow());
-            storage_matrix_same(&solver.materialize(), &expected);
+            let mut input = expected.clone();
+            input.nzval[p] = bad;
+            assert!(!solver.factor_arrow(&input));
+            assert!(solver.factor_arrow(&expected));
         }
     }
-    assert_eq!(solver.c.as_ptr(), c_pointer);
     for (leaf, &ptrs) in solver.leaves.iter().zip(&pointers) {
-        assert_eq!(
-            (leaf.h.as_ptr(), leaf.b.as_ptr(), leaf.factor.l.as_ptr()),
-            ptrs
-        );
+        assert_eq!((leaf.y.as_ptr(), leaf.factor.l.as_ptr()), ptrs);
     }
 }
 
