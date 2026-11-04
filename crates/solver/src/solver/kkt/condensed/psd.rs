@@ -188,6 +188,15 @@ impl<T: FloatT> PackedSchur<T> {
         // disjoint pairs.
         unsafe { *self.out.add(index) = value };
     }
+
+    /// `out[position] += value` for a global Schur position: one block's
+    /// pairs have distinct positions, so its columns add disjointly.
+    #[inline(always)]
+    fn add(&self, position: usize, value: T) {
+        debug_assert!(position < self.len);
+        // SAFETY: each pair of the block in flight owns its position.
+        unsafe { *self.out.add(position) += value };
+    }
 }
 
 unsafe impl<T: Send> Send for PackedSchur<T> {}
@@ -1057,6 +1066,37 @@ impl<T: FloatT> PsdBlock<T> {
         mut store: impl FnMut(usize, usize, usize, T),
     ) {
         self.compute_schur_selected(values, false, &mut store, None);
+    }
+
+    /// `schur[position] += entry` without contribution buffers. Wide dense
+    /// columns run on the pool, as in [`Self::compute_schur_packed`]: each
+    /// pair gets its single addition, so blocks added in turn keep the
+    /// serial bits (41-site Ising at 128 bits on a 16 GB host, whose buffers
+    /// exceed the parallel assembly budget: one thread for ~50 s per call).
+    pub(super) fn add_schur(
+        &mut self,
+        values: &[T],
+        schur: &mut [T],
+        pool: Option<&rayon::ThreadPool>,
+    ) {
+        self.prepare_coefficients(values);
+        let wide =
+            self.sampled.is_none() && !self.dense_indices.is_empty() && T::precision_bits() > 53;
+        match pool.filter(|p| wide && p.current_num_threads() > 1) {
+            Some(pool) => {
+                let (this, n, target) = (&*self, self.Ginv.nrows(), PackedSchur::new(schur));
+                pool.install(|| {
+                    (0..this.columns.len()).into_par_iter().for_each(|b| {
+                        with_block_work(n, |w: &mut BlockWork<T>| {
+                            this.schur_column(values, false, b, w, &mut |_, _, position, v| {
+                                target.add(position, v)
+                            })
+                        })
+                    })
+                });
+            }
+            None => self.compute_schur(values, |_, _, position, v| schur[position] += v),
+        }
     }
 
     // A and column classifications are immutable between explicit updates.

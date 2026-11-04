@@ -512,7 +512,11 @@ enum Source {
 }
 
 impl<T: FloatT> EliminatedRows<T> {
-    fn new(blocks: &[Block<T>], position: impl Fn(usize, usize) -> usize) -> Self {
+    fn new(
+        blocks: &[Block<T>],
+        position: impl Fn(usize, usize) -> usize + Sync,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Self {
         let (mut sources, mut rows, mut cols) = (Vec::new(), Vec::new(), Vec::new());
         let mut orthant_of: Vec<Option<(usize, usize)>> = Vec::new();
         for (bi, block) in blocks.iter().enumerate() {
@@ -585,19 +589,38 @@ impl<T: FloatT> EliminatedRows<T> {
             .flat_map(|c| (0..=c).map(move |i| (i, c)))
             .map(|(i, c)| position(dense[i], dense[c]))
             .collect();
-        // Every product with at least one non-panel column.
-        let mut triples = Vec::new();
-        for (_, &(start, end)) in rows.iter().enumerate().filter(|&(i, _)| !is_wide(i)) {
-            for b in start..end {
-                for a in start..=b {
-                    let (i, j) = (cols[a], cols[b]);
-                    if slot[i] != usize::MAX && slot[j] != usize::MAX {
-                        continue;
-                    }
-                    triples.push((position(i.min(j), i.max(j)), a as u32, b as u32));
+        // Every product with at least one non-panel column. The triples are
+        // distinct, so the pool's sort gives the serial plan; built on the
+        // pool, the plan's pages also spread over its NUMA nodes.
+        let plan = {
+            let (slot, cols, position) = (&slot, &cols, &position);
+            let products = move |&(start, end): &(usize, usize)| {
+                (start..end)
+                    .flat_map(move |b| (start..=b).map(move |a| (a, b)))
+                    .filter(move |&(a, b)| {
+                        slot[cols[a]] == usize::MAX || slot[cols[b]] == usize::MAX
+                    })
+                    .map(move |(a, b)| {
+                        let (i, j) = (cols[a], cols[b]);
+                        (position(i.min(j), i.max(j)), a as u32, b as u32)
+                    })
+            };
+            let narrow: Vec<(usize, usize)> = rows
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| !is_wide(i))
+                .map(|(_, &r)| r)
+                .collect();
+            match pool.filter(|p| p.current_num_threads() > 1) {
+                Some(pool) => pool.install(|| {
+                    let triples = narrow.par_iter().flat_map_iter(products).collect();
+                    OrthantPlan::from_triples(triples, true)
+                }),
+                None => {
+                    OrthantPlan::from_triples(narrow.iter().flat_map(products).collect(), false)
                 }
             }
-        }
+        };
         let in_panel = |e: usize| slot[cols[e]] != usize::MAX;
         let panel_only: Vec<bool> = rows
             .iter()
@@ -670,7 +693,7 @@ impl<T: FloatT> EliminatedRows<T> {
             cell_of,
             panel_only,
             out,
-            plan: OrthantPlan::from_triples(triples),
+            plan,
             fixed,
         }
     }
@@ -923,16 +946,35 @@ struct OrthantPlan {
 }
 
 impl OrthantPlan {
-    fn from_triples(mut triples: Vec<(usize, u32, u32)>) -> Self {
-        triples.sort_unstable();
-        let mut starts = Vec::new();
-        for (k, &(p, _, _)) in triples.iter().enumerate() {
-            if starts.last().is_none_or(|&(q, _)| q != p) {
-                starts.push((p, k));
-            }
+    /// Groups the triples `(position, a, b)`; `parallel` runs on the current pool.
+    fn from_triples(mut triples: Vec<(usize, u32, u32)>, parallel: bool) -> Self {
+        if parallel {
+            triples.par_sort_unstable();
+        } else {
+            triples.sort_unstable();
         }
-        starts.push((usize::MAX, triples.len()));
-        let terms = triples.into_iter().map(|(_, a, b)| (a, b)).collect();
+        let t = &triples;
+        let first = move |&k: &usize| k == 0 || t[k - 1].0 != t[k].0;
+        let group = move |k: usize| (t[k].0, k);
+        let pair = |&(_, a, b): &(usize, u32, u32)| (a, b);
+        let (mut starts, terms): (Vec<_>, Vec<_>) = if parallel {
+            rayon::join(
+                || {
+                    (0..t.len())
+                        .into_par_iter()
+                        .filter(first)
+                        .map(group)
+                        .collect()
+                },
+                || t.par_iter().map(pair).collect(),
+            )
+        } else {
+            (
+                (0..t.len()).filter(first).map(group).collect(),
+                t.iter().map(pair).collect(),
+            )
+        };
+        starts.push((usize::MAX, t.len()));
         Self { starts, terms }
     }
 
@@ -1889,16 +1931,14 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         } else {
             for block in &mut self.blocks {
                 if let Scaling::Psd(psd) = &mut block.scaling {
-                    psd.compute_schur(&self.A.nzval, |_, _, position, v| {
-                        schur.nzval[position] += v;
-                    });
+                    psd.add_schur(&self.A.nzval, &mut schur.nzval, pool.as_deref());
                 }
             }
         }
         // Orthant and eliminated SOC rows form one Gram BᵀB.
-        let elim = self
-            .eliminated
-            .get_or_insert_with(|| EliminatedRows::new(&self.blocks, |i, j| position(schur, i, j)));
+        let elim = self.eliminated.get_or_insert_with(|| {
+            EliminatedRows::new(&self.blocks, |i, j| position(schur, i, j), pool.as_deref())
+        });
         elim.accumulate(
             &mut schur.nzval,
             &self.blocks,
