@@ -8,6 +8,234 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-04 — 128-bit Ising (85/113 sites): dense arrow leaf, leaf-phase parallelism, exact Schur dots, NUMA first-touch spread, tiled Schur left sums; 113-site bounds
+
+- Question: solve the 85- and 113-site Ising inputs at 128 bits in
+  practical time, and 113 sites in Float64 (user, 2026-11-03/04). The
+  tolerances (1e-6, as in Float64), refinement and acceptance are
+  unchanged. Values are numerical estimates; no AlmostSolved run is read
+  as a bound.
+- 128 bits needs the reduced-equality inputs. The jd85o equalities have
+  3796 rows of rank 3375 (eqrank-233989, at 1e-10 and 1e-13). With
+  binary64-rounded coefficients and no MPFR static regularization, the
+  original input ends PrimalInfeasible after 21 iterations: pres stays at
+  0.81 while the dual objective grows 100× per iteration (ma128lo-233960;
+  mf128lo with auto_start_scale off diverges the same way). red85 and
+  red113 keep an independent equality subset and solve.
+- Kept `f732df7`, an MPFR dense arrow leaf. Before QDLDL, the MPFR
+  `auto_ldlsolver` tries one dense leaf of all positive-sign variables
+  with the negative-sign ones as border. It does so when serial QDLDL flops
+  × workers ≥ n³/6, under the dense_block element cap. local_113 at 128
+  bits: 62 s per iteration against about 1197 s with QDLDL (the QDLDL
+  solve took 68 iterations, 81406 s). 85 sites: 70–100 s per iteration
+  against 28–30 min. medium is unaffected; its KKT already takes the
+  negated arrow (leaf 1887, border 33).
+- Leaf-phase changes, red85 lower at 128 bits, 128 threads, 3 iterations,
+  whole nodes (per-call medians):
+  - `3fd9648`: admitted contribution products take ways up to the pool
+    instead of 8. Iteration 58.5 → 48.5 s, residue_contribution 12.97 →
+    2.87 s. Bitwise.
+  - `1096039`: merge of perf/mp128-dense-arrow (Y panels with exact
+    products, arrow admission within 8× the QDLDL factor, AMD reuse).
+    Leaves 27.75 → 12.8 s, iteration about 48.5 → 35 s. Changes rounding.
+  - `06450d2`: multi-column blocked sweeps for one-chunk leaves and narrow
+    trunks. Per iteration, many.first 1.7 → 0.13 s, trunk 1.15 → 0.10,
+    second 1.35 → 0.16 (−3.8 s). Bitwise.
+  - `c0d8b06`: the O(n²) element loops of ldl_rec and solve_unit_lower_t
+    run on the pool. leaf_factor 5.3–5.9 → 4.15–4.23 s. Bitwise.
+  - `78fbf1a`, MPFR FMAs with a zero side rounding inline, is reverted
+    (`bf6bd80`). It showed no gain: under interleave on node177, four runs
+    per arm (234135), solve 148.45 → 148.85 s and assemble 6.12 → 6.15 s
+    per call. Its zero-start chains are exact dots after `d10c1ad`.
+  - `d10c1ad`: each wide condensed Schur entry is one exact dot (the
+    exact sum rounded once) instead of an FMA chain from zero, as
+    `wide_dense_work` already assumed. At 128 bits a k-term chain costs
+    about 15 + 20.7k ns and the exact dot 58 + 4.2k ns. Sums on the
+    41-site input average 75 terms (up to 484). medium at 128 bits (10
+    threads, local, full solve): Solved in 19 iterations with both
+    binaries, native audit PASS with the same f64 residuals, points within
+    2.3e-26; assemble 11.44 → 10.26 s. Without tiling the cluster A/B
+    was lost in placement noise (abxd41-234154, red41, 4 iterations:
+    2f6745d 208–246 s, 78fbf1a 189–244 s). Kept on top of tiling:
+    abtk-234182 (node178, ABBAABBA, red85 lower, 128 bits, T=128, 3
+    iterations, default policy), solve median 115.6 s with the FMA chain
+    (tbTK, 114.3–118.3) → 106.7 s exact (tbTJ, 104.3–108.4), −7.7%;
+    assemble per factorization 7.8 → 5.6 s.
+- NUMA placement (EPYC 7742, NPS4: 8 nodes of 16 CPUs, kernel 3.10,
+  THP always, NUMA balancing on). At 128 bits the assemble median under
+  the default policy was bimodal, and iterations ran 60–92 s against 46 s
+  under `numactl --interleave=all` (234136, MAXIT 3). The default runs did
+  about 28M PTE updates and 2M page migrations; interleave did 0.4M and 0.1M.
+  - Cause: serial first touch. The constructing thread zeroes the arrow
+    leaf and trunk storage, the per-block contribution buffers and the
+    reduced KKT values, and wanders between nodes during setup. Under
+    `--membind=all` (no migration), after one iteration of tbPP (234150),
+    one 12.4 GiB region sat 45% on node 4, most of the rest on nodes 6 and
+    0. The parallel plan and other pool-built arrays were spread (at most
+    20–27% on one node).
+  - A blanket policy is rejected. Interleave helps at 128 bits but costs
+    Float64 4.6% (234139: red85 Float64, T=32, membind +5.5%), since it
+    also moves each worker's private scratch off its node.
+  - Change (`47179fa`): arrays the whole pool works on are written by the
+    pool's workers when they are fresh mappings (32 MiB and up, the CLI's
+    mmap threshold), so first touch spreads them. These are the arrow
+    leaf/trunk storage (on the first pool given), contribution buffers and
+    reduced KKT values. Values are copied unchanged; medium at 128 bits is
+    bitwise.
+  - Kept. red85 lower at 128 bits, T=128, 3 iterations, default policy
+    (abpq-234159, node182, ABBAABBA): solve median 227.7 → 154.5 s (−32%;
+    tbPP 188–280 s, tbPQ 146–157 s), bitwise. red85 lower in Float64, T=32,
+    full solve (abpqf-234160, node185, ABBA): 144.0/145.3 → 144.1/146.5 s,
+    bitwise, so neutral. Under `--membind=all` (numapq-234158) assemble
+    per call fell from 18.2/16.7 to 14.5 s, and no large region kept more
+    than 27% on one node.
+- `752c478`: tiled wide Schur left sums. On red85 at 128 bits, two n=64
+  blocks (4260 columns, 1.8M entries each) hold 7.0e9 of the 8.39e9
+  left-sum terms of one assembly (blkstats-234169). Column by column,
+  each dense right column dotted its packed vector with every earlier
+  column, so it re-read up to 96 MB of left entries and values (about
+  390 GB per assembly). The assembly was bound by memory bandwidth and
+  followed page placement: per call, membind 14.5 s, default 15.6–26.7 s,
+  interleave 6.1 s.
+  - Change: a worker takes up to 16 consecutive right columns whose
+    packed vectors fit in 2 MiB (16 at n=64 and 128 bits) and reads each
+    left column once for all of them. Each pair keeps its own dot and one
+    store, so every leg below has the same point (hash 3de578f64377).
+  - red85 lower at 128 bits, T=128, 3 iterations. tileN-234173 ran under
+    the default policy (node186), tileI-234174 under interleave (node185).
+    Solve s / assemble s per factorization; the tile budget came from
+    `SDPX_TILE_BYTES`, a temporary override that is not committed:
+
+    | arm (columns at n=64) | default | interleave |
+    |---|---|---|
+    | 47179fa | 200.6, 193.7 / 28.6, 27.2 | 108.3, 111.7 / 7.7, 8.1 |
+    | 1 byte (1) | 141.9, 160.4 / 14.5, 18.6 | 113.4, 111.3 / 8.0, 8.1 |
+    | 256 KiB (3) | 124.8, 123.0 / 9.9, 10.1 | 96.9, 98.6 / 4.7, 4.9 |
+    | 512 KiB (7) | 109.3, 110.9 / 5.8, 5.9 | 97.3, 97.7 / 4.2, 4.3 |
+    | 2 MiB (16) | 106.4, 107.5 / 5.5, 5.5 | 96.8, 97.0 / 4.5, 4.5 |
+
+  - Kept with 2 MiB. Against 512 KiB, the solve median is 2.9% lower
+    under the default policy (both legs) and 0.6% lower under interleave.
+    Assemble is 5% lower under the default policy and 5% higher under
+    interleave, and RSS is up to 0.2 GB higher. The default policy now
+    runs within 10% of interleave, against 79% before.
+  - Max-effort review of the diff: all four finders flagged that fixed
+    tiles cut a block's pool tasks by up to 16×, where HEAD ran one task
+    per right column. The verifiers confirmed it; one rated it plausible,
+    since it bites only where a block has the pool alone (add_schur,
+    inner_schur). Example: a 768-bit block with n=46 and 92 columns
+    would get 6 tasks for 64 threads. Tiles are now capped at two per
+    worker, which keeps the last (densest) tile near one worker's share;
+    red85's n=64 blocks still get 16 columns at T=128. The review found
+    no double store, ordering change or reentrancy problem, and a
+    derivable tuple field was removed.
+  - The same cleanup dropped `tile_columns`' guard against n = 0, and a
+    verifier refuted that: CompositeCone::new keeps empty PSD cones, and
+    the serial tile loop calls tile_columns(0). Without the guard five
+    condensed parallel tests panic on the division (observed). `e824e93`
+    restores it, and the 46 condensed tests pass.
+  - The review's sweep found that the cap counted every column. In
+    inner_schur mode a sparse-dominated block's sparse columns are split
+    over the pool and skipped here, so its dense representatives, sorted
+    last, could share a few tiles. `38f381c` counts only the columns that
+    do work (medium at 128 bits bitwise, tests pass). The cap assumes the
+    block has the pool alone, so in the shared assembly it also narrows the
+    tiles of blocks under 32 working columns per worker. On red85 at T=128
+    that touches only blocks with at most 3 MB of left data (blk-234169);
+    the 96 MB and 13 MB blocks keep 16 columns.
+  - Float64 red85 takes the batched dense path, so it is unaffected
+    (tilef-234198, node185, T=32, full solve, ABCCBA): 47179fa 146.9/143.9 s,
+    512 KiB 144.9/145.0 s, 2 MiB 146.5/146.2 s, all bitwise equal.
+  - Final code (2 MiB, capped tiles): medium at 128 bits, 10 threads,
+    local: Solved in 19 iterations, bitwise equal to 47179fa, native audit
+    PASS.
+- `44a4014`: the border factor's dot scratch is spread too. ldl_dots
+  allocates r and w (182 MB each for the 3375-row border at 128 bits) on
+  every call, and the calling thread wrote them, so all 128 workers read
+  pages on one node. border_factor took 1.6 s per factorization under the
+  default policy and 0.84 s under interleave. A split factor now has the
+  pool write them first. red85 lower at 128 bits, T=128, 3 iterations,
+  default policy (abub-234214, node185, ABBAABBA): border_factor 1.58–1.68
+  → 0.80–0.81 s, solve median 106.1 → 102.65 s (−3.3%; 3 of 4 pairs gain
+  3.6–4.9%, the first is flat), all points bitwise equal. Kept.
+- Measured, not built:
+  - Equality substitution is rejected. Gauss–Jordan with threshold
+    Markowitz pivoting on the red85 equalities (3375 rows over 6399
+    positive variables, nnz 2.90M), x_dep = x0 + M x_free, fills the
+    active rows to 4.22M after 1000 pivots and 6.36M after 1500
+    (elim-234185, cancelled after 1500 of 3375 pivots; pivots 1000–1500
+    took 14 min). M tends to a dense 3375 × 3024 matrix, and
+    A_new = A_free + A_dep·M would make the PSD columns dense.
+  - Staircase border order for Y (stair-234176). The 3375 border rows
+    meet the 5566 coupled positive variables in a staircase. Skipping each
+    border column's zero prefix leaves 0.772 of the dense forward work and
+    0.674 of the contribution work in natural order, and 0.604/0.528 under
+    a greedy fewest-new order. The residue GEMM already skips zero
+    prefixes in 32-column tiles, which takes part of the natural-order
+    gain. The greedy order is the open candidate, worth about 3.7 s per
+    iteration if its rounding change passes the audits.
+- Solves. All are Solved and every audit passes its quality gate. Values
+  are corrected numerical endpoints (estimates).
+
+  | input / bits / threads | lower | upper | s | RSS GB |
+  |---|---|---|---|---|
+  | orig113 / 53 / 32 | 43 it, 0.6987629554 | 47 it, 0.7155497030 | 269/247 | 10.6 |
+  | red113 / 53 / 32 | 43 it, 0.6987157098 | 45 it, 0.7154837500 | 222/231 | 10.1 |
+  | red85 / 128 / 128 | 52 it, 0.6973301492 | 56 it, 0.7166894158 | 3517/4248 | 37.3/39.7 |
+  | red85 / 128 / 128, tbTJ | 52 it, 0.6973301492 | 56 it, 0.7166894159 | 1278/1357 | 46.0/45.4 |
+  | red113 / 128 / 128 | 56 it, 0.6991445532 | 56 it, 0.7151527440 | 5069/4703 | 50.2/46.3 |
+
+  - Float64 runs: tbEF (`3e82127`) on node178. 128-bit runs: tbMB
+    (`f732df7` plus the 85-site fix; red85 on node177/node181), except
+    the tbTJ row.
+  - tbTJ has the 128-bit changes above except `44a4014`. It is the tiled
+    code before the review's tile cap, which leaves red85's n=64 tiles at
+    16 columns, with the 2 MiB budget set through `SDPX_TILE_BYTES`.
+    rt128lo-234201 (node186) and rt128up-234202 (node178) ran on whole
+    nodes of the same model under the default policy. Iteration counts
+    are tbMB's, at 24.6/24.2 s per iteration against 67.6/75.9 s
+    (2.8/3.1× faster).
+    Primal objectives are equal in binary64, and corrected endpoints
+    move by 3.2e-11/6.6e-11. Audit maxima: TI 9.0e-12, equalities
+    1.3e-13, PSD −4.5e-8, dual 1.7e-7.
+  - Peak RSS grew from 37.3/39.7 to 46.0/45.4 GB. After 3 iterations both
+    binaries peak at 26.3–26.9 GB (ab4-234011, tileN-234173), so the
+    extra memory accumulates during the solve. It is not attributed. The
+    tiling's per-thread work holds at most 16 columns, under 1 GB over
+    128 threads.
+  - Audit maxima. Float64: TI 1.7e-7, all equalities 4.6e-8, relative
+    primal PSD −3.7e-8, original dual 1.7e-6. 128 bits: TI 3.9e-11,
+    equalities 2.3e-13, PSD −4.5e-8, dual 1.7e-7.
+  - At the same 1e-6 tolerances, the Float64 endpoints carry residual
+    corrections of 3.5e-5 to 2.0e-4, against 3e-7 to 4e-7 at 128 bits. The
+    128-bit 113-site interval [0.6991446, 0.7151527] lies inside the
+    Float64 one [0.6987157, 0.7154838].
+  - local_113 at 128 bits (tbMB, 233988): Solved in 67 iterations, 3705 s.
+- `c325c6f`: the eliminated-row plan is built on the pool. Its triples
+  are distinct, so a parallel sort gives the serial plan, and its pages
+  spread over the pool's NUMA nodes. red85 has 4.94e8 triples (7.9 GB as
+  16-byte tuples). When contribution buffers exceed the parallel assembly
+  budget (memory/8), wide dense PSD columns add straight into the Schur on
+  the pool, one addition per position and block, so blocks in turn keep
+  the serial bits. Before, one thread did this, about 50 s per call.
+  41-site at 128 bits, 10 threads, 2 iterations, 16 GB Mac idle:
+  bitwise equal output; assemble per call 69–104 → 31.5–33 s; wall
+  419.6 → 293.4 s; peak RSS 9.12 → 8.30 GB.
+- Review of the arrow diff (max effort; `ba317bc`). Three defects were
+  fixed:
+  - Y's panel choice followed the thread count. It now goes by width
+    alone, and qpf300 is identical at 1, 2 and 8 threads.
+  - try_dense skipped the storage bound. It now applies it with QDLDL's
+    factor size.
+  - try_dense accepted an LP's zero P, whose dense leaf pivots on exact
+    zeros. It now requires a half-dense positive block, and LPs take
+    QDLDL, bitwise equal to forced QDLDL.
+  - A single oversized leaf on eight ways was left: speed only.
+- Evidence: the jobs named above, under
+  `~/projects/tb-ising-perf-20261103/runs/` (a directory or log per job);
+  binaries and sources in
+  `~/projects/sdpx-ising11-scaling-20261007/{bin,incoming}`.
+
 ## 2026-11-04 — Float64 Ising 85-site end game: NaN escalated shift (fixed), depth-aware pivot bound (rejected)
 
 - Question: why the 85-site solves of 2026-11-03 end AlmostSolved after a
