@@ -1714,22 +1714,6 @@ impl<const N: usize> Scalar for MpFloat<N> {
         if let Some(value) = self.fma_regular(&a, &b) {
             return value;
         }
-        // Exact sums with one zero side, MPFR's results bit for bit: a zero
-        // addend leaves the rounded product (chains that start from zero, as
-        // the wide condensed Schur entries do), a zero product the addend.
-        let zero = |v: &Self| v.kind.abs() == mpfr::ZERO_KIND;
-        let finite = |v: &Self| zero(v) || v.kind.abs() == mpfr::REGULAR_KIND;
-        if zero(&b) {
-            if let Some(value) = self.mul_regular(&a) {
-                return value;
-            }
-        } else if b.kind.abs() == mpfr::REGULAR_KIND
-            && (zero(&self) || zero(&a))
-            && finite(&self)
-            && finite(&a)
-        {
-            return b;
-        }
         let x = self.descriptor();
         let y = a.descriptor();
         let z = b.descriptor();
