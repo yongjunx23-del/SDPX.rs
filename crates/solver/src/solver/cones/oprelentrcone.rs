@@ -1489,6 +1489,31 @@ impl<T: FloatT> OpRelEntropyRows<T> {
     /// v ← N⁻¹v
     pub(crate) fn to_eigen(&self, v: &mut [T]) {
         self.parts(&self.q, v, true);
+        self.minus_dd(v);
+    }
+
+    /// [`Self::to_eigen`] of a v that is zero outside the sorted rows `nz`.
+    /// Each part's congruence runs over the indices its entries touch
+    /// (Hubbard all3's order-51 columns: 67 of 3·51). The skipped terms are
+    /// exact zeros, which wide types' exact dots drop, so the values are
+    /// `to_eigen`'s; binary64 keeps BLAS's dense order.
+    pub(crate) fn to_eigen_sparse(&self, v: &mut [T], nz: &[usize]) {
+        if T::precision_bits() <= 53 {
+            return self.to_eigen(v);
+        }
+        let m = self.dc.len();
+        for (p, part) in v.chunks_exact_mut(m).enumerate() {
+            let lo = nz.partition_point(|&k| k < p * m);
+            let hi = nz.partition_point(|&k| k < (p + 1) * m);
+            if lo < hi {
+                congruence_sparse(self.n, &self.q, &nz[lo..hi], p * m, part);
+            }
+        }
+        self.minus_dd(v);
+    }
+
+    /// The T rows' −DD·(X, Y) term of N⁻¹.
+    fn minus_dd(&self, v: &mut [T]) {
         let m = self.dc.len();
         let (t, xy) = v.split_at_mut(m);
         let (x, y) = xy.split_at(m);
@@ -1522,6 +1547,43 @@ fn congruence_parts<T: FloatT>(n: usize, b: &[T], v: &mut [T], left_t: bool) {
         congruence(n, b, &x, left_t, &mut tmp, &mut out);
         svec(n, &out, part);
     }
+}
+
+/// One part's `v ← BᵀMB` (as [`congruence_parts`]) for an M whose nonzeros
+/// lie at the sorted svec indices `nz` (offset by `base`). M·B vanishes
+/// outside the rows R those entries touch, so both products sum over R.
+fn congruence_sparse<T: FloatT>(n: usize, b: &[T], nz: &[usize], base: usize, v: &mut [T]) {
+    let ij: Vec<_> = nz
+        .iter()
+        .map(|&k| upper_triangular_index_to_coord(k - base))
+        .collect();
+    let mut idx: Vec<usize> = ij.iter().flat_map(|&(i, j)| [i, j]).collect();
+    idx.sort_unstable();
+    idx.dedup();
+    let r = idx.len();
+    let mut at = vec![0; n];
+    idx.iter().enumerate().for_each(|(a, &i)| at[i] = a);
+    let s = T::FRAC_1_SQRT_2();
+    let mut x = vec![T::zero(); r * r];
+    for (&k, &(i, j)) in nz.iter().zip(&ij) {
+        let (a, c) = (at[i], at[j]);
+        if i == j {
+            x[a + a * r] = v[k - base];
+        } else {
+            let w = v[k - base] * s;
+            x[a + c * r] = w;
+            x[c + a * r] = w;
+        }
+    }
+    let br: Vec<T> = (0..n)
+        .flat_map(|j| idx.iter().map(move |&p| b[p + j * n]))
+        .collect();
+    let mut tmp = vec![T::zero(); r * n];
+    product((b'N', b'N'), (r, n, r), (&x, r), (&br, r), &mut tmp); // (M·B)[R, :]
+    let mut out = vec![T::zero(); n * n];
+    product((b'T', b'N'), (n, n, r), (&br, r), (&tmp, r), &mut out); // Bᵀ·M·B
+    symmetrize(n, &mut out);
+    svec(n, &out, v);
 }
 
 #[derive(Clone)]

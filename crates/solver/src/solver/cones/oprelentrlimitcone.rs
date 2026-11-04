@@ -521,6 +521,14 @@ impl<T: FloatT> EigenRows<T> {
         }
     }
 
+    /// [`Self::to_eigen`] of a v that is zero outside the sorted rows `nz`.
+    pub(crate) fn to_eigen_sparse(&self, v: &mut [T], nz: &[usize]) {
+        match self {
+            Self::Ore(t) => t.to_eigen_sparse(v, nz),
+            Self::Limit(t) => t.to_eigen(v),
+        }
+    }
+
     pub(crate) fn from_eigen(&self, v: &mut [T]) {
         match self {
             Self::Ore(t) => t.from_eigen(v),
