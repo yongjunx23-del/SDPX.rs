@@ -55,6 +55,24 @@ status and next actions.
     Solved/15, csdr3 Solved/36, audits PASS, same x/s/z hashes. Local
     cubic3 2-iteration solve 19.7 → 18.4 s (fast profile, preliminary).
     Full solver suite passes.
+- Cluster release `713c11a` (build 234426, node23; medium Solved/15, audit
+  PASS) against `tmP5` (the Hubbard line before integration), release
+  ABBA 234427 on node22 (EPYC 7742), 128 bits:
+  - all3, 32 threads, 3 iterations: 106.7 → 110.8 s (+3.9%), peak RSS
+    26.2 → 19.7 GB (−25%).
+  - cubic3, 16 threads, 4 iterations: 42.6 → 46.1 s (+8.2%), peak RSS
+    8.7 → 7.1 GB (−19%).
+  - The time is in the leaf phase: the exact Y panels the Ising line
+    added (`rns.gemm.shared_crt` +28 s on all3, +13 s on cubic3; refactor
+    +8.5 s / +4.4 s) cost more on the ORE leaves than v0.9.4's row dots.
+    The memory is #15's (no h, b or C copies) and the heap trim. Kept as a
+    trade (memory, and the Ising gains); choosing panels or row dots by
+    leaf shape is the open item.
+  - Full cubic3 (max 200): Solved/56, 544.7 s, 8.2 GB; 192-bit audit r_p
+    3.6e-22, r_d_rel 2.2e-20, gap 2.1e-22, PSD and ORE T−D margins ≥ 0;
+    objective −0.0368986 as campaign 234237 (Solved/58).
+  - Evidence: `~/projects/tb-ore-mt-20261104/runs/abM2-234427`,
+    `~/projects/SDPX.rs/releases/713c11a6fdf04b94e253e08fe2dd6a4d09ad5b10`.
   - Not changed: the QDLDL plan's speedup-2 admission (never on 2
     threads, by design: the plan copies L); per-row `pool.install` and
     per-row delta Vecs in the admitted plan; condensed reduced solvers
