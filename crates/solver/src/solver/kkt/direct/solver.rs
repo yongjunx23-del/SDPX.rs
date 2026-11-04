@@ -372,6 +372,12 @@ where
 
     fn update(&mut self, cones: &CompositeCone<T>, settings: &CoreSettings<T>) -> bool {
         let pool = cones.thread_pool();
+        // Wide types refine through exact rows, which `residual_full` also
+        // prefers, so a residual plan would never be read (Hubbard all3 at
+        // 128 bits: 2.2 GB). Built here instead of on the first refinement.
+        if T::precision_bits() > 64 && self.exact_rows.is_none() {
+            self.exact_rows = Some(ExactRows::new(&self.KKT));
+        }
         self.set_residual_pool(pool.clone());
         self.set_factor_pool(pool);
         self.update_from_cones(cones.iter(), settings)
@@ -975,7 +981,11 @@ where
         // use as `refine_residual` does; without it an owner's reduced
         // residual ran a serial symv (MPI ranks: 27 of 85 s at 32 threads).
         // The row plan keeps every row's addition order, so bits are unchanged.
-        if self.residual_plan.is_none() && self.residual_dense.is_none() && pool.is_some() {
+        if self.residual_plan.is_none()
+            && self.residual_dense.is_none()
+            && self.exact_rows.is_none()
+            && pool.is_some()
+        {
             self.residual_plan = Some(SparseParallel::new_symmetric(&self.KKT));
         }
         if let Some(plan) = &mut self.residual_plan {
@@ -1447,7 +1457,7 @@ pub(crate) fn _escalated<T: FloatT>(base: T, boost: usize, diagonal: T) -> T {
 struct ExactRows {
     ptr: Vec<usize>,
     /// (nz position, column) for off-diagonal entries incoming from CSC columns.
-    entries: Vec<(usize, usize)>,
+    entries: Vec<(u32, u32)>,
     /// Full row work: own CSC column plus incoming mirrors.
     work_offsets: Vec<usize>,
 }
@@ -1470,12 +1480,14 @@ impl ExactRows {
         let ptr = count.clone();
         let work_offsets = ptr.iter().zip(&k.colptr).map(|(a, b)| a + b).collect();
         let mut fill = count;
-        let mut entries = vec![(0usize, 0usize); ptr[n]];
+        // Wide types only: 2³² of their entries exceed a node's memory.
+        assert!(k.nzval.len() <= u32::MAX as usize);
+        let mut entries = vec![(0u32, 0u32); ptr[n]];
         for j in 0..n {
             for p in k.colptr[j]..k.colptr[j + 1] {
                 let r = k.rowval[p];
                 if r != j {
-                    entries[fill[r]] = (p, j);
+                    entries[fill[r]] = (p as u32, j as u32);
                     fill[r] += 1;
                 }
             }
@@ -1515,7 +1527,11 @@ impl ExactRows {
             T::dot_fma(
                 std::iter::once((&b[i], &one))
                     .chain((k.colptr[i]..k.colptr[i + 1]).map(|p| (&k.nzval[p], &neg[k.rowval[p]])))
-                    .chain(incoming.iter().map(|&(p, j)| (&k.nzval[p], &neg[j]))),
+                    .chain(
+                        incoming
+                            .iter()
+                            .map(|&(p, j)| (&k.nzval[p as usize], &neg[j as usize])),
+                    ),
             )
         };
         // Under MPI each rank evaluates one work-balanced row range.
