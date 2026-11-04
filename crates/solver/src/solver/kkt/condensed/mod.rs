@@ -1503,8 +1503,14 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         for block in &mut blocks {
             if let Scaling::Psd(p) = &mut block.scaling {
                 if parallel_assembly {
-                    p.schur_values
-                        .resize(triangular_number(p.columns.len()), T::zero());
+                    // The pool writes these buffers: spread their pages.
+                    let len = triangular_number(p.columns.len());
+                    p.schur_values = pool
+                        .as_deref()
+                        .and_then(|pool| {
+                            crate::algebra::scratch::spread_vec(len, |_| T::zero(), pool)
+                        })
+                        .unwrap_or_else(|| vec![T::zero(); len]);
                 }
                 if dense_schur {
                     continue;
@@ -1540,6 +1546,12 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         reduced.set_factor_pool(pool.clone());
         reduced.set_residual_pool(pool.clone());
         let kkt = reduced.kkt_matrix_mut();
+        // Every assembly rewrites the Schur values on the pool.
+        if let Some(values) = pool.as_deref().and_then(|pool| {
+            crate::algebra::scratch::spread_vec(kkt.nzval.len(), |i| kkt.nzval[i], pool)
+        }) {
+            kkt.nzval = values;
+        }
         debug_assert_eq!(kkt.colptr[..n + 1], schur.colptr);
         debug_assert_eq!(kkt.rowval[..count], schur.rowval);
         drop(schur);

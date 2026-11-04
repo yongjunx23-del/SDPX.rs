@@ -3162,6 +3162,25 @@ impl<T: FloatT> HasLinearSolverInfo for ArrowLDLSolver<T> {
 }
 
 impl<T: FloatT> ArrowLDLSolver<T> {
+    /// The constructing thread wrote the leaf and trunk storage, so all of
+    /// it sits on that thread's NUMA node. Rewrite the large arrays on the
+    /// pool, which works on them, to spread their pages over its nodes.
+    fn spread(&mut self, pool: &rayon::ThreadPool) {
+        let spread = |v: &mut Vec<T>| {
+            if let Some(copy) = crate::algebra::scratch::spread_vec(v.len(), |i| v[i], pool) {
+                *v = copy;
+            }
+        };
+        for leaf in &mut self.leaves {
+            for v in [&mut leaf.h, &mut leaf.b, &mut leaf.y, &mut leaf.factor.l] {
+                spread(v);
+            }
+        }
+        for v in [&mut self.c, &mut self.s, &mut self.tf.l] {
+            spread(v);
+        }
+    }
+
     /// `update_values` writing `map(value)` (exact maps only, such as
     /// negation, so every entry is the value a caller-side map would give).
     fn update_values_mapped(&mut self, index: &[usize], values: &[T], map: impl Fn(T) -> T + Sync) {
@@ -3498,6 +3517,11 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
     }
 
     fn set_pool(&mut self, pool: Option<Arc<rayon::ThreadPool>>) {
+        if let Some(p) = pool.as_ref() {
+            if !self.pool.as_ref().is_some_and(|q| Arc::ptr_eq(p, q)) {
+                self.spread(p);
+            }
+        }
         self.pool = pool;
     }
 

@@ -22,3 +22,21 @@ pub fn with_scratch<V: Default + 'static, R>(f: impl FnOnce(&mut V) -> R) -> R {
     SCRATCH.with(|slot| slot.borrow_mut().push(boxed));
     result
 }
+
+/// Allocations from this size up are fresh mappings (the CLI's
+/// `M_MMAP_THRESHOLD`): the first write places each of their pages.
+const FIRST_TOUCH_BYTES: usize = 32 << 20;
+
+/// `(0..len).map(f)` written by `pool`'s workers when the vector is a fresh
+/// mapping (`None` otherwise). Pages land on the NUMA node of the worker
+/// that first writes them, so an array the whole pool works on spreads over
+/// the pool's nodes instead of the node of the thread that built it.
+pub(crate) fn spread_vec<T: Send>(
+    len: usize,
+    f: impl Fn(usize) -> T + Sync + Send,
+    pool: &rayon::ThreadPool,
+) -> Option<Vec<T>> {
+    use rayon::prelude::*;
+    (pool.current_num_threads() > 1 && len * std::mem::size_of::<T>() >= FIRST_TOUCH_BYTES)
+        .then(|| pool.install(|| (0..len).into_par_iter().map(f).collect()))
+}
