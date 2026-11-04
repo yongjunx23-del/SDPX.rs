@@ -8,6 +8,68 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-04 — 128-bit peak RSS: retained arena heap; trim at iteration starts by default (kept: −38% peak RSS for +4.5% time)
+
+- Question: with the 128-bit changes, red85 peaked at 46.0/45.4 GB against
+  37.3/39.7 GB, though 3-iteration peaks matched (entry below). Attribute
+  and fix it without losing the speedup; points must stay bitwise.
+- Attribution. Full red85 lower solves at 128 bits, T=128, with
+  `SDPX_PROFILE` marks and RSS every 0.2 s (rssMB-234249, rssUB-234250;
+  both audits pass):
+
+  | binary | wall | max RSS | end RSS / free heap / arena (GiB) |
+  |---|---|---|---|
+  | tbMB (`f732df7`) | 57:28 | 37.9 GB | 31.4 / 9.6 / 18.7 |
+  | tbUB (`8fdd5b0` + `44a4014`) | 20:31 | 46.7 GB | 41.3 / 20.4 / 30.2 |
+
+  - Live data (RSS minus glibc free heap) ends at 21.8 and 20.8 GiB. The
+    difference is free heap that glibc keeps resident in the pool
+    workers' arenas: the exact kernels' scratch is below the CLI's 32 MiB
+    mmap threshold.
+  - RSS at each assembly start climbs 0.24 GiB per iteration with tbMB
+    and 0.41 with tbUB. All of tbUB's climb is inside the reduced KKT
+    update: the split leaves' factor and Y phases, whose products run on
+    the whole pool. The condensed PSD assembly adds 0.08 GiB per
+    iteration. The peak is the last refactor's transient (about 3.6 GiB)
+    on that baseline.
+  - `44a4014` is not the cause: tbTJ, before it, peaked at 46.0 GB.
+- Arena caps cost time (tbUB, 12 iterations): `MALLOC_ARENA_MAX=8` +21%
+  s/it, `MALLOC_ARENA_MAX=32` +13%.
+- Change: `receipt::trim_heap` (`malloc_trim(0)` at an iteration start)
+  is the default on Linux once RSS has grown by 256 MiB, the CLI's trim
+  threshold, since the last trim. Each solve's first iteration measures
+  from zero, so a later solve in the same process trims too, and RSS
+  counts kernel pages (`getpagesize`, not a fixed 4 KiB; review fixes, no
+  change on x86_64 or for one solve per process). The `SDPX_MALLOC_TRIM`
+  switch is removed. The 2026-10-11 rejection (+0.7% for −3.8% RSS on mixed)
+  predates the pool-wide leaf products.
+- Release ABBA, whole nodes, every leg bitwise identical:
+  - The old switch on tbUB (a trim at every iteration start), red85
+    lower, 128 bits, T=128, 12 iterations (trimab-234262, node186):
+    305.2/308.3 → 309.0/303.5 s (median −0.2%); max RSS 31.4/31.9 →
+    27.1/27.1 GB.
+  - The same switch, red85 lower, Float64, T=32, full solve
+    (trimf-234270, node178): 147.0/146.6 → 143.2/144.9 s (median −1.9%);
+    max RSS 9.5–9.6 GB in both arms.
+  - The gated default (tbUC against tbUB), red85 lower, 128 bits, T=128,
+    full solves: ABBA on node186 (trimfull-234309) 1227.5/1220.8 →
+    1263.1/1296.1 s (median +4.5%), BAAB on node178 (trimfull2-234310)
+    1214.1/1207.9 → 1288.6/1243.8 s (+4.6%). All eight legs Solved in 52
+    iterations with one solution hash; max RSS 44.5–46.9 → 28.0–28.7 GB
+    (median −38%). The time goes to the split leaves (Y 6.7–6.8 → 7.2–7.6
+    s and factor 5.4–5.5 → 5.5–5.8 s per factorization): each iteration's
+    leaf products refault the pages the trim returned. The 12-iteration
+    run did not show it.
+- Full solves with `SDPX_PROFILE` (`tb-rss.pbs`; tbUB rssUB-234250 and
+  rssUBu-234288 against tbUC rssUC-234289 and rssUCu-234290): lower 46.7
+  → 28.3 GB, upper 48.2 → 28.9 GB; Solved in 52/56 iterations at the same
+  points; audits pass.
+- Decision: kept for the memory. Peak RSS falls 38%, below the 37.9 GB
+  before the 128-bit speedup, at bitwise points; the full 128-bit solve
+  pays 4.5% (1224 → 1280 s, against 3517 s for `f732df7`). Open: recover
+  the 4.5% with a coarser trim cadence or leaf-product scratch that does
+  not fragment the arenas.
+
 ## 2026-11-04 — 128-bit Ising (85/113 sites): dense arrow leaf, leaf-phase parallelism, exact Schur dots, NUMA first-touch spread, tiled Schur left sums; 113-site bounds
 
 - Question: solve the 85- and 113-site Ising inputs at 128 bits in

@@ -398,7 +398,7 @@ where
             }
             // Only iterations that update the KKT system are counted.
             state.iter += 1;
-            crate::receipt::trim_heap();
+            crate::receipt::trim_heap(state.iter == 1);
             if state.iter <= 3 && crate::receipt::profile_requested() {
                 crate::receipt::memory_mark(&format!("iteration {} start", state.iter));
             }
