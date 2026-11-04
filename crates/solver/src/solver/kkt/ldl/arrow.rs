@@ -474,7 +474,7 @@ fn exact_product<T: FloatT>(
 /// `len` zeros, written by the pool when `ways > 1`.
 fn zeros<T: FloatT>(len: usize, ways: usize) -> Vec<T> {
     if ways > 1 {
-        rayon::iter::repeatn(T::zero(), len).collect()
+        rayon::iter::repeat_n(T::zero(), len).collect()
     } else {
         vec![T::zero(); len]
     }
