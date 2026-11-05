@@ -521,6 +521,14 @@ impl<T: FloatT> EigenRows<T> {
         }
     }
 
+    /// [`Self::to_eigen`] of a v that is zero outside the sorted rows `nz`.
+    pub(crate) fn to_eigen_sparse(&self, v: &mut [T], nz: &[usize]) {
+        match self {
+            Self::Ore(t) => t.to_eigen_sparse(v, nz),
+            Self::Limit(t) => t.to_eigen(v),
+        }
+    }
+
     pub(crate) fn from_eigen(&self, v: &mut [T]) {
         match self {
             Self::Ore(t) => t.from_eigen(v),
@@ -633,10 +641,7 @@ impl<T: FloatT> Oracle<T> {
         if !cholesky(n, &mut ls) {
             return None;
         }
-        let mut w = vec![T::zero(); n * n];
-        if !spd_inverse(n, &ls, &mut w) {
-            return None;
-        }
+        let w = spd_inverse(n, ls.clone())?;
         let two = T::one() + T::one();
         let mut logdet_s = T::zero();
         let mut logdet_a = T::zero();
@@ -998,11 +1003,10 @@ impl<T: FloatT> Oracle<T> {
     pub(crate) fn schur_inverse(&mut self) -> Option<Vec<T>> {
         let ny = self.ny();
         let l = self.schur_factor()?;
-        let mut s0i = zeros::<T>(ny * ny);
         let timer = crate::receipt::start();
-        let ok = spd_inverse(ny, &l, &mut s0i) && s0i.iter().all(|v| v.is_finite());
+        let s0i = spd_inverse(ny, l);
         crate::receipt::finish("ore.schur_inverse", timer);
-        ok.then_some(s0i)
+        s0i
     }
 
     /// ⟨z, (∇²F)⁻¹z⟩ = t + vᵀS₀⁻¹v with t = tr(ŜR̂ŜR̂) = ‖L_ŜᵀR̂L_Ŝ‖²,
@@ -1343,6 +1347,9 @@ where
         μ: T,
         _scaling_strategy: ScalingStrategy,
     ) -> bool {
+        // As for the ORE cone: the previous S₀⁻¹ and oracle are dead here.
+        self.data.s0i = Vec::new();
+        self.data.at_s = None;
         let Some(mut oracle) = Oracle::new(self.n, self.m, s) else {
             return false;
         };

@@ -33,6 +33,7 @@ impl DenseBlockSolver {
         k: &CscMatrix<f64>,
         signs: &[i8],
         settings: &CoreSettings<f64>,
+        amd: &mut Option<super::AmdOrdering>,
     ) -> Option<Self> {
         debug_assert!(k.m == k.n && signs.len() == k.n);
         let n = signs.iter().take_while(|&&s| s == 1).count();
@@ -52,7 +53,9 @@ impl DenseBlockSolver {
         // the tail is small and the leading block is dense (classic QP form).
         let leading_fill = k.colptr[n] as f64 / ((n * (n + 1) / 2) as f64);
         let total_fill = k.colptr[k.n] as f64 / ((k.n as f64) * (k.n as f64 + 1.) / 2.);
-        if !(total_fill >= 0.4 || (m <= 256 && m <= n / 4 && leading_fill >= 0.8)) {
+        if !(total_fill >= 0.4 || (m <= 256 && m <= n / 4 && leading_fill >= 0.8))
+            && !super::dense_factor(k, settings, amd, false)
+        {
             return None;
         }
         Some(Self::new(k, signs, settings, n))

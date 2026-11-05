@@ -61,21 +61,14 @@ struct OreRows<T> {
     cone: usize,
     rows: std::ops::Range<usize>,
     cols: Vec<usize>,
-    /// A's stored entries on rows × cols by column (`start`; offsets in
-    /// `rows`); the dense column is +0 elsewhere.
-    start: Vec<usize>,
-    row: Vec<u32>,
+    /// A's entries on rows × cols by column (`ptr` delimits columns): their
+    /// cone-local rows and values. A dense copy held 1 GB on Hubbard all3.
+    ptr: Vec<usize>,
+    nz: Vec<usize>,
     a: Vec<T>,
-    /// KKT positions of the dense rows × cols block (column-major)
+    /// The KKT positions of the dense rows × cols block
     pos: Vec<usize>,
     t: EigenRows<T>,
-}
-
-impl<T> OreRows<T> {
-    /// Entries of the dense rows × cols block.
-    fn dense(&self) -> usize {
-        self.rows.len() * self.cols.len()
-    }
 }
 
 /// A with each operator relative entropy cone's rows dense over the columns
@@ -211,26 +204,25 @@ where
 
         //construct a KKT matrix of the right shape
         let ore = ore_pattern(A, cones);
-        let A = ore.as_ref().map_or(A, |(a, _, _)| a);
+        let (A0, A) = (A, ore.as_ref().map_or(A, |(a, _, _)| a));
         let (KKT, map) = assemble_kkt_matrix(P, A, cones, kktshape);
         let (ore, a_index) = match ore {
             None => (Vec::new(), Vec::new()),
             Some((ref ak, ref index, ref blocks)) => {
-                // The padding of the dense cone rows is not stored.
-                let mut stored = vec![false; ak.nnz()];
-                index.iter().for_each(|&p| stored[p] = true);
                 let rows = blocks.iter().map(|(cone, rows)| {
-                    let (mut cols, mut start, mut row) = (Vec::new(), vec![0], Vec::new());
-                    let (mut a, mut pos) = (Vec::new(), Vec::new());
+                    let (mut cols, mut pos) = (Vec::new(), Vec::new());
+                    let (mut ptr, mut nz, mut a) = (vec![0], Vec::new(), Vec::new());
                     for col in 0..ak.n {
                         let span = ak.colptr[col]..ak.colptr[col + 1];
                         if let Some(p) = span.clone().find(|&p| rows.contains(&ak.rowval[p])) {
                             cols.push(col);
-                            for r in (0..rows.len()).filter(|&r| stored[p + r]) {
-                                row.push(r as u32);
-                                a.push(ak.nzval[p + r]);
+                            for q in A0.colptr[col]..A0.colptr[col + 1] {
+                                if rows.contains(&A0.rowval[q]) {
+                                    nz.push(A0.rowval[q] - rows.start);
+                                    a.push(A0.nzval[q]);
+                                }
                             }
-                            start.push(a.len());
+                            ptr.push(nz.len());
                             pos.extend_from_slice(&map.A[p..p + rows.len()]);
                         }
                     }
@@ -238,8 +230,8 @@ where
                         cone: *cone,
                         rows: rows.clone(),
                         cols,
-                        start,
-                        row,
+                        ptr,
+                        nz,
                         a,
                         pos,
                         t: Default::default(),
@@ -393,6 +385,12 @@ where
 
     fn update(&mut self, cones: &CompositeCone<T>, settings: &CoreSettings<T>) -> bool {
         let pool = cones.thread_pool();
+        // Wide types refine through exact rows, which `residual_full` also
+        // prefers, so a residual plan would never be read (Hubbard all3 at
+        // 128 bits: 2.2 GB). Built here instead of on the first refinement.
+        if T::precision_bits() > 64 && self.exact_rows.is_none() {
+            self.exact_rows = Some(ExactRows::new(&self.KKT));
+        }
         self.set_residual_pool(pool.clone());
         self.set_factor_pool(pool);
         self.update_from_cones(cones.iter(), settings)
@@ -520,15 +518,13 @@ where
         _update_values(&mut self.ldlsolver, &mut self.KKT, &index, &A.nzval);
         // the next cone update writes these rows transformed
         for o in &mut self.ore {
-            for (c, &col) in o.cols.iter().enumerate() {
-                let mut k = o.start[c];
+            let mut a = o.a.iter_mut();
+            for &col in &o.cols {
                 for p in A.colptr[col]..A.colptr[col + 1] {
                     if o.rows.contains(&A.rowval[p]) {
-                        o.a[k] = A.nzval[p];
-                        k += 1;
+                        *a.next().unwrap() = A.nzval[p];
                     }
                 }
-                debug_assert_eq!(k, o.start[c + 1]);
             }
         }
     }
@@ -634,20 +630,22 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
         }
         let pool = self.residual_pool.as_deref();
         let transform = |o: &OreRows<T>| {
-            let (t, rows) = (&o.t, o.rows.len());
-            let mut values = vec![T::zero(); o.dense()];
+            let (t, rows, len) = (&o.t, o.rows.len(), o.pos.len());
             let column = |(c, v): (usize, &mut [T])| {
-                for k in o.start[c]..o.start[c + 1] {
-                    v[o.row[k] as usize] = o.a[k];
-                }
-                t.to_eigen(v);
+                let span = o.ptr[c]..o.ptr[c + 1];
+                zip(&o.nz[span.clone()], &o.a[span.clone()]).for_each(|(&k, &a)| v[k] = a);
+                t.to_eigen_sparse(v, &o.nz[span]);
             };
+            // Zero-filled in parallel too (217 MB per Hubbard all3 n = 51 cone).
+            let mut values = Vec::with_capacity(len);
             if pool.is_some() {
+                values.par_extend(rayon::iter::repeat_n(T::zero(), len));
                 values
                     .par_chunks_exact_mut(rows)
                     .enumerate()
                     .for_each(column);
             } else {
+                values.resize(len, T::zero());
                 values.chunks_exact_mut(rows).enumerate().for_each(column);
             }
             values
@@ -658,9 +656,9 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
         let mut first = 0;
         while first < self.ore.len() {
             let mut end = first + 1;
-            let mut bytes = self.ore[first].dense() * std::mem::size_of::<T>();
+            let mut bytes = self.ore[first].pos.len() * std::mem::size_of::<T>();
             while end < self.ore.len() && end - first < ways {
-                let next = self.ore[end].dense() * std::mem::size_of::<T>();
+                let next = self.ore[end].pos.len() * std::mem::size_of::<T>();
                 if bytes + next > 128 << 20 {
                     break;
                 }
@@ -742,8 +740,10 @@ where
         let map = &self.map;
         let KKT = &mut self.KKT;
         let dsigns = &self.dsigns;
-        let diag_kkt = &mut self.work1;
-        let diag_shifted = &mut self.work2;
+        // Refinement leaves the work buffers at cols·n; only the leading n
+        // entries hold this diagonal.
+        let diag_kkt = &mut self.work1[..map.diag_full.len()];
+        let diag_shifted = &mut self.work2[..map.diag_full.len()];
 
         let applied_shift = if settings.static_regularization_enable {
             let eps = match shift {
@@ -995,7 +995,11 @@ where
         // use as `refine_residual` does; without it an owner's reduced
         // residual ran a serial symv (MPI ranks: 27 of 85 s at 32 threads).
         // The row plan keeps every row's addition order, so bits are unchanged.
-        if self.residual_plan.is_none() && self.residual_dense.is_none() && pool.is_some() {
+        if self.residual_plan.is_none()
+            && self.residual_dense.is_none()
+            && self.exact_rows.is_none()
+            && pool.is_some()
+        {
             self.residual_plan = Some(SparseParallel::new_symmetric(&self.KKT));
         }
         if let Some(plan) = &mut self.residual_plan {
@@ -1467,7 +1471,7 @@ pub(crate) fn _escalated<T: FloatT>(base: T, boost: usize, diagonal: T) -> T {
 struct ExactRows {
     ptr: Vec<usize>,
     /// (nz position, column) for off-diagonal entries incoming from CSC columns.
-    entries: Vec<(usize, usize)>,
+    entries: Vec<(u32, u32)>,
     /// Full row work: own CSC column plus incoming mirrors.
     work_offsets: Vec<usize>,
 }
@@ -1490,12 +1494,14 @@ impl ExactRows {
         let ptr = count.clone();
         let work_offsets = ptr.iter().zip(&k.colptr).map(|(a, b)| a + b).collect();
         let mut fill = count;
-        let mut entries = vec![(0usize, 0usize); ptr[n]];
+        // Wide types only: 2³² of their entries exceed a node's memory.
+        assert!(k.nzval.len() <= u32::MAX as usize);
+        let mut entries = vec![(0u32, 0u32); ptr[n]];
         for j in 0..n {
             for p in k.colptr[j]..k.colptr[j + 1] {
                 let r = k.rowval[p];
                 if r != j {
-                    entries[fill[r]] = (p, j);
+                    entries[fill[r]] = (p as u32, j as u32);
                     fill[r] += 1;
                 }
             }
@@ -1535,7 +1541,11 @@ impl ExactRows {
             T::dot_fma(
                 std::iter::once((&b[i], &one))
                     .chain((k.colptr[i]..k.colptr[i + 1]).map(|p| (&k.nzval[p], &neg[k.rowval[p]])))
-                    .chain(incoming.iter().map(|&(p, j)| (&k.nzval[p], &neg[j]))),
+                    .chain(
+                        incoming
+                            .iter()
+                            .map(|&(p, j)| (&k.nzval[p as usize], &neg[j as usize])),
+                    ),
             )
         };
         // Under MPI each rank evaluates one work-balanced row range.

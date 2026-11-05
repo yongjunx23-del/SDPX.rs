@@ -21,10 +21,7 @@ fn barrier<T: FloatT>(cone: &SupportedConeT<T>, s: &[T]) -> Option<(T, Vec<T>)> 
             }
             let two = T::one() + T::one();
             let value = -(0..n).fold(T::zero(), |v, i| v + two * l[i + i * n].ln());
-            let mut inv = vec![T::zero(); n * n];
-            if !spd_inverse(n, &l, &mut inv) {
-                return None;
-            }
+            let inv = spd_inverse(n, l)?;
             svec(n, &inv, &mut g);
             g.iter_mut().for_each(|v| *v = -*v);
             value

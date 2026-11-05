@@ -358,30 +358,56 @@ fn heap_bytes() -> Option<(u64, u64)> {
     None
 }
 
-/// Experiment switch `SDPX_MALLOC_TRIM`: return free arena pages to the
-/// system at each iteration start (glibc `malloc_trim(0)`; Linux only).
-pub fn trim_heap() {
-    static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("SDPX_MALLOC_TRIM").is_some()) {
-        return;
-    }
+/// Return free arena pages to the system (glibc `malloc_trim(0)`; Linux
+/// only) at an iteration start once RSS is 256 MiB (the CLI's
+/// `M_TRIM_THRESHOLD`) above the last return, or above zero at a solve's
+/// `first` iteration, so a later solve in the same process starts afresh.
+/// Pool workers take the exact kernels' scratch from their own arenas,
+/// below the CLI's mmap threshold, and glibc keeps those arenas' free
+/// chunks resident: red85 at 128 bits and 128 threads otherwise ended its
+/// solve holding 20.4 GiB of free heap in 41.3 GiB RSS.
+pub fn trim_heap(first: bool) {
+    #[cfg(not(target_os = "linux"))]
+    let _ = first;
     #[cfg(target_os = "linux")]
     {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         extern "C" {
             fn malloc_trim(pad: usize) -> std::os::raw::c_int;
+        }
+        // RSS after the last trim.
+        static TRIMMED: AtomicU64 = AtomicU64::new(0);
+        let Some(rss) = current_rss_bytes() else {
+            return;
+        };
+        let mark = if first { 0 } else { TRIMMED.load(Relaxed) };
+        if rss < mark + (256 << 20) {
+            return;
         }
         // SAFETY: malloc_trim only releases free memory.
         unsafe {
             malloc_trim(0);
         }
+        TRIMMED.store(current_rss_bytes().unwrap_or(rss), Relaxed);
     }
 }
 
-/// Resident set size now (Linux `/proc/self/statm`, 4 KiB pages).
+/// Resident set size now (Linux `/proc/self/statm`).
 fn current_rss_bytes() -> Option<u64> {
-    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-    Some(pages * 4096)
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn getpagesize() -> i32;
+        }
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        // statm counts kernel pages: 4 KiB on x86_64, up to 64 KiB on aarch64.
+        Some(pages * unsafe { getpagesize() } as u64)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// Cached profile configuration; disabled instrumentation does no environment lookup.

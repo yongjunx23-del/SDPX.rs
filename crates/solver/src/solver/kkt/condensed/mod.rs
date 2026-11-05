@@ -453,13 +453,15 @@ fn eliminated_soc(dim: usize) -> bool {
 /// Eliminated rows `B` of orthants (`A_r/w_r`) and small second-order cones
 /// (`W⁻¹A_k`), whose Schur contribution is `BᵀB`. Columns present in at least
 /// half of the rows form a dense panel handled by one SYRK; every other
-/// product goes through a precomputed per-position plan.
+/// product goes through a precomputed per-position plan. Binary64 long rows
+/// may instead form their own row panel (`RowPanel`).
 struct EliminatedRows<T> {
     /// Per source block: orthant rows or one SOC; entries index `values`.
     sources: Vec<Source>,
     values: Vec<T>,
     /// Virtual rows as `values` ranges, with their columns.
     rows: Vec<(usize, usize)>,
+    wide: Option<RowPanel<T>>,
     dense: Vec<usize>,
     /// Panel cells `(row + slot·rows, value index)` of the dense entries of
     /// rows that also have sparse entries (their values feed the plan too)
@@ -510,7 +512,11 @@ enum Source {
 }
 
 impl<T: FloatT> EliminatedRows<T> {
-    fn new(blocks: &[Block<T>], position: impl Fn(usize, usize) -> usize) -> Self {
+    fn new(
+        blocks: &[Block<T>],
+        position: impl Fn(usize, usize) -> usize + Sync,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Self {
         let (mut sources, mut rows, mut cols) = (Vec::new(), Vec::new(), Vec::new());
         let mut orthant_of: Vec<Option<(usize, usize)>> = Vec::new();
         for (bi, block) in blocks.iter().enumerate() {
@@ -560,11 +566,22 @@ impl<T: FloatT> EliminatedRows<T> {
             }
         }
         let n = cols.iter().max().map_or(0, |&j| j + 1);
+        // Row-panel rows take part in neither the column panel nor the plan.
+        let wide = RowPanel::select(&rows, &cols, n, &position);
+        let is_wide = |i: usize| wide.as_ref().is_some_and(|w| w.member[i]);
         let mut count = vec![0usize; n];
-        for &j in &cols {
-            count[j] += 1;
+        let mut narrow = 0;
+        for (i, &(start, end)) in rows.iter().enumerate() {
+            if !is_wide(i) {
+                narrow += 1;
+                for &j in &cols[start..end] {
+                    count[j] += 1;
+                }
+            }
         }
-        let threshold = (rows.len() / 2).max(16);
+        // A strict majority: any two panel columns share a row, so every
+        // pair `out` scatters is a structural Schur entry.
+        let threshold = (narrow / 2 + 1).max(16);
         let dense: Vec<usize> = (0..n).filter(|&j| count[j] >= threshold).collect();
         let mut slot = vec![usize::MAX; n];
         for (d, &j) in dense.iter().enumerate() {
@@ -574,23 +591,45 @@ impl<T: FloatT> EliminatedRows<T> {
             .flat_map(|c| (0..=c).map(move |i| (i, c)))
             .map(|(i, c)| position(dense[i], dense[c]))
             .collect();
-        // Every product with at least one non-panel column.
-        let mut triples = Vec::new();
-        for &(start, end) in &rows {
-            for b in start..end {
-                for a in start..=b {
-                    let (i, j) = (cols[a], cols[b]);
-                    if slot[i] != usize::MAX && slot[j] != usize::MAX {
-                        continue;
-                    }
-                    triples.push((position(i.min(j), i.max(j)), a as u32, b as u32));
+        // Every product with at least one non-panel column. The triples are
+        // distinct, so the pool's sort gives the serial plan; built on the
+        // pool, the plan's pages also spread over its NUMA nodes.
+        let plan = {
+            let (slot, cols, position) = (&slot, &cols, &position);
+            let products = move |&(start, end): &(usize, usize)| {
+                (start..end)
+                    .flat_map(move |b| (start..=b).map(move |a| (a, b)))
+                    .filter(move |&(a, b)| {
+                        slot[cols[a]] == usize::MAX || slot[cols[b]] == usize::MAX
+                    })
+                    .map(move |(a, b)| {
+                        let (i, j) = (cols[a], cols[b]);
+                        (position(i.min(j), i.max(j)), a as u32, b as u32)
+                    })
+            };
+            let narrow: Vec<(usize, usize)> = rows
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| !is_wide(i))
+                .map(|(_, &r)| r)
+                .collect();
+            match pool.filter(|p| p.current_num_threads() > 1) {
+                Some(pool) => pool.install(|| {
+                    let triples = narrow.par_iter().flat_map_iter(products).collect();
+                    OrthantPlan::from_triples(triples, true)
+                }),
+                None => {
+                    OrthantPlan::from_triples(narrow.iter().flat_map(products).collect(), false)
                 }
             }
-        }
+        };
         let in_panel = |e: usize| slot[cols[e]] != usize::MAX;
         let panel_only: Vec<bool> = rows
             .iter()
-            .map(|&(start, end)| !dense.is_empty() && (start..end).all(in_panel))
+            .enumerate()
+            .map(|(i, &(start, end))| {
+                !is_wide(i) && !dense.is_empty() && (start..end).all(in_panel)
+            })
             .collect();
         let fixed_row: Vec<bool> = (0..rows.len())
             .map(|i| T::precision_bits() > 64 && panel_only[i] && orthant_of[i].is_some())
@@ -599,7 +638,7 @@ impl<T: FloatT> EliminatedRows<T> {
         let mut index = vec![usize::MAX; rows.len()];
         let (mut k, mut k_fixed) = (0, 0);
         for i in 0..rows.len() {
-            if dense.is_empty() {
+            if dense.is_empty() || is_wide(i) {
                 continue;
             }
             if fixed_row[i] {
@@ -612,6 +651,9 @@ impl<T: FloatT> EliminatedRows<T> {
         }
         let mut cell_of = vec![usize::MAX; cols.len()];
         for (i, &(start, end)) in rows.iter().enumerate() {
+            if is_wide(i) {
+                continue;
+            }
             let height = if fixed_row[i] { k_fixed } else { k };
             for e in start..end {
                 if in_panel(e) {
@@ -645,6 +687,7 @@ impl<T: FloatT> EliminatedRows<T> {
             sources,
             values: vec![T::zero(); cols.len()],
             rows,
+            wide,
             panel: Matrix::zeros((k, dense.len())),
             gram: Matrix::zeros((dense.len(), dense.len())),
             dense,
@@ -652,7 +695,7 @@ impl<T: FloatT> EliminatedRows<T> {
             cell_of,
             panel_only,
             out,
-            plan: OrthantPlan::from_triples(triples),
+            plan,
             fixed,
         }
     }
@@ -793,10 +836,104 @@ impl<T: FloatT> EliminatedRows<T> {
                 }
             }
         }
+        if let Some(wide) = self.wide.as_mut() {
+            wide.accumulate(schur, &self.values);
+        }
         if T::precision_bits() <= 53 {
             self.plan.accumulate_rounded(schur, &self.values);
         } else {
             self.plan.accumulate(schur, &self.values, pool);
+        }
+    }
+}
+
+/// Shortest eliminated row a `RowPanel` considers.
+const WIDE_ROW: usize = 64;
+
+/// Binary64 long eliminated rows: one SYRK of their dense `rows × union`
+/// panel forms all their products. The pair plan grows with Σ L(L+1)/2 and
+/// is summed serially: the 41-site Ising model's 54 dense loop/probability
+/// rows (~4,300 entries) gave 494M plan terms, built in the first assembly
+/// (48 s, ~12 GB) and summed on every iteration.
+struct RowPanel<T> {
+    member: Vec<bool>,
+    /// `(row + slot·rows, value index)` of every entry of a member row.
+    cells: Vec<(usize, usize)>,
+    panel: Matrix<T>,
+    gram: Matrix<T>,
+    /// `(Gram index, Schur position)` of every pair sharing a member row.
+    out: Vec<(usize, usize)>,
+}
+
+impl<T: FloatT> RowPanel<T> {
+    fn select(
+        rows: &[(usize, usize)],
+        cols: &[usize],
+        n: usize,
+        position: &impl Fn(usize, usize) -> usize,
+    ) -> Option<Self> {
+        if T::precision_bits() > 53 {
+            return None;
+        }
+        let member: Vec<bool> = rows.iter().map(|&(s, e)| e - s >= WIDE_ROW).collect();
+        let (mut k, mut pairs) = (0, 0u128);
+        let mut slot = vec![usize::MAX; n];
+        for (&(start, end), _) in rows.iter().zip(&member).filter(|(_, &m)| m) {
+            k += 1;
+            let l = (end - start) as u128;
+            pairs += l * (l + 1) / 2;
+            for &j in &cols[start..end] {
+                slot[j] = 0;
+            }
+        }
+        let union: Vec<usize> = (0..n).filter(|&j| slot[j] == 0).collect();
+        let d = union.len();
+        // The SYRK may take a few times the flops of the products it replaces.
+        if k == 0 || (k * d) as u128 * (d as u128 + 1) / 2 > 8 * pairs {
+            return None;
+        }
+        for (s, &j) in union.iter().enumerate() {
+            slot[j] = s;
+        }
+        let mut cells = Vec::new();
+        // Orthant rows are the Schur pattern's cliques: only pairs sharing a
+        // member row are structural, and every other Gram entry is zero.
+        let words = k.div_ceil(64);
+        let mut mask = vec![0u64; d * words];
+        for (r, (&(start, end), _)) in rows.iter().zip(&member).filter(|(_, &m)| m).enumerate() {
+            for e in start..end {
+                let s = slot[cols[e]];
+                cells.push((r + s * k, e));
+                mask[s * words + r / 64] |= 1 << (r % 64);
+            }
+        }
+        let shares =
+            |i: usize, c: usize| (0..words).any(|w| mask[i * words + w] & mask[c * words + w] != 0);
+        let out = (0..d)
+            .flat_map(|c| (0..=c).map(move |i| (i, c)))
+            .filter(|&(i, c)| shares(i, c))
+            .map(|(i, c)| (i + c * d, position(union[i], union[c])))
+            .collect();
+        Some(Self {
+            member,
+            cells,
+            panel: Matrix::zeros((k, d)),
+            gram: Matrix::zeros((d, d)),
+            out,
+        })
+    }
+
+    /// `schur += PᵀP` for the panel `P` of the current scaled `values`.
+    fn accumulate(&mut self, schur: &mut [T], values: &[T]) {
+        let panel = self.panel.data_mut();
+        for &(cell, e) in &self.cells {
+            panel[cell] = values[e];
+        }
+        self.gram
+            .syrk(&self.panel.t(), T::one(), T::zero(), MatrixTriangle::Triu);
+        let gram = self.gram.data();
+        for &(g, p) in &self.out {
+            schur[p] += gram[g];
         }
     }
 }
@@ -811,16 +948,35 @@ struct OrthantPlan {
 }
 
 impl OrthantPlan {
-    fn from_triples(mut triples: Vec<(usize, u32, u32)>) -> Self {
-        triples.sort_unstable();
-        let mut starts = Vec::new();
-        for (k, &(p, _, _)) in triples.iter().enumerate() {
-            if starts.last().is_none_or(|&(q, _)| q != p) {
-                starts.push((p, k));
-            }
+    /// Groups the triples `(position, a, b)`; `parallel` runs on the current pool.
+    fn from_triples(mut triples: Vec<(usize, u32, u32)>, parallel: bool) -> Self {
+        if parallel {
+            triples.par_sort_unstable();
+        } else {
+            triples.sort_unstable();
         }
-        starts.push((usize::MAX, triples.len()));
-        let terms = triples.into_iter().map(|(_, a, b)| (a, b)).collect();
+        let t = &triples;
+        let first = move |&k: &usize| k == 0 || t[k - 1].0 != t[k].0;
+        let group = move |k: usize| (t[k].0, k);
+        let pair = |&(_, a, b): &(usize, u32, u32)| (a, b);
+        let (mut starts, terms): (Vec<_>, Vec<_>) = if parallel {
+            rayon::join(
+                || {
+                    (0..t.len())
+                        .into_par_iter()
+                        .filter(first)
+                        .map(group)
+                        .collect()
+                },
+                || t.par_iter().map(pair).collect(),
+            )
+        } else {
+            (
+                (0..t.len()).filter(first).map(group).collect(),
+                t.iter().map(pair).collect(),
+            )
+        };
+        starts.push((usize::MAX, t.len()));
         Self { starts, terms }
     }
 
@@ -1351,8 +1507,14 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         for block in &mut blocks {
             if let Scaling::Psd(p) = &mut block.scaling {
                 if parallel_assembly {
-                    p.schur_values
-                        .resize(triangular_number(p.columns.len()), T::zero());
+                    // The pool writes these buffers: spread their pages.
+                    let len = triangular_number(p.columns.len());
+                    p.schur_values = pool
+                        .as_deref()
+                        .and_then(|pool| {
+                            crate::algebra::scratch::spread_vec(len, |_| T::zero(), pool)
+                        })
+                        .unwrap_or_else(|| vec![T::zero(); len]);
                 }
                 if dense_schur {
                     continue;
@@ -1388,6 +1550,12 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         reduced.set_factor_pool(pool.clone());
         reduced.set_residual_pool(pool.clone());
         let kkt = reduced.kkt_matrix_mut();
+        // Every assembly rewrites the Schur values on the pool.
+        if let Some(values) = pool.as_deref().and_then(|pool| {
+            crate::algebra::scratch::spread_vec(kkt.nzval.len(), |i| kkt.nzval[i], pool)
+        }) {
+            kkt.nzval = values;
+        }
         debug_assert_eq!(kkt.colptr[..n + 1], schur.colptr);
         debug_assert_eq!(kkt.rowval[..count], schur.rowval);
         drop(schur);
@@ -1638,6 +1806,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
 
     fn assemble(&mut self) -> bool {
         let parallel_publication = self.scaling_workers > 1 && self.n > 1;
+        let timer = crate::receipt::start();
         // Each PSD block owns its contribution buffer. After joining, each
         // destination column publishes the blocks in their original cone order.
         if self.parallel_assembly {
@@ -1705,6 +1874,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 }
             });
         }
+        crate::receipt::finish("assemble.psd", timer);
+        let timer = crate::receipt::start();
         let pool = self.pool.clone();
         let schur = self.reduced.kkt_matrix_mut();
         match pool.as_deref().filter(|p| p.current_num_threads() > 1) {
@@ -1779,22 +1950,24 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         } else {
             for block in &mut self.blocks {
                 if let Scaling::Psd(psd) = &mut block.scaling {
-                    psd.compute_schur(&self.A.nzval, |_, _, position, v| {
-                        schur.nzval[position] += v;
-                    });
+                    psd.add_schur(&self.A.nzval, &mut schur.nzval, pool.as_deref());
                 }
             }
         }
+        // Publication, or the whole PSD Schur without contribution buffers.
+        crate::receipt::finish("assemble.publish", timer);
+        let timer = crate::receipt::start();
         // Orthant and eliminated SOC rows form one Gram BᵀB.
-        let elim = self
-            .eliminated
-            .get_or_insert_with(|| EliminatedRows::new(&self.blocks, |i, j| position(schur, i, j)));
+        let elim = self.eliminated.get_or_insert_with(|| {
+            EliminatedRows::new(&self.blocks, |i, j| position(schur, i, j), pool.as_deref())
+        });
         elim.accumulate(
             &mut schur.nzval,
             &self.blocks,
             &self.A.nzval,
             pool.as_deref(),
         );
+        crate::receipt::finish("assemble.elim", timer);
         schur.nzval[..self.schur_nnz].is_finite()
     }
 

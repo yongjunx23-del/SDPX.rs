@@ -39,9 +39,11 @@ enum LocalStructure {
 
 /// Dense working-set cap of the local arrow structures, and the size up to
 /// which generic leaves are always admitted. Beyond it a generic arrow must
-/// stay within `ARROW_KKT_FACTOR` times the stored KKT, so sparse structure
-/// is never densified without bound; a dense border coupling (as in sampled
-/// bootstrap problems) fills QDLDL's factor just as much.
+/// stay within `ARROW_KKT_FACTOR` times the stored KKT or its sparse LDL
+/// factor (QDLDL's AMD fill, when the caller supplies it), whichever is
+/// larger, so sparse structure is never densified without bound; a dense
+/// border coupling (as in sampled bootstrap problems) fills QDLDL's factor
+/// just as much.
 const ARROW_MAX_BYTES: u128 = 512 * 1024 * 1024;
 const ARROW_KKT_FACTOR: u128 = 8;
 /// Smallest single dense leaf admitted to the arrow backend.
@@ -59,6 +61,12 @@ const FACTOR_PANEL: usize = 8;
 /// precision tried (256–512 bits, up to 2.6× at 4 threads).
 const REC_FACTOR_MIN: usize = 256;
 const REC_BASE: usize = 128;
+/// Y columns per panel of a split wide leaf's blocked forward solve
+/// ([`DenseLeaf::forward_panel_rows`]). Panels run in turn with the pool in
+/// their products: 64-column panels as concurrent serial items each encoded
+/// the same factor blocks (+21 GiB peak at 113 sites; at 545 sites an
+/// allocation failed at 195 GB RSS).
+const Y_PANEL: usize = 1024;
 /// Estimated workspace of one batch of exact leaf contributions.
 const BATCH_WORK_BYTES: usize = 4 << 30;
 /// Per-step factor tasks are small: split a leaf factor only with at least
@@ -152,8 +160,11 @@ fn ldl_dots<T: FloatT>(
 ) -> Result<(), &'static str> {
     use sdpx_arithmetic::inner_parallel as ip;
     let row = |i: usize| i * (i + 1) / 2;
-    let mut r = vec![T::zero(); row(n)];
-    let mut w = vec![T::zero(); row(n)];
+    // Every entry of r and w is written before it is read. A split factor's
+    // workers all read them, so the pool writes them first and their pages
+    // spread over its NUMA nodes.
+    let mut r = crate::algebra::scratch::spread_here(row(n), |_| T::zero(), split);
+    let mut w = crate::algebra::scratch::spread_here(row(n), |_| T::zero(), split);
     let mut d = vec![T::zero(); n];
     let a = &*l;
     // entry (i, j) from row i's first j entries and row j of W
@@ -316,24 +327,26 @@ fn ldl_rec<T: FloatT>(
         ways,
         d1,
     )?;
-    let l11 = {
-        let left = &*left;
-        collect_ways(n1 * n1, ways, |e| left[e % n1 + e / n1 * ld])
-    };
+    let mut l11 = zeros(n1 * n1, ways);
+    for_columns(&mut l11, n1, n1, n1, ways, |j, column| {
+        column.copy_from_slice(&left[j * ld..j * ld + n1])
+    });
     let low: Vec<usize> = first[n1..].iter().map(|&f| f.min(n1)).collect();
     solve_unit_lower_t(n2, n1, &l11, n1, &mut left[n1..], ld, &low, ways);
     drop(l11);
     // W21 before scaling; L21 = W21·D1⁻¹ in place
-    let w = {
-        let left = &*left;
-        collect_ways(n2 * n1, ways, |e| left[n1 + e % n2 + e / n2 * ld])
-    };
-    columns_ways(left, ld, n1, ways, |j, column| {
-        column[n1..n].iter_mut().for_each(|v| *v *= d1[j])
+    let mut w = zeros(n2 * n1, ways);
+    for_columns(&mut w, n2, n1, n2, ways, |j, column| {
+        column.copy_from_slice(&left[n1 + j * ld..n1 + j * ld + n2])
+    });
+    for_columns(left, ld, n1, n2, ways, |j, column| {
+        for v in &mut column[n1..n1 + n2] {
+            *v *= d1[j];
+        }
     });
     let l21 = &left[n1..];
     // packed (a, b), a ≤ b, is the Schur term (b, a)
-    let mut packed = collect_ways(n2 * (n2 + 1) / 2, ways, |_| T::zero());
+    let mut packed = zeros(n2 * (n2 + 1) / 2, ways);
     let upper = crate::algebra::with_split_hint(ways, || {
         T::xgemm_upper_exact(
             b'N',
@@ -351,13 +364,13 @@ fn ldl_rec<T: FloatT>(
         )
     });
     if upper {
-        columns_ways(right, ld, n2, ways, |a, column| {
+        for_columns(right, ld, n2, n2, ways, |a, column| {
             for b in a..n2 {
                 column[n1 + b] -= packed[b * (b + 1) / 2 + a];
             }
         });
     } else {
-        let mut s = collect_ways(n2 * n2, ways, |_| T::zero());
+        let mut s = zeros(n2 * n2, ways);
         exact_product(
             (b'N', b'T'),
             (n2, n2, n1),
@@ -366,7 +379,7 @@ fn ldl_rec<T: FloatT>(
             &mut s,
             ways,
         );
-        columns_ways(right, ld, n2, ways, |a, column| {
+        for_columns(right, ld, n2, n2, ways, |a, column| {
             for b in a..n2 {
                 column[n1 + b] -= s[a + b * n2];
             }
@@ -408,11 +421,13 @@ fn solve_unit_lower_t<T: FloatT>(
     use sdpx_arithmetic::inner_parallel as ip;
     if n <= REC_BASE {
         let lr: Vec<T> = (0..n * n).map(|e| l[e / n + e % n * ldl]).collect();
-        let mut rows = {
-            let b = &*b;
-            collect_ways(m * n, ways, |e| b[e / n + e % n * ldb])
-        };
+        let mut rows = zeros(m * n, ways);
+        let source = &*b;
+        // each row gathers its own entries of B
         let solve = |(i, x): (usize, &mut [T])| {
+            for (j, v) in x.iter_mut().enumerate() {
+                *v = source[i + j * ldb];
+            }
             for j in low[i]..n {
                 let lo = low[i];
                 x[j] -= T::dot_slices(&x[lo..j], &lr[j * n + lo..j * n + j]);
@@ -429,7 +444,7 @@ fn solve_unit_lower_t<T: FloatT>(
         } else {
             rows.chunks_mut(n).enumerate().for_each(solve);
         }
-        columns_ways(b, ldb, n, ways, |j, column| {
+        for_columns(b, ldb, n, m, ways, |j, column| {
             for (i, v) in column[..m].iter_mut().enumerate() {
                 *v = rows[i * n + j];
             }
@@ -448,7 +463,7 @@ fn solve_unit_lower_t<T: FloatT>(
         ways,
     );
     let (b1, b2) = b.split_at_mut(n1 * ldb);
-    let mut p = collect_ways(m * n2, ways, |_| T::zero());
+    let mut p = zeros(m * n2, ways);
     exact_product(
         (b'N', b'T'),
         (m, n2, n1),
@@ -457,51 +472,13 @@ fn solve_unit_lower_t<T: FloatT>(
         &mut p,
         ways,
     );
-    columns_ways(b2, ldb, n2, ways, |j, column| {
-        for (v, &q) in column[..m].iter_mut().zip(&p[j * m..(j + 1) * m]) {
-            *v -= q;
+    for_columns(b2, ldb, n2, m, ways, |j, column| {
+        for (v, &pv) in column[..m].iter_mut().zip(&p[j * m..(j + 1) * m]) {
+            *v -= pv;
         }
     });
     let low2: Vec<usize> = low.iter().map(|&f| f.saturating_sub(n1)).collect();
     solve_unit_lower_t(m, n2, &l[n1 + n1 * ldl..], ldl, b2, ldb, &low2, ways);
-}
-
-/// `(0..len).map(f)`, over the ambient pool when `ways > 1` (the copies and
-/// clears beside a recursive factor's products).
-fn collect_ways<T: Send>(len: usize, ways: usize, f: impl Fn(usize) -> T + Sync + Send) -> Vec<T> {
-    if ways > 1 {
-        let mut v = Vec::new();
-        (0..len)
-            .into_par_iter()
-            .with_min_len(1 << 12)
-            .map(f)
-            .collect_into_vec(&mut v);
-        v
-    } else {
-        (0..len).map(f).collect()
-    }
-}
-
-/// `f(j, column j)` for the first `cols` columns (leading dimension `ld`) of
-/// `a`, over the ambient pool when `ways > 1`.
-fn columns_ways<T: Send>(
-    a: &mut [T],
-    ld: usize,
-    cols: usize,
-    ways: usize,
-    f: impl Fn(usize, &mut [T]) + Sync + Send,
-) {
-    if ways > 1 {
-        a.par_chunks_mut(ld)
-            .take(cols)
-            .enumerate()
-            .for_each(|(j, c)| f(j, c));
-    } else {
-        a.chunks_mut(ld)
-            .take(cols)
-            .enumerate()
-            .for_each(|(j, c)| f(j, c));
-    }
 }
 
 /// `c = op(a)·op(b)` (`m × n`, inner `k`): one exact sum rounded once per
@@ -532,6 +509,47 @@ fn exact_product<T: FloatT>(
             mi,
         )
     });
+}
+
+/// `len` zeros, written by the pool when `ways > 1`.
+fn zeros<T: FloatT>(len: usize, ways: usize) -> Vec<T> {
+    if ways > 1 {
+        rayon::iter::repeat_n(T::zero(), len).collect()
+    } else {
+        vec![T::zero(); len]
+    }
+}
+
+/// `f(j, x[j·ld..])` for the first `cols` columns of `x` (leading dimension
+/// `ld`, `rows` elements each touched), split over the pool when `ways > 1`.
+/// The recursive factor's and solve's copies, scalings and updates: each
+/// element is rounded once by its own column, so the split never changes a
+/// bit (Ising 85-site, 128 bits: serial, they held the leaf factor's thread
+/// for 4–5 s of 10 while the pool waited).
+fn for_columns<T: FloatT>(
+    x: &mut [T],
+    ld: usize,
+    cols: usize,
+    rows: usize,
+    ways: usize,
+    f: impl Fn(usize, &mut [T]) + Sync + Send,
+) {
+    use sdpx_arithmetic::inner_parallel as ip;
+    if ways > 1 {
+        // columns per task: one grain of element work
+        let work = ip::weight(T::precision_bits() as usize) * rows.max(1) as u128;
+        let tile = (ip::grain() / work).max(1) as usize;
+        x.par_chunks_mut(ld)
+            .take(cols)
+            .enumerate()
+            .with_min_len(tile)
+            .for_each(|(j, column)| f(j, column));
+    } else {
+        x.chunks_mut(ld)
+            .take(cols)
+            .enumerate()
+            .for_each(|(j, column)| f(j, column));
+    }
 }
 
 /// `rayon::join` when spare workers may take `b`; under a board offer `b`
@@ -904,30 +922,38 @@ impl<T: FloatT> DenseLeaf<T> {
         self.forward_suffix(x, 0);
     }
 
-    /// [`Self::forward`] split over the ambient pool: once a row block is
-    /// final, every later row applies that block's columns in ascending order
-    /// (rows are independent), then the next block finishes serially. Each
-    /// entry sees the serial FMA order, so results are bitwise identical.
-    fn forward_blocked(&self, x: &mut [T], block: usize) {
+    /// [`Self::forward_many`] split over the ambient pool (`cols`
+    /// row-interleaved columns, entry (i, c) at `i * cols + c`): once a row
+    /// block is final, every later row applies that block's columns in
+    /// ascending order (rows are independent), then the next block finishes
+    /// serially. Each entry sees the serial FMA order, so results are
+    /// bitwise identical.
+    fn forward_blocked(&self, x: &mut [T], cols: usize, block: usize) {
         let n = self.n;
         let mut r0 = 0;
         while r0 < n {
             let r1 = (r0 + block).min(n);
             for i in r0..r1 {
                 for k in r0..i {
-                    x[i] = (-self.l[i + k * n]).mul_add(x[k], x[i]);
+                    let l = -self.l[i + k * n];
+                    for c in 0..cols {
+                        x[i * cols + c] = l.mul_add(x[k * cols + c], x[i * cols + c]);
+                    }
                 }
             }
-            let (head, tail) = x.split_at_mut(r1);
-            let done = &head[r0..r1];
+            let (head, tail) = x.split_at_mut(r1 * cols);
+            let done = &head[r0 * cols..r1 * cols];
             let rows_per = (block / 2).max(1);
-            tail.par_chunks_mut(rows_per)
+            tail.par_chunks_mut(rows_per * cols)
                 .enumerate()
-                .for_each(|(c, rows)| {
-                    for (j, v) in rows.iter_mut().enumerate() {
-                        let i = r1 + c * rows_per + j;
-                        for (k, &xk) in (r0..r1).zip(done) {
-                            *v = (-self.l[i + k * n]).mul_add(xk, *v);
+                .for_each(|(p, rows)| {
+                    for (j, row) in rows.chunks_mut(cols).enumerate() {
+                        let i = r1 + p * rows_per + j;
+                        for (k, xk) in (r0..r1).zip(done.chunks(cols)) {
+                            let l = -self.l[i + k * n];
+                            for (v, &xk) in row.iter_mut().zip(xk) {
+                                *v = l.mul_add(xk, *v);
+                            }
                         }
                     }
                 });
@@ -977,6 +1003,74 @@ impl<T: FloatT> DenseLeaf<T> {
         }
     }
 
+    /// [`Self::forward_suffix_rows`] for the suffix rows `rows` of a panel of
+    /// columns (`x`, `n - start` rows per column): row halves with one exact
+    /// product update of the lower half between them, so a panel reads L once
+    /// instead of once per column; blocks up to `REC_BASE` rows take the
+    /// staged-row dots. One rounding per level, as in [`ldl_rec`]. `ways`:
+    /// workers granted to the products and to the columns of the blocks and
+    /// updates; every entry is computed alike, so the bits do not depend on it.
+    fn forward_panel_rows(
+        &self,
+        x: &mut [T],
+        start: usize,
+        rows: std::ops::Range<usize>,
+        ways: usize,
+    ) {
+        use sdpx_arithmetic::inner_parallel as ip;
+        let (n, width) = (self.n, self.n - start);
+        let (r0, r1) = (rows.start, rows.end);
+        if r1 - r0 <= REC_BASE {
+            let solve = |column: &mut [T]| {
+                for i in r0..r1 {
+                    let r = i + start;
+                    let lo = self
+                        .first
+                        .get(r)
+                        .map_or(start, |&f| f.max(start))
+                        .max(r0 + start);
+                    let v = T::dot_slices(&self.l[r * n + lo..=r * n + r], &column[lo - start..=i]);
+                    column[i] = v;
+                }
+            };
+            if ways > 1 {
+                // columns per task: one grain of dot work
+                let work = ip::weight(T::precision_bits() as usize)
+                    * ((r1 - r0) * (r1 - r0) / 2).max(1) as u128;
+                let tile = (ip::grain() / work).max(1) as usize;
+                x.par_chunks_mut(width).with_min_len(tile).for_each(solve);
+            } else {
+                x.chunks_mut(width).for_each(solve);
+            }
+            return;
+        }
+        let h = (r0 + r1) / 2;
+        self.forward_panel_rows(x, start, r0..h, ways);
+        let (m, cols) = (r1 - h, x.len() / width);
+        let mut p = vec![T::zero(); m * cols];
+        exact_product(
+            (b'N', b'N'),
+            (m, cols, h - r0),
+            (&self.l[start + h + (start + r0) * n..], n),
+            (&x[r0..], width),
+            &mut p,
+            ways,
+        );
+        let update = |(column, update): (&mut [T], &[T])| {
+            for (v, &u) in column[h..r1].iter_mut().zip(update) {
+                *v -= u;
+            }
+        };
+        if ways > 1 {
+            x.par_chunks_mut(width)
+                .zip(p.par_chunks(m))
+                .for_each(update);
+        } else {
+            x.chunks_mut(width).zip(p.chunks(m)).for_each(update);
+        }
+        self.forward_panel_rows(x, start, h..r1, ways);
+    }
+
     /// [`Self::backward`] after [`Self::stage_rows`]`(0)`: each entry is
     /// `x[i] - Σ_{k>i} L_ki x_k` as one exact dot rounded once. Column `i`
     /// from its staged unit diagonal is contiguous, so solved entries are
@@ -993,12 +1087,13 @@ impl<T: FloatT> DenseLeaf<T> {
         }
     }
 
-    /// [`Self::backward`] split over the ambient pool: the bottom row block
+    /// [`Self::backward_many`] split over the ambient pool (row-interleaved
+    /// columns as in [`Self::forward_blocked`]): the bottom row block
     /// finishes serially, then every earlier row applies that block's columns
     /// in parallel. A row sums its terms block by block from the bottom,
     /// ascending within a block: the `back` order of the serial sweep, so
     /// the bits are identical.
-    fn backward_blocked(&self, x: &mut [T]) {
+    fn backward_blocked(&self, x: &mut [T], cols: usize) {
         let n = self.n;
         let block = self.back;
         let mut r1 = n;
@@ -1006,20 +1101,25 @@ impl<T: FloatT> DenseLeaf<T> {
             let r0 = r1.saturating_sub(block);
             for i in (r0..r1).rev() {
                 for k in i + 1..r1 {
-                    x[i] = (-self.l[k + i * n]).mul_add(x[k], x[i]);
+                    let l = -self.l[k + i * n];
+                    for c in 0..cols {
+                        x[i * cols + c] = l.mul_add(x[k * cols + c], x[i * cols + c]);
+                    }
                 }
             }
-            let (head, tail) = x.split_at_mut(r0);
-            let done = &tail[..r1 - r0];
+            let (head, tail) = x.split_at_mut(r0 * cols);
+            let done = &tail[..(r1 - r0) * cols];
             let rows_per = (block / 2).max(1);
-            head.par_chunks_mut(rows_per)
+            head.par_chunks_mut(rows_per * cols)
                 .enumerate()
-                .for_each(|(c, rows)| {
-                    for (j, v) in rows.iter_mut().enumerate() {
-                        let i = c * rows_per + j;
+                .for_each(|(p, rows)| {
+                    for (j, row) in rows.chunks_mut(cols).enumerate() {
+                        let i = p * rows_per + j;
                         let column = &self.l[r0 + i * n..r1 + i * n];
-                        for (&lk, &xk) in column.iter().zip(done) {
-                            *v = (-lk).mul_add(xk, *v);
+                        for (&lk, xk) in column.iter().zip(done.chunks(cols)) {
+                            for (v, &xk) in row.iter_mut().zip(xk) {
+                                *v = (-lk).mul_add(xk, *v);
+                            }
                         }
                     }
                 });
@@ -1127,11 +1227,11 @@ impl<T: FloatT> DenseLeaf<T> {
     /// [`Self::solve`] with both sweeps split over the ambient pool (the
     /// serial order).
     fn solve_blocked(&self, x: &mut [T]) {
-        self.forward_blocked(x, FORWARD_BLOCK);
+        self.forward_blocked(x, 1, FORWARD_BLOCK);
         for (x, d) in x.iter_mut().zip(&self.dinv) {
             *x *= *d;
         }
-        self.backward_blocked(x);
+        self.backward_blocked(x, 1);
     }
 
     /// `solve` with the forward sweep split over `pool`. Rows are processed
@@ -1381,8 +1481,9 @@ impl<T: FloatT> Leaf<T> {
             let (l, y) = (&l, &y);
             let col = ids[lj];
             // SAFETY: leaf column lj alone writes entries (i ≤ lj, lj) of the
-            // factor and row lj of Y. A diagonal outside the pattern stays 0.
-            unsafe { *l.0.add(lj + lj * g) = T::zero() };
+            // factor and row lj of Y. Entries outside the pattern are 0: the
+            // last factor staged −L rows in the strict upper triangle.
+            unsafe { std::slice::from_raw_parts_mut(l.0.add(lj * g), lj + 1) }.fill(T::zero());
             let mut p = 0;
             for q in kkt.colptr[col]..kkt.colptr[col + 1] {
                 let i = kkt.rowval[q];
@@ -1431,6 +1532,8 @@ impl<T: FloatT> Leaf<T> {
         // Large panels copy and scale over the pool (BFSS L13 t5: 5e7
         // entries per ORE leaf ran serially on the leaf phase's tail).
         let wide = split && width > 0 && self.y.len() >= 1 << 16;
+        // Split leaves are the few that dominate the leaf phase.
+        let timer = split_factor.then(crate::receipt::start).flatten();
         if let Some(source) = source {
             self.load(source, split_factor || wide);
             self.factor
@@ -1452,10 +1555,13 @@ impl<T: FloatT> Leaf<T> {
                 self.y.copy_from_slice(&self.b);
             }
         }
+        crate::receipt::finish("arrow.leaf_factor", timer);
         if self.y.is_empty() {
             return Ok(());
         }
-        // Exactly accumulated types solve Y by rows: one exact dot per entry.
+        let timer = split_factor.then(crate::receipt::start).flatten();
+        // Exactly accumulated types solve Y by rows: one exact dot per entry,
+        // or one rounding per level of a wide leaf's panel solve.
         let rows = T::precision_bits() > 64;
         if rows {
             self.factor.stage_rows(start);
@@ -1479,7 +1585,37 @@ impl<T: FloatT> Leaf<T> {
                 ip::weight(T::precision_bits() as usize) * (width * width / 2 * columns) as u128;
             ip::tasks_if(true, work, columns) > 1
         };
-        if split && width > 0 && posted {
+        if rows && width >= REC_FACTOR_MIN {
+            // Per-column dots read the whole factor once per coupled column;
+            // a panel reads it once. Panels run in turn, with the pool's
+            // workers for a split leaf (as the factor's own products) or
+            // alone. A column's bits depend on neither its panel nor the
+            // workers, so the choice is by width alone: Y keeps its bits at
+            // every thread count.
+            let ways = if split_factor {
+                rayon::current_num_threads()
+            } else {
+                1
+            };
+            let mut columns: Vec<&mut [T]> = self
+                .y
+                .chunks_mut(width)
+                .enumerate()
+                .filter(|(j, _)| packed || couples[*j])
+                .map(|(_, column)| column)
+                .collect();
+            let mut x = Vec::with_capacity(width * columns.len().min(Y_PANEL));
+            for panel in columns.chunks_mut(Y_PANEL) {
+                x.clear();
+                for column in panel.iter() {
+                    x.extend_from_slice(column);
+                }
+                factor.forward_panel_rows(&mut x, start, 0..width, ways);
+                for (column, solved) in panel.iter_mut().zip(x.chunks(width)) {
+                    column.copy_from_slice(solved);
+                }
+            }
+        } else if split && width > 0 && posted {
             // One posted item per column block, so idle workers of the leaf
             // phase help the longest Y first and no worker waits in a join.
             let columns: Vec<std::sync::Mutex<&mut [T]>> = self
@@ -1507,6 +1643,7 @@ impl<T: FloatT> Leaf<T> {
                 solve(&mut self.y[j * width..(j + 1) * width]);
             }
         }
+        crate::receipt::finish("arrow.leaf_y", timer);
         if !self.z.is_empty() && width > 0 {
             let columns = if packed { self.coupled.len() } else { t };
             let dinv = &self.factor.dinv[start..];
@@ -1547,9 +1684,11 @@ impl<T: FloatT> Leaf<T> {
         if chunks > 1 {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::forward_many);
-        } else if cols == 1 && split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
-            // One column has the single-RHS layout and order.
-            self.factor.forward_blocked(&mut self.batch_w, LEAF_BLOCK);
+        } else if split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
+            // Too few columns to split them (the constant and affine pair):
+            // rows split instead, each column in the serial order.
+            self.factor
+                .forward_blocked(&mut self.batch_w, cols, LEAF_BLOCK);
         } else {
             self.factor.forward_many(&mut self.batch_w, cols);
         }
@@ -1593,8 +1732,8 @@ impl<T: FloatT> Leaf<T> {
         if chunks > 1 {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::backward_many);
-        } else if cols == 1 && split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
-            self.factor.backward_blocked(&mut self.batch_w);
+        } else if split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
+            self.factor.backward_blocked(&mut self.batch_w, cols);
         } else {
             self.factor.backward_many(&mut self.batch_w, cols);
         }
@@ -1618,7 +1757,7 @@ impl<T: FloatT> Leaf<T> {
             *w = rhs[id];
         }
         if split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
-            self.factor.forward_blocked(&mut self.w, LEAF_BLOCK);
+            self.factor.forward_blocked(&mut self.w, 1, LEAF_BLOCK);
         } else {
             self.factor.forward(&mut self.w);
         }
@@ -1657,7 +1796,7 @@ impl<T: FloatT> Leaf<T> {
             self.w.iter_mut().enumerate().for_each(update);
         }
         if split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
-            self.factor.backward_blocked(&mut self.w);
+            self.factor.backward_blocked(&mut self.w, 1);
         } else {
             self.factor.backward(&mut self.w);
         }
@@ -1703,8 +1842,8 @@ impl<T: FloatT> Leaf<T> {
         if chunks > 1 {
             self.factor
                 .chunked(&mut self.batch_w, cols, chunks, DenseLeaf::backward_many);
-        } else if cols == 1 && split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
-            self.factor.backward_blocked(&mut self.batch_w);
+        } else if split && self.factor.n >= f64_scaled::<T>(LEAF_SPLIT_MIN, 16) {
+            self.factor.backward_blocked(&mut self.batch_w, cols);
         } else {
             self.factor.backward_many(&mut self.batch_w, cols);
         }
@@ -2231,19 +2370,63 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     /// Eligibility is structural only: connected components of the
     /// positive-sign subgraph become leaves, negative-sign variables become
     /// the border.  Returns `None` when the shape is not exploitable, so the
-    /// caller transparently keeps QDLDL.
-    pub fn try_new(k: &CscMatrix<T>, signs: &[i8], settings: &CoreSettings<T>) -> Option<Self> {
-        let (groups, trunk, _) = Self::plan(k, signs)?;
+    /// caller transparently keeps QDLDL. `ldl_nnz` is the sparse LDL factor
+    /// size of `k` (0 when unknown); see [`ARROW_MAX_BYTES`].
+    pub fn try_new(
+        k: &CscMatrix<T>,
+        signs: &[i8],
+        settings: &CoreSettings<T>,
+        ldl_nnz: usize,
+    ) -> Option<Self> {
+        let (groups, trunk, _) = Self::plan(k, signs, ldl_nnz)?;
         Some(Self::from_groups(k, signs, settings, groups, trunk, None))
     }
 
     /// Dense work estimate of the arrow of `signs`; `None` when ineligible.
-    pub fn work(k: &CscMatrix<T>, signs: &[i8]) -> Option<u128> {
-        Self::plan(k, signs).map(|(_, _, work)| work)
+    pub fn work(k: &CscMatrix<T>, signs: &[i8], ldl_nnz: usize) -> Option<u128> {
+        Self::plan(k, signs, ldl_nnz).map(|(_, _, work)| work)
+    }
+
+    /// Dense values of leaves of sizes `leaves` and a `t`-wide border (per
+    /// leaf h and L, b and y, solve vectors; the border's C and factor, plus
+    /// the exact-dots retry's rows), and whether they [`Self::fits`].
+    fn storage(
+        k: &CscMatrix<T>,
+        leaves: impl IntoIterator<Item = usize>,
+        t: usize,
+        ldl_nnz: usize,
+    ) -> (u128, bool) {
+        let t = t as u128;
+        let cells = leaves
+            .into_iter()
+            .map(|g| 2 * (g as u128).pow(2) + 2 * g as u128 * t + 8 * g as u128)
+            .sum::<u128>()
+            + 3 * t * t
+            + 8 * k.n as u128;
+        (cells, Self::fits(k, cells, ldl_nnz))
+    }
+
+    /// Whether the bytes of `cells` dense values fit [`ARROW_MAX_BYTES`] or
+    /// `ARROW_KKT_FACTOR` times the larger of the stored KKT and `ldl_nnz`.
+    fn fits(k: &CscMatrix<T>, cells: u128, ldl_nnz: usize) -> bool {
+        let size = std::mem::size_of::<T>() as u128;
+        cells * size <= ARROW_MAX_BYTES.max(ARROW_KKT_FACTOR * k.nnz().max(ldl_nnz) as u128 * size)
+    }
+
+    /// A single leaf pays only as a large dense block (an owner rank holding
+    /// one sampled PSD block): the dense, pool-parallel leaf factor then
+    /// replaces scalar sparse LDL. `positive_entries`: its stored upper
+    /// entries.
+    fn dense_leaf(g: usize, positive_entries: usize) -> bool {
+        g >= SINGLE_LEAF_MIN && 2 * positive_entries >= g * (g + 1) / 2
     }
 
     /// [`Self::try_new`]'s leaves, border and dense work estimate.
-    fn plan(k: &CscMatrix<T>, signs: &[i8]) -> Option<(Vec<Vec<usize>>, Vec<usize>, u128)> {
+    fn plan(
+        k: &CscMatrix<T>,
+        signs: &[i8],
+        ldl_nnz: usize,
+    ) -> Option<(Vec<Vec<usize>>, Vec<usize>, u128)> {
         let n = k.n;
         debug_assert!(k.m == n && signs.len() == n && signs.iter().all(|&s| s == 1 || s == -1));
         if n == 0 {
@@ -2280,19 +2463,8 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let n_pos = (n - t) as u128;
         // Generic arrows no longer store h, b or C (they read the KKT), but
         // admission still counts them: the backend choice is unchanged.
-        let cells: u128 = groups
-            .iter()
-            .map(|g| {
-                let g = g.len() as u128;
-                // h and L; b and y; solve vectors.
-                2 * g * g + 2 * g * t as u128 + 8 * g
-            })
-            .sum::<u128>()
-            // C and the border factor, plus the exact-dots retry's rows
-            + 3 * (t as u128).pow(2)
-            + 8 * n as u128;
-        let max_bytes = ARROW_MAX_BYTES
-            .max(ARROW_KKT_FACTOR * k.nnz() as u128 * std::mem::size_of::<T>() as u128);
+        let (mut cells, mut storage_ok) =
+            Self::storage(k, groups.iter().map(|g| g.len()), t, ldl_nnz);
         // Dense work estimates: leaf factorizations ~ sum(g^3)/3, coupling
         // transforms ~ n_pos*t^2/2, trunk factor ~ t^3/3.  Arrow only pays
         // when real dense leaf blocks exist to amortize that dense
@@ -2302,14 +2474,12 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let leaf_work: u128 = groups.iter().map(|g| (g.len() as u128).pow(3)).sum();
         let border_work = n_pos * (t as u128).pow(2) + (t as u128).pow(3);
         let mut work_ok = border_work <= 24 * leaf_work.max(1);
-        // A single leaf pays only when it is a large dense block (an owner
-        // rank holding one sampled PSD block): the dense, pool-parallel leaf
-        // factor then replaces scalar sparse LDL. Sparse single components
-        // (e.g. a connected LP) stay on the sparse backend.
+        // Sparse single components (e.g. a connected LP) stay on the sparse
+        // backend.
         let leaves_ok = groups.len() >= 2
-            || groups.first().is_some_and(|g| {
-                g.len() >= SINGLE_LEAF_MIN && 2 * positive_entries >= g.len() * (g.len() + 1) / 2
-            });
+            || groups
+                .first()
+                .is_some_and(|g| Self::dense_leaf(g.len(), positive_entries));
         // Leaves store B and Y over the border columns they couple to, and
         // their Y solves and Schur products touch only those. A dense leaf's
         // products over its coupled columns are updates any sparse
@@ -2320,12 +2490,11 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         // L13 t5: 63 cone leaves over 13156 primal columns, 42% coupled;
         // QDLDL ran one thread). The returned estimate, which orients the
         // arrow, keeps the full form.
-        let mut cells = cells;
         let mut coupled_work = 0u128;
         if T::precision_bits() > 64
             && leaves_ok
             && (t as u128).pow(3) <= 24 * leaf_work.max(1)
-            && (!work_ok || cells * std::mem::size_of::<T>() as u128 > max_bytes)
+            && (!work_ok || !storage_ok)
         {
             let mut owner = vec![usize::MAX; n];
             let mut local = vec![0usize; n];
@@ -2344,6 +2513,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 coupled_work += g * q * q;
             }
             cells = coupled_cells + 4 * (t as u128).pow(2) + 8 * n as u128;
+            storage_ok = Self::fits(k, cells, ldl_nnz);
             work_ok = true;
         }
         if crate::receipt::profile_requested() {
@@ -2357,13 +2527,14 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 .filter(|&(i, j)| signs[i] != signs[j])
                 .count();
             eprintln!(
-                "GROUP_STATS n={n} components={} leaf_min={} leaf_med={} leaf_max={} border={t} coupling_nnz={coupling} dense_mib={:.1} leaf_work={leaf_work} border_work={border_work} coupled_work={coupled_work} eligible={}",
+                "GROUP_STATS n={n} components={} leaf_min={} leaf_med={} leaf_max={} border={t} coupling_nnz={coupling} dense_mib={:.1} kkt_nnz={} ldl_nnz={ldl_nnz} leaf_work={leaf_work} border_work={border_work} coupled_work={coupled_work} eligible={}",
                 groups.len(),
                 sizes.first().copied().unwrap_or(0),
                 sizes.get(sizes.len() / 2).copied().unwrap_or(0),
                 sizes.last().copied().unwrap_or(0),
                 cells as f64 * std::mem::size_of::<T>() as f64 / 1048576.0,
-                leaves_ok && work_ok && cells * std::mem::size_of::<T>() as u128 <= max_bytes,
+                k.nnz(),
+                leaves_ok && work_ok && storage_ok,
             );
         }
         if !leaves_ok {
@@ -2372,7 +2543,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         if !work_ok {
             return None;
         }
-        if cells * std::mem::size_of::<T>() as u128 > max_bytes {
+        if !storage_ok {
             return None;
         }
         Some((groups, trunk, leaf_work + border_work))
@@ -2388,13 +2559,51 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         signs: &[i8],
         settings: &CoreSettings<T>,
         perm: Option<Vec<usize>>,
+        ldl_nnz: usize,
     ) -> Option<Negated<T>> {
         // A generic arrow reads only the pattern here: refactors negate.
         let signs: Vec<i8> = signs.iter().map(|&s| -s).collect();
-        let mut inner = Self::try_new(k, &signs, settings)?;
+        let mut inner = Self::try_new(k, &signs, settings, ldl_nnz)?;
         inner.fallback_perm = perm;
         inner.negated = true;
         Some(Negated { inner })
+    }
+
+    /// One dense leaf of every positive-sign variable, the negative-sign
+    /// ones as border, when the serial sparse factor would cost more than the
+    /// dense one spread over the pool (`super::dense_factor`): the pooled
+    /// dense kernels then replace serial sparse LDL (Ising 85-site condensed
+    /// KKT at 128 bits: QDLDL took about 30 minutes per factorization on
+    /// 3–5 busy cores of 128). Same element cap as `dense_block`; like a
+    /// natural single leaf, the positive block must be half dense (a sparse
+    /// one, such as an LP's zero P, would pivot on exact zeros: MPFR has no
+    /// static shift) and the dense storage must stay within the arrow bound
+    /// for QDLDL's factor size.
+    pub fn try_dense(
+        k: &CscMatrix<T>,
+        signs: &[i8],
+        settings: &CoreSettings<T>,
+        amd: &mut Option<super::AmdOrdering>,
+    ) -> Option<Self> {
+        let (leaf, trunk): (Vec<usize>, Vec<usize>) = (0..k.n).partition(|&i| signs[i] > 0);
+        let (g, t) = (leaf.len(), trunk.len());
+        if g < 128 || (g * g + g * t + t * t) as u128 > 256 * 1024 * 1024 {
+            return None;
+        }
+        let positive_entries = (0..k.n)
+            .flat_map(|j| (k.colptr[j]..k.colptr[j + 1]).map(move |q| (k.rowval[q], j)))
+            .filter(|&(i, j)| signs[i] > 0 && signs[j] > 0)
+            .count();
+        if !Self::dense_leaf(g, positive_entries) || !super::dense_factor(k, settings, amd, true) {
+            return None;
+        }
+        let lnz = amd.as_ref().map_or(0, |o| o.2.lnz);
+        if !Self::storage(k, [g], t, lnz).1 {
+            return None;
+        }
+        let mut solver = Self::from_groups(k, signs, settings, vec![leaf], trunk, None);
+        solver.fallback_perm = amd.as_ref().map(|o| o.0.clone());
+        Some(solver)
     }
 
     /// Leaves made of an SOC block followed by one primal column with a
@@ -2808,6 +3017,59 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         }
     }
 
+    fn reg(&self) -> Option<(T, T)> {
+        self.settings.dynamic_regularization_enable.then_some((
+            self.settings.dynamic_regularization_eps,
+            self.settings.dynamic_regularization_delta,
+        ))
+    }
+
+    /// Whether the QDLDL fallback meets a zero pivot as well: its ordering
+    /// eliminates a singleton leaf before every border column, so that pivot
+    /// is the leaf's unmodified diagonal entry, under the same dynamic
+    /// regularization.
+    fn fallback_meets_zero(&self, kkt: &CscMatrix<T>) -> bool {
+        let Some(perm) = &self.fallback_perm else {
+            return false;
+        };
+        let mut pos = vec![0; perm.len()];
+        perm.iter().enumerate().for_each(|(i, &k)| pos[k] = i);
+        let border = self
+            .trunk
+            .iter()
+            .map(|&k| pos[k])
+            .min()
+            .unwrap_or(perm.len());
+        let reg = self.reg();
+        self.leaves.iter().any(|leaf| {
+            let &[row] = leaf.ids.as_slice() else {
+                return false;
+            };
+            let sign = T::from_i8(self.signs[row]).unwrap();
+            pos[row] < border
+                && self
+                    .first_entry(leaf, kkt)
+                    .is_some_and(|d| DenseLeaf::pivot(d, sign, reg, &mut 0) == Err("zero_pivot"))
+        })
+    }
+
+    /// A leaf's unmodified (0, 0) entry: its first pivot. Generic leaves
+    /// read it from the KKT's diagonal (the last entry of its `Triu`
+    /// column, 0 when absent), negated for −K.
+    fn first_entry(&self, leaf: &Leaf<T>, kkt: &CscMatrix<T>) -> Option<T> {
+        if self.local_structure.is_some() {
+            return leaf.h.first().copied();
+        }
+        let &id = leaf.ids.first()?;
+        let q = kkt.colptr[id + 1]
+            .checked_sub(1)
+            .filter(|&q| q >= kkt.colptr[id]);
+        let d = q
+            .filter(|&q| kkt.rowval[q] == id)
+            .map_or(T::zero(), |q| kkt.nzval[q]);
+        Some(if self.negated { -d } else { d })
+    }
+
     fn owned_leaves(&self) -> std::ops::Range<usize> {
         self.ranks
             .as_ref()
@@ -2831,10 +3093,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             negate: self.negated,
         });
         let source = source.as_ref();
-        let reg = self.settings.dynamic_regularization_enable.then_some((
-            self.settings.dynamic_regularization_eps,
-            self.settings.dynamic_regularization_delta,
-        ));
+        let reg = self.reg();
         let t = self.trunk.len();
         let owned = self.owned_leaves();
         let timer = crate::receipt::start();
@@ -2862,8 +3121,11 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             // Products are admitted largest first while their workspace fits
             // one contribution batch (`BATCH_WORK_BYTES`); the others form in
             // `subtract_contributions`, batched as before.
-            // A product above a worker's share of all products' work splits
-            // into that many ways (the largest would otherwise end the phase).
+            // A product of at least a worker's share of all products' work
+            // may take every worker. The largest leaves are claimed first but
+            // finish last, so their products end the phase while lanes out of
+            // leaves help (Hubbard cubic3 at 16 threads: 1.45 shares rounded
+            // down to one way formed the last product serially in 2.2 s).
             // Wide products wait for `subtract_contributions`, which gives
             // them every worker.
             let mut admitted = vec![false; owned.len()];
@@ -2893,7 +3155,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
                 .map(|(l, _)| product_work(l))
                 .sum();
             let share = products / threads as f64;
-            let ways = |l: &Leaf<T>| crate::algebra::measured_ways(product_work(l), share);
+            let ways = |l: &Leaf<T>| if product_work(l) >= share { threads } else { 1 };
             // Counts are diagnostic only; no per-leaf counter buffer is needed.
             let count = AtomicUsize::new(0);
             // Lanes serve a leaf that splits its factor (a straggler, whose
@@ -3085,10 +3347,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     }
 
     fn factor_border(&mut self) -> bool {
-        let reg = self.settings.dynamic_regularization_enable.then_some((
-            self.settings.dynamic_regularization_eps,
-            self.settings.dynamic_regularization_delta,
-        ));
+        let reg = self.reg();
         let mut border_count = 0usize;
         let timer = crate::receipt::start();
         // Every pool thread is idle during the border factor.
@@ -3141,7 +3400,13 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let indices: Vec<usize> = (0..self.rowval.len()).collect();
         solver.update_values(&indices, &matrix.nzval);
         solver.set_pool(self.pool.clone());
-        solver.refactor(&matrix)
+        // A failed fallback would keep its whole sparse factor for the rest
+        // of the solve (Hubbard all3 at 128 bits: 6.2 GiB).
+        let ok = solver.refactor(&matrix);
+        if !ok {
+            self.fallback = None;
+        }
+        ok
     }
 
     fn solve_arrow(&mut self, x: &mut [T], b: &[T]) {
@@ -3357,6 +3622,27 @@ impl<T: FloatT> HasLinearSolverInfo for ArrowLDLSolver<T> {
     }
 }
 
+impl<T: FloatT> ArrowLDLSolver<T> {
+    /// The constructing thread wrote the leaf and trunk storage, so all of
+    /// it sits on that thread's NUMA node. Rewrite the large arrays on the
+    /// pool, which works on them, to spread their pages over its nodes.
+    fn spread(&mut self, pool: &rayon::ThreadPool) {
+        let spread = |v: &mut Vec<T>| {
+            if let Some(copy) = crate::algebra::scratch::spread_vec(v.len(), |i| v[i], pool) {
+                *v = copy;
+            }
+        };
+        for leaf in &mut self.leaves {
+            for v in [&mut leaf.h, &mut leaf.b, &mut leaf.y, &mut leaf.factor.l] {
+                spread(v);
+            }
+        }
+        for v in [&mut self.c, &mut self.tf.l] {
+            spread(v);
+        }
+    }
+}
+
 impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
     /// Routes local structures' entries; generic arrows read the KKT at
     /// refactor instead.
@@ -3434,10 +3720,28 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
     }
 
     fn refactor(&mut self, kkt: &CscMatrix<T>) -> bool {
-        self.use_arrow = self.factor_arrow(kkt);
+        // A leaf's first pivot is its unmodified (0, 0) entry. When that is
+        // zero the leaf phase fails as well, but only after every other
+        // leaf's factor and product (the Zero-cone singletons of an ORE −K
+        // before the MPFR shift escalates).
+        let reg = self.reg();
+        let zero = self.leaves.iter().any(|leaf| {
+            let sign = leaf
+                .signs
+                .first()
+                .map_or(-T::one(), |&s| T::from_i8(s).unwrap());
+            self.first_entry(leaf, kkt)
+                .is_some_and(|d| DenseLeaf::pivot(d, sign, reg, &mut 0) == Err("zero_pivot"))
+        });
+        self.use_arrow = !zero && self.factor_arrow(kkt);
         // A general fallback ordering needs every static shift: report the
         // failure so the caller escalates, which also ends the exemption.
         if !self.use_arrow && self.shift_exempt && !self.unshifted.is_empty() {
+            return false;
+        }
+        if zero && self.fallback_meets_zero(kkt) {
+            // As after a failed fallback, no older factor stays in use.
+            self.fallback = None;
             return false;
         }
         self.use_arrow || self.factor_fallback(kkt)
@@ -3453,7 +3757,13 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
 
     fn solve_many(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T], cols: usize) {
         if !self.use_arrow {
-            self.fallback.as_mut().unwrap().solve_many(kkt, x, b, cols);
+            // A failed factor keeps no fallback; a caller that solves
+            // anyway (the symmetric default start) gets NaN, as from a
+            // failed QDLDL factor.
+            match self.fallback.as_mut() {
+                Some(f) => f.solve_many(kkt, x, b, cols),
+                None => x.fill(T::nan()),
+            }
             return;
         }
         let (n, t) = (self.n, self.trunk.len());
@@ -3658,13 +3968,21 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
 
     fn solve(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T]) {
         if !self.use_arrow {
-            self.fallback.as_mut().unwrap().solve(kkt, x, b);
+            match self.fallback.as_mut() {
+                Some(f) => f.solve(kkt, x, b),
+                None => x.fill(T::nan()),
+            }
             return;
         }
         self.solve_arrow(x, b);
     }
 
     fn set_pool(&mut self, pool: Option<Arc<rayon::ThreadPool>>) {
+        if let Some(p) = pool.as_ref() {
+            if !self.pool.as_ref().is_some_and(|q| Arc::ptr_eq(p, q)) {
+                self.spread(p);
+            }
+        }
         self.pool = pool;
     }
 
@@ -3743,20 +4061,28 @@ mod tests {
             // Forward: bitwise identical.
             let (mut s, mut b) = (rhs.clone(), rhs.clone());
             leaf.forward(&mut s);
-            pool.install(|| leaf.forward_blocked(&mut b, LEAF_BLOCK));
+            pool.install(|| leaf.forward_blocked(&mut b, 1, LEAF_BLOCK));
             assert_eq!(s, b);
+            let pair: Vec<T> = rhs.iter().flat_map(|&v| [v, -v]).collect();
+            let (mut s2, mut b2) = (pair.clone(), pair.clone());
+            leaf.forward_many(&mut s2, 2);
+            pool.install(|| leaf.forward_blocked(&mut b2, 2, LEAF_BLOCK));
+            assert_eq!(s2, b2);
             // Backward: the shared block order, bitwise identical, and equal to
             // the batched sweep column by column.
             let (mut s, mut b) = (rhs.clone(), rhs.clone());
             leaf.backward(&mut s);
-            pool.install(|| leaf.backward_blocked(&mut b));
+            pool.install(|| leaf.backward_blocked(&mut b, 1));
             assert_eq!(s, b);
-            let mut many: Vec<T> = rhs.iter().flat_map(|&v| [v, -v]).collect();
+            let mut many = pair.clone();
             leaf.backward_many(&mut many, 2);
             for (i, &v) in s.iter().enumerate() {
                 assert_eq!(many[2 * i], v);
                 assert_eq!(many[2 * i + 1], -v);
             }
+            let mut blocked = pair.clone();
+            pool.install(|| leaf.backward_blocked(&mut blocked, 2));
+            assert_eq!(many, blocked);
         }
     }
     use sdpx_arithmetic::MpFloat;
@@ -3861,7 +4187,7 @@ mod tests {
                 .collect(),
         );
         let settings = CoreSettings::<T>::default();
-        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings).unwrap();
+        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings, 0).unwrap();
         assert!(solver.refactor(&k));
         // 16 workers over 3 leaves split the refactor's border columns and
         // chunk the 8/16-column panels; every result must stay bitwise equal.
@@ -3966,6 +4292,27 @@ mod tests {
                 assert!(j >= first(i) || v.is_zero());
                 assert!(close(v, dots.l[i + j * n]), "({i}, {j})");
             }
+        }
+        // The blocked panel forward solve of a staged suffix matches the
+        // per-column dots to rounding, with the same bits on a pool.
+        let (start, cols) = (7, 5);
+        let width = n - start;
+        serial.stage_rows(start);
+        let panel: Vec<T> = (0..width * cols)
+            .map(|e| T::from_f64(((e * 7) % 23) as f64 / 23.0 - 0.4).unwrap())
+            .collect();
+        let mut blocked = panel.clone();
+        serial.forward_panel_rows(&mut blocked, start, 0..width, 1);
+        let mut pooled = panel.clone();
+        pool.install(|| serial.forward_panel_rows(&mut pooled, start, 0..width, 8));
+        assert_eq!(blocked, pooled);
+        let mut per_column = panel;
+        for column in per_column.chunks_mut(width) {
+            serial.forward_suffix_rows(column, start);
+        }
+        assert_ne!(blocked, per_column);
+        for (e, (&b, &c)) in blocked.iter().zip(&per_column).enumerate() {
+            assert!(close(b, c), "{e}");
         }
     }
     #[test]
@@ -4108,7 +4455,7 @@ mod tests {
         let k = CscMatrix::new(n, n, colptr, rowval, nzval);
         let signs: Vec<i8> = (0..n).map(|i| if i < g { 1 } else { -1 }).collect();
         let settings = CoreSettings::<f64>::default();
-        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings).unwrap();
+        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings, 0).unwrap();
         assert!(solver.refactor(&k) && solver.use_arrow);
         let b: Vec<f64> = (0..n).map(|i| (i as f64 - 7.0) / 5.0).collect();
         let mut x = vec![0.0; n];
@@ -4163,7 +4510,7 @@ mod tests {
         let k = CscMatrix::new(n, n, colptr, rowval, nzval);
         let signs = vec![1i8; n];
         let mut solver =
-            ArrowLDLSolver::try_new(&k, &signs, &CoreSettings::<T>::default()).unwrap();
+            ArrowLDLSolver::try_new(&k, &signs, &CoreSettings::<T>::default(), 0).unwrap();
         assert!(solver.refactor(&k) && solver.use_arrow && solver.trunk.is_empty());
         let b: Vec<T> = (0..n * cols)
             .map(|e| T::from_f64(((e * 13) % 17) as f64 / 17.0 - 0.3).unwrap())
@@ -4290,7 +4637,7 @@ mod tests {
     fn arrow_solves_quasidefinite_and_falls_back() {
         let (k, signs) = arrow_kkt();
         let settings = CoreSettings::<f64>::default();
-        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings).unwrap();
+        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings, 0).unwrap();
         assert_eq!(solver.leaves.len(), 3);
         assert_eq!(solver.trunk, vec![5, 6]);
         assert!(solver.refactor(&k));
@@ -4305,28 +4652,32 @@ mod tests {
         }
         // single connected positive component: not eligible
         let (k1, s1) = arrow_kkt_merged(true);
-        assert!(ArrowLDLSolver::try_new(&k1, &s1, &settings).is_none());
+        assert!(ArrowLDLSolver::try_new(&k1, &s1, &settings, 0).is_none());
         // QDLDL parity: a wrong-sign leaf pivot is regularized, not rejected.
         // A generic arrow reads its values from the KKT it refactors.
         let (mut k2, s2) = arrow_kkt();
         let diag0 = k2.colptr[1] - 1; // (0,0) is the last entry of column 0
-        let mut solver = ArrowLDLSolver::try_new(&k2, &s2, &settings).unwrap();
+        let mut solver = ArrowLDLSolver::try_new(&k2, &s2, &settings, 0).unwrap();
         k2.nzval[diag0] = -100.0;
         assert!(solver.refactor(&k2));
         assert!(solver.use_arrow);
         assert!(solver.regularize_count > 0);
         // Both backends must reject a zero singleton pivot when dynamic
-        // regularization is disabled, then recover after restoring it.
+        // regularization is disabled (the failed fallback is dropped and a
+        // solve gives NaN), then recover after restoring it.
         let (k3, s3) = arrow_kkt();
         let mut settings3 = CoreSettings::<f64>::default();
         settings3.dynamic_regularization_enable = false;
         let diag4 = k3.colptr[5] - 1; // (4,4)
-        let mut solver = ArrowLDLSolver::try_new(&k3, &s3, &settings3).unwrap();
+        let mut solver = ArrowLDLSolver::try_new(&k3, &s3, &settings3, 0).unwrap();
         let mut zero = k3.clone();
         zero.nzval[diag4] = 0.0;
         assert!(!solver.refactor(&zero));
         assert!(!solver.use_arrow);
-        assert!(solver.fallback.is_some());
+        assert!(solver.fallback.is_none());
+        let mut x = vec![0.0; k3.n];
+        solver.solve(&zero, &mut x, &mut b.clone());
+        assert!(x.iter().all(|v| v.is_nan()));
         assert!(solver.refactor(&k3));
         assert!(solver.use_arrow);
         let mut rhs = b.clone();
@@ -4361,7 +4712,7 @@ mod tests {
             .collect();
         let expect = reference_solve(&k64, &b64);
         let settings = CoreSettings::<MpFloat<2>>::default();
-        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings).unwrap();
+        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings, 0).unwrap();
         assert!(solver.refactor(&k));
         assert!(solver.use_arrow);
         let mut rhs = b.clone();
@@ -4407,7 +4758,49 @@ mod tests {
             .into_iter()
             .chain(vec![-1i8; t])
             .collect::<Vec<_>>();
-        assert!(ArrowLDLSolver::try_new(&k, &signs, &CoreSettings::<f64>::default()).is_none());
+        assert!(ArrowLDLSolver::try_new(&k, &signs, &CoreSettings::<f64>::default(), 0).is_none());
+    }
+
+    /// An exact-dot leaf whose block is a star: L fills (2, 1), which
+    /// `stage_rows` mirrors outside the KKT pattern. Each refactor must load
+    /// the same block, so a repeated refactor solves bitwise the same.
+    #[test]
+    fn arrow_reload_clears_staged_rows() {
+        type T = sdpx_arithmetic::Bits512;
+        // Leaves {0, 1, 2} (no (1, 2) entry) and {3}; border {4, 5}.
+        let columns: [&[(usize, f64)]; 6] = [
+            &[(0, 4.)],
+            &[(0, 1.), (1, 4.)],
+            &[(0, 1.), (2, 4.)],
+            &[(3, 4.)],
+            &[(0, 1.), (3, 1.), (4, -4.)],
+            &[(2, 1.), (3, 0.5), (4, 0.25), (5, -4.)],
+        ];
+        let mut colptr = vec![0];
+        let (mut rowval, mut nzval) = (Vec::new(), Vec::new());
+        for column in columns {
+            for &(i, v) in column {
+                rowval.push(i);
+                nzval.push(T::from_f64(v).unwrap());
+            }
+            colptr.push(rowval.len());
+        }
+        let k = CscMatrix::new(6, 6, colptr, rowval, nzval);
+        let signs = [1, 1, 1, 1, -1, -1];
+        let settings = CoreSettings::<T>::default();
+        let mut solver = ArrowLDLSolver::try_new(&k, &signs, &settings, 0).unwrap();
+        let b: Vec<T> = (0..6)
+            .map(|i| T::from_f64(i as f64 - 2.).unwrap())
+            .collect();
+        let mut solves = Vec::new();
+        for _ in 0..2 {
+            assert!(solver.refactor(&k));
+            assert!(solver.use_arrow);
+            let mut x = vec![T::zero(); 6];
+            solver.solve(&k, &mut x, &mut b.clone());
+            solves.push(x);
+        }
+        assert_eq!(solves[0], solves[1]);
     }
     include!("arrow_storage_tests.rs");
 }

@@ -90,8 +90,9 @@ pub struct QDLDLFactorisation<T = f64> {
     /// shared solver thread pool for elimination-tree parallelism
     pool: Option<Arc<rayon::ThreadPool>>,
     /// elimination-tree schedule for parallel factorisation/solve, built
-    /// when a pool is first attached (its scratch is O(groups × n));
-    /// `Some(None)` when the symbolic pattern does not admit the scheme
+    /// when a pool is first attached (its scratch is O(n));
+    /// `Some(None)` when the symbolic pattern does not admit the scheme or
+    /// the pool would not repay it
     plan: Option<Option<ParallelPlan<T>>>,
 }
 
@@ -121,12 +122,13 @@ where
 
     /// Share the solver thread pool with the factorisation/solve kernels.
     /// Elimination-tree parallelism is only used when the symbolic pattern
-    /// admits it; the serial kernels run otherwise.
+    /// admits it and the pool repays it; the serial kernels run otherwise.
     pub fn set_pool(&mut self, pool: Option<Arc<rayon::ThreadPool>>) {
-        if pool.is_some() && self.plan.is_none() {
+        if let Some(p) = pool.as_ref().filter(|_| self.plan.is_none()) {
             let ws = &self.workspace;
             let n = self.D.len();
-            let plan = ParallelPlan::build(n, &ws.etree, &ws.Lnz, &self.L.colptr, &self.L.rowval);
+            let (lp, li) = (&self.L.colptr, &self.L.rowval);
+            let plan = ParallelPlan::build(n, &ws.etree, &ws.Lnz, lp, li, p.current_num_threads());
             if crate::receipt::profile_requested() {
                 static DUMPED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);

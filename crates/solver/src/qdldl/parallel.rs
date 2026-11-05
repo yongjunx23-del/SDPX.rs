@@ -67,9 +67,9 @@ impl<T: FloatT> ColStore<T> {
     }
 }
 
-/// Per-group reusable scratch.  Dense vectors are indexed by global column;
-/// positions outside the group are never touched, matching the serial code
-/// where untouched positions keep their stale values.
+/// Per-group reusable scratch.  Dense vectors are indexed by the column's
+/// slot in its group (`rank_of`): a leaf column's rows lie in its own group
+/// or the trunk, so a group never touches another group's positions.
 #[derive(Debug)]
 struct GroupWs<T> {
     y_vals: Vec<T>,
@@ -83,35 +83,50 @@ struct GroupWs<T> {
     err: bool,
     /// (path sequence, column) pairs for the current trunk row.
     row_cols: Vec<(u32, usize)>,
-    /// Trunk-position contributions as (path sequence, value), bucketed by
-    /// trunk rank, recorded in the order the segment consumed its columns.
-    trunk_delta: Vec<Vec<(u32, T)>>,
+    /// Trunk-position contributions as (path sequence, trunk rank, value),
+    /// in the order the segment consumed its columns.
+    trunk_delta: Vec<(u32, u32, T)>,
     /// (path sequence, `y_c * Lx_tmp`) contributions to `D[k]`.
     d_delta: Vec<(u32, T)>,
-    /// Forward-solve scratch and trunk-position contributions.
+    /// Forward-solve scratch and its trunk-position contributions as
+    /// (column, trunk rank, value).
     xbuf: Vec<T>,
-    solve_delta: Vec<Vec<(u32, T)>>,
+    solve_delta: Vec<(u32, u32, T)>,
 }
 
 impl<T: FloatT> GroupWs<T> {
-    fn new(n: usize, ntrunk: usize) -> Self {
+    fn new(size: usize) -> Self {
         Self {
-            y_vals: vec![T::zero(); n],
-            y_markers: vec![false; n],
-            y_idx: vec![0; n],
-            elim: vec![0; n],
-            d: vec![T::zero(); n],
-            dinv: vec![T::zero(); n],
+            y_vals: vec![T::zero(); size],
+            y_markers: vec![false; size],
+            y_idx: vec![0; size],
+            elim: vec![0; size],
+            d: vec![T::zero(); size],
+            dinv: vec![T::zero(); size],
             pos_count: 0,
             reg_count: 0,
             err: false,
             row_cols: Vec::new(),
-            trunk_delta: vec![Vec::new(); ntrunk],
+            trunk_delta: Vec::new(),
             d_delta: Vec::new(),
-            xbuf: vec![T::zero(); n],
-            solve_delta: vec![Vec::new(); ntrunk],
+            xbuf: vec![T::zero(); size],
+            solve_delta: Vec::new(),
         }
     }
+}
+
+/// Mutable references to `v[i]` for the sorted, distinct indices `ids`.
+fn pick_mut<'a, A>(mut v: &'a mut [A], ids: &[usize]) -> Vec<&'a mut A> {
+    let mut out = Vec::with_capacity(ids.len());
+    let mut base = 0;
+    for &i in ids {
+        let (_, tail) = std::mem::take(&mut v).split_at_mut(i - base);
+        let (x, rest) = tail.split_first_mut().unwrap();
+        out.push(x);
+        v = rest;
+        base = i + 1;
+    }
+    out
 }
 
 /// Trunk-side scratch shared by the serial parts of a parallel factorisation.
@@ -152,6 +167,8 @@ pub(super) struct ParallelPlan<T> {
     /// Per-column forward-solve contributions `(trunk row, delta)` for the
     /// ordered replay in [`ParallelPlan::solve`].
     solve_pos: Vec<Vec<(u32, T)>>,
+    /// Groups on the current trunk row's path, ascending.
+    touched: Vec<usize>,
 }
 
 const NO_GROUP: usize = usize::MAX;
@@ -159,13 +176,15 @@ const NO_GROUP: usize = usize::MAX;
 impl<T: FloatT> ParallelPlan<T> {
     /// Build the elimination-tree schedule from the symbolic factorisation.
     /// Returns `None` when the pattern does not admit the grouped parallel
-    /// scheme; the caller then keeps using the serial kernels.
+    /// scheme or `threads` would not repay it; the caller then keeps using
+    /// the serial kernels.
     pub(super) fn build(
         n: usize,
         etree: &[usize],
         lnz: &[usize],
         lp: &[usize],
         li: &[usize],
+        threads: usize,
     ) -> Option<Self> {
         if n == 0 {
             return None;
@@ -215,11 +234,10 @@ impl<T: FloatT> ParallelPlan<T> {
             }
         }
 
-        // Per-group workspaces cost ~O(groups × n) scratch; parallelising a
-        // single group buys nothing, and very fine-grained partitions would
-        // dominate the factor storage.  Reject both and stay serial.
-        const MAX_WS_CELLS: usize = 500_000;
-        if groups.len() < 2 || groups.len().saturating_mul(n) > MAX_WS_CELLS {
+        // Parallelising a single group buys nothing.  Group scratch is sized
+        // to the group and a trunk row visits only the groups on its path, so
+        // the partition's granularity costs no more than O(n).
+        if groups.len() < 2 {
             return None;
         }
 
@@ -231,17 +249,52 @@ impl<T: FloatT> ParallelPlan<T> {
 
         // Validate the disjointness invariant on the symbolic L pattern:
         // leaf columns may only be written by rows of their own group or by
-        // trunk rows; trunk columns only by trunk rows.
+        // trunk rows; trunk columns only by trunk rows. Meanwhile estimate
+        // the work: a column with l entries costs ~l² (the j-th row using it
+        // updates its j earlier entries). Trunk columns, and a leaf column's
+        // updates of trunk rows (recorded per group, replayed in order), are
+        // serial; the rest runs per group.
+        let mut serial = 0f64;
+        let mut work = vec![0f64; groups.len()];
         for (c, g) in group_of.iter().enumerate() {
+            let mut b = 0f64;
             for &r in &li[lp[c]..lp[c + 1]] {
                 if *g == NO_GROUP {
                     if group_of[r] != NO_GROUP {
                         return None;
                     }
-                } else if group_of[r] != NO_GROUP && group_of[r] != *g {
+                } else if group_of[r] == NO_GROUP {
+                    b += 1.0;
+                } else if group_of[r] != *g {
                     return None;
                 }
             }
+            let l = (lp[c + 1] - lp[c]) as f64;
+            if *g == NO_GROUP {
+                serial += l * l;
+            } else {
+                serial += b * b;
+                work[*g] += l * l - b * b;
+            }
+        }
+        // The plan copies L and pays a pool dispatch per trunk row: keep it
+        // only when the pool can at least halve the factor (a 1880-row trunk
+        // of 1920 ran 7x slower on 4 threads; Hubbard thermal cubic3, whose
+        // 1305-row group dominates, ran 1.17x faster on 16 for 2.6 GB more).
+        let (max, sum) = work
+            .iter()
+            .fold((0f64, 0f64), |(m, s), &w| (m.max(w), s + w));
+        // A pattern without off-diagonal work estimates zero, not 0/0.
+        let speedup = (serial + sum) / (serial + max.max(sum / threads as f64)).max(1.0);
+        if crate::receipt::profile_requested() {
+            eprintln!(
+                "QDLDLPLAN groups={} trunk={} speedup={speedup:.2}",
+                groups.len(),
+                trunk.len()
+            );
+        }
+        if speedup < 2.0 {
+            return None;
         }
 
         // Owner-local column storage.
@@ -258,10 +311,7 @@ impl<T: FloatT> ParallelPlan<T> {
         }
         let trunk_store = ColStore::new(trunk.clone(), lnz);
 
-        let ws = groups
-            .iter()
-            .map(|_| GroupWs::new(n, trunk.len()))
-            .collect();
+        let ws = groups.iter().map(|g| GroupWs::new(g.len())).collect();
         let tws = TrunkWs {
             y_vals: vec![T::zero(); n],
             y_markers: vec![false; n],
@@ -282,6 +332,7 @@ impl<T: FloatT> ParallelPlan<T> {
             pos_delta: Vec::new(),
             pos_d: Vec::new(),
             solve_pos: Vec::new(),
+            touched: Vec::new(),
         })
     }
 
@@ -328,6 +379,8 @@ impl<T: FloatT> ParallelPlan<T> {
         }
         self.trunk_store.reset();
         d.fill(T::zero());
+        // Trunk rows clear the buffers of the groups they touch; a failed
+        // factorization may leave some behind.
         for w in &mut self.ws {
             w.y_vals.fill(T::zero());
             w.y_markers.fill(QDLDL_UNUSED);
@@ -336,6 +389,9 @@ impl<T: FloatT> ParallelPlan<T> {
             w.pos_count = 0;
             w.reg_count = 0;
             w.err = false;
+            w.row_cols.clear();
+            w.trunk_delta.clear();
+            w.d_delta.clear();
         }
         *regularize_count = 0;
 
@@ -356,8 +412,9 @@ impl<T: FloatT> ParallelPlan<T> {
         // Column 0 is consumed by the preamble even when it belongs to a
         // leaf group; mirror the seed values into the owner's workspace.
         if self.group_of[0] != NO_GROUP {
-            self.ws[self.group_of[0]].d[0] = d[0];
-            self.ws[self.group_of[0]].dinv[0] = dinv[0];
+            let (w, r) = (&mut self.ws[self.group_of[0]], self.rank_of[0]);
+            w.d[r] = d[0];
+            w.dinv[r] = dinv[0];
         }
 
         let params = (dsigns, regularize_enable, regularize_eps, regularize_delta);
@@ -384,10 +441,10 @@ impl<T: FloatT> ParallelPlan<T> {
                 })
         });
         for (cols, w) in self.groups.iter().zip(self.ws.iter()) {
-            for &k in cols {
+            for (r, &k) in cols.iter().enumerate() {
                 if k != 0 {
-                    d[k] = w.d[k];
-                    dinv[k] = w.dinv[k];
+                    d[k] = w.d[r];
+                    dinv[k] = w.dinv[r];
                 }
             }
             pos_count += w.pos_count;
@@ -462,7 +519,6 @@ impl<T: FloatT> ParallelPlan<T> {
         regularize_count: &mut usize,
     ) {
         let (dsigns, regularize_enable, regularize_eps, regularize_delta) = params;
-        let ntrunk = self.trunk.len();
 
         // Seed y values into the owning workspace and build the shared
         // elimination path; identical order to the serial row loop.
@@ -479,7 +535,7 @@ impl<T: FloatT> ParallelPlan<T> {
                 if self.group_of[bidx] == NO_GROUP {
                     tws.y_vals[bidx] = ax[i];
                 } else {
-                    self.ws[self.group_of[bidx]].y_vals[bidx] = ax[i];
+                    self.ws[self.group_of[bidx]].y_vals[self.rank_of[bidx]] = ax[i];
                 }
                 if tws.y_markers[bidx] == QDLDL_UNUSED {
                     tws.y_markers[bidx] = QDLDL_USED;
@@ -512,51 +568,44 @@ impl<T: FloatT> ParallelPlan<T> {
         // Partition the path (processing order = reverse y_idx) into
         // per-group leaf lists, tagging each column with its sequence
         // position for the ordered replay.  Trunk columns are eliminated
-        // inline during the replay itself.  Contribution buffers must be
-        // reset for every group on every row — a group absent from this
-        // row's path still owns stale entries from earlier rows, and a
-        // stale sequence tag can alias a different position (or overrun
-        // the per-position lists entirely).
-        for w in self.ws.iter_mut() {
-            w.row_cols.clear();
-            for bucket in w.trunk_delta.iter_mut() {
-                bucket.clear();
-            }
-            w.d_delta.clear();
-        }
+        // inline during the replay itself.  Only the groups on the path take
+        // part; their buffers are cleared again once the row is replayed, so
+        // no stale sequence tag survives into a later row.
         let mut seq = 0u32;
         for &c in self.tws.y_idx[..nnz_y].iter().rev() {
             let g = self.group_of[c];
             if g != NO_GROUP {
+                if self.ws[g].row_cols.is_empty() {
+                    self.touched.push(g);
+                }
                 self.ws[g].row_cols.push((seq, c));
             }
             seq += 1;
         }
+        self.touched.sort_unstable();
 
         // Parallel leaf segments.  Group workspaces own their leaf columns,
         // so no writes are shared; trunk-position and D contributions are
         // recorded with their sequence tags.
         let trunk_rank = &self.trunk_rank;
         let rank_of = &self.rank_of;
+        let ws = pick_mut(&mut self.ws, &self.touched);
+        let stores = pick_mut(&mut self.stores, &self.touched);
         pool.install(|| {
-            self.ws
-                .par_iter_mut()
-                .zip(self.stores.par_iter_mut())
+            ws.into_par_iter()
+                .zip(stores.into_par_iter())
                 .for_each(|(w, store)| {
-                    if w.row_cols.is_empty() {
-                        return;
-                    }
                     for &(s, cidx) in &w.row_cols {
                         let r = rank_of[cidx];
                         let tmp = store.next[r];
-                        let y_c = w.y_vals[cidx];
+                        let y_c = w.y_vals[r];
                         for idx in store.lp[r]..tmp {
                             let lxj = store.lx[idx];
                             let lij = store.li[idx];
                             if trunk_rank[lij] == NO_GROUP {
-                                w.y_vals[lij] -= lxj * y_c;
+                                w.y_vals[rank_of[lij]] -= lxj * y_c;
                             } else {
-                                w.trunk_delta[trunk_rank[lij]].push((s, lxj * y_c));
+                                w.trunk_delta.push((s, trunk_rank[lij] as u32, lxj * y_c));
                             }
                         }
                         let ltmp = y_c * dinv[cidx];
@@ -564,7 +613,7 @@ impl<T: FloatT> ParallelPlan<T> {
                         store.li[tmp] = k;
                         store.next[r] += 1;
                         w.d_delta.push((s, y_c * ltmp));
-                        w.y_vals[cidx] = T::zero();
+                        w.y_vals[r] = T::zero();
                     }
                 });
         });
@@ -579,16 +628,21 @@ impl<T: FloatT> ParallelPlan<T> {
         self.pos_delta.resize_with(nnz_y, Vec::new);
         self.pos_d.clear();
         self.pos_d.resize(nnz_y, T::zero());
-        for w in self.ws.iter() {
-            for rank in 0..ntrunk {
-                for &(s, d) in &w.trunk_delta[rank] {
-                    self.pos_delta[s as usize].push((self.trunk[rank] as u32, d));
-                }
+        // A position's contributions come from one column and hit distinct
+        // trunk rows, so their order within the position does not matter.
+        for &g in &self.touched {
+            let w = &mut self.ws[g];
+            for &(s, rank, d) in &w.trunk_delta {
+                self.pos_delta[s as usize].push((self.trunk[rank as usize] as u32, d));
             }
             for &(s, d) in &w.d_delta {
                 self.pos_d[s as usize] = d;
             }
+            w.row_cols.clear();
+            w.trunk_delta.clear();
+            w.d_delta.clear();
         }
+        self.touched.clear();
         for e in 0..nnz_y {
             let cidx = self.tws.y_idx[nnz_y - 1 - e];
             for &(row, delta) in &self.pos_delta[e] {
@@ -637,50 +691,49 @@ impl<T: FloatT> ParallelPlan<T> {
         // Forward solve (L+I)x = b.  Leaf columns scatter into their own
         // group and into trunk positions; the latter are replayed in global
         // column order afterwards.
-        for w in self.ws.iter_mut() {
-            w.xbuf.copy_from_slice(x);
-            for b in w.solve_delta.iter_mut() {
-                b.clear();
-            }
-        }
-        let trunk_rank = &self.trunk_rank;
+        let (trunk_rank, rank_of) = (&self.trunk_rank, &self.rank_of);
+        let xr: &[T] = x;
         pool.install(|| {
             self.ws
                 .par_iter_mut()
                 .zip(self.groups.par_iter())
                 .for_each(|(w, cols)| {
-                    for &i in cols {
-                        let xi = w.xbuf[i];
+                    w.solve_delta.clear();
+                    for (b, &c) in w.xbuf.iter_mut().zip(cols) {
+                        *b = xr[c];
+                    }
+                    for (r, &i) in cols.iter().enumerate() {
+                        let xi = w.xbuf[r];
                         for idx in lp[i]..lp[i + 1] {
                             let lxj = lx[idx];
                             let lij = li[idx];
                             if trunk_rank[lij] == NO_GROUP {
-                                w.xbuf[lij] -= lxj * xi;
+                                w.xbuf[rank_of[lij]] -= lxj * xi;
                             } else {
-                                w.solve_delta[trunk_rank[lij]].push((i as u32, lxj * xi));
+                                w.solve_delta
+                                    .push((i as u32, trunk_rank[lij] as u32, lxj * xi));
                             }
                         }
                     }
                 });
         });
-        for (g, w) in self.ws.iter().enumerate() {
-            for &i in &self.groups[g] {
-                x[i] = w.xbuf[i];
+        for (w, cols) in self.ws.iter().zip(&self.groups) {
+            for (b, &i) in w.xbuf.iter().zip(cols) {
+                x[i] = *b;
             }
         }
         // Merge leaf contributions into per-column lists, then replay all
         // columns in exact serial order: at column `i` a leaf column's
         // recorded trunk-row contributions are applied and a trunk column
         // scatters inline — the same shared-state order as `_lsolve` even
-        // when leaf and trunk columns interleave.
+        // when leaf and trunk columns interleave.  A column's contributions
+        // hit distinct trunk rows, so their order within it does not matter.
         let n = self.trunk_rank.len();
         self.solve_pos.clear();
         self.solve_pos.resize_with(n, Vec::new);
         for w in self.ws.iter() {
-            for rank in 0..self.trunk.len() {
-                for &(c, d) in &w.solve_delta[rank] {
-                    self.solve_pos[c as usize].push((self.trunk[rank] as u32, d));
-                }
+            for &(c, rank, d) in &w.solve_delta {
+                self.solve_pos[c as usize].push((self.trunk[rank as usize] as u32, d));
             }
         }
         for i in 0..n {
@@ -713,21 +766,29 @@ impl<T: FloatT> ParallelPlan<T> {
                 .par_iter_mut()
                 .zip(self.groups.par_iter())
                 .for_each(|(w, cols)| {
-                    w.xbuf.copy_from_slice(xr);
-                    for &i in cols.iter().rev() {
+                    for (b, &c) in w.xbuf.iter_mut().zip(cols) {
+                        *b = xr[c];
+                    }
+                    for (r, &i) in cols.iter().enumerate().rev() {
                         let mut s = T::zero();
                         for idx in lp[i]..lp[i + 1] {
-                            s += lx[idx] * w.xbuf[li[idx]];
+                            let lij = li[idx];
+                            let xj = if trunk_rank[lij] == NO_GROUP {
+                                w.xbuf[rank_of[lij]]
+                            } else {
+                                xr[lij]
+                            };
+                            s += lx[idx] * xj;
                         }
-                        let xi = &mut w.xbuf[i];
+                        let xi = &mut w.xbuf[r];
                         *xi *= dinv[i];
                         *xi -= s;
                     }
                 });
         });
-        for (g, w) in self.ws.iter().enumerate() {
-            for &i in &self.groups[g] {
-                x[i] = w.xbuf[i];
+        for (w, cols) in self.ws.iter().zip(&self.groups) {
+            for (b, &i) in w.xbuf.iter().zip(cols) {
+                x[i] = *b;
             }
         }
     }
@@ -754,25 +815,27 @@ fn leaf_row<T: FloatT>(
     let y_idx = &mut ws.y_idx;
     let elim = &mut ws.elim;
 
+    // Every column on the path lies below `k` in its leaf subtree.
+    let rk = rank_of[k];
     let mut nnz_y = 0;
     for i in ap[k]..ap[k + 1] {
         let bidx = ai[i];
         if bidx == k {
-            ws.d[k] = ax[i];
+            ws.d[rk] = ax[i];
             continue;
         }
         debug_assert_eq!(group_of[bidx], group_of[k]);
-        y_vals[bidx] = ax[i];
-        if y_markers[bidx] == QDLDL_UNUSED {
-            y_markers[bidx] = QDLDL_USED;
+        y_vals[rank_of[bidx]] = ax[i];
+        if y_markers[rank_of[bidx]] == QDLDL_UNUSED {
+            y_markers[rank_of[bidx]] = QDLDL_USED;
             elim[0] = bidx;
             let mut nnz_e = 1;
             let mut next_idx = etree[bidx];
             while next_idx != QDLDL_UNKNOWN && next_idx < k {
-                if y_markers[next_idx] == QDLDL_USED {
+                if y_markers[rank_of[next_idx]] == QDLDL_USED {
                     break;
                 }
-                y_markers[next_idx] = QDLDL_USED;
+                y_markers[rank_of[next_idx]] = QDLDL_USED;
                 elim[nnz_e] = next_idx;
                 next_idx = etree[next_idx];
                 nnz_e += 1;
@@ -790,37 +853,37 @@ fn leaf_row<T: FloatT>(
         debug_assert_eq!(group_of[cidx], group_of[k]);
         let r = rank_of[cidx];
         let tmp = store.next[r];
-        let y_c = y_vals[cidx];
+        let y_c = y_vals[r];
         for idx in store.lp[r]..tmp {
             let lxj = store.lx[idx];
             let lij = store.li[idx];
             debug_assert_eq!(group_of[lij], group_of[k]);
-            y_vals[lij] -= lxj * y_c;
+            y_vals[rank_of[lij]] -= lxj * y_c;
         }
-        let ltmp = y_c * ws.dinv[cidx];
+        let ltmp = y_c * ws.dinv[r];
         store.lx[tmp] = ltmp;
         store.li[tmp] = k;
         store.next[r] += 1;
-        ws.d[k] -= y_c * ltmp;
-        y_vals[cidx] = T::zero();
-        y_markers[cidx] = QDLDL_UNUSED;
+        ws.d[rk] -= y_c * ltmp;
+        y_vals[r] = T::zero();
+        y_markers[r] = QDLDL_UNUSED;
     }
 
     if regularize_enable {
         let sign = T::from_i8(dsigns[k]).unwrap();
-        if ws.d[k] * sign < regularize_eps {
-            ws.d[k] = regularize_delta * sign;
+        if ws.d[rk] * sign < regularize_eps {
+            ws.d[rk] = regularize_delta * sign;
             ws.reg_count += 1;
         }
     }
-    if ws.d[k].is_zero() {
+    if ws.d[rk].is_zero() {
         ws.err = true;
         return;
     }
-    if ws.d[k] > T::zero() {
+    if ws.d[rk] > T::zero() {
         ws.pos_count += 1;
     }
-    ws.dinv[k] = T::recip(ws.d[k]);
+    ws.dinv[rk] = T::recip(ws.d[rk]);
 }
 
 #[cfg(test)]
@@ -904,6 +967,7 @@ mod tests {
         // parallel factorisation
         let mut par = QDLDLFactorisation::new(&a, Some(opts)).unwrap();
         par.set_pool(Some(pool(4)));
+        assert!(par.threads() > 1);
         par.refactor().unwrap();
 
         assert_factors_equal(&serial, &par);
@@ -925,25 +989,30 @@ mod tests {
         assert_eq!(b1, b2);
     }
 
-    /// A fork-join sparse structure (two chains merging) exercises the
-    /// parallel plan outside the pure arrow case; a plain chain exercises
-    /// the serial fallback when the plan finds no parallelism.
+    /// A fork-join sparse structure (four chains merging) exercises the
+    /// parallel plan outside the pure arrow case; a trunk-heavy arrow and a
+    /// plain chain exercise the serial fallback when the plan would not pay
+    /// or finds no parallelism.
     #[test]
     fn parallel_fallback_and_fork() {
-        // fork: columns 0..7 form two chains (0-3, 4-7) joining the trunk
-        // columns 8..10 (dense border)
-        let a = arrow_matrix(2, 4, 2);
-        let n = a.n;
-        let opts = QDLDLSettingsBuilder::default()
-            .perm((0..n).collect())
-            .build()
-            .unwrap();
-        let mut serial = QDLDLFactorisation::new(&a, Some(opts.clone())).unwrap();
-        serial.refactor().unwrap();
-        let mut par = QDLDLFactorisation::new(&a, Some(opts)).unwrap();
-        par.set_pool(Some(pool(3)));
-        par.refactor().unwrap();
-        assert_factors_equal(&serial, &par);
+        // fork: columns 0..31 form four chains of eight joining the trunk
+        // columns 32..33 (dense border); then a 12-column border over two
+        // pairs holds nearly all the work and stays serial
+        for (blocks, bs, border, parallel) in [(4, 8, 2, true), (2, 2, 12, false)] {
+            let a = arrow_matrix(blocks, bs, border);
+            let n = a.n;
+            let opts = QDLDLSettingsBuilder::default()
+                .perm((0..n).collect())
+                .build()
+                .unwrap();
+            let mut serial = QDLDLFactorisation::new(&a, Some(opts.clone())).unwrap();
+            serial.refactor().unwrap();
+            let mut par = QDLDLFactorisation::new(&a, Some(opts)).unwrap();
+            par.set_pool(Some(pool(3)));
+            assert_eq!(par.threads() > 1, parallel);
+            par.refactor().unwrap();
+            assert_factors_equal(&serial, &par);
+        }
 
         // tridiagonal chain: single group, serial path still exact
         let n = 8;
