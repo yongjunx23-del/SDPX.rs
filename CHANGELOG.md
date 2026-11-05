@@ -5,6 +5,72 @@ All notable changes to SDPX are recorded here. Versions follow
 iteration-limited runs and diagnostics; evidence is in
 [docs/JOURNAL.md](docs/JOURNAL.md).
 
+## [0.9.5] - 2026-11-05
+
+### Release highlights
+
+- Hubbard thermal ORE programs (128-bit negated arrow) run faster and in
+  less memory. Release ABBAs against 0.9.4 on all3 at 32 threads went from
+  159.9 to 97.7 s for 3 iterations (−39%), and peak RSS from 37.9 to
+  26.2 GB (−31%). Merged with the Ising line and the KKT-read arrows, the
+  release measures 19.7 GB peak (−25%) at +3.9% time against that branch.
+- 128-bit Ising (85/113 sites) is practical. An MPFR dense arrow leaf
+  replaces serial QDLDL. local_113 takes 62 s per iteration, against about
+  1197 s with QDLDL. Leaf-phase parallelism, exact Schur dots, NUMA
+  first-touch spreading and tiled Schur left sums then cut a red85 iteration
+  at 128 threads from 67.6/75.9 to 24.6/24.2 s (lower/upper).
+- Generic arrows read their values from the KKT instead of keeping copies.
+  BFSS t5 peaks at 63.3 GiB at 128 bits (0.9.4: 88.9) and 116.5 GiB at
+  512 bits (0.9.4: 171.0), with identical points.
+
+### Changed
+
+- Arrow factor:
+  - Generic (and negated) arrows load each leaf's block and couplings, and
+    the border's C, from the synchronized KKT at every refactor. They keep
+    no h, b or C copies, and `update_values` is a no-op for them.
+  - Few-column leaf sweeps split by rows over the pool. Admitted
+    contribution products of a worker's share take every worker.
+  - Wide leaves solve Y by panels with exact products. Each panel rounds
+    once per product instead of once per row dot, and the choice depends
+    on the leaf's width only, so Y keeps its bits at every thread count.
+    This changes MPFR iterates relative to 0.9.4.
+  - A first pivot that is exactly zero skips the doomed leaf phase. When
+    QDLDL meets the same pivot first, its fallback is not built. A failed
+    fallback is dropped instead of staying allocated (Hubbard all3: 6.2 GiB).
+  - Before QDLDL, an MPFR KKT tries one pooled dense leaf of all
+    positive-sign variables, with the negative-sign ones as border. It does
+    so when serial QDLDL flops times the worker count reach n³/6, under the
+    dense_block element cap.
+- The QDLDL elimination-tree plan is admitted by estimated speedup (at
+  least 2), not by a 500k-entry cap.
+- Condensed Schur assembly:
+  - Wide entries sum as exact dots.
+  - Long orthant rows form one dense panel and one SYRK.
+  - Wide left sums are tiled over consecutive right columns.
+  - dense_block also takes systems whose sparse factor keeps half the
+    dense work.
+- ORE rows keep A sparse and transform only the touched indices. Wide types
+  skip the residual plan they never read, and S₀ inverse buffers are freed
+  after their last use.
+- Arrays the whole pool works on are first-touched by the pool's workers,
+  so their pages spread over its NUMA nodes.
+- On Linux, the solver trims the retained allocator heap at iteration
+  starts once RSS has grown 256 MiB since the last trim. On 85-site Ising at 128 bits this
+  cut peak RSS from 46 to 28 GB, at bitwise points and +4.5% time.
+
+### Fixed
+
+- Leaves that load from the KKT clear the −L rows the previous exact-dot
+  factor staged in their upper triangle. Before, any leaf whose block is
+  not dense factored stale fill on every later refactor.
+- An escalated static shift computed its norm over the whole refinement
+  buffer and could come out NaN. This ended 85-site Float64 Ising solves
+  as AlmostSolved.
+- Condensed panel columns need a strict majority of the narrow rows.
+  Before, two columns in half the rows each could share none, and the
+  Schur scatter panicked on the missing pair.
+
 ## [0.9.4] - 2026-10-30
 
 ### Release highlights

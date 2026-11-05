@@ -52,7 +52,13 @@ Cluster gates (`~/projects/sdpx-ising11-scaling-20261007` on `hpc`):
 - Ising ABBA `t14abba.pbs` / `t15abba.pbs`, with audit `audit_point.jl` (`t4dgate.pbs`'s Λ27 audit call is broken; use `t14aud.pbs`).
 - Small-case timing across nodes is bimodal: the conservative governor, a cold process, and MOSEK's warm minimum-of-3. Decide small Float64 timing with same-node interleaved A/B (`t13/abfam.py`).
 
-## Current state (2026-10-30)
+## Current state (2026-11-05)
+
+Version 0.9.5 adds the Hubbard ORE arrow work, the 128-bit and Float64 Ising
+work, generic arrows that read their values from the KKT (PR #15) and the
+heap trim at iteration starts. Integrated against the Hubbard line before
+merging, it trades +4 to +8% time for −19 to −25% peak RSS on Hubbard (row
+24). The merge fixed #15's stale staged rows in exact-dot leaves.
 
 Version 0.9.4 adds the BFSS L13 parallel arrow path, the ORE limit cone and
 the 2026-10-30 review repairs: data updates rewrite the stored original copy,
