@@ -2578,7 +2578,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     /// natural single leaf, the positive block must be half dense (a sparse
     /// one, such as an LP's zero P, would pivot on exact zeros: MPFR has no
     /// static shift) and the dense storage must stay within the arrow bound
-    /// for QDLDL's factor size.
+    /// for QDLDL's factor size. Without a border the matrix is definite, so
+    /// any order pivots on positive values and density does not matter
+    /// (dE3's condensed Schur, 26% dense: serial QDLDL ~5 min per factor).
     pub fn try_dense(
         k: &CscMatrix<T>,
         signs: &[i8],
@@ -2594,7 +2596,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             .flat_map(|j| (k.colptr[j]..k.colptr[j + 1]).map(move |q| (k.rowval[q], j)))
             .filter(|&(i, j)| signs[i] > 0 && signs[j] > 0)
             .count();
-        if !Self::dense_leaf(g, positive_entries) || !super::dense_factor(k, settings, amd, true) {
+        if !(t == 0 || Self::dense_leaf(g, positive_entries))
+            || !super::dense_factor(k, settings, amd, true)
+        {
             return None;
         }
         let lnz = amd.as_ref().map_or(0, |o| o.2.lnz);
