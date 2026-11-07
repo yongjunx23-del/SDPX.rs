@@ -8,7 +8,7 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
-## 2026-11-07 — SDPLIB at MPFR against SDPA-GMP: supernodal factor, condensed form for pure SDPs, step certificate, τ-chase window, NT singular vectors (kept, perf/de3-20261106)
+## 2026-11-07 — SDPLIB at MPFR against SDPA-GMP: supernodal factor, condensed form for pure SDPs, step certificate, τ-chase window and ray rule, NT singular vectors, exact-dot dense kernels, arena trims (kept, perf/de3-20261106)
 
 - Comparison (SDPA-GMP-omp `bd0e73b` against SDPX v0.9.5, node57, EPYC
   7742, 32 cores; SDPX 256 bits; jobs 234788/234789,
@@ -134,7 +134,74 @@ status and next actions.
   - Rejected: MRRR (dlarrv-style on BᵀB) reached only 1.4e3–1.4e4 eps
     orthogonality, with RRR and child-growth failures
     (`~/.cache/sdpx-e2e/patches/svd-mrrr-20261106.patch`).
-- Open: the dE3 τ-chase restart (41 iterations lost); per-thread scratch
+- Kept (convergence contract, agent branch `perf/de3-chase-20261107`,
+  `c670d53`): the six-iteration window also fires above 1e-2·τ₀ when τ fell
+  at least fourfold over the window while the unscaled ‖s‖∞ and ‖z‖∞ each
+  stayed within 1.5× (the iterate moves out along a ray). Restart scale
+  and kept side unchanged; no tolerance or gate moves.
+  - The dE3 restart is a genuine chase (trace job 235016): over iterations
+    23–29 ‖s‖∞ (1.07) and ‖z‖∞ (about 2e3) stop moving while τ falls about
+    0.12 decades per iteration. Without the restart (`auto_start_scale:
+    false`) dE3 ends Solved/62 with r_p 2.8e-14, r_d 3.2e-7 (180–220× the
+    reference), and 12_min Solved/51 with its objective off by 1.4e-5
+    relative and residuals 1e11–1e12× worse. Both pass only because the
+    residual tests scale with the growing iterate, so suppressing the
+    restart was not pursued.
+  - Release ABBAs, T=32: dE3 256 bits (job 235047, node113) 311.2 → 280.0 s
+    (−10.0%), 90 → 80 iterations, restart 41 → 31; 12_min 512 bits
+    (235048, node190) 138.0 → 120.3 s (−12.8%), 115 → 99, restart 33 → 17.
+    Final points bitwise identical; peak RSS unchanged. dE3 audit (235050)
+    equals the reference.
+  - Margins: the two chases keep both sides within 1.03–1.3×; the closest
+    healthy windows across 46 F64 cases, SDPLIB, Λ19-rs, ising11, medium,
+    csdr3, gravity and infeasible LPs reach 2.13× (sched_100_100), 2.25×
+    (sched_100_50) and 2.9× (truss5). Healthy windows that pass the slope
+    test with sides within 2× fall at most 1.95× in τ (threshold 4×).
+  - Paired validation (job 235049): identical points and τ traces on
+    control1, truss5, arch0, gpp100 (AlmostSolved/178), sched 100_50, 50_50
+    and 100_100, hinf2 and Λ19-rs. Local: medium, ising11, csdr3 and
+    csdr3-tight bitwise identical, audits PASS; infeasible LPs keep status,
+    restart and iteration count.
+  - Observed: SDPA-GMP's dE3 objectives (0.53367937 / 0.53367933) and
+    SDPX's (0.53368046 / 0.53368037) differ by 2e-6 relative, and SDPX's
+    objective keeps rising as τ deepens (0.53367 at τ 7e-3, 0.5336805 at
+    8e-7). Hypothesis: dE3 is ill-posed; SDPA's point is not audited.
+- Kept (`perf/exactdot-tri-20261107`, `75f9a93` + `b5587db`): MPFR
+  `xpotrf` and the default MPFR `xtrsm_lower` take each entry from one
+  exact dot of the completed entries instead of a rounded FMA chain. The
+  PSD step certificate's private row-wise Cholesky computed the same bits
+  and now calls `xpotrf` (arch0 points identical).
+  - arch0 256 bits T=32 node105 release ABBA (job 235036, tbD5 `55bf8d3`
+    against tbD7 `75f9a93`): 26.43/26.46 → 20.37/20.67 s (−22.4%),
+    Solved/35 on every leg; audit identical (rel gap 4.44e-19, r_p
+    1.72e-20, r_d 3.21e-16). theta1 1.077 → 1.013 s, Solved/17, audit
+    identical. Local (Mac, 8 threads): 12.07 → 9.00 s; NT `R⁻¹` 2.81 →
+    0.65 s, Z Cholesky 0.77 → 0.26 s.
+  - cubic3 ORE 128 bits, 4 iterations, T=16 (job 235037): 46.44 → 46.47 s
+    (neutral); residuals agree to 1e-22 relative.
+  - `xpotrs` stays on FMA chains: only the chordal PSD completion calls it,
+    once per solve.
+- Kept (memory, `perf/sn-trim-20261107`, `735c183`): `malloc_trim` before
+  each top-level supernodal front, under the iteration-start rule (RSS 256
+  MiB above the last trim). Each front's exact-product scratch is freed on
+  the workers' arenas, which keep the pages resident while the next, larger
+  front allocates. dE3 256 bits T=32 node57 release ABBA (job 235026):
+  peak RSS 5.437 → 4.830 GB (−11.2%), solve 308.6 → 313.7 s (+1.65%),
+  Solved/90 on every leg. Kept as a memory trade, as with the 128-bit
+  iteration-start trim (2026-11-04).
+- Kept (`perf/sn-dots-20261107`, `8b82ae9`): supernodal solves by exact
+  dots. Each forward row subtracts one exact dot of its panel columns, and
+  each backward column one exact dot of the panel's solved rows. dE3 256
+  bits, 8 threads, Mac: 4 iterations `trsv` 0.92 → 0.49 s, iterates agree
+  to 1e-40; full solve Solved/90, audit identical to the reference, `trsv`
+  13.1 s of 303.5 s. Release ABBA: below.
+- arch0 thread sweep (tbD7, node105, jobs 235038–235040; 256 bits): T=4
+  21.4 s / 383 MB, T=8 17.7 s / 523 MB, T=16 20.1 s / 849 MB, T=32 20.5
+  s / 988 MB. arch0 is one 161-block, so most work is serial: scale cones
+  8.1–9.3 s and cone_svd 5.7–6.8 s at every T. The cluster is about 2×
+  slower per core than the Mac at MPFR (local T=8: 9.0 s). Peak RSS grows
+  about 25 MB per thread.
+- Open: dE3's restarted attempt (49 of 80 iterations); per-thread scratch
   (arch0 1.0 GB against SDPA's 33 MB). Remaining svd.invit on arch0 is about
   2% of wall.
 
