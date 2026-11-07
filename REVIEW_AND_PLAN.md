@@ -64,7 +64,9 @@ and arena trims between supernodal fronts (dE3 peak RSS −11.2% for +1.65%
 time). Against SDPA-GMP on node57 at 32 threads (journal 2026-11-07): dE3
 305 s / 5.5 GB against 288 s / 654 MB (was over 4 h), 12_min 67 against 314
 s, truss5 1.2 against 7.0 s; arch0 54 against 17 s and theta1 2.2 against
-1.6 s were slower (NT SVD, triangular kernels; arch0 now about 20 s).
+1.6 s were slower (NT SVD, triangular kernels). The combined release ABBA on
+node105 (job 235053) now gives dE3 261 s / 4.8 GB in 80 iterations, arch0
+21.1 s, theta1 1.15 s and 12_min at 512 bits 120.6 s.
 
 Version 0.9.5 adds the Hubbard ORE arrow work, the 128-bit and Float64 Ising
 work, generic arrows that read their values from the KKT (PR #15) and the

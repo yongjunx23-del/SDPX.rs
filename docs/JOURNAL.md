@@ -194,13 +194,50 @@ status and next actions.
   each backward column one exact dot of the panel's solved rows. dE3 256
   bits, 8 threads, Mac: 4 iterations `trsv` 0.92 → 0.49 s, iterates agree
   to 1e-40; full solve Solved/90, audit identical to the reference, `trsv`
-  13.1 s of 303.5 s. Release ABBA: below.
+  13.1 s of 303.5 s. In the combined ABBA below, dE3's `trsv` falls 38.2 →
+  19.0 s (−6.2% of the base solve).
 - arch0 thread sweep (tbD7, node105, jobs 235038–235040; 256 bits): T=4
   21.4 s / 383 MB, T=8 17.7 s / 523 MB, T=16 20.1 s / 849 MB, T=32 20.5
   s / 988 MB. arch0 is one 161-block, so most work is serial: scale cones
   8.1–9.3 s and cone_svd 5.7–6.8 s at every T. The cluster is about 2×
   slower per core than the Mac at MPFR (local T=8: 9.0 s). Peak RSS grows
   about 25 MB per thread.
+- Combined release ABBA, node105, T=32 (job 235053; tbD5 `55bf8d3` against
+  tbD8 `935c0b6`, legs A B B A; `~/projects/tbD-de3-20261107/runs/tbD-fin8-235053`):
+
+  | Case | Base | Lead | Change | Iterations | Peak RSS |
+  |---|---|---|---|---|---|
+  | dE3 256, s_d15 | 308.83/308.07 s | 261.23/260.79 s | −15.4% | 90 → 80 | 5.52 → 4.77 GB |
+  | 12_min 512, s_low | 140.55/140.01 s | 120.74/120.39 s | −14.1% | 115 → 99 | 1.36 GB both |
+  | arch0 256, s_d15 | 26.28/26.74 s | 21.37/20.91 s | −20.3% | 35 | 1.0–1.1 GB |
+  | theta1 256, s_d15 | 1.17 s | 1.15 s | noise | 17 | 105 MB |
+
+  All Solved; objectives agree to the printed 21 digits. Audits of the lead
+  points (`audit12.py`): dE3 rel gap 9.06e-8, r_p 1.54e-16, r_d 1.44e-9, PSD
+  minima 3.2e-20 / 2.28e-16; 12_min rel gap 9.77e-8, r_p 7.64e-25, r_d
+  2.44e-21; both equal to the reference audits.
+- Rejected (identical points, no gain):
+  - Column-parallel supernodal front assembly (extend-add, W21 scaling and
+    the update fold on the pool, each target column taking its children in
+    child order). dE3 Mac 8 threads, 4 iterations: per factor 2.55 s =
+    subtrees 0.95 s + top fronts 1.6 s, of which `ldl_rec` on the 1932-column
+    root is nearly all; assembly, zero fill, W21 and fold together are under
+    0.2 s. The earlier 3.79 s "assemble" probe summed concurrent subtree
+    fronts, which also call `front` with every thread.
+  - Compact-WY blocked V formation in the MPFR SVD (32-reflector blocks,
+    V −= Y·(T·(YᵀV)) by exact products, with the inner gate's ways). arch0
+    Mac 8 threads: `svd.reflectors` 1.01 → 0.92 s, same 35 iterations and
+    objective. At n = 161 each 32-wide product converts V to residues again;
+    1.5 ms per product, about the rate the column-parallel rank-1 updates
+    already reach. Below the 2% rule; blocked bidiagonalization (dlabrd) has
+    the same limit and was not built.
+- arch0 memory (Mac, de3-d7): peak RSS at 5 iterations 167 MiB (T=1), 284
+  (T=2), 355 (T=4), 448 (T=8). Live heap at iteration 15, T=8 (macOS malloc
+  stack logging): 343 MiB. The main holders: RNS congruence scratch 56 MiB
+  (8 buffers); condensed `BlockWork` scratch 48 MiB; PSD `StepWorkspace`
+  33 MiB; growing dense buffers about 60 MiB; thread stacks 16 MiB; residue
+  caches 12 MiB; `PsdWork` 1–1.5 MiB per thread. None dominates; each scales
+  with threads.
 - Open: dE3's restarted attempt (49 of 80 iterations); per-thread scratch
   (arch0 1.0 GB against SDPA's 33 MB). Remaining svd.invit on arch0 is about
   2% of wall.
