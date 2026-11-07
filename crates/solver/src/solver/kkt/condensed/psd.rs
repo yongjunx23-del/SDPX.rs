@@ -1119,10 +1119,11 @@ impl<T: FloatT> PsdBlock<T> {
         match pool.filter(|p| wide && p.current_num_threads() > 1) {
             Some(pool) => {
                 let (this, n, target) = (&*self, self.Ginv.nrows(), PackedSchur::new(schur));
+                let ways = (pool.current_num_threads() / self.dense_indices.len()).max(1);
                 pool.install(|| {
                     this.tiles(false).for_each(|tile| {
                         with_block_work(n, |w: &mut BlockWork<T>| {
-                            this.schur_tile(values, false, tile, w, &mut |_, _, position, v| {
+                            this.schur_tile(values, false, tile, w, ways, &mut |_, _, position, v| {
                                 target.add(position, v)
                             })
                         })
@@ -1264,7 +1265,7 @@ impl<T: FloatT> PsdBlock<T> {
         with_block_work(n, |w: &mut BlockWork<T>| {
             for start in (0..columns).step_by(tile) {
                 let end = (start + tile).min(columns);
-                self.schur_tile(values, skip_sparse, start..end, w, &mut store);
+                self.schur_tile(values, skip_sparse, start..end, w, 1, &mut store);
             }
         });
     }
@@ -1297,6 +1298,7 @@ impl<T: FloatT> PsdBlock<T> {
         skip_sparse: bool,
         tile: Range<usize>,
         w: &mut BlockWork<T>,
+        ways: usize,
         store: &mut impl FnMut(usize, usize, usize, T),
     ) {
         let n = w.n;
@@ -1313,7 +1315,7 @@ impl<T: FloatT> PsdBlock<T> {
                 if used == w.slots.len() {
                     w.slots.push(ColumnWork::new(n));
                 }
-                self.column_vector(values, b, w, used);
+                self.column_vector(values, b, w, used, ways);
                 slot = used;
                 used += 1;
             }
@@ -1347,7 +1349,7 @@ impl<T: FloatT> PsdBlock<T> {
 
     /// Packs `svec(Ginv·A·Ginv)` of dense column `b` into slot `s`, or
     /// prepares its entries for evaluation on first read.
-    fn column_vector(&self, values: &[T], b: usize, w: &mut BlockWork<T>, s: usize) {
+    fn column_vector(&self, values: &[T], b: usize, w: &mut BlockWork<T>, s: usize, ways: usize) {
         let n = w.n;
         let BlockWork {
             mat3,
@@ -1357,18 +1359,18 @@ impl<T: FloatT> PsdBlock<T> {
             ..
         } = w;
         let c = &mut slots[s];
-        coefficient_product(
-            c.product.data_mut(),
-            n,
-            0,
-            &self.Ginv,
-            &self.columns[b],
-            &self.axpy_plans[b],
-            values,
-        );
         c.vector.resize(triangular_number(n), T::zero());
         c.lazy = false;
         if T::precision_bits() <= 64 {
+            coefficient_product(
+                c.product.data_mut(),
+                n,
+                0,
+                &self.Ginv,
+                &self.columns[b],
+                &self.axpy_plans[b],
+                values,
+            );
             pooled_gemm_sym(mat3, &c.product, &self.Ginv, None);
             mat_to_svec(&mut c.vector, &*mat3);
             return;
@@ -1384,6 +1386,46 @@ impl<T: FloatT> PsdBlock<T> {
             }
         }
         let r = c.support.len();
+        // Dense coefficients (at least an eighth of the support square): the
+        // whole `Ginv[:, S]·A_SS·Ginv[S, :]` as one exact residue congruence,
+        // rounded once, instead of n·nnz chained AXPYs and a second product.
+        // `ways` splits it when few dense columns share the pool.
+        if 8 * self.axpy_plans[b].len() >= r * r && T::residue_blas_applies(n, n, r) {
+            panel.resize((n, r));
+            rows.resize((r, r));
+            rows.data_mut().fill(T::zero());
+            for (t, &q) in c.support.iter().enumerate() {
+                panel.data_mut()[t * n..(t + 1) * n]
+                    .copy_from_slice(&self.Ginv.data()[q * n..(q + 1) * n]);
+            }
+            let column = &self.columns[b];
+            for &(q, p, eidx) in &self.axpy_plans[b] {
+                let e = &column.entries[eidx as usize];
+                let v = if e.i == e.j {
+                    values[e.position]
+                } else {
+                    values[e.position] * T::FRAC_1_SQRT_2()
+                };
+                let tq = c.support.binary_search(&(q as usize)).unwrap();
+                let tp = c.support.binary_search(&(p as usize)).unwrap();
+                rows.data_mut()[tp + tq * r] = v;
+            }
+            if with_split_hint(ways, || {
+                congruence_exact_sym(mat3, &*panel, false, &*rows, None, None)
+            }) {
+                mat_to_svec(&mut c.vector, &*mat3);
+                return;
+            }
+        }
+        coefficient_product(
+            c.product.data_mut(),
+            n,
+            0,
+            &self.Ginv,
+            &self.columns[b],
+            &self.axpy_plans[b],
+            values,
+        );
         if T::residue_product_applies(n, n, r) {
             panel.resize((n, r));
             rows.resize((r, n));
@@ -1510,10 +1552,11 @@ impl<T: FloatT> PsdBlock<T> {
             .filter(|p| self.sampled.is_none() && dense_count > 0 && p.current_num_threads() > 1)
         {
             let (this, n) = (&*self, self.Ginv.nrows());
+            let ways = (pool.current_num_threads() / dense_count).max(1);
             pool.install(|| {
                 this.tiles(skip_sparse).for_each(|tile| {
                     with_block_work(n, |w: &mut BlockWork<T>| {
-                        this.schur_tile(values, skip_sparse, tile, w, &mut |t, a, _, v| {
+                        this.schur_tile(values, skip_sparse, tile, w, ways, &mut |t, a, _, v| {
                             packed.write(t, a, v)
                         })
                     })
