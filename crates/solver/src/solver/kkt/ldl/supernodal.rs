@@ -3,9 +3,9 @@
 //! Serial QDLDL pays one rounded scalar multiply-subtract per factor term.
 //! Here every supernode's frontal matrix is factored by the arrow solver's
 //! dense exact kernels ([`ldl_rec`]: exact dots and residue products), and
-//! independent subtrees run concurrently. Each kernel is exact or runs in a
-//! fixed order, and children are assembled in a fixed order, so the factor
-//! does not depend on the thread count.
+//! each front starts once its children are factored. Each kernel is exact or
+//! runs in a fixed order, and children are assembled in a fixed order, so the
+//! factor does not depend on the thread count or the schedule.
 //!
 //! The ordering is AMD without dense-row removal ([`ordering`]): QDLDL's
 //! threshold (15·√n) treats every row of a dense-ish Schur complement as
@@ -18,7 +18,8 @@ use crate::solver::core::CoreSettings;
 use crate::solver::kkt::direct::DirectLDLSolver;
 use crate::solver::kkt::{HasLinearSolverInfo, LinearSolverInfo};
 use rayon::prelude::*;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 const NONE: usize = usize::MAX;
 /// Columns per solve panel, and rows per parallel task of its update.
@@ -43,18 +44,15 @@ struct Symbolic {
     /// Rows of each front: its own columns, then the rows below them.
     rows: Vec<Vec<usize>>,
     children: Vec<Vec<usize>>,
+    parent: Vec<usize>,
     /// Positions in the parent's `rows` of each row below a supernode.
     relmap: Vec<Vec<usize>>,
     /// Per supernode: (KKT value index, offset in the column-major front).
     entries: Vec<Vec<(usize, usize)>>,
-    /// Roots of the subtrees factored concurrently, ascending; the
-    /// supernodes of root `t` are `first[t]..=t`.
-    tasks: Vec<usize>,
-    first: Vec<usize>,
 }
 
 impl Symbolic {
-    fn new<T: FloatT>(k: &CscMatrix<T>, signs: &[i8], perm0: Vec<usize>, threads: usize) -> Self {
+    fn new<T: FloatT>(k: &CscMatrix<T>, signs: &[i8], perm0: Vec<usize>) -> Self {
         let n = k.n;
         // Elimination tree under `perm0`, then a postorder of it (same fill).
         let parent0 = etree(&upper_pattern(k, &invert(&perm0)), n);
@@ -162,7 +160,7 @@ impl Symbolic {
             .map(|node| (node.f..node.l).chain(node.below).collect())
             .collect();
         let width = |s: usize| start[s + 1] - start[s];
-        let mut sparent = vec![NONE; nsn];
+        let mut parent = vec![NONE; nsn];
         let mut children: Vec<Vec<usize>> = vec![Vec::new(); nsn];
         let mut relmap: Vec<Vec<usize>> = vec![Vec::new(); nsn];
         for s in 0..nsn {
@@ -170,7 +168,7 @@ impl Symbolic {
                 continue;
             };
             let p = sn_of[r];
-            sparent[s] = p;
+            parent[s] = p;
             children[p].push(s);
             let (fp, wp) = (start[p], width(p));
             let below_p = &rows[p][wp..];
@@ -200,39 +198,6 @@ impl Symbolic {
                 }
             }
         }
-        // Concurrent subtrees: split the heaviest subtree until each is at
-        // most a share of the work; their ancestors factor afterwards with
-        // the whole pool on each front.
-        let work: Vec<f64> = (0..nsn)
-            .map(|s| {
-                let (w, b) = (width(s) as f64, (rows[s].len() - width(s)) as f64);
-                w * w * w / 3.0 + w * w * b + w * b * b
-            })
-            .collect();
-        let mut subtree = work.clone();
-        let mut first: Vec<usize> = (0..nsn).collect();
-        for s in 0..nsn {
-            if sparent[s] != NONE {
-                subtree[sparent[s]] += subtree[s];
-                first[sparent[s]] = first[sparent[s]].min(first[s]);
-            }
-        }
-        let roots: Vec<usize> = (0..nsn).filter(|&s| sparent[s] == NONE).collect();
-        let mut tasks = Vec::new();
-        if threads > 1 {
-            let grain = roots.iter().map(|&s| subtree[s]).sum::<f64>() / (4 * threads) as f64;
-            let mut open = roots;
-            while let Some(s) = open.pop() {
-                if subtree[s] <= grain || children[s].is_empty() {
-                    tasks.push(s);
-                } else {
-                    open.extend(&children[s]);
-                }
-            }
-        } else {
-            tasks = roots;
-        }
-        tasks.sort_unstable();
         let signs = perm.iter().map(|&old| signs[old]).collect();
         Self {
             perm,
@@ -240,10 +205,9 @@ impl Symbolic {
             start,
             rows,
             children,
+            parent,
             relmap,
             entries,
-            tasks,
-            first,
         }
     }
 
@@ -407,6 +371,48 @@ fn postorder(parent: &[usize]) -> Vec<usize> {
     order
 }
 
+/// One numeric factorization in flight. A front starts when its last child
+/// finishes, so small ancestor chains overlap the wide leaves (dE3 at 32
+/// threads: fronts of 16-162 columns waited for a 1457-column leaf), and a
+/// wide front still splits its own work over the pool.
+struct Fronts<'a, T: FloatT> {
+    sym: &'a Symbolic,
+    kkt: &'a CscMatrix<T>,
+    reg: Option<(T, T)>,
+    ways: usize,
+    /// Children of each front not yet factored.
+    pending: Vec<AtomicUsize>,
+    updates: Vec<Mutex<Vec<T>>>,
+    /// Factor columns and D⁻¹ of each front.
+    factors: Vec<Mutex<(Vec<T>, Vec<T>)>>,
+    error: Mutex<Option<&'static str>>,
+}
+
+impl<'a, T: FloatT> Fronts<'a, T> {
+    fn run<'s>(&'s self, scope: &rayon::Scope<'s>, s: usize) {
+        let sym = self.sym;
+        // Finished fronts free their scratch on the workers' arenas, which
+        // keep those pages resident; return them before an assembled front.
+        if !sym.children[s].is_empty() {
+            crate::receipt::trim_heap(false);
+        }
+        let mut take = |c: usize| std::mem::take(&mut *self.updates[c].lock().unwrap());
+        match sym.front(s, self.kkt, &mut take, self.reg, &mut 0, self.ways) {
+            Ok((ls, ds, us)) => {
+                *self.factors[s].lock().unwrap() = (ls, ds);
+                *self.updates[s].lock().unwrap() = us;
+                let p = sym.parent[s];
+                if p != NONE && self.pending[p].fetch_sub(1, Ordering::AcqRel) == 1 {
+                    scope.spawn(move |scope| self.run(scope, p));
+                }
+            }
+            Err(error) => {
+                self.error.lock().unwrap().get_or_insert(error);
+            }
+        }
+    }
+}
+
 pub struct SupernodalLDLSolver<T: FloatT> {
     sym: Symbolic,
     /// Factor columns of each supernode (`rows × width`, column-major).
@@ -420,15 +426,14 @@ pub struct SupernodalLDLSolver<T: FloatT> {
 
 impl<T: FloatT> SupernodalLDLSolver<T> {
     pub fn new(k: &CscMatrix<T>, signs: &[i8], settings: &CoreSettings<T>, perm: Vec<usize>) -> Self {
-        let threads = crate::solver::core::worker_budget(settings.max_threads as usize);
-        let sym = Symbolic::new(k, signs, perm, threads);
+        let sym = Symbolic::new(k, signs, perm);
         if crate::receipt::profile_requested() {
             let nsn = sym.start.len() - 1;
             let widest = (0..nsn).map(|s| sym.rows[s].len()).max().unwrap_or(0);
             eprintln!(
-                "SUPERNODAL n={} supernodes={nsn} tasks={} front_max={widest} lnz={}",
+                "SUPERNODAL n={} supernodes={nsn} leaves={} front_max={widest} lnz={}",
                 k.n,
-                sym.tasks.len(),
+                sym.children.iter().filter(|c| c.is_empty()).count(),
                 (0..nsn).map(|s| sym.width(s) * sym.rows[s].len()).sum::<usize>(),
             );
         }
@@ -449,61 +454,30 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
 
     fn factor(&mut self, kkt: &CscMatrix<T>) -> Result<(), &'static str> {
         let sym = &self.sym;
-        let reg = self.reg;
         let nsn = sym.start.len() - 1;
-        let threads = rayon::current_num_threads();
-        // Subtrees concurrently on the pool; a wide front (dE3: leaves of
-        // 692-1457 columns) still splits its own work over the pool.
-        let mut jobs = Vec::with_capacity(sym.tasks.len());
-        let (mut l, mut d) = (&mut self.l[..], &mut self.dinv[..]);
-        let (mut s0, mut c0) = (0, 0);
-        for &root in &sym.tasks {
-            let lo = sym.first[root];
-            let (_, rest) = l.split_at_mut(lo - s0);
-            let (mine, rest) = rest.split_at_mut(root + 1 - lo);
-            l = rest;
-            let (_, drest) = d.split_at_mut(sym.start[lo] - c0);
-            let (dmine, drest) = drest.split_at_mut(sym.start[root + 1] - sym.start[lo]);
-            d = drest;
-            (s0, c0) = (root + 1, sym.start[root + 1]);
-            jobs.push((lo, root, mine, dmine));
-        }
-        let subtree = |(lo, root, l, d): (usize, usize, &mut [Vec<T>], &mut [T])| {
-            let mut updates: Vec<Vec<T>> = (lo..=root).map(|_| Vec::new()).collect();
-            let mut count = 0;
-            for s in lo..=root {
-                let mut take = |c: usize| std::mem::take(&mut updates[c - lo]);
-                let (ls, ds, us) = sym.front(s, kkt, &mut take, reg, &mut count, threads)?;
-                l[s - lo] = ls;
-                let c = sym.start[s] - sym.start[lo];
-                d[c..c + ds.len()].copy_from_slice(&ds);
-                updates[s - lo] = us;
+        let fronts = Fronts {
+            sym,
+            kkt,
+            reg: self.reg,
+            ways: rayon::current_num_threads(),
+            pending: sym.children.iter().map(|c| AtomicUsize::new(c.len())).collect(),
+            updates: (0..nsn).map(|_| Mutex::new(Vec::new())).collect(),
+            factors: (0..nsn).map(|_| Mutex::new((Vec::new(), Vec::new()))).collect(),
+            error: Mutex::new(None),
+        };
+        let cx = &fronts;
+        rayon::scope(|scope| {
+            for s in (0..nsn).filter(|&s| sym.children[s].is_empty()) {
+                scope.spawn(move |scope| cx.run(scope, s));
             }
-            Ok((root, std::mem::take(&mut updates[root - lo])))
-        };
-        let done: Vec<Result<(usize, Vec<T>), &'static str>> = if threads > 1 && jobs.len() > 1 {
-            jobs.into_par_iter().map(subtree).collect()
-        } else {
-            jobs.into_iter().map(subtree).collect()
-        };
-        let mut updates: Vec<Vec<T>> = (0..nsn).map(|_| Vec::new()).collect();
-        let mut in_task = vec![false; nsn];
-        for result in done {
-            let (root, update) = result?;
-            in_task[sym.first[root]..=root].fill(true);
-            updates[root] = update;
+        });
+        if let Some(error) = fronts.error.into_inner().unwrap() {
+            return Err(error);
         }
-        // Their ancestors, each front on the whole pool. Every front's
-        // scratch is freed on the workers' arenas, which keep those pages
-        // resident; return them before the next, larger front.
-        let mut count = 0;
-        for s in (0..nsn).filter(|&s| !in_task[s]) {
-            crate::receipt::trim_heap(false);
-            let mut take = |c: usize| std::mem::take(&mut updates[c]);
-            let (ls, ds, us) = sym.front(s, kkt, &mut take, reg, &mut count, threads)?;
+        for (s, factor) in fronts.factors.into_iter().enumerate() {
+            let (ls, ds) = factor.into_inner().unwrap();
             self.l[s] = ls;
             self.dinv[sym.start[s]..sym.start[s + 1]].copy_from_slice(&ds);
-            updates[s] = us;
         }
         crate::receipt::trim_heap(false);
         Ok(())
