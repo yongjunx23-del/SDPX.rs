@@ -739,16 +739,12 @@ impl<const N: usize> XpotrfScalar for F<N> {
         }
         let n = n as usize;
         let ld = lda as usize;
+        let lower = upper(u) == b'L';
+        // Entry (i, k), i >= k, of the stored triangle.
+        let at = |i: usize, k: usize| if lower { i + k * ld } else { k + i * ld };
+        // Each entry subtracts one exact dot of the completed columns.
         for j in 0..n {
-            let mut d = a[j + j * ld];
-            for k in 0..j {
-                let v = if upper(u) == b'L' {
-                    a[j + k * ld]
-                } else {
-                    a[k + j * ld]
-                };
-                d = (-v).mul_add(v, d);
-            }
+            let d = a[j + j * ld] - Self::dot_fma((0..j).map(|k| (&a[at(j, k)], &a[at(j, k)])));
             a[j + j * ld] = d;
             if !d.is_finite() || d <= Self::zero() {
                 *info = (j + 1) as i32;
@@ -761,7 +757,7 @@ impl<const N: usize> XpotrfScalar for F<N> {
             // disjoint element, so it can join the ambient pool under the
             // solver's inner-parallel gate.
             let tasks = inner_tasks::<N>(tail * j.max(1), tail);
-            if tasks > 1 && upper(u) == b'L' {
+            if tasks > 1 && lower {
                 let (done, rest) = a.split_at_mut(j * ld);
                 rest[j + 1..n]
                     .par_iter_mut()
@@ -769,41 +765,23 @@ impl<const N: usize> XpotrfScalar for F<N> {
                     .enumerate()
                     .for_each(|(t, q)| {
                         let i = j + 1 + t;
-                        let mut v = *q;
-                        for k in 0..j {
-                            v = (-done[i + k * ld]).mul_add(done[j + k * ld], v);
-                        }
-                        *q = v / d;
+                        let solved = Self::dot_fma((0..j).map(|k| (&done[i + k * ld], &done[j + k * ld])));
+                        *q = (*q - solved) / d;
                     });
             } else if tasks > 1 {
                 let (head, right) = a.split_at_mut((j + 1) * ld);
                 // columns j+1..n only: a longer buffer holds no matrix entries
                 let len = (tail * ld).min(right.len());
                 let right = &mut right[..len];
+                let pivot = &head[j * ld..j * ld + j];
                 right.par_chunks_mut(ld).with_min_len(tail.div_ceil(tasks)).for_each(|col| {
-                    let mut v = col[j];
-                    for k in 0..j {
-                        v = (-col[k]).mul_add(head[k + j * ld], v);
-                    }
-                    col[j] = v / d;
+                    col[j] = (col[j] - Self::dot_slices(&col[..j], pivot)) / d;
                 });
             } else {
                 for i in j + 1..n {
-                    let q = if upper(u) == b'L' {
-                        i + j * ld
-                    } else {
-                        j + i * ld
-                    };
-                    let mut v = a[q];
-                    for k in 0..j {
-                        let (v1, v2) = if upper(u) == b'L' {
-                            (a[i + k * ld], a[j + k * ld])
-                        } else {
-                            (a[k + i * ld], a[k + j * ld])
-                        };
-                        v = (-v1).mul_add(v2, v);
-                    }
-                    a[q] = v / d;
+                    let solved = Self::dot_fma((0..j).map(|k| (&a[at(i, k)], &a[at(j, k)])));
+                    let q = at(i, j);
+                    a[q] = (a[q] - solved) / d;
                 }
             }
         }
