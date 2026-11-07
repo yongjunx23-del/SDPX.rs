@@ -8,6 +8,55 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-07 — Dense wide Schur congruence, SVD chain fallback, PSD step lanes (kept, perf/step-lane-20261107 → perf/de3-20261106)
+
+- Kept (`f1f23f8`): at MPFR a dense condensed Schur column (coefficients at
+  least an eighth of its support square) is `Ginv[:, S]·A_SS·Ginv[S, :]` as
+  one exact residue congruence, rounded once, instead of n·nnz chained
+  AXPYs and a second product. Few dense columns split it over the pool
+  (`ways` = threads / dense columns). Release ABBA, node105, T=32 (job
+  235063, tbD8 `935c0b6` → tbD9):
+  - 12_min 512 bits: 118.65/118.28 → 88.29/87.81 s (−25.6%), 99 iterations.
+  - gpp250-1 256 bits: 189.37/189.11 → 149.59/148.88 s (−21.1%), 61 iterations.
+  - gpp124-1 256 bits: 35.59 → 29.38 s (−17.4%), 56 iterations.
+  - dE3: 256.62/258.71 → 259.78/258.65 s (noise), 80 iterations.
+  - Points change only where dense wide columns exist (12_min, dE3); arch0
+    and theta1 are bitwise. The 160-digit audits of dE3 and 12_min equal the
+    reference audits (rel gap 9.06e-8 / 9.77e-8, r_p 1.54e-16 / 7.64e-25,
+    r_d 1.44e-9 / 2.44e-21).
+- Kept (`6873b11`): cone SVD inverse iteration orthogonalizes each chain's
+  windows with up to twelve Newton steps (was four). When a chain still does
+  not converge, only that chain is redone in dstein order, not the whole
+  vector set. ABBA job 235065 (tbD9 → tbD10):
+  - gpp250-1: 150.00/150.89 → 112.89/113.17 s (−24.8%).
+  - gpp124-1: 29.37/29.25 → 24.22/24.25 s (−17.3%).
+  - 12_min −0.5% and dE3 −1.0% (noise).
+  - Iterations unchanged, objectives agree to the 21 printed digits. Points
+    differ in the last bits; the dE3 and 12_min audits again equal the
+    references.
+  - Mac T=8 SDPLIB sweep at 256 bits: gpp250-1 73.04 → 55.80 s, gpp124-1
+    12.48 → 10.13 s; nine smaller SDPs neutral with equal objectives.
+- Kept (`968b3a6`): a lone PSD cone gets a step lane when a thread is spare.
+  At MPFR its dz and ds bounds (`kkt_bounds`: f64 eigenvalue bound, then the
+  `xpotrf` certificate) run as a `rayon::join` pair, each half with half the
+  split hint and its own `StepWorkspace`. ABBA job 235072 (tbD10 → tbD11):
+  - gpp250-1: 113.52/113.23 → 93.30/92.06 s (−18.1%); peak RSS 2.6–2.7 →
+    3.0 GB (the second workspace and lane).
+  - arch0: 21.12/21.45 → 20.67/20.94 s (−2.2%).
+  - 12_min and dE3 neutral (+0.0% / +0.5%); gpp124-1 single legs 24.36 →
+    22.85 s.
+  - Points bitwise identical on every case.
+- Combined, node105 T=32, tbD8 → tbD11: gpp250-1 189.2 → 92.7 s (−51%),
+  gpp124-1 35.6 → 22.9 s (−36%), 12_min 118.5 → 88.1 s (−26%), arch0
+  unchanged before the lane (−2.2% with it), dE3 257.7 → 259.5 s (noise).
+- dE3 thread sweep (tbD9, 4 iterations, node105, job 235077): T=8 28.55 s,
+  T=16 22.84, T=32 19.71, T=64 19.25; peak RSS 3.29 → 3.72 GB. The
+  supernodal factor is 21.82 / 17.67 / 15.28 / 14.90 s for five factors.
+  Its exact GEMMs (`rns.gemm.shared_crt`) fall 14.79 → 6.34 s, but the rest
+  stays at 7.0–8.6 s at every T. That remainder is mostly `ldl_rec` on the
+  1932-column root front (journal entry below), so dE3 scaling past 16
+  threads needs a parallel root-front factor.
+
 ## 2026-11-07 — SDPLIB at MPFR against SDPA-GMP: supernodal factor, condensed form for pure SDPs, step certificate, τ-chase window and ray rule, NT singular vectors, exact-dot dense kernels, arena trims (kept, perf/de3-20261106)
 
 - Comparison (SDPA-GMP-omp `bd0e73b` against SDPX v0.9.5, node57, EPYC
