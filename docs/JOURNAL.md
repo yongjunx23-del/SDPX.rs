@@ -8,6 +8,52 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-07 — Dependency-driven supernodal factor (kept, perf/sn-dag-20261107 → perf/de3-20261106); dE3 factor profile; closed leads
+
+- Hypothesis (profiles below): at 32 threads the subtree grain leaves small
+  fronts (16–162 columns) as serial ancestors that wait for every subtree,
+  including the 1457-column leaf, and then run one at a time on the pool.
+- Change (`b60698f`): fronts run as a dependency graph in one rayon scope;
+  each starts when its last child finishes, wide fronts still split their
+  own work, and the heap trim runs before each assembled front. The
+  subtree tasks and their grain are gone. Children are assembled in the
+  same fixed order, so the factor is schedule-invariant.
+- Evidence: local dE3 4 iterations, 256 bits, 8 threads: x, z, s bitwise
+  identical; factor 13.31 → 12.83/12.57 s. Release ABBA (job 235108,
+  node54, s_d15, 256 bits): T=32 263.55/263.01 → 231.10/232.25 s (−12.0%),
+  Solved/80, identical points; T=8 411.53 → 410.06 s (neutral). Peak RSS
+  4.63/4.68 → 5.41/5.28 GB at T=32 (+15%), 3.39 → 3.81 GB at T=8 (more
+  fronts' residue workspace is live at once). Kept for the time; the
+  memory cost is recorded as a trade.
+- Rejected: batched wide left dots in the condensed PSD Schur assembly
+  (12_min). The point was bitwise identical, but the batched residue tiles
+  took 22.1 thread-s against the 7.2 they replaced: at m≈100, n≤16 and k
+  561–1953 (about 48 primes at 512 bits) one residue GEMM costs 14–33 ms
+  per chunk against 2–10 ms of exact dots over the zero-filled panel.
+  Patch `~/.cache/sdpx-e2e/patches/schur-batched-dots.patch`.
+- Measured: 12_min dense left dots cost about 57 ns per term in the
+  assembly (8 threads, about 70M terms per assembly). A 512-bit
+  microbenchmark gives 36.6 ns/term contiguous, 34.3 gathered through u32
+  positions and 30.4 through `dot_slices`, so the gather layout is not the
+  cost; the exact-dot kernel is. No change.
+- Closed: dE3 restart scale. Restart τ₀ 2.5e-10 (default, eps^(1/8) at
+  256 bits) 80 iterations, 1e-8 75, 1e-7 77, 1e-6 80 (`SDPX_TEST_RESTART_TAU`,
+  local). The restarted attempt settles near τ 1.6e-6 (s/τ 6.7e5, z/τ
+  1.2e8) after 17 iterations near τ 3–7e-9 whatever τ₀ is. Below the 2%
+  rule across cases; not pursued.
+- dE3 factor structure (cluster profiles 235086/235089/235103, node105 and
+  node54, 4 iterations = 5 factors, 256 bits): 30 supernodes; the root (w
+  1932, 2.40e9 of 5.46e9 work) and one leaf (w 1457, r 1808, 1.96e9) hold
+  80%. T=8: factor 18.7 s = subtrees 7.7 + wide ancestors 9.8 + small
+  ancestors 1.2; root `ldl_rec` 14.6 s (Schur products 5.8, TRSM 8.0, of
+  which TRSM products 6.1 and leaves 1.9). T=32: factor 12.9 s =
+  subtrees 4.1 + wide ancestors 5.1 + small ancestors 3.5 (fronts 20–22,
+  16–162 columns, became ancestors at the finer grain); root 7.6 s. Large
+  residue GEMMs at T=32: encode 1.2 s, products 2.5, CRT 0.6 (T=8: 3.2,
+  5.8, 1.9). Grain test switch at T=32: never splitting a subtree below
+  the largest leaf's work 12.15 s, half of it 11.32, default 12.9; at T=8
+  the leaf grain cost +3.4%. Points identical.
+
 ## 2026-11-07 — Dense wide Schur congruence, SVD chain fallback, PSD step lanes (kept, perf/step-lane-20261107 → perf/de3-20261106)
 
 - Kept (`f1f23f8`): at MPFR a dense condensed Schur column (coefficients at
