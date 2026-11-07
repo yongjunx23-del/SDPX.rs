@@ -137,8 +137,7 @@ impl Symbolic {
                 let added = stored(w, b) - stored(c.l - c.f, c.below.len()) - stored(p.l - p.f, b);
                 let zeros = c.zeros + p.zeros + added;
                 let frac = zeros as f64 / stored(w, b).max(1) as f64;
-                if !(w <= 4 || (w <= 16 && frac < 0.8) || (w <= 48 && frac < 0.1) || frac < 0.05)
-                {
+                if !(w <= 4 || (w <= 16 && frac < 0.8) || (w <= 48 && frac < 0.1) || frac < 0.05) {
                     break;
                 }
                 let c = nodes.pop().unwrap();
@@ -185,7 +184,10 @@ impl Symbolic {
         }
         // KKT positions (checked) and front offsets (a front of 2^32 wide
         // entries could not be stored) fit u32.
-        assert!(k.nnz() <= u32::MAX as usize, "supernodal KKT exceeds u32 positions");
+        assert!(
+            k.nnz() <= u32::MAX as usize,
+            "supernodal KKT exceeds u32 positions"
+        );
         let mut entries: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nsn];
         for s in 0..nsn {
             let (f, w, r) = (start[s], width(s), rows[s].len());
@@ -272,7 +274,17 @@ impl Symbolic {
         }
         let sign = |k: usize| T::from_i8(self.signs[f + k]).unwrap();
         let mut dinv = vec![T::zero(); w];
-        ldl_rec(&mut front, r, w, &vec![0; w], &sign, reg, count, ways, &mut dinv)?;
+        ldl_rec(
+            &mut front,
+            r,
+            w,
+            &vec![0; w],
+            &sign,
+            reg,
+            count,
+            ways,
+            &mut dinv,
+        )?;
         if b > 0 {
             let mut l11 = vec![T::zero(); w * w];
             for j in 0..w {
@@ -290,7 +302,20 @@ impl Symbolic {
             let l21 = &front[w..];
             let mut packed = zeros::<T>(b * (b + 1) / 2, ways);
             let upper = crate::algebra::with_split_hint(ways, || {
-                T::xgemm_upper_exact(b'N', b'T', b, b, w, &w21, b, l21, r, &mut packed, None, None)
+                T::xgemm_upper_exact(
+                    b'N',
+                    b'T',
+                    b,
+                    b,
+                    w,
+                    &w21,
+                    b,
+                    l21,
+                    r,
+                    &mut packed,
+                    None,
+                    None,
+                )
             });
             if upper {
                 for a in 0..b {
@@ -301,7 +326,14 @@ impl Symbolic {
             } else {
                 drop(packed);
                 let mut full = zeros::<T>(b * b, ways);
-                exact_product((b'N', b'T'), (b, b, w), (&w21, b), (l21, r), &mut full, ways);
+                exact_product(
+                    (b'N', b'T'),
+                    (b, b, w),
+                    (&w21, b),
+                    (l21, r),
+                    &mut full,
+                    ways,
+                );
                 for a in 0..b {
                     for c in a..b {
                         update[c + a * b] -= full[a + c * b];
@@ -444,7 +476,12 @@ pub struct SupernodalLDLSolver<T: FloatT> {
 }
 
 impl<T: FloatT> SupernodalLDLSolver<T> {
-    pub fn new(k: &CscMatrix<T>, signs: &[i8], settings: &CoreSettings<T>, perm: Vec<usize>) -> Self {
+    pub fn new(
+        k: &CscMatrix<T>,
+        signs: &[i8],
+        settings: &CoreSettings<T>,
+        perm: Vec<usize>,
+    ) -> Self {
         let sym = Symbolic::new(k, signs, perm);
         if crate::receipt::profile_requested() {
             let nsn = sym.start.len() - 1;
@@ -453,7 +490,9 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
                 "SUPERNODAL n={} supernodes={nsn} leaves={} front_max={widest} lnz={}",
                 k.n,
                 sym.children.iter().filter(|c| c.is_empty()).count(),
-                (0..nsn).map(|s| sym.width(s) * sym.rows[s].len()).sum::<usize>(),
+                (0..nsn)
+                    .map(|s| sym.width(s) * sym.rows[s].len())
+                    .sum::<usize>(),
             );
         }
         let nsn = sym.start.len() - 1;
@@ -479,12 +518,21 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
             kkt,
             reg: self.reg,
             ways: rayon::current_num_threads(),
-            pending: sym.children.iter().map(|c| AtomicUsize::new(c.len())).collect(),
+            pending: sym
+                .children
+                .iter()
+                .map(|c| AtomicUsize::new(c.len()))
+                .collect(),
             updates: (0..nsn).map(|_| Mutex::new(Vec::new())).collect(),
-            factors: (0..nsn).map(|_| Mutex::new((Vec::new(), Vec::new()))).collect(),
+            factors: (0..nsn)
+                .map(|_| Mutex::new((Vec::new(), Vec::new())))
+                .collect(),
             // The old factor is never solved with once a new one starts; its
             // storage holds the new columns instead of staying live beside them.
-            reuse: std::mem::take(&mut self.l).into_iter().map(Mutex::new).collect(),
+            reuse: std::mem::take(&mut self.l)
+                .into_iter()
+                .map(Mutex::new)
+                .collect(),
             error: Mutex::new(None),
         };
         let cx = &fronts;
@@ -498,7 +546,11 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
             self.l = std::iter::zip(fronts.factors, fronts.reuse)
                 .map(|(f, old)| {
                     let (ls, _) = f.into_inner().unwrap();
-                    if ls.is_empty() { old.into_inner().unwrap() } else { ls }
+                    if ls.is_empty() {
+                        old.into_inner().unwrap()
+                    } else {
+                        ls
+                    }
                 })
                 .collect();
             return Err(error);
@@ -537,7 +589,11 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
                     let i0 = k1 + c * SOLVE_ROWS;
                     for (t, v) in chunk.iter_mut().enumerate() {
                         let i = i0 + t;
-                        *v -= T::dot_fma(x.iter().enumerate().map(|(kk, xk)| (&l[i + (k0 + kk) * r], xk)));
+                        *v -= T::dot_fma(
+                            x.iter()
+                                .enumerate()
+                                .map(|(kk, xk)| (&l[i + (k0 + kk) * r], xk)),
+                        );
                     }
                 };
                 if par && tail.len() > SOLVE_ROWS {

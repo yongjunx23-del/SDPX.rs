@@ -1123,9 +1123,14 @@ impl<T: FloatT> PsdBlock<T> {
                 pool.install(|| {
                     this.tiles(false).for_each(|tile| {
                         with_block_work(n, |w: &mut BlockWork<T>| {
-                            this.schur_tile(values, false, tile, w, ways, &mut |_, _, position, v| {
-                                target.add(position, v)
-                            })
+                            this.schur_tile(
+                                values,
+                                false,
+                                tile,
+                                w,
+                                ways,
+                                &mut |_, _, position, v| target.add(position, v),
+                            )
                         })
                     })
                 });

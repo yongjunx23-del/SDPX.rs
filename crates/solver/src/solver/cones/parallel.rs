@@ -83,7 +83,9 @@ impl ConeThreading {
         pool: std::sync::Arc<rayon::ThreadPool>,
     ) -> Option<Self> {
         let width = pool.current_num_threads();
-        Self::build(cones, width, None, None, Some(pool)).ok().flatten()
+        Self::build(cones, width, None, None, Some(pool))
+            .ok()
+            .flatten()
     }
 
     // Scale heavy PSD cones first. Whole cones remain independent; workers
@@ -504,7 +506,9 @@ fn useful_width<T: FloatT>(
 /// gpp250-1 (250) flat from 8 to 32 workers, 3.0 → 1.25 GB.
 fn lone_units(n: usize, nx: usize) -> u128 {
     let (n, nx) = (n as u128, nx as u128);
-    (n * n).div_ceil(64 * 64).max((nx * nx * nx / 3).div_ceil(64 * 64 * 64))
+    (n * n)
+        .div_ceil(64 * 64)
+        .max((nx * nx * nx / 3).div_ceil(64 * 64 * 64))
 }
 
 /// Cost (`cone_cost`) one worker absorbs per PSD cone: a cone of order 64.

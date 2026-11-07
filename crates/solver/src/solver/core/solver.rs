@@ -1631,8 +1631,15 @@ mod tau_chase_tests {
         let mut c = TauChase::<f64>::default();
         assert!((0..40).all(|k| !c.observe(1e-13, 10f64.powi(-k), 1e-33, || (1.0, 1.0), None)));
         let mut c = TauChase::<f64>::default();
-        let fired = (0..40)
-            .position(|k| c.observe(1e-17, 10f64.powi(-2 * k), 1e-33 * 10f64.powi(-k / 4), || (1.0, 1.0), None));
+        let fired = (0..40).position(|k| {
+            c.observe(
+                1e-17,
+                10f64.powi(-2 * k),
+                1e-33 * 10f64.powi(-k / 4),
+                || (1.0, 1.0),
+                None,
+            )
+        });
         assert_eq!(fired, Some(12));
         // ... but not from a start-phase anchor (gap above 1e-6).
         let mut c = TauChase::<f64>::default();
@@ -1647,7 +1654,13 @@ mod tau_chase_tests {
         let fired = (0..40).position(|k| {
             let k = k as f64;
             let tau = if k < 20.0 { 0.1 } else { 1e-3 };
-            c.observe(10f64.powf(-k / 8.0), 10f64.powf(-k / 3.0), tau, || (1.0, 1.0), Some(1.0))
+            c.observe(
+                10f64.powf(-k / 8.0),
+                10f64.powf(-k / 3.0),
+                tau,
+                || (1.0, 1.0),
+                Some(1.0),
+            )
         });
         assert_eq!(fired, Some(20));
         // Above 1e-2·τ₀: τ falling 0.15 decades per iteration with s and z
@@ -1658,7 +1671,13 @@ mod tau_chase_tests {
             (0..20).position(|k| {
                 let (k, mu) = (k as f64, 10f64.powf(-(k as f64) / 2.0));
                 let tau = 10f64.powf(-0.15 * k);
-                c.observe(mu.powf(0.3), mu, tau, || (1.0, grow.powf(k / 6.0)), Some(1.0))
+                c.observe(
+                    mu.powf(0.3),
+                    mu,
+                    tau,
+                    || (1.0, grow.powf(k / 6.0)),
+                    Some(1.0),
+                )
             })
         };
         assert_eq!(ray(1.0), Some(6));

@@ -960,7 +960,16 @@ fn kkt_bounds<T: FloatT>(
     αmax: T,
     w: &mut PsdWork<T>,
 ) -> (T, T) {
-    let PsdWork { vector, mat1, mat2, svd, eig, second, n, .. } = w;
+    let PsdWork {
+        vector,
+        mat1,
+        mat2,
+        svd,
+        eig,
+        second,
+        n,
+        ..
+    } = w;
     match scaled {
         Some(v) => {
             vector.clear();
@@ -996,7 +1005,10 @@ fn kkt_bounds<T: FloatT>(
     };
     if !sdpx_arithmetic::inner_parallel::paired() {
         let αz = first(mat1, eig, mat2);
-        return (αz, step_length_psd_component(mat1, eig, ds, &f.Λisqrt, αmax, &mut mat2.data));
+        return (
+            αz,
+            step_length_psd_component(mat1, eig, ds, &f.Λisqrt, αmax, &mut mat2.data),
+        );
     }
     let n = *n;
     let other = second.get_or_insert_with(|| Box::new(StepWorkspace::new(n)));
