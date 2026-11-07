@@ -21,6 +21,9 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 const NONE: usize = usize::MAX;
+/// Columns per solve panel, and rows per parallel task of its update.
+const SOLVE_PANEL: usize = 64;
+const SOLVE_ROWS: usize = 256;
 
 /// AMD ordering that removes only completely dense rows.
 pub(crate) fn ordering<T: FloatT>(k: &CscMatrix<T>) -> super::AmdOrdering {
@@ -495,34 +498,72 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
         Ok(())
     }
 
-    /// `y = L⁻ᵀ D⁻¹ L⁻¹ y` in the factor's order.
+    /// `y = L⁻ᵀ D⁻¹ L⁻¹ y` in the factor's order, by panels of each front.
+    /// Forward: each row takes its panel columns' fused updates in column
+    /// order, rows split over the pool. Backward: each panel column takes
+    /// the rows after its panel as one exact dot, then the panel's own rows
+    /// in reverse. Panels are fixed, so the result is thread-invariant.
     fn solve_permuted(&self, y: &mut [T]) {
         let sym = &self.sym;
         let nsn = sym.start.len() - 1;
+        let par = rayon::current_num_threads() > 1;
         for s in 0..nsn {
-            let (f, w, rows) = (sym.start[s], sym.width(s), &sym.rows[s]);
+            let (w, rows) = (sym.width(s), &sym.rows[s]);
             let (l, r) = (&self.l[s], rows.len());
-            for k in 0..w {
-                let yk = y[f + k];
-                if yk.is_zero() {
-                    continue;
+            let mut g: Vec<T> = rows.iter().map(|&row| y[row]).collect();
+            for k0 in (0..w).step_by(SOLVE_PANEL) {
+                let k1 = (k0 + SOLVE_PANEL).min(w);
+                for k in k0..k1 {
+                    let gk = g[k];
+                    for i in k + 1..k1 {
+                        g[i] = (-l[i + k * r]).mul_add(gk, g[i]);
+                    }
                 }
-                for i in k + 1..r {
-                    let row = rows[i];
-                    y[row] = (-l[i + k * r]).mul_add(yk, y[row]);
+                let (head, tail) = g.split_at_mut(k1);
+                let x = &head[k0..k1];
+                let update = |(c, chunk): (usize, &mut [T])| {
+                    let i0 = k1 + c * SOLVE_ROWS;
+                    for (kk, &xk) in x.iter().enumerate() {
+                        let column = &l[i0 + (k0 + kk) * r..];
+                        for (v, &lik) in chunk.iter_mut().zip(column) {
+                            *v = (-lik).mul_add(xk, *v);
+                        }
+                    }
+                };
+                if par && tail.len() > SOLVE_ROWS {
+                    tail.par_chunks_mut(SOLVE_ROWS).enumerate().for_each(update);
+                } else {
+                    tail.chunks_mut(SOLVE_ROWS).enumerate().for_each(update);
                 }
+            }
+            for (&row, v) in rows.iter().zip(g) {
+                y[row] = v;
             }
         }
         y.iter_mut().zip(&self.dinv).for_each(|(v, &d)| *v *= d);
         for s in (0..nsn).rev() {
-            let (f, w, rows) = (sym.start[s], sym.width(s), &sym.rows[s]);
+            let (w, rows) = (sym.width(s), &sym.rows[s]);
             let (l, r) = (&self.l[s], rows.len());
-            for k in (0..w).rev() {
-                let mut v = y[f + k];
-                for i in k + 1..r {
-                    v = (-l[i + k * r]).mul_add(y[rows[i]], v);
+            let mut g: Vec<T> = rows.iter().map(|&row| y[row]).collect();
+            for k0 in (0..w).step_by(SOLVE_PANEL).rev() {
+                let k1 = (k0 + SOLVE_PANEL).min(w);
+                let (head, tail) = g.split_at_mut(k1);
+                let dot = |k: usize| T::dot_slices(&l[k1 + k * r..r + k * r], tail);
+                let t: Vec<T> = if par && tail.len() * (k1 - k0) > SOLVE_ROWS * SOLVE_PANEL {
+                    (k0..k1).into_par_iter().map(dot).collect()
+                } else {
+                    (k0..k1).map(dot).collect()
+                };
+                for k in (k0..k1).rev() {
+                    let mut v = head[k] - t[k - k0];
+                    for i in k + 1..k1 {
+                        v = (-l[i + k * r]).mul_add(head[i], v);
+                    }
+                    head[k] = v;
                 }
-                y[f + k] = v;
+            }
+            for (&row, v) in rows[..w].iter().zip(&g[..w]) {
+                y[row] = *v;
             }
         }
     }
@@ -556,7 +597,10 @@ impl<T: FloatT> DirectLDLSolver<T> for SupernodalLDLSolver<T> {
         for (v, &old) in y.iter_mut().zip(&self.sym.perm) {
             *v = b[old];
         }
-        self.solve_permuted(&mut y);
+        match &self.pool {
+            Some(pool) => pool.install(|| self.solve_permuted(&mut y)),
+            None => self.solve_permuted(&mut y),
+        }
         for (&v, &old) in y.iter().zip(&self.sym.perm) {
             x[old] = v;
         }
