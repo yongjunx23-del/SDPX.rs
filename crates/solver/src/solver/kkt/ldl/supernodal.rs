@@ -506,10 +506,10 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
     }
 
     /// `y = L⁻ᵀ D⁻¹ L⁻¹ y` in the factor's order, by panels of each front.
-    /// Forward: each row takes its panel columns' fused updates in column
-    /// order, rows split over the pool. Backward: each panel column takes
-    /// the rows after its panel as one exact dot, then the panel's own rows
-    /// in reverse. Panels are fixed, so the result is thread-invariant.
+    /// Forward: each row subtracts one exact dot of its panel columns, rows
+    /// split over the pool. Backward: each panel column takes the rows after
+    /// its panel as one exact dot, then the panel's own solved rows as
+    /// another. Panels are fixed, so the result is thread-invariant.
     fn solve_permuted(&self, y: &mut [T]) {
         let sym = &self.sym;
         let nsn = sym.start.len() - 1;
@@ -520,21 +520,17 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
             let mut g: Vec<T> = rows.iter().map(|&row| y[row]).collect();
             for k0 in (0..w).step_by(SOLVE_PANEL) {
                 let k1 = (k0 + SOLVE_PANEL).min(w);
-                for k in k0..k1 {
-                    let gk = g[k];
-                    for i in k + 1..k1 {
-                        g[i] = (-l[i + k * r]).mul_add(gk, g[i]);
-                    }
+                for i in k0 + 1..k1 {
+                    let solved = T::dot_fma((k0..i).map(|k| (&l[i + k * r], &g[k])));
+                    g[i] -= solved;
                 }
                 let (head, tail) = g.split_at_mut(k1);
                 let x = &head[k0..k1];
                 let update = |(c, chunk): (usize, &mut [T])| {
                     let i0 = k1 + c * SOLVE_ROWS;
-                    for (kk, &xk) in x.iter().enumerate() {
-                        let column = &l[i0 + (k0 + kk) * r..];
-                        for (v, &lik) in chunk.iter_mut().zip(column) {
-                            *v = (-lik).mul_add(xk, *v);
-                        }
+                    for (t, v) in chunk.iter_mut().enumerate() {
+                        let i = i0 + t;
+                        *v -= T::dot_fma(x.iter().enumerate().map(|(kk, xk)| (&l[i + (k0 + kk) * r], xk)));
                     }
                 };
                 if par && tail.len() > SOLVE_ROWS {
@@ -562,11 +558,8 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
                     (k0..k1).map(dot).collect()
                 };
                 for k in (k0..k1).rev() {
-                    let mut v = head[k] - t[k - k0];
-                    for i in k + 1..k1 {
-                        v = (-l[i + k * r]).mul_add(head[i], v);
-                    }
-                    head[k] = v;
+                    let solved = T::dot_slices(&l[k + 1 + k * r..k1 + k * r], &head[k + 1..k1]);
+                    head[k] = head[k] - t[k - k0] - solved;
                 }
             }
             for (&row, v) in rows[..w].iter().zip(&g[..w]) {
