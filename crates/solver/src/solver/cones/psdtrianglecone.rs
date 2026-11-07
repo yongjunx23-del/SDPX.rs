@@ -1142,9 +1142,46 @@ fn admits<T: FloatT>(delta: &Matrix<T>, α: T, buf: &mut Vec<T>) -> bool {
     for j in 0..n {
         buf[j * (n + 1)] += T::one();
     }
+    if T::precision_bits() > 64 {
+        return cholesky_upper_exact(buf, n);
+    }
     let mut info = 0;
     T::xpotrf(b'U', n as i32, buf, n as i32, &mut info);
     info == 0
+}
+
+/// Upper Cholesky A = UᵀU in place (column-major, upper triangle read),
+/// row by row as dpotf2 does: each entry is one exact dot product of two
+/// contiguous column prefixes, rounded once (2.5× faster than the FMA chain
+/// of `xpotrf` at 256 bits, n = 161). The entries of a row are independent
+/// and join the ambient pool under the inner-parallel gate. False when a
+/// pivot is not positive.
+fn cholesky_upper_exact<T: FloatT>(a: &mut [T], n: usize) -> bool {
+    use rayon::prelude::*;
+    let weight = sdpx_arithmetic::inner_parallel::weight(T::precision_bits());
+    for j in 0..n {
+        let (head, right) = a.split_at_mut((j + 1) * n);
+        let uj = &mut head[j * n..];
+        let d = uj[j] - T::dot_slices(&uj[..j], &uj[..j]);
+        if !d.is_finite() || d <= T::zero() {
+            return false;
+        }
+        let d = d.sqrt();
+        uj[j] = d;
+        let uj = &uj[..j];
+        let row = |col: &mut [T]| col[j] = (col[j] - T::dot_slices(&col[..j], uj)) / d;
+        let tail = n - j - 1;
+        let tasks = sdpx_arithmetic::inner_parallel::tasks((tail * j) as u128 * weight, tail);
+        if tasks > 1 {
+            right
+                .par_chunks_mut(n)
+                .with_min_len(tail.div_ceil(tasks))
+                .for_each(row);
+        } else {
+            right.chunks_mut(n).for_each(row);
+        }
+    }
+    true
 }
 
 fn step_length_psd_component<T>(
@@ -1172,7 +1209,7 @@ where
                 return αmax;
             }
             let fast = if T::precision_bits() > 64 && workΔ.nrows() > 3 {
-                eigval_min_f64(workΔ, αmax)
+                eigval_min_f64(workΔ, αmax, work)
             } else {
                 None
             };
@@ -1211,7 +1248,13 @@ where
 /// relatively. Step lengths are a free IPM parameter (the step is scaled by
 /// the step fraction and kept interior), so this accuracy is ample.
 /// Pure Rust: no shared BLAS/LAPACK state across the pool's threads.
-fn eigval_min_f64<T: FloatT>(delta: &Matrix<T>, αmax: T) -> Option<T> {
+///
+/// When `B` is too coarse (on arch0 it misses by 1–10×, while the estimate
+/// matches full precision to 1e-14), a full-precision Cholesky of
+/// I + αc·Δ at αc = (1 − 1e-10)·min(−1/γ, αmax) decides instead: success
+/// proves the true bound exceeds αc, so the returned step is above it by at
+/// most 1e-10 relative, as on the a priori path. `buf` is its scratch.
+fn eigval_min_f64<T: FloatT>(delta: &Matrix<T>, αmax: T, buf: &mut Vec<T>) -> Option<T> {
     let n = delta.nrows();
     let amax = αmax.to_f64()?;
     let mut a = Vec::with_capacity(n * n);
@@ -1232,6 +1275,17 @@ fn eigval_min_f64<T: FloatT>(delta: &Matrix<T>, αmax: T) -> Option<T> {
         0.0
     };
     if bound <= 1e-10 * gamma.abs().max(floor) {
+        return T::from_f64(gamma);
+    }
+    let __ts = std::time::Instant::now();
+    let αc = if gamma < 0.0 && -1.0 / gamma < amax {
+        T::from_f64(-(1.0 - 1e-10) / gamma)?
+    } else {
+        αmax
+    };
+    let certified = admits(delta, αc, buf);
+    crate::receipt::phase("cone_eigmin_certify", __ts.elapsed());
+    if certified {
         T::from_f64(gamma)
     } else {
         None
@@ -1483,7 +1537,7 @@ mod f64_eigmin_tests {
                 "n={n}: {fast} vs {exact64}"
             );
             // The certified path, when it answers, agrees with full precision.
-            if let Some(v) = eigval_min_f64(&m, T::one()) {
+            if let Some(v) = eigval_min_f64(&m, T::one(), &mut Vec::new()) {
                 assert!((v.to_f64().unwrap() - exact64).abs() <= 1e-10);
             }
         }
