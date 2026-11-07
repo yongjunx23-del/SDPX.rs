@@ -2580,7 +2580,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     /// static shift) and the dense storage must stay within the arrow bound
     /// for QDLDL's factor size. Without a border the matrix is definite, so
     /// any order pivots on positive values and density does not matter
-    /// (dE3's condensed Schur, 26% dense: serial QDLDL ~5 min per factor).
+    /// (dE3's condensed Schur is 26% dense).
     pub fn try_dense(
         k: &CscMatrix<T>,
         signs: &[i8],
