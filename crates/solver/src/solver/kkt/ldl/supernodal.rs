@@ -446,7 +446,8 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
         let reg = self.reg;
         let nsn = sym.start.len() - 1;
         let threads = rayon::current_num_threads();
-        // Subtrees, each serial, on the pool.
+        // Subtrees concurrently on the pool; a wide front (dE3: leaves of
+        // 692-1457 columns) still splits its own work over the pool.
         let mut jobs = Vec::with_capacity(sym.tasks.len());
         let (mut l, mut d) = (&mut self.l[..], &mut self.dinv[..]);
         let (mut s0, mut c0) = (0, 0);
@@ -461,12 +462,12 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
             (s0, c0) = (root + 1, sym.start[root + 1]);
             jobs.push((lo, root, mine, dmine));
         }
-        let serial = |(lo, root, l, d): (usize, usize, &mut [Vec<T>], &mut [T])| {
+        let subtree = |(lo, root, l, d): (usize, usize, &mut [Vec<T>], &mut [T])| {
             let mut updates: Vec<Vec<T>> = (lo..=root).map(|_| Vec::new()).collect();
             let mut count = 0;
             for s in lo..=root {
                 let mut take = |c: usize| std::mem::take(&mut updates[c - lo]);
-                let (ls, ds, us) = sym.front(s, kkt, &mut take, reg, &mut count, 1)?;
+                let (ls, ds, us) = sym.front(s, kkt, &mut take, reg, &mut count, threads)?;
                 l[s - lo] = ls;
                 let c = sym.start[s] - sym.start[lo];
                 d[c..c + ds.len()].copy_from_slice(&ds);
@@ -475,9 +476,9 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
             Ok((root, std::mem::take(&mut updates[root - lo])))
         };
         let done: Vec<Result<(usize, Vec<T>), &'static str>> = if threads > 1 && jobs.len() > 1 {
-            jobs.into_par_iter().map(serial).collect()
+            jobs.into_par_iter().map(subtree).collect()
         } else {
-            jobs.into_iter().map(serial).collect()
+            jobs.into_iter().map(subtree).collect()
         };
         let mut updates: Vec<Vec<T>> = (0..nsn).map(|_| Vec::new()).collect();
         let mut in_task = vec![false; nsn];
