@@ -266,25 +266,33 @@ impl Symbolic {
     ) -> Result<(Vec<T>, Vec<T>, Vec<T>), &'static str> {
         let (f, w, r) = (self.start[s], self.width(s), self.rows[s].len());
         let b = r - w;
-        let mut front = zeros::<T>(r * r, ways);
+        // The factor columns (r × w) and the parent's update (F22, b × b)
+        // are assembled apart; the update block is never part of the front.
+        let mut front = zeros::<T>(r * w, ways);
+        let mut update = zeros::<T>(b * b, ways);
         for &(q, offset) in &self.entries[s] {
             front[offset] = kkt.nzval[q];
         }
         for &c in &self.children[s] {
-            let update = updates(c);
+            let child = updates(c);
             let map = &self.relmap[c];
             let bc = map.len();
             for jj in 0..bc {
-                let column = map[jj] * r;
-                for ii in jj..bc {
-                    front[map[ii] + column] += update[ii + jj * bc];
+                let (j, values) = (map[jj], &child[jj * bc..(jj + 1) * bc]);
+                if j < w {
+                    for ii in jj..bc {
+                        front[map[ii] + j * r] += values[ii];
+                    }
+                } else {
+                    for ii in jj..bc {
+                        update[map[ii] - w + (j - w) * b] += values[ii];
+                    }
                 }
             }
         }
         let sign = |k: usize| T::from_i8(self.signs[f + k]).unwrap();
         let mut dinv = vec![T::zero(); w];
         ldl_rec(&mut front, r, w, &vec![0; w], &sign, reg, count, ways, &mut dinv)?;
-        let mut update = Vec::new();
         if b > 0 {
             let mut l11 = vec![T::zero(); w * w];
             for j in 0..w {
@@ -304,25 +312,23 @@ impl Symbolic {
             let upper = crate::algebra::with_split_hint(ways, || {
                 T::xgemm_upper_exact(b'N', b'T', b, b, w, &w21, b, l21, r, &mut packed, None, None)
             });
-            update = zeros::<T>(b * b, ways);
             if upper {
                 for a in 0..b {
                     for c in a..b {
-                        update[c + a * b] = front[w + c + (w + a) * r] - packed[c * (c + 1) / 2 + a];
+                        update[c + a * b] -= packed[c * (c + 1) / 2 + a];
                     }
                 }
             } else {
+                drop(packed);
                 let mut full = zeros::<T>(b * b, ways);
                 exact_product((b'N', b'T'), (b, b, w), (&w21, b), (l21, r), &mut full, ways);
                 for a in 0..b {
                     for c in a..b {
-                        update[c + a * b] = front[w + c + (w + a) * r] - full[a + c * b];
+                        update[c + a * b] -= full[a + c * b];
                     }
                 }
             }
         }
-        front.truncate(r * w);
-        front.shrink_to_fit();
         Ok((front, dinv, update))
     }
 }
