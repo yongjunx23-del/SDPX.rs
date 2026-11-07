@@ -246,7 +246,7 @@ fn ldl_dots<T: FloatT>(
 /// envelope. Blocks up to `REC_BASE` take [`ldl_dots`]. `ways`: spare workers
 /// granted to the products and base factors.
 #[allow(clippy::too_many_arguments)]
-fn ldl_rec<T: FloatT>(
+pub(super) fn ldl_rec<T: FloatT>(
     l: &mut [T],
     ld: usize,
     n: usize,
@@ -408,7 +408,7 @@ fn ldl_rec<T: FloatT>(
 /// rows of B solve independently by exact dots from their first nonzero
 /// column (`low`, at most `n`: the skipped entries stay exact zeros).
 #[allow(clippy::too_many_arguments)]
-fn solve_unit_lower_t<T: FloatT>(
+pub(super) fn solve_unit_lower_t<T: FloatT>(
     m: usize,
     n: usize,
     l: &[T],
@@ -483,7 +483,7 @@ fn solve_unit_lower_t<T: FloatT>(
 
 /// `c = op(a)·op(b)` (`m × n`, inner `k`): one exact sum rounded once per
 /// entry, with `ways` offered to the residue product.
-fn exact_product<T: FloatT>(
+pub(super) fn exact_product<T: FloatT>(
     (ta, tb): (u8, u8),
     (m, n, k): (usize, usize, usize),
     (a, lda): (&[T], usize),

@@ -1,4 +1,5 @@
 use super::qdldl::QDLDLDirectLDLSolver;
+use super::supernodal::SupernodalLDLSolver;
 use crate::{
     algebra::{CscMatrix, FloatT, MatrixTriangle},
     solver::{kkt::direct::BoxedDirectLDLSolver, CoreSettings},
@@ -179,11 +180,26 @@ impl<const N: usize> LDLConfiguration for MpFloat<N> {
                 return solver;
             }
         }
-        // No arrow structure: one pooled dense leaf when serial QDLDL would
-        // cost more.
+        // No arrow structure: the supernodal factor when its ordering leaves
+        // fronts wide enough for the dense exact kernels (its multiply-
+        // subtracts per factor entry, about the mean front width) and saves
+        // most of the dense work; else one pooled dense leaf when serial
+        // QDLDL would cost more.
+        let sn = super::supernodal::ordering(matrix);
+        let sn_flops = (sn.2.n_div + sn.2.n_mult_subs_ldl) as f64;
+        if crate::receipt::profile_requested() {
+            eprintln!("MP_SN lnz={} flops={sn_flops:.3e}", sn.2.lnz);
+        }
+        let wide = sn_flops >= 40. * sn.2.lnz as f64;
+        if wide && 4. * sn_flops <= (matrix.n as f64).powi(3) / 6. {
+            return Box::new(SupernodalLDLSolver::new(matrix, signs, settings, sn.0));
+        }
         let mut amd = Some(ordering);
         if let Some(solver) = Arrow::try_dense(matrix, signs, settings, &mut amd) {
             return Box::new(solver);
+        }
+        if wide {
+            return Box::new(SupernodalLDLSolver::new(matrix, signs, settings, sn.0));
         }
         Box::new(QDLDLDirectLDLSolver::new(
             matrix,
