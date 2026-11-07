@@ -8,7 +8,7 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
-## 2026-11-07 — SDPLIB at MPFR against SDPA-GMP: supernodal factor, condensed form for pure SDPs, step certificate, τ-chase window (kept, perf/de3-20261106)
+## 2026-11-07 — SDPLIB at MPFR against SDPA-GMP: supernodal factor, condensed form for pure SDPs, step certificate, τ-chase window, NT singular vectors (kept, perf/de3-20261106)
 
 - Comparison (SDPA-GMP-omp `bd0e73b` against SDPX v0.9.5, node57, EPYC
   7742, 32 cores; SDPX 256 bits; jobs 234788/234789,
@@ -109,9 +109,34 @@ status and next actions.
   - dE3 (local, 8 threads, 91819c5): restart 42 → 41, Solved/90, same final
     point, 419 s. The window barely helps here; the first attempt's gap
     keeps falling while the objective drifts.
-- Open: the dE3 τ-chase restart (41 iterations lost), the NT SVD on arch0
-  and theta1 (27.3 of 54 s on arch0, 19.3 s inverse iteration), per-thread
-  scratch.
+- Kept (agent branch `perf/svd-vectors-20261106`, `a86993d` + `8f6c399`,
+  `mpfr_svd.rs` only): NT singular vectors by inverse iteration.
+  - Cause (verified): near convergence about 148 of arch0's 161 values lie
+    in one 1e-3·‖T‖ window, so the in-loop Gram–Schmidt cost O(k²·2n) per
+    solve.
+  - Every vector is first computed by itself. Each chain of windows is then
+    orthonormalized as V ← V(I − E/2), with E = VᵀV − I restricted to window
+    pairs, by two exact GEMMs; repeated while (k·max|E|)² > eps. When
+    k·max|E| ≥ 1/2 or four steps fail, the old in-order Gram–Schmidt path
+    runs, bitwise unchanged. The independent first pass runs as board items,
+    pool tasks or serially, with the same bits on every route (digests equal
+    at 1 and 4 threads on arch0/256, ising11/512, Λ35-rs/1024).
+  - Orthogonality on dumps: arch0 2.34e2 against 2.69e2 eps, Λ35-rs/1024
+    2.56e2 against 3.07e2 eps; residuals unchanged.
+  - arch0 256 bits T=32 node55 release (job 235012, mirror v095 tbSv1 tbSv2
+    tbSv2 tbSv1 v095): 62.69 → 47.56 s (windows) → 44.92 s (parallel),
+    −28.3%. svd.invit 19.47 → 4.19 → 1.00 s; cone_svd 27.7 → 9.35 s. All legs
+    Solved/49, r_p 2.86e-37, r_d 1.56e-31. Peak RSS within the leg spread.
+  - 12_min 256 bits (job 235014): 69.83 → 70.25 s (+0.6%, noise), 97
+    iterations, objective equal to 30 digits. QR fallbacks 51 → 62 of 1455
+    SVDs from the changed trajectory; no first-pass vector failed.
+  - gpp100 at 1e-30 stays AlmostSolved (185 → 192 iterations).
+  - Rejected: MRRR (dlarrv-style on BᵀB) reached only 1.4e3–1.4e4 eps
+    orthogonality, with RRR and child-growth failures
+    (`~/.cache/sdpx-e2e/patches/svd-mrrr-20261106.patch`).
+- Open: the dE3 τ-chase restart (41 iterations lost); per-thread scratch
+  (arch0 1.0 GB against SDPA's 33 MB). Remaining svd.invit on arch0 is about
+  2% of wall.
 
 ## 2026-11-05 — Integration of the Hubbard ORE and 128-bit Ising lines with main (PR #15); review repairs (perf/hubbard-ising-20261105)
 
