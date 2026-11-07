@@ -493,15 +493,19 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
             in_task[sym.first[root]..=root].fill(true);
             updates[root] = update;
         }
-        // Their ancestors, each front on the whole pool.
+        // Their ancestors, each front on the whole pool. Every front's
+        // scratch is freed on the workers' arenas, which keep those pages
+        // resident; return them before the next, larger front.
         let mut count = 0;
         for s in (0..nsn).filter(|&s| !in_task[s]) {
+            crate::receipt::trim_heap(false);
             let mut take = |c: usize| std::mem::take(&mut updates[c]);
             let (ls, ds, us) = sym.front(s, kkt, &mut take, reg, &mut count, threads)?;
             self.l[s] = ls;
             self.dinv[sym.start[s]..sym.start[s + 1]].copy_from_slice(&ds);
             updates[s] = us;
         }
+        crate::receipt::trim_heap(false);
         Ok(())
     }
 
