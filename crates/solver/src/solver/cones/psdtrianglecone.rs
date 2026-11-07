@@ -1142,46 +1142,9 @@ fn admits<T: FloatT>(delta: &Matrix<T>, α: T, buf: &mut Vec<T>) -> bool {
     for j in 0..n {
         buf[j * (n + 1)] += T::one();
     }
-    if T::precision_bits() > 64 {
-        return cholesky_upper_exact(buf, n);
-    }
     let mut info = 0;
     T::xpotrf(b'U', n as i32, buf, n as i32, &mut info);
     info == 0
-}
-
-/// Upper Cholesky A = UᵀU in place (column-major, upper triangle read),
-/// row by row as dpotf2 does: each entry is one exact dot product of two
-/// contiguous column prefixes, rounded once (2.5× faster than the FMA chain
-/// of `xpotrf` at 256 bits, n = 161). The entries of a row are independent
-/// and join the ambient pool under the inner-parallel gate. False when a
-/// pivot is not positive.
-fn cholesky_upper_exact<T: FloatT>(a: &mut [T], n: usize) -> bool {
-    use rayon::prelude::*;
-    let weight = sdpx_arithmetic::inner_parallel::weight(T::precision_bits());
-    for j in 0..n {
-        let (head, right) = a.split_at_mut((j + 1) * n);
-        let uj = &mut head[j * n..];
-        let d = uj[j] - T::dot_slices(&uj[..j], &uj[..j]);
-        if !d.is_finite() || d <= T::zero() {
-            return false;
-        }
-        let d = d.sqrt();
-        uj[j] = d;
-        let uj = &uj[..j];
-        let row = |col: &mut [T]| col[j] = (col[j] - T::dot_slices(&col[..j], uj)) / d;
-        let tail = n - j - 1;
-        let tasks = sdpx_arithmetic::inner_parallel::tasks((tail * j) as u128 * weight, tail);
-        if tasks > 1 {
-            right
-                .par_chunks_mut(n)
-                .with_min_len(tail.div_ceil(tasks))
-                .for_each(row);
-        } else {
-            right.chunks_mut(n).for_each(row);
-        }
-    }
-    true
 }
 
 fn step_length_psd_component<T>(
