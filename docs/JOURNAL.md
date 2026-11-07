@@ -231,6 +231,9 @@ status and next actions.
     1.5 ms per product, about the rate the column-parallel rank-1 updates
     already reach. Below the 2% rule; blocked bidiagonalization (dlabrd) has
     the same limit and was not built.
+  - Inner-parallel grain 2^15 → 2^17 limb products (arch0 runs 17.7 s at
+    T=8 against 20.5 s at T=32 on node105): Mac T=8 10.75 → 12.59 s (+17%),
+    identical points. Not tried on the cluster.
 - arch0 memory (Mac, de3-d7): peak RSS at 5 iterations 167 MiB (T=1), 284
   (T=2), 355 (T=4), 448 (T=8). Live heap at iteration 15, T=8 (macOS malloc
   stack logging): 343 MiB. The main holders: RNS congruence scratch 56 MiB
