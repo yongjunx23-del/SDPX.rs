@@ -8,7 +8,7 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
-## 2026-11-07 — SDPLIB at MPFR against SDPA-GMP: supernodal factor, condensed form for pure SDPs, step certificate (kept, perf/de3-20261106)
+## 2026-11-07 — SDPLIB at MPFR against SDPA-GMP: supernodal factor, condensed form for pure SDPs, step certificate, τ-chase window (kept, perf/de3-20261106)
 
 - Comparison (SDPA-GMP-omp `bd0e73b` against SDPX v0.9.5, node57, EPYC
   7742, 32 cores; SDPX 256 bits; jobs 234788/234789,
@@ -91,8 +91,27 @@ status and next actions.
   MB; the rest of the 5.5 GB peak is transient exact-product workspace in
   the factor. arch0: setup 36 MB; per-thread cone and assembly scratch grows
   it to 1.0 GB at 22 threads (first cone scaling alone +61 MB at T=1).
-- Open: the dE3 τ-chase restart (iterations), the NT SVD on arch0 and theta1
-  (27.3 of 54 s on arch0, 19.3 s inverse iteration), per-thread scratch.
+- Kept (convergence contract, agent branch `perf/tau-chase-20261106`,
+  `7821f3d`): a first attempt below 1e-2·τ₀ also restarts when μ fell at
+  least 30-fold over the last six iterations while the relative gap fell
+  less than half as many decades. A gap that still improves tenfold every
+  7–10 iterations kept re-anchoring the old stall test. The peak-referenced
+  test of automatic and restarted attempts is unchanged; no tolerance or
+  gate moves.
+  - 12_min 512 bits T=32 release ABBA (jobs 235002/235003): 151.7 → 138.4 s
+    (−8.8%), restart 45 → 33, final point bitwise identical; audit (235013)
+    unchanged: rel gap 9.77e-8, r_p 7.64e-25, r_d 2.44e-21.
+  - csdr3 at tol 1e-12: restart 46 → 39, 93 → 86 iterations, same point.
+  - SDPLIB sweep: restarts move earlier on several inputs with identical
+    final points, except control3 (59 → 58 iterations, restart 15 → 9). It
+    no longer keeps the dual's start scale; Solved, objective within 5.2e-29
+    relative, r_p 8.2e-44 (was 2.5e-33), r_d 8.7e-37 (was 6.6e-36).
+  - dE3 (local, 8 threads, 91819c5): restart 42 → 41, Solved/90, same final
+    point, 419 s. The window barely helps here; the first attempt's gap
+    keeps falling while the objective drifts.
+- Open: the dE3 τ-chase restart (41 iterations lost), the NT SVD on arch0
+  and theta1 (27.3 of 54 s on arch0, 19.3 s inverse iteration), per-thread
+  scratch.
 
 ## 2026-11-05 — Integration of the Hubbard ORE and 128-bit Ising lines with main (PR #15); review repairs (perf/hubbard-ising-20261105)
 
