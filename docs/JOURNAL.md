@@ -8,6 +8,54 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-08 — Condensed assembly slot products sized on first use (kept, perf/lazy-product-20261108 → perf/de3-20261106); cone-owned MPFR scratch (rejected); SDPA-GMP comparison on the lead
+
+- SDPA-GMP comparison (job 235148, node78, EPYC 7742, 32 cores, both
+  solvers on the same node; SDPX lead `dea6fdf`-equivalent tbDv1). Wall
+  time and peak RSS, SDPA → SDPX: control1 0.51 s → 0.65 s (SDPX solve
+  0.34 s; the first case of the job also loads the binary); theta1 1.67 →
+  1.98 s; truss5 7.18 → 1.26 s; arch0 (1e-30) 16.98 s / 34 MB → 26.26 s /
+  0.75 GB; dE3 289.4 s / 0.66 GB → 229.5 s / 3.90 GB (SDPX 1.26×; was
+  5.38 GB in job 235123); 12_min 314.9 s / 0.18 GB → 85.6 s / 1.45 GB
+  (3.68×). gpp100 at 1e-30: SDPA pFEAS in 7.3 s, SDPX AlmostSolved after
+  200 iterations in 41.1 s (known). Iterations SDPA / SDPX: dE3 33 / 80,
+  12_min 78 / 99, arch0 53 / 49, theta1 43 / 32, truss5 48 / 36,
+  control1 46 / 54.
+- dE3's gap to SDPA in iterations is the τ chase: SDPA's own solution is
+  large (x up to 3.7e16, X 1.1e16, Y 2.6e8), which its infeasible-start
+  method reaches by growing the iterates while HSD shrinks τ. The KKT start
+  gives no warning (‖s‖∞·‖z‖∞ 0.03 on dE3, 0.06 on 12_min, against the
+  1e15 chase-start rule), so no start-scale predictor applies.
+- Rejected (`perf/cone-work-20261108`, `eac9d97`): MPFR PSD cones own their
+  `PsdWork` when the pool has more workers than PSD cones, instead of a set
+  per worker. Release ABBA (job 235143, node76, tbDv1 against tbDu1,
+  identical points on every leg): 12_min T=32 81.61/81.15 → 80.41/80.14 s,
+  peak RSS 1394/1423 → 1408/1425 MB; T=64 74.86/75.65 → 75.11/74.47 s,
+  1961/1994 → 1966/1925 MB; arch0 T=32 18.98/18.97 → 19.15/19.20 s
+  (+1.1%), 672/689 → 595/606 MB (−11%); dE3 T=32 227.68/229.06 →
+  227.75/227.96 s, 3842/3827 → 3874/3956 MB. Only arch0 saves memory, and
+  its lone cone's single set moves between workers (likely remote NUMA
+  pages). 12_min's growth with workers (1.4 → 2.0 GB from 32 to 64) is
+  not cone scratch. Local Mac reruns at T=24 sit inside ±100 MB noise
+  (cw 989/789/826 MB, lead 930/831).
+- Kept (`389a93e`): a condensed assembly tile's extra slots allocate their
+  n×n product on first use; columns packed from one dense congruence never
+  need it (slot 0 stays sized, it is also the work matrix). Release ABBA
+  (job 235145, node55, 12_min 512 bits, tbDv1 against tbDx1, identical
+  points): T=32 85.16/85.65 → 81.60/81.25 s, peak RSS 1410/1419 →
+  1337/1358 MB (−4.7%); T=64 76.82/77.54 → 78.09/77.18 s, 1918/1899 →
+  1829/1871 MB (−3.5%). node55's lead legs ran 4.5% slower than node76's
+  (job 235143), so the T=32 time is not claimed. Local Mac, identical
+  points: dE3 4 iterations T=8 16.30/16.51 → 16.41/16.43 s, RSS in noise;
+  arch0 Solved/35 10.46/10.46 → 10.47/10.48 s, 554/561 → 526/540 MB;
+  ising11 E2E Solved/54, audit PASS.
+- Other directions checked this round, no change: 12_min's A entries are
+  full precision (√2-scaled svec values), so a short-operand left-dot
+  kernel cannot apply; the n = 85 cone already scales first with helpers;
+  arch0's three scaling congruences per solve include the residual's H·z,
+  which the refinement measures; gpp100's gap falls about a decade per 10
+  iterations after iteration 58 (degenerate), a known failure.
+
 ## 2026-11-08 — τ-chase restart scale and kept side for ray-rule restarts (rejected); shared MPFR scratch sets (rejected)
 
 - dE3 trace (256 bits, `SDPX_TRACE_TAU`): τ peaks at 4.78 (iteration 10)
