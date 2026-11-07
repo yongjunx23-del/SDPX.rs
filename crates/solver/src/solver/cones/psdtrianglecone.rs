@@ -960,33 +960,25 @@ fn kkt_bounds<T: FloatT>(
     αmax: T,
     w: &mut PsdWork<T>,
 ) -> (T, T) {
-    let αz = match scaled {
+    let PsdWork { vector, mat1, mat2, svd, eig, second, n, .. } = w;
+    match scaled {
         Some(v) => {
-            w.vector.clear();
-            w.vector.extend_from_slice(v);
-            step_length_psd_component(
-                &mut w.mat1,
-                &mut w.eig,
-                &w.vector,
-                &f.Λisqrt,
-                αmax,
-                &mut w.mat2.data,
-            )
+            vector.clear();
+            vector.extend_from_slice(v);
         }
-        None => step_component_inner(
+        None => mul_Wx_scratch(
+            MatrixShape::N,
+            vector,
             dz,
+            T::one(),
+            T::zero(),
             &f.R,
-            &f.Λisqrt,
-            false,
-            αmax,
-            &mut w.vector,
-            &mut w.mat1,
-            &mut w.mat2,
-            &mut w.svd.Vt,
-            &mut w.eig,
+            mat1,
+            mat2,
+            &mut svd.Vt,
         ),
-    };
-    for (d, &v) in ds.iter_mut().zip(&w.vector) {
+    }
+    for (d, &v) in ds.iter_mut().zip(vector.iter()) {
         *d = -v;
     }
     match offset {
@@ -997,15 +989,41 @@ fn kkt_bounds<T: FloatT>(
             }
         }
     }
-    let αs = step_length_psd_component(
-        &mut w.mat1,
-        &mut w.eig,
-        ds,
-        &f.Λisqrt,
-        αmax,
-        &mut w.mat2.data,
+    // Both bounds use αmax, so they are independent: an idle ambient worker
+    // takes the second with the caller's inner gate and half its ways.
+    let first = |m1: &mut Matrix<T>, e: &mut EigEngine<T>, m2: &mut Matrix<T>| {
+        step_length_psd_component(m1, e, vector, &f.Λisqrt, αmax, &mut m2.data)
+    };
+    if !sdpx_arithmetic::inner_parallel::paired() {
+        let αz = first(mat1, eig, mat2);
+        return (αz, step_length_psd_component(mat1, eig, ds, &f.Λisqrt, αmax, &mut mat2.data));
+    }
+    let n = *n;
+    let other = second.get_or_insert_with(|| Box::new(StepWorkspace::new(n)));
+    let (inner, ways) = (
+        sdpx_arithmetic::inner_parallel::active(),
+        crate::algebra::split_hint().div_ceil(2),
     );
-    (αz, αs)
+    let half = |run: &mut dyn FnMut() -> T| {
+        let _gate = sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, true);
+        crate::algebra::with_split_hint(ways, run)
+    };
+    let ds = &*ds;
+    rayon::join(
+        || half(&mut || first(mat1, eig, mat2)),
+        || {
+            half(&mut || {
+                step_length_psd_component(
+                    &mut other.mat1,
+                    &mut other.eig,
+                    ds,
+                    &f.Λisqrt,
+                    αmax,
+                    &mut other.mat2.data,
+                )
+            })
+        },
+    )
 }
 
 fn step_component_inner<T>(

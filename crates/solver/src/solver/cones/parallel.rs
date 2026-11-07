@@ -378,7 +378,9 @@ impl ConeThreading {
                 .saturating_mul(4)
                 .min(active)
                 .min((*prefix.last().unwrap() / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
-            if lanes > 1 {
+            // One lane is worth the queue only when spare workers can take
+            // its inner splits (a lone PSD block's congruences, Cholesky).
+            if lanes > 1 || (lanes == 1 && spare) {
                 balanced_lanes(cones, &prefix, lanes)
             } else {
                 Vec::new()

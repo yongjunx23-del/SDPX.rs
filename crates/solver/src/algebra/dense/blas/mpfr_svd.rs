@@ -547,6 +547,9 @@ pub(super) struct InvitWork<const N: usize> {
     block: Vec<F<N>>,
     gram: Vec<F<N>>,
     prod: Vec<F<N>>,
+    /// Chains left to `dstein`'s order, and one chain's local windows.
+    redo: Vec<(usize, usize)>,
+    local: Vec<usize>,
 }
 
 /// One vector's pivoted LU of the shifted tridiagonal, per thread.
@@ -616,7 +619,7 @@ pub(super) fn inverse_vectors<const N: usize>(
     if n < 2 || s.iter().any(|x| *x == F::zero() || !x.is_finite()) {
         return false;
     }
-    let InvitWork { off, order, xs, used, groups, seeds, block, gram, prod } = ws;
+    let InvitWork { off, order, xs, used, groups, seeds, block, gram, prod, redo, local } = ws;
     // The zero diagonal of T, then its off-diagonal.
     off.clear();
     off.resize(m, F::zero());
@@ -693,18 +696,7 @@ pub(super) fn inverse_vectors<const N: usize>(
         }
         true
     };
-    // First every vector by itself, the windows then orthogonalized together
-    // (`orthogonalize_windows`); if a window is too far from orthonormal for
-    // that, the dstein order, Gram–Schmidt inside the iteration.
-    for inline in [false, true] {
-        if !sweep.run(used, groups, seeds, order, inline, xs, v, n, &finish) {
-            return false;
-        }
-        if inline || orthogonalize_windows(v, n, order, groups, block, gram, prod) {
-            return true;
-        }
-    }
-    false
+    sweep.vectors(used, groups, seeds, order, xs, v, n, &finish, [block, gram, prod], redo, local)
 }
 
 /// One inverse-iteration sweep (the `dstein` steps of [`inverse_vectors`])
@@ -845,6 +837,37 @@ impl<const N: usize> Sweep<'_, N> {
         false
     }
 
+    /// Every vector by itself, then each chain's windows orthogonalized
+    /// together ([`orthogonalize_windows`]). A chain too far from orthonormal
+    /// for that is recomputed in `dstein`'s order, Gram–Schmidt inside the
+    /// iteration. No window spans two chains, so those vectors are the ones a
+    /// whole `dstein`-order pass computes.
+    #[allow(clippy::too_many_arguments)]
+    fn vectors(
+        &self,
+        shifts: &[F<N>],
+        groups: &[usize],
+        seeds: &[u64],
+        order: &[usize],
+        xs: &mut Vec<F<N>>,
+        v: &mut [F<N>],
+        n: usize,
+        finish: &(dyn Fn(&[F<N>], &mut [F<N>]) -> bool + Sync),
+        [block, gram, prod]: [&mut Vec<F<N>>; 3],
+        redo: &mut Vec<(usize, usize)>,
+        local: &mut Vec<usize>,
+    ) -> bool {
+        if !self.run(shifts, groups, seeds, order, false, xs, v, n, finish) {
+            return false;
+        }
+        orthogonalize_windows(v, n, order, groups, block, gram, prod, redo);
+        redo.iter().all(|&(a, b)| {
+            local.clear();
+            local.extend(groups[a..b].iter().map(|g| g - a));
+            self.run(&shifts[a..b], local, &seeds[a..b], &order[a..b], true, xs, v, n, finish)
+        })
+    }
+
     /// Vector `j` of `order` (shift `shifts[j]`, start `seeds[j]`), written
     /// by `finish(x, column)` to column `order[j]` of the `n`-row `v`. With
     /// `inline`, the vectors run in order into the rows of `xs`, each solve
@@ -962,9 +985,12 @@ fn signed_unit<const N: usize>(x: &mut [F<N>]) -> bool {
 /// pair as it was; the two products are exact residue GEMMs at larger
 /// sizes. Independent inverse-iteration vectors in a window differ from
 /// the eigenvectors by `O(eps·‖T‖/gap)`, so one step usually suffices; it is
-/// repeated while `(k·max|E|)² > eps` for a chain of `k`. Returns false,
-/// with the columns unspecified, if `k·max|E| ≥ 1/2` (values too close for
-/// independent vectors) or four steps do not converge.
+/// repeated while `(k·max|E|)² > eps` for a chain of `k`. Each step squares
+/// `k·max|E|`, so twelve steps converge from below 1/2 at every width up to
+/// 4096 bits. A chain with `k·max|E| ≥ 1/2` (values too close for
+/// independent vectors), or one that does not converge, keeps its columns
+/// and is pushed to `redo`.
+#[allow(clippy::too_many_arguments)]
 fn orthogonalize_windows<const N: usize>(
     v: &mut [F<N>],
     n: usize,
@@ -973,7 +999,9 @@ fn orthogonalize_windows<const N: usize>(
     block: &mut Vec<F<N>>,
     gram: &mut Vec<F<N>>,
     prod: &mut Vec<F<N>>,
-) -> bool {
+    redo: &mut Vec<(usize, usize)>,
+) {
+    redo.clear();
     let eps = F::<N>::epsilon();
     let half = F::<N>::one() / num::<N>(2);
     let mut a = 0;
@@ -994,7 +1022,7 @@ fn orthogonalize_windows<const N: usize>(
             prod.resize(n * k, F::zero());
             let (ki, ni) = (k as i32, n as i32);
             let mut converged = false;
-            for _ in 0..4 {
+            for _ in 0..12 {
                 <F<N> as XgemmScalar>::xgemm(b'T', b'N', ki, ki, ni, F::one(), block, ni, block, ni, F::zero(), gram, ki);
                 let mut big = F::<N>::zero();
                 for u in 0..k {
@@ -1013,7 +1041,7 @@ fn orthogonalize_windows<const N: usize>(
                 }
                 let spread = big * num::<N>(k);
                 if !(spread < half) {
-                    return false;
+                    break;
                 }
                 if big == F::zero() {
                     converged = true;
@@ -1029,15 +1057,15 @@ fn orthogonalize_windows<const N: usize>(
                 }
             }
             if !converged {
-                return false;
-            }
-            for (t, &p) in order[a..b].iter().enumerate() {
-                v[p * n..(p + 1) * n].copy_from_slice(&block[t * n..(t + 1) * n]);
+                redo.push((a, b));
+            } else {
+                for (t, &p) in order[a..b].iter().enumerate() {
+                    v[p * n..(p + 1) * n].copy_from_slice(&block[t * n..(t + 1) * n]);
+                }
             }
         }
         a = b;
     }
-    true
 }
 
 /// Right singular vectors of the upper bidiagonal `(d, e)` whose values lie
@@ -1075,7 +1103,7 @@ fn normal_vectors<const N: usize>(
         return false;
     }
     let c = (lo + hi) / num::<N>(2);
-    let InvitWork { off, order, xs, used, groups, seeds, block, gram, prod } = ws;
+    let InvitWork { off, order, xs, used, groups, seeds, block, gram, prod, redo, local } = ws;
     // off[0..n] the diagonal of F, off[n..2n-1] its off-diagonal.
     off.clear();
     for i in 0..n {
@@ -1140,17 +1168,8 @@ fn normal_vectors<const N: usize>(
         column.copy_from_slice(x);
         true
     };
-    // As in `inverse_vectors`: independent vectors, then the windows
-    // orthogonalized together, else Gram–Schmidt inside the iteration.
-    for inline in [false, true] {
-        if !sweep.run(used, groups, seeds, order, inline, xs, v, n, &finish) {
-            return false;
-        }
-        if inline || orthogonalize_windows(v, n, order, groups, block, gram, prod) {
-            return true;
-        }
-    }
-    false
+    // As in `inverse_vectors`.
+    sweep.vectors(used, groups, seeds, order, xs, v, n, &finish, [block, gram, prod], redo, local)
 }
 
 // Packed Householder reconstruction, applied backwards as in SDPX's upstream
