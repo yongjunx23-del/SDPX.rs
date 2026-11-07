@@ -8,6 +8,46 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-08 — Pool width for a lone large PSD cone (kept, perf/lone-psd-width-20261108 → perf/de3-20261106); width measurements
+
+- Observed (thread sweep 235110, node76, lead binary, 256 bits): single
+  PSD block problems stop scaling at 6–8 threads. arch0 (n 161) 17.47 /
+  19.82 / 19.89 / 21.11 s at 8 / 12 / 16 / 22 threads; gpp124-1 (124)
+  18.93 / 19.76 / 20.59 s at 6 / 8 / 10; gpp250-1 (250) 89.43 / 93.60 /
+  92.06 / 93.76 s at 8 / 16 / 24 / 32 with peak RSS 1.25 → 3.18 GB. Every
+  phase slows slightly past 8 (SVD, eigmin, step lengths, congruences).
+  The MPFR useful-width rule counted a lone cone as (n/64)³ units: 22
+  workers for arch0, 10 for gpp124-1, 32 for gpp250-1.
+- Per-cone cap test (job 235113, node54, 32-thread budget, temporary
+  switch): arch0 best on 8 workers (17.59 s against 20.77 on 22), gpp124-1
+  on 4 (18.75 against 22.31 on 10), gpp250-1 needs 8 or more (113.4 s on
+  4, 92.4 on 8, 91.5 on 32). No single cap fits. Ising red41-mp at 128
+  bits (job 234154) is assembly-bound (115 of 189 s) on 54 workers that
+  come from the cubic count of its four blocks of order 119–128, so a
+  global change would narrow it.
+- Change (`6e20a86`): exactly one PSD cone above order 64 counts
+  max(⌈n²/64²⌉, ⌈nx³/(3·64³)⌉) units (its kernels' per-step n² splits;
+  the dense condensed Schur over its nx columns), never more than the
+  cubic count (theta2 would otherwise widen 5 → 32, unmeasured).
+  Multi-cone problems and cones up to order 64 keep their widths (checked:
+  dE3, control3, qap6, truss4, mcp250-1 and mcp500-1, which chordal
+  splitting leaves multi-cone, and theta2).
+- Release ABBA (job 235119, node54, 32 threads, s_d15, 256 bits),
+  identical points and iterations: arch0 20.44/20.47 → 19.26/18.97 s
+  (−6.6%), peak RSS 1.04 → 0.72 GB; gpp124-1 22.23/22.53 → 19.39/19.57 s
+  (−12.9%), 0.54 → 0.38 GB; gpp100 10.19/10.53 → 9.26/9.09 s (−11.4%);
+  gpp250-1 91.35/91.49 → 90.18/90.31 s (−1.3%), 2.95 → 2.78 GB. Kept.
+- Open, measured (job 235115, node76, temporary switch): 12_min at 512
+  bits on 31–32 workers instead of 24 runs 81.4/81.5 s against 88.4/87.0
+  (−7%; assembly 54 → 45.5 s). The width rule ignores condensed assembly
+  work for PSD problems; an assembly term from A would also count
+  materialized sampled columns (ising11, Λ) and arrow-path problems
+  (BFSS), so it needs the backend and the sampled flag. Not built.
+- dE3 memory after the dependency-driven factor (job 235113, SDPX_PROFILE,
+  4 iterations, T=32): glibc free heap is 1.2–2.0 GB at iteration
+  boundaries in both builds (arena 3.6–4.6 GB); the extra peak comes from
+  more fronts' transient residue workspace in flight, not live data.
+
 ## 2026-11-07 — Dependency-driven supernodal factor (kept, perf/sn-dag-20261107 → perf/de3-20261106); dE3 factor profile; closed leads
 
 - Hypothesis (profiles below): at 32 threads the subtree grain leaves small
