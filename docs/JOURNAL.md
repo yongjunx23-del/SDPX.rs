@@ -8,6 +8,32 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-08 — Cone pool sized by condensed assembly for pure PSD problems (kept, perf/asm-width-20261108 → perf/de3-20261106)
+
+- Cause (observed, job 235115 and 235134, node76, 12_min at 512 bits):
+  the width rule counted only cone work, so 12_min (16 PSD cones of order
+  1–85) ran on 24 workers whatever the budget, while its condensed Schur
+  assembly (89.8M exact left-dot terms per iteration) scales with the pool.
+  Same binary, width forced by a test switch: T=64 72.7 s on 64 workers
+  against 90.2 s on 24 (assembly 27.5 against 54.1 s per solve); T=48 75.2 s;
+  T=32 80.9 s. Peak RSS 1.38 → 1.83 / 2.17 GB at 48 / 64 workers (per-worker
+  cone scratch, about 11 MiB live per worker, all in blocks under 4 MiB).
+- Change (`7c55e72`): a non-sampled MPFR problem with P = 0, a condensed
+  KKT and only PSD/orthant cones passes its exact left-dot term count
+  (Σ over each PSD cone's touching columns of the running nnz) to the width
+  rule; with several cones the pool gets at least one worker per 64³ terms
+  (the f64 unit of `psd_unit`, scaled by words² like the cone costs). The
+  lone-cone rule is unchanged.
+- Width at a 32-thread budget (Mac, receipts): 12_min 24 → 32; dE3 32,
+  arch0 10, control1 3, truss5 32, theta1 2, gpp100 4 unchanged; sampled
+  problems (ising11) never take the term. ising11 E2E Solved/54, point
+  `a18ab4b6a4a3` as the lead.
+- Release ABBA job 235137 (node54, tbDl1 `630cae1` against tbDs1
+  `7c55e72`, identical points, Solved/99 on every leg): T=32 88.65/86.66 →
+  80.70/81.05 s (−7.7%), peak RSS 1.36/1.32 → 1.51/1.49 GB; T=64
+  89.03/89.28 → 74.70/72.49 s (−17.5%), 1.41/1.39 → 2.13/2.09 GB. Kept
+  for the time; the extra memory is the per-worker cone scratch (open).
+
 ## 2026-11-08 — dE3 factor memory: i32 residue products, prime-group packing, front reuse, u32 indices (kept, perf/{rns-i32-prod,rns-prime-groups,sn-reuse,u32-index}-20261108 → perf/de3-20261106); SDPA-GMP comparison refreshed
 
 - SDPA-GMP comparison (job 235123, node54, 32 cores, both solvers on the
