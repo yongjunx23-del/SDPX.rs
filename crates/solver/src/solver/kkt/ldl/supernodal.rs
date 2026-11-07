@@ -48,7 +48,7 @@ struct Symbolic {
     /// Positions in the parent's `rows` of each row below a supernode.
     relmap: Vec<Vec<usize>>,
     /// Per supernode: (KKT value index, offset in the column-major front).
-    entries: Vec<Vec<(usize, usize)>>,
+    entries: Vec<Vec<(u32, u32)>>,
 }
 
 impl Symbolic {
@@ -183,7 +183,10 @@ impl Symbolic {
                 })
                 .collect();
         }
-        let mut entries: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nsn];
+        // KKT positions (checked) and front offsets (a front of 2^32 wide
+        // entries could not be stored) fit u32.
+        assert!(k.nnz() <= u32::MAX as usize, "supernodal KKT exceeds u32 positions");
+        let mut entries: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nsn];
         for s in 0..nsn {
             let (f, w, r) = (start[s], width(s), rows[s].len());
             let below = &rows[s][w..];
@@ -194,7 +197,9 @@ impl Symbolic {
                     } else {
                         w + below.binary_search(&row).unwrap()
                     };
-                    entries[s].push((q, pos + (c - f) * r));
+                    let offset = pos + (c - f) * r;
+                    debug_assert!(offset <= u32::MAX as usize);
+                    entries[s].push((q as u32, offset as u32));
                 }
             }
         }
@@ -235,7 +240,7 @@ impl Symbolic {
         let mut front = zeros::<T>(r * w, ways);
         let mut update = zeros::<T>(b * b, ways);
         for &(q, offset) in &self.entries[s] {
-            front[offset] = kkt.nzval[q];
+            front[offset as usize] = kkt.nzval[q as usize];
         }
         for &c in &self.children[s] {
             let child = updates(c);

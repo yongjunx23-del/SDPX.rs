@@ -17,10 +17,12 @@ pub(crate) fn worthwhile<T: FloatT>(a: &CscMatrix<T>) -> bool {
     (a.m > 1 || a.n > 1) && a.nnz() as u128 * words * words >= MIN_PARALLEL_WORK
 }
 
+/// One stored entry of a row: its column and CSC position (u32 halves the
+/// plan, which otherwise rivals a wide matrix's values in bytes).
 #[derive(Clone, Copy)]
 struct Entry {
-    column: usize,
-    position: usize,
+    column: u32,
+    position: u32,
 }
 
 pub(crate) struct SparseParallel {
@@ -71,6 +73,10 @@ impl SparseParallel {
     }
 
     fn build<T>(a: &CscMatrix<T>, symmetric: bool) -> Self {
+        assert!(
+            a.rowval.len() <= u32::MAX as usize && a.n <= u32::MAX as usize,
+            "sparse row plan exceeds u32 indices"
+        );
         let mut rowptr = vec![0; a.m + 1];
         for &row in &a.rowval {
             rowptr[row + 1] += 1;
@@ -99,12 +105,15 @@ impl SparseParallel {
         for column in 0..a.n {
             for position in a.colptr[column]..a.colptr[column + 1] {
                 let row = a.rowval[position];
-                entries[rowptr[row]] = Entry { column, position };
+                entries[rowptr[row]] = Entry {
+                    column: column as u32,
+                    position: position as u32,
+                };
                 rowptr[row] += 1;
                 if symmetric && row != column {
                     entries[rowptr[column]] = Entry {
-                        column: row,
-                        position,
+                        column: row as u32,
+                        position: position as u32,
                     };
                     rowptr[column] += 1;
                 }
@@ -338,7 +347,7 @@ impl SparseParallel {
                 pool.install(|| {
                     split_outputs(y, &self.row_lanes, &|row, out| {
                         for e in &self.entries[self.rowptr[row]..self.rowptr[row + 1]] {
-                            *out += alpha * a.nzval[e.position] * x[e.column];
+                            *out += alpha * a.nzval[e.position as usize] * x[e.column as usize];
                         }
                     })
                 });
@@ -368,9 +377,9 @@ impl SparseParallel {
                 pool.install(|| {
                     split_output_pair(y0, y1, &self.row_lanes, &|row, o0, o1| {
                         for e in &self.entries[self.rowptr[row]..self.rowptr[row + 1]] {
-                            let v = a.nzval[e.position];
-                            *o0 += alpha * v * x[0][e.column];
-                            *o1 += alpha * v * x[1][e.column];
+                            let v = a.nzval[e.position as usize];
+                            *o0 += alpha * v * x[0][e.column as usize];
+                            *o1 += alpha * v * x[1][e.column as usize];
                         }
                     })
                 });
@@ -805,7 +814,9 @@ impl SparseParallel {
             }
         } else {
             let row = &self.entries[self.rowptr[output]..self.rowptr[output + 1]];
-            let terms = row.iter().map(|e| (&a.nzval[e.position], &x[e.column]));
+            let terms = row
+                .iter()
+                .map(|e| (&a.nzval[e.position as usize], &x[e.column as usize]));
             if wide && a.nnz() >= 4 * a.m {
                 exact_output(y, terms, alpha);
             } else {
