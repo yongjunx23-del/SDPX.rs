@@ -217,8 +217,9 @@ impl Symbolic {
 
     /// Assemble and partially factor front `s`: its factor columns (`r × w`,
     /// unit lower on top), their D⁻¹, and the update block for the parent
-    /// (`b × b`, lower triangle).
-    #[allow(clippy::type_complexity)]
+    /// (`b × b`, lower triangle). `reuse` is the previous factor's storage
+    /// for these columns (empty before the first factorization).
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn front<T: FloatT>(
         &self,
         s: usize,
@@ -227,12 +228,22 @@ impl Symbolic {
         reg: Option<(T, T)>,
         count: &mut usize,
         ways: usize,
+        mut reuse: Vec<T>,
     ) -> Result<(Vec<T>, Vec<T>, Vec<T>), &'static str> {
         let (f, w, r) = (self.start[s], self.width(s), self.rows[s].len());
         let b = r - w;
         // The factor columns (r × w) and the parent's update (F22, b × b)
         // are assembled apart; the update block is never part of the front.
-        let mut front = zeros::<T>(r * w, ways);
+        let mut front = if reuse.len() == r * w {
+            if ways > 1 {
+                reuse.par_iter_mut().for_each(|v| *v = T::zero());
+            } else {
+                reuse.fill(T::zero());
+            }
+            reuse
+        } else {
+            zeros::<T>(r * w, ways)
+        };
         let mut update = zeros::<T>(b * b, ways);
         for &(q, offset) in &self.entries[s] {
             front[offset] = kkt.nzval[q];
@@ -385,6 +396,8 @@ struct Fronts<'a, T: FloatT> {
     updates: Vec<Mutex<Vec<T>>>,
     /// Factor columns and D⁻¹ of each front.
     factors: Vec<Mutex<(Vec<T>, Vec<T>)>>,
+    /// The previous factor's columns, refilled in place.
+    reuse: Vec<Mutex<Vec<T>>>,
     error: Mutex<Option<&'static str>>,
 }
 
@@ -397,7 +410,8 @@ impl<'a, T: FloatT> Fronts<'a, T> {
             crate::receipt::trim_heap(false);
         }
         let mut take = |c: usize| std::mem::take(&mut *self.updates[c].lock().unwrap());
-        match sym.front(s, self.kkt, &mut take, self.reg, &mut 0, self.ways) {
+        let reuse = std::mem::take(&mut *self.reuse[s].lock().unwrap());
+        match sym.front(s, self.kkt, &mut take, self.reg, &mut 0, self.ways, reuse) {
             Ok((ls, ds, us)) => {
                 *self.factors[s].lock().unwrap() = (ls, ds);
                 *self.updates[s].lock().unwrap() = us;
@@ -463,6 +477,9 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
             pending: sym.children.iter().map(|c| AtomicUsize::new(c.len())).collect(),
             updates: (0..nsn).map(|_| Mutex::new(Vec::new())).collect(),
             factors: (0..nsn).map(|_| Mutex::new((Vec::new(), Vec::new()))).collect(),
+            // The old factor is never solved with once a new one starts; its
+            // storage holds the new columns instead of staying live beside them.
+            reuse: std::mem::take(&mut self.l).into_iter().map(Mutex::new).collect(),
             error: Mutex::new(None),
         };
         let cx = &fronts;
@@ -472,11 +489,18 @@ impl<T: FloatT> SupernodalLDLSolver<T> {
             }
         });
         if let Some(error) = fronts.error.into_inner().unwrap() {
+            // Keep every front's storage for the next attempt.
+            self.l = std::iter::zip(fronts.factors, fronts.reuse)
+                .map(|(f, old)| {
+                    let (ls, _) = f.into_inner().unwrap();
+                    if ls.is_empty() { old.into_inner().unwrap() } else { ls }
+                })
+                .collect();
             return Err(error);
         }
         for (s, factor) in fronts.factors.into_iter().enumerate() {
             let (ls, ds) = factor.into_inner().unwrap();
-            self.l[s] = ls;
+            self.l.push(ls);
             self.dinv[sym.start[s]..sym.start[s + 1]].copy_from_slice(&ds);
         }
         crate::receipt::trim_heap(false);
