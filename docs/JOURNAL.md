@@ -8,6 +8,61 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-08 — dE3 factor memory: i32 residue products, prime-group packing, front reuse, u32 indices (kept, perf/{rns-i32-prod,rns-prime-groups,sn-reuse,u32-index}-20261108 → perf/de3-20261106); SDPA-GMP comparison refreshed
+
+- SDPA-GMP comparison (job 235123, node54, 32 cores, both solvers on the
+  same node; SDPX `a01493a`-equivalent tbDl1). Wall time and peak RSS,
+  SDPA → SDPX: control1 0.46 s → 0.43 s; theta1 1.63 → 1.99 s; truss5
+  7.07 → 1.18 s; arch0 (1e-30) 17.0 s / 33 MB → 26.0 s / 0.80 GB (was
+  60.7 s); dE3 288 s / 0.64 GB → 228 s / 5.14 GB (SDPX 1.26×); 12_min
+  311 s / 0.18 GB → 89.7 s / 1.31 GB (3.47×). gpp100 at 1e-30: SDPA
+  pFEAS PARTIAL in 7.2 s, SDPX AlmostSolved after 200 iterations in
+  42.2 s (known; 91 s before). arch0 and theta1 stay SDPA wins: SDPX's
+  NT SVD is 39% of arch0 (Mac T=8 profile: scaling 52%, step lengths
+  15%), and HKM / eig(LᵀSL) remain closed directions.
+- dE3 live-heap tracer (test branch, global allocator recording large
+  blocks' call sites at each new live peak; local Mac T=8 and job 235127
+  node54 T=32, 4 iterations): live peak 2.9–3.0 GB against 4.2–4.6 GB
+  RSS. At the peak: the root front's packed operand residues 507 MB, the
+  previous factor's L 400 MB beside the new fronts, the stored-product
+  buffer 338 MB, per-PSD assembly buffers 265 MB, reduced KKT values
+  216 MB, the residual row plan 144 MB.
+- Observed: dE3's root-front products (966³, upper) take 96 primes where
+  24 suffice without spread. Operand exponents sit at three levels (about
+  67% of entries near 1, 30% near 2⁻²⁵⁶, 2.4% near 2⁻⁵¹²) inside rows
+  and columns, so per-row/column windows leave a 508-bit spread. Splitting
+  by level would take 168 prime-products against 96; the prime count is
+  inherent to exact products here.
+- Kept, all bitwise (identical x, s, z on dE3, 12_min, arch0, ising11, medium):
+  - `9bcb6ed`: stored-path residue products as i32 (reduced residues are
+    inside ±2^25). Release ABBA job 235127 (node54, T=32): dE3
+    226.64/229.22 → 225.86/227.53 s, peak RSS 5.25/5.37 → 4.93/4.89 GB;
+    12_min 87.45/87.80 → 87.31/88.57 s, 1.36/1.34 → 1.27/1.29 GB.
+  - `c62aac7`: a single-column-block stored product whose residues exceed
+    256 MiB encodes them a prime group at a time (Mac dE3 4.10 → 3.58 GB).
+  - `676b73a`: each factorization refills the previous factor's front
+    storage (Mac dE3 4.40 → 4.04 GB).
+  - `dc9cc90`: residual row plan and supernodal entry map hold u32 pairs
+    (Mac dE3 4.42 → 4.27 GB).
+  - Combined (Mac dE3 4 iterations T=8): 4.40 → 3.11–3.19 GB (−28%),
+    time unchanged. Release ABBA job 235135 (node54, T=32, tbDl1 `630cae1`
+    against tbDq2 = merge `333980e`, identical points on every leg): dE3
+    236.74/235.21 → 232.79/232.42 s (−1.4%), peak RSS 5.27/5.34 → 3.96/3.89
+    GB (−26%); 12_min 87.27/88.62 → 88.29/87.68 s (neutral), 1.37/1.35 →
+    1.26/1.34 GB; arch0 19.01/19.05 → 19.35/19.15 s (+1.1%), 724/716 →
+    698/676 MB. The arch0 cost is kept for the dE3 memory.
+- glibc allocator settings (job 235133, node76, dE3 4 iterations T=32,
+  identical points): lead 14.71/14.18 s, 4.13/3.97 GB; the four changes
+  13.93/14.04 s, 2.98/2.94 GB. On top of them MALLOC_ARENA_MAX=8 14.76 s /
+  2.49 GB, =4 14.85 s / 2.46 GB, mmap threshold 1 MiB 14.81 s / 2.69 GB,
+  4 MiB plus trim and top pad 14.20 s / 3.21 GB. Each saving costs 4–6%
+  time; defaults kept.
+- Measured, not kept: without per-PSD assembly buffers (test switch) dE3
+  Mac T=8 3.66–3.74 → 3.38–3.40 GB for +5% assembly (+0.6% total), but
+  12_min +4.7% (assembly 5.3 → 5.7 s per 4 iterations) for no memory.
+  No rule separates them yet. A smaller stored block (2^24 entries) gave
+  dE3 −7% live; superseded by the i32 buffer and prime groups.
+
 ## 2026-11-08 — Pool width for a lone large PSD cone (kept, perf/lone-psd-width-20261108 → perf/de3-20261106); width measurements
 
 - Observed (thread sweep 235110, node76, lead binary, 256 bits): single
