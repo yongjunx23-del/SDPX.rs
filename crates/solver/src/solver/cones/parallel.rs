@@ -272,7 +272,7 @@ impl ConeThreading {
         // Preserve the measured PSD admission. Materialized PSD A columns
         // do not describe the condensed factor's work.
         let cap = if existing.is_none() {
-            useful_width(cones)
+            useful_width(cones, kkt.map(|(_, a)| a.n))
         } else {
             usize::MAX
         };
@@ -441,16 +441,28 @@ impl ConeThreading {
 /// order 12–16) ran at 3.12 GHz / IPC 2.69 on 8 threads but 2.35 GHz / IPC
 /// 0.83 on 64, with useful instructions unchanged (journal 2026-10-07).
 /// Problems without PSD cones and binary64 keep the requested width.
-fn useful_width<T: FloatT>(cones: &[SupportedCone<T>]) -> usize {
+/// `columns`: the primal columns, when the KKT is known (see [`lone_units`]).
+fn useful_width<T: FloatT>(cones: &[SupportedCone<T>], columns: Option<usize>) -> usize {
     if T::precision_bits() <= 64 {
         return usize::MAX;
     }
     let unit = psd_unit::<T>();
+    let lone = columns.filter(|_| {
+        cones
+            .iter()
+            .filter(|c| matches!(c, SupportedCone::PSDTriangleCone(_)))
+            .count()
+            == 1
+    });
     let (mut units, mut other, mut psd) = (0u128, 0u128, false);
     for cone in cones {
-        if matches!(cone, SupportedCone::PSDTriangleCone(_)) {
+        if let SupportedCone::PSDTriangleCone(k) = cone {
             psd = true;
-            units += cone_cost(cone).div_ceil(unit).max(1);
+            let cubic = cone_cost(cone).div_ceil(unit).max(1);
+            units += match lone {
+                Some(nx) if k.n > 64 => cubic.min(lone_units(k.n, nx)),
+                _ => cubic,
+            };
         } else {
             other += cone_cost(cone);
         }
@@ -465,6 +477,20 @@ fn useful_width<T: FloatT>(cones: &[SupportedCone<T>]) -> usize {
     } else {
         (width as usize).max(2)
     }
+}
+
+/// Units of a lone PSD cone of order `n` above 64 beside `nx` primal columns.
+/// With no other cone to overlap, its phases are its own kernels' inner
+/// splits, which divide each step's n² work (rank-one updates, rotations,
+/// congruence columns) rather than the cone's n³; the condensed Schur over
+/// the columns that touch it is dense (nx³/3). Both only narrow the cubic
+/// count (theta2: 498 columns would widen 5 to 32, unmeasured). At 256 bits
+/// on a 32-thread budget (node54, journal 2026-11-08): arch0 (n 161) 20.8 s
+/// on 22 workers, 17.6 s on 8; gpp124-1 (124) 22.3 s on 10, 18.8 s on 4;
+/// gpp250-1 (250) flat from 8 to 32 workers, 3.0 → 1.25 GB.
+fn lone_units(n: usize, nx: usize) -> u128 {
+    let (n, nx) = (n as u128, nx as u128);
+    (n * n).div_ceil(64 * 64).max((nx * nx * nx / 3).div_ceil(64 * 64 * 64))
 }
 
 /// Cost (`cone_cost`) one worker absorbs per PSD cone: a cone of order 64.
