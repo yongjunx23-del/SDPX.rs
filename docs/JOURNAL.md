@@ -8,6 +8,92 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-07 — SDPLIB at MPFR against SDPA-GMP: supernodal factor, condensed form for pure SDPs, step certificate (kept, perf/de3-20261106)
+
+- Comparison (SDPA-GMP-omp `bd0e73b` against SDPX v0.9.5, node57, EPYC
+  7742, 32 cores; SDPX 256 bits; jobs 234788/234789,
+  `~/projects/tb-sdpa-cmp-20261106/runs`). Wall time and peak RSS, SDPA →
+  SDPX:
+  - control1 0.24–0.36 → 0.34–0.40 s; theta1 1.6 → 2.2–2.3 s; truss5
+    7.0 → 1.2 s; arch0 17.0 s / 33 MB → 60.7–61.5 s / 1.0 GB (SDPA 53
+    iterations, 85% in its Schur assembly).
+  - gpp100 at 1e-30: SDPA exit 3 in 7 s, SDPX AlmostSolved in 91 s (known).
+  - 12_min: 314 s / 179 MB → 154 s / 1.38 GB.
+  - dE3 (n 6067, 17 PSD blocks ≤ 48): SDPA 288 s / 654 MB in 33
+    iterations; SDPX was stopped by the 4 h limit.
+- dE3 diagnosis (observed):
+  - Auto chose the augmented form. At MPFR there is no static
+    regularization, so with P = 0 the x diagonal is zero. The negated
+    arrow needs a 6067-wide dense border (5.3 GB, over its bound), and
+    QDLDL's order meets zero pivots and shifts them. First iteration: 134 s
+    serial and a 2.09e-5 step.
+  - Forced condensed: definite Schur, 26% dense, one pooled dense leaf
+    (`112eaba`): Solved/91 in 1260 s, 12.8 s per factor, 13.2 GB (tbD1).
+  - AMD without dense-row removal orders that Schur at 2.70e9
+    multiply-subtracts, against QDLDL's 1.5×-threshold ordering at 3.07e10
+    (its threshold treats every row as dense) and the dense 4e10.
+- Kept:
+  - Supernodal multifrontal LDLᵀ for wide types without arrow structure
+    (`kkt/ldl/supernodal.rs`). AMD with `dense = -1`, relaxed supernodes
+    (CHOLMOD limits), fronts factored by the arrow's exact kernels
+    (`ldl_rec`, `solve_unit_lower_t`, exact upper products). Subtrees run
+    concurrently and every front splits over the pool. Thread-invariant:
+    dE3 at 2 and 8 threads gives identical x, s, z.
+    - Selected when its flops per factor entry are at least 40 and four
+      times its flops are at most n³/6; otherwise the dense leaf, then
+      supernodal when wide, else QDLDL.
+    - Panel-parallel solves: forward rows by panel columns in order;
+      backward panel columns as one exact dot of the later rows.
+    - Fronts hold r×w factor columns and the b×b update apart.
+  - Condensed form for wide types when P = 0 and every cone is PSD or
+    orthant (`prefer_condensed`). 256 bits: truss5 1.34 → 0.94 s (23
+    iterations either way); dE3 auto now condensed_supernodal, first
+    iteration 13 s with a 0.60 step. theta1, gpp100, arch0 and 12_min
+    were already condensed; control1 is below the 256-row floor.
+  - PSD step certificate (agent branch `perf/psd-step-20261106`,
+    `abe3015`). When the a priori f64 bound rejects, a full-precision
+    exact-dot Cholesky of I + αc·Δ at αc = (1 − 1e-10)·α̂ decides before
+    the MPFR eigensolve fallback. arch0 256 bits T=32 node57 release ABBA
+    (job 234871): v095 61.00/61.07 s → 54.13/54.19 s (−11.3%), repeat
+    234985 −11.4%. All legs Solved/49, objectives agree to 1.4e-40.
+    `cone_eigmin` 8.8 → 1.9 s.
+- dE3 results (node57, 32 threads, 256 bits, s_d15 settings,
+  `~/projects/tbD-de3-20261107/runs`). All Solved in 91 iterations with
+  identical iterate lines:
+
+  | Build | Path | Solve | Factor median | Peak RSS |
+  |---|---|---|---|---|
+  | tbD1 `112eaba` (forced condensed) | dense leaf | 1259.9 s | 12.87 s | 13.2 GB |
+  | tbD2 `8c00ec8` (forced condensed) | supernodal | 778.1 s | 6.30 s (6.4 cores) | 5.0 GB |
+  | tbD4 `118ed1c` (auto) | condensed_supernodal | 305.2 s | 2.53 s (19.7 cores) | 5.5 GB |
+
+  - The original-coordinate audit (`audit12.py`, 160 digits) is identical
+    for tbD1 and tbD4: gap 9.06e-8, r_p 1.54e-16, r_d 1.44e-9 at max|z|
+    3.9e10 (scaled 3e-20), PSD minimum eigenvalues 3.2e-20 / 2.3e-16.
+  - tbD4 phases: factor 234.6 s of 305; solves 37.8 s over 199 calls (0.165
+    s, against 0.64 s serial).
+  - SDPX is now faster per iteration than SDPA (3.35 against 8.7 s) but
+    takes 91 iterations against 33. A τ-chase restart at iteration 42
+    discards the first run. That run reached gap 4e-9 at iteration 29
+    with the objective still drifting (0.53364 → 0.53367 against 0.533680)
+    and dres 1.9e-11 against tol_feas 1e-15.
+- Unaffected checks: 12_min ABBA v095 vs tbD4 (job 235006): 66.96/66.91 →
+  66.95/67.34 s, Solved/97, same objective; condensed_arrow both sides.
+  SDPLIB sweep at 256 bits (s_d15, Mac, v0.9.5 fast vs this branch):
+  control1, theta1, truss5, gpp100, arch0 all Solved with the same
+  iterations and objectives. ising11 E2E Solved/54, audit PASS
+  (primal 1.31e-48, dual 2.41e-47, gap 2.89e-44).
+- Rejected (step agent, evidence in its run dirs): pairing the two MPFR
+  KKT bounds with `rayon::join` (neutral, job 234872); a 32-row blocked
+  certificate Cholesky (−0.6%, below the 2% rule, job 234984; branch
+  `perf/psd-step-blocked-20261106`).
+- Memory, dE3: per-PSD-block assembly buffers 371 MB, Schur 216 MB, L 418
+  MB; the rest of the 5.5 GB peak is transient exact-product workspace in
+  the factor. arch0: setup 36 MB; per-thread cone and assembly scratch grows
+  it to 1.0 GB at 22 threads (first cone scaling alone +61 MB at T=1).
+- Open: the dE3 τ-chase restart (iterations), the NT SVD on arch0 and theta1
+  (27.3 of 54 s on arch0, 19.3 s inverse iteration), per-thread scratch.
+
 ## 2026-11-05 — Integration of the Hubbard ORE and 128-bit Ising lines with main (PR #15); review repairs (perf/hubbard-ising-20261105)
 
 - Scope: `ore-mt-qdldl-20261104` (v0.9.4 + Hubbard ORE work) merged with
