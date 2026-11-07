@@ -350,7 +350,8 @@ where
                 self.callbacks.checkpoint.restart.is_none(),
             ) {
                 if let (Some(tau), Some(gap)) = (self.variables.tau(), self.info.gap_rel()) {
-                    if chase.observe(gap, state.μ, tau, reference) {
+                    let sides = || self.variables.slack_dual_norms();
+                    if chase.observe(gap, state.μ, tau, sides, reference) {
                         chase_tau = Some(match reference {
                             Some(_) => TauChase::restart_tau(tau),
                             None => T::min(tau, TauChase::<T>::deep_tau()),
@@ -1469,19 +1470,75 @@ const CHASE_START_SCALE: f64 = 1e15;
 /// attempt is measured against its peak τ and restarts at `deep_tau`. Too
 /// small a τ₀ costs far less than a chase: Λ35-rs takes 283–284 iterations
 /// from 1e-90 or 1e-120, Λ27-rs 138/158/200 from 1e-29/1e-50/1e-78.
+///
+/// Below `1e-2·τ₀` a first attempt also fires on a short window: over the
+/// last `WINDOW` iterations μ fell at least 30-fold while the gap fell less
+/// than half as many decades. Once τ settles the gap falls with μ (slope
+/// about 1); in a chase the gap is about μ/τ² with τ falling 0.4 decades
+/// per decade of μ, so the slope is 0.2–0.5. A gap that still creeps
+/// tenfold every 7–10 iterations keeps re-anchoring the rule above: 12_min
+/// (SDPA, 512 bits) has window slopes 0.5 → 0.2 over iterations 33–45 and
+/// fired only at 45, csdr3 at tolerance 1e-12 at 46 (window: 39). Healthy
+/// landings show such windows only above the τ test (truss5 τ 0.08–0.11,
+/// Λ19-rs 0.13).
+///
+/// The window also fires above `1e-2·τ₀` when the iterate moves out along
+/// a ray: over the window τ fell at least fourfold while the unscaled
+/// `‖s‖∞` and `‖z‖∞` each stayed within 1.5×, so (x, s, z)/τ only grows.
+/// dE3 (256 bits) holds s at 1.07 and z within 1.42× over iterations 25–31
+/// while τ falls 0.86 → 0.165, and 12_min both within 1.3× over 11–17 (τ
+/// 1.37 → 0.125); their first attempts end Solved at 62 and 51 without the
+/// restart, but 12_min's objective is then off by 1.4e-5 and both points'
+/// original-coordinate residuals are 1e2–1e12 times those after it. The
+/// rule moves dE3 from 41 to 31 and 12_min from 33 to 17. Elsewhere the
+/// closest window with that slope and fall keeps the sides within 2.1×
+/// (SOCP sched, iteration 7) or 2.9× (truss5).
 #[derive(Default)]
 struct TauChase<T> {
     anchor: Option<(T, T)>,
     peak: T,
+    /// `(gap, μ, τ, ‖s‖∞, ‖z‖∞)` of the last `WINDOW + 1` first-attempt
+    /// iterates.
+    recent: std::collections::VecDeque<(T, T, T, T, T)>,
 }
 
 impl<T: FloatT> TauChase<T> {
+    const WINDOW: usize = 6;
+
     /// `reference`: the attempt's τ₀, or `None` for its peak τ so far.
-    fn observe(&mut self, gap: T, mu: T, tau: T, reference: Option<T>) -> bool {
+    /// `sides`: the iterate's `(‖s‖∞, ‖z‖∞)`, read on first attempts only.
+    fn observe(
+        &mut self,
+        gap: T,
+        mu: T,
+        tau: T,
+        sides: impl FnOnce() -> (T, T),
+        reference: Option<T>,
+    ) -> bool {
         if !(gap.is_finite() && mu.is_finite() && tau.is_finite() && tau > T::zero()) {
             return false;
         }
         self.peak = T::max(self.peak, tau);
+        if let Some(tau0) = reference {
+            let (s, z) = sides();
+            self.recent.push_back((gap, mu, tau, s, z));
+            if self.recent.len() > Self::WINDOW + 1 {
+                self.recent.pop_front();
+            }
+            if let (true, Some(&(gap0, mu0, t0, s0, z0))) =
+                (self.recent.len() > Self::WINDOW, self.recent.front())
+            {
+                let (fell, gained) = (mu0 / mu, gap0 / gap);
+                let within = |a: T, b: T| T::max(a / b, b / a) <= (1.5).as_T();
+                let ray = t0 >= tau * (4.0).as_T() && within(s, s0) && within(z, z0);
+                if (tau < tau0 * (1e-2).as_T() || ray)
+                    && fell >= (30.0).as_T()
+                    && gained * gained < fell
+                {
+                    return true;
+                }
+            }
+        }
         // A start's gap is ~0 (equal costs), so a first anchor there never
         // moves. Against the peak, anchor in the convergence phase only:
         // Λ27-rs (no chase) stalls near gap 1e-13 at iterations 89–99 while
@@ -1556,14 +1613,14 @@ mod tau_chase_tests {
         let mut c = TauChase::<f64>::default();
         for k in 0..60 {
             let v = 10f64.powi(-k / 2);
-            assert!(!c.observe(v, v, v, Some(1.0)));
+            assert!(!c.observe(v, v, v, || (1.0, 1.0), Some(1.0)));
         }
         // Stall: gap flat at 1e-13 while μ falls; fires once μ drops 1e4.
         let mut c = TauChase::<f64>::default();
         let mut fired = None;
         for k in 0..40 {
             let mu = 1e-20 * 10f64.powi(-k);
-            if c.observe(1e-13, mu, 1e-11, Some(1.0)) {
+            if c.observe(1e-13, mu, 1e-11, || (1.0, 1.0), Some(1.0)) {
                 fired = Some(k);
                 break;
             }
@@ -1572,17 +1629,40 @@ mod tau_chase_tests {
         // Against the peak: a settled τ never fires; τ falling 100-fold
         // below its peak with a stalled gap does.
         let mut c = TauChase::<f64>::default();
-        assert!((0..40).all(|k| !c.observe(1e-13, 10f64.powi(-k), 1e-33, None)));
+        assert!((0..40).all(|k| !c.observe(1e-13, 10f64.powi(-k), 1e-33, || (1.0, 1.0), None)));
         let mut c = TauChase::<f64>::default();
         let fired = (0..40)
-            .position(|k| c.observe(1e-17, 10f64.powi(-2 * k), 1e-33 * 10f64.powi(-k / 4), None));
+            .position(|k| c.observe(1e-17, 10f64.powi(-2 * k), 1e-33 * 10f64.powi(-k / 4), || (1.0, 1.0), None));
         assert_eq!(fired, Some(12));
         // ... but not from a start-phase anchor (gap above 1e-6).
         let mut c = TauChase::<f64>::default();
-        assert!(!c.observe(1e-222, 1.0, 1e-27, None));
-        assert!((0..12).all(|k| !c.observe(1e3, 10f64.powi(-4 * k), 1e-27, None)));
-        assert!(!c.observe(1e-13, 1e-60, 1e-30, None));
-        assert!(!c.observe(1e-13, 1e-62, 1e-30, None));
+        assert!(!c.observe(1e-222, 1.0, 1e-27, || (1.0, 1.0), None));
+        assert!((0..12).all(|k| !c.observe(1e3, 10f64.powi(-4 * k), 1e-27, || (1.0, 1.0), None)));
+        assert!(!c.observe(1e-13, 1e-60, 1e-30, || (1.0, 1.0), None));
+        assert!(!c.observe(1e-13, 1e-62, 1e-30, || (1.0, 1.0), None));
+        // A gap creeping tenfold per 8 iterations re-anchors while μ falls
+        // only 10^2.7 per period; the window (slope 0.38) fires once τ is
+        // below 1e-2·τ₀.
+        let mut c = TauChase::<f64>::default();
+        let fired = (0..40).position(|k| {
+            let k = k as f64;
+            let tau = if k < 20.0 { 0.1 } else { 1e-3 };
+            c.observe(10f64.powf(-k / 8.0), 10f64.powf(-k / 3.0), tau, || (1.0, 1.0), Some(1.0))
+        });
+        assert_eq!(fired, Some(20));
+        // Above 1e-2·τ₀: τ falling 0.15 decades per iteration with s and z
+        // fixed (a ray) and the gap at slope 0.3 fires once the window is
+        // full; with z doubling per window only the τ test fires, at 14.
+        let ray = |grow: f64| {
+            let mut c = TauChase::<f64>::default();
+            (0..20).position(|k| {
+                let (k, mu) = (k as f64, 10f64.powf(-(k as f64) / 2.0));
+                let tau = 10f64.powf(-0.15 * k);
+                c.observe(mu.powf(0.3), mu, tau, || (1.0, grow.powf(k / 6.0)), Some(1.0))
+            })
+        };
+        assert_eq!(ray(1.0), Some(6));
+        assert_eq!(ray(2.0), Some(14));
         assert_eq!(TauChase::<f64>::deep_tau(), f64::EPSILON.sqrt());
         assert_eq!(TauChase::<f64>::restart_tau(1e-11), 1e-11);
     }

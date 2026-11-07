@@ -45,9 +45,13 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "T::one()")]
     pub initial_tau: T,
 
-    ///restart once when a first attempt from τ₀ ≥ 1e-10 chases τ: since
-    ///the relative gap last improved tenfold, μ fell by 1e4 and τ below
-    ///1e-2·τ₀. The restart uses τ₀ = min(τ, eps^(1/8)) (Λ27: 451
+    ///restart once when a first attempt from τ₀ ≥ 1e-10 chases τ: τ fell
+    ///below 1e-2·τ₀ and, since the relative gap last improved tenfold, μ
+    ///fell by 1e4, or over the last 6 iterations μ fell 30-fold while the
+    ///gap fell less than half as many decades and either τ is below
+    ///1e-2·τ₀ or τ fell fourfold with ‖s‖∞ and ‖z‖∞ within 1.5× (the
+    ///iterate moving out along a ray). The restart uses
+    ///τ₀ = min(τ, eps^(1/8)) (Λ27: 451
     ///iterations from 1, 181 from 1e-30). On by default for wide types: it
     ///only acts on a unit start, i.e. an accepted KKT start (SDPB 3.1
     ///resampled Ising inputs: Λ27-rs 345 → 230 iterations with the former

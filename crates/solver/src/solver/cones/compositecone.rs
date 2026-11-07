@@ -495,7 +495,7 @@ where
             let cached = if let Some(threading) =
                 self.threading.as_ref().filter(|t| t.cone_workers > 1)
             {
-                if αmax.is_finite() && αmax > T::zero() && threading.sym_step_lanes.len() > 1 {
+                if αmax.is_finite() && αmax > T::zero() && !threading.sym_step_lanes.is_empty() {
                     self.sym_step_bounds.resize(self.cones.len(), (αmax, αmax));
                     threading.pool.install(|| {
                         cone_parallel::queued_affine_bounds(
@@ -1648,7 +1648,7 @@ where
             if threading.orthant_chunk.is_none()
                 && αmax.is_finite()
                 && αmax > T::zero()
-                && threading.sym_step_lanes.len() > 1
+                && !threading.sym_step_lanes.is_empty()
             {
                 self.sym_step_bounds.resize(self.cones.len(), (αmax, αmax));
                 threading.pool.install(|| {

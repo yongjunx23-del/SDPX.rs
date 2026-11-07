@@ -251,6 +251,7 @@ pub(crate) fn prefer_condensed<T: FloatT>(
     let mut retained_aux = 0usize;
     let mut augmented_cells = 0u128;
     let mut factor_cells = 0u128;
+    let mut only_psd = true;
     for cone in cones.iter() {
         match cone {
             SupportedCone::PSDTriangleCone(c) => {
@@ -262,8 +263,11 @@ pub(crate) fn prefer_condensed<T: FloatT>(
             SupportedCone::NonnegativeCone(_) => {}
             // Both forms hold these rows alike (−D and N⁻¹A, factored before
             // the variables), so they do not decide the form.
-            SupportedCone::OpRelEntropyCone(_) | SupportedCone::OpRelEntropyLimitCone(_) => {}
+            SupportedCone::OpRelEntropyCone(_) | SupportedCone::OpRelEntropyLimitCone(_) => {
+                only_psd = false;
+            }
             _ => {
+                only_psd = false;
                 retained = retained.saturating_add(cone.numel());
                 // Match the existing SOC/GenPower sparse expansion sizes.
                 if cone.is_sparse_expandable() {
@@ -279,6 +283,17 @@ pub(crate) fn prefer_condensed<T: FloatT>(
     let reduced = A.n.saturating_add(retained);
     if A.n == 0 || psd < 256 {
         return false;
+    }
+    // Wide types have no static regularization, so with P = 0 and only
+    // PSD/orthant rows the x diagonal is zero: an augmented factor must
+    // eliminate the coupled cone rows before x, carrying the condensed
+    // Schur's fill plus the dense scaling blocks (the negated arrow's dense
+    // border), or a generic sparse order meets zero pivots and shifts them
+    // (dE3: shifted QDLDL, a 2e-5 first step). 256 bits, condensed against
+    // augmented: dE3 first iteration 13 s / 134 s, truss5 0.94 / 1.34 s,
+    // same iterations.
+    if T::precision_bits() > 53 && only_psd && P.nnz() == 0 {
+        return true;
     }
 
     // Bound the same structural union built by new(): P plus diagonals,
