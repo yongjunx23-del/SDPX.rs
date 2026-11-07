@@ -8,6 +8,52 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-08 — τ-chase restart scale and kept side for ray-rule restarts (rejected); shared MPFR scratch sets (rejected)
+
+- dE3 trace (256 bits, `SDPX_TRACE_TAU`): τ peaks at 4.78 (iteration 10)
+  and falls to 0.24 by 30 while z/τ grows 97 → 9565 and the unscaled s
+  settles at 1.07; the ray rule fires at 31. The restart scale is
+  eps^(1/8) (2.5e-10) whenever τ is above it, so the restart point does not
+  depend on when the rule fires, but the side rule does: before iteration
+  25 s/τ is below its start (1.004), and `kept_side` would keep the primal.
+  12_min (512 bits): τ peaks at 2.86 (8), falls to 0.16 by 16, restart at
+  17 from τ₀ 5.9e-20 (s/τ 3.8e20 against a final max|s| of 9.7e16).
+- Sweep (test switches `SDPX_TEST_RAY_TAU`, `SDPX_TEST_KEEP`; job 235139,
+  node3, untimed; 160-digit original-coordinate audits):
+
+  | Case | Restart | Iterations | Objective | rel r_p | rel r_d |
+  |---|---|---|---|---|---|
+  | dE3 | eps^(1/8), both sides (shipped) | 80 | 0.533680459 | 5.1e-17 | 7.2e-10 |
+  | dE3 | 1e-6 | 80 | 0.533679517 | 1.8e-14 | 2.6e-7 |
+  | dE3 | 1e-4 | 88 | 0.533679531 | 1.8e-14 | 2.5e-7 |
+  | dE3 | 1e-2 | chases again at 74; MaxIterations 300 | | | |
+  | dE3 | 1e-4, keep primal | 106 | 0.533680352 | 5.0e-17 | 8.5e-6 |
+  | dE3 | keep primal | 97 | 0.533680608 | 6.3e-20 | 4.3e-3 |
+  | 12_min | eps^(1/8), both sides (shipped) | 99 | −0.472364242 | 5.8e-27 | 1.2e-21 |
+  | 12_min | keep primal | 85 | −0.472310046 | 1.6e-31 | 5.5e-6 |
+  | 12_min | 1e-6 | 64 | −0.472357734 | 1.3e-14 | 2.7e-9 |
+  | 12_min | 1e-4, keep primal | 67 | −0.472343414 | 1.1e-17 | 2.3e-7 |
+  | 12_min | 1e-4 or 1e-2 | chase again at 68–69, 691–692 | | | |
+
+- The shorter 12_min runs (64 and 67 iterations) stop 1.4e-5 and 4.4e-5
+  from the shipped objective (SDPA-GMP −0.4723643) with residuals 10⁷–10¹⁴
+  times larger; the iterations saved come from stopping far from the
+  solution the shipped rule reaches.
+- dE3's dual grows as its residual falls (max|z| 5e8 at r_d 2.5e-7, 3.9e10
+  at 7.2e-10), so the objective depends on how far out the point stops;
+  SDPA-GMP's 0.5336794 sits with the less feasible points. Under the
+  Clarabel normalization (‖q‖+‖x‖+‖z‖) every point above is Solved. No
+  restart scale or kept side beats the shipped rule in iterations at equal
+  or better original residuals; the detection itself could move at most
+  from 31 to 25 on dE3 before the side rule flips. Not kept; the ray rule
+  and restart scales stay.
+- Shared MPFR cone and assembly scratch sets (one process-wide pool keyed by
+  type and order instead of a set per worker): 12_min 4 iterations (Mac)
+  peak RSS 731 → 840 MB at T=8 and 987 → 1084 MB at T=24, same point. The
+  assembly lanes work one block together, so the pool still holds a set
+  per lane for the large order, plus sets of every other order. Rejected
+  (branch `perf/shared-scratch-20261108`).
+
 ## 2026-11-08 — Cone pool sized by condensed assembly for pure PSD problems (kept, perf/asm-width-20261108 → perf/de3-20261106)
 
 - Cause (observed, job 235115 and 235134, node76, 12_min at 512 bits):
