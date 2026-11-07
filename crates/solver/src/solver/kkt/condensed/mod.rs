@@ -289,9 +289,9 @@ pub(crate) fn prefer_condensed<T: FloatT>(
     // eliminate the coupled cone rows before x, carrying the condensed
     // Schur's fill plus the dense scaling blocks (the negated arrow's dense
     // border), or a generic sparse order meets zero pivots and shifts them
-    // (dE3: shifted QDLDL, 42 tiny steps before the restart). 256 bits,
-    // condensed against augmented: dE3 one iteration 12 s / 179 s, truss5
-    // 0.94 / 1.34 s, same iterations.
+    // (dE3: shifted QDLDL, a 2e-5 first step). 256 bits, condensed against
+    // augmented: dE3 first iteration 13 s / 134 s, truss5 0.94 / 1.34 s,
+    // same iterations.
     if T::precision_bits() > 53 && only_psd && P.nnz() == 0 {
         return true;
     }
