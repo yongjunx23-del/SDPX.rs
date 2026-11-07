@@ -1313,7 +1313,9 @@ impl<T: FloatT> PsdBlock<T> {
             let mut slot = usize::MAX;
             if !right.sparse {
                 if used == w.slots.len() {
-                    w.slots.push(ColumnWork::new(n));
+                    // Sized on first use: dense-coefficient columns pack
+                    // their vector from one congruence without a product.
+                    w.slots.push(ColumnWork::new(0));
                 }
                 self.column_vector(values, b, w, used, ways);
                 slot = used;
@@ -1362,6 +1364,7 @@ impl<T: FloatT> PsdBlock<T> {
         c.vector.resize(triangular_number(n), T::zero());
         c.lazy = false;
         if T::precision_bits() <= 64 {
+            c.product.resize((n, n));
             coefficient_product(
                 c.product.data_mut(),
                 n,
@@ -1417,6 +1420,7 @@ impl<T: FloatT> PsdBlock<T> {
                 return;
             }
         }
+        c.product.resize((n, n));
         coefficient_product(
             c.product.data_mut(),
             n,
