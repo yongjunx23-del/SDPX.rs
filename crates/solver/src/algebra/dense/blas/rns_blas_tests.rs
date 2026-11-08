@@ -460,8 +460,9 @@ fn residue_split_encode_matches_serial() {
         let mut expected = Vec::new();
         group_residues(chunks.view(), &plan, 0, plan.count(), &mut expected);
         for split in [Split::Serial, Split::Pool(&pool), Split::Ways(3)] {
-            let store =
-                pool.install(|| CachedResidues::from_view(x, lo, hi - lo, &plan, &split, None));
+            let store = pool.install(|| {
+                CachedResidues::from_view(x, &lo.into(), hi - lo, &plan, 0..plan.count(), &split, None)
+            });
             assert_eq!(matches!(store, CachedResidues::Narrow(..)), bits <= 24);
             let mut decoded = Vec::new();
             store.extend(0..len * plan.count(), &mut decoded);
