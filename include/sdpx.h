@@ -67,7 +67,7 @@ typedef struct {
 typedef struct {
  uint32_t abi_version, struct_size, status, iterations;
  /* Actual factorization threads, cone pool workers, and KKT form (1 or 2).
-  * High precision uses serial QDLDL with independently parallel cone work. */
+  * High precision supports pooled dense, arrow, supernodal and QDLDL factors. */
  uint32_t working_bits, backend_threads, cone_threads, kkt_form;
  uint32_t reserved_0; /* Reserved ABI slot; always zero. */
  uint64_t n, m;

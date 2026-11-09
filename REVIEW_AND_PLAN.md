@@ -1,6 +1,6 @@
 # SDPX development plan
 
-Updated 2026-10-30. [AGENTS.md](AGENTS.md) defines working rules and numerical
+Updated 2026-11-09. [AGENTS.md](AGENTS.md) defines working rules and numerical
 contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 [Journal](docs/JOURNAL.md) holds full timings, job histories, source hashes,
 failed attempts and audit evidence. This file keeps goals, current state,
@@ -13,6 +13,32 @@ original-coordinate audit. A feasible large-PSD reproducer changes from
 false `PrimalInfeasible` to audited `Solved` at 512 bits; the singleton/SOC
 tail/equality checks also pass with presolve enabled and disabled. See the
 journal for the unchanged 1e-16 audit gate and evidence hashes.
+
+## Active review round (2026-11-09)
+
+The Mac checkout is now based on `origin/main` v0.9.5 (`cec03f3`), with
+three performance candidates on `perf/svd-schur-20261109`:
+contiguous exact SVD dots (`b791676`), shared exact Schur dot accumulation
+(`6dc1936`), and packed lower-triangular supernodal updates (`fd4eccf`).
+All retain the requested precision and existing tolerances.
+
+Mac release checks pass: medium Solved/15 with the original 1e-6 audit;
+Ising11/512 Solved/54 with the original 1e-30 audit; the rebuilt C ABI 4
+solves a small LP, and the converter builds. The four-iteration 12_min/512
+Schur comparison has identical points; its fast-profile timing is preliminary.
+
+Cluster job `235280` is the bounded 32-core, exclusive-node release ABBA
+on arch0, gpp124-1, 12_min and dE3. Jobs `235277` and `235279` were cancelled
+and repacked after the first allocation shared a node. Cluster SSH began
+timing out after submission; the job's current state and results are not
+yet retrieved. Evidence is in `~/.cache/sdpx-e2e/perf-review-20261109` and
+the matching `~/projects/sdpx-perf-review-20261109` cluster campaign.
+
+Next: retrieve the complete solves and point checks, keep or revert each
+candidate from measured evidence, then publish and deploy the accepted
+revision. Retire superseded installed binaries only after checking active
+job references; retain benchmark data and source history. The pre-update
+local Ising113 note is preserved in the named Git stash.
 
 ## Goals
 
