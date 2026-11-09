@@ -1337,7 +1337,70 @@ impl<T: FloatT> PsdBlock<T> {
             return;
         };
         let BlockWork { slots, targets, .. } = w;
+        // A tile shares each left coefficient across its exact dot outputs.
+        // Broad per-vector exponent bounds spare the generic dot's collected
+        // term list and exponent pass; the accumulator checks every term.
+        let batch = T::precision_bits() > 64 && used > 1;
+        let ranges: Vec<_> = if batch {
+            slots[..used]
+                .iter()
+                .map(|c| {
+                    c.vector
+                        .iter()
+                        .filter_map(T::product_exponent)
+                        .fold((i64::MAX, i64::MIN), |(lo, hi), e| (lo.min(e), hi.max(e)))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut ends = vec![0; if batch { used } else { 0 }];
+        if batch {
+            for &(slot, target) in targets.iter().filter(|&&(s, _)| s < used) {
+                ends[slot] = ends[slot].max(target);
+            }
+        }
+        let mut bounds = vec![(0, -1); ends.len()];
         for (a, left) in self.columns[..=last].iter().enumerate() {
+            let sums = if batch
+                && left.entries.len() >= 64
+                && (0..used)
+                    .filter(|&s| ends[s] >= a && !slots[s].lazy)
+                    .count()
+                    > 1
+            {
+                let (lo, hi) = left
+                    .entries
+                    .iter()
+                    .filter_map(|e| values[e.position].product_exponent())
+                    .fold((i64::MAX, i64::MIN), |(lo, hi), e| (lo.min(e), hi.max(e)));
+                for (bound, &(v_lo, v_hi)) in bounds.iter_mut().zip(&ranges) {
+                    *bound = if lo <= hi && v_lo <= v_hi {
+                        (lo.saturating_add(v_lo), hi.saturating_add(v_hi))
+                    } else {
+                        (0, -1)
+                    };
+                }
+                let columns = &slots[..used];
+                let ends = &ends;
+                let terms = |_: usize| {
+                    left.entries.iter().flat_map(|e| {
+                        let value = &values[e.position];
+                        let p = triangular_number(e.j) + e.i;
+                        columns.iter().enumerate().filter_map(move |(s, c)| {
+                            (ends[s] >= a && !c.lazy).then_some((s, value, &c.vector[p]))
+                        })
+                    })
+                };
+                let serial = |n: usize, f: &(dyn Fn(usize) + Sync)| {
+                    for c in 0..n {
+                        f(c);
+                    }
+                };
+                T::dot_outputs_chunked(used, 1, Some(&bounds), &terms, &serial)
+            } else {
+                Vec::new()
+            };
             for &(slot, target) in targets.iter().filter(|&&(_, t)| a <= t) {
                 let v = match slots.get_mut(slot) {
                     None => sparse_schur_value(
@@ -1347,7 +1410,12 @@ impl<T: FloatT> PsdBlock<T> {
                         values,
                         self.sqrt2,
                     ),
-                    Some(c) => self.left_dot(values, left, c, n),
+                    Some(c) => sums
+                        .get(slot)
+                        .copied()
+                        .flatten()
+                        .filter(|_| !c.lazy)
+                        .unwrap_or_else(|| self.left_dot(values, left, c, n)),
                 };
                 store(target, a, self.columns[target].schur_position(left, a), v);
             }
