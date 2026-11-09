@@ -81,23 +81,23 @@ pub trait XpotrsScalar: Sized {
         uplo: u8, n: i32, nrhs: i32, a: &[Self], lda: i32,  b: &mut [Self], ldb: i32, info: &mut i32
     );
     /// Solve L*X=B (or L'*X=B), with a square lower-triangular factor.
-    /// MPFR uses the shared fixed-precision arithmetic; native types use TRSM.
+    /// MPFR takes each entry from one exact dot; native types use TRSM.
     fn xtrsm_lower(n: usize, a: &[Self], b: &mut [Self], transpose: bool)
     where Self: crate::algebra::FloatT {
         use rayon::prelude::*;
         if n == 0 { return; }
         assert_eq!(a.len(), n*n);
         assert_eq!(b.len() % n, 0);
+        // Each entry subtracts one exact dot of the solved entries.
         let solve = |column: &mut [Self]| {
             for step in 0..n {
                 let i = if transpose { n-1-step } else { step };
-                let mut v = column[i];
-                let range = if transpose { i+1..n } else { 0..i };
-                for k in range {
-                    let av = if transpose { a[k+i*n] } else { a[i+k*n] };
-                    v = (-av).mul_add(column[k], v);
-                }
-                column[i] = v / a[i+i*n];
+                let solved = if transpose {
+                    Self::dot_slices(&a[i*n+i+1..(i+1)*n], &column[i+1..n])
+                } else {
+                    Self::dot_fma((0..i).map(|k| (&a[i+k*n], &column[k])))
+                };
+                column[i] = (column[i] - solved) / a[i+i*n];
             }
         };
         let rhs = b.len() / n.max(1);

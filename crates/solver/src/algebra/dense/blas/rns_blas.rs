@@ -1172,15 +1172,16 @@ impl CachedResidues {
     /// so blocks and ways do not change the store.
     fn from_view<const N: usize>(
         x: View<'_, N>,
-        lo: impl Into<Windows>,
+        lo: &Windows,
         spread: i64,
         plan: &Plan,
+        primes: std::ops::Range<usize>,
         split: &Split<'_>,
         reusable: Option<Self>,
     ) -> Self {
         const BLOCK: usize = 64 * PANEL;
-        let (len, lo) = (x.len(), lo.into());
-        Self::filled(plan.bits, len * plan.count(), reusable, |store| {
+        let len = x.len();
+        Self::filled(plan.bits, len * primes.len(), reusable, |store| {
             let ways = split_ways(split).min(len / MIN_ROWS_PER_WAY).max(1);
             run_ways(split, ways, |w| {
                 let (r0, r1) = panel_rows(len, ways, w);
@@ -1197,8 +1198,9 @@ impl CachedResidues {
                             fill_chunk(&x.data[r], &mut m.e[slot..], chunks, lo, width);
                         }
                     }
-                    panel_residues(m.rows(0, rows), plan, 0, plan.count(), |q, r, res| {
+                    panel_residues(m.rows(0, rows), plan, primes.start, primes.end, |q, r, res| {
                         // SAFETY: way w alone writes entries r0..r1 of every prime.
+                        // `q` counts from `primes.start`.
                         unsafe { store.put(q * len + b0 + r, res) }
                     });
                 }
@@ -1292,6 +1294,10 @@ enum Operand {
 /// store; below it the per-group chunk kernel is already cheap.
 const PACK_OPERAND_MIN: usize = 1 << 20;
 
+/// Stored residues one product holds at once (dE3's 966-column root-front
+/// products take 96 primes: 537 MB for both operands in one piece).
+const PACK_GROUP_BYTES: usize = 256 << 20;
+
 /// Residues one way decodes, at least.
 const DECODE_PER_WAY: usize = 1 << 16;
 
@@ -1305,7 +1311,7 @@ fn packed_operand<const N: usize>(
     if plan.bits > CACHE_MAX_BITS || x.len().saturating_mul(plan.count()) < PACK_OPERAND_MIN {
         return Operand::Chunks(chunk_matrix(x, lo, spread, plan, split));
     }
-    Operand::Packed(CachedResidues::from_view(x, lo, spread, plan, split, None), x.len())
+    Operand::Packed(CachedResidues::from_view(x, &lo, spread, plan, 0..plan.count(), split, None), x.len())
 }
 
 impl Operand {
@@ -1433,7 +1439,7 @@ impl ResidueCache {
             });
         {
             let wide = Plan::with_count(plan.bits, count);
-            let res = CachedResidues::from_view(x, lo, spread, &wide, split, reusable);
+            let res = CachedResidues::from_view(x, &lo.into(), spread, &wide, 0..count, split, reusable);
             let entry = Arc::new(CacheEntry {
                 fingerprint: fp,
                 bits: plan.bits,
@@ -1815,9 +1821,9 @@ const CRT_TILE: usize = 64;
 /// exact integers in any order (`crt`'s width bound covers all `K+1` rows),
 /// and `frac` is summed in prime order, so every value equals
 /// [`CrtAccumulator`]'s bitwise.
-fn crt_tiled<const N: usize>(
+fn crt_tiled<const N: usize, R: Copy + Into<f64>>(
     plan: &Plan,
-    prod: &[f64],
+    prod: &[R],
     stride: usize,
     read: &[usize],
     outputs: std::ops::Range<usize>,
@@ -1845,12 +1851,12 @@ fn crt_tiled<const N: usize>(
             };
             if read.is_empty() {
                 for ((d, &x), f) in dst.iter_mut().zip(&row[t0..t0 + t]).zip(&mut frac[..t]) {
-                    update(d, x, f);
+                    update(d, x.into(), f);
                 }
             } else {
                 // Gather first: the contiguous update below then vectorizes.
                 for (d, &r) in dst.iter_mut().zip(&read[t0..t0 + t]) {
-                    *d = row[r];
+                    *d = row[r].into();
                 }
                 for (d, f) in dst.iter_mut().zip(&mut frac[..t]) {
                     update(d, *d, f);
@@ -1884,9 +1890,9 @@ fn crt_tiled<const N: usize>(
 /// [`crt_tiled`] over outputs `0..total`, whole tiles shared over the
 /// split's ways.
 #[allow(clippy::too_many_arguments)]
-fn crt_tiled_split<const N: usize>(
+fn crt_tiled_split<const N: usize, R: Copy + Into<f64> + Sync>(
     plan: &Plan,
-    prod: &[f64],
+    prod: &[R],
     stride: usize,
     read: &[usize],
     total: usize,
@@ -2158,11 +2164,6 @@ pub(super) fn gemm<const N: usize>(
         Some(b) => (b.a, b.b, b.spread, Some((b.rows, b.cols))),
         None => (lo_a.into(), lo_b.into(), (da, db), None),
     };
-    let ca = packed_operand(av, wa, spread.0, &plan, &split);
-    let cb = (!same_operand).then(|| match cache_b {
-        Some(cache) => cache.operand(bv, lo_b, db, &plan, &split),
-        None => packed_operand(bv, wb, spread.1, &plan, &split),
-    });
     let timer = (split_ways(&split) > 1)
         .then(crate::receipt::start)
         .flatten();
@@ -2181,24 +2182,68 @@ pub(super) fn gemm<const N: usize>(
         unsafe { *optr.get().add(o) = v };
     };
     let scale = if scales.is_some() { 0 } else { lo_a + lo_b };
+    let offset = |j: usize| shape.column_offset(j, upper_only);
+    // One column block whose stored residues would exceed PACK_GROUP_BYTES
+    // encodes them a prime group at a time into the same storage; each
+    // residue is its own prime's, so the products and their CRT are
+    // unchanged. Only the chunk fill repeats per group.
+    let packs = |len: usize| plan.bits <= CACHE_MAX_BITS && len.saturating_mul(count) >= PACK_OPERAND_MIN;
+    let residue_bytes = (len_a + if same_operand { 0 } else { len_b }) as u128
+        * count as u128
+        * if plan.bits <= 24 { 3 } else { 4 };
+    if cache_b.is_none()
+        && packs(len_a)
+        && (same_operand || packs(len_b))
+        && residue_bytes > PACK_GROUP_BYTES as u128
+        && shape.column_blocks(count, upper_only).len() == 2
+    {
+        let group = count.div_ceil(residue_bytes.div_ceil(PACK_GROUP_BYTES as u128) as usize);
+        let outputs = offset(n);
+        let mut prod: Vec<MaybeUninit<i32>> = Vec::with_capacity(count * outputs);
+        // SAFETY: uninitialized entries are valid `MaybeUninit`s.
+        unsafe { prod.set_len(prod.capacity()) };
+        let (mut ra, mut rb) = (None, None);
+        for q0 in (0..count).step_by(group) {
+            let primes = q0..(q0 + group).min(count);
+            let a = CachedResidues::from_view(av, &wa, spread.0, &plan, primes.clone(), &split, ra.take());
+            let b = (!same_operand)
+                .then(|| CachedResidues::from_view(bv, &wb, spread.1, &plan, primes.clone(), &split, rb.take()));
+            let sb = (b.as_ref().unwrap_or(&a), len_b);
+            let reach = reach.as_deref();
+            shape.stored_products(&plan, (&a, len_a), sb, &mut prod, outputs, 0..n, primes, upper_only, reach, &split);
+            (ra, rb) = (Some(a), b);
+        }
+        drop((ra, rb));
+        // SAFETY: every group's tasks wrote every entry of its primes.
+        let prod = unsafe { &*(prod.as_slice() as *const [MaybeUninit<i32>] as *const [i32]) };
+        let ok = crt_tiled_split(&plan, prod, outputs, &[], outputs, scale, &split, &write);
+        crate::receipt::finish("rns.gemm.shared_crt", timer);
+        return ok;
+    }
+    let ca = packed_operand(av, wa, spread.0, &plan, &split);
+    let cb = (!same_operand).then(|| match cache_b {
+        Some(cache) => cache.operand(bv, lo_b, db, &plan, &split),
+        None => packed_operand(bv, wb, spread.1, &plan, &split),
+    });
     let stored_b = cb.as_ref().map_or_else(|| ca.stored(), Operand::stored);
     if let (Some(sa), Some(sb)) = (ca.stored(), stored_b) {
         // Column blocks of every prime's products, each reconstructed before
         // the next reuses the storage. Every task overwrites its outputs, so
         // nothing is cleared.
-        let offset = |j: usize| shape.column_offset(j, upper_only);
         let blocks = shape.column_blocks(count, upper_only);
         let largest = blocks.windows(2).map(|b| offset(b[1]) - offset(b[0])).max();
-        let mut prod: Vec<MaybeUninit<f64>> = Vec::with_capacity(count * largest.unwrap_or(0));
+        // Reduced residues lie inside ±2^25 (primes below 2^26): i32 holds
+        // them exactly at half the bytes of f64.
+        let mut prod: Vec<MaybeUninit<i32>> = Vec::with_capacity(count * largest.unwrap_or(0));
         // SAFETY: uninitialized entries are valid `MaybeUninit`s.
         unsafe { prod.set_len(prod.capacity()) };
         let ok = blocks.windows(2).all(|b| {
             let (first, outputs) = (offset(b[0]), offset(b[1]) - offset(b[0]));
             let prod = &mut prod[..count * outputs];
             let reach = reach.as_deref();
-            shape.stored_products(&plan, sa, sb, prod, outputs, b[0]..b[1], upper_only, reach, &split);
+            shape.stored_products(&plan, sa, sb, prod, outputs, b[0]..b[1], 0..count, upper_only, reach, &split);
             // SAFETY: the block's tasks wrote every entry.
-            let prod = unsafe { &*(prod as *const [MaybeUninit<f64>] as *const [f64]) };
+            let prod = unsafe { &*(prod as *const [MaybeUninit<i32>] as *const [i32]) };
             let write = |i: usize, v: F<N>| write(first + i, v);
             crt_tiled_split(&plan, prod, outputs, &[], outputs, scale, &split, &write)
         });
@@ -2508,7 +2553,7 @@ fn column_panels(
 const PANEL_COLS: usize = 32;
 
 /// Residue products (one per prime and output) of one column block of a
-/// stored-operand product (1 GiB): a block still holds about a thousand
+/// stored-operand product (512 MiB of i32): a block still holds about a thousand
 /// tile tasks (BFSS L13 t5: a 13155² contribution held 13 GB, zeroed and
 /// unmapped on the caller's thread).
 const STORED_BLOCK: usize = 1 << 27;
@@ -3246,9 +3291,10 @@ impl GemmShape {
         plan: &Plan,
         (ra, len_a): (&CachedResidues, usize),
         (rb, len_b): (&CachedResidues, usize),
-        prod: &mut [MaybeUninit<f64>],
+        prod: &mut [MaybeUninit<i32>],
         outputs: usize,
         columns: std::ops::Range<usize>,
+        primes: std::ops::Range<usize>,
         upper_only: bool,
         reach: Option<&[(usize, usize)]>,
         split: &Split<'_>,
@@ -3270,9 +3316,9 @@ impl GemmShape {
             }
         }
         tiles.sort_by_key(|&(_, cols, _, rows, (lo, hi))| std::cmp::Reverse(rows * cols * (hi - lo)));
-        let (count, first) = (plan.count(), self.column_offset(columns.start, upper_only));
+        let (count, first) = (primes.len(), self.column_offset(columns.start, upper_only));
         let tasks = count * tiles.len();
-        let (next, base) = (AtomicUsize::new(0), SendValues(prod.as_mut_ptr().cast::<f64>()));
+        let (next, base) = (AtomicUsize::new(0), SendValues(prod.as_mut_ptr().cast::<i32>()));
         let (rows_max, cols_max, depth_max) = (TILE_ROWS.min(m), TILE_COLS.min(n), TILE_DEPTH.min(k));
         run_ways(split, split_threads(split).min(tasks), |_| {
             let mut part = take_scratch(rows_max * cols_max);
@@ -3283,7 +3329,9 @@ impl GemmShape {
                 if task >= tasks {
                     break;
                 }
-                let q = task % count;
+                // The stores hold primes `primes` from their start.
+                let qi = task % count;
+                let q = primes.start + qi;
                 let (j0, cols, i0, rows, (k_lo, k_hi)) = tiles[task / count];
                 let (p, pinv) = (plan.p[q], plan.pinv[q]);
                 let out = |j: usize| q * outputs + self.column_offset(j0 + j, upper_only) - first;
@@ -3298,7 +3346,7 @@ impl GemmShape {
                     for j in 0..cols {
                         for i in i0..end(j) {
                             // SAFETY: task (q, tile) alone writes these outputs of prime q.
-                            unsafe { *base.get().add(out(j) + i) = 0.0 };
+                            unsafe { *base.get().add(out(j) + i) = 0 };
                         }
                     }
                     continue;
@@ -3311,20 +3359,20 @@ impl GemmShape {
                         let (a, b) = (&mut a[..rows * d], &mut b[..cols * d]);
                         if ta_n {
                             for (t, a) in a.chunks_mut(rows).enumerate() {
-                                ra.decode_to(q * len_a + i0 + (d0 + t) * self.lda, a);
+                                ra.decode_to(qi * len_a + i0 + (d0 + t) * self.lda, a);
                             }
                         } else {
                             for (i, a) in a.chunks_mut(d).enumerate() {
-                                ra.decode_to(q * len_a + d0 + (i0 + i) * self.lda, a);
+                                ra.decode_to(qi * len_a + d0 + (i0 + i) * self.lda, a);
                             }
                         }
                         if tb_n {
                             for (j, b) in b.chunks_mut(d).enumerate() {
-                                rb.decode_to(q * len_b + d0 + (j0 + j) * self.ldb, b);
+                                rb.decode_to(qi * len_b + d0 + (j0 + j) * self.ldb, b);
                             }
                         } else {
                             for (t, b) in b.chunks_mut(cols).enumerate() {
-                                rb.decode_to(q * len_b + j0 + (d0 + t) * self.ldb, b);
+                                rb.decode_to(qi * len_b + j0 + (d0 + t) * self.ldb, b);
                             }
                         }
                         let (lda, ldb) = (if ta_n { rows } else { d }, if tb_n { d } else { cols });
@@ -3342,8 +3390,8 @@ impl GemmShape {
                                 *dest = if k0 == k_lo {
                                     value
                                 } else {
-                                    reduce(*dest + value, p, pinv)
-                                };
+                                    reduce(*dest as f64 + value, p, pinv)
+                                } as i32;
                             }
                         }
                     }

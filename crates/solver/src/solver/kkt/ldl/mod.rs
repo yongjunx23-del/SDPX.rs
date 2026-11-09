@@ -4,6 +4,7 @@ pub mod auto;
 pub mod config;
 mod dense_block;
 pub mod qdldl;
+mod supernodal;
 
 #[cfg(feature = "faer-sparse")]
 pub mod faer_ldl;

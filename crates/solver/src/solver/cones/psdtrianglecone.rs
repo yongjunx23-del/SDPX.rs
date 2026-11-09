@@ -960,33 +960,34 @@ fn kkt_bounds<T: FloatT>(
     αmax: T,
     w: &mut PsdWork<T>,
 ) -> (T, T) {
-    let αz = match scaled {
+    let PsdWork {
+        vector,
+        mat1,
+        mat2,
+        svd,
+        eig,
+        second,
+        n,
+        ..
+    } = w;
+    match scaled {
         Some(v) => {
-            w.vector.clear();
-            w.vector.extend_from_slice(v);
-            step_length_psd_component(
-                &mut w.mat1,
-                &mut w.eig,
-                &w.vector,
-                &f.Λisqrt,
-                αmax,
-                &mut w.mat2.data,
-            )
+            vector.clear();
+            vector.extend_from_slice(v);
         }
-        None => step_component_inner(
+        None => mul_Wx_scratch(
+            MatrixShape::N,
+            vector,
             dz,
+            T::one(),
+            T::zero(),
             &f.R,
-            &f.Λisqrt,
-            false,
-            αmax,
-            &mut w.vector,
-            &mut w.mat1,
-            &mut w.mat2,
-            &mut w.svd.Vt,
-            &mut w.eig,
+            mat1,
+            mat2,
+            &mut svd.Vt,
         ),
-    };
-    for (d, &v) in ds.iter_mut().zip(&w.vector) {
+    }
+    for (d, &v) in ds.iter_mut().zip(vector.iter()) {
         *d = -v;
     }
     match offset {
@@ -997,15 +998,44 @@ fn kkt_bounds<T: FloatT>(
             }
         }
     }
-    let αs = step_length_psd_component(
-        &mut w.mat1,
-        &mut w.eig,
-        ds,
-        &f.Λisqrt,
-        αmax,
-        &mut w.mat2.data,
+    // Both bounds use αmax, so they are independent: an idle ambient worker
+    // takes the second with the caller's inner gate and half its ways.
+    let first = |m1: &mut Matrix<T>, e: &mut EigEngine<T>, m2: &mut Matrix<T>| {
+        step_length_psd_component(m1, e, vector, &f.Λisqrt, αmax, &mut m2.data)
+    };
+    if !sdpx_arithmetic::inner_parallel::paired() {
+        let αz = first(mat1, eig, mat2);
+        return (
+            αz,
+            step_length_psd_component(mat1, eig, ds, &f.Λisqrt, αmax, &mut mat2.data),
+        );
+    }
+    let n = *n;
+    let other = second.get_or_insert_with(|| Box::new(StepWorkspace::new(n)));
+    let (inner, ways) = (
+        sdpx_arithmetic::inner_parallel::active(),
+        crate::algebra::split_hint().div_ceil(2),
     );
-    (αz, αs)
+    let half = |run: &mut dyn FnMut() -> T| {
+        let _gate = sdpx_arithmetic::inner_parallel::Guard::enter_levels(inner, true);
+        crate::algebra::with_split_hint(ways, run)
+    };
+    let ds = &*ds;
+    rayon::join(
+        || half(&mut || first(mat1, eig, mat2)),
+        || {
+            half(&mut || {
+                step_length_psd_component(
+                    &mut other.mat1,
+                    &mut other.eig,
+                    ds,
+                    &f.Λisqrt,
+                    αmax,
+                    &mut other.mat2.data,
+                )
+            })
+        },
+    )
 }
 
 fn step_component_inner<T>(
@@ -1172,7 +1202,7 @@ where
                 return αmax;
             }
             let fast = if T::precision_bits() > 64 && workΔ.nrows() > 3 {
-                eigval_min_f64(workΔ, αmax)
+                eigval_min_f64(workΔ, αmax, work)
             } else {
                 None
             };
@@ -1211,7 +1241,13 @@ where
 /// relatively. Step lengths are a free IPM parameter (the step is scaled by
 /// the step fraction and kept interior), so this accuracy is ample.
 /// Pure Rust: no shared BLAS/LAPACK state across the pool's threads.
-fn eigval_min_f64<T: FloatT>(delta: &Matrix<T>, αmax: T) -> Option<T> {
+///
+/// When `B` is too coarse (on arch0 it misses by 1–10×, while the estimate
+/// matches full precision to 1e-14), a full-precision Cholesky of
+/// I + αc·Δ at αc = (1 − 1e-10)·min(−1/γ, αmax) decides instead: success
+/// proves the true bound exceeds αc, so the returned step is above it by at
+/// most 1e-10 relative, as on the a priori path. `buf` is its scratch.
+fn eigval_min_f64<T: FloatT>(delta: &Matrix<T>, αmax: T, buf: &mut Vec<T>) -> Option<T> {
     let n = delta.nrows();
     let amax = αmax.to_f64()?;
     let mut a = Vec::with_capacity(n * n);
@@ -1232,6 +1268,17 @@ fn eigval_min_f64<T: FloatT>(delta: &Matrix<T>, αmax: T) -> Option<T> {
         0.0
     };
     if bound <= 1e-10 * gamma.abs().max(floor) {
+        return T::from_f64(gamma);
+    }
+    let __ts = std::time::Instant::now();
+    let αc = if gamma < 0.0 && -1.0 / gamma < amax {
+        T::from_f64(-(1.0 - 1e-10) / gamma)?
+    } else {
+        αmax
+    };
+    let certified = admits(delta, αc, buf);
+    crate::receipt::phase("cone_eigmin_certify", __ts.elapsed());
+    if certified {
         T::from_f64(gamma)
     } else {
         None
@@ -1483,7 +1530,7 @@ mod f64_eigmin_tests {
                 "n={n}: {fast} vs {exact64}"
             );
             // The certified path, when it answers, agrees with full precision.
-            if let Some(v) = eigval_min_f64(&m, T::one()) {
+            if let Some(v) = eigval_min_f64(&m, T::one(), &mut Vec::new()) {
                 assert!((v.to_f64().unwrap() - exact64).abs() <= 1e-10);
             }
         }

@@ -541,12 +541,25 @@ pub(super) struct InvitWork<const N: usize> {
     off: Vec<F<N>>,
     order: Vec<usize>,
     xs: Vec<F<N>>,
+    used: Vec<F<N>>,
+    groups: Vec<usize>,
+    seeds: Vec<u64>,
+    block: Vec<F<N>>,
+    gram: Vec<F<N>>,
+    prod: Vec<F<N>>,
+    /// Chains left to `dstein`'s order, and one chain's local windows.
+    redo: Vec<(usize, usize)>,
+    local: Vec<usize>,
+}
+
+/// One vector's pivoted LU of the shifted tridiagonal, per thread.
+#[derive(Default)]
+struct InvitRows<const N: usize> {
     dd: Vec<F<N>>,
     du: Vec<F<N>>,
     du2: Vec<F<N>>,
     dl: Vec<F<N>>,
     swap: Vec<bool>,
-    used: Vec<F<N>>,
 }
 
 /// Right singular vectors by [`normal_vectors`] when the values lie within
@@ -577,15 +590,23 @@ struct SvdScratch<const N: usize> {
 /// diagonal, off-diagonal `d1, e1, d2, …, dn`): `T x = σx` for
 /// `x = (v1, u1, v2, u2, …)/√2`. Inverse iteration follows LAPACK `dstein`:
 /// one pivoted LU of `T − σI` per value (tiny pivots raised to `eps·‖T‖`), a
-/// fixed pseudo-random start, Gram–Schmidt against the earlier vectors whose
-/// shifts lie within `1e-3·‖T‖` of the current one, and one more solve after
-/// the growth test passes. `dstein` orthogonalizes against the whole chain of
-/// values linked by such gaps; vectors further apart than `1e-3·‖T‖` are
-/// already orthogonal to `O(eps·‖T‖/gap)`, the bound it accepts between
-/// chains, so the window keeps that bound with less work. Each vector costs
-/// O(n) work instead of replaying O(n²) rotations over n rows. Returns false,
-/// with `v` unspecified, when a value is zero or a vector does not converge,
-/// for the replay fallback.
+/// fixed pseudo-random start, and one more solve after the growth test
+/// passes. Vectors whose shifts lie within `1e-3·‖T‖` of each other (a
+/// window) need explicit orthogonalization. `dstein` orthogonalizes against
+/// the whole chain of values linked by such gaps; vectors further apart than
+/// `1e-3·‖T‖` are already orthogonal to `O(eps·‖T‖/gap)`, the bound it
+/// accepts between chains, so the window keeps that bound with less work.
+/// Each vector is first computed by itself (split over idle workers, the
+/// same bits on every route) and the windows are then orthogonalized
+/// together ([`orthogonalize_windows`]: two matrix products
+/// per chain instead of a Gram–Schmidt pass after every solve, which costs
+/// O(n³) when a clustered spectrum puts most values in one window). If a
+/// window is too far from orthonormal for that (values within roundoff of
+/// each other), the vectors are recomputed in `dstein`'s order, with
+/// Gram–Schmidt against the window's earlier vectors after each solve. Each
+/// vector costs O(n) work instead of replaying O(n²) rotations over n rows.
+/// Returns false, with `v` unspecified, when a value is zero or a vector does
+/// not converge, for the replay fallback.
 pub(super) fn inverse_vectors<const N: usize>(
     d: &[F<N>],
     e: &[F<N>],
@@ -594,24 +615,25 @@ pub(super) fn inverse_vectors<const N: usize>(
     v: &mut [F<N>],
     ws: &mut InvitWork<N>,
 ) -> bool {
-    const MAXITS: usize = 5;
-    const EXTRA: usize = 1;
     let m = 2 * n;
     if n < 2 || s.iter().any(|x| *x == F::zero() || !x.is_finite()) {
         return false;
     }
-    let InvitWork { off, order, xs, dd, du, du2, dl, swap, used } = ws;
+    let InvitWork { off, order, xs, used, groups, seeds, block, gram, prod, redo, local } = ws;
+    // The zero diagonal of T, then its off-diagonal.
     off.clear();
+    off.resize(m, F::zero());
     for i in 0..n {
         off.push(d[i]);
         if i + 1 < n {
             off.push(e[i]);
         }
     }
+    let sub = &off[m..];
     let mut tnorm = F::zero();
     for k in 0..m {
-        let below = if k > 0 { off[k - 1].abs() } else { F::zero() };
-        let above = if k + 1 < m { off[k].abs() } else { F::zero() };
+        let below = if k > 0 { sub[k - 1].abs() } else { F::zero() };
+        let above = if k + 1 < m { sub[k].abs() } else { F::zero() };
         if below + above > tnorm {
             tnorm = below + above;
         }
@@ -627,24 +649,14 @@ pub(super) fn inverse_vectors<const N: usize>(
         return false;
     }
     let ortol = tnorm / num::<N>(1000);
-    let tiny = eps * tnorm;
-    let crit = (<F<N> as num_traits::FromPrimitive>::from_f64(0.1).unwrap() / num::<N>(m)).sqrt();
     order.clear();
     order.extend(0..n);
     order.sort_unstable_by(|&a, &b| {
         s[a].abs().partial_cmp(&s[b].abs()).unwrap().then(a.cmp(&b))
     });
-    xs.clear();
-    xs.resize(m * n, F::zero());
-    for buffer in [&mut *dd, &mut *du, &mut *du2, &mut *dl] {
-        buffer.clear();
-        buffer.resize(m, F::zero());
-    }
-    swap.clear();
-    swap.resize(m, false);
-    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
-    let (mut group, mut prev) = (0usize, F::zero());
     used.clear();
+    groups.clear();
+    let (mut group, mut prev) = (0usize, F::zero());
     for (j, &p) in order.iter().enumerate() {
         let mut shift = s[p].abs();
         if j > 0 {
@@ -658,12 +670,84 @@ pub(super) fn inverse_vectors<const N: usize>(
         while shift - used[group] > ortol {
             group += 1;
         }
+        groups.push(group);
+    }
+    start_seeds(seeds, n, m);
+    let sweep = Sweep {
+        len: m,
+        tri: off,
+        tiny: eps * tnorm,
+        least: eps,
+        gain: num::<N>(m) * tnorm,
+        crit: (<F<N> as num_traits::FromPrimitive>::from_f64(0.1).unwrap() / num::<N>(m)).sqrt(),
+    };
+    // V's column is the odd-position half of the unit vector, renormalized.
+    let finish = |x: &[F<N>], column: &mut [F<N>]| {
+        for (i, c) in column.iter_mut().enumerate() {
+            *c = x[2 * i];
+        }
+        let half = norm(column);
+        if half == F::zero() || !half.is_finite() {
+            return false;
+        }
+        let inv = half.recip();
+        for c in column.iter_mut() {
+            *c *= inv;
+        }
+        true
+    };
+    sweep.vectors(used, groups, seeds, order, xs, v, n, &finish, [block, gram, prod], redo, local)
+}
+
+/// One inverse-iteration sweep (the `dstein` steps of [`inverse_vectors`])
+/// over the symmetric tridiagonal of order `len` with diagonal `tri[..len]`
+/// and off-diagonal `tri[len..]`.
+struct Sweep<'a, const N: usize> {
+    len: usize,
+    tri: &'a [F<N>],
+    /// Pivots below `tiny` are raised to it.
+    tiny: F<N>,
+    /// Each solve starts from `x·gain·max(|u_last|, least)/‖x‖₁`.
+    least: F<N>,
+    gain: F<N>,
+    /// Growth test on the solution's largest entry.
+    crit: F<N>,
+}
+
+impl<const N: usize> Sweep<'_, N> {
+    /// Unit vector `x` for `shift`, its largest entry positive, from the
+    /// pseudo-random start drawn after `seed`, with Gram–Schmidt against the
+    /// rows of `window` after each solve; false when it leaves the finite
+    /// range or does not converge.
+    fn vector(
+        &self,
+        shift: F<N>,
+        mut seed: u64,
+        window: &[F<N>],
+        x: &mut [F<N>],
+        r: &mut InvitRows<N>,
+    ) -> bool {
+        const MAXITS: usize = 5;
+        const EXTRA: usize = 1;
+        let len = self.len;
+        let (diag, sub) = self.tri.split_at(len);
+        let InvitRows { dd, du, du2, dl, swap } = r;
+        if dd.len() != len {
+            for buffer in [&mut *dd, &mut *du, &mut *du2, &mut *dl] {
+                buffer.clear();
+                buffer.resize(len, F::zero());
+            }
+            swap.clear();
+            swap.resize(len, false);
+        }
         // T − shift·I = P·L·U, U with two superdiagonals (LAPACK dgttrf).
-        dd.fill(-shift);
+        for (x, &a) in dd.iter_mut().zip(diag) {
+            *x = a - shift;
+        }
         du2.fill(F::zero());
-        du[..m - 1].copy_from_slice(&off);
-        dl[..m - 1].copy_from_slice(&off);
-        for i in 0..m - 1 {
+        du[..len - 1].copy_from_slice(sub);
+        dl[..len - 1].copy_from_slice(sub);
+        for i in 0..len - 1 {
             if dd[i].abs() >= dl[i].abs() {
                 swap[i] = false;
                 if dd[i] != F::zero() {
@@ -679,20 +763,19 @@ pub(super) fn inverse_vectors<const N: usize>(
                 let temp = du[i];
                 du[i] = dd[i + 1];
                 dd[i + 1] = temp - fact * dd[i + 1];
-                if i + 2 < m {
+                if i + 2 < len {
                     du2[i] = du[i + 1];
                     du[i + 1] = -fact * du[i + 1];
                 }
             }
         }
+        let tiny = self.tiny;
         for x in dd.iter_mut() {
             if x.abs() < tiny {
                 *x = if *x < F::zero() { -tiny } else { tiny };
             }
         }
-        let last = dd[m - 1].abs();
-        let (done, rest) = xs.split_at_mut(j * m);
-        let x = &mut rest[..m];
+        let last = dd[len - 1].abs();
         for xi in x.iter_mut() {
             seed = seed
                 .wrapping_mul(6364136223846793005)
@@ -701,7 +784,6 @@ pub(super) fn inverse_vectors<const N: usize>(
             *xi = <F<N> as num_traits::FromPrimitive>::from_f64(2.0 * unit - 1.0).unwrap();
         }
         let mut passed = 0;
-        let mut converged = false;
         for _ in 0..MAXITS {
             let mut l1 = F::zero();
             for xi in x.iter() {
@@ -710,12 +792,12 @@ pub(super) fn inverse_vectors<const N: usize>(
             if l1 == F::zero() || !l1.is_finite() {
                 return false;
             }
-            let grow = if last > eps { last } else { eps };
-            let scale = num::<N>(m) * tnorm * grow / l1;
+            let grow = if last > self.least { last } else { self.least };
+            let scale = self.gain * grow / l1;
             for xi in x.iter_mut() {
                 *xi *= scale;
             }
-            for i in 0..m - 1 {
+            for i in 0..len - 1 {
                 if swap[i] {
                     let temp = x[i];
                     x[i] = x[i + 1];
@@ -724,13 +806,12 @@ pub(super) fn inverse_vectors<const N: usize>(
                     x[i + 1] -= dl[i] * x[i];
                 }
             }
-            x[m - 1] /= dd[m - 1];
-            x[m - 2] = (x[m - 2] - du[m - 2] * x[m - 1]) / dd[m - 2];
-            for i in (0..m - 2).rev() {
+            x[len - 1] /= dd[len - 1];
+            x[len - 2] = (x[len - 2] - du[len - 2] * x[len - 1]) / dd[len - 2];
+            for i in (0..len - 2).rev() {
                 x[i] = (x[i] - du[i] * x[i + 1] - du2[i] * x[i + 2]) / dd[i];
             }
-            for q in group..j {
-                let y = &done[q * m..(q + 1) * m];
+            for y in window.chunks_exact(len) {
                 let ndot = -F::dot_fma(x.iter().zip(y));
                 for (xi, &yi) in x.iter_mut().zip(y) {
                     *xi = yi.mul_add(ndot, *xi);
@@ -745,55 +826,256 @@ pub(super) fn inverse_vectors<const N: usize>(
                     big = xi.abs();
                 }
             }
-            if big < crit {
+            if big < self.crit {
                 continue;
             }
             passed += 1;
             if passed > EXTRA {
-                converged = true;
-                break;
+                return signed_unit(x);
             }
         }
-        if !converged {
+        false
+    }
+
+    /// Every vector by itself, then each chain's windows orthogonalized
+    /// together ([`orthogonalize_windows`]). A chain too far from orthonormal
+    /// for that is recomputed in `dstein`'s order, Gram–Schmidt inside the
+    /// iteration. No window spans two chains, so those vectors are the ones a
+    /// whole `dstein`-order pass computes.
+    #[allow(clippy::too_many_arguments)]
+    fn vectors(
+        &self,
+        shifts: &[F<N>],
+        groups: &[usize],
+        seeds: &[u64],
+        order: &[usize],
+        xs: &mut Vec<F<N>>,
+        v: &mut [F<N>],
+        n: usize,
+        finish: &(dyn Fn(&[F<N>], &mut [F<N>]) -> bool + Sync),
+        [block, gram, prod]: [&mut Vec<F<N>>; 3],
+        redo: &mut Vec<(usize, usize)>,
+        local: &mut Vec<usize>,
+    ) -> bool {
+        if !self.run(shifts, groups, seeds, order, false, xs, v, n, finish) {
             return false;
         }
-        let total = norm(x);
-        if total == F::zero() || !total.is_finite() {
-            return false;
+        orthogonalize_windows(v, n, order, groups, block, gram, prod, redo);
+        redo.iter().all(|&(a, b)| {
+            local.clear();
+            local.extend(groups[a..b].iter().map(|g| g - a));
+            self.run(&shifts[a..b], local, &seeds[a..b], &order[a..b], true, xs, v, n, finish)
+        })
+    }
+
+    /// Vector `j` of `order` (shift `shifts[j]`, start `seeds[j]`), written
+    /// by `finish(x, column)` to column `order[j]` of the `n`-row `v`. With
+    /// `inline`, the vectors run in order into the rows of `xs`, each solve
+    /// followed by Gram–Schmidt against rows `groups[j]..j`. Otherwise every
+    /// vector runs by itself: as board items in a cone lane, as pool tasks,
+    /// or serially, the same bits on every route.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        shifts: &[F<N>],
+        groups: &[usize],
+        seeds: &[u64],
+        order: &[usize],
+        inline: bool,
+        xs: &mut Vec<F<N>>,
+        v: &mut [F<N>],
+        n: usize,
+        finish: &(dyn Fn(&[F<N>], &mut [F<N>]) -> bool + Sync),
+    ) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (len, count) = (self.len, order.len());
+        if inline {
+            xs.clear();
+            xs.resize(count * len, F::zero());
+            return crate::algebra::scratch::with_scratch(|r: &mut InvitRows<N>| {
+                (0..count).all(|j| {
+                    let (done, rest) = xs.split_at_mut(j * len);
+                    let x = &mut rest[..len];
+                    let p = order[j];
+                    self.vector(shifts[j], seeds[j], &done[groups[j] * len..], x, r)
+                        && finish(x, &mut v[p * n..(p + 1) * n])
+                })
+            });
         }
-        let mut jmax = 0;
-        for (i, xi) in x.iter().enumerate() {
-            if xi.abs() > x[jmax].abs() {
-                jmax = i;
-            }
+        // About 40 multiply-adds per entry: the LU and two or three solves.
+        let offer =
+            sdpx_arithmetic::inner_parallel::active() || rayon::current_thread_index().is_some();
+        let parts = tasks_if(offer, (40 * len * count) as u128 * w::<N>(), count);
+        let size = count.div_ceil(parts);
+        struct Columns<T>(*mut T);
+        // SAFETY: vector `j` writes only column `order[j]` of `v`.
+        unsafe impl<T: Send> Sync for Columns<T> {}
+        let columns = Columns(v.as_mut_ptr());
+        let failed = AtomicBool::new(false);
+        let item = |i: usize| {
+            let columns = &columns;
+            crate::algebra::scratch::with_scratch(|(r, x): &mut (InvitRows<N>, Vec<F<N>>)| {
+                x.resize(len, F::zero());
+                for j in i * size..((i + 1) * size).min(count) {
+                    if failed.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // SAFETY: column `order[j]` belongs to vector `j` alone.
+                    let column =
+                        unsafe { std::slice::from_raw_parts_mut(columns.0.add(order[j] * n), n) };
+                    if !self.vector(shifts[j], seeds[j], &[], &mut x[..len], r) || !finish(&x[..len], column) {
+                        failed.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            })
+        };
+        let items = count.div_ceil(size);
+        if parts > 1 && sdpx_arithmetic::inner_parallel::board::offered() {
+            sdpx_arithmetic::inner_parallel::board::run(items, &item);
+        } else if parts > 1 {
+            (0..items).into_par_iter().for_each(item);
+        } else {
+            item(0);
         }
-        let inv = if x[jmax] < F::zero() { -total.recip() } else { total.recip() };
-        for xi in x.iter_mut() {
-            *xi *= inv;
-        }
-        let column = &mut v[p * n..(p + 1) * n];
-        for (i, c) in column.iter_mut().enumerate() {
-            *c = x[2 * i];
-        }
-        let half = norm(column);
-        if half == F::zero() || !half.is_finite() {
-            return false;
-        }
-        let inv = half.recip();
-        for c in column.iter_mut() {
-            *c *= inv;
+        !failed.into_inner()
+    }
+}
+
+/// The generator state before each of `count` vectors of `len` draws, as
+/// one stream.
+fn start_seeds(seeds: &mut Vec<u64>, count: usize, len: usize) {
+    seeds.clear();
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..count {
+        seeds.push(seed);
+        for _ in 0..len {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
         }
     }
+}
+
+/// Scales `x` to unit length with its largest entry positive; false when
+/// its norm is zero or not finite.
+fn signed_unit<const N: usize>(x: &mut [F<N>]) -> bool {
+    let total = norm(x);
+    if total == F::zero() || !total.is_finite() {
+        return false;
+    }
+    let mut jmax = 0;
+    for (i, xi) in x.iter().enumerate() {
+        if xi.abs() > x[jmax].abs() {
+            jmax = i;
+        }
+    }
+    let inv = if x[jmax] < F::zero() { -total.recip() } else { total.recip() };
+    for xi in x.iter_mut() {
+        *xi *= inv;
+    }
     true
+}
+
+/// Orthonormalizes the unit columns `v[order[j]]` within each window: the
+/// pairs of sorted values `q < j` with `q ≥ groups[j]`, the pairs the
+/// iteration's Gram–Schmidt would join. For each chain of linked values,
+/// `E = VᵀV − I` on its window pairs and diagonal (zero elsewhere) gives
+/// `V ← V (I − E/2)`, which leaves those entries `O(‖E‖²)` and every other
+/// pair as it was; the two products are exact residue GEMMs at larger
+/// sizes. Independent inverse-iteration vectors in a window differ from
+/// the eigenvectors by `O(eps·‖T‖/gap)`, so one step usually suffices; it is
+/// repeated while `(k·max|E|)² > eps` for a chain of `k`. Each step squares
+/// `k·max|E|`, so twelve steps converge from below 1/2 at every width up to
+/// 4096 bits. A chain with `k·max|E| ≥ 1/2` (values too close for
+/// independent vectors), or one that does not converge, keeps its columns
+/// and is pushed to `redo`.
+#[allow(clippy::too_many_arguments)]
+fn orthogonalize_windows<const N: usize>(
+    v: &mut [F<N>],
+    n: usize,
+    order: &[usize],
+    groups: &[usize],
+    block: &mut Vec<F<N>>,
+    gram: &mut Vec<F<N>>,
+    prod: &mut Vec<F<N>>,
+    redo: &mut Vec<(usize, usize)>,
+) {
+    redo.clear();
+    let eps = F::<N>::epsilon();
+    let half = F::<N>::one() / num::<N>(2);
+    let mut a = 0;
+    while a < order.len() {
+        let mut b = a + 1;
+        while b < order.len() && groups[b] < b {
+            b += 1;
+        }
+        let k = b - a;
+        if k > 1 {
+            block.clear();
+            for &p in &order[a..b] {
+                block.extend_from_slice(&v[p * n..(p + 1) * n]);
+            }
+            gram.clear();
+            gram.resize(k * k, F::zero());
+            prod.clear();
+            prod.resize(n * k, F::zero());
+            let (ki, ni) = (k as i32, n as i32);
+            let mut converged = false;
+            for _ in 0..12 {
+                <F<N> as XgemmScalar>::xgemm(b'T', b'N', ki, ki, ni, F::one(), block, ni, block, ni, F::zero(), gram, ki);
+                let mut big = F::<N>::zero();
+                for u in 0..k {
+                    for t in 0..k {
+                        let x = &mut gram[t + u * k];
+                        let (q, j) = if t < u { (a + t, a + u) } else { (a + u, a + t) };
+                        if t == u {
+                            *x -= F::one();
+                        } else if q < groups[j] {
+                            *x = F::zero();
+                        }
+                        if x.abs() > big {
+                            big = x.abs();
+                        }
+                    }
+                }
+                let spread = big * num::<N>(k);
+                if !(spread < half) {
+                    break;
+                }
+                if big == F::zero() {
+                    converged = true;
+                    break;
+                }
+                <F<N> as XgemmScalar>::xgemm(b'N', b'N', ni, ki, ki, F::one(), block, ni, gram, ki, F::zero(), prod, ni);
+                for (x, &y) in block.iter_mut().zip(prod.iter()) {
+                    *x = y.mul_add(-half, *x);
+                }
+                if spread * spread <= eps {
+                    converged = true;
+                    break;
+                }
+            }
+            if !converged {
+                redo.push((a, b));
+            } else {
+                for (t, &p) in order[a..b].iter().enumerate() {
+                    v[p * n..(p + 1) * n].copy_from_slice(&block[t * n..(t + 1) * n]);
+                }
+            }
+        }
+        a = b;
+    }
 }
 
 /// Right singular vectors of the upper bidiagonal `(d, e)` whose values lie
 /// within a factor two (`σmin ≥ σmax/2`), as eigenvectors of the shifted
 /// normal tridiagonal `F = BᵀB − c²I` (`c` the mid value) of order `n`.
 /// Same inverse iteration as [`inverse_vectors`] (pivoted LU, growth test,
-/// Gram–Schmidt within `1e-3·σmax²`, one extra solve), with the growth test
-/// taken on `F/‖F‖`. Clustering and pivot floors retain the unshifted scale:
-/// the input singular values do not gain absolute accuracy when shifted.
+/// one extra solve, windows of `1e-3·σmax²` orthogonalized together or else
+/// by Gram–Schmidt), with the growth test taken on `F/‖F‖`. Clustering and
+/// pivot floors retain the unshifted scale: the input singular values do not
+/// gain absolute accuracy when shifted.
 /// Within the factor two, forming `BᵀB` keeps the vectors'
 /// error at the bidiagonalization's backward error over the gap, as for the
 /// Golub–Kahan form.
@@ -805,8 +1087,6 @@ fn normal_vectors<const N: usize>(
     v: &mut [F<N>],
     ws: &mut InvitWork<N>,
 ) -> bool {
-    const MAXITS: usize = 5;
-    const EXTRA: usize = 1;
     if n < 2 || s.iter().any(|x| *x == F::zero() || !x.is_finite()) {
         return false;
     }
@@ -823,7 +1103,7 @@ fn normal_vectors<const N: usize>(
         return false;
     }
     let c = (lo + hi) / num::<N>(2);
-    let InvitWork { off, order, dd, du, du2, dl, swap, used, .. } = ws;
+    let InvitWork { off, order, xs, used, groups, seeds, block, gram, prod, redo, local } = ws;
     // off[0..n] the diagonal of F, off[n..2n-1] its off-diagonal.
     off.clear();
     for i in 0..n {
@@ -865,14 +1145,8 @@ fn normal_vectors<const N: usize>(
     order.sort_unstable_by(|&a, &b| {
         s[a].abs().partial_cmp(&s[b].abs()).unwrap().then(a.cmp(&b))
     });
-    for buffer in [&mut *dd, &mut *du, &mut *du2, &mut *dl] {
-        buffer.clear();
-        buffer.resize(n, F::zero());
-    }
-    swap.clear();
-    swap.resize(n, false);
     used.clear();
-    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    groups.clear();
     let (mut group, mut prev) = (0usize, F::zero());
     for (j, &p) in order.iter().enumerate() {
         let mut shift = (s[p].abs() - c) * (s[p].abs() + c);
@@ -884,132 +1158,18 @@ fn normal_vectors<const N: usize>(
         while shift - used[group] > ortol {
             group += 1;
         }
-        // F − shift·I = P·L·U, U with two superdiagonals (LAPACK dgttrf).
-        for i in 0..n {
-            dd[i] = diag[i] - shift;
-        }
-        du2.fill(F::zero());
-        du[..n - 1].copy_from_slice(sub);
-        dl[..n - 1].copy_from_slice(sub);
-        for i in 0..n - 1 {
-            if dd[i].abs() >= dl[i].abs() {
-                swap[i] = false;
-                if dd[i] != F::zero() {
-                    let fact = dl[i] / dd[i];
-                    dl[i] = fact;
-                    dd[i + 1] -= fact * du[i];
-                }
-            } else {
-                swap[i] = true;
-                let fact = dd[i] / dl[i];
-                dd[i] = dl[i];
-                dl[i] = fact;
-                let temp = du[i];
-                du[i] = dd[i + 1];
-                dd[i + 1] = temp - fact * dd[i + 1];
-                if i + 2 < n {
-                    du2[i] = du[i + 1];
-                    du[i + 1] = -fact * du[i + 1];
-                }
-            }
-        }
-        for x in dd.iter_mut() {
-            if x.abs() < tiny {
-                *x = if *x < F::zero() { -tiny } else { tiny };
-            }
-        }
-        let last = dd[n - 1].abs();
-        // Completed vectors already occupy their final V columns. Split off
-        // this column to keep the same Gram–Schmidt order without another n² buffer.
-        let (before, rest) = v.split_at_mut(p * n);
-        let (x, after) = rest.split_at_mut(n);
-        for xi in x.iter_mut() {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let unit = (seed >> 11) as f64 / (1u64 << 53) as f64;
-            *xi = <F<N> as num_traits::FromPrimitive>::from_f64(2.0 * unit - 1.0).unwrap();
-        }
-        let mut passed = 0;
-        let mut converged = false;
-        for _ in 0..MAXITS {
-            let mut l1 = F::zero();
-            for xi in x.iter() {
-                l1 += xi.abs();
-            }
-            if l1 == F::zero() || !l1.is_finite() {
-                return false;
-            }
-            // dstein's growth test on F/‖F‖: ‖F‖ is far below one when the
-            // values nearly coincide.
-            let grow = if last > tiny { last } else { tiny };
-            let scale = num::<N>(n) * grow / l1;
-            for xi in x.iter_mut() {
-                *xi *= scale;
-            }
-            for i in 0..n - 1 {
-                if swap[i] {
-                    let temp = x[i];
-                    x[i] = x[i + 1];
-                    x[i + 1] = temp - dl[i] * x[i];
-                } else {
-                    x[i + 1] -= dl[i] * x[i];
-                }
-            }
-            x[n - 1] /= dd[n - 1];
-            x[n - 2] = (x[n - 2] - du[n - 2] * x[n - 1]) / dd[n - 2];
-            for i in (0..n - 2).rev() {
-                x[i] = (x[i] - du[i] * x[i + 1] - du2[i] * x[i + 2]) / dd[i];
-            }
-            for q in group..j {
-                let p0 = order[q];
-                let y = if p0 < p {
-                    &before[p0 * n..(p0 + 1) * n]
-                } else {
-                    &after[(p0 - p - 1) * n..(p0 - p) * n]
-                };
-                let ndot = -F::dot_fma(x.iter().zip(y));
-                for (xi, &yi) in x.iter_mut().zip(y) {
-                    *xi = yi.mul_add(ndot, *xi);
-                }
-            }
-            let mut big = F::zero();
-            for xi in x.iter() {
-                if !xi.is_finite() {
-                    return false;
-                }
-                if xi.abs() > big {
-                    big = xi.abs();
-                }
-            }
-            if big < crit {
-                continue;
-            }
-            passed += 1;
-            if passed > EXTRA {
-                converged = true;
-                break;
-            }
-        }
-        if !converged {
-            return false;
-        }
-        let total = norm(x);
-        if total == F::zero() || !total.is_finite() {
-            return false;
-        }
-        let mut jmax = 0;
-        for (i, xi) in x.iter().enumerate() {
-            if xi.abs() > x[jmax].abs() {
-                jmax = i;
-            }
-        }
-        let inv = if x[jmax] < F::zero() { -total.recip() } else { total.recip() };
-        for xi in x.iter_mut() {
-            *xi *= inv;
-        }
+        groups.push(group);
     }
-    true
+    start_seeds(seeds, n, n);
+    // dstein's growth test on F/‖F‖: ‖F‖ is far below one when the values
+    // nearly coincide.
+    let sweep = Sweep { len: n, tri: off, tiny, least: tiny, gain: num::<N>(n), crit };
+    let finish = |x: &[F<N>], column: &mut [F<N>]| {
+        column.copy_from_slice(x);
+        true
+    };
+    // As in `inverse_vectors`.
+    sweep.vectors(used, groups, seeds, order, xs, v, n, &finish, [block, gram, prod], redo, local)
 }
 
 // Packed Householder reconstruction, applied backwards as in SDPX's upstream

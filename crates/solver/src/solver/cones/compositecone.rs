@@ -495,7 +495,7 @@ where
             let cached = if let Some(threading) =
                 self.threading.as_ref().filter(|t| t.cone_workers > 1)
             {
-                if αmax.is_finite() && αmax > T::zero() && threading.sym_step_lanes.len() > 1 {
+                if αmax.is_finite() && αmax > T::zero() && !threading.sym_step_lanes.is_empty() {
                     self.sym_step_bounds.resize(self.cones.len(), (αmax, αmax));
                     threading.pool.install(|| {
                         cone_parallel::queued_affine_bounds(
@@ -639,7 +639,7 @@ where
     /// CPU budget; one and structurally small workloads keep the serial path.
     /// Native BLAS must use one thread when cone workers execute PSD kernels.
     pub fn configure_threads(&mut self, threads: usize) -> Result<(), rayon::ThreadPoolBuildError> {
-        self.threading = ConeThreading::new(&self.cones, threads, None)?;
+        self.threading = ConeThreading::new(&self.cones, threads, None, None)?;
         Ok(())
     }
 
@@ -649,9 +649,48 @@ where
         threads: usize,
         p: &CscMatrix<T>,
         a: &CscMatrix<T>,
+        condensed: bool,
     ) -> Result<(), rayon::ThreadPoolBuildError> {
-        self.threading = ConeThreading::new(&self.cones, threads, Some((p, a)))?;
+        let assembly = condensed.then(|| self.psd_left_dot_terms(a)).flatten();
+        self.threading = ConeThreading::new(&self.cones, threads, Some((p, a)), assembly)?;
         Ok(())
+    }
+
+    /// Exact products of a condensed PSD Schur's left dots, Σ_b Σ_{a≤b}
+    /// nnz_a over each PSD cone's touching columns in order; `None` unless
+    /// every cone is PSD or nonnegative.
+    fn psd_left_dot_terms(&self, a: &CscMatrix<T>) -> Option<u128> {
+        let mut owner = vec![usize::MAX; a.m];
+        let mut psd = 0;
+        for (cone, rows) in self.cones.iter().zip(&self.rng_cones) {
+            match cone {
+                SupportedCone::PSDTriangleCone(_) => {
+                    owner[rows.clone()].fill(psd);
+                    psd += 1;
+                }
+                SupportedCone::NonnegativeCone(_) => {}
+                _ => return None,
+            }
+        }
+        let (mut running, mut count) = (vec![0u128; psd], vec![0u128; psd]);
+        let (mut touched, mut terms) = (Vec::new(), 0u128);
+        for j in 0..a.n {
+            for &row in &a.rowval[a.colptr[j]..a.colptr[j + 1]] {
+                let k = owner[row];
+                if k != usize::MAX {
+                    if count[k] == 0 {
+                        touched.push(k);
+                    }
+                    count[k] += 1;
+                }
+            }
+            for k in touched.drain(..) {
+                running[k] += count[k];
+                terms += running[k];
+                count[k] = 0;
+            }
+        }
+        Some(terms)
     }
 
     /// Drop a pool whose binary64 cone phases are light when the KKT factor
@@ -1648,7 +1687,7 @@ where
             if threading.orthant_chunk.is_none()
                 && αmax.is_finite()
                 && αmax > T::zero()
-                && threading.sym_step_lanes.len() > 1
+                && !threading.sym_step_lanes.is_empty()
             {
                 self.sym_step_bounds.resize(self.cones.len(), (αmax, αmax));
                 threading.pool.install(|| {

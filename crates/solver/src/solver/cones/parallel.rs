@@ -72,8 +72,9 @@ impl ConeThreading {
         cones: &[SupportedCone<T>],
         requested: usize,
         kkt: Option<(&CscMatrix<T>, &CscMatrix<T>)>,
+        assembly: Option<u128>,
     ) -> Result<Option<Self>, rayon::ThreadPoolBuildError> {
-        Self::build(cones, requested, kkt, None)
+        Self::build(cones, requested, kkt, assembly, None)
     }
 
     /// Plan lanes for `cones` on an existing pool (its width is the budget).
@@ -82,7 +83,9 @@ impl ConeThreading {
         pool: std::sync::Arc<rayon::ThreadPool>,
     ) -> Option<Self> {
         let width = pool.current_num_threads();
-        Self::build(cones, width, None, Some(pool)).ok().flatten()
+        Self::build(cones, width, None, None, Some(pool))
+            .ok()
+            .flatten()
     }
 
     // Scale heavy PSD cones first. Whole cones remain independent; workers
@@ -227,6 +230,7 @@ impl ConeThreading {
         cones: &[SupportedCone<T>],
         requested: usize,
         kkt: Option<(&CscMatrix<T>, &CscMatrix<T>)>,
+        assembly: Option<u128>,
         existing: Option<std::sync::Arc<rayon::ThreadPool>>,
     ) -> Result<Option<Self>, rayon::ThreadPoolBuildError> {
         let budget = crate::solver::core::worker_budget(requested);
@@ -272,7 +276,7 @@ impl ConeThreading {
         // Preserve the measured PSD admission. Materialized PSD A columns
         // do not describe the condensed factor's work.
         let cap = if existing.is_none() {
-            useful_width(cones)
+            useful_width(cones, kkt.map(|(_, a)| a.n), assembly)
         } else {
             usize::MAX
         };
@@ -378,7 +382,9 @@ impl ConeThreading {
                 .saturating_mul(4)
                 .min(active)
                 .min((*prefix.last().unwrap() / MIN_LANE_WORK).min(usize::MAX as u128) as usize);
-            if lanes > 1 {
+            // One lane is worth the queue only when spare workers can take
+            // its inner splits (a lone PSD block's congruences, Cholesky).
+            if lanes > 1 || (lanes == 1 && spare) {
                 balanced_lanes(cones, &prefix, lanes)
             } else {
                 Vec::new()
@@ -439,16 +445,37 @@ impl ConeThreading {
 /// order 12–16) ran at 3.12 GHz / IPC 2.69 on 8 threads but 2.35 GHz / IPC
 /// 0.83 on 64, with useful instructions unchanged (journal 2026-10-07).
 /// Problems without PSD cones and binary64 keep the requested width.
-fn useful_width<T: FloatT>(cones: &[SupportedCone<T>]) -> usize {
+/// `columns`: the primal columns, when the KKT is known (see [`lone_units`]).
+/// `assembly`: the condensed Schur's left-dot terms of a non-sampled pure
+/// PSD/orthant problem (`CompositeCone::psd_left_dot_terms`); with several
+/// cones, a worker per 64³ terms when that exceeds the cone count. 12_min
+/// (16 cones, 89.8M terms) at 512 bits on a 32-thread budget: 88.4 s on
+/// 24 workers, 81.4 on 31–32 (assembly 54 → 45.5 s; journal 2026-11-08).
+fn useful_width<T: FloatT>(
+    cones: &[SupportedCone<T>],
+    columns: Option<usize>,
+    assembly: Option<u128>,
+) -> usize {
     if T::precision_bits() <= 64 {
         return usize::MAX;
     }
     let unit = psd_unit::<T>();
+    let lone = columns.filter(|_| {
+        cones
+            .iter()
+            .filter(|c| matches!(c, SupportedCone::PSDTriangleCone(_)))
+            .count()
+            == 1
+    });
     let (mut units, mut other, mut psd) = (0u128, 0u128, false);
     for cone in cones {
-        if matches!(cone, SupportedCone::PSDTriangleCone(_)) {
+        if let SupportedCone::PSDTriangleCone(k) = cone {
             psd = true;
-            units += cone_cost(cone).div_ceil(unit).max(1);
+            let cubic = cone_cost(cone).div_ceil(unit).max(1);
+            units += match lone {
+                Some(nx) if k.n > 64 => cubic.min(lone_units(k.n, nx)),
+                _ => cubic,
+            };
         } else {
             other += cone_cost(cone);
         }
@@ -457,12 +484,31 @@ fn useful_width<T: FloatT>(cones: &[SupportedCone<T>]) -> usize {
         return usize::MAX;
     }
     units += other.div_ceil(unit);
+    if let (None, Some(terms)) = (lone, assembly) {
+        units = units.max(terms.div_ceil(64 * 64 * 64));
+    }
     let width = (units as f64 * width_factor()).ceil();
     if width >= usize::MAX as f64 {
         usize::MAX
     } else {
         (width as usize).max(2)
     }
+}
+
+/// Units of a lone PSD cone of order `n` above 64 beside `nx` primal columns.
+/// With no other cone to overlap, its phases are its own kernels' inner
+/// splits, which divide each step's n² work (rank-one updates, rotations,
+/// congruence columns) rather than the cone's n³; the condensed Schur over
+/// the columns that touch it is dense (nx³/3). Both only narrow the cubic
+/// count (theta2: 498 columns would widen 5 to 32, unmeasured). At 256 bits
+/// on a 32-thread budget (node54, journal 2026-11-08): arch0 (n 161) 20.8 s
+/// on 22 workers, 17.6 s on 8; gpp124-1 (124) 22.3 s on 10, 18.8 s on 4;
+/// gpp250-1 (250) flat from 8 to 32 workers, 3.0 → 1.25 GB.
+fn lone_units(n: usize, nx: usize) -> u128 {
+    let (n, nx) = (n as u128, nx as u128);
+    (n * n)
+        .div_ceil(64 * 64)
+        .max((nx * nx * nx / 3).div_ceil(64 * 64 * 64))
 }
 
 /// Cost (`cone_cost`) one worker absorbs per PSD cone: a cone of order 64.
@@ -1029,7 +1075,7 @@ mod tests {
     fn balanced_partition_and_joined_failure_own_each_row_once() {
         let kinds = vec![SupportedConeT::<f64>::NonnegativeConeT(4096); 4];
         let mut cones: Vec<_> = kinds.iter().map(make_cone).collect();
-        let threading = ConeThreading::new(&cones, 2, None).unwrap().unwrap();
+        let threading = ConeThreading::new(&cones, 2, None, None).unwrap().unwrap();
         assert_eq!(threading.pool.current_num_threads(), 2);
         assert_eq!(threading.lanes.len(), 4);
         for (i, lane) in threading.lanes.iter().enumerate() {

@@ -246,7 +246,7 @@ fn ldl_dots<T: FloatT>(
 /// envelope. Blocks up to `REC_BASE` take [`ldl_dots`]. `ways`: spare workers
 /// granted to the products and base factors.
 #[allow(clippy::too_many_arguments)]
-fn ldl_rec<T: FloatT>(
+pub(super) fn ldl_rec<T: FloatT>(
     l: &mut [T],
     ld: usize,
     n: usize,
@@ -408,7 +408,7 @@ fn ldl_rec<T: FloatT>(
 /// rows of B solve independently by exact dots from their first nonzero
 /// column (`low`, at most `n`: the skipped entries stay exact zeros).
 #[allow(clippy::too_many_arguments)]
-fn solve_unit_lower_t<T: FloatT>(
+pub(super) fn solve_unit_lower_t<T: FloatT>(
     m: usize,
     n: usize,
     l: &[T],
@@ -483,7 +483,7 @@ fn solve_unit_lower_t<T: FloatT>(
 
 /// `c = op(a)·op(b)` (`m × n`, inner `k`): one exact sum rounded once per
 /// entry, with `ways` offered to the residue product.
-fn exact_product<T: FloatT>(
+pub(super) fn exact_product<T: FloatT>(
     (ta, tb): (u8, u8),
     (m, n, k): (usize, usize, usize),
     (a, lda): (&[T], usize),
@@ -2578,7 +2578,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
     /// natural single leaf, the positive block must be half dense (a sparse
     /// one, such as an LP's zero P, would pivot on exact zeros: MPFR has no
     /// static shift) and the dense storage must stay within the arrow bound
-    /// for QDLDL's factor size.
+    /// for QDLDL's factor size. Without a border the matrix is definite, so
+    /// any order pivots on positive values and density does not matter
+    /// (dE3's condensed Schur is 26% dense).
     pub fn try_dense(
         k: &CscMatrix<T>,
         signs: &[i8],
@@ -2594,7 +2596,9 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             .flat_map(|j| (k.colptr[j]..k.colptr[j + 1]).map(move |q| (k.rowval[q], j)))
             .filter(|&(i, j)| signs[i] > 0 && signs[j] > 0)
             .count();
-        if !Self::dense_leaf(g, positive_entries) || !super::dense_factor(k, settings, amd, true) {
+        if !(t == 0 || Self::dense_leaf(g, positive_entries))
+            || !super::dense_factor(k, settings, amd, true)
+        {
             return None;
         }
         let lnz = amd.as_ref().map_or(0, |o| o.2.lnz);

@@ -221,8 +221,13 @@ impl<T: FloatT> PreparedProblem<T> {
         }}
         crate::receipt::memory_mark("problem data");
         let mut cones = CompositeCone::<T>::new(&data.cones);
+        // Materialized sampled columns do not describe the condensed work.
+        let condensed = T::precision_bits() > 53
+            && sampled.is_none()
+            && data.P.nnz() == 0
+            && DefaultKKTSystem::uses_condensed(&data, &cones, &settings);
         cones
-            .configure_threads_for_kkt(settings.max_threads as usize, &data.P, &data.A)
+            .configure_threads_for_kkt(settings.max_threads as usize, &data.P, &data.A, condensed)
             .map_err(|_| SettingsError::LinearSolverProblem {
                 solver: "cone workers",
                 problem: "failed to create worker pool",
