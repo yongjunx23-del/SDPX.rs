@@ -251,7 +251,7 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
             let x: &[F<N>] = x;
             let min = cols.div_ceil(parts);
             a[(k + 1) * m..n * m].par_chunks_mut(m).with_min_len(min).for_each(|col| {
-                let mut dot = F::dot_fma(x.iter().zip(&col[k..m]));
+                let mut dot = F::dot_slices(x, &col[k..m]);
                 dot *= tau;
                 let ndot = -dot;
                 for i in k..m {
@@ -260,7 +260,7 @@ pub(super) fn reduce_bidiagonal<const N: usize>(
             });
         } else {
             for j in k + 1..n {
-                let mut dot = F::dot_fma(x.iter().zip(&a[k + j * m..m + j * m]));
+                let mut dot = F::dot_slices(x, &a[k + j * m..m + j * m]);
                 dot *= tau;
                 let ndot = -dot;
                 for i in k..m {
@@ -812,7 +812,7 @@ impl<const N: usize> Sweep<'_, N> {
                 x[i] = (x[i] - du[i] * x[i + 1] - du2[i] * x[i + 2]) / dd[i];
             }
             for y in window.chunks_exact(len) {
-                let ndot = -F::dot_fma(x.iter().zip(y));
+                let ndot = -F::dot_slices(x, y);
                 for (xi, &yi) in x.iter_mut().zip(y) {
                     *xi = yi.mul_add(ndot, *xi);
                 }
@@ -1186,7 +1186,7 @@ pub(super) fn apply_reflectors<const N: usize>(
 ) {
     for k in (0..n).rev() {
         let update = |col: &mut [F<N>]| {
-            let mut dot = F::dot_fma((k + 1..m).map(|i| (&a[i + k * m], &col[i]))) + col[k];
+            let mut dot = F::dot_slices(&a[k + 1 + k * m..(k + 1) * m], &col[k + 1..m]) + col[k];
             dot *= left[k];
             let ndot = -dot;
             col[k] += ndot;
