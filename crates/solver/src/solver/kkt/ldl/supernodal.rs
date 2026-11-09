@@ -240,7 +240,7 @@ impl Symbolic {
         let (f, w, r) = (self.start[s], self.width(s), self.rows[s].len());
         let b = r - w;
         // The factor columns (r × w) and the parent's update (F22, b × b)
-        // are assembled apart; the update block is never part of the front.
+        // are assembled apart; F22 keeps only its packed lower triangle.
         let mut front = if reuse.len() == r * w {
             if ways > 1 {
                 reuse.par_iter_mut().for_each(|v| *v = T::zero());
@@ -251,7 +251,7 @@ impl Symbolic {
         } else {
             zeros::<T>(r * w, ways)
         };
-        let mut update = zeros::<T>(b * b, ways);
+        let mut update = zeros::<T>(b * (b + 1) / 2, ways);
         for &(q, offset) in &self.entries[s] {
             front[offset as usize] = kkt.nzval[q as usize];
         }
@@ -260,14 +260,16 @@ impl Symbolic {
             let map = &self.relmap[c];
             let bc = map.len();
             for jj in 0..bc {
-                let (j, values) = (map[jj], &child[jj * bc..(jj + 1) * bc]);
+                let (j, values) = (map[jj], &child[jj * (2 * bc - jj + 1) / 2..]);
                 if j < w {
                     for ii in jj..bc {
-                        front[map[ii] + j * r] += values[ii];
+                        front[map[ii] + j * r] += values[ii - jj];
                     }
                 } else {
+                    let col = j - w;
+                    let start = col * (2 * b - col + 1) / 2;
                     for ii in jj..bc {
-                        update[map[ii] - w + (j - w) * b] += values[ii];
+                        update[start + map[ii] - j] += values[ii - jj];
                     }
                 }
             }
@@ -319,8 +321,9 @@ impl Symbolic {
             });
             if upper {
                 for a in 0..b {
+                    let start = a * (2 * b - a + 1) / 2;
                     for c in a..b {
-                        update[c + a * b] -= packed[c * (c + 1) / 2 + a];
+                        update[start + c - a] -= packed[c * (c + 1) / 2 + a];
                     }
                 }
             } else {
@@ -335,8 +338,9 @@ impl Symbolic {
                     ways,
                 );
                 for a in 0..b {
+                    let start = a * (2 * b - a + 1) / 2;
                     for c in a..b {
-                        update[c + a * b] -= full[a + c * b];
+                        update[start + c - a] -= full[a + c * b];
                     }
                 }
             }
