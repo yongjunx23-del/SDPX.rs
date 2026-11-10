@@ -1208,3 +1208,126 @@ fn leaf_contribution_timing() {
     run::<16>(170, 96);
     run::<12>(170, 114);
 }
+
+#[test]
+fn two_cover_residues_match_dense() {
+    let mut checked = 0;
+    let mut halves = 0;
+    for m in [8, 17, 30] {
+        let plan = Plan::with_count(prime_bits(m), 3);
+        for &prime in &plan.primes {
+            let (p, pinv) = (prime as f64, 1.0 / prime as f64);
+            let h = (prime / 2) as i64;
+            for r in [0, 1, -1, 2, -2, 3, -3, h, -h, h - 1, 1 - h] {
+                let image = r.rem_euclid(prime as i64) as u64;
+                let expected = symmetric(mulmod(image, inverse(2, prime), prime), prime);
+                assert_eq!(half_residue(r as f64, p), expected);
+                halves += 1;
+            }
+            for ta in [b'N', b'T'] {
+                let (lda, ldx, cover) = (m + 3, m + 2, [0, m - 1]);
+                let mut a = vec![f64::NAN; lda * m];
+                let mut x = vec![f64::NAN; ldx * m];
+                for j in 0..m {
+                    for i in 0..m {
+                        let raw = ((i * 7919 + j * 104729 + 3) as u64 * 65537) % prime;
+                        a[i + j * lda] = symmetric(raw, prime);
+                        let raw = ((i.min(j) * 8191 + i.max(j) * 131071 + 1) as u64 * 32749) % prime;
+                        x[i + j * ldx] = if cover.contains(&i) || cover.contains(&j) {
+                            symmetric(raw, prime)
+                        } else if (i + j) % 2 == 0 { -0.0 } else { 0.0 };
+                    }
+                }
+                x[0] = 1.0;
+                x[(m - 1) + (m - 1) * ldx] = -1.0;
+                x[(m - 1) * ldx] = -h as f64;
+                x[m - 1] = -h as f64;
+                let mut dense_t = vec![0.0; m * m];
+                let mut expected = vec![0.0; m * (m + 1) / 2];
+                let mut panel = vec![0.0; m * m.min(UPPER_PANEL)];
+                int_gemm(b'N', if ta == b'N' { b'T' } else { b'N' }, m, m, m,
+                    &x, ldx, &a, lda, &mut dense_t, m);
+                for v in &mut dense_t { *v = reduce(*v, p, pinv); }
+                second_product(ta, m, 0, m, m, &a, lda, &dense_t, &mut expected,
+                    &mut panel, true, p, pinv);
+                let mut w = vec![f64::NAN; m * m];
+                let mut got = vec![f64::NAN; expected.len()];
+                two_cover_product(ta, m, &a, lda, &x, ldx, cover, p, pinv,
+                    &mut w, &mut panel, &mut got);
+                for (i, (got, expected)) in got.iter().zip(&expected).enumerate() {
+                    assert!(got.is_finite());
+                    assert!((*got == 0.0 && *expected == 0.0) || got.to_bits() == expected.to_bits(),
+                        "residue m={m} ta={ta} prime={prime} output={i}");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    println!("two_cover residue outputs={checked} balanced half comparisons={halves}");
+}
+
+#[test]
+fn two_cover_congruence_matches_full() {
+    let mut rng = Lcg(0x2c0_512);
+    let mut checked = 0;
+    let sentinel = F::<8>::from_f64(7.125).unwrap();
+    let base = F::<8>::from_f64(1.0).unwrap() / F::<8>::from_f64(7.0).unwrap();
+    let (_, exponent, limbs) = base.exact_encode();
+    let (zero_kind, _, _) = F::<8>::zero().exact_encode();
+    let zeros = [F::<8>::exact_decode(zero_kind, exponent, *limbs),
+        F::<8>::exact_decode(-zero_kind, exponent + 77, *limbs)];
+    // Variants exercise exact covers and each structural/shape fallback.
+    for (m, k, variant) in [(30, 30, 0), (17, 17, 0), (8, 8, 0), (7, 7, 0),
+        (27, 30, 0), (30, 30, 1), (30, 30, 2), (30, 30, 3), (30, 30, 4)] {
+        for ta in [b'N', b'T'] {
+            let (ar, ac) = if ta == b'N' { (m, k) } else { (k, m) };
+            let (lda, ldx, cover) = (ar + 3, k + 2, [0, k - 1]);
+            let logical = random::<8>(&mut rng, ar * ac, 9);
+            let mut a = vec![F::<8>::nan(); lda * ac];
+            for j in 0..ac { a[j * lda..j * lda + ar].copy_from_slice(&logical[j * ar..(j + 1) * ar]); }
+            let values = random::<8>(&mut rng, k * k, 11);
+            let mut x = vec![F::<8>::nan(); ldx * k];
+            for j in 0..k {
+                for i in 0..k {
+                    x[i + j * ldx] = if cover.contains(&i) || cover.contains(&j) {
+                        values[i.min(j) + i.max(j) * k]
+                    } else { zeros[(i + j) % 2] };
+                }
+            }
+            x[0] = base;
+            x[(k - 1) + (k - 1) * ldx] = -base;
+            match variant {
+                1 => { x[2 + 3 * ldx] = base; x[3 + 2 * ldx] = base; }
+                2 => { x[3 * ldx] = base; x[3] = -base; }
+                3 => {
+                    for j in 0..k { for i in 0..k { x[i + j * ldx] = values[i.min(j) + i.max(j) * k]; } }
+                    x[0] = base; x[1 + ldx] = base; x[2 + 2 * ldx] = base;
+                }
+                4 => { x[0] = zeros[0]; }
+                _ => {}
+            }
+            let detected = two_cover(View { data: &x, rows: k, cols: k, ld: ldx });
+            assert_eq!(detected, (variant == 0).then_some(cover));
+            let mut full = vec![F::<8>::zero(); m * m];
+            assert!(congruence(ta, m, k, &a, lda, &x, ldx, false, None, &mut full, None));
+            let mut cache = ResidueCache::default();
+            for _ in 0..2 {
+                let mut upper = vec![sentinel; m * m];
+                assert!(congruence(ta, m, k, &a, lda, &x, ldx, true, None,
+                    &mut upper, Some(&mut cache)));
+                for j in 0..m {
+                    for i in 0..m {
+                        let (got, expected) = (upper[i + j * m], full[i + j * m]);
+                        if i > j { assert_eq!(got.exact_encode(), sentinel.exact_encode()); }
+                        else {
+                            assert!((got.is_zero() && expected.is_zero()) || got.exact_encode() == expected.exact_encode(),
+                                "MPFR m={m} k={k} ta={ta} variant={variant} output=({i},{j})");
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("two_cover full512 upper comparisons={checked}; ta=N/T, padded, cache miss/hit, lower sentinel, shape/structure fallbacks");
+}
