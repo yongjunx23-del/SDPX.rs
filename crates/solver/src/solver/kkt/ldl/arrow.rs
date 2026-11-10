@@ -420,9 +420,7 @@ pub(super) fn solve_unit_lower_t<T: FloatT>(
     ways: usize,
 ) {
     use sdpx_arithmetic::inner_parallel as ip;
-    if n <= REC_BASE
-        && (n <= REC_BASE / 2
-            || !T::residue_product_applies(m, n.div_ceil(2), n / 2))
+    if n <= REC_BASE && (n <= REC_BASE / 2 || !T::residue_product_applies(m, n.div_ceil(2), n / 2))
     {
         let lr: Vec<T> = (0..n * n).map(|e| l[e / n + e % n * ldl]).collect();
         let mut rows = zeros(m * n, ways);
