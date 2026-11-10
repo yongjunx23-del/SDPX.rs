@@ -1418,8 +1418,9 @@ impl<T: FloatT> PsdBlock<T> {
                 let tp = c.support.binary_search(&(p as usize)).unwrap();
                 rows.data_mut()[tp + tq * r] = v;
             }
+            let mut cache = (r == n).then(|| self.ginv_cache.clone());
             if with_split_hint(ways, || {
-                congruence_exact_sym(mat3, &*panel, false, &*rows, None, None)
+                congruence_exact_sym(mat3, &*panel, false, &*rows, None, cache.as_mut())
             }) {
                 mat_to_svec(&mut c.vector, &*mat3);
                 return;
