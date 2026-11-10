@@ -3486,6 +3486,74 @@ impl GemmShape {
     }
 }
 
+// A sufficient exact two-index cover: the only nonzero diagonals select it.
+// Verify the whole logical matrix, including symmetry, without reading padding.
+fn two_cover<const N: usize>(x: View<'_, N>) -> Option<[usize; 2]> {
+    let mut cover = [0; 2];
+    let mut count = 0;
+    for i in 0..x.rows {
+        if !x.data[i + i * x.ld].is_zero() {
+            if count == 2 { return None; }
+            cover[count] = i;
+            count += 1;
+        }
+    }
+    if count != 2 { return None; }
+    for j in 0..x.cols {
+        for i in 0..=j {
+            let v = &x.data[i + j * x.ld];
+            if *v != x.data[j + i * x.ld]
+                || (!cover.contains(&i) && !cover.contains(&j) && !v.is_zero())
+            {
+                return None;
+            }
+        }
+    }
+    Some(cover)
+}
+
+// Balanced modular division by two, exact for odd p and integer |r| < p/2.
+fn half_residue(r: f64, p: f64) -> f64 {
+    (if (r as i64) & 1 == 0 { r } else if r < 0.0 { r + p } else { r - p }) * 0.5
+}
+
+// X = E B + Bᵀ Eᵀ, with B's cover intersection halved modulo p.
+// V = op(A) Bᵀ and W = U Vᵀ, U = op(A) E; C = W + Wᵀ.
+// The caller guarantees m == k >= 8: B/U/V use 6m entries of the old
+// m*min(m,16) panel, and W uses the old k*m intermediate. Both products
+// and their paired output have <= k terms, within the original Plan bound.
+#[allow(clippy::too_many_arguments)]
+fn two_cover_product(
+    ta: u8, m: usize, a: &[f64], lda: usize, x: &[f64], ldx: usize,
+    cover: [usize; 2], p: f64, pinv: f64,
+    w: &mut [f64], panel: &mut [f64], out: &mut [f64],
+) {
+    let (b, rest) = panel.split_at_mut(2 * m);
+    let (u, rest) = rest.split_at_mut(2 * m);
+    let v = &mut rest[..2 * m];
+    for j in 0..m {
+        for c in 0..2 {
+            let r = x[cover[c] + j * ldx];
+            b[c + j * 2] = if cover.contains(&j) { half_residue(r, p) } else { r };
+            u[j + c * m] = if ta.to_ascii_uppercase() == b'N' {
+                a[j + cover[c] * lda]
+            } else {
+                a[cover[c] + j * lda]
+            };
+        }
+    }
+    int_gemm(ta, b'T', m, 2, m, a, lda, b, 2, v, m);
+    for r in v.iter_mut() { *r = reduce(*r, p, pinv); }
+    int_gemm(b'N', b'T', m, m, 2, u, m, v, m, w, m);
+    let mut at = 0;
+    for j in 0..m {
+        for i in 0..=j {
+            out[at] = reduce(w[i + j * m] + w[j + i * m], p, pinv);
+            at += 1;
+        }
+    }
+}
+
 /// Correctly rounded `op(A)·X·op(A)ᵀ` (`m × m`) for a `k × k` matrix `X`,
 /// written as `out[i + j·m]`. The intermediate `X·op(A)ᵀ` stays exact in
 /// residues, so every output is the exact congruence rounded once — never
@@ -3546,18 +3614,27 @@ pub(super) fn congruence<const N: usize>(
     let (len_a, len_x) = (av.len(), xv.len());
     let outputs = if upper_only { m * (m + 1) / 2 } else { m * m };
     let tb = if ta_n { b'T' } else { b'N' };
+    let split = split_plan(pool, (m * k * (m + k)) as u128 * plan.count() as u128);
+    let cover = if upper_only && m == k && k >= 8 && split_ways(&split) == 1 {
+        two_cover(xv)
+    } else {
+        None
+    };
     // T = X·op(A)ᵀ (k × m), reduced; then C = op(A)·T.
     let prime = |q: usize, aq: &[f64], xq: &[f64], cq: &mut [f64], t: &mut Vec<f64>| {
         let (p, pinv) = (plan.p[q], plan.pinv[q]);
         t.resize(k * m + if upper_only { m * m.min(UPPER_PANEL) } else { 0 }, 0.0);
         let (t, panel) = t.split_at_mut(k * m);
+        if let Some(cover) = cover {
+            two_cover_product(ta, m, aq, lda, xq, ldx, cover, p, pinv, t, panel, cq);
+            return;
+        }
         int_gemm(b'N', tb, k, m, k, xq, ldx, aq, lda, t, k);
         for v in t.iter_mut() {
             *v = reduce(*v, p, pinv);
         }
         second_product(ta, m, 0, m, k, aq, lda, t, cq, panel, upper_only, p, pinv);
     };
-    let split = split_plan(pool, (m * k * (m + k)) as u128 * plan.count() as u128);
     let ca = match cache_a {
         Some(cache) => cache.operand(av, lo_a, da, &plan, &split),
         None => Operand::Chunks(chunk_matrix(av, lo_a, da, &plan, &split)),
