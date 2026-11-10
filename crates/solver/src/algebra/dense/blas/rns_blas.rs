@@ -985,6 +985,88 @@ fn group_residues(m: ChunkView<'_>, plan: &Plan, q0: usize, q1: usize, out: &mut
     });
 }
 
+/// A bounded per-call palette avoids encoding repeated congruence coefficients.
+/// Both forms retain the original exponent window and physical X span.
+enum CongruenceX {
+    Dense(ChunkMatrix),
+    Palette { chunks: ChunkMatrix, map: Vec<u8> },
+}
+
+impl CongruenceX {
+    fn new<const N: usize>(
+        x: View<'_, N>,
+        lo: i64,
+        spread: i64,
+        plan: &Plan,
+        split: &Split<'_>,
+    ) -> Self {
+        let palette = || {
+            // At most two panels, with at least fourfold value compression.
+            let cap = 64.min(x.len() / 4);
+            if cap == 0 {
+                return None;
+            }
+            let mut ids = HashMap::with_capacity(cap);
+            let mut values = Vec::with_capacity(cap);
+            let mut map = Vec::with_capacity(x.len());
+            for e in 0..x.len() {
+                // Padding is zero even when its unused storage is non-finite.
+                // Zero signs may also carry stale exponents and limbs.
+                let key = if x.stored(e) && !x.data[e].is_zero() {
+                    Some(x.data[e].exact_encode())
+                } else {
+                    None
+                };
+                let id = match ids.get(&key) {
+                    Some(&id) => id,
+                    None => {
+                        if values.len() == cap {
+                            return None;
+                        }
+                        let id = values.len() as u8;
+                        values.push(if key.is_some() { x.data[e] } else { F::zero() });
+                        ids.insert(key, id);
+                        id
+                    }
+                };
+                map.push(id);
+            }
+            let len = values.len();
+            let view = View {
+                data: &values,
+                rows: len,
+                cols: 1,
+                ld: len,
+            };
+            Some(Self::Palette {
+                chunks: chunk_matrix(view, lo, spread, plan, split),
+                map,
+            })
+        };
+        palette().unwrap_or_else(|| Self::Dense(chunk_matrix(x, lo, spread, plan, split)))
+    }
+
+    fn residues(&self, plan: &Plan, q0: usize, q1: usize, out: &mut Vec<f64>) {
+        match self {
+            Self::Dense(chunks) => group_residues(chunks.view(), plan, q0, q1, out),
+            Self::Palette { chunks, map } => {
+                let mut compact = take_scratch(chunks.len * (q1 - q0));
+                group_residues(chunks.view(), plan, q0, q1, &mut compact);
+                out.resize(map.len() * (q1 - q0), 0.0);
+                for (dest, source) in out
+                    .chunks_exact_mut(map.len())
+                    .zip(compact.chunks_exact(chunks.len))
+                {
+                    for (dest, &id) in dest.iter_mut().zip(map) {
+                        *dest = source[id as usize];
+                    }
+                }
+                release_buffer(compact);
+            }
+        }
+    }
+}
+
 /// Whether the CPU runs AVX2. x86-64 builds target baseline SSE2; the hot
 /// residue loops are exact integer arithmetic in binary64, so their AVX2
 /// instances return the same bits.
@@ -3480,7 +3562,7 @@ pub(super) fn congruence<const N: usize>(
         Some(cache) => cache.operand(av, lo_a, da, &plan, &split),
         None => Operand::Chunks(chunk_matrix(av, lo_a, da, &plan, &split)),
     };
-    let cx = chunk_matrix(xv, lo_x, dx, &plan, &split);
+    let cx = CongruenceX::new(xv, lo_x, dx, &plan, &split);
     // A granted split shares output columns rather than primes: no CRT
     // accumulator is merged, and one fork covers the whole product.
     let ways = split_ways(&split).min(m / CONGRUENCE_MIN_COLS).max(1);
@@ -3536,7 +3618,7 @@ pub(super) fn congruence<const N: usize>(
     for q0 in (0..count).step_by(STREAM_GROUP) {
         let q1 = (q0 + STREAM_GROUP).min(count);
         ca.residues(&plan, q0, q1, &mut s.a);
-        group_residues(cx.view(), &plan, q0, q1, &mut s.b);
+        cx.residues(&plan, q0, q1, &mut s.b);
         let (a, b) = (&s.a, &s.b);
         let group = &mut prod[q0 * outputs..q1 * outputs];
         prime_products(&split, outputs, group, &mut s.t, |qi, prod, t| {
@@ -3641,7 +3723,7 @@ fn congruence_prime_groups<const N: usize>(
     shape: CongruenceShape,
     plan: &Plan,
     ca: &Operand,
-    cx: &ChunkMatrix,
+    cx: &CongruenceX,
     split: &Split<'_>,
     ways: usize,
     scale: i64,
@@ -3671,7 +3753,7 @@ fn congruence_prime_groups<const N: usize>(
             take_scratch(k * m + if upper_only { m * m.min(UPPER_PANEL) } else { 0 }),
         );
         ca.residues(plan, q0, q1, &mut a);
-        group_residues(cx.view(), plan, q0, q1, &mut x);
+        cx.residues(plan, q0, q1, &mut x);
         for q in q0..q1 {
             let (p, pinv) = (plan.p[q], plan.pinv[q]);
             let aq = &a[(q - q0) * len_a..(q - q0 + 1) * len_a];
@@ -3742,7 +3824,7 @@ fn congruence_columns<const N: usize>(
     shape: CongruenceShape,
     plan: &Plan,
     ca: &Operand,
-    cx: &ChunkMatrix,
+    cx: &CongruenceX,
     split: &Split<'_>,
     ways: usize,
     scale: i64,
@@ -3772,7 +3854,7 @@ fn congruence_columns<const N: usize>(
                 let mut buf = Vec::new();
                 ca.residues(plan, q0, q1, &mut buf);
                 a.copy_from_slice(&buf[..(q1 - q0) * len_a]);
-                group_residues(cx.view(), plan, q0, q1, &mut buf);
+                cx.residues(plan, q0, q1, &mut buf);
                 x.copy_from_slice(&buf[..(q1 - q0) * len_x]);
             })
     };

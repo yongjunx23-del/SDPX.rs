@@ -749,11 +749,109 @@ fn residue_diag_congruence_is_exact_rounded_once() {
 }
 
 #[test]
+fn congruence_x_palette_matches_dense() {
+    // The residue oracle compares every physical entry and prime by bits;
+    // it does not round away wide-spread terms in a fixed-width dot oracle.
+    let check = |data: &[F<8>], rows, cols, ld, distinct: Option<usize>| {
+        let view = View {
+            data,
+            rows,
+            cols,
+            ld,
+        };
+        let (lo, hi) = view.exponent_range().unwrap();
+        let spread = hi - lo;
+        let plan = Plan::new(rows, 3.0 * 512.0 + spread as f64 + 32.0).unwrap();
+        let dense = chunk_matrix(view, lo, spread, &plan, &Split::Serial);
+        let compact = CongruenceX::new(view, lo, spread, &plan, &Split::Serial);
+        match (&compact, distinct) {
+            (CongruenceX::Palette { chunks, .. }, Some(n)) => {
+                assert_eq!(chunks.len, n);
+                assert_eq!((chunks.chunks, chunks.width), (dense.chunks, dense.width));
+            }
+            (CongruenceX::Dense(_), None) => {}
+            _ => panic!("unexpected palette selection"),
+        }
+        let (mut expected, mut got) = (Vec::new(), Vec::new());
+        for q0 in (0..plan.count()).step_by(7) {
+            let q1 = (q0 + 7).min(plan.count());
+            group_residues(dense.view(), &plan, q0, q1, &mut expected);
+            compact.residues(&plan, q0, q1, &mut got);
+            assert_eq!(got.len(), expected.len());
+            for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "prime group {q0}, entry {i}");
+            }
+        }
+    };
+    let base = F::<8>::from_f64(1.0).unwrap() / F::<8>::from_f64(7.0).unwrap();
+    let (kind, exponent, limbs) = base.exact_encode();
+    // Distinct values differ only in low mantissa bits, with both signs.
+    let values: Vec<_> = (0..65)
+        .map(|i| {
+            let mut bits = *limbs;
+            bits[0] = i as u64;
+            F::<8>::exact_decode(if i % 2 == 0 { kind } else { -kind }, exponent, bits)
+        })
+        .collect();
+    let repeated =
+        |unique: usize, len: usize| -> Vec<_> { (0..len).map(|i| values[i % unique]).collect() };
+    check(&repeated(64, 256), 256, 1, 256, Some(64));
+    check(&repeated(65, 260), 260, 1, 260, None);
+    check(&repeated(16, 64), 64, 1, 64, Some(16));
+    check(&repeated(16, 63), 63, 1, 63, None);
+    check(&repeated(33, 137), 137, 1, 137, Some(33));
+    let mut late = repeated(64, 1024);
+    late[1023] = values[64];
+    check(&late, 1024, 1, 1024, None);
+    let (zero_kind, _, _) = F::<8>::zero().exact_encode();
+    let zeros = [
+        F::<8>::exact_decode(zero_kind, exponent, *limbs),
+        F::<8>::exact_decode(-zero_kind, exponent + 77, *limbs),
+    ];
+    let (rows, cols, ld) = (17, 19, 23);
+    let mut padded = vec![F::<8>::nan(); cols * ld];
+    for j in 0..cols {
+        for i in 0..rows {
+            let e = i + j * ld;
+            padded[e] = if e % 5 < 2 {
+                zeros[e % 2]
+            } else {
+                values[e % 13]
+            };
+        }
+    }
+    check(&padded, rows, cols, ld, Some(14));
+    let wide = [base, base.scale_pow2(MAX_SPREAD), -base, zeros[1]];
+    let wide: Vec<_> = wide.into_iter().cycle().take(81).collect();
+    check(&wide, 9, 9, 9, Some(4));
+    // Public acceptance retains the existing exponent-spread boundary.
+    let mut out = vec![F::<8>::zero(); 81];
+    let mut a = vec![F::<8>::zero(); 81];
+    for i in 0..9 {
+        a[i + i * 9] = F::<8>::from_f64(1.0).unwrap();
+    }
+    assert!(congruence(
+        b'N', 9, 9, &a, 9, &wide, 9, false, None, &mut out, None
+    ));
+    let mut rejected = wide.clone();
+    rejected[1] = base.scale_pow2(MAX_SPREAD + 1);
+    assert!(!congruence(
+        b'N', 9, 9, &a, 9, &rejected, 9, false, None, &mut out, None
+    ));
+}
+
+#[test]
 fn prime_group_congruence_matches_unsplit() {
-    fn run<const N: usize>(m: usize, seed: u64) {
+    fn run<const N: usize>(m: usize, seed: u64, palette: bool) {
         let mut rng = Lcg(seed);
         let a = random::<N>(&mut rng, m * m, 40);
         let mut x = random::<N>(&mut rng, m * m, 40);
+        if palette {
+            let values = x[..7].to_vec();
+            for (i, x) in x.iter_mut().enumerate() {
+                *x = values[i % values.len()];
+            }
+        }
         for j in 0..m {
             for i in j + 1..m {
                 x[i + j * m] = x[j + i * m];
@@ -779,7 +877,7 @@ fn prime_group_congruence_matches_unsplit() {
                     pool.install(|| {
                         let split = Split::Ways(ways);
                         let ca = Operand::Chunks(chunk_matrix(av, lo_a, da, &plan, &split));
-                        let cx = chunk_matrix(xv, lo_x, dx, &plan, &split);
+                        let cx = CongruenceX::new(xv, lo_x, dx, &plan, &split);
                         let shape = CongruenceShape {
                             ta: b'N',
                             ta_n: true,
@@ -814,8 +912,9 @@ fn prime_group_congruence_matches_unsplit() {
             }
         }
     }
-    run::<4>(9, 71);
-    run::<12>(53, 72);
+    run::<4>(9, 71, false);
+    run::<12>(53, 72, false);
+    run::<8>(9, 73, true);
 }
 
 /// Cost of granting ways to one congruence when nobody steals them (a single
