@@ -769,6 +769,27 @@ fn support_product<T: FloatT>(
     }
 }
 
+// A sufficient two-index cover, using the same last-entry plan as materialization.
+fn has_two_index_cover<T: FloatT>(column: &Column, plan: &[(u32, u32, u32)], values: &[T]) -> bool {
+    let mut cover = [0; 2];
+    let mut count = 0;
+    for &(q, p, eidx) in plan {
+        if q == p && values[column.entries[eidx as usize].position] != T::zero() {
+            if count == 2 {
+                return false;
+            }
+            cover[count] = q;
+            count += 1;
+        }
+    }
+    count == 2
+        && plan.iter().all(|&(q, p, eidx)| {
+            cover.contains(&q)
+                || cover.contains(&p)
+                || values[column.entries[eidx as usize].position] == T::zero()
+        })
+}
+
 /// Packed entries of `column` not read by an earlier column.
 fn newly_read(read: &mut [bool], column: &Column) -> u128 {
     column
@@ -1394,11 +1415,16 @@ impl<T: FloatT> PsdBlock<T> {
             }
         }
         let r = c.support.len();
-        // Dense coefficients (at least an eighth of the support square): the
+        // Dense coefficients or a full-support two-index cover: the
         // whole `Ginv[:, S]·A_SS·Ginv[S, :]` as one exact residue congruence,
         // rounded once, instead of n·nnz chained AXPYs and a second product.
         // `ways` splits it when few dense columns share the pool.
-        if 8 * self.axpy_plans[b].len() >= r * r && T::residue_blas_applies(n, n, r) {
+        if T::residue_blas_applies(n, n, r)
+            && (8 * self.axpy_plans[b].len() >= r * r
+                || (r == n
+                    && ways == 1
+                    && has_two_index_cover(&self.columns[b], &self.axpy_plans[b], values)))
+        {
             panel.resize((n, r));
             rows.resize((r, r));
             rows.data_mut().fill(T::zero());
