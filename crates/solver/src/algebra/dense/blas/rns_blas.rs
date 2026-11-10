@@ -986,7 +986,7 @@ fn group_residues(m: ChunkView<'_>, plan: &Plan, q0: usize, q1: usize, out: &mut
 }
 
 /// A bounded per-call palette avoids encoding repeated congruence coefficients.
-/// Both forms retain the original exponent window and physical X span.
+/// The generic constructor retains the original exponent window and physical X span.
 enum CongruenceX {
     Dense(ChunkMatrix),
     Palette { chunks: ChunkMatrix, map: Vec<u8> },
@@ -3518,13 +3518,14 @@ fn half_residue(r: f64, p: f64) -> f64 {
 }
 
 // X = E B + Bᵀ Eᵀ, with B's cover intersection halved modulo p.
+// x holds the two selected raw residue rows as a 2 × m matrix.
 // V = op(A) Bᵀ and W = U Vᵀ, U = op(A) E; C = W + Wᵀ.
 // The caller guarantees m == k >= 8: B/U/V use 6m entries of the old
 // m*min(m,16) panel, and W uses the old k*m intermediate. Both products
 // and their paired output have <= k terms, within the original Plan bound.
 #[allow(clippy::too_many_arguments)]
 fn two_cover_product(
-    ta: u8, m: usize, a: &[f64], lda: usize, x: &[f64], ldx: usize,
+    ta: u8, m: usize, a: &[f64], lda: usize, x: &[f64],
     cover: [usize; 2], p: f64, pinv: f64,
     w: &mut [f64], panel: &mut [f64], out: &mut [f64],
 ) {
@@ -3533,7 +3534,7 @@ fn two_cover_product(
     let v = &mut rest[..2 * m];
     for j in 0..m {
         for c in 0..2 {
-            let r = x[cover[c] + j * ldx];
+            let r = x[c + j * 2];
             b[c + j * 2] = if cover.contains(&j) { half_residue(r, p) } else { r };
             u[j + c * m] = if ta.to_ascii_uppercase() == b'N' {
                 a[j + cover[c] * lda]
@@ -3626,7 +3627,7 @@ pub(super) fn congruence<const N: usize>(
         t.resize(k * m + if upper_only { m * m.min(UPPER_PANEL) } else { 0 }, 0.0);
         let (t, panel) = t.split_at_mut(k * m);
         if let Some(cover) = cover {
-            two_cover_product(ta, m, aq, lda, xq, ldx, cover, p, pinv, t, panel, cq);
+            two_cover_product(ta, m, aq, lda, xq, cover, p, pinv, t, panel, cq);
             return;
         }
         int_gemm(b'N', tb, k, m, k, xq, ldx, aq, lda, t, k);
@@ -3639,7 +3640,18 @@ pub(super) fn congruence<const N: usize>(
         Some(cache) => cache.operand(av, lo_a, da, &plan, &split),
         None => Operand::Chunks(chunk_matrix(av, lo_a, da, &plan, &split)),
     };
-    let cx = CongruenceX::new(xv, lo_x, dx, &plan, &split);
+    let cx = if let Some(cover) = cover {
+        let mut selected = Vec::with_capacity(2 * k);
+        for j in 0..k {
+            for &i in &cover { selected.push(x[i + j * ldx]); }
+        }
+        CongruenceX::new(
+            View { data: &selected, rows: 2, cols: k, ld: 2 }, lo_x, dx, &plan, &split,
+        )
+    } else {
+        CongruenceX::new(xv, lo_x, dx, &plan, &split)
+    };
+    let serial_x_len = if cover.is_some() { 2 * k } else { len_x };
     // A granted split shares output columns rather than primes: no CRT
     // accumulator is merged, and one fork covers the whole product.
     let ways = split_ways(&split).min(m / CONGRUENCE_MIN_COLS).max(1);
@@ -3702,7 +3714,7 @@ pub(super) fn congruence<const N: usize>(
             prime(
                 q0 + qi,
                 &a[qi * len_a..(qi + 1) * len_a],
-                &b[qi * len_x..(qi + 1) * len_x],
+                &b[qi * serial_x_len..(qi + 1) * serial_x_len],
                 prod,
                 t,
             );

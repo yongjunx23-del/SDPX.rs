@@ -1213,7 +1213,7 @@ fn leaf_contribution_timing() {
 fn two_cover_residues_match_dense() {
     let mut checked = 0;
     let mut halves = 0;
-    for m in [8, 17, 30] {
+    for m in [8, 17, 30, 40] {
         let plan = Plan::with_count(prime_bits(m), 3);
         for &prime in &plan.primes {
             let (p, pinv) = (prime as f64, 1.0 / prime as f64);
@@ -1252,7 +1252,11 @@ fn two_cover_residues_match_dense() {
                     &mut panel, true, p, pinv);
                 let mut w = vec![f64::NAN; m * m];
                 let mut got = vec![f64::NAN; expected.len()];
-                two_cover_product(ta, m, &a, lda, &x, ldx, cover, p, pinv,
+                let mut selected = Vec::with_capacity(2 * m);
+                for j in 0..m {
+                    for &i in &cover { selected.push(x[i + j * ldx]); }
+                }
+                two_cover_product(ta, m, &a, lda, &selected, cover, p, pinv,
                     &mut w, &mut panel, &mut got);
                 for (i, (got, expected)) in got.iter().zip(&expected).enumerate() {
                     assert!(got.is_finite());
@@ -1277,7 +1281,7 @@ fn two_cover_congruence_matches_full() {
     let zeros = [F::<8>::exact_decode(zero_kind, exponent, *limbs),
         F::<8>::exact_decode(-zero_kind, exponent + 77, *limbs)];
     // Variants exercise exact covers and each structural/shape fallback.
-    for (m, k, variant) in [(30, 30, 0), (17, 17, 0), (8, 8, 0), (7, 7, 0),
+    for (m, k, variant) in [(40, 40, 0), (40, 40, 5), (30, 30, 0), (17, 17, 0), (8, 8, 0), (7, 7, 0),
         (27, 30, 0), (30, 30, 1), (30, 30, 2), (30, 30, 3), (30, 30, 4)] {
         for ta in [b'N', b'T'] {
             let (ar, ac) = if ta == b'N' { (m, k) } else { (k, m) };
@@ -1304,10 +1308,18 @@ fn two_cover_congruence_matches_full() {
                     x[0] = base; x[1 + ldx] = base; x[2 + 2 * ldx] = base;
                 }
                 4 => { x[0] = zeros[0]; }
+                5 => {
+                    for j in 0..k { for i in 0..k {
+                        x[i + j * ldx] = if cover.contains(&i) || cover.contains(&j) {
+                            base
+                        } else { zeros[(i + j) % 2] };
+                    } }
+                    x[(k - 1) + (k - 1) * ldx] = -base;
+                }
                 _ => {}
             }
             let detected = two_cover(View { data: &x, rows: k, cols: k, ld: ldx });
-            assert_eq!(detected, (variant == 0).then_some(cover));
+            assert_eq!(detected, (variant == 0 || variant == 5).then_some(cover));
             let mut full = vec![F::<8>::zero(); m * m];
             assert!(congruence(ta, m, k, &a, lda, &x, ldx, false, None, &mut full, None));
             let mut cache = ResidueCache::default();
