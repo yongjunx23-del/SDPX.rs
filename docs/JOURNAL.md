@@ -13894,3 +13894,35 @@ The BFSS affected cases require rerunning with this repair. Previously
 accepted exact certificates remain valid because they were checked against
 the original rational data. No half-line exclusion is inferred from a
 native status, and the paper has not been edited.
+
+## 2026-11-11 — singleton Schur-cover admission (draft; performance pending)
+
+**Fresh correctness checkpoint only; not yet retained or mergeable.** The
+condensed PSD and residue admission helpers now admit a genuine singleton
+anchor after validating all nonzeros against the actual cover; only then is
+a distinct dummy anchor added. Existing kernels, packing, precision and
+convergence gates are unchanged. This intentionally changes intermediate
+rounding to an exact congruence rounded once, so cross-arm points/refinement
+counts may differ.
+
+Tested core tree `6d74456ce69aebb0ba8619e00b327f35e1d0ae48` is based on main
+`88f5100c7dba0ade45634408bf793d8fcab3d59b`. Four new focused tests and two
+unchanged regressions pass. Fresh baseline/candidate complete control3 and
+control4 solves at true 256 bits, plus candidate control4 at 512 bits, pass
+all eight independent 180-digit original-coordinate metrics at the unchanged
+1e-30 gate. Independent final packet review passes, including exact replay
+of all five original audits.
+
+The five validation-only native times, all audit metrics and provenance are
+in the [compact checkpoint report](validation/singleton-cover-20261111.md).
+They are not performance samples. Matched release libraries use reviewed
+single-precision CLI-derived adapters, not the production multi-precision
+CLI. All actual cone/backend budgets are four threads, BLAS one.
+
+The fixed fresh-host performance gate is 8 control4 ABBA/BAAB blocks with a
+95% one-sided upper geometric ratio bound <=0.98, then only after passing,
+32 control3 blocks requiring <=1.02. No replacement, extension, pooled older
+data or favorable-leg selection. Performance, exact-head CI and final review
+remain pending; do not merge. The tested Rust blobs are unchanged by this
+documentation-only child. No historical unavailable artifacts are used as
+current verification.

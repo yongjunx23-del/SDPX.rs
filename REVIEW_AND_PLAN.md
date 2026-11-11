@@ -1,6 +1,6 @@
 # SDPX development plan
 
-Updated 2026-10-30. [AGENTS.md](AGENTS.md) defines working rules and numerical
+Updated 2026-11-11. [AGENTS.md](AGENTS.md) defines working rules and numerical
 contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 [Journal](docs/JOURNAL.md) holds full timings, job histories, source hashes,
 failed attempts and audit evidence. This file keeps goals, current state,
@@ -13,6 +13,23 @@ original-coordinate audit. A feasible large-PSD reproducer changes from
 false `PrimalInfeasible` to audited `Solved` at 512 bits; the singleton/SOC
 tail/equality checks also pass with presolve enabled and disabled. See the
 journal for the unchanged 1e-16 audit gate and evidence hashes.
+
+## Singleton-cover draft checkpoint (2026-11-11)
+
+Fresh singleton Schur-cover admission has passed focused regressions and
+complete control3/control4 original-coordinate audits at 256 bits, plus
+candidate control4 at 512 bits, with the unchanged 1e-30 gate. Independent
+final packet review passes, including all five original-audit replays. Tested
+core tree is
+`6d74456ce69aebb0ba8619e00b327f35e1d0ae48`, based on main `88f5100c`.
+[Evidence and limits](docs/validation/singleton-cover-20261111.md).
+
+**Not yet retained or mergeable:** run the predeclared current-host release
+performance gate (8 C4 blocks requiring a <=0.98 one-sided upper B/A bound,
+then only if it passes, 32 C3 blocks requiring <=1.02), preserving all data
+and per-leg original audits. Check exact-head CI and final review before any
+merge. No speedup, broad nonregression or production multi-precision CLI
+benchmark is claimed. Documentation preserves all tested Rust blobs.
 
 ## Goals
 
