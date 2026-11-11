@@ -14,7 +14,7 @@ false `PrimalInfeasible` to audited `Solved` at 512 bits; the singleton/SOC
 tail/equality checks also pass with presolve enabled and disabled. See the
 journal for the unchanged 1e-16 audit gate and evidence hashes.
 
-## Singleton-cover draft checkpoint (2026-11-11)
+## Singleton-cover trial (2026-11-11; inconclusive)
 
 Fresh singleton Schur-cover admission has passed focused regressions and
 complete control3/control4 original-coordinate audits at 256 bits, plus
@@ -24,12 +24,15 @@ core tree is
 `6d74456ce69aebb0ba8619e00b327f35e1d0ae48`, based on main `88f5100c`.
 [Evidence and limits](docs/validation/singleton-cover-20261111.md).
 
-**Not yet retained or mergeable:** run the predeclared current-host release
-performance gate (8 C4 blocks requiring a <=0.98 one-sided upper B/A bound,
-then only if it passes, 32 C3 blocks requiring <=1.02), preserving all data
-and per-leg original audits. Check exact-head CI and final review before any
-merge. No speedup, broad nonregression or production multi-precision CLI
-benchmark is claimed. Documentation preserves all tested Rust blobs.
+**Not retained or mergeable:** the fixed 32-leg C4 release campaign completed
+with every numerical/reference gate passing, but its primary result is
+INCONCLUSIVE: geometric B/A 0.765759, model upper bound 1.052237 > 0.98.
+C3 performance was not run, as preregistered. No favorable-subset rescue,
+replacement or extension. External-monitor reentry and severe drift limit
+attribution; all raw times are preserved in the report. PR #24 stays draft,
+unmerged, regardless of CI. Next: independently validate a bounded-cost,
+non-reentrant measurement supervisor before designing a new experiment.
+All tested Rust blobs remain unchanged.
 
 ## Goals
 

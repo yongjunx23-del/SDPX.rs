@@ -13895,9 +13895,9 @@ accepted exact certificates remain valid because they were checked against
 the original rational data. No half-line exclusion is inferred from a
 native status, and the paper has not been edited.
 
-## 2026-11-11 — singleton Schur-cover admission (draft; performance pending)
+## 2026-11-11 — singleton Schur-cover admission (performance inconclusive)
 
-**Fresh correctness checkpoint only; not yet retained or mergeable.** The
+**Fresh correctness passes; performance inconclusive, not retained or mergeable.** The
 condensed PSD and residue admission helpers now admit a genuine singleton
 anchor after validating all nonzeros against the actual cover; only then is
 a distinct dummy anchor added. Existing kernels, packing, precision and
@@ -13922,7 +13922,29 @@ CLI. All actual cone/backend budgets are four threads, BLAS one.
 The fixed fresh-host performance gate is 8 control4 ABBA/BAAB blocks with a
 95% one-sided upper geometric ratio bound <=0.98, then only after passing,
 32 control3 blocks requiring <=1.02. No replacement, extension, pooled older
-data or favorable-leg selection. Performance, exact-head CI and final review
-remain pending; do not merge. The tested Rust blobs are unchanged by this
+data or favorable-leg selection. The completed C4 performance gate does not pass, as described below.
+Exact-head CI cannot make the candidate mergeable. The tested Rust blobs are unchanged by this
 documentation-only child. No historical unavailable artifacts are used as
 current verification.
+
+
+The single preregistered C4 campaign completed all 32 legs and 256 original
+metrics; every within-arm point/counter/settings/runtime/provenance gate passes.
+Independent final review reproduces INCONCLUSIVE/NOT_PROMOTABLE: geometric
+B/A 0.7657594631, model bounds [0.5572769141, 1.0522372999], upper >0.98.
+Descriptive medians A11.1863866485/B10.4687420595 s do not rescue it. C3 was
+correctly not run; no samples were dropped/replaced, no extension, pooling or
+time subtraction. All 32 primary times are public in the report.
+
+The external controller permits successful signal-handler reentry while
+scanning a growing directory. Three per-leg inclusive guard-wall totals exceed
+their child interval; they are not exclusive overhead. The baseline's second
+half also shows increased solve CPU, and generic RNS route counts vary despite
+exact numerical outputs and seven counters. Monitor interference, scheduling,
+spinning/path mix and external activity are not causally separated. No cap
+failure was recorded; polled limits are not hard kernel limits. The favorable
+nominal ratio is not retained as a speed claim. PR #24 remains draft/unmerged.
+Before any fresh experiment, validate a bounded-cost non-reentrant supervisor
+with simulated children and overhead/stop/resource checks; do not rescue or
+restart this completed campaign. No solver source change accompanies this
+all-data documentation update.
