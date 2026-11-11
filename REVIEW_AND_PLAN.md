@@ -647,3 +647,15 @@ modified solve passes every uncapped/original-cone audit at unchanged
 512-bit precision and tolerances. The current-main port passes the small
 limit-cone and retained L11 checkpoint gates. See the QICS journal entry and
 PR #11 for the run inventory; the default HSD algorithm is unchanged.
+
+
+## 2026-11-11 — active exact two-cover packed-sum experiment
+
+Main-based helper fusion is functionally validated, performance pending.
+Keep PR24 unmerged and independent. Three focused RNS tests and one complete
+C4/256/four-worker solve pass exact main-A point/counter/settings/runtime parity
+and the unchanged original 1e-30 audit. The full lib-test cold build timed out;
+only the separately reviewed exact-component replacement passed. No speed,
+memory, complete 512-bit SDP or full local-suite claim. Before promotion: freeze
+and run matched uninstrumented release/regression gates, needed precision
+validation, exact-head CI and final review. [Evidence](docs/validation/packed-cover-sum-20261111.md).

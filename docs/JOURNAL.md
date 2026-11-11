@@ -13894,3 +13894,25 @@ The BFSS affected cases require rerunning with this repair. Previously
 accepted exact certificates remain valid because they were checked against
 the original rational data. No half-line exclusion is inferred from a
 native status, and the paper has not been edited.
+
+
+## 2026-11-11 — packed exact two-cover sums, functional only
+
+Experimental main-based helper fusion directly packs `U V^T + V U^T` after
+the unchanged first product. It avoids full-W writes/reads; nominal arithmetic
+and scratch allocation stay unchanged. Four balanced products sum below 2^52,
+so this changes no residue, Plan, precision or final rounding. No singleton
+admission or PR24 code is included.
+
+Three exact RNS component tests pass (including 23,584 new i128 outputs and
+18,240 existing 512-bit comparisons), then real production C4/256/four workers
+is Solved/60 with exact main-A point/seven-counter/settings/runtime parity and
+all eight original 180-digit 1e-30 audit gates passing. The whole-solver
+lib-test cold build hit its 1200 s cap; it remains failed, not a passing suite.
+The focused replacement used exact production RNS/test bodies; the real
+application contains no receipt shims.
+
+Performance is pending, not kept for speed or memory. Standalone draft only;
+do not merge until matched release/regression/precision/CI and review gates.
+See [curated validation](validation/packed-cover-sum-20261111.md); raw
+benchmark material remains local.
