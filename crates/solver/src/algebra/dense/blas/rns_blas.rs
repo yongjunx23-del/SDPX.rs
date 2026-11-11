@@ -3519,15 +3519,15 @@ fn half_residue(r: f64, p: f64) -> f64 {
 
 // X = E B + Bᵀ Eᵀ, with B's cover intersection halved modulo p.
 // x holds the two selected raw residue rows as a 2 × m matrix.
-// V = op(A) Bᵀ and W = U Vᵀ, U = op(A) E; C = W + Wᵀ.
+// V = op(A) Bᵀ, U = op(A) E; pack C = U Vᵀ + V Uᵀ directly.
 // The caller guarantees m == k >= 8: B/U/V use 6m entries of the old
-// m*min(m,16) panel, and W uses the old k*m intermediate. Both products
-// and their paired output have <= k terms, within the original Plan bound.
+// m*min(m,16) panel; the caller's intermediate scratch stays unchanged.
+// Each packed sum has four balanced products, within the original k-term bound.
 #[allow(clippy::too_many_arguments)]
 fn two_cover_product(
     ta: u8, m: usize, a: &[f64], lda: usize, x: &[f64],
     cover: [usize; 2], p: f64, pinv: f64,
-    w: &mut [f64], panel: &mut [f64], out: &mut [f64],
+    _w: &mut [f64], panel: &mut [f64], out: &mut [f64],
 ) {
     let (b, rest) = panel.split_at_mut(2 * m);
     let (u, rest) = rest.split_at_mut(2 * m);
@@ -3545,13 +3545,17 @@ fn two_cover_product(
     }
     int_gemm(ta, b'T', m, 2, m, a, lda, b, 2, v, m);
     for r in v.iter_mut() { *r = reduce(*r, p, pinv); }
-    int_gemm(b'N', b'T', m, m, 2, u, m, v, m, w, m);
     let mut at = 0;
     for j in 0..m {
-        for i in 0..=j {
-            out[at] = reduce(w[i + j * m] + w[j + i * m], p, pinv);
+        for i in 0..j {
+            let sum = u[i] * v[j] + u[i + m] * v[j + m]
+                + u[j] * v[i] + u[j + m] * v[i + m];
+            out[at] = reduce(sum, p, pinv);
             at += 1;
         }
+        let q = u[j] * v[j] + u[j + m] * v[j + m];
+        out[at] = reduce(q + q, p, pinv);
+        at += 1;
     }
 }
 

@@ -1343,3 +1343,104 @@ fn two_cover_congruence_matches_full() {
     }
     println!("two_cover full512 upper comparisons={checked}; ta=N/T, padded, cache miss/hit, lower sentinel, shape/structure fallbacks");
 }
+
+#[test]
+fn packed_cover_sum_matches_i128_congruence() {
+    // Independent full X·Aᵀ then A·(X·Aᵀ), in i128 modulo p: no floating
+    // GEMM, production reduction/halving, or rank-two identity in the oracle.
+    fn balanced(value: i128, p: i128) -> i128 {
+        let r = value.rem_euclid(p);
+        if r > p / 2 { r - p } else { r }
+    }
+    let mut checked = 0;
+    let mut cancellation_checked = 0;
+    let mut cases = 0;
+    for m in [8, 17, 30, 40] {
+        // Largest actual eligible width (26 only at m=8), plus conservative18.
+        for bits in [prime_bits(m), 18] {
+            let plan = Plan::with_count(bits, 1);
+            assert!(plan.k_chunk >= m);
+            let prime = plan.primes[0];
+            let (p, h) = (prime as i128, (prime / 2) as i128);
+            let extremes = [h, -h, h - 1, 1 - h, 1, -1, 0, 3, -3];
+            for cover in [[0, m - 1], [1, m - 2]] {
+                for cancel in [false, true] {
+                    let mut op_a = vec![0i128; m * m];
+                    let mut x = vec![0i128; m * m];
+                    for j in 0..m {
+                        for i in 0..m {
+                            op_a[i + j * m] = if cancel {
+                                if cover.contains(&j) { extremes[i % 2] } else { 0 }
+                            } else {
+                                extremes[(i * 7 + j * 5 + i * j) % extremes.len()]
+                            };
+                            if !cancel && (cover.contains(&i) || cover.contains(&j)) {
+                                x[i + j * m] = extremes[(i.min(j) * 5 + i.max(j) * 7) % extremes.len()];
+                            }
+                        }
+                    }
+                    // Signed odd diagonals/intersection force modular halves.
+                    // Cancellation: [1,1]·[[1,1],[1,-3]]·[1,1]ᵀ = 0.
+                    let (c, d) = (cover[0], cover[1]);
+                    x[c + c * m] = if cancel { 1 } else { -3 };
+                    x[d + d * m] = if cancel { -3 } else { 5 };
+                    x[c + d * m] = if cancel { 1 } else { -3 };
+                    x[d + c * m] = x[c + d * m];
+                    let mut t = vec![0i128; m * m];
+                    for j in 0..m {
+                        for i in 0..m {
+                            let sum: i128 = (0..m).map(|q| x[i + q * m] * op_a[j + q * m]).sum();
+                            t[i + j * m] = balanced(sum, p);
+                        }
+                    }
+                    let mut expected = Vec::with_capacity(m * (m + 1) / 2);
+                    for j in 0..m {
+                        for i in 0..=j {
+                            let sum: i128 = (0..m).map(|q| op_a[i + q * m] * t[q + j * m]).sum();
+                            expected.push(balanced(sum, p));
+                        }
+                    }
+                    if cancel { assert!(expected.iter().all(|&r| r == 0)); }
+                    for ta in [b'N', b'T'] {
+                        let lda = m + 3;
+                        let mut a = vec![f64::NAN; lda * m];
+                        for j in 0..m {
+                            for i in 0..m {
+                                a[i + j * lda] = if ta == b'N' {
+                                    op_a[i + j * m] as f64
+                                } else {
+                                    op_a[j + i * m] as f64
+                                };
+                            }
+                        }
+                        let mut selected = Vec::with_capacity(2 * m);
+                        for j in 0..m {
+                            for &i in &cover { selected.push(x[i + j * m] as f64); }
+                        }
+                        let mut w = vec![f64::NAN; m * m + 3];
+                        let mut panel = vec![f64::NAN; m * m.min(UPPER_PANEL) + 3];
+                        let sentinel = 9.25f64;
+                        let mut got = vec![sentinel; expected.len() + 3];
+                        two_cover_product(ta, m, &a, lda, &selected, cover,
+                            prime as f64, 1.0 / prime as f64, &mut w, &mut panel, &mut got);
+                        for (index, (&actual, &want)) in got[..expected.len()].iter().zip(&expected).enumerate() {
+                            assert!(actual.is_finite());
+                            assert_eq!(actual, want as f64,
+                                "packed m={m} bits={bits} ta={ta} cover={cover:?} cancel={cancel} index={index}");
+                            checked += 1;
+                            cancellation_checked += usize::from(cancel);
+                        }
+                        assert!(got[expected.len()..].iter().all(|&r| r.to_bits() == sentinel.to_bits()));
+                        assert!(w.iter().all(|r| r.is_nan()));
+                        assert!(panel[6 * m..].iter().all(|r| r.is_nan()));
+                        cases += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 64);
+    assert_eq!(checked, 23_584);
+    assert_eq!(cancellation_checked, 11_792);
+    println!("packed cover i128 cases={cases} outputs={checked} cancellation={cancellation_checked}");
+}
