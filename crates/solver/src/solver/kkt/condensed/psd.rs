@@ -769,7 +769,7 @@ fn support_product<T: FloatT>(
     }
 }
 
-// A sufficient two-index cover, using the same last-entry plan as materialization.
+// A sufficient one- or two-index cover, using materialization's last-entry plan.
 fn has_two_index_cover<T: FloatT>(column: &Column, plan: &[(u32, u32, u32)], values: &[T]) -> bool {
     let mut cover = [0; 2];
     let mut count = 0;
@@ -782,10 +782,10 @@ fn has_two_index_cover<T: FloatT>(column: &Column, plan: &[(u32, u32, u32)], val
             count += 1;
         }
     }
-    count == 2
+    (count == 1 || count == 2)
         && plan.iter().all(|&(q, p, eidx)| {
-            cover.contains(&q)
-                || cover.contains(&p)
+            cover[..count].contains(&q)
+                || cover[..count].contains(&p)
                 || values[column.entries[eidx as usize].position] == T::zero()
         })
 }
@@ -1415,7 +1415,7 @@ impl<T: FloatT> PsdBlock<T> {
             }
         }
         let r = c.support.len();
-        // Dense coefficients or a full-support two-index cover: the
+        // Dense coefficients or a full-support one- or two-index cover: the
         // whole `Ginv[:, S]·A_SS·Ginv[S, :]` as one exact residue congruence,
         // rounded once, instead of n·nnz chained AXPYs and a second product.
         // `ways` splits it when few dense columns share the pool.
@@ -1978,5 +1978,127 @@ impl<T: FloatT> PsdBlock<T> {
             );
             mat_to_svec(y, &w.mat3);
         })
+    }
+}
+
+#[cfg(test)]
+mod singleton_cover_tests {
+    use super::*;
+    use num_traits::{FloatConst, FromPrimitive, Zero};
+    use sdpx_arithmetic::{MpFloat, Scalar};
+    type F = MpFloat<4>;
+
+    #[test]
+    fn singleton_cover_psd_execution_and_value_updates() {
+        let base = F::from_f64(1.0).unwrap() / F::from_f64(7.0).unwrap();
+        let mut checked = 0;
+        for n in [24, 30, 40] {
+            for c in [0, n / 2, n - 1] {
+                let mut entries = Vec::new();
+                let mut values = Vec::new();
+                for i in 0..n {
+                    entries.push(Entry {
+                        position: values.len(),
+                        i: i.min(c),
+                        j: i.max(c),
+                    });
+                    values.push(if i % 2 == 0 { base } else { -base });
+                }
+                let extra: Vec<_> = (0..n).filter(|&i| i != c).take(2).collect();
+                entries.push(Entry {
+                    position: values.len(),
+                    i: extra[0],
+                    j: extra[1],
+                });
+                let extra_position = values.len();
+                values.push(F::zero());
+                let column = Column {
+                    index: 0,
+                    entries,
+                    sparse: false,
+                    schur_positions: Vec::new(),
+                };
+                let mut block =
+                    PsdBlock::<F>::from_columns(n, triangular_number(n), vec![column], true);
+                for j in 0..n {
+                    for i in 0..n {
+                        block.Ginv[(i, j)] =
+                            F::from_f64((1 + i.min(j) + 3 * i.max(j)) as f64).unwrap() * base;
+                    }
+                }
+                assert!(F::residue_blas_applies(n, n, n));
+                assert!(8 * block.axpy_plans[0].len() < n * n);
+                assert!(has_two_index_cover(
+                    &block.columns[0],
+                    &block.axpy_plans[0],
+                    &values
+                ));
+                with_block_work(n, |w: &mut BlockWork<F>| {
+                    for update in 0..3 {
+                        if update == 2 {
+                            block.Ginv[(0, 0)] = -block.Ginv[(0, 0)];
+                        }
+                        let mut x = Matrix::zeros((n, n));
+                        for &(q, p, eidx) in &block.axpy_plans[0] {
+                            let e = &block.columns[0].entries[eidx as usize];
+                            x[(p as usize, q as usize)] = if e.i == e.j {
+                                values[e.position]
+                            } else {
+                                values[e.position] * F::FRAC_1_SQRT_2()
+                            };
+                        }
+                        let mut full = Matrix::zeros((n, n));
+                        assert!(F::xcongruence_exact(
+                            b'N',
+                            n,
+                            n,
+                            block.Ginv.data(),
+                            n,
+                            x.data(),
+                            n,
+                            full.data_mut(),
+                            false,
+                            None,
+                            None
+                        ));
+                        // Match the public symmetric wrapper's upper-authoritative mirror.
+                        for j in 0..n {
+                            for i in j + 1..n {
+                                full[(i, j)] = full[(j, i)];
+                            }
+                        }
+                        let mut expected = vec![F::zero(); triangular_number(n)];
+                        mat_to_svec(&mut expected, &full);
+                        w.slots[0].product.data_mut().fill(F::nan());
+                        block.column_vector(&values, 0, w, 0, 1);
+                        assert_eq!(w.slots[0].support, (0..n).collect::<Vec<_>>());
+                        // This proves early exact return; public success alone would be vacuous.
+                        assert!(w.slots[0].product.data().iter().all(|v| v.is_nan()));
+                        for (g, e) in w.slots[0].vector.iter().zip(expected) {
+                            assert!(g.is_finite());
+                            assert!(
+                                (g.is_zero() && e.is_zero())
+                                    || g.exact_encode() == e.exact_encode()
+                            );
+                            checked += 1;
+                        }
+                    }
+                    values[extra_position] = base;
+                    assert!(!has_two_index_cover(
+                        &block.columns[0],
+                        &block.axpy_plans[0],
+                        &values
+                    ));
+                    w.slots[0].product.data_mut().fill(F::nan());
+                    block.column_vector(&values, 0, w, 0, 1);
+                    assert!(w.slots[0].product.data().iter().all(|v| v.is_finite()));
+                    values[extra_position] = F::zero();
+                    w.slots[0].product.data_mut().fill(F::nan());
+                    block.column_vector(&values, 0, w, 0, 1);
+                    assert!(w.slots[0].product.data().iter().all(|v| v.is_nan()));
+                });
+            }
+        }
+        println!("singleton PSD exact branch full-oracle packed comparisons={checked}; density false/full support, NaN sentinel, update values/Ginv");
     }
 }

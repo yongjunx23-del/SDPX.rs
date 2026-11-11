@@ -3486,7 +3486,7 @@ impl GemmShape {
     }
 }
 
-// A sufficient exact two-index cover: the only nonzero diagonals select it.
+// A sufficient exact cover, selected by one or two nonzero diagonals.
 // Verify the whole logical matrix, including symmetry, without reading padding.
 fn two_cover<const N: usize>(x: View<'_, N>) -> Option<[usize; 2]> {
     let mut cover = [0; 2];
@@ -3498,17 +3498,19 @@ fn two_cover<const N: usize>(x: View<'_, N>) -> Option<[usize; 2]> {
             count += 1;
         }
     }
-    if count != 2 { return None; }
+    if count == 0 { return None; }
     for j in 0..x.cols {
         for i in 0..=j {
             let v = &x.data[i + j * x.ld];
             if *v != x.data[j + i * x.ld]
-                || (!cover.contains(&i) && !cover.contains(&j) && !v.is_zero())
+                || (!cover[..count].contains(&i) && !cover[..count].contains(&j) && !v.is_zero())
             {
                 return None;
             }
         }
     }
+    // Validate singleton incidence before padding: the dummy must not admit edges.
+    if count == 1 { cover[1] = usize::from(cover[0] == 0); }
     Some(cover)
 }
 

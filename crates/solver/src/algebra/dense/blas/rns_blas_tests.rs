@@ -1343,3 +1343,309 @@ fn two_cover_congruence_matches_full() {
     }
     println!("two_cover full512 upper comparisons={checked}; ta=N/T, padded, cache miss/hit, lower sentinel, shape/structure fallbacks");
 }
+
+#[test]
+fn singleton_cover_selector_and_residues() {
+    let mut checked = 0;
+    for m in [8, 17, 30, 40] {
+        let plan = Plan::with_count(prime_bits(m), 3);
+        for c in [0, m / 2, m - 1] {
+            let d = usize::from(c == 0);
+            let ld = m + 2;
+            let mut x = vec![F::<4>::nan(); ld * m];
+            for j in 0..m {
+                for i in 0..m {
+                    x[i + j * ld] = if i == c || j == c {
+                        F::from_f64(-1.0).unwrap()
+                    } else {
+                        F::zero()
+                    };
+                }
+            }
+            assert_eq!(
+                two_cover(View {
+                    data: &x,
+                    rows: m,
+                    cols: m,
+                    ld
+                }),
+                Some([c, d])
+            );
+            let e = (0..m).find(|&e| e != c && e != d).unwrap();
+            // An edge at the prospective dummy must not make a two-star a singleton.
+            x[d + e * ld] = F::from_f64(1.0).unwrap();
+            x[e + d * ld] = x[d + e * ld];
+            assert_eq!(
+                two_cover(View {
+                    data: &x,
+                    rows: m,
+                    cols: m,
+                    ld
+                }),
+                None
+            );
+            x[d + e * ld] = F::zero();
+            x[e + d * ld] = F::zero();
+            x[c + c * ld] = F::zero();
+            assert_eq!(
+                two_cover(View {
+                    data: &x,
+                    rows: m,
+                    cols: m,
+                    ld
+                }),
+                None
+            );
+            x[c + c * ld] = F::from_f64(1.0).unwrap();
+            x[c + e * ld] = -x[e + c * ld];
+            assert_eq!(
+                two_cover(View {
+                    data: &x,
+                    rows: m,
+                    cols: m,
+                    ld
+                }),
+                None
+            );
+            for &prime in &plan.primes {
+                let (p, pinv) = (prime as f64, 1.0 / prime as f64);
+                let h = (prime / 2) as i64;
+                for ta in [b'N', b'T'] {
+                    for odd in [1.0, -1.0, 3.0, -3.0] {
+                        let lda = m + 3;
+                        let mut a = vec![f64::NAN; lda * m];
+                        let mut x = vec![f64::NAN; ld * m];
+                        for j in 0..m {
+                            for i in 0..m {
+                                let raw = ((i * 7919 + j * 104729 + 3) as u64 * 65537) % prime;
+                                a[i + j * lda] = symmetric(raw, prime);
+                                let raw = ((i.min(j) * 8191 + i.max(j) * 131071 + 1) as u64
+                                    * 32749)
+                                    % prime;
+                                x[i + j * ld] = if i == c || j == c {
+                                    symmetric(raw, prime)
+                                } else {
+                                    -0.0
+                                };
+                            }
+                        }
+                        x[c + c * ld] = -odd;
+                        x[c + d * ld] = odd;
+                        x[d + c * ld] = odd;
+                        x[c + e * ld] = -h as f64;
+                        x[e + c * ld] = -h as f64;
+                        let mut dense_t = vec![0.0; m * m];
+                        let mut expected = vec![0.0; m * (m + 1) / 2];
+                        let mut panel = vec![0.0; m * m.min(UPPER_PANEL)];
+                        int_gemm(
+                            b'N',
+                            if ta == b'N' { b'T' } else { b'N' },
+                            m,
+                            m,
+                            m,
+                            &x,
+                            ld,
+                            &a,
+                            lda,
+                            &mut dense_t,
+                            m,
+                        );
+                        for v in &mut dense_t {
+                            *v = reduce(*v, p, pinv);
+                        }
+                        second_product(
+                            ta,
+                            m,
+                            0,
+                            m,
+                            m,
+                            &a,
+                            lda,
+                            &dense_t,
+                            &mut expected,
+                            &mut panel,
+                            true,
+                            p,
+                            pinv,
+                        );
+                        let cover = [c, d];
+                        let mut selected = Vec::new();
+                        for j in 0..m {
+                            for &i in &cover {
+                                selected.push(x[i + j * ld]);
+                            }
+                        }
+                        let mut got = vec![f64::NAN; expected.len()];
+                        let mut w = vec![0.0; m * m];
+                        two_cover_product(
+                            ta, m, &a, lda, &selected, cover, p, pinv, &mut w, &mut panel, &mut got,
+                        );
+                        for (g, e) in got.iter().zip(expected) {
+                            assert!(g.is_finite());
+                            assert!((*g == 0.0 && e == 0.0) || g.to_bits() == e.to_bits());
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("singleton residue outputs={checked}; primary0/mid/last, N/T, signed odd intersection/diagonal, padding and rejection selectors");
+}
+
+#[test]
+fn singleton_cover_congruence_full256_and_updates() {
+    let mut rng = Lcg(0x511_20261111);
+    let sentinel = F::<4>::from_f64(7.125).unwrap();
+    let base = F::<4>::from_f64(1.0).unwrap() / F::<4>::from_f64(7.0).unwrap();
+    let mut checked = 0;
+    for (m, k) in [(8, 8), (17, 17), (30, 30), (40, 40), (7, 7), (27, 30)] {
+        for c in [0, k / 2, k - 1] {
+            for ta in [b'N', b'T'] {
+                let (ar, ac) = if ta == b'N' { (m, k) } else { (k, m) };
+                let (lda, ldx) = (ar + 3, k + 2);
+                let logical = random::<4>(&mut rng, ar * ac, 9);
+                let mut a = vec![F::<4>::nan(); lda * ac];
+                for j in 0..ac {
+                    a[j * lda..j * lda + ar].copy_from_slice(&logical[j * ar..(j + 1) * ar]);
+                }
+                a[0] = base;
+                let values = random::<4>(&mut rng, k * k, 11);
+                let mut x = vec![F::<4>::nan(); ldx * k];
+                let mut cache = ResidueCache::default();
+                for variant in 0..4 {
+                    let primary = if variant == 3 { (c + 1) % k } else { c };
+                    for j in 0..k {
+                        for i in 0..k {
+                            x[i + j * ldx] = if i == primary || j == primary {
+                                values[i.min(j) + i.max(j) * k]
+                            } else {
+                                F::zero()
+                            };
+                        }
+                    }
+                    x[primary + primary * ldx] = -base;
+                    if variant == 1 {
+                        let e: Vec<_> = (0..k).filter(|&i| i != primary).take(2).collect();
+                        x[e[0] + e[1] * ldx] = base;
+                        x[e[1] + e[0] * ldx] = base;
+                    }
+                    if variant == 2 {
+                        let e = (primary + 1) % k;
+                        x[e + primary * ldx] = base;
+                        x[primary + e * ldx] = -base;
+                    }
+                    for update in 0..3 {
+                        if update == 2 {
+                            a[0] = -a[0];
+                        }
+                        let mut full = vec![F::<4>::zero(); m * m];
+                        // upper_only=false cannot select the structural two-row kernel.
+                        assert!(congruence(
+                            ta, m, k, &a, lda, &x, ldx, false, None, &mut full, None
+                        ));
+                        let old = cache.entry.lock().unwrap().clone();
+                        let mut got = vec![sentinel; m * m];
+                        assert!(congruence(
+                            ta,
+                            m,
+                            k,
+                            &a,
+                            lda,
+                            &x,
+                            ldx,
+                            true,
+                            None,
+                            &mut got,
+                            Some(&mut cache)
+                        ));
+                        let new = cache.entry.lock().unwrap().clone();
+                        if prime_bits(k) <= CACHE_MAX_BITS {
+                            let new = new.unwrap();
+                            if update == 1 {
+                                assert!(Arc::ptr_eq(old.as_ref().unwrap(), &new));
+                            }
+                            if update == 2 {
+                                assert_ne!(old.as_ref().unwrap().fingerprint, new.fingerprint);
+                            }
+                        } else {
+                            assert!(new.is_none());
+                        }
+                        for j in 0..m {
+                            for i in 0..m {
+                                if i > j {
+                                    assert_eq!(
+                                        got[i + j * m].exact_encode(),
+                                        sentinel.exact_encode()
+                                    );
+                                } else {
+                                    let (g, e) = (got[i + j * m], full[i + j * m]);
+                                    assert!((g.is_zero() && e.is_zero()) || g.exact_encode() == e.exact_encode(), "m={m} k={k} c={c} ta={ta} variant={variant} update={update} ({i},{j})");
+                                    checked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("singleton true256 full-oracle comparisons={checked}; cache miss/hit/updateA, changing primary/X, shape/structure fallbacks");
+}
+
+#[test]
+fn singleton_cover_nonfinite_and_spread_reject_without_writes() {
+    let n = 30;
+    let ld = n + 2;
+    let base = F::<4>::from_f64(1.0).unwrap() / F::<4>::from_f64(7.0).unwrap();
+    let sentinel = F::<4>::from_f64(7.125).unwrap();
+    let mut a = vec![F::<4>::nan(); ld * n];
+    let mut x = a.clone();
+    for j in 0..n {
+        for i in 0..n {
+            a[i + j * ld] = base;
+            x[i + j * ld] = if i == n - 1 || j == n - 1 {
+                base
+            } else {
+                F::zero()
+            };
+        }
+    }
+    let mut out = vec![sentinel; n * n];
+    assert!(congruence(
+        b'N', n, n, &a, ld, &x, ld, true, None, &mut out, None
+    ));
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for which in 0..2 {
+            let (mut aa, mut xx) = (a.clone(), x.clone());
+            if which == 0 {
+                aa[1] = F::from_f64(bad).unwrap();
+            } else {
+                xx[1 + 2 * ld] = F::from_f64(bad).unwrap();
+            }
+            out.fill(sentinel);
+            assert!(!congruence(
+                b'N', n, n, &aa, ld, &xx, ld, true, None, &mut out, None
+            ));
+            assert!(out
+                .iter()
+                .all(|v| v.exact_encode() == sentinel.exact_encode()));
+        }
+    }
+    for which in 0..2 {
+        let (mut aa, mut xx) = (a.clone(), x.clone());
+        if which == 0 {
+            aa[0] = base.scale_pow2(MAX_SPREAD + 1);
+        } else {
+            xx[n - 1] = base.scale_pow2(MAX_SPREAD + 1);
+        }
+        out.fill(sentinel);
+        assert!(!congruence(
+            b'N', n, n, &aa, ld, &xx, ld, true, None, &mut out, None
+        ));
+        assert!(out
+            .iter()
+            .all(|v| v.exact_encode() == sentinel.exact_encode()));
+    }
+    println!("singleton full-logical nonfinite/spread rejection leaves output untouched; NaN padding ignored");
+}
