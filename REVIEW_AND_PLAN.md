@@ -659,3 +659,14 @@ only the separately reviewed exact-component replacement passed. No speed,
 memory, complete 512-bit SDP or full local-suite claim. Before promotion: freeze
 and run matched uninstrumented release/regression gates, needed precision
 validation, exact-head CI and final review. [Evidence](docs/validation/packed-cover-sum-20261111.md).
+
+
+## 2026-11-11 — packed-sum performance decision: inconclusive
+
+PR25 stays draft/unmerged. Fixed C4 release2validation+32timed solves and all
+original audits pass, but geometric B/A0.996827714, upperone-sided95%1.042404222
+fails the predeclared0.98 gate. No median/order/sample rescue, repeat or pooling;
+C3 regression and complete512SDP not run. Independent closeout and CI validate
+their actual scopes, not speed. Preserve the tested Rust/evidence; pursue a
+distinct bounded attribution of serial-cover encoding/CRT on selected main
+before another optimization. [All-data curated outcome](docs/validation/packed-cover-sum-20261111.md).

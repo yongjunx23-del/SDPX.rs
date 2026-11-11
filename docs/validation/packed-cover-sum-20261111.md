@@ -1,6 +1,6 @@
-# Packed exact two-cover sums: functional validation, performance pending
+# Packed exact two-cover sums: performance inconclusive, do not merge
 
-**DRAFT / DO NOT MERGE. No speed benefit has been established.** This change
+**DRAFT / DO NOT MERGE. The fixed release experiment is inconclusive; no speed benefit has been established.** This change
 is independent of the unmerged singleton-admission experiment in PR #24.
 It is based on main `88f5100c7dba0ade45634408bf793d8fcab3d59b` and retains
 main's requirement for exactly two cover anchors.
@@ -123,11 +123,113 @@ Settings retain `1e-30` absolute/relative gap, feasibility and original-coordina
 tolerances, four workers and a 120-second internal limit; other defaults and
 full effective settings match main A.
 
-No release performance comparison or complete 512-bit SDP run is claimed.
 The static C4 classification contains 190 existing two-cover coefficient
-matrices; that is not a measured call count or CPU share. Performance,
-regression, needed precision validation, exact-head CI and final review remain
-pending before promotion. Keep this PR draft and do not merge on functional
-checks or CI alone. Benchmark inputs, suites, runners, raw logs, frozen points
-and binaries remain local per repository policy; only this curated record and
-source changes are published.
+matrices; that is not a measured call count or CPU share. The completed release
+comparison below did not pass its prespecified performance gate. C3 regression
+and complete 512-bit SDP runs were therefore not started. Keep this PR draft;
+correctness or CI success does not establish a performance benefit. Benchmark
+inputs, suites, runners, raw logs, frozen points and binaries remain local per
+repository policy; only this curated record and source changes are published.
+
+## Completed fixed release comparison: inconclusive
+
+This is a distinct prospective experiment, not a repeat or pooling of PR24 or
+the failed custom-observer attempt. The production Rust blobs above stayed
+unchanged. Baseline is main `88f5100c`; candidate is the exact tested source tree
+`fd8b9361`. Frozen release-256 binary SHA-256 values:
+
+- A: `2fcd3c1ff2907fefb8c5cc0c5d5d7905ba36117690e607040db3c236f96ad51c`
+- B: `130efd2a6c184240e1e984295c2e7b272e57d18cf3efa3fc9edf4f856b7435f1`
+
+Both used O3, thin LTO, one codegen unit, native CPU flags, the same toolchain,
+features, six linked providers, C4 input and strict settings identified above.
+True 256 bits; requested and actual four cone/four backend workers; BLAS/OMP
+one and Rayon four. No integer-GEMM override, so Linux's default is faer_seq.
+These are receipt-enabled native-solve timings through matching narrow
+CLI-derived adapters, without the temporary custom observer. Built-in receipt
+phase/CPU clocks remain enabled. They are not full multi-precision CLI,
+zero-overhead, exclusive-host or ordinary-resource timings. Hashing/audits
+occurred outside the native solve clock; no time was subtracted or corrected.
+
+The protocol and explicit order were independently reviewed and frozen before
+any release point. Exactly one A and one B validation-only complete solve/audit
+preceded eight fixed four-leg blocks. Validation roles are excluded forever
+from the primary. A fixed two-second pause followed every audited leg,
+including validations and the final leg. No sample replacement, extension,
+repeat, old-data pooling or alternate primary was permitted.
+
+For each block, `L = (log(B1)+log(B2)-log(A1)-log(A2))/2`. The decision uses
+`mean(L) + t(0.95,7)*sd(L,ddof=1)/sqrt(8)`, with
+`t(0.95,7)=1.894578605061305`. Retention required its exponent to be at most
+`0.98`, a one-sided 95% upper bound demonstrating at least a 2% gain under the
+stated model. The displayed pair of endpoints is a two-sided 90% Student
+interval, not a two-sided 95% interval. Only C4 passing would permit the
+predeclared 32-block C3 noninferiority phase (upper bound at most `1.02`).
+
+All 34 complete C4 solves were `Solved/60`, with exact full main-A serialized
+point, all seven counters, effective settings and runtime parity. Every solve
+passed all eight separate original-coordinate 180-digit `1e-30` audit gates
+(272 individual metrics). All 68 solver/auditor process-limit and reaping
+receipts passed. No incomplete or favorable-only numerical samples were kept.
+
+Native seconds below are rounded to nine decimal places; all 32 timed legs
+are shown in their frozen order. Validation-only A/B: `10.768462386` / `10.424065907` seconds, excluded.
+
+| Block | Order | Native seconds in order |
+| --- | --- | --- |
+| 1 | BAAB | 10.371415587, 10.151110225, 9.483509393, 9.256414835 |
+| 2 | ABBA | 10.047714132, 9.568222797, 10.050019552, 10.162039455 |
+| 3 | ABBA | 10.293281269, 9.699359139, 11.994353503, 10.271384564 |
+| 4 | BAAB | 11.007662561, 10.549730372, 10.408860146, 9.951295999 |
+| 5 | ABBA | 10.160335992, 10.900959607, 9.907424052, 9.906510616 |
+| 6 | BAAB | 9.930551842, 10.572056747, 10.835022052, 9.934485584 |
+| 7 | BAAB | 9.388445217, 10.870576650, 11.743613674, 11.051190855 |
+| 8 | ABBA | 11.710029059, 12.336577256, 12.435949852, 10.672942035 |
+
+**Result: INCONCLUSIVE.** Geometric B/A is `0.996827713825668`; the two-sided
+90% interval is `[0.953243923890503, 1.04240422220100]`. The one-sided 95%
+upper bound `1.04240422220100` misses the required `0.98`. This neither proves
+a speedup nor establishes neutrality. Native arm medians are A `10.3510707075`
+and B `10.0006577755` seconds; their favorable descriptive ratio `0.96614718`
+does not override the failed primary gate.
+
+Order diagnostics also differ: ABBA geometric B/A `1.03965540`, BAAB
+`0.95576427`; first/second halves `1.00381098` / `0.98989303`. These are retained
+as descriptions, not a basis for selecting samples, adjusting time, identifying
+a host-load cause or rescuing the experiment. The Student model assumes
+independent, approximately normal block logs; balance cannot remove nonlinear
+drift, autocorrelation or heavy tails, and eight blocks may be underpowered.
+No exclusive host use or causal explanation for the variability is claimed.
+
+C3 validation/timing was correctly **not run**. There was no repeat or later
+512-bit run. The whole campaign exited normally in `678.116063391` seconds;
+explicit controller bookkeeping before its final write was `21.211494619`
+seconds. All-data API/process/CPU/RSS values remain in the sealed local packet;
+they are descriptive, not alternative acceptance endpoints. Per-child AS2GiB
+may affect planning. CPU600s, per-file2MiB, solver external/internal150/120s,
+audit300s, campaign5400s/C4phase1800s, known-output256MiB and10GiB disk reserve
+were predeclared. Output/disk/parent bookkeeping checks are boundary checks,
+not continuous aggregate kernel quotas. No generic process/history scanner ran
+during child execution; cooperative locking does not imply host exclusivity.
+
+Independent final closeout passed, confirming the complete data, roles,
+sequence, bounds, provenance, all numerical gates and the absence of C3. A
+passing closeout verifies the inconclusive result; it does not turn it into a
+performance pass.
+
+Evidence SHA-256 values:
+
+- Protocol: `a0cb40ad3a7fa5504ba4a5b48329b5aebe9961e9d4b9eb0110b639b3d689e259`
+- Sequence: `e6d639cc230546965d4d8cec2050d8405984b877786e99cd4202cf8ff702e6b1`
+- All34 timing/usage CSV: `8e2376ba729240c984cab288d4d9575f7d8ce0760f2457a827b6ec4c6dee20ba`
+- Result: `9f12b2f0a54db5971416a554ae9174c97468fa9e153ca837280b53099588f338`
+- 490-file proof manifest: `efb7b6c016561a3fdc04efd8fddb1c0e96d4a61dcd2a4b341a17eb79fb8872c2`
+- Independent closeout: `c1c3cbbdbde0bbe861fb98b7abb4c4f276f4ad54bb089fc22cbedeb2b7ad96d3`
+
+CI run [43019210047](https://github.com/yongjunx23-del/SDPX.rs/actions/runs/43019210047)
+passed all five jobs on documentation head `1b788e60`, whose Rust blobs match
+the tested source. Any later documentation-head CI is distinct. The full local
+lib-test cap failure remains recorded above. No speed/memory benefit or merge
+is justified, and the experiment stays draft/unmerged. A distinct next research
+step is measuring the currently unclassified serial-cover CRT/encoding cost;
+no such diagnostic or new optimization result is claimed here.

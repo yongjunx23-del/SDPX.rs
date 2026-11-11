@@ -13916,3 +13916,21 @@ Performance is pending, not kept for speed or memory. Standalone draft only;
 do not merge until matched release/regression/precision/CI and review gates.
 See [curated validation](validation/packed-cover-sum-20261111.md); raw
 benchmark material remains local.
+
+
+## 2026-11-11 — packed two-cover release gate inconclusive, not promoted
+
+The fixed, independently reviewed release experiment completed two excluded
+validation solves and eight four-leg C4 blocks, with all 34 exact main-A
+point/counter/settings/runtime and original 180-digit 1e-30 audit gates passing.
+Geometric B/A=0.996827714; two-sided90% Student interval
+[0.953243924,1.042404222]. The one-sided95% upper1.042404222 fails the
+predeclared <=0.98 retention rule. Favorable median ratio0.96614718 cannot
+rescue it; ABBA/BAAB order ratios1.03966/0.95576 expose uncertainty, not a
+causal diagnosis. C3 and complete512SDP were correctly not run. No repeats,
+extensions or old-data pooling. Independent all-data closeout PASS verifies
+this inconclusive outcome, not speed. Exact-head CI on1b788e60 passed5jobs;
+PR25 remains draft/unmerged, not kept for speed or memory. See the updated
+[curated record](validation/packed-cover-sum-20261111.md), including all34
+native times and limits. Next: measure unclassified serial-cover CRT/encoding
+before choosing another lever; no new implementation or gain inferred.
