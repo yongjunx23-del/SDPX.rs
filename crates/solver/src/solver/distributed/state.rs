@@ -215,6 +215,7 @@ impl<T: FloatT> OwnedState<T> {
                 sampled_input: data.sampled_input,
                 chordal_info: None,
                 original: None,
+                jump: None,
             };
             let variables = DefaultVariables::new(local.n, local.m);
             let residuals = DefaultResiduals::new(local.n, local.m);

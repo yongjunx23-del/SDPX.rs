@@ -127,6 +127,16 @@ pub struct DefaultSettings<T: FloatT> {
     #[builder(default = "is_primitive::<T>().then(|| (1e-6).as_T())")]
     pub tol_original: Option<T>,
 
+    /// Sampled (SDPB) problems only: stop with `DualFeasible` once the dual
+    /// iterate passes an SDPB-style jump test. The functional y is kept, each
+    /// Gram matrix gets the smallest correction that satisfies the dual
+    /// equalities exactly, and the corrected matrices must be positive
+    /// definite (Cholesky at working precision). This certifies c - B y as a
+    /// sum of squares, i.e. an excluded point in a feasibility scan. The test
+    /// runs once both residuals are below sqrt(tol_feas).
+    #[builder(default = "false")]
+    pub find_dual_feasible: bool,
+
     ///absolute infeasibility tolerance (primal and dual)
     #[builder(default = "accuracy_default::<T>(1e-8)")]
     pub tol_infeas_abs: T,

@@ -60,6 +60,9 @@ pub struct DefaultProblemData<T> {
     /// or a structured-cone RHS exceeds the infinity sentinel. Data updates
     /// write the copy too.
     pub(crate) original: Option<super::original_check::OriginalData<T>>,
+
+    /// Input q and sampled operator for `find_dual_feasible` (sampled only).
+    pub(crate) jump: Option<(Vec<T>, std::sync::Arc<SampledOperator<T>>)>,
 }
 
 impl<T> DefaultProblemData<T>
@@ -185,6 +188,9 @@ where
                     sampled: sampled.map(|op| std::sync::Arc::new(op.clone())),
                 }
             };
+        let jump = sampled
+            .filter(|_| settings.find_dual_feasible)
+            .map(|op| (q.to_vec(), std::sync::Arc::new(op.clone())));
         let mut original = if preserve_cones && settings.tol_original.is_some() {
             Some(copy_original(&P, &q, &A, &b, input_cones))
         } else {
@@ -294,6 +300,7 @@ where
             presolver,
             chordal_info,
             original,
+            jump,
         }
     }
 

@@ -41,6 +41,9 @@ pub enum SolverStatus {
     InsufficientProgress,
     /// Solver terminated by user callback
     CallbackTerminated,
+    /// `find_dual_feasible`: the dual iterate passed the jump test. The
+    /// solution's y certifies dual feasibility; the gap is not closed.
+    DualFeasible,
 }
 
 impl SolverStatus {
@@ -737,7 +740,20 @@ mod internal {
                 "inconsistent replicated solver termination status",
             );
             if !is_done {
-                return Flow::Proceed;
+                let settings = self.settings.core();
+                let jump = settings.find_dual_feasible
+                    && self
+                        .info
+                        .residual_max()
+                        .is_some_and(|r| r < settings.tol_feas.sqrt())
+                    && self
+                        .solution
+                        .dual_jump(&self.data, &self.variables, &self.settings);
+                if !crate::mpi::agreed_branch(jump) {
+                    return Flow::Proceed;
+                }
+                self.info.set_status(SolverStatus::DualFeasible);
+                return Flow::Stop;
             }
             if self.info.get_status() == SolverStatus::Solved {
                 if let Some(ratio) =

@@ -14,6 +14,14 @@ false `PrimalInfeasible` to audited `Solved` at 512 bits; the singleton/SOC
 tail/equality checks also pass with presolve enabled and disabled. See the
 journal for the unchanged 1e-16 audit gate and evidence hashes.
 
+Bootstrap workflow (2026-11-13, kept): `find_dual_feasible` stops excluded
+sampled points with a certified functional (`DualFeasible`; ising11
+feasibility pair 39 → 30 iterations), and `sdpx-bootstrap` provides
+`certify`, `sdpb-out`, `spectrum` and `approx-objective`. For feasibility
+scans set tol_infeas_abs/rel and tol_ktratio to the scan threshold (allowed
+point 67 → 43 iterations at 1e-30). Open: Λ19/27 pairs on the cluster,
+cheaper jump checks, checkpoints for partitioned solves. Journal 2026-11-13.
+
 ## Goals
 
 **Minimize time and peak memory to reach an audited solution at the requested
