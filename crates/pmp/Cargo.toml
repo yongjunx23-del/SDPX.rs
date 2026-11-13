@@ -18,3 +18,7 @@ all-precisions = ["sdpx-arithmetic/all-precisions"]
 [[bin]]
 name = "sdpx-pmp2sdp"
 path = "src/main.rs"
+
+[[bin]]
+name = "sdpx-bootstrap"
+path = "src/bootstrap_main.rs"

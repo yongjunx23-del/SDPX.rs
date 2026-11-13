@@ -3,6 +3,7 @@
 //! Adapted from SDPB 3.1.0 pmp2sdp (MIT); see provenance/SDPB-LICENSE.
 //! Decimal strings are parsed directly at the caller's MPFR precision. No
 //! solver, MPI installation, Julia runtime, or BLAS provider is required.
+pub mod post;
 mod resample;
 mod sampling;
 mod stream;

@@ -192,6 +192,23 @@ where
         })
     }
 
+    fn dual_jump(
+        &mut self,
+        data: &DefaultProblemData<T>,
+        variables: &DefaultVariables<T>,
+        settings: &DefaultSettings<T>,
+    ) -> bool {
+        let Some((q, operator)) = &data.jump else {
+            return false;
+        };
+        let mut scratch = variables.copy_of();
+        let status = self.status;
+        self.status = SolverStatus::Solved;
+        self.reconstruct(data, &mut scratch, settings, false);
+        self.status = status;
+        operator.dual_jump(q, &self.z)
+    }
+
     fn finalize(&mut self, info: &DefaultInfo<T>) {
         self.solve_time = info.solve_time;
     }

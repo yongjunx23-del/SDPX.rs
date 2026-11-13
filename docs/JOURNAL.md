@@ -8,6 +8,41 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-13 — Bootstrap workflow: dual feasibility jump (kept), `sdpx-bootstrap` post-processing, paper draft (feat/bootstrap-20261113)
+
+- Inputs (`~/.cache/sdpx-e2e/work/bootstrap-inputs`, `mkfeas.py`): ising11
+  with zero objective plus a one-sample block `b·y + c0 ≥ t`, t = optimum ∓
+  1e-3 (`excl`, `allow`). Mac M4, fast profile, 512 bits, 4 threads,
+  ising11 E2E settings (1e-42).
+- Baseline main `88f5100`: excl Solved/39 (1.66 s); from iteration ~22 only
+  the primal shrinks, 100× per step, with dres in lockstep. allow
+  DualInfeasible/67; with tol_infeas_abs/rel and tol_ktratio 1e-30 (the
+  512-bit defaults are 1.2e-77) DualInfeasible/43. Settings only.
+- Jump test (offline `sdpx-bootstrap certify`): keep y, smallest Frobenius
+  Gram correction for exact sampled equalities, Cholesky. Sweep with
+  max_iter: iterates 8–29 fail (27/28/29 fail on 4/2/1 Gram blocks), 30+
+  pass: residual 2.8e-20 → 8e-154, min relative pivot 2.5e-25. The ising11
+  optimum is (correctly) not certified: its functional has zeros.
+- In solver: setting `find_dual_feasible` (default off; sampled inputs),
+  status `DualFeasible` (C value 12), test once both residuals < sqrt(tol_feas)
+  (`solver/sampled/jump.rs`, input q and sampled operator kept at setup).
+  excl DualFeasible/30 (1.62 s; the checks cost about what the 9 iterations
+  saved on this small case), independently certified offline; allow
+  unchanged (67); ising11 with the setting Solved/54, same objective.
+- `sdpx-bootstrap` (crates/pmp): `certify`, `sdpb-out` (out.txt, y.txt,
+  x_j, X/Y matrices), `spectrum` (barycentric interpolation through the
+  samples, cancellation-scaled lambda_min, golden refinement of every local
+  minimum, Householder least-squares weights), `approx-objective`
+  (Lagrangian of a nearby SDP at the stored point). ising11 spectrum: 11
+  zeros in blocks 0–5, rel lambda 1e-46…1e-43, all weights positive, primal
+  residual 1.7e-25, same at 16/64 subdivisions, 1.4 s. A ‖F‖ scale (always
+  ±1 for 1×1 blocks) and a pre-refinement threshold filter (missed double
+  zeros, residual 0.117) were wrong and fixed.
+- Open: Λ19/27 feasibility pairs on the cluster; cheaper jump checks
+  (reconstruction + projection per check); MPI checkpoints.
+- Paper draft `paper/sdpx.tex` (no SDPA-GMP comparison per user; ORE cone
+  section; workflow section with the numbers above).
+
 ## 2026-11-08 — Condensed assembly slot products sized on first use (kept, perf/lazy-product-20261108 → perf/de3-20261106); cone-owned MPFR scratch (rejected); SDPA-GMP comparison on the lead
 
 - SDPA-GMP comparison (job 235148, node78, EPYC 7742, 32 cores, both

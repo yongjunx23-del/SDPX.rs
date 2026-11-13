@@ -1,0 +1,1032 @@
+\documentclass[11pt]{article}
+
+% arXiv note: arXiv does not run BibTeX on refs.bib; upload the generated
+% sdpx.bbl together with this file.
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{microtype}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\K}{\mathcal{K}}
+\newcommand{\Sym}{\mathbb{S}}
+\newcommand{\svec}{\operatorname{svec}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\tauo}{\tau_0}
+
+\title{SDPX: A Fixed-Precision Homogeneous Self-Dual Interior-Point Solver\\
+with Exactly Rounded Linear Algebra for Conformal Bootstrap SDPs}
+\author{TODO}
+\date{Draft, \today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We describe SDPX, a conic interior-point solver written in Rust. It is derived
+from Clarabel.rs and uses one homogeneous self-dual (HSD) predictor--corrector
+engine, generic over the scalar type, for both IEEE binary64 and fixed-precision
+MPFR arithmetic from 128 to 2048 bits. Its main target is the high-precision
+semidefinite programs (SDPs) that arise in the numerical conformal bootstrap.
+These problems are polynomial matrix programs whose positive-semidefinite
+blocks SDPX keeps in the sampled, factored form introduced by SDPB. The
+arithmetic layer stores MPFR values with owned limbs and rounds common
+products and sums inline. Every dot product is computed exactly and rounded
+once. Large dense products, including congruences $A^\top \operatorname{diag}(d) A$,
+use a residue-number-system method on binary64 BLAS and stay correctly rounded,
+so the working precision is never lowered. The linear-algebra layer condenses
+PSD blocks into a Schur complement and factors it with arrow-structured,
+supernodal multifrontal or sparse $LDL^\top$ kernels built on the same exact
+products. Iterative refinement runs against the unshifted operator. Every
+result is reported in original coordinates and can be audited there. On
+matched resampled Ising bootstrap inputs at 768 and 1024 bits on one 64-core
+node, SDPX was 4.5--5.7$\times$ faster than SDPB~3.1.0, and all of its points
+passed an independent original-coordinate audit. Beyond PSD blocks, SDPX
+supports the operator relative entropy cone of quantum information, used for
+thermal bootstrap problems, with a barrier evaluated in the generalized
+eigenbasis of its two matrix arguments. For bootstrap workflows it adds an
+SDPB-style dual feasibility jump that certifies excluded points, SDPB-layout
+outputs, and extremal-functional spectrum extraction. In binary64 it does not yet match
+MOSEK on most of a 58-problem audited benchmark. We list the known failures
+and open limitations.
+\end{abstract}
+
+% ---------------------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+
+The numerical conformal bootstrap turns consistency conditions on a conformal
+field theory into positivity constraints on polynomial matrices
+\cite{Rattazzi2008,PolandRychkovVichi2019}. After truncation, each bound or
+feasibility test becomes a polynomial matrix program (PMP). The PMP is
+converted to an SDP by sampling every polynomial matrix at a set of points and
+writing it in a bilinear basis. These SDPs have two unusual properties. First,
+the data and the optimal points span many orders of magnitude. Resolving them
+requires hundreds of bits of working precision, and the solutions of interest
+are reported to tolerances such as $10^{-30}$ or $10^{-42}$. Second, the PSD
+blocks have a fixed internal structure (a basis of sampled polynomials times
+sample weights) that a generic sparse SDP format destroys.
+
+SDPB \cite{SimmonsDuffin2015,LandrySimmonsDuffin2019} is the standard solver
+for this class. It uses arbitrary-precision arithmetic and an
+infeasible-start primal--dual method specialized to the sampled block
+structure, and it scales across MPI ranks and nodes.
+
+SDPX takes a different set of design decisions:
+\begin{itemize}
+  \item \emph{One engine for every precision.} The interior-point method is
+    a homogeneous self-dual embedding \cite{YeToddMizuno1994} taken from
+    Clarabel \cite{GoulartChen2024}. It is generic over the scalar, so the
+    same code solves binary64 problems (compared against MOSEK) and MPFR
+    problems (compared against SDPB).
+  \item \emph{A general conic interface.} Besides PSD blocks, SDPX supports
+    zero, nonnegative, second-order, exponential, power and generalized power
+    cones, and the quantum-information operator relative entropy cone
+    together with its limit cone (Section~\ref{sec:ore}). Sampled bootstrap
+    blocks are one kind of input, not a separate solver.
+  \item \emph{Exactly rounded linear algebra at fixed precision.} Dot products
+    and dense matrix products at MPFR precision are computed exactly and
+    rounded once. This makes the results independent of thread count and
+    summation order, and lets iterative refinement keep working on badly
+    scaled systems without lowering the precision.
+  \item \emph{Original-coordinate outputs and audits.} Solutions and residuals
+    are reported for the problem as given. Sampled factors define the
+    operator throughout, and every reported benchmark point is audited
+    against the original data by separate code.
+\end{itemize}
+
+SDPX provides a native Rust API, a command-line program (\code{sdpx}), a C ABI,
+and a PMP-to-SDP converter (\code{sdpx-pmp2sdp}) adapted from SDPB~3.1.0's
+\code{pmp2sdp}. The solver core and HSD embedding are adapted from
+Clarabel.rs. The solver, arithmetic and FFI crates are Apache-2.0 licensed and
+the converter crate is MIT licensed.
+% TODO(verify): confirm the license statement against provenance/ before submission.
+
+This draft describes the version on the repository's main branch as of
+November 2026 (release 0.9.5 plus later merged performance work). Several
+measurements below were taken on earlier commits. Each table names its date
+and commit or job.
+
+% ---------------------------------------------------------------------------
+\section{Problem class and formulation}
+\label{sec:formulation}
+
+\subsection{Conic form}
+
+SDPX solves
+\begin{equation}
+  \min_{x\in\R^n}\; \tfrac12 x^\top P x + q^\top x
+  \quad\text{subject to}\quad Ax + s = b,\quad s \in \K,
+  \label{eq:primal}
+\end{equation}
+where $P \succeq 0$ and $\K$ is a product of the cones listed in
+Section~\ref{sec:intro}. A PSD cone of order $m$ is stored as $\svec$
+coordinates: the upper triangle in column order, with off-diagonal entries
+scaled by $\sqrt2$, so that $\langle X, Y\rangle = \svec(X)^\top \svec(Y)$.
+The dual is
+\begin{equation}
+  \max_{x,z}\; -\tfrac12 x^\top P x - b^\top z
+  \quad\text{subject to}\quad Px + A^\top z + q = 0,\quad z\in\K^*.
+\end{equation}
+
+\subsection{The operator relative entropy cone}\label{sec:ore}
+
+Thermal bootstrap problems for matrix models and lattice systems need
+inequalities between the density matrix and a reference state that are not
+semidefinite constraints. They are expressed through the operator relative
+entropy cone of quantum information,
+\begin{equation}
+  \mathcal{K}_{\mathrm{ORE}} = \operatorname{cl}\bigl\{(T,X,Y) :
+  X, Y \succ 0,\; T \succeq D(X,Y)\bigr\},\qquad
+  D(X,Y) = -X^{1/2}\log\!\bigl(X^{-1/2} Y X^{-1/2}\bigr)X^{1/2},
+\end{equation}
+for $n\times n$ symmetric $T,X,Y$ stacked in $\svec$ form. $D$ is the operator
+perspective of $-\log$ (picos' \code{oprelentr}, QICS'
+\code{OpPerspecEpi(n,"log")} \cite{HeSaundersonFawziQICS}). SDPX uses the
+self-concordant barrier
+$f = -\log\det(T-D) - \log\det X - \log\det Y$ with $\nu = 3n$. Only the
+primal barrier is known, so it also defines the scaling: $H_s =
+(\mu\nabla^2 f(s))^{-1}$, and the centrality condition $z = -\mu\nabla f(s)$
+is linearized into the combined step.
+
+All derivatives are evaluated in the generalized eigenbasis of $(X,Y)$:
+with $X = LL^\top$ and $L^{-1}YL^{-\top} = U\Lambda U^\top$, the derivative
+of $D$ acts entrywise (divided differences of $\log$ on $\Lambda$). The
+Hessian factors as $\nabla^2 f = \mathcal{L}^\top
+\operatorname{diag}(W\otimes W, S_0)\mathcal{L}$ with a unit block-triangular
+$\mathcal{L}$, $W = (Q^\top(T-D)Q)^{-1}$ and $S_0$ the Schur block of
+$(X,Y)$ of order $n(n+1)$. The inverse Hessian therefore needs only $S_0^{-1}$
+and the explicit $\hat Z\otimes \hat Z$, which avoids squaring the
+conditioning of $W$; in the KKT system it appears as $N D N^\top$, and the
+augmented and retained-row paths transform right-hand sides by $N^{-1}$.
+Dual iterates are kept in $\K^*$ by a Dikin-ellipsoid test at the trial
+primal point, $\langle z,s\rangle^2 > (\nu-1)\langle z,(\nabla^2f)^{-1}z\rangle$,
+first through an $O(n^3)$ upper bound that drops $S_0$'s curvature (exact on
+the central path) and only for inconclusive trials through a conjugate
+gradient solve with $S_0$.
+
+Some thermal problems have optimal points at infinity along a recession ray
+$(0,W,W)$ of the cone. SDPX also provides the closure of the cone plus a
+rank-$m$ ray in reduced coordinates $(T,B,A,C)$,
+$T \succeq \bigl[\begin{smallmatrix}0 & B\\ B^\top & A-C\end{smallmatrix}\bigr]
++ E\,N(A,C)\,E^\top$ with $E = [B; A-C]$ and
+$N(A,C) = \int_0^1 (1-s)\bigl((1-s)C+sA\bigr)^{-1}ds$, which shares the
+eigenbasis, the barrier form ($\nu = n+2k$, $k=n-m$) and all KKT rules.
+Both cones run at every precision, inside the arrow-structured factorization
+of Section~\ref{sec:linalg} when many cones couple through a border.
+Thermal matrix-model inputs (two\_L4 at 53, 128 and 256 bits; two\_L6 at 53
+and 128 bits) are solved and audited, and on a Hubbard thermal campaign the
+arrow kernels cut time by 39\% and peak memory by 31\% at 32 threads
+(\code{all3}, 2026-11-04). The BFSS thermal problems remain open
+(Section~\ref{sec:limits}).
+
+\subsection{Homogeneous self-dual embedding}
+
+Following Clarabel \cite{GoulartChen2024}, SDPX iterates on
+$(x, z, s, \tau, \kappa)$ with $(s,z)\in\K\times\K^*$ and $\tau,\kappa \ge 0$,
+and drives the residuals
+\begin{align}
+  r_x &= Px + A^\top z + q\tau, \\
+  r_z &= Ax + s - b\tau, \\
+  r_\tau &= \kappa + q^\top x + b^\top z + x^\top P x/\tau
+\end{align}
+to zero along a central path. A solution with $\tau > 0$ yields
+$(x,s,z)/\tau$. A limit with $\tau \to 0$ and $\kappa > 0$ yields a
+certificate of primal or dual infeasibility. Each iteration (i) evaluates
+residuals and the convergence and infeasibility tests, (ii) computes
+Nesterov--Todd (NT) scalings for the symmetric cones
+\cite{NesterovTodd1997,NesterovTodd1998}, (iii) updates and factors the KKT
+operator, (iv) solves for the affine and combined predictor--corrector
+directions \cite{Mehrotra1992}, and (v) chooses a step length and updates the
+iterate. The previously accepted iterate is kept so it can be recovered if a
+later step fails.
+
+The stopping rules, reduced (``almost'') tolerances, infeasibility detection,
+regularization with escalation and the distinct \code{AlmostSolved} status are
+Clarabel's. In binary64 the default tolerances are Clarabel's ($10^{-8}$ for
+gaps and feasibility). In MPFR the defaults are $\sqrt{\eps}$ for the strict
+tests and $\eps^{1/4}$ for the reduced tests, where $\eps$ is the unit
+roundoff of the working precision. The bootstrap benchmarks below set explicit
+tolerances (e.g.\ $10^{-42}$).
+
+\subsection{Sampled bilinear-basis PSD blocks}
+\label{sec:sampled}
+
+A bootstrap PMP block is a polynomial matrix of size $d\times d$ that must be
+positive semidefinite on a half-line. After sampling, it becomes a PSD
+constraint of side $d\cdot h$, where $h$ is the number of basis rows. SDPX
+represents such a block by a basis matrix $Q\in\R^{h\times K}$, whose columns
+$q_k$ are the bilinear basis evaluated at the sample points, and by weights.
+The primitive columns of the operator are indexed by $(s, r, k)$ with
+$r\le s<d$ and $k<K$:
+\begin{equation}
+  A_{(s,r,k)} \;=\; w_{(s,r,k)}\,
+  \svec\!\Bigl(\operatorname{sym}(e_r e_s^\top) \otimes q_k q_k^\top\Bigr),
+  \label{eq:sampled-col}
+\end{equation}
+where $\operatorname{sym}(M) = (M+M^\top)/2$. The factors $(Q, w)$ define the
+operator. A materialized coefficient matrix is used only as a rounded view.
+Presolve may remove other columns and rows, remapping factor offsets and the
+linear operator together. Chordal decomposition is disabled for sampled inputs
+because it would replace the factors by rounded coefficients.
+
+The converter reads SDPB JSON or XML PMPs. Blocks given by explicit sample
+points and scalings without a prefactor (as written by PyCFTBoot
+\cite{Behan2017} or SDPB.m) are resampled by default: their prefactor is
+recovered, it must reproduce every given scaling, and the block is
+regenerated with SDPB~3.1's sample points and bilinear bases.
+Sample points are found by safeguarded Newton iteration followed by bisection
+at full working precision, so generated coefficients can differ from
+upstream's in the last digits. On these inputs resampling changes SDPX's
+iteration counts noticeably, as shown in Section~\ref{sec:results}.
+
+\subsection{Preprocessing and original coordinates}
+
+Ordinary direct solves apply presolve, chordal decomposition
+\cite{VandenbergheAndersen2015} and Ruiz equilibration \cite{Ruiz2001} by
+default. Presolve removes infinite orthant bounds and exactly dependent
+equalities, merges second-order-cone tail coordinates with zero rows of $A$,
+and fixes variables whose only nonzero is a single-entry orthant or equality
+row. Postsolve lifts $x$, $s$, $z$ and certificates back. Solutions and
+residuals are always reported in original coordinates.
+
+An optional original-coordinate acceptance test (\code{tol\_original}) requires
+the returned point to satisfy, at a given tolerance $t$:
+$\|b-Ax-s\|_\infty$, $\operatorname{dist}_\K(s)$ and
+$\operatorname{dist}_\K(b-Ax)$ at most $t(1+\|b\|_\infty)$;
+$\|Px+A^\top z+q\|_\infty$ and $\operatorname{dist}_{\K^*}(z)$ at most
+$t(1+\|q\|_\infty)$; and a duality gap of at most $t$ absolute or
+$t(1+|\text{primal objective}|)$ relative. The default is $10^{-6}$ in binary64
+and off in MPFR. This test exists because the internal Clarabel normalization
+divides by $\|x\|+\|s\|$ (or $\|x\|+\|z\|$) of the transformed problem. Presolve,
+chordal overlap variables and large solutions inflate those norms. For
+sampled problems the test applies the factor-defined operator.
+
+Independently of the solver, the benchmark points in
+Section~\ref{sec:results} are checked by separate audit scripts written in
+Julia and Python. These scripts recompute the primal and dual residuals,
+the duality gap, the PSD conditions and the link between each sampled PSD
+matrix and its linear form, in the original coordinates and in high precision.
+% TODO(verify): describe exactly what the audit's "map"/"PSD link" quantity
+% measures (audit_point.jl / t17aud.pbs); the sources report it but do not
+% define it.
+
+% ---------------------------------------------------------------------------
+\section{Arithmetic}
+\label{sec:arith}
+
+\subsection{Fixed-precision values with owned storage}
+
+The scalar \code{MpFloat<N>} stores an $N$-limb (64-bit limbs) mantissa, a
+kind tag and an exponent inline. It holds no pointers, so copies, moves and
+vector reallocations keep ownership independent, and arrays of values are
+contiguous. The precision is $64N$ bits (e.g.\ 768 bits is $N=12$). MPFR
+\cite{Fousse2007} descriptors are created only for the duration of a call. All
+arithmetic rounds to nearest, ties to even.
+
+For regular operands, multiplication up to 1280 bits and addition and
+subtraction up to 512 bits are implemented inline and round to nearest-even.
+128- and 256-bit fused multiply--add and two-product FMMA use exact stack
+kernels with a single rounding. Division at 128--1024 bits is a port of GMP's
+schoolbook division with a 3-by-2 inverse, rounded once. FMA at 512--1024
+bits keeps GMP's product in place and adds the shifted addend before one
+rounding. Every other case calls MPFR. In all cases the result is
+bit-for-bit equal to the MPFR result.
+
+\subsection{Exactly rounded dot products}
+
+Every finite value is $M\cdot 2^{e-p}$ with an $N$-limb integer mantissa $M$.
+A product of two values is therefore the exact $2N$-limb integer $M_a M_b$
+scaled by $2^{e_a+e_b-2p}$. The \code{exactdot} kernel aligns all products
+of a dot product to the smallest scale and adds their 64-bit limbs into
+128-bit slots, one accumulator per sign. Carries are resolved once at the end.
+The result is the exact sum, which a single \code{mpfr\_set\_z\_2exp} rounds
+once to nearest-even. The accumulator is bounded at 512 limbs per sign,
+about $3\times10^4$ bits of exponent spread. Wider spreads use exact product
+descriptors and exact MPFR summation, without allocating the exponent gap.
+Non-finite operands fall back to the caller's ordinary chain.
+
+Products use an inlined schoolbook kernel for small widths, a row-product
+kernel on aarch64 up to 12 limbs, and GMP's \code{mpn} routines otherwise.
+On x86, BMI2/ADX kernels are selected at runtime. Because the sum is exact
+before rounding, the result does not depend on term order, partitioning or
+thread count, and it is never less accurate than the FMA chain it replaces.
+
+SDPX uses exact dots wherever a long accumulation would otherwise round
+repeatedly. Examples are every row of the MPFR refinement residual, sparse
+products $Ax$ and $A^\top x$ with enough entries per output, MPFR Cholesky
+(\code{xpotrf}) and lower triangular solves (\code{xtrsm}), where each entry
+is one exact dot of the completed entries, supernodal and arrow
+forward/backward solves, and Schur complement assembly.
+
+\subsection{Residue-number-system exact matrix products}
+\label{sec:rns}
+
+For large dense products SDPX follows the approach of SDPB's
+\code{bigint\_syrk}, which is itself modeled on FLINT's \code{mul\_blas}. The
+steps are as follows.
+\begin{enumerate}
+  \item Each operand is aligned to one binary exponent, either per matrix or
+    per output window when that needs fewer primes. Every entry then becomes
+    an exact integer. Writing $p$ for the precision, $\delta_a,\delta_b$ for
+    the exponent spreads of the two operands and $k$ for the inner
+    dimension, an output entry is bounded by
+    $|S| \le k\, 2^{p+\delta_a}\, 2^{p+\delta_b}$.
+  \item Primes are chosen so that their product $M$ exceeds $4|S|$, i.e.\
+    with about $2p + \delta_a + \delta_b + \log_2 k + 3$ bits in total. Each
+    prime has $b$ bits, where $b$ is chosen such that
+    $k\cdot 2^{2b-2} < 2^{53}$. A per-prime product of symmetric residues is
+    then a binary64 \code{dgemm} whose every partial sum is an integer
+    below $2^{53}$, so it is exact.
+  \item Residue encoding and CRT reconstruction are themselves posed as
+    \code{dgemm}s, with entries split into short bit chunks multiplied
+    against tables of $2^{cj} \bmod p_i$ (encode) or chunks of $M/p_i$
+    (decode). Every binary64 product and sum in them is also an integer
+    below $2^{53}$.
+  \item The CRT reconstructs the exact integer dot product, and each output
+    entry is rounded once to nearest-even.
+\end{enumerate}
+The result therefore equals the correctly rounded exact dot product, which is
+exactly what \code{exactdot} returns. If the exponent spread exceeds a fixed
+bound the kernel declines and the exact-dot path is used. GEMM, SYRK, upper
+triangular products, general congruences, diagonal congruences
+$A^\top\operatorname{diag}(d)A$ and the sampled quadratic and bilinear forms
+share one streaming, prime-partitioned implementation. Operands that are
+constant during a solve (for example the constraint matrix in a congruence)
+keep their residues in a cache. At top level the work is split across primes
+(encode and product) and across outputs (decode). Calls that already run
+inside pool tasks stream primes in small groups with an incremental CRT, so
+that each call's working set fits a core's share of cache. Ordinary square
+MPFR GEMMs use the residue kernel from 1024 bits at side $\ge 12$; the other
+products have their own eligibility rules.
+
+\subsection{What this guarantees}
+
+Because both \code{exactdot} and the residue products return the exactly
+rounded result, they are a faster way to compute values at the requested
+precision, not a lower-precision approximation. SDPX has no mixed-precision
+factorization, no low-precision inner solver and no precision-ladder warm
+start (Section~\ref{sec:contracts}). The one place where binary64 is used to
+\emph{decide} something about MPFR data is the PSD step-length estimate
+(Section~\ref{sec:steps}). Step lengths are a free parameter of the method,
+and that estimate is either certified or replaced by a full-precision
+computation.
+
+% ---------------------------------------------------------------------------
+\section{Linear algebra}
+\label{sec:linalg}
+
+\subsection{Augmented and condensed KKT forms}
+
+The Newton system has the quasi-definite augmented form
+\begin{equation}
+  \begin{bmatrix} P + \delta I & A^\top \\ A & -(H + \delta I) \end{bmatrix}
+  \begin{bmatrix} \Delta x \\ \Delta z \end{bmatrix} = \begin{bmatrix} r_1 \\ r_2 \end{bmatrix},
+\end{equation}
+where $H$ is the block-diagonal NT scaling and $\delta$ an optional static
+shift. SDPX can factor this system directly (\emph{augmented}). It can also
+eliminate the rows of PSD blocks, nonnegative cones and small second-order
+cones (dimension at most 16) into a Schur complement on $x$ and keep the
+remaining cone rows (\emph{condensed}). An eliminated SOC block contributes
+$B^\top B$ with $B=W^{-1}A_\K$, using the explicit NT factor. The automatic
+rule condenses ordinary PSD data when it has at least 256 PSD $\svec$
+coordinates and the reduced dimension is at most a quarter of that, comparing
+structural storage estimates. For wide types, problems with $P=0$ whose cones
+are all PSD or nonnegative are condensed.
+% Source note: docs/ARCHITECTURE.md describes only the 256-coordinate rule;
+% the P = 0 rule is from JOURNAL 2026-11-07 (prefer_condensed).
+The condensed matrix is written into the primal block of the direct solver's
+KKT matrix, so only one authoritative sparse matrix exists. Refinement
+always measures residuals with the original augmented operator, not with the
+regularized Schur matrix, and no equality rows are inverted or removed.
+
+\paragraph{Sampled blocks.}
+For a sampled block, $H^{-1}$ acts by congruence with $G = W^{-1}$. Let $R$
+denote the NT factor (Section~\ref{sec:nt}) and set
+$V = R^{-1}(I_d\otimes Q)$. The Gram matrix $K = V^\top V$ is computed by one
+SYRK (exactly rounded at MPFR precision), and it stays in packed upper storage.
+For two primitive columns $p, p'$ whose index pairs into the columns of $V$
+are $(a,c)$ and $(a',c')$, the Schur entry is
+\begin{equation}
+  S_{pp'} = w_p\,w_{p'}\,\tfrac12\bigl(K_{aa'}K_{cc'} + K_{ac'}K_{ca'}\bigr),
+\end{equation}
+up to the $\svec$ normalization. This is the same structure SDPB exploits. The
+product $V$ uses the block-diagonal layout of $I_d\otimes Q$, which costs a
+factor $d$ less than a dense product. Its residues are reused while the
+scaling is unchanged. The adjoint $A^\top H^{-1}b$ is computed as exact
+quadratic or symmetric bilinear forms in the columns of $V$, rounded once per
+output.
+
+\subsection{Direct factorization backends}
+
+With \code{direct\_solve\_method = auto}, the direct layer first tries the
+structural backends and then a general sparse factorization.
+
+\paragraph{Arrow $LDL^\top$.}
+When the positive-signed variables split into structurally disconnected
+components, the KKT matrix has the arrow form
+\begin{equation}
+  K = \begin{bmatrix} \operatorname{diag}(H_i) & B \\ B^\top & C \end{bmatrix},
+  \qquad H_i \succ 0,\; C \prec 0 .
+\end{equation}
+Each leaf $H_i$ is factored densely and independently. The border Schur
+complement $C - \sum_i B_i^\top H_i^{-1} B_i$ is formed with exact products
+and factored densely. Variants eliminate local bound rows, local or shared SOC
+leaves, and local unions of orthant and SOC rows. At MPFR precision the
+backend also considers the arrow structure of $-K$, in which retained cone
+Hessian rows act as leaves and primal variables as the border, and it takes
+the eligible form with less estimated dense work. Admission uses structural
+estimates (leaf counts, workspace limits of 512~MiB or a multiple of the KKT
+storage, border density). A failed arrow factorization falls back to QDLDL at
+the same precision.
+
+On the Ising bootstrap problems the condensed system has this arrow
+structure. Leaves correspond to sampled blocks and the border to the free
+variables; for example, the border is 104 rows for $\Lambda=27$ and 170 rows
+for $\Lambda=35$.
+% TODO(verify): the border sizes are recorded in JOURNAL 2026-10-09 for the
+% original (non-resampled) Lambda27/Lambda35 inputs; confirm they hold for -rs.
+
+\paragraph{Supernodal multifrontal $LDL^\top$.}
+For wide types without arrow structure, SDPX uses a multifrontal supernodal
+factorization \cite{DuffReid1983}. The ordering is AMD
+\cite{AmestoyDavisDuff1996} without dense-row removal. On a dense-ish Schur
+complement, QDLDL's dense-row threshold ($15\sqrt n$) treats every row as dense.
+For the condensed Schur complement of the SDPLIB problem \code{dE3} (order 6237),
+AMD without that removal gives $2.7\times10^9$ multiply--subtracts against
+$3.1\times10^{10}$. Supernodes are relaxed with CHOLMOD's limits
+\cite{Chen2008CHOLMOD}. Each frontal matrix is factored by the arrow solver's
+dense exact kernels, a recursive $LDL^\top$ using exact dots and residue
+products. Fronts start as soon as their children finish, and children are
+assembled in a fixed order. Every kernel is either exact or runs in a fixed
+order, so the factor does not depend on the thread count or the schedule. The
+supernodal backend is chosen when its flops per factor entry are at least 40
+and four times its flops are at most $n^3/6$. Otherwise a dense leaf is used,
+then the supernodal factor if the system is wide, and QDLDL otherwise.
+% Source note: docs/ARCHITECTURE.md's backend table does not list the
+% supernodal backend; this paragraph follows JOURNAL 2026-11-07 and
+% crates/solver/src/solver/kkt/ldl/supernodal.rs.
+
+\paragraph{General sparse.}
+QDLDL (from OSQP \cite{Stellato2020}) is used at every precision, with
+elimination-tree parallel scheduling, recorded supernode sweeps and replayed
+row patterns on refactorization. In binary64 the faer supernodal $LDL^\top$
+is used when estimated flops are at least $10^8$ and flops per factor nonzero
+are at least 40. A dense positive leading block is factored by a pooled tiled
+Cholesky.
+% TODO(verify): add a citation for the faer library if desired.
+
+\subsection{Regularization and iterative refinement}
+
+At MPFR precision the static shift starts at zero. Only after a failed
+factorization is a shift applied: the first retry uses at least
+$\eps\cdot\max|\operatorname{diag}(K)|$, followed by Clarabel's $\times100$
+escalation. Shifts affect only the factorization. Newton solves are refined
+against the true, unshifted operator, and at MPFR precision every refinement
+residual row is one exact dot rounded once. Each right-hand side is refined
+with its own residual and measured correction gain. A row whose residual has
+reached its own rounding floor (for zero-cone rows,
+$\eps\,(\sum|A_r||x| + |b_r|)$) counts as converged. Refinement acceptance
+tolerances are never relaxed. In binary64, an outer refinement whose
+unnormalized residual has grown continues with GMRES-IR.
+
+Two scope choices reduce work without changing tolerances. On the MPFR
+sampled path the affine predictor may be left unrefined while the combined
+direction is refined as usual. Also, the constant and affine right-hand sides
+share one batched solve.
+
+% ---------------------------------------------------------------------------
+\section{Algorithmic choices}
+\label{sec:algo}
+
+\subsection{\texorpdfstring{Initial point and the $\tau$ chase}{Initial point and the tau chase}}
+\label{sec:start}
+
+For symmetric cones the start solves the KKT system with identity scalings and
+shifts $(s,z)$ into the cone, as in Clarabel. If that start is rejected, SDPX
+uses a unit interior point with $\tau_0 = \min(1, 1/\max_j d_j)$, where $d$
+are the column equilibration scales. Below $\tau_0 = 1$ the shifted KKT dual is
+kept and only the primal starts at unit slacks. The reason is that on rejected
+bootstrap starts $x$ can be degenerate (up to $10^{77}$) while the dual is
+already near its final scale.
+
+A recurring failure mode on bootstrap inputs is what the code calls a
+\emph{$\tau$ chase}. The scaled iterate $(x,s,z)/\tau$ must grow by many
+orders of magnitude to reach the solution, and HSD gets there by shrinking
+$\tau$ slowly while the relative gap stalls. For wide types SDPX detects this
+on a first attempt and restarts. The rules are:
+\begin{itemize}
+  \item since the relative gap last improved tenfold, $\mu$ fell by $10^4$
+    while $\tau < 10^{-2}\tau_0$; or
+  \item over a six-iteration window, $\mu$ fell at least 30-fold while the gap
+    fell less than half as many decades, with $\tau<10^{-2}\tau_0$; or
+  \item over the same window, $\tau$ fell at least fourfold while the unscaled
+    $\|s\|_\infty$ and $\|z\|_\infty$ each stayed within a factor 1.5, so the
+    iterate moves outward along a ray.
+\end{itemize}
+The restart starts at $\tau_0 = \min(\tau, \eps^{1/8})$, and only the side
+(primal or dual) that outgrew its start is rescaled. An attempt that chases
+again from that scale restarts at $2^{-341}$, clamped to
+$[\eps^{1/2},\eps^{1/3}]$. This value was chosen because a restart lands best
+near the solution's $\tau$, which on $\Lambda_{35}$ is a property of the
+problem rather than of the precision. An accepted KKT start whose
+$\|s\|_\infty\|z\|_\infty$ exceeds $10^{15}$ in equilibrated units starts at
+the restart scale directly. These rules are heuristics fitted to the measured
+traces recorded in the project journal. Section~\ref{sec:limits} discusses
+their cost on \code{dE3}.
+
+\subsection{\texorpdfstring{Fixed-$\tau$ end phase}{Fixed-tau end phase}}
+
+For wide types, once $\tau$ has stayed within 10\% over ten iterates, the
+relative gap is at most $10^{-8}$, the feasibility residual fell tenfold and the
+last three steps were at least $0.8$, SDPX fixes $\tau$. Later directions then
+keep $\Delta\tau=\Delta\kappa=0$, $\mu$ counts only the cones, and the constant
+right-hand side is no longer solved. The termination tests are unchanged. The
+phase is off in binary64.
+
+\subsection{NT scaling and the MPFR SVD}
+\label{sec:nt}
+
+For a PSD block with primal $S$ and dual $Z$, SDPX computes Cholesky factors
+$S = L_1L_1^\top$ and $Z = L_2L_2^\top$, takes the SVD
+$L_2^\top L_1 = U\Lambda V^\top$, and forms $R = L_1V\Lambda^{-1/2}$ together
+with $R^{-1}$, as Clarabel does. At MPFR precision the default SVD is
+right-only. Its singular values come from dqds, and its vectors from inverse
+iteration. Near convergence, most singular values of a block can lie in one
+narrow window (about 148 of 161 on \code{arch0} within $10^{-3}\|T\|$). Each
+vector is therefore first computed independently. Each chain of windows is
+then orthonormalized by $V \leftarrow V(I - E/2)$, $E = V^\top V - I$
+restricted to window pairs, using two exact GEMMs, repeated while
+$(k\max|E|)^2>\eps$. If this does not converge the code falls back to the
+in-order Gram--Schmidt path. Full SVDs and fallbacks use bidiagonal QR with
+rotations logged and replayed row-parallel. The independent first pass gives
+the same bits on every scheduling route. Clustering and pivot thresholds use
+the unshifted matrix scale.
+
+HKM (the XZ direction used by SDPB \cite{Helmberg1996}) was
+evaluated as an alternative. Its cone update is about $6.5\times$ cheaper, but
+on \code{ising11} at 512 bits it increased iterations from 52 to 58 and time
+from 37.1 to 41.9~s. It was not adopted for the condensed sampled path.
+
+\subsection{Step lengths and the PSD step certificate}
+\label{sec:steps}
+
+For a PSD block the maximal step is $\min(-1/\lambda_{\min}(\Delta),
+\alpha_{\max})$, where $\Delta$ is the direction in scaled coordinates. At
+MPFR precision SDPX first computes $\lambda_{\min}$ from a binary64 copy by
+Householder tridiagonalization and Sturm bisection. With the copy's rounding,
+the true value lies within $B = 2(n+1)^2\eps_{64}\|\Delta\|_F$. If $B$ is at
+most $10^{-10}$ relative to $\max(|\lambda|, 1/\alpha_{\max})$, the estimate is
+accepted. Otherwise a full-precision Cholesky of
+$I+\alpha_c\Delta$ at $\alpha_c=(1-10^{-10})\min(-1/\lambda,\alpha_{\max})$
+(built from exact dots) decides. Success proves that the true bound exceeds
+$\alpha_c$. On failure the full-precision eigensolver runs. In either case the
+returned step is within $10^{-10}$ relative of the true bound. The step is
+then scaled by the step fraction and kept interior.
+
+\subsection{Centrality correctors}
+
+For symmetric-cone problems with orthant or SOC rows, up to two Gondzio
+correctors \cite{Gondzio1996} push orthant products, SOC spectral values of
+the scaled Jordan product, and $\tau\kappa$ into $[0.1\sigma\mu, 10\sigma\mu]$.
+A corrector is kept only when the step grows by 1\%, and correctors are
+skipped once $\alpha\ge0.9$. In binary64 PSD blocks also receive a corrector,
+and symmetric problems try a quadratic curve on the affine and combined
+directions. At MPFR precision a PSD Gondzio corrector saved 12--17\% of
+iterations on the Ising problems. Each call costs one combined solve,
+however, and the net effect was a slowdown, so it is not used.
+
+% ---------------------------------------------------------------------------
+\section{Parallelism}
+\label{sec:parallel}
+
+\paragraph{Shared-memory.}
+Each solver owns one worker pool (\code{max\_threads}). The pool runs cone
+blocks, factorization and long vector work, and dominant blocks split their
+tiles over the same pool. The pool width is sized from structural work
+estimates that depend only on dimensions and precision. For example, a lone
+PSD cone above order 64 counts
+$\max(\lceil n^2/64^2\rceil, \lceil n_x^3/(3\cdot 64^3)\rceil)$ units, and
+multi-cone pure-PSD problems count their exact condensed-assembly terms. The
+faer factors and solves run inside the same pool. PSD contribution buffers
+are published by disjoint CSC columns, and each destination adds blocks in
+their original cone order. Exact MPFR products give the same rounded result
+at every thread count. In binary64, factorization backends may change
+rounding with the thread count, and the original-coordinate audit remains the
+accuracy gate. Scratch is per thread and reused across iterations. On Linux,
+worker binding preserves the caller's CPU mask. Multi-rank runs can start
+idle-priority keeper threads when the frequency governor follows load.
+
+\paragraph{MPI.}
+MPI is loaded at runtime. The ordinary MPI path replicates input data and
+shards the expensive work by blocks. With \code{--partitions}, ranks own whole
+blocks (owner partitioning) and share the equality Schur complement. Measured
+block costs from earlier runs can be fed to the balancer. Both paths plug into
+the same HSD loop. Owner sums fold gathered values in rank order, and exact
+refinement residual rows are split across ranks by work. Results on the Ising
+problems are in Section~\ref{sec:mpi-results}.
+
+% ---------------------------------------------------------------------------
+\section{Numerical contracts}
+\label{sec:contracts}
+
+The project fixes the following rules. Performance changes are accepted only
+if they keep them.
+\begin{enumerate}
+  \item \emph{Precision is never lowered.} SDPX uses no silent precision
+    lowering, no mixed-precision factorization and no precision-ladder warm
+    starts. MPFR values own their storage. Correctly rounded exact
+    accumulation (residue products, \code{exactdot}) is allowed.
+  \item \emph{Clarabel-style convergence and infeasibility detection.}
+    Iterative refinement may change scope (for example which right-hand
+    sides are refined), but never its acceptance tolerances.
+    \code{AlmostSolved} is never promoted to \code{Solved}, and
+    the componentwise feasibility tolerance stays off by default.
+  \item \emph{Original-coordinate outputs.} Accepted-iterate recovery is kept,
+    and sampled factors define their operator; a rounded materialization is
+    never swapped in.
+  \item \emph{Default preprocessing.} Direct solves default to Ruiz,
+    presolve and chordal decomposition. Data updates require presolve and
+    chordal decomposition to be off.
+  \item \emph{No benchmark-specific branches and no weakened gates.} Known
+    failures stay labeled as failures.
+\end{enumerate}
+Changes to convergence rules, regularization, refinement scope or presolve
+tolerances (for example the $\tau$-chase rules of Section~\ref{sec:start})
+require measured evidence: full solves that pass the original-coordinate
+audit, and a recorded journal entry.
+
+% ---------------------------------------------------------------------------
+\section{Bootstrap workflow features}\label{sec:workflow}
+
+A bootstrap study runs many related SDPs: feasibility tests over a grid of
+gap assumptions, bisections, and optimizations whose functional is
+analysed afterwards. SDPX provides these pieces in the solver and in a
+separate post-processing program, \code{sdpx-bootstrap}, which reads the
+sampled SDP directory and the solver's JSON result. Because each block's
+functional is a polynomial matrix of degree one less than its number of
+samples, it is evaluated anywhere in the sampled range by barycentric
+interpolation through the samples. The original PMP is not needed.
+
+\paragraph{Feasibility runs and the dual jump.}
+An excluded point is one for which a functional $y$ exists with
+$c - By \succeq 0$ in the SOS sense: there are Gram matrices
+$Y_j \succeq 0$ with $\langle Q_p, Y\rangle = c_p - B_p^\top y$ for every
+sample column $p$. In the HSD embedding the dual residual decays with the
+gap, so the default stopping rule waits until the gap is closed. SDPB stops
+earlier because its infeasible-start steps can jump to exact feasibility.
+SDPX obtains the same effect with an explicit test. With the setting
+\code{find\_dual\_feasible}, once both residuals are below
+$\sqrt{\epsilon_{\mathrm{feas}}}$ it keeps the current $y$, adds to each
+Gram matrix the smallest Frobenius-norm correction that satisfies every
+sampled equality exactly, and factors the corrected matrices by Cholesky at
+working precision. Within one polynomial-matrix block and level pair
+$(r,s)$ the correction is $\sum_k w_k f\,q_kq_k^\top$ ($f=1$ on the
+diagonal, $1/2$ off it), where $w$ solves a sample Gram system of order
+equal to the number of samples. Success certifies $c-By$ as a sum of
+squares, and the solver returns the new status \code{DualFeasible}. The
+same test is available offline as \code{sdpx-bootstrap certify}, which
+reports the equality residual before and after the correction and the
+smallest Cholesky pivot.
+
+We built a feasibility pair from the $\Lambda_{11}$ Ising input (512 bits,
+$\epsilon = 10^{-42}$) by setting the objective to zero and adding a
+one-sample block that enforces $b^\top y + c_0 \ge t$ for $t$ just below or
+above the optimum. The excluded side was \code{Solved} after 39 iterations
+without the test; with it, the solver stops \code{DualFeasible} after 30.
+At the stopped point the corrected equality residual is $10^{-154}$ (from
+$3\times10^{-20}$) and the smallest relative Cholesky pivot is
+$2.5\times10^{-25}$. Iterates before 30 fail the test, so the stop is the
+earliest certifiable one. On the allowed side the solver returns the HSD
+dual-infeasibility certificate. With the 512-bit default infeasibility and
+$\kappa/\tau$ tolerances ($1.2\times10^{-77}$) this took 67 iterations; with
+$10^{-30}$, the threshold scale used by SDPB, it took 43. The ordinary
+$\Lambda_{11}$ optimization is unchanged by the setting (54 iterations,
+same objective). These are fast-profile runs on a laptop with 4 threads;
+the gains have not yet been measured on larger inputs.
+% TODO(verify): repeat the feasibility pair on Lambda19/27 on the cluster.
+
+\paragraph{SDPB-layout output.}
+\code{sdpx-bootstrap sdpb-out} writes \code{out.txt}
+(\code{terminateReason}, objectives, gap, errors, runtime), \code{y.txt},
+the per-block primal vectors \code{x\_j.txt} and the Gram matrices
+\code{X\_matrix\_j\_p.txt} and \code{Y\_matrix\_j\_p.txt}, so that existing
+analysis scripts can read SDPX results. SDPX's sampled primal is SDPB's
+$x$ and $X$; $y$ is minus the zero-cone part of $z$, and the PSD part of $z$
+holds the $Y$ blocks.
+
+\paragraph{Spectrum extraction.}
+\code{sdpx-bootstrap spectrum} implements the extremal functional method.
+For each block it evaluates $F(x) = c(x) - B(x)^\top y$ (divided by the
+sample scalings) on a refined grid over $[0, x_{\max}]$, normalizes the
+smallest eigenvalue by the cancellation scale $\|c(x)\| +
+\sum_i |y_i|\,\|B_i(x)\|$, refines every local minimum by golden-section
+search at working precision, and reports minima below a threshold as zeros
+with their null vectors $v$. It then solves the primal equations
+$\sum_z \lambda_z\, v_z^\top B(x_z) v_z = b$ in least squares by Householder
+QR. On the $\Lambda_{11}$ optimum it finds 11 zeros in 6 of the 11 blocks
+with relative eigenvalues between $10^{-46}$ and $10^{-43}$, all weights
+positive, and a relative residual of $1.7\times10^{-25}$ in the primal
+equations. The result is the same with 16 and 64 grid subdivisions per
+sample interval, and the run takes about 1.4~s. Refining every minimum
+matters: near a double zero the grid value is $O(h^2)$, far above the
+threshold until refined.
+
+\paragraph{Nearby problems.}
+\code{sdpx-bootstrap approx-objective} evaluates the Lagrangian
+$c_0' + c'^\top x + b'^\top y - y^\top B' x$ of a nearby SDP of the same
+structure at a stored solution, the first-order estimate SDPB provides for
+navigator and OPE scans. Checkpoints (\code{--checkpoint},
+\code{--restart}) give exact continuations and hot starts for nearby inputs
+of the same structure; they are not yet available for partitioned MPI
+solves.
+
+% ---------------------------------------------------------------------------
+\section{Results}
+\label{sec:results}
+
+\subsection{Methodology}
+
+Cluster measurements were taken on exclusive nodes of a PBS cluster whose
+nodes are recorded as two-socket, 64-cores-per-socket AMD EPYC 7742 machines.
+Each solve ran in a fresh process, and runs on a node were sequential. SDPX
+used one BLAS thread, with its own pool pinned to physical cores. Timings
+are process wall times unless stated otherwise. ``ABBA'' denotes interleaved
+A/B/B/A legs on one node. Every SDPX point quoted as \emph{audited} passed the
+separate original-coordinate audit.
+% TODO(verify): the CPU model is stated in the journal for nodes 22, 54/57/78
+% (via the SDPLIB entries) and for the "2x64-core EPYC 7742" Ising nodes of
+% 2026-10-08; confirm node26 and node30 are the same model.
+
+\subsection{Ising bootstrap problems against SDPB}
+
+The Ising inputs were generated with PyCFTBoot and converted by
+\code{sdpx-pmp2sdp}. They are labeled by $\Lambda$ and spin range. For example,
+$\Lambda_{27}$ spins 0--50 has 26 blocks with bases of 55--57 functions.
+The suffix ``-rs'' denotes inputs resampled to SDPB~3.1 sample points.
+% TODO(verify): state the physical setup of each input (which correlators,
+% gap assumptions, what Lambda counts) from the generator scripts; the
+% sources give only the labels.
+
+Table~\ref{tab:ising-sdpb} gives the most recent matched comparison
+(2026-10-16) against the official SDPB~3.1.0 build. Both solvers ran on the
+same exclusive node (\code{node26}) with the same input directory, the same
+precision and thresholds of $10^{-42}$. SDPB used 64 MPI ranks bound to cores
+and SDPX used 64 pinned threads. SDPB's wall time includes MPI startup. The
+SDPX build is commit \code{211a192}. Releases 0.9.3--0.9.5 and later work have
+not been re-measured on these cases.
+
+\begin{table}[t]
+\centering
+\caption{Ising bootstrap SDPs, SDPB~3.1.0 vs.\ SDPX (\code{211a192}), one
+node, 64 cores, thresholds $10^{-42}$, PBS job 226114, 2026-10-16. All SDPX
+points pass the original-coordinate audit (job 226115), and the audited
+objectives equal SDPB's primal objectives to every printed digit. SDPB peak
+memory was not sampled in this job. $^{a}$Original input, not resampled.}
+\label{tab:ising-sdpb}
+\begin{tabular}{lrrrrr}
+\toprule
+Case & Bits & SDPB it / wall & SDPX it / wall & Speedup & SDPX peak RSS \\
+\midrule
+$\Lambda_{19}$-rs & 768 & 240 / 144.5 s & 89 / 25.5 s & 5.67$\times$ & 1.29 GB \\
+$\Lambda_{27}$-rs & 768 & 259 / 365.5 s & 127 / 73.8 s & 4.95$\times$ & 2.85 GB \\
+$\Lambda_{35}$-rs & 1024 & 734 / 2733.7 s & 347 / 609.6 s & 4.48$\times$ & 8.09 GB \\
+$\Lambda_{19}$-xml$^{a}$ & 768 & 243 / 148.0 s & 105 / 35.3 s & 4.19$\times$ & 1.32 GB \\
+\code{ising11} & 768 & 201 / 14.6 s & 54 / 3.1 s & 4.70$\times$ & 0.24 GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The audit residuals of these points (primal, dual, map) are: $\Lambda_{19}$-rs
+$3.8\times10^{-58}$, $7.8\times10^{-55}$, $7.5\times10^{-31}$;
+$\Lambda_{27}$-rs $3.8\times10^{-67}$, $3.5\times10^{-69}$, $1.6\times10^{-34}$;
+$\Lambda_{35}$-rs $3.2\times10^{-130}$, $1.2\times10^{-142}$,
+$4.0\times10^{-42}$; $\Lambda_{19}$-xml $2.6\times10^{-74}$,
+$2.0\times10^{-74}$, $2.3\times10^{-31}$; \code{ising11} $1.3\times10^{-48}$,
+$2.4\times10^{-47}$, $6.7\times10^{-39}$.
+
+Most of the advantage comes from iterations: SDPX takes 27--49\% of SDPB's
+iteration count on these inputs. Resampling barely changes SDPB ($\Lambda_{19}$:
+243 to 240 iterations), but it reduces SDPX from 105 to 89 iterations and from
+35.3 to 25.5~s. The reason recorded in the journal is that SDPX's refinement
+corrections nearly vanish on resampled inputs (corrections per iteration
+1.33 on $\Lambda_{19}$-xml against 0 on $\Lambda_{19}$-rs).
+
+Table~\ref{tab:ising-old} lists earlier scoreboard rows on non-resampled
+inputs (2026-10-13). The SDPB references there were taken earlier on the same
+cluster.
+% TODO(verify): the journal (2026-10-16, B1) notes that the 2026-10-09
+% "matched SDPB" rows used SDPB build 67ebd53, not 3.1.0; confirm which build
+% produced the 265 it / 375 s, 285 s, 745 it / 2762 s and 746 it / 2009 s
+% references in REVIEW_AND_PLAN.md's scoreboard.
+
+\begin{table}[t]
+\centering
+\caption{Earlier scoreboard rows (REVIEW\_AND\_PLAN.md), 64 threads, 768 bits
+and tolerance $10^{-42}$ unless noted, dated 2026-10-13. SDPB build: see the
+TODO in the source. The $\Lambda_{19}$ spins 0--50 row is from 2026-10-09 data
+that predates later start-rule changes.}
+\label{tab:ising-old}
+\begin{tabular}{llll}
+\toprule
+Case & SDPX & Audited & SDPB \\
+\midrule
+$\Lambda_{27}$ spins 0--50 & 170 it / 130.5 s & yes & 265 it / 375 s \\
+$\Lambda_{19}$ spins 0--50 & 153 it / 153.8 s & --- & 285 s \\
+$\Lambda_{19}$ & 121 it / 71.0 s & yes & --- \\
+\code{ising11} (512 bits) & 54 it / 3.44 s & --- & --- \\
+$\Lambda_{35}$ spins 0--70, 1024 bits & 357 it / 676.3 s & yes & 745 it / 2762 s \\
+$\Lambda_{35}$ spins 0--70, 768 bits & 357 it / 535.8 s & yes & 746 it / 2009 s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Memory.}
+Matched memory against SDPB has not been measured at this scale. The only
+recorded comparison is $\Lambda_{19}$ at 768 bits on 4 cores, where SDPX used
+1136~MiB PSS against SDPB's 445~MiB; it has not been repeated since.
+
+\subsection{Multi-node runs}
+\label{sec:mpi-results}
+
+With owner partitioning, $\Lambda_{35}$ at 1024 bits limited to 60 iterations
+took 87.5~s on 4 nodes in a $16\times16$ layout (16 ranks of 16 threads; keeper
+threads on, receipts off), compared with 126~s for SDPB on 4 nodes with 64 ranks per
+node over the same 60 iterations. These are iteration-limited runs, not
+solutions.
+% TODO(verify): the SDPB 4-node 60-iteration time (126 s) is from the
+% 2026-10-09 table (task 20); confirm it used the same input and precision as
+% the 87.5 s SDPX run (journal 2026-10-12, L35).
+A complete 4-node owner solve of $\Lambda_{35}$ spins 0--70 at 1024 bits took
+357 iterations in 458.5~s (2026-10-13, job 225446), with the same objective as
+the single-node solve. No matching SDPB 4-node full solve is recorded. The
+ordinary (non-owner) MPI path does not scale: it took 201~s on 4 nodes in the
+same 60-iteration test. With one rank of 64 threads on a node, the owner path
+is about 2.5$\times$ slower than the plain shared-memory solver, so it needs
+several ranks per node.
+
+\subsection{SDPLIB at MPFR precision}
+
+General SDPs from SDPLIB \cite{Borchers1999} at MPFR precision exercise the
+non-bootstrap paths. They shaped several components described above: the
+supernodal factor, the condensed form for $P=0$ PSD problems, the PSD step
+certificate, the windowed NT singular vectors, the exact-dot Cholesky and
+triangular kernels, and the ray rule of the $\tau$ chase. Before this work,
+SDPX did not finish \code{dE3} within a 4-hour limit. The supernodal factor
+reduced its median factorization from 12.9~s (dense leaf) to 2.5~s and the
+solve from 1260 to 305~s (node57, 32 threads, 256 bits). The \code{dE3} and
+\code{12\_min} points pass a 160-digit original-coordinate audit (job 235053):
+relative gap $9.06\times10^{-8}$, $r_p = 1.54\times10^{-16}$,
+$r_d=1.44\times10^{-9}$ for \code{dE3} and $9.77\times10^{-8}$,
+$7.64\times10^{-25}$, $2.44\times10^{-21}$ for \code{12\_min}.
+
+\subsection{Binary64 against MOSEK}
+
+The binary64 benchmark has 58 problems (LP, SOCP and SDP), solved at 1 and 16
+threads. Every returned point is audited at $10^{-6}$ in original coordinates
+(with $s := b - Ax$) by a separate Julia oracle. MOSEK~11.2.2 \cite{MOSEK} is
+the reference, and its points face the same audit. In the 2026-10-09 setup
+SDPX requested tolerance $10^{-8}$.
+% TODO(verify): confirm the tolerance settings used by the t16b and 226044
+% scoreboard runs and the node CPU model.
+
+\begin{table}[t]
+\centering
+\caption{Binary64 58-problem audited scoreboard. A ``win'' is an audited SDPX
+solve faster than MOSEK. Geometric-mean ratios are SDPX/MOSEK time ($>1$:
+SDPX slower). Cross-node timing in this harness is noisy, so ratios differ
+by build and node.}
+\label{tab:f64}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+Build (date) & Result \\
+\midrule
+t16b (int5 \code{a5334dd} + FMA + task 16; 2026-10-09) &
+  54 audited solves, 0 \code{Solved}-but-failing points; wins 19 (1 thread) and
+  12 (16 threads). Geo-mean SDPX/MOSEK at 1 thread: LP 2.39, SDP 1.65, SOCP
+  1.35; at 16 threads: 2.21 / 2.50 / 1.68. \\
+Same-node A/B (task 13) &
+  Geo-mean at 1 thread: LP 2.3, SDP 1.5, SOCP 1.5. \\
+\code{2709067} (job 226044, \code{node30}; 2026-10-16) &
+  54 audited solves, 0 \code{Solved}-but-failing; wins 17 (1 thread), 12 (16
+  threads). \code{hinf3} became an audited win and \code{gpp250-1} became
+  \code{AlmostSolved}. The change responsible for the latter was later
+  reverted, so this run does not describe current main. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+% Source note: REVIEW_AND_PLAN.md lists int5 geo-means (LP 2.53, SDP 1.65,
+% SOCP 1.43; 16 threads 2.18 / 2.29 / 1.77) next to the t16b win counts; the
+% t16b geo-means above are from JOURNAL 2026-10-16 ("Performance plan").
+
+Binary64 is the goal furthest from met. SDPX is slower than MOSEK on most
+problems, and tiny LPs lose to per-solve overhead (2--20~ms against MOSEK's
+warm 1--5~ms). Four problems are not solved: \code{hinf3} (platform-sensitive),
+\code{sched\_100\_50\_orig}, \code{csdr3} and \code{f64\_large}. Since then,
+many binary64 kernel changes have been kept on the basis of same-node A/B runs
+(mostly with bitwise-identical points and 2--16\% gains on the affected
+cases), but no full
+58-case scoreboard of current main has been recorded.
+
+% ---------------------------------------------------------------------------
+\section{Limitations and known failures}
+\label{sec:limits}
+
+The following are open. They are listed as recorded in the project's plan.
+
+\begin{itemize}
+  \item \textbf{Mixed $\Lambda_{27}$ at 1024 bits.} On a frozen 0.9.1 build the
+    solver reports \code{Solved} after 42 iterations, but the point fails the
+    $10^{-30}$ original-coordinate audit: dual $1.475\times10^{-23}$, primal
+    $3.73\times10^{-28}$, PSD link $2.73\times10^{-26}$, componentwise dual
+    0.84355. Primal variables reach $5.8\times10^{118}$. The resampled input
+    also fails (dual $2.34\times10^{-23}$, 57 iterations). This problem
+    (18\,703 variables) is the size of the SDPB benchmarks. It is a
+    different input from the 768-bit $\Lambda_{27}$ of
+    Tables~\ref{tab:ising-sdpb} and~\ref{tab:ising-old}, which passes its
+    audit. A diagnostic run with explicit gates is prepared but has not been
+    run.
+  \item \textbf{$\Lambda_{35}$ plateau.} The dual has no Slater point, and both
+    SDPX and SDPB spend a long stretch of iterations on a gap plateau. SDPX
+    now solves the problem with an audited point at 768 and 1024 bits, but
+    the plateau still dominates its iteration count. Shortening it remains
+    open.
+  \item \textbf{Thermal bootstrap (BFSS) problems.} At 128 bits, BFSS L11u
+    ends with status \code{InsufficientProgress} after 107 iterations. The primal variables of
+    L11 and t5 are not identified along $\operatorname{null}(A)$. At 512 bits
+    the first step on t5 puts up to $8.6\times10^{48}$ into $x$, so residuals
+    normalized by $\|x\|$ ($3\times10^{-41}$) no longer measure
+    feasibility.
+  \item \textbf{Single-block SDPs.} \code{arch0}, one PSD block of order
+    161, spends 39\% of a local profile in the NT SVD and stops scaling at
+    about 8 threads. \code{gpp100} at
+    $10^{-30}$ ends \code{AlmostSolved} after 200 iterations, and the gap
+    shrinks only about a decade per 10 iterations after iteration 58.
+  \item \textbf{Memory.} Per-thread scratch and the transient workspace of
+    exact products dominate peak memory on small problems (e.g.\ \code{arch0}
+    0.75~GB), and the matched comparison against SDPB at bootstrap scale has
+    not been done.
+  \item \textbf{Binary64 problems not solved:} \code{hinf3},
+    \code{sched\_100\_50\_orig}, \code{csdr3} and \code{f64\_large}. On
+    \code{sched\_100\_50\_orig}, an expanded 4741-dimensional SOC reaches
+    $\operatorname{cond}(W^2)\approx5\times10^{16}$, and refinement cannot
+    repair the auxiliary row. \code{f64\_large} (a large SU(2) SDP) has PSD
+    blocks whose kernel is shared by all constraint matrices and $b$; SDPX
+    ends \code{AlmostSolved}, and MOSEK's ``optimal'' points fail the
+    $10^{-6}$ audit. A Goldstone LP/SOC problem at 256 bits stalls with the
+    dual residual at $10^{-8}$ to $10^{-11}$ while the primal residual reaches
+    $10^{-29}$. A gravity problem in binary64 was \code{Solved} with
+    $r_d = 4.01\times10^{-6}$ above its $2\times10^{-6}$ audit before an
+    earlier fix and has not been re-run since.
+  \item \textbf{Feasibility runs.} The dual jump of
+    Section~\ref{sec:workflow} stops excluded points early, but allowed
+    points still need the HSD infeasibility certificate, and both were
+    measured on one $\Lambda_{11}$ pair only.
+  \item \textbf{Heuristic restarts.} The $\tau$-chase rules are fitted to
+    measured traces. On \code{dE3}, a solve without the restart ends
+    \code{Solved} after 62 iterations, but its original-coordinate residuals
+    are 180--220$\times$ those of the restarted solve. The restarted solve
+    takes 80 iterations, 49 of them after the restart. No predictor in the
+    KKT start identifies such problems in advance.
+  \item \textbf{Thread scaling.} On the Ising problems, plain single-node runs
+    gain at most 3\% from 64 to 128 threads. Single-block SDPs stop scaling at 6--8 threads.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+
+SDPX shows that a single Clarabel-derived HSD engine, generic over the scalar,
+can serve both binary64 and high-precision bootstrap SDPs. Exactly rounded dot
+products and residue-number-system matrix products provide most of the speed
+at fixed precision without lowering it. On matched resampled Ising inputs at
+768 and 1024 bits it reached audited solutions 4.5--5.7$\times$ faster than
+SDPB~3.1.0 on one node, mainly through fewer iterations. The same engine
+handles the operator relative entropy cone for thermal problems, and the
+bootstrap tools certify excluded points and extract the spectrum from the
+solution. In binary64 it is not yet competitive with MOSEK on most
+problems. The open items are memory use, the $\Lambda_{35}$ plateau, the
+mixed $\Lambda_{27}$ audit failure, a fresh matched comparison at
+current main, checkpoints for partitioned MPI solves, and measuring
+feasibility scans at bootstrap scale.
+
+\paragraph{Software availability.}
+The source code is available at
+\url{https://github.com/yongjunx23-del/SDPX.rs} \cite{SDPXrs}. Upstream
+attribution and licenses for Clarabel.rs and SDPB-derived code are retained in
+the repository's \code{provenance/} directory.
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}

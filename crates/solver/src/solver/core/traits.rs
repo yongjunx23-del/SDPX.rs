@@ -599,6 +599,12 @@ pub trait Solution<T: FloatT> {
     ) -> Option<T> {
         None
     }
+
+    /// `find_dual_feasible`: whether the current dual iterate passes the
+    /// jump test in original coordinates. False when the test does not apply.
+    fn dual_jump(&mut self, _data: &Self::D, _variables: &Self::V, _settings: &Self::SE) -> bool {
+        false
+    }
 }
 
 /// Settings for a conic optimization problem.

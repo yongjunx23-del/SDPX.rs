@@ -104,6 +104,30 @@ the original program before using it as a bound. Temporary initialization
 constraints must be removed and the resulting program audited separately.
 See the QICS entry in [the journal](docs/JOURNAL.md) for the BFSS validation.
 
+## Bootstrap workflow
+
+For feasibility scans over sampled inputs, `"find_dual_feasible": true` in
+the settings stops an excluded point as soon as the dual iterate passes an
+SDPB-style jump test (status `DualFeasible`): y is kept, the Gram matrices
+get the smallest correction that satisfies the sampled equalities exactly,
+and the corrected matrices must factor by Cholesky. Allowed points end with
+the HSD dual-infeasibility certificate; set `tol_infeas_abs`,
+`tol_infeas_rel` and `tol_ktratio` to the scan threshold (e.g. `1e-30`).
+
+`sdpx-bootstrap` (built with `-p sdpx-pmp`) post-processes a solution of a
+sampled directory without the original PMP:
+
+```sh
+target/fast/sdpx-bootstrap certify  --sdp problem-sdp --solution solution.json
+target/fast/sdpx-bootstrap spectrum --sdp problem-sdp --solution solution.json
+target/fast/sdpx-bootstrap sdpb-out --sdp problem-sdp --solution solution.json --out sdpb-out
+target/fast/sdpx-bootstrap approx-objective --sdp nearby-sdp --base problem-sdp --solution solution.json
+```
+
+`spectrum` reports the zeros of the extremal functional on [0, last sample
+point] and weights solving the primal equations at them; `sdpb-out` writes
+SDPB's output layout.
+
 ## Reducing explicit SDP inputs
 
 For Float64 equality/PSD models such as SU(2), reduce the input before

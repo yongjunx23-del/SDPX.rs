@@ -1182,6 +1182,7 @@ fn adjoint_leaf<T: FloatT>(
     w.adjoint = terms;
 }
 
+mod jump;
 mod split;
 use split::*;
 struct SampledBlockWorkspace<T> {

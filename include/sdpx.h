@@ -76,7 +76,7 @@ typedef struct {
 /* Status: 0 unsolved,1 solved,2 primal infeasible,3 dual infeasible,
  * 4 almost solved,5 almost primal infeasible,6 almost dual infeasible,
  * 7 max iterations,8 max time,9 numerical error,10 insufficient progress,
- * 11 callback terminated. Info floating scalars are approximate summaries.
+ * 11 callback terminated, 12 dual feasible (find_dual_feasible). Info floating scalars are approximate summaries.
  * Exact numeric results are obtained through decimal bulk output below. */
 /* Versioned first handshake prevents old clients from allocating ABI-3 storage. */
 int32_t sdpx_default_settings_v4(sdpx_settings *out);
