@@ -828,7 +828,7 @@ impl SparseParallel {
 
 fn exact_output<'a, T: FloatT + 'a>(
     y: &mut T,
-    terms: impl Iterator<Item = (&'a T, &'a T)>,
+    terms: impl Iterator<Item = (&'a T, &'a T)> + Clone,
     alpha: T,
 ) {
     *y = crate::algebra::csc::wide_output(*y, terms, alpha, T::one());

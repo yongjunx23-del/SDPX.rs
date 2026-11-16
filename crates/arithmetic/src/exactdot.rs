@@ -50,11 +50,38 @@ type Pair<'a, const N: usize> = (&'a MpFloat<N>, &'a MpFloat<N>);
 
 /// Exact dot product rounded once. `chain` preserves the caller's handling
 /// of non-finite operands.
-pub(crate) fn dot<'a, const N: usize>(
-    pairs: impl IntoIterator<Item = Pair<'a, N>>,
+pub(crate) fn dot<'a, const N: usize, I>(
+    pairs: I,
     chain: impl Fn(&mut dyn Iterator<Item = Pair<'a, N>>) -> MpFloat<N>,
-) -> MpFloat<N> {
+) -> MpFloat<N>
+where
+    I: IntoIterator<Item = Pair<'a, N>>,
+    I::IntoIter: Clone,
+{
+    let pairs = pairs.into_iter();
+    // One pass with the window kernel; a non-finite term or a span beyond
+    // the accumulator bound reads the terms again through the scanned kernel.
+    if window_first::<N>() {
+        if let Some(v) = window_dot(pairs.clone()) {
+            return v;
+        }
+    }
     dot_with(pairs, chain, N <= INLINE_N)
+}
+
+/// Whether [`window_dot`] is tried before the scanned slot kernel: at every
+/// width with the BMI2/ADX terms, else up to 8 limbs, where one carry chain
+/// per term still beats the slots' independent adds (Apple M4, ns per term,
+/// slots -> window: 2 limbs 4.7 -> 3.1, 4 limbs 7.4 -> 7.1, 8 limbs 30.4 ->
+/// 28.8, 12 limbs 45 -> 52, 16 limbs 98 -> 109; one-term dots 3-15% faster
+/// through 8 limbs).
+#[inline(always)]
+fn window_first<const N: usize>() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if x86::fast() {
+        return N <= MAX_N;
+    }
+    N <= 8
 }
 
 /// `dot` with the per-term kernel chosen explicitly: the inlined product or
@@ -184,8 +211,10 @@ pub(crate) fn dot_slices<'a, const N: usize>(
     if N > MAX_N {
         return dot_mpfr(a.iter().zip(b), chain);
     }
-    if let Some(v) = window_dot(a, b) {
-        return v;
+    if window_first::<N>() {
+        if let Some(v) = window_dot(a.iter().zip(b)) {
+            return v;
+        }
     }
     let regular = |k: i32| k.abs() == mpfr::REGULAR_KIND;
     let zero = |k: i32| k.abs() == mpfr::ZERO_KIND;
@@ -234,88 +263,176 @@ pub(crate) fn dot_slices<'a, const N: usize>(
 
 /// Exponent-sum reach, in limbs, of [`window_dot`] on each side of a dot's
 /// first nonzero term. BFSS arrow-leaf dots span under 16 limbs; a wider
-/// dot takes the scanned two-pass path.
+/// dot continues in the slot kernel ([`widen`]).
 const WINDOW: usize = 16;
 
-/// [`dot_slices`] in one pass, without the exponent scan: bit 0 of the
-/// limb accumulators weighs 2^(e0 - 64·WINDOW - 2P) for the first nonzero
-/// term's exponent sum e0, and each product adds by one carry chain. The
-/// sum is the same exact integer at another alignment, so the value is
-/// that of the scanned path. `None` when a term is non-finite or lands
-/// more than `WINDOW` limbs from e0.
-fn window_dot<const N: usize>(a: &[MpFloat<N>], b: &[MpFloat<N>]) -> Option<MpFloat<N>> {
-    // Kinds are 0 (NaN), ±1 (inf), ±2 (zero) and ±3 (regular), signed by
-    // the value. The product of two kinds has the product's sign, and its
-    // square is 81 for regular factors, 16 or 36 for an exact zero of finite
-    // factors and below 16 when a factor is NaN or infinite (no sign to
-    // branch on).
-    const BOTH: i32 = (mpfr::REGULAR_KIND * mpfr::REGULAR_KIND).pow(2);
-    const FINITE: i32 = (mpfr::ZERO_KIND * mpfr::ZERO_KIND).pow(2);
-    let class = |x: &MpFloat<N>, y: &MpFloat<N>| (x.kind * y.kind).pow(2);
-    let Some(first) = a.iter().zip(b).position(|(x, y)| {
-        let k = class(x, y);
-        k == BOTH || k < FINITE
-    }) else {
+/// Squared kind product of two regular factors, and the least one of two
+/// finite factors. Kinds are 0 (NaN), ±1 (inf), ±2 (zero) and ±3 (regular),
+/// signed by the value: the product of two kinds has the product's sign, and
+/// its square is 81 for regular factors, 16 or 36 for an exact zero of finite
+/// factors and below 16 when a factor is NaN or infinite (no sign to branch
+/// on).
+const BOTH: i32 = (mpfr::REGULAR_KIND * mpfr::REGULAR_KIND).pow(2);
+const FINITE: i32 = (mpfr::ZERO_KIND * mpfr::ZERO_KIND).pow(2);
+
+/// A dot over any term sequence (contiguous, strided or gathered operands)
+/// in one pass, without the exponent scan: bit 0 of the limb accumulators
+/// weighs 2^(e0 - 64·WINDOW - 2P) for the first nonzero term's exponent sum
+/// e0, and each product adds by one carry chain. The sum is the same exact
+/// integer at another alignment, so the value is that of the scanned path.
+/// A term more than `WINDOW` limbs from e0 hands the partial sums and the
+/// terms left to [`widen`]. `None` when a term is non-finite or the terms
+/// span more than the accumulator bound.
+#[inline(always)]
+fn window_dot<'a, const N: usize>(
+    mut pairs: impl Iterator<Item = Pair<'a, N>> + Clone,
+) -> Option<MpFloat<N>> {
+    let (x, y) = loop {
         // Every product is an exact zero.
-        return Some(MpFloat::<N>::default());
+        let Some((x, y)) = pairs.next() else {
+            return Some(MpFloat::<N>::default());
+        };
+        let k = (x.kind * y.kind).pow(2);
+        if k == BOTH {
+            break (x, y);
+        }
+        if k < FINITE {
+            return None;
+        }
     };
-    let (x, y) = (&a[first], &b[first]);
-    if class(x, y) != BOTH {
-        return None;
-    }
     let base = x.exponent as i64 + y.exponent as i64 - 64 * WINDOW as i64;
     // The farthest term ends at limb 2·WINDOW + 2N + 1; one limb more holds
     // the carries of up to 2^64 terms.
     let len = 2 * WINDOW + 2 * N + 3;
     #[cfg(target_arch = "x86_64")]
     let fast = x86::fast();
+    #[cfg(not(target_arch = "x86_64"))]
+    let fast = false;
     with_window::<N, _>(|acc| {
         let (pos, neg) = acc.split_at_mut(len);
-        let neg = &mut neg[..len];
+        // One product buffer per dot; every term overwrites its 2N limbs.
+        let (neg, prod) = neg.split_at_mut(len);
+        let prod = &mut prod[..2 * N];
         let accs = [pos.as_mut_ptr(), neg.as_mut_ptr()];
-        for (x, y) in a[first..].iter().zip(&b[first..]) {
+        // Offsets of the terms added: rounding reads only their limbs.
+        let (mut low, mut high) = (64 * WINDOW as u64, 64 * WINDOW as u64);
+        let mut term = (x, y);
+        loop {
+            let (x, y) = term;
             let kind = x.kind * y.kind;
-            if kind * kind != BOTH {
-                if kind * kind < FINITE {
-                    return None;
+            if kind * kind == BOTH {
+                let offset = (x.exponent as i64 + y.exponent as i64 - base) as u64;
+                if offset > 128 * WINDOW as u64 {
+                    return widen(pos, neg, base, term, pairs);
                 }
-                continue;
-            }
-            let offset = (x.exponent as i64 + y.exponent as i64 - base) as u64;
-            if offset > 128 * WINDOW as u64 {
+                low = low.min(offset);
+                high = high.max(offset);
+                // SAFETY: the term ends at limb offset/64 + 2N + 1 < len - 1.
+                unsafe {
+                    let dst = accs[(kind < 0) as usize].add((offset / 64) as usize);
+                    let shift = (offset % 64) as u32;
+                    if fast {
+                        #[cfg(target_arch = "x86_64")]
+                        x86::add_term::<N>(dst, &x.limbs, &y.limbs, shift);
+                    } else {
+                        mul_limbs::<N>(&x.limbs, &y.limbs, prod);
+                        add_chain(dst, prod, shift);
+                    }
+                }
+            } else if kind * kind < FINITE {
                 return None;
             }
-            // SAFETY: the term ends at limb offset/64 + 2N + 1 < len - 1.
-            unsafe {
-                let dst = accs[(kind < 0) as usize].add((offset / 64) as usize);
-                let shift = (offset % 64) as u32;
-                #[cfg(target_arch = "x86_64")]
-                if fast {
-                    x86::add_term::<N>(dst, &x.limbs, &y.limbs, shift);
-                    continue;
-                }
-                let mut prod = [0u64; 2 * MAX_N];
-                mul_limbs::<N>(&x.limbs, &y.limbs, &mut prod[..2 * N]);
-                add_chain(dst, &prod[..2 * N], shift);
+            match pairs.next() {
+                Some(next) => term = next,
+                None => break,
             }
         }
-        round_acc(pos, neg, len, base)
+        // Limbs below the lowest term are zero; the highest term ends at
+        // limb high/64 + 2N + 1 and one limb more holds the carries.
+        let (l0, l1) = ((low / 64) as usize, (high / 64) as usize + 2 * N + 3);
+        round_acc(
+            &mut pos[l0..l1],
+            &mut neg[l0..l1],
+            l1 - l0,
+            base + 64 * l0 as i64,
+        )
     })
 }
 
-/// Run `f` on a zeroed scratch of at least two [`window_dot`] accumulators
-/// sized to `N`.
+/// The rest of a [`window_dot`] whose term `first` left the window: the
+/// terms from `first` on are scanned and summed by the slot kernel, aligned
+/// to hold the window's partial sums `pos - neg` (bit 0 weighing
+/// 2^(base - 2P)) as well. The whole is the same exact integer, rounded
+/// once. `None` for a non-finite term or a span beyond the accumulator bound.
+#[cold]
+#[inline(never)]
+fn widen<'a, const N: usize>(
+    pos: &[u64],
+    neg: &[u64],
+    base: i64,
+    first: Pair<'a, N>,
+    rest: impl Iterator<Item = Pair<'a, N>> + Clone,
+) -> Option<MpFloat<N>> {
+    let terms = std::iter::once(first).chain(rest);
+    let (mut emin, mut emax) = (i64::MAX, i64::MIN);
+    for (x, y) in terms.clone() {
+        let k = (x.kind * y.kind).pow(2);
+        if k == BOTH {
+            let e = x.exponent as i64 + y.exponent as i64;
+            emin = emin.min(e);
+            emax = emax.max(e);
+        } else if k < FINITE {
+            return None;
+        }
+    }
+    // The window's sums fill `pos.len()` limbs from bit `base - lo`.
+    let lo = emin.min(base);
+    let hi = emax.max(base + 64 * (pos.len() as i64 - 2 * N as i64 - 2));
+    let len = acc_len::<N>(lo, hi)?;
+    let mut scratch = SCRATCH
+        .try_with(|s| s.try_borrow_mut().ok().map(|mut s| std::mem::take(&mut *s)))
+        .ok()??;
+    for acc in [&mut scratch.pos, &mut scratch.neg] {
+        acc.clear();
+        acc.resize(len, 0);
+    }
+    let (limb, shift) = (((base - lo) / 64) as usize, ((base - lo) % 64) as u32);
+    // SAFETY: `len` holds the window's limbs from `limb` and one shift slot.
+    unsafe {
+        add_shifted(scratch.pos.as_mut_ptr().add(limb), pos, shift);
+        add_shifted(scratch.neg.as_mut_ptr().add(limb), neg, shift);
+    }
+    let regular = terms.filter(|(x, y)| (x.kind * y.kind).pow(2) == BOTH);
+    add_terms(
+        &mut scratch.pos,
+        &mut scratch.neg,
+        lo,
+        len,
+        N <= INLINE_N,
+        regular,
+    );
+    let out = round_slots(&mut scratch.pos, &mut scratch.neg, lo);
+    let _ = SCRATCH.try_with(|s| {
+        if let Ok(mut slot) = s.try_borrow_mut() {
+            *slot = scratch;
+        }
+    });
+    out
+}
+
+/// Run `f` on a zeroed scratch of two [`window_dot`] accumulators and one
+/// product (`2N` limbs), sized to `N`.
 #[inline(always)]
 fn with_window<const N: usize, R>(f: impl FnOnce(&mut [u64]) -> R) -> R {
     const W: usize = 2 * WINDOW + 3;
     if N <= 4 {
-        f(&mut [0u64; 2 * (W + 8)])
+        f(&mut [0u64; 2 * (W + 8) + 8])
     } else if N <= 8 {
-        f(&mut [0u64; 2 * (W + 16)])
+        f(&mut [0u64; 2 * (W + 16) + 16])
     } else if N <= 16 {
-        f(&mut [0u64; 2 * (W + 32)])
+        f(&mut [0u64; 2 * (W + 32) + 32])
     } else {
-        f(&mut [0u64; 2 * (W + 2 * MAX_N)])
+        f(&mut [0u64; 2 * (W + 2 * MAX_N) + 2 * MAX_N])
     }
 }
 
@@ -1256,8 +1373,7 @@ impl<const N: usize> MpFloat<N> {
             }
         }
         let exponent = scale + shift + p as i64;
-        let (emin, emax) = unsafe { (mpfr::get_emin() as i64, mpfr::get_emax() as i64) };
-        if exponent < emin || exponent > emax {
+        if !Self::exponent_in_range(exponent) {
             // Overflow or underflow: MPFR's own rounding and range handling.
             let z = gmp::mpz_t {
                 alloc: n as _,

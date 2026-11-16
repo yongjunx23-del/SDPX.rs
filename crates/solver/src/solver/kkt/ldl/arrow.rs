@@ -2252,7 +2252,7 @@ fn class_terms<'a, T: FloatT>(
     leaves: &'a [Leaf<T>],
     j: usize,
     value: impl Fn(&'a Leaf<T>, usize) -> &'a T + Copy + 'a,
-) -> impl Iterator<Item = (&'a T, &'a T)> + 'a {
+) -> impl Iterator<Item = (&'a T, &'a T)> + Clone + 'a {
     classes
         .iter()
         .filter(move |class| class.position[j] != usize::MAX)

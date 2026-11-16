@@ -94,9 +94,13 @@ pub trait Scalar:
     fn cbrt(self) -> Self;
     fn mul_add(self, a: Self, b: Self) -> Self;
     /// Accumulate products in iterator order, rounding each FMA at this precision.
-    /// The default folds `mul_add`; owned high-precision types may reuse one
-    /// accumulator instead of producing a fresh result per product.
-    fn dot_fma<'a>(pairs: impl IntoIterator<Item = (&'a Self, &'a Self)>) -> Self {
+    /// The default folds `mul_add`; exactly accumulated types return the exact
+    /// sum rounded once and may read the (cloneable) terms twice.
+    fn dot_fma<'a, I>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a Self, &'a Self)>,
+        I::IntoIter: Clone,
+    {
         pairs
             .into_iter()
             .fold(Self::zero(), |acc, (x, y)| x.mul_add(*y, acc))
@@ -492,7 +496,11 @@ impl<const N: usize> MpFloat<N> {
     /// Dot product accumulated exactly and rounded once at this precision
     /// (see `exactdot`). Non-finite operands keep [`Self::dot_fma_chain`].
     #[inline]
-    pub fn dot_fma<'a>(pairs: impl IntoIterator<Item = (&'a Self, &'a Self)>) -> Self {
+    pub fn dot_fma<'a, I>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a Self, &'a Self)>,
+        I::IntoIter: Clone,
+    {
         exactdot::dot(pairs, |terms| Self::dot_fma_chain(terms))
     }
 
@@ -682,8 +690,27 @@ impl<const N: usize> MpFloat<N> {
             self.round_product(b, prod, e)
         })
     }
+    /// Whether `e` lies in MPFR's exponent range. Nothing in this workspace
+    /// narrows the default range ±(2^30 - 1), which holds every result of
+    /// the inline kernels; that is checked once per process, sparing two
+    /// thread-local reads per operation.
     #[inline]
     fn exponent_in_range(e: i64) -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+        const DEFAULT: i64 = (1 << 30) - 1;
+        static RANGE: AtomicU8 = AtomicU8::new(0);
+        if (-DEFAULT..=DEFAULT).contains(&e) {
+            match RANGE.load(Relaxed) {
+                1 => return true,
+                0 => {
+                    let default = unsafe {
+                        mpfr::get_emin() as i64 <= -DEFAULT && mpfr::get_emax() as i64 >= DEFAULT
+                    };
+                    RANGE.store(if default { 1 } else { 2 }, Relaxed);
+                }
+                _ => {}
+            }
+        }
         unsafe { mpfr::get_emin() as i64 <= e && e <= mpfr::get_emax() as i64 }
     }
     /// Normalize and round an exact `2N`-limb product to nearest-even.
@@ -905,8 +932,7 @@ impl<const N: usize> MpFloat<N> {
                 }
             }
             let exponent = scale + shift + p;
-            let (emin, emax) = unsafe { (mpfr::get_emin() as i64, mpfr::get_emax() as i64) };
-            if exponent < emin || exponent > emax {
+            if !Self::exponent_in_range(exponent) {
                 return None;
             }
             let kind = if negative {
@@ -1721,7 +1747,11 @@ impl<const N: usize> Scalar for MpFloat<N> {
             mpfr::fma(r, &x, &y, &z, ROUND);
         })
     }
-    fn dot_fma<'a>(pairs: impl IntoIterator<Item = (&'a Self, &'a Self)>) -> Self {
+    fn dot_fma<'a, I>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a Self, &'a Self)>,
+        I::IntoIter: Clone,
+    {
         MpFloat::dot_fma(pairs)
     }
     fn dot_slices(a: &[Self], b: &[Self]) -> Self {
