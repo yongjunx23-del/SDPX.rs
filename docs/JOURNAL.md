@@ -8,6 +8,74 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-16 — One-pass window kernel for every exact dot and one exponent-range check (kept, perf/onepass-dot-20261116); dE3 regression from the TRSM recursion of PR #20 (reverted)
+
+- Scope: the 2026-11-10 review work on `perf/svd-schur-20261109` was measured
+  on the Mac only and left uncommitted when PR #19 closed; its Ginv and
+  congruence-middle pieces are superseded on main by PRs #20–#23. This
+  branch ports the rest onto main `1986b91` (`6aebc86`):
+  - `Scalar::dot_fma` over any cloneable term sequence (strided, gathered)
+    tries the one-pass window kernel `dot_slices` had. A term outside the
+    window keeps the partial sums and continues in the slot kernel
+    (`widen`); rounding reads only the limbs the terms touched; one product
+    buffer serves a dot. Without BMI2/ADX the window is tried through 8 limbs
+    only. The value is the exact sum rounded once, as before.
+  - The inline scalar kernels check MPFR's exponent range once per process
+    (default ±(2^30 − 1), never narrowed here) instead of two thread-local
+    reads per operation.
+- Mac fast E2E: ising11/512 Solved/54, audit PASS (primal 1.31e-48, dual
+  2.41e-47, as base); csdr3/256 at 4 threads Solved/36, audit PASS.
+- x86 release ABBA (job 237117, node55, EPYC 7742, T=32, whole node, main
+  `1986b91` against `6aebc86`, medians of A B B A; every point bitwise
+  identical to main, peak RSS unchanged):
+
+  | Case | Main | One-pass | Change |
+  |---|---|---|---|
+  | 12_min 512, s_low | 82.39 s | 76.47 s | −7.2% |
+  | arch0 256, s_d15 | 19.99 s | 18.94 s | −5.3% |
+  | SDP_gpp124-1 256, s_d15 | 20.41 s | 19.15 s | −6.2% |
+  | dE3 256, s_d15 | 273.5 s | 262.8 s | −3.9% |
+
+  The x86 gains exceed the Mac's (arch0 −2.2%, 12_min −10.4% at 4
+  iterations there) as the 11-10 entry expected: the window kernel is
+  22–42% faster per term than the slots at 2–8 limbs with BMI2/ADX.
+- Observed: main's dE3 (273.5 s) was 20% above the Nov 8 lead (228 s on
+  node76). Mirrored bisection on node55 (job 237125, T=32, full solves):
+  `389a93e` 235.6/257.8 s, `cec03f3` 238.3/241.9 s, `88f5100` 270.9/272.0
+  s, `1986b91` 274.7/274.1 s; 80 iterations throughout. The step is in
+  `supernodal.factor` (189–192 → 221–224 s, inside it
+  `rns.gemm.shared_crt` 145–153 → 192–194 s), and the final point changes
+  with it. Of PRs #20–#23 only `3b7ebd1` changes rounding: it lets TRSM
+  blocks of 65–128 columns split once more when the residue product admits
+  the half update, so the supernodal fronts' `solve_unit_lower_t` runs
+  residue products where it took exact row dots. Its evidence was theta2 at
+  512 bits and four workers (−2.2%); PR #20 made no supernodal claim.
+- Reverted `3b7ebd1` (`4fb92cd`). Release ABBA against `6aebc86` (job 237128,
+  node55, medians; the node ran slower than in job 237117, so compare
+  within the job only):
+
+  | Case | `6aebc86` | `4fb92cd` | Change | Point |
+  |---|---|---|---|---|
+  | dE3 256, T=32 | 296.8 s | 256.3 s | −13.6% | = Nov 8 lead (`supernodal.factor` 228 → 190 s) |
+  | 12_min 512, T=32 | 80.16 s | 79.69 s | −0.6% | = Nov 8 lead |
+  | arch0 256, T=32 | 19.72 s | 19.81 s | +0.5% | unchanged |
+  | SDP_gpp124-1 256, T=32 | 20.06 s | 20.00 s | −0.3% | unchanged |
+  | theta1 512, T=4 | 1.66 s | 1.57 s | −5.4% | unchanged |
+
+  All Solved at unchanged iteration counts (80, 99, 35, 56, 17); peak RSS
+  in the leg spread.
+- Audits (`audit12.py`, 160 digits, compute node; jobs 237132/237133) of
+  the `4fb92cd` points: 12_min rel gap 9.77e-8, r_p 7.64e-25, r_d 2.44e-21;
+  dE3 rel gap 9.06e-8, r_p 1.54e-16, r_d 1.44e-9, PSD minima 3.2e-20 /
+  2.28e-16. Both equal the reference audits (journal 2026-11-07).
+- Decision: both kept. Against main the branch gives (two jobs, same node)
+  12_min −7.2%, gpp124-1 −6.2%, arch0 −5.3%, dE3 about −17%. Runs and
+  scripts: `~/projects/tbD-de3-20261107/runs/tbZo-{ab1-237117,bis1-237125,ab2-237128}`,
+  `tb-zo{1,2,3}.pbs`.
+- Open: the theta2 gain PR #20 measured for the recursion (−2.2% at four
+  workers) did not show on theta1 (−5.4% without it). A gate that keeps the
+  extra level off the supernodal fronts would need its own evidence.
+
 ## 2026-11-13 — Bootstrap workflow: dual feasibility jump (kept), `sdpx-bootstrap` post-processing, paper draft (feat/bootstrap-20261113)
 
 - Inputs (`~/.cache/sdpx-e2e/work/bootstrap-inputs`, `mkfeas.py`): ising11

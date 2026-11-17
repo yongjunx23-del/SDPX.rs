@@ -442,14 +442,14 @@ fn _csc_quad_form<T: FloatT>(M: &CscMatrix<T>, uplo: MatrixTriangle, y: &[T], x:
 /// rank-sharded sparse products use the same formula.
 pub(crate) fn wide_output<'a, T: FloatT + 'a>(
     y: T,
-    terms: impl Iterator<Item = (&'a T, &'a T)>,
+    terms: impl Iterator<Item = (&'a T, &'a T)> + Clone,
     a: T,
     one: T,
 ) -> T {
     fn with_head<'s, 'a: 's, T: FloatT + 'a>(
         head: &'s T,
         one: &'s T,
-        terms: impl Iterator<Item = (&'a T, &'a T)>,
+        terms: impl Iterator<Item = (&'a T, &'a T)> + Clone,
     ) -> T {
         T::dot_fma(std::iter::once((head, one)).chain(terms.map(|(p, q)| (p as &'s T, q as &'s T))))
     }

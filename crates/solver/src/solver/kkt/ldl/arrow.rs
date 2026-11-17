@@ -404,9 +404,8 @@ pub(super) fn ldl_rec<T: FloatT>(
 
 /// X·Lᵀ = B for X (`m × n`, overwriting B with leading dimension `ldb`), L
 /// unit lower of order `n` (its diagonal is not read): recursive halves of L
-/// with one exact product update between them. A residue-admitted half update
-/// lets blocks up to `REC_BASE` split once more; otherwise their rows of B
-/// solve independently by exact dots from their first nonzero
+/// with one exact product update between them; up to `REC_BASE` columns,
+/// rows of B solve independently by exact dots from their first nonzero
 /// column (`low`, at most `n`: the skipped entries stay exact zeros).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn solve_unit_lower_t<T: FloatT>(
@@ -420,8 +419,7 @@ pub(super) fn solve_unit_lower_t<T: FloatT>(
     ways: usize,
 ) {
     use sdpx_arithmetic::inner_parallel as ip;
-    if n <= REC_BASE && (n <= REC_BASE / 2 || !T::residue_product_applies(m, n.div_ceil(2), n / 2))
-    {
+    if n <= REC_BASE {
         let lr: Vec<T> = (0..n * n).map(|e| l[e / n + e % n * ldl]).collect();
         let mut rows = zeros(m * n, ways);
         let source = &*b;
@@ -2252,7 +2250,7 @@ fn class_terms<'a, T: FloatT>(
     leaves: &'a [Leaf<T>],
     j: usize,
     value: impl Fn(&'a Leaf<T>, usize) -> &'a T + Copy + 'a,
-) -> impl Iterator<Item = (&'a T, &'a T)> + 'a {
+) -> impl Iterator<Item = (&'a T, &'a T)> + Clone + 'a {
     classes
         .iter()
         .filter(move |class| class.position[j] != usize::MAX)
