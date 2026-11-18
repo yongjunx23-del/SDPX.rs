@@ -524,6 +524,8 @@ struct PsdBlock<T> {
     dense_indices: Vec<usize>,
     column_groups: Vec<Vec<usize>>,
     dense_representatives: Vec<usize>,
+    // Sorted (representative, alias) pairs; singleton coefficients need no entries.
+    coefficient_aliases: Vec<(usize, usize)>,
     coefficient_plan_valid: bool,
     dense_column_map: Vec<usize>,
     dense_vectors: Vec<T>,
