@@ -108,7 +108,7 @@ where
             }
         };
 
-        let (mut perm_kkt, mut perm_map) = crate::qdldl::permute_symmetric(KKT, &iperm);
+        let (perm_kkt, perm_map) = crate::qdldl::permute_symmetric::<true, _>(KKT, &iperm);
 
         //Permute the Dsigns to match the ordering to be used internally
         let mut perm_dsigns = vec![1_i8; Dsigns.len()];
@@ -129,8 +129,6 @@ where
             ..Default::default()
         };
         // -----------------------------
-
-        sort_csc_columns_with_map(&mut perm_kkt, &mut perm_map);
 
         let symbKKT = SymbolicSparseColMatRef::new_checked(
             perm_kkt.n,
@@ -308,54 +306,6 @@ where
         }
         self.pool = pool;
     }
-}
-
-// ---------------------------------------------------------------------
-// utility functions
-// ---------------------------------------------------------------------
-
-fn sort_csc_columns_with_map<T>(M: &mut CscMatrix<T>, map: &mut [usize])
-where
-    T: FloatT + faer_traits::RealField,
-{
-    // when we permute the KKT matrix into an upper triangular form, the
-    // data within each column is no long ordered by increasing row number.
-
-    // Fix that here, and update the map to reflect the new ordering
-
-    // we need to sort on the inverted map, then invert back
-    let mut imap = invperm(map);
-
-    // it is not obvious to me how to sort all three of the vectors
-    // M.nzvals, Mrowvals, and map together without allocating.
-    // Allocate a permutation vector for the whole thing, get sort
-    // indices for the rowvals columns, then permute everything
-    let mut perm = (0..M.nnz()).collect::<Vec<_>>();
-
-    for col in 0..M.n {
-        let start = M.colptr[col];
-        let end = M.colptr[col + 1];
-        perm[start..end].sort_by_key(|&k| M.rowval[k]);
-    }
-
-    let mut tmpT = vec![T::zero(); M.nzval.len()];
-    let mut tmpint = vec![0usize; M.nzval.len()];
-
-    tmpT.copy_from_slice(&M.nzval);
-    permute(&mut M.nzval, &tmpT, &perm);
-
-    tmpint.copy_from_slice(&M.rowval);
-    permute(&mut M.rowval, &tmpint, &perm);
-
-    tmpint.copy_from_slice(&imap);
-    permute(&mut imap, &tmpint, &perm);
-
-    // map = invperm(imap), but in place
-    for (i, j) in imap.iter().enumerate() {
-        map[*j] = i;
-    }
-
-    debug_assert!(M.check_format().is_ok());
 }
 
 // ---------------------------------------------------------------------
