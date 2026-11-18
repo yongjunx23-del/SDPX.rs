@@ -115,7 +115,13 @@ fn group_couples<T: FloatT>(
     t: usize,
 ) -> Vec<Vec<bool>> {
     let mut couples = vec![vec![false; t]; groups];
-    for j in 0..k.n {
+    // In an upper triangle no column before the first change of side
+    // can contain a leaf-to-border edge.
+    let prefix = owner
+        .iter()
+        .take_while(|&&g| (g == usize::MAX) == (owner[0] == usize::MAX))
+        .count();
+    for j in prefix..k.n {
         for &i in &k.rowval[k.colptr[j]..k.colptr[j + 1]] {
             match (owner[i], owner[j]) {
                 (x, usize::MAX) if x != usize::MAX => couples[x][local[j]] = true,
@@ -2433,12 +2439,26 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             return None;
         }
         let mut parent: Vec<usize> = (0..n).collect();
-        // Stored positive-positive entries (upper triangle with diagonal).
+        // The KKT is canonical upper CSC. A homogeneous prefix with the
+        // maximum entry count is one clique, including stored zeros.
+        let prefix = signs.iter().take_while(|&&s| s == signs[0]).count();
         let mut positive_entries = 0usize;
-        for j in 0..n {
+        let start = if signs[0] < 0 {
+            prefix
+        } else if k.colptr[prefix] as u128 == prefix as u128 * (prefix as u128 + 1) / 2 {
+            parent[..prefix].fill(0);
+            positive_entries = k.colptr[prefix];
+            prefix
+        } else {
+            0
+        };
+        for j in start..n {
+            if signs[j] < 0 {
+                continue;
+            }
             for q in k.colptr[j]..k.colptr[j + 1] {
                 let i = k.rowval[q];
-                if signs[i] > 0 && signs[j] > 0 {
+                if signs[i] > 0 {
                     positive_entries += 1;
                     let a = find(&mut parent, i);
                     let b = find(&mut parent, j);
@@ -2522,7 +2542,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
             // edges and the dense working-set estimate.
             let mut sizes: Vec<usize> = groups.iter().map(|g| g.len()).collect();
             sizes.sort_unstable();
-            let coupling = (0..n)
+            let coupling = (prefix..n)
                 .flat_map(|j| (k.colptr[j]..k.colptr[j + 1]).map(move |q| (k.rowval[q], j)))
                 .filter(|&(i, j)| signs[i] != signs[j])
                 .count();
