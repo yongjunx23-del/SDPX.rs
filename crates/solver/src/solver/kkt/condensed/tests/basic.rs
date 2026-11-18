@@ -2,6 +2,31 @@ use super::*;
 use crate::solver::core::ScalingStrategy;
 use sdpx_arithmetic::Bits128;
 
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn schur_positions_beyond_u32() {
+    let start = u32::MAX as usize + 17;
+    let mut high = Column {
+        index: 100_000,
+        entries: Vec::new(),
+        sparse: false,
+        schur_start: start,
+        schur_positions: vec![7],
+    };
+    let low = Column {
+        index: 11,
+        entries: Vec::new(),
+        sparse: false,
+        schur_start: 8,
+        schur_positions: vec![7],
+    };
+    // Either local column can have the higher global index after density sorting.
+    assert_eq!(high.schur_position(&low, 0), start + 7);
+    assert_eq!(low.schur_position(&high, 0), start + 7);
+    high.schur_positions.clear();
+    assert_eq!(high.schur_position(&low, 0), 5_000_050_011);
+}
+
 #[test]
 fn dense_panels_are_lazy_and_reused() {
     fn check<T: FloatT>(batched: bool) {
@@ -894,6 +919,11 @@ fn structural_psd_blocks_remain_sparse_with_global_equalities() {
     assert_eq!(solver.retained_A.nnz(), 4);
     let kkt = solver.reduced.kkt_matrix();
     assert_eq!(kkt.rowval[kkt.colptr[3]..kkt.colptr[4]], [2, 3]);
+    let Scaling::Psd(block) = &solver.blocks[1].scaling else {
+        unreachable!()
+    };
+    let cols = &block.columns;
+    assert_eq!(cols[1].schur_position(&cols[0], 0), kkt.colptr[3]);
 }
 
 #[test]
