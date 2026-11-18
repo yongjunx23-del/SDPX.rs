@@ -651,14 +651,19 @@ where
         a: &CscMatrix<T>,
         condensed: bool,
     ) -> Result<(), rayon::ThreadPoolBuildError> {
-        let assembly = condensed.then(|| self.psd_left_dot_terms(a)).flatten();
+        let needs_assembly_cost = condensed
+            && crate::solver::core::worker_budget(threads)
+                > cone_parallel::useful_width(&self.cones, Some(a.n), None);
+        let assembly = needs_assembly_cost
+            .then(|| self.psd_left_dot_terms(a))
+            .flatten();
         self.threading = ConeThreading::new(&self.cones, threads, Some((p, a)), assembly)?;
         Ok(())
     }
 
     /// Exact products of a condensed PSD Schur's left dots, Σ_b Σ_{a≤b}
-    /// nnz_a over each PSD cone's touching columns in order; `None` unless
-    /// every cone is PSD or nonnegative.
+    /// nnz_a over each PSD cone's touching columns in order. Retained
+    /// equalities and orthant rows contribute no PSD terms.
     fn psd_left_dot_terms(&self, a: &CscMatrix<T>) -> Option<u128> {
         let mut owner = vec![usize::MAX; a.m];
         let mut psd = 0;
@@ -668,9 +673,12 @@ where
                     owner[rows.clone()].fill(psd);
                     psd += 1;
                 }
-                SupportedCone::NonnegativeCone(_) => {}
+                SupportedCone::ZeroCone(_) | SupportedCone::NonnegativeCone(_) => {}
                 _ => return None,
             }
+        }
+        if psd < 2 {
+            return None;
         }
         let (mut running, mut count) = (vec![0u128; psd], vec![0u128; psd]);
         let (mut touched, mut terms) = (Vec::new(), 0u128);
