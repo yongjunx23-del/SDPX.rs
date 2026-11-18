@@ -295,10 +295,15 @@ impl<T: Scalar> Collective<T> for WorldCollective {
     fn reduce_sum_in_place(&self, site: usize, values: &mut [T]) -> Result<(), CollectiveError> {
         self.handshake(site, Operation::Sum, Some(values.len()), None)?;
         if values.len() >= self.0.size() {
-            // Every rank folds one slice (same rank order, same sums).
+            // All ranks agreed on the full length above. Fold bounded wire
+            // windows so large borders need neither a full matrix of staging
+            // bytes nor displacements larger than MPI's signed int.
             self.0.ensure_collective_thread();
-            self.0
-                .reduce_sum_slice(self.0.collective_site(site), values);
+            let width = T::wire_size().unwrap_or(1).max(1);
+            let window = ((32 << 20) / width).max(1);
+            for part in values.chunks_mut(window) {
+                self.0.reduce_sum_slice(self.0.collective_site(site), part);
+            }
             return Ok(());
         }
         let all = self.gather(site, values)?;

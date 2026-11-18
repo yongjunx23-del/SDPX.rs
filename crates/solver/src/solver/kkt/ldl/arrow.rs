@@ -3401,8 +3401,7 @@ impl<T: FloatT> ArrowLDLSolver<T> {
         let solver = self.fallback.as_mut().unwrap();
         // The fallback's internal permuted copy must observe the current
         // values, including the caller's temporary regularization shifts.
-        let indices: Vec<usize> = (0..self.rowval.len()).collect();
-        solver.update_values(&indices, &matrix.nzval);
+        solver.update_prefix(&matrix.nzval);
         solver.set_pool(self.pool.clone());
         // A failed fallback would keep its whole sparse factor for the rest
         // of the solve (Hubbard all3 at 128 bits: 6.2 GiB).

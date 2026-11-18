@@ -1055,6 +1055,7 @@ impl<T: FloatT> PsdBlock<T> {
             dense_indices,
             column_groups,
             dense_representatives,
+            coefficient_aliases: Vec::new(),
             coefficient_plan_valid: false,
             dense_column_map,
             dense_vectors: Vec::new(),
@@ -1123,11 +1124,8 @@ impl<T: FloatT> PsdBlock<T> {
         self.compute_schur_selected(values, false, &mut store, None);
     }
 
-    /// `schur[position] += entry` without contribution buffers. Wide dense
-    /// columns run on the pool, as in [`Self::compute_schur_packed`]: each
-    /// pair gets its single addition, so blocks added in turn keep the
-    /// serial bits (41-site Ising at 128 bits on a 16 GB host, whose buffers
-    /// exceed the parallel assembly budget: one thread for ~50 s per call).
+    /// Add one cone directly to the shared matrix. Within a cone, different
+    /// column pairs have different global positions. Cones still add in order.
     pub(super) fn add_schur(
         &mut self,
         values: &[T],
@@ -1135,29 +1133,53 @@ impl<T: FloatT> PsdBlock<T> {
         pool: Option<&rayon::ThreadPool>,
     ) {
         self.prepare_coefficients(values);
-        let wide =
-            self.sampled.is_none() && !self.dense_indices.is_empty() && T::precision_bits() > 53;
-        match pool.filter(|p| wide && p.current_num_threads() > 1) {
-            Some(pool) => {
-                let (this, n, target) = (&*self, self.Ginv.nrows(), PackedSchur::new(schur));
-                let ways = (pool.current_num_threads() / self.dense_indices.len()).max(1);
-                pool.install(|| {
-                    this.tiles(false).for_each(|tile| {
-                        with_block_work(n, |w: &mut BlockWork<T>| {
-                            this.schur_tile(
-                                values,
-                                false,
-                                tile,
-                                w,
-                                ways,
-                                &mut |_, _, position, v| target.add(position, v),
-                            )
-                        })
-                    })
-                });
-            }
-            None => self.compute_schur(values, |_, _, position, v| schur[position] += v),
+        if self.use_batched_columns() {
+            self.compute_schur_dense_batched(values, false, |_, _, k, v| schur[k] += v, pool);
+        } else if let Some(pool) = self.tile_pool(pool, false) {
+            let target = PackedSchur::new(schur);
+            self.parallel_schur_tiles(values, false, pool, |_, _, k, v| target.add(k, v));
+        } else {
+            self.compute_schur(values, |_, _, k, v| schur[k] += v);
         }
+    }
+
+    fn use_batched_columns(&self) -> bool {
+        self.sampled.is_none()
+            && !self.dense_indices.is_empty()
+            && T::precision_bits() <= 53
+            && (self.svec_len() as u128) * (self.dense_indices.len() as u128) <= (1u128 << 26)
+    }
+
+    fn tile_pool<'a>(
+        &self,
+        pool: Option<&'a rayon::ThreadPool>,
+        skip_sparse: bool,
+    ) -> Option<&'a rayon::ThreadPool> {
+        pool.filter(|p| {
+            self.sampled.is_none()
+                && p.current_num_threads() > 1
+                && (!self.dense_indices.is_empty() || (!skip_sparse && self.columns.len() >= 128))
+        })
+    }
+
+    fn parallel_schur_tiles(
+        &self,
+        values: &[T],
+        skip_sparse: bool,
+        pool: &rayon::ThreadPool,
+        store: impl Fn(usize, usize, usize, T) + Sync,
+    ) {
+        let n = self.Ginv.nrows();
+        let ways = (pool.current_num_threads() / self.dense_indices.len().max(1)).max(1);
+        pool.install(|| {
+            self.tiles(skip_sparse).for_each(|tile| {
+                with_block_work(n, |w: &mut BlockWork<T>| {
+                    self.schur_tile(values, skip_sparse, tile, w, ways, &mut |b, a, k, v| {
+                        store(b, a, k, v)
+                    })
+                })
+            })
+        });
     }
 
     // A and column classifications are immutable between explicit updates.
@@ -1205,6 +1227,14 @@ impl<T: FloatT> PsdBlock<T> {
             }
         }
 
+        self.coefficient_aliases.clear();
+        self.coefficient_aliases.extend(
+            self.dense_representatives
+                .iter()
+                .enumerate()
+                .filter_map(|(column, &rep)| (rep != column).then_some((rep, column))),
+        );
+        self.coefficient_aliases.sort_unstable();
         self.dense_indices.clear();
         self.dense_indices.extend(
             self.columns
@@ -1278,11 +1308,7 @@ impl<T: FloatT> PsdBlock<T> {
         // scalar anyway and the svec_n × dense_count workspace is far more
         // expensive in wide arithmetic.
         self.prepare_coefficients(values);
-        let dense_count = self.dense_indices.len();
-        let batched = dense_count > 0
-            && T::precision_bits() <= 53
-            && (self.svec_len() as u128) * (dense_count as u128) <= (1u128 << 26);
-        if batched {
+        if self.use_batched_columns() {
             self.compute_schur_dense_batched(values, skip_sparse, &mut store, pool);
             return;
         }
@@ -1348,11 +1374,16 @@ impl<T: FloatT> PsdBlock<T> {
                 used += 1;
             }
             // Stream one transform per exact representative at every precision.
-            for target in 0..=b {
-                if self.dense_representatives[target] == b {
-                    w.targets.push((slot, target));
-                }
-            }
+            let first = self
+                .coefficient_aliases
+                .partition_point(|&(rep, _)| rep < b);
+            w.targets.extend(
+                self.coefficient_aliases[first..]
+                    .iter()
+                    .take_while(|&&(rep, _)| rep == b)
+                    .map(|&(_, alias)| (slot, alias)),
+            );
+            w.targets.push((slot, b));
         }
         let Some(last) = w.targets.iter().map(|&(_, target)| target).max() else {
             return;
@@ -1568,12 +1599,7 @@ impl<T: FloatT> PsdBlock<T> {
         pool: Option<&rayon::ThreadPool>,
     ) {
         self.prepare_coefficients(values);
-        let dense_count = self.dense_indices.len();
-        let batched = self.sampled.is_none()
-            && dense_count > 0
-            && T::precision_bits() <= 53
-            && (self.svec_len() as u128) * (dense_count as u128) <= (1u128 << 26);
-        if batched {
+        if self.use_batched_columns() {
             let mut sink: SchurSink<'_, fn(usize, usize, usize, T), T> =
                 SchurSink::Packed(PackedSchur::new(out));
             self.compute_schur_dense_dispatch(values, skip_sparse, &mut sink, pool);
@@ -1581,22 +1607,9 @@ impl<T: FloatT> PsdBlock<T> {
         }
         // Sampled and wide-precision blocks keep the closure path.
         let packed = PackedSchur::new(out);
-        // Wide dense columns: one n³ congruence each, in Schur tiles on the
-        // pool. Each representative writes its own pairs, so values are
-        // unchanged.
-        if let Some(pool) = pool
-            .filter(|p| self.sampled.is_none() && dense_count > 0 && p.current_num_threads() > 1)
-        {
-            let (this, n) = (&*self, self.Ginv.nrows());
-            let ways = (pool.current_num_threads() / dense_count).max(1);
-            pool.install(|| {
-                this.tiles(skip_sparse).for_each(|tile| {
-                    with_block_work(n, |w: &mut BlockWork<T>| {
-                        this.schur_tile(values, skip_sparse, tile, w, ways, &mut |t, a, _, v| {
-                            packed.write(t, a, v)
-                        })
-                    })
-                })
+        if let Some(pool) = self.tile_pool(pool, skip_sparse) {
+            self.parallel_schur_tiles(values, skip_sparse, pool, |b, a, _, v| {
+                packed.write(b, a, v)
             });
             return;
         }
