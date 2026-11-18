@@ -1,6 +1,6 @@
 # SDPX development plan
 
-Updated 2026-10-30. [AGENTS.md](AGENTS.md) defines working rules and numerical
+Updated 2026-11-18. [AGENTS.md](AGENTS.md) defines working rules and numerical
 contracts; [architecture](docs/ARCHITECTURE.md) defines modules/backends.
 [Journal](docs/JOURNAL.md) holds full timings, job histories, source hashes,
 failed attempts and audit evidence. This file keeps goals, current state,
@@ -21,6 +21,16 @@ feasibility pair 39 → 30 iterations), and `sdpx-bootstrap` provides
 scans set tol_infeas_abs/rel and tol_ktratio to the scan threshold (allowed
 point 67 → 43 iterations at 1e-30). Open: Λ19/27 pairs on the cluster,
 cheaper jump checks, checkpoints for partitioned solves. Journal 2026-11-13.
+
+## Full square lattice activity models
+
+Use the complete 41-, 61- and 85-site activity models for square4, square5 and square6. At 108 physical cores compare Float64 with MOSEK and MPFR128 with SDPA-GMP-OMP. Record the formulation, original coefficient hashes, arithmetic, stopping thresholds, original bound checks, optimizer and process times, and per-rank peak memory.
+
+1. For square4 use the original-coordinate corrected-gap threshold of 1e-5. Compute stationarity with outward rounding on the serialized data for high-precision points. At 108 cores interleave pages across the NUMA domains containing the assigned CPUs. Preserve the solver defaults for other topologies.
+2. For square5 keep the complete dense primal triangle in the final KKT and use faer's native permutation. Dense packed positions and sparse CSC column starts use machine words, with four-byte offsets inside each sparse column. The remaining Float64 hotspot is numerical LDL. The first positive step fits within 207 GiB per process at 1 × 108 and 2 × 54. Compare the next factor implementation against those timings, checkpoint iteration 1 for its original-coordinate residual, and validate both converged bounds. The iteration-limited CLI exported its best earlier point. Keep Schur and refactor timings separate.
+3. For MPFR128 and square6, make factor storage local to its owning rank, including the Schur tiles and numerical factor workspace. First demonstrate this ownership on square5 with the original inputs and the same total cores. Check the per-rank storage bound before materializing square6. Evaluate matrix-free products against the exact explicit operator if its minimum storage exceeds the allocation.
+
+The journal records direct and matrix-variable MOSEK results, the installed SDPA entry-count limit, and the distributed assembly trial.
 
 ## Goals
 
