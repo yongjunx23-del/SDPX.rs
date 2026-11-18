@@ -1603,22 +1603,22 @@ impl<T: FloatT> Leaf<T> {
             } else {
                 1
             };
-            let mut columns: Vec<&mut [T]> = self
-                .y
-                .chunks_mut(width)
-                .enumerate()
-                .filter(|(j, _)| packed || couples[*j])
-                .map(|(_, column)| column)
-                .collect();
-            let mut x = Vec::with_capacity(width * columns.len().min(Y_PANEL));
-            for panel in columns.chunks_mut(Y_PANEL) {
-                x.clear();
-                for column in panel.iter() {
-                    x.extend_from_slice(column);
-                }
-                factor.forward_panel_rows(&mut x, start, 0..width, ways);
-                for (column, solved) in panel.iter_mut().zip(x.chunks(width)) {
-                    column.copy_from_slice(solved);
+            let mut scratch = Vec::new();
+            for (panel, columns) in self.coupled.chunks(Y_PANEL).enumerate() {
+                let first = if packed { panel * Y_PANEL } else { columns[0] };
+                if packed || columns[columns.len() - 1] - first == columns.len() - 1 {
+                    let y = &mut self.y[first * width..(first + columns.len()) * width];
+                    factor.forward_panel_rows(y, start, 0..width, ways);
+                } else {
+                    scratch.clear();
+                    scratch.reserve(width * columns.len());
+                    for &j in columns {
+                        scratch.extend_from_slice(&self.y[j * width..(j + 1) * width]);
+                    }
+                    factor.forward_panel_rows(&mut scratch, start, 0..width, ways);
+                    for (&j, solved) in columns.iter().zip(scratch.chunks(width)) {
+                        self.y[j * width..(j + 1) * width].copy_from_slice(solved);
+                    }
                 }
             }
         } else if split && width > 0 && posted {
