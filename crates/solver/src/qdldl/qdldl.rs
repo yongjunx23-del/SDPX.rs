@@ -367,7 +367,7 @@ fn _qdldl_new<T: FloatT>(
 
     //permute to (another) upper triangular matrix and store the
     //index mapping the input's entries to the permutation's entries
-    let (A, AtoPAPt) = permute_symmetric::<false, _>(Ain, &iperm);
+    let (A, AtoPAPt) = permute_symmetric(Ain, &iperm);
 
     // handle the (possibly permuted) vector of
     // diagonal D signs if one was specified.  Otherwise
@@ -1261,7 +1261,7 @@ fn _invperm(p: &[usize]) -> Result<Vec<usize>, QDLDLError> {
 // Given a sparse symmetric matrix `A` (with only upper triangular entries), return
 // permuted sparse symmetric matrix `P` (also only upper triangular) given the
 // inverse permutation vector `iperm`."
-pub(crate) fn permute_symmetric<const SORTED: bool, T: FloatT>(
+pub(crate) fn permute_symmetric<T: FloatT>(
     A: &CscMatrix<T>,
     iperm: &[usize],
 ) -> (CscMatrix<T>, Vec<usize>) {
@@ -1272,7 +1272,7 @@ pub(crate) fn permute_symmetric<const SORTED: bool, T: FloatT>(
     // we will record a mapping of entries from A to PAPt
     let mut AtoPAPt = vec![0; A.nnz()];
 
-    _permute_symmetric_inner::<SORTED, _>(
+    _permute_symmetric_inner(
         A,
         &mut AtoPAPt,
         iperm,
@@ -1280,16 +1280,13 @@ pub(crate) fn permute_symmetric<const SORTED: bool, T: FloatT>(
         &mut P.colptr,
         &mut P.nzval,
     );
-    if SORTED {
-        debug_assert!(P.check_format().is_ok());
-    }
     (P, AtoPAPt)
 }
 
 // the main function without extra argument checks
 // following the book: Timothy Davis - Direct Methods for Sparse Linear Systems
 
-fn _permute_symmetric_inner<const SORTED: bool, T: FloatT>(
+fn _permute_symmetric_inner<T: FloatT>(
     A: &CscMatrix<T>,
     AtoPAPt: &mut [usize],
     iperm: &[usize],
@@ -1349,34 +1346,15 @@ fn _permute_symmetric_inner<const SORTED: bool, T: FloatT>(
                 // find next free location in rowval (this results in unordered columns in the rowval)
                 let rowP_idx = row_starts[col_idx];
 
-                if SORTED {
-                    // Until this column is sorted, the row slot holds its
-                    // source entry and the source map holds its final row.
-                    Pr[rowP_idx] = rowA_idx;
-                    AtoPAPt[rowA_idx] = min(colP, rowP);
-                } else {
-                    Pr[rowP_idx] = min(colP, rowP);
-                    Pv[rowP_idx] = Av[rowA_idx];
-                    AtoPAPt[rowA_idx] = rowP_idx;
-                }
+                // store rowval and nzval
+                Pr[rowP_idx] = min(colP, rowP);
+                Pv[rowP_idx] = Av[rowA_idx];
+
+                //record this into the mapping vector
+                AtoPAPt[rowA_idx] = rowP_idx;
 
                 // increment next free location
                 row_starts[col_idx] += 1;
-            }
-        }
-    }
-    if SORTED {
-        for span in Pc.windows(2) {
-            let start = span[0];
-            let rows = &mut Pr[start..span[1]];
-            rows.sort_unstable_by_key(|&source| AtoPAPt[source]);
-            // The source entries of different columns are disjoint. Once
-            // sorted, each temporary map slot can become the update index.
-            for (i, row) in rows.iter_mut().enumerate() {
-                let source = *row;
-                *row = AtoPAPt[source];
-                Pv[start + i] = Av[source];
-                AtoPAPt[source] = start + i;
             }
         }
     }

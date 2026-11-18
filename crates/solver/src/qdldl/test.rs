@@ -133,7 +133,7 @@ fn test_permute_symmetric() {
     //no permutation at all
     let A = test_matrix_4x4();
     let iperm: Vec<usize> = vec![0, 1, 2, 3];
-    let (P, AtoPAPt) = permute_symmetric::<false, _>(&A, &iperm);
+    let (P, AtoPAPt) = permute_symmetric(&A, &iperm);
 
     assert_eq!(&A.colptr, &P.colptr);
     assert_eq!(&A.rowval, &P.rowval);
@@ -156,25 +156,11 @@ fn test_permute_symmetric() {
 
     let perm: Vec<usize> = vec![2, 3, 0, 1];
     let iperm = _invperm(&perm).unwrap();
-    let (P, _) = permute_symmetric::<false, _>(&A, &iperm);
+    let (P, _) = permute_symmetric(&A, &iperm);
 
     assert_eq!(&P.colptr, &vec![0, 1, 3, 5, 8]);
     assert_eq!(&P.rowval, &vec![0, 0, 1, 2, 0, 2, 3, 0]);
     assert_eq!(&P.nzval, &vec![6.0, 7.0, 8.0, 1.0, 4.0, 2.0, 3.0, 5.0]);
-
-    // Faer consumes the same entries in sorted rows and updates them by source.
-    let (sorted, map) = permute_symmetric::<true, _>(&A, &iperm);
-    assert_eq!(sorted.colptr, P.colptr);
-    assert!(sorted.check_format().is_ok());
-    for j in 0..A.n {
-        for k in A.colptr[j]..A.colptr[j + 1] {
-            let i = iperm[A.rowval[k]];
-            let col = i.max(iperm[j]);
-            assert!((sorted.colptr[col]..sorted.colptr[col + 1]).contains(&map[k]));
-            assert_eq!(sorted.rowval[map[k]], i.min(iperm[j]));
-            assert_eq!(sorted.nzval[map[k]], A.nzval[k]);
-        }
-    }
 }
 
 #[test]

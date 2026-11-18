@@ -4,14 +4,11 @@ use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
 
 use faer::{
     linalg::cholesky::ldlt::factor::{LdltParams, LdltRegularization},
+    perm::PermRef,
     sparse::{
-        linalg::{
-            amd::Control,
-            cholesky::{
-                factorize_symbolic_cholesky, CholeskySymbolicParams, LdltRef, SymbolicCholesky,
-                SymmetricOrdering,
-            },
-            SupernodalThreshold,
+        linalg::cholesky::{
+            factorize_symbolic_cholesky, CholeskySymbolicParams, LdltRef, SymbolicCholesky,
+            SymmetricOrdering,
         },
         SparseColMatRef, SymbolicSparseColMatRef,
     },
@@ -47,21 +44,10 @@ where
 }
 
 pub struct FaerDirectLDLSolver<T: FloatT + faer_traits::RealField> {
-    // we will pre-permute the KKT matrix and factor it inside faer with
-    // an identity permutation.   This means we will also need to store
-    // the mapping from the original ordering to the permuted ordering
-    // for both the KKT matrix and the Dsigns, and will need to permute
-    // the rhs and solution vectors accordingly
-    perm: Vec<usize>,
-    iperm: Vec<usize>,
-
-    // permuted KKT matrix
-    perm_kkt: CscMatrix<T>,
-    perm_map: Vec<usize>,
-    perm_dsigns: Vec<i8>,
-
-    // space for permuted LHS/RHS when solving
-    bperm: Vec<T>,
+    // Mutable coefficients follow the caller's CSC order. Faer applies the
+    // AMD permutation as it packs the triangle its numeric kernel requires.
+    values: Vec<T>,
+    signs: Vec<i8>,
 
     // regularizer parameters captured from settings
     regularizer_params: FaerLDLRegularizerParams<T>,
@@ -108,41 +94,18 @@ where
             }
         };
 
-        let (perm_kkt, perm_map) = crate::qdldl::permute_symmetric::<true, _>(KKT, &iperm);
-
-        //Permute the Dsigns to match the ordering to be used internally
-        let mut perm_dsigns = vec![1_i8; Dsigns.len()];
-        permute(&mut perm_dsigns, Dsigns, &perm);
-
-        // the amd_params will not be used by faer even though
-        // we put them into CholeskySymbolicParams, provided
-        // that my ordering is SymmetricOrdering::Identity
-
-        let amd_params = Control {
-            ..Default::default()
-        };
-
-        let supernodal_flop_ratio_threshold = SupernodalThreshold::AUTO;
-        let cholesky_params = CholeskySymbolicParams {
-            supernodal_flop_ratio_threshold,
-            amd_params,
-            ..Default::default()
-        };
-        // -----------------------------
-
-        let symbKKT = SymbolicSparseColMatRef::new_checked(
-            perm_kkt.n,
-            perm_kkt.n,
-            &perm_kkt.colptr,
+        let symbolic = SymbolicSparseColMatRef::new_unsorted_checked(
+            KKT.n,
+            KKT.n,
+            &KKT.colptr,
             None,
-            &perm_kkt.rowval,
+            &KKT.rowval,
         );
-
         let symbolic_cholesky = factorize_symbolic_cholesky(
-            symbKKT,
+            symbolic,
             Side::Upper,
-            SymmetricOrdering::Identity,
-            cholesky_params,
+            SymmetricOrdering::Custom(PermRef::new_checked(&perm, &iperm, KKT.n)),
+            CholeskySymbolicParams::default(),
         )
         .unwrap();
 
@@ -163,15 +126,9 @@ where
         let req = StackReq::any_of(&[req_factor, req_solve]);
         let work = MemBuffer::new(req);
 
-        let bperm = vec![T::zero(); perm_kkt.n];
-
         Self {
-            perm,
-            iperm,
-            perm_kkt,
-            perm_map,
-            perm_dsigns,
-            bperm,
+            values: KKT.nzval.clone(),
+            signs: Dsigns.to_vec(),
             regularizer_params,
             ldlt_params,
             symbolic_cholesky,
@@ -192,8 +149,8 @@ where
             name: "faer".to_string(),
             threads: self.parallelism.degree(),
             direct: true,
-            nnzA: self.perm_kkt.nnz(),
-            nnzL: self.ld_vals.len() - self.perm_kkt.n,
+            nnzA: self.values.len(),
+            nnzL: self.ld_vals.len() - self.symbolic_cholesky.nrows(),
         }
     }
 }
@@ -203,36 +160,24 @@ where
     T: FloatT + faer_traits::RealField,
 {
     fn update_values(&mut self, index: &[usize], values: &[T]) {
-        // this is replicating the update_values function in qdldl
-        let nzval = &mut self.perm_kkt.nzval; // post perm internal data
-        let AtoPAPt = &self.perm_map; //mapping from input matrix entries
-
-        for (i, &idx) in index.iter().enumerate() {
-            nzval[AtoPAPt[idx]] = values[i];
+        for (&i, &v) in index.iter().zip(values) {
+            self.values[i] = v;
         }
     }
 
     fn update_prefix(&mut self, values: &[T]) {
-        for (&dst, &v) in self.perm_map.iter().zip(values) {
-            self.perm_kkt.nzval[dst] = v;
-        }
+        self.values[..values.len()].copy_from_slice(values);
     }
 
     fn scale_values(&mut self, index: &[usize], scale: T) {
-        // this is replicating the scale_values function in qdldl
-        let nzval = &mut self.perm_kkt.nzval; // post perm internal data
-        let AtoPAPt = &self.perm_map; //mapping from input matrix entries
-
-        for &idx in index.iter() {
-            nzval[AtoPAPt[idx]] *= scale;
+        for &i in index {
+            self.values[i] *= scale;
         }
     }
 
     fn solve(&mut self, _kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T]) {
-        // NB: faer solves in place.  Permute b to match the ordering used internally
-        permute(&mut self.bperm, b, &self.perm);
-
-        let rhs = MatMut::from_column_major_slice_mut(&mut self.bperm[0..], b.len(), 1);
+        x.copy_from_slice(b);
+        let rhs = MatMut::from_column_major_slice_mut(x, b.len(), 1);
         let ldlt = LdltRef::new(&self.symbolic_cholesky, self.ld_vals.as_slice());
 
         let solve = || {
@@ -247,28 +192,16 @@ where
             Some(pool) => pool.install(solve),
             None => solve(),
         }
-
-        // bperm is now the solution, permute it back to the original ordering
-        permute(x, &self.bperm, &self.iperm);
     }
 
-    fn refactor(&mut self, _kkt: &CscMatrix<T>) -> bool {
-        // SAFETY: new() checked this sorted CSC structure. Only nzval is
-        // modified after construction; colptr, rowval and dimensions stay fixed.
-        let symbKKT = unsafe {
-            SymbolicSparseColMatRef::new_unchecked(
-                self.perm_kkt.n,
-                self.perm_kkt.n,
-                &self.perm_kkt.colptr,
-                None,
-                &self.perm_kkt.rowval,
-            )
+    fn refactor(&mut self, kkt: &CscMatrix<T>) -> bool {
+        // SAFETY: constructor checked this fixed CSC structure. Numeric
+        // updates change only coefficients and never the input pattern.
+        let symbolic = unsafe {
+            SymbolicSparseColMatRef::new_unchecked(kkt.n, kkt.n, &kkt.colptr, None, &kkt.rowval)
         };
-
-        let a: SparseColMatRef<usize, T> =
-            SparseColMatRef::new(symbKKT, self.perm_kkt.nzval.as_slice());
-
-        let regularizer = self.regularizer_params.to_faer(&self.perm_dsigns);
+        let a = SparseColMatRef::new(symbolic, &self.values);
+        let regularizer = self.regularizer_params.to_faer(&self.signs);
 
         let mut factorize = || {
             self.symbolic_cholesky
@@ -301,7 +234,12 @@ where
             let req_solve = self
                 .symbolic_cholesky
                 .solve_in_place_scratch::<T>(1, parallelism);
-            self.work = MemBuffer::new(StackReq::any_of(&[req_factor, req_solve]));
+            let req = StackReq::any_of(&[req_factor, req_solve]);
+            if !MemStack::new(&mut self.work).can_hold(req) {
+                // Release the old factor workspace before acquiring the larger one.
+                self.work = MemBuffer::new(StackReq::empty());
+                self.work = MemBuffer::new(req);
+            }
             self.parallelism = parallelism;
         }
         self.pool = pool;
@@ -329,13 +267,7 @@ fn test_faer_ldl() {
     let mut x = vec![0.0; 6];
     let mut b = vec![1.0, 2.0, 3.0, 4., 5., 6.];
 
-    // check that the permuted values are in what should be natural order
-    let nzval = &solver.perm_kkt.nzval; // post perm internal data
-    let AtoPAPt = &solver.perm_map; //mapping from input matrix entries
-
-    for i in 0..nzval.len() {
-        assert_eq!(KKT.nzval[i], nzval[AtoPAPt[i]]);
-    }
+    assert_eq!(solver.values, KKT.nzval);
 
     solver.refactor(&KKT);
     solver.solve(&KKT, &mut x, &mut b);

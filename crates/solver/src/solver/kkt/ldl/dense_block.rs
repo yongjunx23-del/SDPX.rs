@@ -220,8 +220,7 @@ impl DenseBlockSolver {
         solver.set_pool(self.pool.clone());
         // Fallback can be dormant across many dense updates. Synchronize all
         // current values, including the caller's temporary static shift.
-        let indices: Vec<_> = (0..k.nzval.len()).collect();
-        solver.update_values(&indices, &k.nzval);
+        solver.update_prefix(&k.nzval);
         solver.refactor(k)
     }
 }
