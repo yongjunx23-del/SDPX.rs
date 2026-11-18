@@ -248,6 +248,12 @@ where
         }
     }
 
+    pub(crate) fn update_prefix(&mut self, values: &[T]) {
+        for (&dst, &v) in self.workspace.AtoPAPt.iter().zip(values) {
+            self.workspace.triuA.nzval[dst] = v;
+        }
+    }
+
     /// Update a subset of the values of the matrix to be (re)factored.  See [`refactor`](crate::qdldl::QDLDLFactorisation::refactor)
     ///
     pub fn scale_values(&mut self, indices: &[usize], scale: T) {

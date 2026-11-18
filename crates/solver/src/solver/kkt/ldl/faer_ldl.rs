@@ -214,6 +214,12 @@ where
         }
     }
 
+    fn update_prefix(&mut self, values: &[T]) {
+        for (&dst, &v) in self.perm_map.iter().zip(values) {
+            self.perm_kkt.nzval[dst] = v;
+        }
+    }
+
     fn scale_values(&mut self, index: &[usize], scale: T) {
         // this is replicating the scale_values function in qdldl
         let nzval = &mut self.perm_kkt.nzval; // post perm internal data

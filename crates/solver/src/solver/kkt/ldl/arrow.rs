@@ -3559,6 +3559,7 @@ impl<T: FloatT> HasLinearSolverInfo for Negated<T> {
 // caller's value updates need no routing.
 impl<T: FloatT> DirectLDLSolver<T> for Negated<T> {
     fn update_values(&mut self, _index: &[usize], _values: &[T]) {}
+    fn update_prefix(&mut self, _values: &[T]) {}
 
     fn scale_values(&mut self, _index: &[usize], _scale: T) {}
 
@@ -3706,6 +3707,12 @@ impl<T: FloatT> DirectLDLSolver<T> for ArrowLDLSolver<T> {
             self.value_plans.clear();
         }
         self.value_plans.push(plan);
+    }
+
+    fn update_prefix(&mut self, values: &[T]) {
+        if self.local_structure.is_some() {
+            self.update_entries(0..values.len(), |i, dst| *dst = values[i]);
+        }
     }
 
     fn scale_values(&mut self, index: &[usize], scale: T) {

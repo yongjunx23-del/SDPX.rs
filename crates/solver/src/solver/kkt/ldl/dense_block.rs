@@ -520,6 +520,8 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
     // Refactor reads the caller's complete KKT, including temporary shifts.
     // A dormant sparse fallback is synchronized there before factorization.
     fn update_values(&mut self, _indices: &[usize], _values: &[f64]) {}
+    fn update_prefix(&mut self, _values: &[f64]) {}
+
     fn scale_values(&mut self, _indices: &[usize], _scale: f64) {}
     fn set_pool(&mut self, pool: Option<Arc<rayon::ThreadPool>>) {
         if let Some(solver) = &mut self.fallback {

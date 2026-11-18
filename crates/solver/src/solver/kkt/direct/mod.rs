@@ -4,11 +4,24 @@ mod datamaps;
 mod kkt_assembly;
 mod solver;
 use datamaps::*;
-use kkt_assembly::*;
+pub(super) use kkt_assembly::KktPrimal;
+use kkt_assembly::{allocate_kkt_Hsblocks, assemble_kkt_matrix};
 pub use solver::*;
 
 pub trait DirectLDLSolver<T: FloatT>: HasLinearSolverInfo {
     fn update_values(&mut self, index: &[usize], values: &[T]);
+    /// Publish a contiguous primal block. Backends that reorder the matrix
+    /// can consume the corresponding prefix of their permutation directly.
+    fn update_prefix(&mut self, values: &[T]) {
+        let mut indices = [0; 256];
+        for (chunk, values) in values.chunks(indices.len()).enumerate() {
+            let start = chunk * indices.len();
+            for (offset, index) in indices[..values.len()].iter_mut().enumerate() {
+                *index = start + offset;
+            }
+            self.update_values(&indices[..values.len()], values);
+        }
+    }
     fn scale_values(&mut self, index: &[usize], scale: T);
     fn solve(&mut self, kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T]);
     /// Column-major RHS panel, sharing the current factors. Backends may fuse

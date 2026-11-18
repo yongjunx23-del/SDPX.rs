@@ -6,7 +6,10 @@
 //! uses the original augmented operator, not the regularized Schur matrix.
 #![allow(non_snake_case)]
 
-use super::{direct::DirectLDLKKTSolver, HasLinearSolverInfo, KKTSolver, LinearSolverInfo};
+use super::{
+    direct::{DirectLDLKKTSolver, KktPrimal},
+    HasLinearSolverInfo, KKTSolver, LinearSolverInfo,
+};
 use crate::algebra::*;
 use crate::solver::{cones::*, core::CoreSettings};
 use crate::solver::{SampledOperator, SampledSchurWorkspace, SampledWorkspace};
@@ -162,6 +165,94 @@ pub(crate) fn parallel_assembly_budget_bytes() -> usize {
             (b / 8).min(usize::MAX as u64) as usize
         })
     })
+}
+
+/// A full-column PSD block proves the primal triangle is dense. Otherwise
+/// build the exact column union, stopping after its count if it is dense.
+fn sparse_schur_pattern<T: FloatT>(
+    P: &CscMatrix<T>,
+    blocks: &[Block<T>],
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    let n = P.n;
+    if blocks
+        .iter()
+        .any(|b| matches!(&b.scaling, Scaling::Psd(p) if p.columns.len() == n))
+    {
+        return None;
+    }
+    // Exact structural union. Each PSD block couples its active columns;
+    // each orthant coordinate couples only columns touching that row.
+    // Global equality rows do not turn independent primal blocks dense.
+    // Every PSD block's column set and every orthant row is a clique; P adds
+    // its own lower pattern. Column j gathers rows i <= j of the cliques it
+    // belongs to, stamped for dedup and sorted.
+    let mut cliques: Vec<Vec<usize>> = Vec::new();
+    for block in blocks {
+        match &block.scaling {
+            Scaling::Psd(p) => cliques.push(p.columns.iter().map(|c| c.index).collect()),
+            Scaling::Orthant { rows, .. } => {
+                cliques.extend(rows.iter().map(|row| row.iter().map(|&(j, _)| j).collect()))
+            }
+            Scaling::SocElim { rows, .. } => {
+                let mut union: Vec<usize> = rows.iter().flatten().map(|&(j, _)| j).collect();
+                union.sort_unstable();
+                union.dedup();
+                cliques.push(union);
+            }
+            _ => {}
+        }
+    }
+    let mut column_cliques: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for (c, clique) in cliques.iter_mut().enumerate() {
+        clique.sort_unstable();
+        for &j in clique.iter() {
+            column_cliques[j].push(c as u32);
+        }
+    }
+    // Two passes: count, then fill an exactly sized `rowval` (the Schur
+    // pattern is the largest setup array; no doubling slack at the peak).
+    let mut stamp = vec![usize::MAX; n];
+    let mut colptr = vec![0; n + 1];
+    let mut rowval = Vec::new();
+    for fill in [false, true] {
+        if fill {
+            if colptr[n] == triangular_number(n) {
+                return None;
+            }
+            rowval.reserve_exact(colptr[n]);
+            stamp.fill(usize::MAX);
+        }
+        for j in 0..n {
+            let start = rowval.len();
+            let mut len = 0;
+            let mut add = |i: usize| {
+                if stamp[i] != j {
+                    stamp[i] = j;
+                    len += 1;
+                    if fill {
+                        rowval.push(i);
+                    }
+                }
+            };
+            add(j);
+            for p in P.colptr[j]..P.colptr[j + 1] {
+                if P.rowval[p] <= j {
+                    add(P.rowval[p]);
+                }
+            }
+            for &c in &column_cliques[j] {
+                for &i in cliques[c as usize].iter().take_while(|&&i| i <= j) {
+                    add(i);
+                }
+            }
+            if fill {
+                rowval[start..].sort_unstable();
+            } else {
+                colptr[j + 1] = colptr[j] + len;
+            }
+        }
+    }
+    Some((colptr, rowval))
 }
 
 /// Per-block contributions must fit the available byte allowance.
@@ -1432,79 +1523,10 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         crate::receipt::memory_mark("kkt cone blocks");
         let nr = retained_rows.len();
         let retained_A = CscMatrix::new(nr, n, colptr, rowval, nzval);
-        // Exact structural union. Each PSD block couples its active columns;
-        // each orthant coordinate couples only columns touching that row.
-        // Global equality rows do not turn independent primal blocks dense.
-        // Every PSD block's column set and every orthant row is a clique; P adds
-        // its own lower pattern. Column j gathers rows i <= j of the cliques it
-        // belongs to, stamped for dedup and sorted.
-        let mut cliques: Vec<Vec<usize>> = Vec::new();
-        for block in &blocks {
-            match &block.scaling {
-                Scaling::Psd(p) => cliques.push(p.columns.iter().map(|c| c.index).collect()),
-                Scaling::Orthant { rows, .. } => {
-                    cliques.extend(rows.iter().map(|row| row.iter().map(|&(j, _)| j).collect()))
-                }
-                Scaling::SocElim { rows, .. } => {
-                    let mut union: Vec<usize> = rows.iter().flatten().map(|&(j, _)| j).collect();
-                    union.sort_unstable();
-                    union.dedup();
-                    cliques.push(union);
-                }
-                _ => {}
-            }
-        }
-        let mut column_cliques: Vec<Vec<u32>> = vec![Vec::new(); n];
-        for (c, clique) in cliques.iter_mut().enumerate() {
-            clique.sort_unstable();
-            for &j in clique.iter() {
-                column_cliques[j].push(c as u32);
-            }
-        }
-        // Two passes: count, then fill an exactly sized `rowval` (the Schur
-        // pattern is the largest setup array; no doubling slack at the peak).
-        let mut stamp = vec![usize::MAX; n];
-        let mut colptr = vec![0; n + 1];
-        let mut rowval = Vec::new();
-        for fill in [false, true] {
-            if fill {
-                rowval.reserve_exact(colptr[n]);
-                stamp.fill(usize::MAX);
-            }
-            for j in 0..n {
-                let start = rowval.len();
-                let mut len = 0;
-                let mut add = |i: usize| {
-                    if stamp[i] != j {
-                        stamp[i] = j;
-                        len += 1;
-                        if fill {
-                            rowval.push(i);
-                        }
-                    }
-                };
-                add(j);
-                for p in P.colptr[j]..P.colptr[j + 1] {
-                    if P.rowval[p] <= j {
-                        add(P.rowval[p]);
-                    }
-                }
-                for &c in &column_cliques[j] {
-                    for &i in cliques[c as usize].iter().take_while(|&&i| i <= j) {
-                        add(i);
-                    }
-                }
-                if fill {
-                    rowval[start..].sort_unstable();
-                } else {
-                    colptr[j + 1] = colptr[j] + len;
-                }
-            }
-        }
-        drop((cliques, column_cliques, stamp));
-        let count = rowval.len();
-        // Retain structural zeros: numerical updates never alter this plan.
-        let schur = CscMatrix::new(n, n, colptr, rowval, vec![T::zero(); count]);
+        let pattern = sparse_schur_pattern(P, &blocks);
+        let count = pattern
+            .as_ref()
+            .map_or_else(|| triangular_number(n), |(_, rows)| rows.len());
         let pool = cones.thread_pool();
         // Independent cones keep their publish order, with contribution
         // storage bounded by this process's share of the node allocation.
@@ -1517,8 +1539,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             count <= u32::MAX as usize,
             "Schur pattern exceeds u32 positions"
         );
-        let dense_schur = count == triangular_number(n);
-        let mut position_of = vec![0u32; if dense_schur { 0 } else { n }];
+        let mut position_of = vec![0u32; if pattern.is_none() { 0 } else { n }];
         for block in &mut blocks {
             if let Scaling::Psd(p) = &mut block.scaling {
                 if parallel_assembly {
@@ -1531,9 +1552,9 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                         })
                         .unwrap_or_else(|| vec![T::zero(); len]);
                 }
-                if dense_schur {
+                let Some((colptr, rowval)) = &pattern else {
                     continue;
-                }
+                };
                 // Pair (b, a <= b) lives in Schur column max(index) at row
                 // min(index). Visit columns by index and scatter each Schur
                 // column once instead of binary searching every pair.
@@ -1544,8 +1565,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 order.sort_unstable_by_key(|&c| index[c]);
                 for (t, &c) in order.iter().enumerate() {
                     let j = index[c];
-                    for q in schur.colptr[j]..schur.colptr[j + 1] {
-                        position_of[schur.rowval[q]] = q as u32;
+                    for q in colptr[j]..colptr[j + 1] {
+                        position_of[rowval[q]] = q as u32;
                     }
                     for &m in &order[..=t] {
                         positions[c.max(m)][c.min(m)] = position_of[index[m]];
@@ -1557,23 +1578,23 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             }
         }
         let retained_cones = CompositeCone::new(&retained_types);
-        let mut reduced =
-            DirectLDLKKTSolver::new(&schur, &retained_A, &retained_cones, nr, n, settings);
+        let primal = match pattern {
+            None => KktPrimal::DenseSchur,
+            Some((colptr, rowval)) => KktPrimal::SparseSchur { colptr, rowval },
+        };
+        let mut reduced = DirectLDLKKTSolver::new_with_primal(
+            primal,
+            &retained_A,
+            &retained_cones,
+            settings,
+            pool.as_deref(),
+        );
         // The reduced system is replicated; a structured backend shares its
         // factorization work over the ranks.
         reduced.set_world(local_world(local_only));
         reduced.set_factor_pool(pool.clone());
         reduced.set_residual_pool(pool.clone());
-        let kkt = reduced.kkt_matrix_mut();
-        // Every assembly rewrites the Schur values on the pool.
-        if let Some(values) = pool.as_deref().and_then(|pool| {
-            crate::algebra::scratch::spread_vec(kkt.nzval.len(), |i| kkt.nzval[i], pool)
-        }) {
-            kkt.nzval = values;
-        }
-        debug_assert_eq!(kkt.colptr[..n + 1], schur.colptr);
-        debug_assert_eq!(kkt.rowval[..count], schur.rowval);
-        drop(schur);
+        debug_assert_eq!(reduced.kkt_matrix_mut().colptr[n], count);
         crate::receipt::memory_mark("kkt reduced solver");
         let mut solver = Self {
             local_only,
