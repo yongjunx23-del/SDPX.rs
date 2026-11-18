@@ -1135,7 +1135,27 @@ impl<T: FloatT> PsdBlock<T> {
     ) {
         self.prepare_coefficients(values);
         if self.use_batched_columns() {
-            self.compute_schur_dense_batched(values, false, |_, _, k, v| schur[k] += v, pool);
+            let split = pool.filter(|p| p.current_num_threads() > 1 && self.columns.len() >= 128);
+            self.compute_schur_dense_batched(
+                values,
+                split.is_some(),
+                |_, _, k, v| schur[k] += v,
+                pool,
+            );
+            if let Some(pool) = split {
+                let timer = crate::receipt::start();
+                let target = PackedSchur::new(schur);
+                // Pairs of columns in one cone have distinct KKT positions.
+                // Cones still add in order, without a second triangle.
+                pool.install(|| {
+                    self.columns.par_iter().enumerate().for_each(|(b, right)| {
+                        if right.sparse {
+                            self.sparse_column(values, b, right, |_, k, v| target.add(k, v));
+                        }
+                    })
+                });
+                crate::receipt::finish("schur.sparse", timer);
+            }
         } else if let Some(pool) = self.tile_pool(pool, false) {
             let target = PackedSchur::new(schur);
             self.parallel_schur_tiles(values, false, pool, |_, _, k, v| target.add(k, v));
@@ -1825,22 +1845,34 @@ impl<T: FloatT> PsdBlock<T> {
         self.publish_sparse(values, skip_sparse, sink);
     }
 
-    /// Sparse left columns keep their exact scalar path, published through the
-    /// same sink.
+    #[inline]
+    fn sparse_column(
+        &self,
+        values: &[T],
+        b: usize,
+        right: &Column,
+        mut store: impl FnMut(usize, usize, T),
+    ) {
+        for (a, left) in self.columns[..=b].iter().enumerate() {
+            let v = sparse_schur_value(left, right, &self.Ginv, values, self.sqrt2);
+            store(a, right.schur_position(left, a), v);
+        }
+    }
+
+    /// Sparse right columns keep their scalar accumulation order.
     fn publish_sparse<F: FnMut(usize, usize, usize, T)>(
         &self,
         values: &[T],
         skip_sparse: bool,
         sink: &mut SchurSink<'_, F, T>,
     ) {
+        if skip_sparse {
+            return;
+        }
         let sparse_timer = crate::receipt::start();
         for (b, right) in self.columns.iter().enumerate() {
-            if !right.sparse || skip_sparse {
-                continue;
-            }
-            for (a, left) in self.columns[..=b].iter().enumerate() {
-                let v = sparse_schur_value(left, right, &self.Ginv, values, self.sqrt2);
-                sink.write(b, a, right.schur_position(left, a), v);
+            if right.sparse {
+                self.sparse_column(values, b, right, |a, k, v| sink.write(b, a, k, v));
             }
         }
         crate::receipt::finish("schur.sparse", sparse_timer);
