@@ -336,6 +336,11 @@ where
                 eprintln!("start-stats iter {} {}", state.iter, self.variables.scale_stats());
             }
             if self.terminate(&mut state, &affinity).stop() {
+                // The iteration limit can coincide with a scheduled checkpoint.
+                // Save the advanced iterate before finish() picks the best point.
+                if self.info.get_status() == SolverStatus::MaxIterations && state.α > T::zero() {
+                    self.write_checkpoint(state.iter);
+                }
                 break;
             }
             // A first attempt from the user's τ₀ watches τ against τ₀; an
