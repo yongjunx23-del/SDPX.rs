@@ -26,6 +26,9 @@ struct Entry {
 }
 
 pub(crate) struct SparseParallel {
+    /// A known packed upper square starts at column zero. Only the
+    /// remaining sparse columns need explicit row entries.
+    packed: usize,
     rowptr: Vec<usize>,
     entries: Vec<Entry>,
     row_lanes: Vec<usize>,
@@ -64,25 +67,26 @@ impl SparseParallel {
     }
 
     pub(crate) fn new<T>(a: &CscMatrix<T>) -> Self {
-        Self::build(a, false)
+        Self::build(a, false, 0)
     }
 
-    pub(crate) fn new_symmetric<T>(a: &CscMatrix<T>) -> Self {
+    pub(crate) fn new_symmetric<T>(a: &CscMatrix<T>, packed: usize) -> Self {
         assert_eq!(a.n, a.m);
-        Self::build(a, true)
+        Self::build(a, true, packed)
     }
 
-    fn build<T>(a: &CscMatrix<T>, symmetric: bool) -> Self {
+    fn build<T>(a: &CscMatrix<T>, symmetric: bool, packed: usize) -> Self {
+        let base = a.colptr[packed];
         assert!(
-            a.rowval.len() <= u32::MAX as usize && a.n <= u32::MAX as usize,
+            a.rowval.len() - base <= u32::MAX as usize && a.n <= u32::MAX as usize,
             "sparse row plan exceeds u32 indices"
         );
         let mut rowptr = vec![0; a.m + 1];
-        for &row in &a.rowval {
+        for &row in &a.rowval[base..] {
             rowptr[row + 1] += 1;
         }
         if symmetric {
-            for col in 0..a.n {
+            for col in packed..a.n {
                 for p in a.colptr[col]..a.colptr[col + 1] {
                     if a.rowval[p] != col {
                         rowptr[col + 1] += 1;
@@ -102,18 +106,18 @@ impl SparseParallel {
         ];
         // Scanning CSC in exactly its original order preserves the order of
         // every row's additions, including explicitly stored zeros.
-        for column in 0..a.n {
+        for column in packed..a.n {
             for position in a.colptr[column]..a.colptr[column + 1] {
                 let row = a.rowval[position];
                 entries[rowptr[row]] = Entry {
                     column: column as u32,
-                    position: position as u32,
+                    position: (position - base) as u32,
                 };
                 rowptr[row] += 1;
                 if symmetric && row != column {
                     entries[rowptr[column]] = Entry {
                         column: row as u32,
-                        position: position as u32,
+                        position: (position - base) as u32,
                     };
                     rowptr[column] += 1;
                 }
@@ -139,6 +143,7 @@ impl SparseParallel {
             }
         }
         Self {
+            packed,
             rowptr,
             entries,
             row_lanes: Vec::new(),
@@ -168,10 +173,20 @@ impl SparseParallel {
             // Every lane carries at least one grain of multiply-adds; extra
             // lanes on a small operator only add fork-join latency.
             let grain = sdpx_arithmetic::inner_parallel::grain().max(1);
-            let work = self.entries.len() as u128
+            let work = (self.entries.len() as u128 + (self.packed as u128).pow(2))
                 * sdpx_arithmetic::inner_parallel::weight(T::precision_bits());
             let lanes = workers.min((work / grain).max(1).min(usize::MAX as u128) as usize);
-            self.row_lanes = partitions(&self.rowptr, lanes);
+            self.row_lanes = if self.packed == 0 {
+                partitions(&self.rowptr, lanes)
+            } else {
+                let work: Vec<_> = self
+                    .rowptr
+                    .iter()
+                    .enumerate()
+                    .map(|(row, &p)| p + row.min(self.packed) * self.packed)
+                    .collect();
+                partitions(&work, lanes)
+            };
             self.column_lanes = partitions(&a.colptr, lanes);
             self.active_lanes = if self.active.is_empty() {
                 Vec::new()
@@ -332,6 +347,22 @@ impl SparseParallel {
         }
     }
 
+    #[inline]
+    fn symmetric_row<T: Copy>(&self, a: &CscMatrix<T>, row: usize, mut add: impl FnMut(usize, T)) {
+        if row < self.packed {
+            for (col, &v) in a.nzval[a.colptr[row]..a.colptr[row + 1]].iter().enumerate() {
+                add(col, v);
+            }
+            for col in row + 1..self.packed {
+                add(col, a.nzval[a.colptr[col] + row]);
+            }
+        }
+        let tail = &a.nzval[a.colptr[self.packed]..];
+        for e in &self.entries[self.rowptr[row]..self.rowptr[row + 1]] {
+            add(e.column as usize, tail[e.position as usize]);
+        }
+    }
+
     pub(crate) fn symv<T: FloatT>(
         &self,
         a: &CscMatrix<T>,
@@ -346,9 +377,7 @@ impl SparseParallel {
                 y.scale(beta);
                 pool.install(|| {
                     split_outputs(y, &self.row_lanes, &|row, out| {
-                        for e in &self.entries[self.rowptr[row]..self.rowptr[row + 1]] {
-                            *out += alpha * a.nzval[e.position as usize] * x[e.column as usize];
-                        }
+                        self.symmetric_row(a, row, |col, v| *out += alpha * v * x[col]);
                     })
                 });
                 return;
@@ -376,11 +405,10 @@ impl SparseParallel {
                 y1.scale(beta);
                 pool.install(|| {
                     split_output_pair(y0, y1, &self.row_lanes, &|row, o0, o1| {
-                        for e in &self.entries[self.rowptr[row]..self.rowptr[row + 1]] {
-                            let v = a.nzval[e.position as usize];
-                            *o0 += alpha * v * x[0][e.column as usize];
-                            *o1 += alpha * v * x[1][e.column as usize];
-                        }
+                        self.symmetric_row(a, row, |col, v| {
+                            *o0 += alpha * v * x[0][col];
+                            *o1 += alpha * v * x[1][col];
+                        });
                     })
                 });
                 return;

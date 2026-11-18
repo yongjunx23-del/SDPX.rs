@@ -447,7 +447,7 @@ fn row_gather_parity<T: FloatT>() {
         (&mut a, MatrixTriangle::Triu),
         (&mut k, MatrixTriangle::Tril),
     ] {
-        let mut plan = SparseParallel::new_symmetric(matrix);
+        let mut plan = SparseParallel::new_symmetric(matrix, 0);
         for width in [1, 2, 4] {
             let pool = Arc::new(
                 rayon::ThreadPoolBuilder::new()
@@ -476,6 +476,48 @@ fn row_gather_parity<T: FloatT>() {
 #[test]
 fn row_gather_f64() {
     row_gather_parity::<f64>();
+}
+
+#[test]
+fn packed_primal_residual_uses_only_sparse_tail_entries() {
+    let mut k = CscMatrix::new(
+        5,
+        5,
+        vec![0, 1, 3, 6, 9, 11],
+        vec![0, 0, 1, 0, 1, 2, 0, 2, 3, 3, 4],
+        vec![1., -1e16, 2., 1e16, 0., 1., -3., 2., -1., -4., -5.],
+    );
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap(),
+    );
+    let mut packed = SparseParallel::new_symmetric(&k, 3);
+    let mut full = SparseParallel::new_symmetric(&k, 0);
+    assert_eq!(packed.entries.len() + 9, full.entries.len());
+    for p in [&mut full, &mut packed] {
+        p.configure(&k, Some(pool.clone()));
+        p.row_lanes = vec![0, 2];
+    }
+    let (x, z) = ([0.5, 1., 1., 1.5, 0.], [-1., 2., 2., 0., 0.25]);
+    for _ in 0..2 {
+        let (mut a, mut b) = ([1.; 5], [-1.; 5]);
+        let (mut c, mut d) = (a, b);
+        full.symv(&k, MatrixTriangle::Triu, &mut a, &x, -1., 1.);
+        full.symv(&k, MatrixTriangle::Triu, &mut b, &z, -1., 1.);
+        packed.symv_pair(
+            &k,
+            MatrixTriangle::Triu,
+            [&mut c, &mut d],
+            [&x, &z],
+            -1.,
+            1.,
+        );
+        assert_eq!((a, b), (c, d));
+        k.nzval[4] = -3.;
+        k.nzval[7] = 0.75;
+    }
 }
 #[test]
 fn row_gather_mpfr256() {
