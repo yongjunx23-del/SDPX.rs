@@ -918,6 +918,7 @@ impl<T: FloatT> PsdBlock<T> {
                     index: col,
                     entries,
                     sparse: false,
+                    schur_start: 0,
                     schur_positions: Vec::new(),
                 });
             }

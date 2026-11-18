@@ -219,6 +219,12 @@ fn sparse_schur_pattern<T: FloatT>(
             if colptr[n] == triangular_number(n) {
                 return None;
             }
+            assert!(
+                colptr
+                    .windows(2)
+                    .all(|p| u32::try_from((p[1] - p[0]).saturating_sub(1)).is_ok()),
+                "sparse Schur column exceeds u32 offsets"
+            );
             rowval.reserve_exact(colptr[n]);
             stamp.fill(usize::MAX);
         }
@@ -482,9 +488,9 @@ struct Column {
     index: usize,
     entries: Vec<Entry>,
     sparse: bool,
-    // Global Schur value index of each pair (b, a <= b); u32 halves the
-    // largest per-iteration index stream (checked when the pattern is built).
-    // Empty when the Schur is a full upper triangle, indexed from `index`.
+    // In a sparse Schur, the pair belongs to the later global CSC column.
+    // Its offset fits u32 even when the whole triangle exceeds 2^32 entries.
+    schur_start: usize,
     schur_positions: Vec<u32>,
 }
 
@@ -494,7 +500,7 @@ impl Column {
         if self.schur_positions.is_empty() {
             triangular_number(self.index.max(left.index)) + self.index.min(left.index)
         } else {
-            self.schur_positions[a] as usize
+            self.schur_start.max(left.schur_start) + self.schur_positions[a] as usize
         }
     }
 }
@@ -1421,6 +1427,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                             index: col,
                             entries: Vec::new(),
                             sparse: false,
+                            schur_start: 0,
                             schur_positions: Vec::new(),
                         });
                         psd_last_column[psd] = col;
@@ -1537,10 +1544,6 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             assembly_buffer_bytes(&blocks),
             parallel_assembly_budget_bytes(),
         );
-        assert!(
-            count <= u32::MAX as usize,
-            "Schur pattern exceeds u32 positions"
-        );
         let mut position_of = vec![0u32; if pattern.is_none() { 0 } else { n }];
         for block in &mut blocks {
             if let Scaling::Psd(p) = &mut block.scaling {
@@ -1567,14 +1570,15 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 order.sort_unstable_by_key(|&c| index[c]);
                 for (t, &c) in order.iter().enumerate() {
                     let j = index[c];
-                    for q in colptr[j]..colptr[j + 1] {
-                        position_of[rowval[q]] = q as u32;
+                    for (offset, &row) in rowval[colptr[j]..colptr[j + 1]].iter().enumerate() {
+                        position_of[row] = offset as u32;
                     }
                     for &m in &order[..=t] {
                         positions[c.max(m)][c.min(m)] = position_of[index[m]];
                     }
                 }
                 for (column, positions) in p.columns.iter_mut().zip(positions) {
+                    column.schur_start = colptr[column.index];
                     column.schur_positions = positions;
                 }
             }
