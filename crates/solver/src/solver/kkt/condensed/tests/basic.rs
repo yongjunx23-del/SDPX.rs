@@ -124,6 +124,17 @@ fn dense_dot_tiles_match_the_serial_store_loop() {
     block.compute_schur_packed(&a.nzval, false, &mut packed, Some(&pool));
     assert_eq!(serial, packed);
     assert!(parallel_dot_lanes() > lanes_before);
+
+    // The bounded assembler adds into the original global triangle.
+    assert!(block.columns.iter().any(|c| c.sparse));
+    for column in &mut block.columns {
+        column.schur_positions.clear();
+    }
+    let mut expected = vec![0.25; triangular_number(count)];
+    let mut actual = expected.clone();
+    block.add_schur(&a.nzval, &mut expected, None);
+    block.add_schur(&a.nzval, &mut actual, Some(&pool));
+    assert_eq!(actual, expected);
 }
 
 // The chunk-parallel dense transform must reproduce the serial chunk loop bit

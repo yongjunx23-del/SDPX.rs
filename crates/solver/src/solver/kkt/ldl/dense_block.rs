@@ -23,6 +23,7 @@ pub(super) struct DenseBlockSolver {
     fallback: Option<BoxedDirectLDLSolver<f64>>,
     use_dense: bool,
     packed_leading: bool,
+    large: bool,
     pool: Option<Arc<rayon::ThreadPool>>,
     // Pooled factorization tiles, kept across refactors (fully overwritten).
     tiles: Vec<Vec<Vec<f64>>>,
@@ -38,12 +39,23 @@ impl DenseBlockSolver {
         debug_assert!(k.m == k.n && signs.len() == k.n);
         let n = signs.iter().take_while(|&&s| s == 1).count();
         let m = k.n - n;
-        if n < 128 || signs[n..].iter().any(|&s| s != -1) {
+        if n < 128 || k.n > i32::MAX as usize || signs[n..].iter().any(|&s| s != -1) {
             return None;
         }
-        let elements = (n * n + n * m + m * m) as u128;
-        if elements > 256 * 1024 * 1024 || k.n > i32::MAX as usize {
-            return None;
+        let large = large_factor(n, m);
+        if large {
+            // Large packed primal systems can exploit level-3 BLAS, provided
+            // the factor, border and one set of Cholesky tiles fit this rank.
+            let (h, s) = (n as u128, m as u128);
+            let max = h.max(s);
+            let workspace = 8 * (h * h + h * s + s * s + max * (max + TILE as u128) / 2);
+            if k.colptr[n] as u128 != h * (h + 1) / 2
+                || crate::solver::core::worker_budget(settings.max_threads as usize) < 2
+                || super::super::condensed::effective_memory_bytes()
+                    .is_none_or(|limit| 5 * workspace > 3 * limit as u128)
+            {
+                return None;
+            }
         }
         // Structural admission only: the values are populated after
         // construction, and a failed dense factorization falls back to the
@@ -78,6 +90,7 @@ impl DenseBlockSolver {
             fallback: None,
             use_dense: false,
             packed_leading: k.colptr[n] == n * (n + 1) / 2,
+            large: large_factor(n, m),
             pool: None,
             tiles: Vec::new(),
         }
@@ -85,31 +98,6 @@ impl DenseBlockSolver {
 
     fn factor_dense(&mut self, k: &CscMatrix<f64>) -> bool {
         let (n, m) = (self.n, self.m);
-        // Only the upper triangle of H and S is read (`U` factorizations and
-        // solves), so clear just the columns' upper parts as they are filled.
-        for j in 0..n {
-            self.h[j * n..j * n + j + 1].fill(0.);
-        }
-        self.y.fill(0.);
-        for j in 0..m {
-            self.s[j * m..j * m + j + 1].fill(0.);
-        }
-        for j in 0..k.n {
-            for p in k.colptr[j]..k.colptr[j + 1] {
-                let i = k.rowval[p];
-                let v = k.nzval[p];
-                if !v.is_finite() {
-                    return false;
-                }
-                if j < n {
-                    self.h[i + j * n] = v;
-                } else if i < n {
-                    self.y[i + (j - n) * n] = v;
-                } else {
-                    self.s[i - n + (j - n) * m] = -v;
-                }
-            }
-        }
         // Every blocked kernel runs the same tiles whatever the worker count
         // (a single-worker pool when there is no pool), so the factor does
         // not depend on the number of threads.
@@ -118,6 +106,50 @@ impl DenseBlockSolver {
             .as_deref()
             .filter(|pool| pool.current_num_threads() > 1);
         let blocked = pool.unwrap_or(serial_pool());
+        let packed = self.packed_leading;
+        let primal = |(j, col): (usize, &mut [f64])| {
+            let col = &mut col[..=j];
+            let span = k.colptr[j]..k.colptr[j + 1];
+            if packed {
+                col.copy_from_slice(&k.nzval[span]);
+            } else {
+                col.fill(0.);
+                for p in span {
+                    col[k.rowval[p]] = k.nzval[p];
+                }
+            }
+            col.iter().all(|x| x.is_finite())
+        };
+        let border = |(j, (y, s)): (usize, (&mut [f64], &mut [f64]))| {
+            y.fill(0.);
+            s[..=j].fill(0.);
+            for p in k.colptr[n + j]..k.colptr[n + j + 1] {
+                let i = k.rowval[p];
+                let v = k.nzval[p];
+                if !v.is_finite() {
+                    return false;
+                }
+                if i < n {
+                    y[i] = v
+                } else {
+                    s[i - n] = -v
+                }
+            }
+            true
+        };
+        let filled = blocked.install(|| {
+            self.h.par_chunks_mut(n).enumerate().all(primal)
+                && (m == 0
+                    || self
+                        .y
+                        .par_chunks_mut(n)
+                        .zip(self.s.par_chunks_mut(m))
+                        .enumerate()
+                        .all(border))
+        });
+        if !filled {
+            return false;
+        }
         let rule = self.pivot_rule();
         if !factor_block(&mut self.h, n, blocked, &mut self.tiles, rule)
             || !self.valid_factor(&self.h, n)
@@ -180,8 +212,7 @@ impl DenseBlockSolver {
                 );
             }
         }
-        let mut tiles = Vec::new();
-        if !factor_block(&mut self.s, m, blocked, &mut tiles, rule) {
+        if !factor_block(&mut self.s, m, blocked, &mut self.tiles, rule) {
             return false;
         }
         self.y.iter().all(|v| v.is_finite()) && self.valid_factor(&self.s, m)
@@ -229,6 +260,11 @@ impl DenseBlockSolver {
 /// every tile operation is one BLAS call, so factors do not depend on the
 /// number of workers.
 const TILE: usize = 128;
+
+fn large_factor(n: usize, m: usize) -> bool {
+    let (n, m) = (n as u128, m as u128);
+    n * n + n * m + m * m > 256 * 1024 * 1024
+}
 
 /// Cholesky of the upper triangle of `a` (n x n): tiled on `pool` from
 /// `2 * TILE`, where the tile boundaries alone fix the arithmetic, so any
@@ -413,18 +449,23 @@ fn tiled_potrf(
     let diag: Vec<f64> = (0..n).map(|i| a[i + i * n]).collect();
     // tiles[j][i], i <= j: rows of block i, columns of block j, ld = size(i).
     // Buffers are reused across calls; packing overwrites every element.
-    tiles.resize_with(p, Vec::new);
-    for (j, column) in tiles.iter_mut().enumerate() {
-        column.resize_with(j + 1, Vec::new);
-        for (i, t) in column.iter_mut().enumerate() {
-            let (ri, cj) = (size(i), size(j));
-            t.resize(ri * cj, 0.);
-            for c in 0..cj {
-                let src = (j * TILE + c) * n + i * TILE;
-                t[c * ri..][..ri].copy_from_slice(&a[src..src + ri]);
-            }
-        }
+    if tiles.len() < p {
+        tiles.resize_with(p, Vec::new);
     }
+    let tiles = &mut tiles[..p];
+    pool.install(|| {
+        tiles.par_iter_mut().enumerate().for_each(|(j, column)| {
+            column.resize_with(j + 1, Vec::new);
+            for (i, t) in column.iter_mut().enumerate() {
+                let (ri, cj) = (size(i), size(j));
+                t.resize(ri * cj, 0.);
+                for c in 0..cj {
+                    let src = (j * TILE + c) * n + i * TILE;
+                    t[c * ri..][..ri].copy_from_slice(&a[src..src + ri]);
+                }
+            }
+        })
+    });
     let ok = pool.install(|| {
         for k in 0..p {
             let kk = size(k) as i32;
@@ -481,15 +522,20 @@ fn tiled_potrf(
     if !ok {
         return false;
     }
-    for (j, column) in tiles.iter().enumerate() {
-        for (i, t) in column.iter().enumerate() {
-            let (ri, cj) = (size(i), size(j));
-            for c in 0..cj {
-                let dst = (j * TILE + c) * n + i * TILE;
-                a[dst..dst + ri].copy_from_slice(&t[c * ri..][..ri]);
-            }
-        }
-    }
+    pool.install(|| {
+        a.par_chunks_mut(TILE * n)
+            .zip(tiles.par_iter())
+            .enumerate()
+            .for_each(|(j, (slab, column))| {
+                for (i, t) in column.iter().enumerate() {
+                    let (ri, cj) = (size(i), size(j));
+                    for c in 0..cj {
+                        let dst = c * n + i * TILE;
+                        slab[dst..dst + ri].copy_from_slice(&t[c * ri..][..ri]);
+                    }
+                }
+            })
+    });
     true
 }
 
@@ -535,7 +581,7 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
         rhs: &[f64],
         point: &[f64],
     ) -> Option<f64> {
-        if !self.packed_leading {
+        if !self.packed_leading || k.colptr[self.n] > i32::MAX as usize {
             return None;
         }
         out.copy_from_slice(rhs);
@@ -567,7 +613,15 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
     }
 
     fn refactor(&mut self, k: &CscMatrix<f64>) -> bool {
-        self.use_dense = self.factor_dense(k);
+        self.use_dense = !(self.large && self.fallback.is_some()) && self.factor_dense(k);
+        if !self.use_dense && self.large && self.fallback.is_none() {
+            // Only one large factor may be live. Subsequent refactors use
+            // the sparse backend if dense elimination rejected a pivot.
+            self.h = Vec::new();
+            self.y = Vec::new();
+            self.s = Vec::new();
+            self.tiles = Vec::new();
+        }
         self.use_dense || self.factor_fallback(k)
     }
     fn solve(&mut self, k: &CscMatrix<f64>, x: &mut [f64], b: &mut [f64]) {
@@ -578,13 +632,47 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
         x.copy_from_slice(b);
         let (u, v) = x.split_at_mut(self.n);
         let (n, m) = (self.n as i32, self.m as i32);
+        let pool = self
+            .pool
+            .as_deref()
+            .filter(|p| p.current_num_threads() > 1 && self.y.len() >= 1 << 20);
         unsafe {
             blas::dtrsv(b'U', b'T', b'N', n, &self.h, n, u, 1);
             if m > 0 {
-                blas::dgemv(b'T', n, m, 1., &self.y, n, u, 1, -1., v, 1);
+                if let Some(pool) = pool {
+                    pool.install(|| {
+                        v.par_chunks_mut(TILE)
+                            .zip(self.y.par_chunks(TILE * self.n))
+                            .for_each(|(v, y)| {
+                                blas::dgemv(b'T', n, v.len() as i32, 1., y, n, u, 1, -1., v, 1);
+                            })
+                    });
+                } else {
+                    blas::dgemv(b'T', n, m, 1., &self.y, n, u, 1, -1., v, 1);
+                }
                 blas::dtrsv(b'U', b'T', b'N', m, &self.s, m, v, 1);
                 blas::dtrsv(b'U', b'N', b'N', m, &self.s, m, v, 1);
-                blas::dgemv(b'N', n, m, -1., &self.y, n, v, 1, 1., u, 1);
+                if let Some(pool) = pool {
+                    pool.install(|| {
+                        u.par_chunks_mut(TILE).enumerate().for_each(|(i, u)| {
+                            blas::dgemv(
+                                b'N',
+                                u.len() as i32,
+                                m,
+                                -1.,
+                                &self.y[i * TILE..],
+                                n,
+                                v,
+                                1,
+                                1.,
+                                u,
+                                1,
+                            );
+                        })
+                    });
+                } else {
+                    blas::dgemv(b'N', n, m, -1., &self.y, n, v, 1, 1., u, 1);
+                }
             }
             blas::dtrsv(b'U', b'N', b'N', n, &self.h, n, u, 1);
         }

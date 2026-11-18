@@ -24,7 +24,7 @@ const PARALLEL_ASSEMBLY_FALLBACK_BYTES: usize = 256 << 20;
 
 /// The node allocation is shared by its local MPI ranks. Process resource
 /// limits apply to this rank alone, including finite limits below the fallback.
-fn effective_memory_bytes() -> Option<u64> {
+pub(super) fn effective_memory_bytes() -> Option<u64> {
     let ranks = crate::mpi::World::get().map_or(1, |w| w.local_size()) as u64;
     node_memory_bytes()
         .map(|bytes| bytes / ranks)

@@ -168,6 +168,7 @@ pub struct DirectLDLKKTSolver<T> {
     residual_runs: crate::algebra::SymvRuns,
     residual_dense: Option<Matrix<T>>,
     packed_residual: bool,
+    packed_primal: usize,
     /// Incoming symmetric mirrors of the fixed KKT pattern (MPFR exact residuals).
     exact_rows: Option<ExactRows>,
     /// `|K|` in binary64 for the GMRES-IR rounding floor; rebuilt after
@@ -217,6 +218,11 @@ where
         //construct a KKT matrix of the right shape
         let ore = ore_pattern(A, cones);
         let (A0, A) = (A, ore.as_ref().map_or(A, |(a, _, _)| a));
+        let packed_primal = if matches!(primal, KktPrimal::DenseSchur) {
+            n
+        } else {
+            0
+        };
         let (KKT, map) = assemble_kkt_matrix(primal, A, cones, kktshape, pool);
         crate::receipt::memory_mark("kkt assembled");
         let (ore, a_index) = match ore {
@@ -327,6 +333,7 @@ where
         ldlsolver.set_pool(cones.thread_pool());
 
         let packed_residual = ldlsolver.linear_solver_info().name == "dense_block"
+            && KKT.colptr[n] <= i32::MAX as usize
             && KKT.colptr[n] == triangular_number(n);
         let residual_runs = if T::precision_bits() <= 64 {
             crate::algebra::SymvRuns::new(&KKT)
@@ -357,6 +364,7 @@ where
             residual_runs,
             residual_dense: None,
             packed_residual,
+            packed_primal,
             exact_rows: None,
             abs_kkt: None,
             residual_world: None,
@@ -396,7 +404,7 @@ where
         // prefers, so a residual plan would never be read (Hubbard all3 at
         // 128 bits: 2.2 GB). Built here instead of on the first refinement.
         if T::precision_bits() > 64 && self.exact_rows.is_none() {
-            self.exact_rows = Some(ExactRows::new(&self.KKT));
+            self.exact_rows = Some(ExactRows::new(&self.KKT, self.packed_primal));
         }
         self.set_residual_pool(pool.clone());
         self.set_factor_pool(pool);
@@ -1013,11 +1021,12 @@ where
         // residual ran a serial symv (MPI ranks: 27 of 85 s at 32 threads).
         // The row plan keeps every row's addition order, so bits are unchanged.
         if self.residual_plan.is_none()
+            && !self.packed_residual
             && self.residual_dense.is_none()
             && self.exact_rows.is_none()
             && pool.is_some()
         {
-            self.residual_plan = Some(SparseParallel::new_symmetric(&self.KKT));
+            self.residual_plan = Some(SparseParallel::new_symmetric(&self.KKT, self.packed_primal));
         }
         if let Some(plan) = &mut self.residual_plan {
             plan.configure(&self.KKT, pool);
@@ -1388,7 +1397,7 @@ where
         let mut norms = vec![T::zero(); count];
         let column = |c: usize| c * full..(c + 1) * full;
         if T::precision_bits() > 64 && self.exact_rows.is_none() {
-            self.exact_rows = Some(ExactRows::new(&self.KKT));
+            self.exact_rows = Some(ExactRows::new(&self.KKT, self.packed_primal));
         }
         let (kkt, pool, world) = (&self.KKT, &self.residual_pool, self.residual_world);
         if let Some(rows) = &self.exact_rows {
@@ -1422,7 +1431,7 @@ where
         }
         let dense = self.residual_dense.as_ref();
         if dense.is_none() && self.residual_plan.is_none() && pool.is_some() {
-            let mut rows = SparseParallel::new_symmetric(kkt);
+            let mut rows = SparseParallel::new_symmetric(kkt, self.packed_primal);
             rows.configure(kkt, pool.clone());
             self.residual_plan = Some(rows);
         }
@@ -1486,6 +1495,7 @@ pub(crate) fn _escalated<T: FloatT>(base: T, boost: usize, diagonal: T) -> T {
 /// (|x| up to 1e80+) exceeds the residual itself and stalls refinement; the
 /// exact residual keeps the error at eps·|e_i|.
 struct ExactRows {
+    packed: usize,
     ptr: Vec<usize>,
     /// (nz position, column) for off-diagonal entries incoming from CSC columns.
     entries: Vec<(u32, u32)>,
@@ -1494,10 +1504,11 @@ struct ExactRows {
 }
 
 impl ExactRows {
-    fn new<T>(k: &CscMatrix<T>) -> Self {
+    fn new<T>(k: &CscMatrix<T>, packed: usize) -> Self {
         let n = k.n;
+        let base = k.colptr[packed];
         let mut count = vec![0usize; n + 1];
-        for j in 0..n {
+        for j in packed..n {
             for p in k.colptr[j]..k.colptr[j + 1] {
                 let r = k.rowval[p];
                 if r != j {
@@ -1509,21 +1520,31 @@ impl ExactRows {
             count[i + 1] += count[i];
         }
         let ptr = count.clone();
-        let work_offsets = ptr.iter().zip(&k.colptr).map(|(a, b)| a + b).collect();
+        let work_offsets = ptr
+            .iter()
+            .zip(&k.colptr)
+            .enumerate()
+            .map(|(i, (a, b))| {
+                let r = i.min(packed);
+                let mirrors = base - k.colptr[packed - r] - r;
+                a + b + mirrors
+            })
+            .collect();
         let mut fill = count;
         // Wide types only: 2³² of their entries exceed a node's memory.
-        assert!(k.nzval.len() <= u32::MAX as usize);
+        assert!(k.nzval.len() - base <= u32::MAX as usize);
         let mut entries = vec![(0u32, 0u32); ptr[n]];
-        for j in 0..n {
+        for j in packed..n {
             for p in k.colptr[j]..k.colptr[j + 1] {
                 let r = k.rowval[p];
                 if r != j {
-                    entries[fill[r]] = (p as u32, j as u32);
+                    entries[fill[r]] = ((p - base) as u32, j as u32);
                     fill[r] += 1;
                 }
             }
         }
         Self {
+            packed,
             ptr,
             entries,
             work_offsets,
@@ -1555,13 +1576,15 @@ impl ExactRows {
         let one = T::one();
         let row = |i: usize| {
             let incoming = &self.entries[self.ptr[i]..self.ptr[i + 1]];
+            let tail = &k.nzval[k.colptr[self.packed]..];
             T::dot_fma(
                 std::iter::once((&b[i], &one))
                     .chain((k.colptr[i]..k.colptr[i + 1]).map(|p| (&k.nzval[p], &neg[k.rowval[p]])))
+                    .chain((i + 1..self.packed).map(|j| (&k.nzval[k.colptr[j] + i], &neg[j])))
                     .chain(
                         incoming
                             .iter()
-                            .map(|&(p, j)| (&k.nzval[p as usize], &neg[j as usize])),
+                            .map(|&(p, j)| (&tail[p as usize], &neg[j as usize])),
                     ),
             )
         };

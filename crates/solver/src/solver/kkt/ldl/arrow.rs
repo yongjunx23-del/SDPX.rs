@@ -483,6 +483,7 @@ pub(super) fn solve_unit_lower_t<T: FloatT>(
             *v -= pv;
         }
     });
+    drop(p);
     let low2: Vec<usize> = low.iter().map(|&f| f.saturating_sub(n1)).collect();
     solve_unit_lower_t(m, n2, &l[n1 + n1 * ldl..], ldl, b2, ldb, &low2, ways);
 }
@@ -1022,6 +1023,7 @@ impl<T: FloatT> DenseLeaf<T> {
         start: usize,
         rows: std::ops::Range<usize>,
         ways: usize,
+        product: &mut [T],
     ) {
         use sdpx_arithmetic::inner_parallel as ip;
         let (n, width) = (self.n, self.n - start);
@@ -1051,15 +1053,15 @@ impl<T: FloatT> DenseLeaf<T> {
             return;
         }
         let h = (r0 + r1) / 2;
-        self.forward_panel_rows(x, start, r0..h, ways);
+        self.forward_panel_rows(x, start, r0..h, ways, product);
         let (m, cols) = (r1 - h, x.len() / width);
-        let mut p = vec![T::zero(); m * cols];
+        let p = &mut product[..m * cols];
         exact_product(
             (b'N', b'N'),
             (m, cols, h - r0),
             (&self.l[start + h + (start + r0) * n..], n),
             (&x[r0..], width),
-            &mut p,
+            p,
             ways,
         );
         let update = |(column, update): (&mut [T], &[T])| {
@@ -1074,7 +1076,7 @@ impl<T: FloatT> DenseLeaf<T> {
         } else {
             x.chunks_mut(width).zip(p.chunks(m)).for_each(update);
         }
-        self.forward_panel_rows(x, start, h..r1, ways);
+        self.forward_panel_rows(x, start, h..r1, ways, product);
     }
 
     /// [`Self::backward`] after [`Self::stage_rows`]`(0)`: each entry is
@@ -1603,22 +1605,25 @@ impl<T: FloatT> Leaf<T> {
             } else {
                 1
             };
-            let mut columns: Vec<&mut [T]> = self
-                .y
-                .chunks_mut(width)
-                .enumerate()
-                .filter(|(j, _)| packed || couples[*j])
-                .map(|(_, column)| column)
-                .collect();
-            let mut x = Vec::with_capacity(width * columns.len().min(Y_PANEL));
-            for panel in columns.chunks_mut(Y_PANEL) {
-                x.clear();
-                for column in panel.iter() {
-                    x.extend_from_slice(column);
-                }
-                factor.forward_panel_rows(&mut x, start, 0..width, ways);
-                for (column, solved) in panel.iter_mut().zip(x.chunks(width)) {
-                    column.copy_from_slice(solved);
+            // The largest recursive update overwrites this many entries.
+            // Every row split and every RHS panel can reuse the same storage.
+            let mut product = zeros(width.div_ceil(2) * self.coupled.len().min(Y_PANEL), ways);
+            let mut scratch = Vec::new();
+            for (panel, columns) in self.coupled.chunks(Y_PANEL).enumerate() {
+                let first = if packed { panel * Y_PANEL } else { columns[0] };
+                if packed || columns[columns.len() - 1] - first == columns.len() - 1 {
+                    let y = &mut self.y[first * width..(first + columns.len()) * width];
+                    factor.forward_panel_rows(y, start, 0..width, ways, &mut product);
+                } else {
+                    scratch.clear();
+                    scratch.reserve(width * columns.len());
+                    for &j in columns {
+                        scratch.extend_from_slice(&self.y[j * width..(j + 1) * width]);
+                    }
+                    factor.forward_panel_rows(&mut scratch, start, 0..width, ways, &mut product);
+                    for (&j, solved) in columns.iter().zip(scratch.chunks(width)) {
+                        self.y[j * width..(j + 1) * width].copy_from_slice(solved);
+                    }
                 }
             }
         } else if split && width > 0 && posted {
@@ -4332,9 +4337,10 @@ mod tests {
             .map(|e| T::from_f64(((e * 7) % 23) as f64 / 23.0 - 0.4).unwrap())
             .collect();
         let mut blocked = panel.clone();
-        serial.forward_panel_rows(&mut blocked, start, 0..width, 1);
+        let mut product = vec![T::zero(); width.div_ceil(2) * cols];
+        serial.forward_panel_rows(&mut blocked, start, 0..width, 1, &mut product);
         let mut pooled = panel.clone();
-        pool.install(|| serial.forward_panel_rows(&mut pooled, start, 0..width, 8));
+        pool.install(|| serial.forward_panel_rows(&mut pooled, start, 0..width, 8, &mut product));
         assert_eq!(blocked, pooled);
         let mut per_column = panel;
         for column in per_column.chunks_mut(width) {

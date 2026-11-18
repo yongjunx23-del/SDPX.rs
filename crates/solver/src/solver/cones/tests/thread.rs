@@ -9,6 +9,20 @@ use crate::{
 };
 use sdpx_arithmetic::Bits256;
 
+#[test]
+fn psd_assembly_cost_with_retained_rows() {
+    use SupportedConeT::*;
+    let cones = CompositeCone::<f64>::new(&[
+        ZeroConeT(1),
+        NonnegativeConeT(1),
+        PSDTriangleConeT(2),
+        PSDTriangleConeT(1),
+    ]);
+    let a = super::CscMatrix::new(6, 2, vec![0, 3, 7], vec![0, 2, 5, 1, 2, 3, 5], vec![1.; 7]);
+    // The first PSD contributes 1 + 3 terms and the second contributes 1 + 2.
+    assert_eq!(cones.psd_left_dot_terms(&a), Some(7));
+}
+
 fn check_kernels<T: FloatT>(kinds: &[SupportedConeT<T>]) {
     check_kernels_threads(kinds, 4);
 }

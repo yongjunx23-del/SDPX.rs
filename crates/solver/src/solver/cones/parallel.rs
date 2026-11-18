@@ -446,12 +446,12 @@ impl ConeThreading {
 /// 0.83 on 64, with useful instructions unchanged (journal 2026-10-07).
 /// Problems without PSD cones and binary64 keep the requested width.
 /// `columns`: the primal columns, when the KKT is known (see [`lone_units`]).
-/// `assembly`: the condensed Schur's left-dot terms of a non-sampled pure
-/// PSD/orthant problem (`CompositeCone::psd_left_dot_terms`); with several
-/// cones, a worker per 64³ terms when that exceeds the cone count. 12_min
+/// `assembly`: the left-dot terms of the explicit condensed PSD blocks,
+/// including models with retained equalities. With several cones, allow a
+/// worker per 64³ terms when that exceeds the cone count. 12_min
 /// (16 cones, 89.8M terms) at 512 bits on a 32-thread budget: 88.4 s on
 /// 24 workers, 81.4 on 31–32 (assembly 54 → 45.5 s; journal 2026-11-08).
-fn useful_width<T: FloatT>(
+pub(super) fn useful_width<T: FloatT>(
     cones: &[SupportedCone<T>],
     columns: Option<usize>,
     assembly: Option<u128>,

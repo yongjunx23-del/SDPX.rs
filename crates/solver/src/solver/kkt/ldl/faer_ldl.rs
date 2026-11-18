@@ -44,9 +44,7 @@ where
 }
 
 pub struct FaerDirectLDLSolver<T: FloatT + faer_traits::RealField> {
-    // Mutable coefficients follow the caller's CSC order. Faer applies the
-    // AMD permutation as it packs the triangle its numeric kernel requires.
-    values: Vec<T>,
+    nnz: usize,
     signs: Vec<i8>,
 
     // regularizer parameters captured from settings
@@ -127,7 +125,7 @@ where
         let work = MemBuffer::new(req);
 
         Self {
-            values: KKT.nzval.clone(),
+            nnz: KKT.nnz(),
             signs: Dsigns.to_vec(),
             regularizer_params,
             ldlt_params,
@@ -149,7 +147,7 @@ where
             name: "faer".to_string(),
             threads: self.parallelism.degree(),
             direct: true,
-            nnzA: self.values.len(),
+            nnzA: self.nnz,
             nnzL: self.ld_vals.len() - self.symbolic_cholesky.nrows(),
         }
     }
@@ -159,21 +157,11 @@ impl<T> DirectLDLSolver<T> for FaerDirectLDLSolver<T>
 where
     T: FloatT + faer_traits::RealField,
 {
-    fn update_values(&mut self, index: &[usize], values: &[T]) {
-        for (&i, &v) in index.iter().zip(values) {
-            self.values[i] = v;
-        }
-    }
-
-    fn update_prefix(&mut self, values: &[T]) {
-        self.values[..values.len()].copy_from_slice(values);
-    }
-
-    fn scale_values(&mut self, index: &[usize], scale: T) {
-        for &i in index {
-            self.values[i] *= scale;
-        }
-    }
+    // The owner updates the CSC before notifying the backend. Faer reads
+    // that matrix while the static shift is applied and retains its factors.
+    fn update_values(&mut self, _: &[usize], _: &[T]) {}
+    fn update_prefix(&mut self, _: &[T]) {}
+    fn scale_values(&mut self, _: &[usize], _: T) {}
 
     fn solve(&mut self, _kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T]) {
         x.copy_from_slice(b);
@@ -200,7 +188,7 @@ where
         let symbolic = unsafe {
             SymbolicSparseColMatRef::new_unchecked(kkt.n, kkt.n, &kkt.colptr, None, &kkt.rowval)
         };
-        let a = SparseColMatRef::new(symbolic, &self.values);
+        let a = SparseColMatRef::new(symbolic, &kkt.nzval);
         let regularizer = self.regularizer_params.to_faer(&self.signs);
 
         let mut factorize = || {
@@ -252,7 +240,7 @@ where
 
 #[test]
 fn test_faer_ldl() {
-    let KKT = CscMatrix {
+    let mut KKT = CscMatrix {
         m: 6,
         n: 6,
         colptr: vec![0, 1, 2, 4, 6, 8, 10],
@@ -266,8 +254,6 @@ fn test_faer_ldl() {
 
     let mut x = vec![0.0; 6];
     let mut b = vec![1.0, 2.0, 3.0, 4., 5., 6.];
-
-    assert_eq!(solver.values, KKT.nzval);
 
     solver.refactor(&KKT);
     solver.solve(&KKT, &mut x, &mut b);
@@ -283,7 +269,7 @@ fn test_faer_ldl() {
     assert!(x.norm_inf_diff(&xsol) < 1e-10);
 
     // assign a new entry at the end of the KKT matrix and resolve
-    solver.update_values(&[9], &[-10.0]);
+    KKT.nzval[9] = -10.;
 
     solver.refactor(&KKT);
     solver.solve(&KKT, &mut x, &mut b);
@@ -297,8 +283,6 @@ fn test_faer_ldl() {
         -0.7307692307692306,
     ];
     assert!(x.norm_inf_diff(&xsol) < 1e-10);
-
-    solver.scale_values(&[1, 2], 2.);
 }
 
 #[test]
