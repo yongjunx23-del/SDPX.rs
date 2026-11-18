@@ -653,6 +653,8 @@ impl<T: FloatT> DirectLDLSolver<T> for SupernodalLDLSolver<T> {
     // Values are read from the KKT at each refactor.
     fn update_values(&mut self, _index: &[usize], _values: &[T]) {}
 
+    fn update_prefix(&mut self, _values: &[T]) {}
+
     fn scale_values(&mut self, _index: &[usize], _scale: T) {}
 
     fn solve(&mut self, _kkt: &CscMatrix<T>, x: &mut [T], b: &mut [T]) {

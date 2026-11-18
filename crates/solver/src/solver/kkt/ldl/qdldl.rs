@@ -74,6 +74,10 @@ where
         self.factors.update_values(index, values);
     }
 
+    fn update_prefix(&mut self, values: &[T]) {
+        self.factors.update_prefix(values);
+    }
+
     fn scale_values(&mut self, index: &[usize], scale: T) {
         self.factors.scale_values(index, scale);
     }

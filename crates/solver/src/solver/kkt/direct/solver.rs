@@ -198,6 +198,18 @@ where
         n: usize,
         settings: &CoreSettings<T>,
     ) -> Self {
+        debug_assert_eq!(A.size(), (m, n));
+        Self::new_with_primal(KktPrimal::Matrix(P), A, cones, settings, None)
+    }
+
+    pub(crate) fn new_with_primal(
+        primal: KktPrimal<'_, T>,
+        A: &CscMatrix<T>,
+        cones: &CompositeCone<T>,
+        settings: &CoreSettings<T>,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Self {
+        let (m, n) = A.size();
         // get a constructor for the LDL solver we should use,
         // and also the matrix shape it requires
         let (kktshape, ldl_ctor) = T::get_ldlsolver_config(settings);
@@ -205,7 +217,8 @@ where
         //construct a KKT matrix of the right shape
         let ore = ore_pattern(A, cones);
         let (A0, A) = (A, ore.as_ref().map_or(A, |(a, _, _)| a));
-        let (KKT, map) = assemble_kkt_matrix(P, A, cones, kktshape);
+        let (KKT, map) = assemble_kkt_matrix(primal, A, cones, kktshape, pool);
+        crate::receipt::memory_mark("kkt assembled");
         let (ore, a_index) = match ore {
             None => (Vec::new(), Vec::new()),
             Some((ref ak, ref index, ref blocks)) => {
@@ -240,12 +253,6 @@ where
                 (rows.collect(), index.clone())
             }
         };
-        debug_assert!(
-            kktshape != MatrixTriangle::Triu
-                || P.count_diagonal_entries(MatrixTriangle::Triu) != n
-                || map.P.iter().enumerate().all(|(i, &position)| i == position)
-        );
-
         //Need this many extra variables for sparse cones
         let p = map.sparse_maps.pdim();
 
@@ -506,7 +513,15 @@ where
     }
 
     fn update_P(&mut self, P: &CscMatrix<T>) {
-        _update_values(&mut self.ldlsolver, &mut self.KKT, &self.map.P, &P.nzval);
+        match &self.map.P {
+            PrimalMap::Indexed(indices) => {
+                _update_values(&mut self.ldlsolver, &mut self.KKT, indices, &P.nzval)
+            }
+            PrimalMap::Prefix(len) => {
+                self.KKT.nzval[..*len].copy_from_slice(&P.nzval);
+                self.ldlsolver.update_prefix(&P.nzval);
+            }
+        }
     }
 
     fn update_A(&mut self, A: &CscMatrix<T>) {
@@ -544,8 +559,10 @@ impl<T: FloatT> DirectLDLKKTSolver<T> {
     }
 
     pub(crate) fn publish_P(&mut self) {
-        self.ldlsolver
-            .update_values(&self.map.P, &self.KKT.nzval[..self.map.P.len()]);
+        let PrimalMap::Prefix(len) = self.map.P else {
+            unreachable!("condensed primal prefix")
+        };
+        self.ldlsolver.update_prefix(&self.KKT.nzval[..len]);
     }
 
     // A condensed system retains some original cones. Read their current

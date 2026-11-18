@@ -347,8 +347,13 @@ where
 // LDL Data Map
 //--------------------------------------
 
+pub(crate) enum PrimalMap {
+    Prefix(usize),
+    Indexed(Vec<usize>),
+}
+
 pub(crate) struct LDLDataMap {
-    pub P: Vec<usize>,
+    pub P: PrimalMap,
     pub A: Vec<usize>,
     pub Hsblocks: Vec<usize>, //indices of the lower RHS blocks (by cone)
     pub sparse_maps: Vec<SparseExpansionMap>, //sparse cone expansion terms
@@ -362,13 +367,8 @@ pub(crate) struct LDLDataMap {
 }
 
 impl LDLDataMap {
-    pub fn new<T: FloatT>(
-        Pmat: &CscMatrix<T>,
-        Amat: &CscMatrix<T>,
-        cones: &CompositeCone<T>,
-    ) -> Self {
-        let (m, n) = (Amat.nrows(), Pmat.nrows());
-        let P = vec![0; Pmat.nnz()];
+    pub fn new<T: FloatT>(P: PrimalMap, Amat: &CscMatrix<T>, cones: &CompositeCone<T>) -> Self {
+        let (m, n) = Amat.size();
         let A = vec![0; Amat.nnz()];
 
         // the diagonal of the ULHS KKT block P.
