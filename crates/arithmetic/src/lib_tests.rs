@@ -410,7 +410,7 @@ fn inline_mul_matches_mpfr<const N: usize>() {
         MpFloat::<N> {
             limbs,
             kind,
-            exponent: e as mpfr::exp_t,
+            exponent: e as i32,
         }
     };
     let top = MpFloat::<N> {
@@ -444,7 +444,7 @@ fn inline_mul_matches_mpfr<const N: usize>() {
     let one = MpFloat::<N>::one();
     assert!(one.mul_regular(&MpFloat::<N>::zero()).is_none());
     let huge = MpFloat::<N> {
-        exponent: (1 << 29) as mpfr::exp_t,
+        exponent: (1 << 29) as i32,
         ..one
     };
     assert!(huge.mul_regular(&huge).is_none());
@@ -489,7 +489,7 @@ fn inline_add_matches_mpfr<const N: usize>() {
         MpFloat::<N> {
             limbs,
             kind,
-            exponent: e as mpfr::exp_t,
+            exponent: e as i32,
         }
     };
     let gaps = [
@@ -584,7 +584,7 @@ fn time_ops<const N: usize>() {
             MpFloat::<N> {
                 limbs,
                 kind,
-                exponent: ((next() % 9) as i64 - 4) as mpfr::exp_t,
+                exponent: ((next() % 9) as i64 - 4) as i32,
             }
         })
         .collect();
@@ -646,7 +646,7 @@ fn time_fmma<const N: usize>() {
             MpFloat::<N> {
                 limbs,
                 kind,
-                exponent: ((next() % 9) as i64 - 4) as mpfr::exp_t,
+                exponent: ((next() % 9) as i64 - 4) as i32,
             }
         })
         .collect();
@@ -707,7 +707,7 @@ fn narrow_fmma_matches_mpfr<const N: usize>() {
         MpFloat::<N> {
             limbs,
             kind,
-            exponent: e as mpfr::exp_t,
+            exponent: e as i32,
         }
     };
     for i in 0..20_000 {
@@ -948,7 +948,7 @@ fn check_exact_fma<const N: usize>(spread: u64) {
             MpFloat::<N> {
                 limbs,
                 kind,
-                exponent: ((next() % (2 * spread + 1)) as i64 - spread as i64) as mpfr::exp_t,
+                exponent: ((next() % (2 * spread + 1)) as i64 - spread as i64) as i32,
             }
         })
         .collect();
@@ -1016,7 +1016,7 @@ fn check_exact_div<const N: usize>(spread: u64) {
                 } else {
                     -mpfr::REGULAR_KIND
                 },
-                exponent: ((next() % (2 * spread + 1)) as i64 - spread as i64) as mpfr::exp_t,
+                exponent: ((next() % (2 * spread + 1)) as i64 - spread as i64) as i32,
             }
         })
         .collect();
