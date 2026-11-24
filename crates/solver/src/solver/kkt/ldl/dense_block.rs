@@ -223,6 +223,15 @@ impl DenseBlockSolver {
             && self.valid_factor(&self.s, m, blocked)
     }
 
+    /// The pool for blocked kernels: one worker without a pool, so every
+    /// worker count runs the same blocks.
+    fn blocked_pool(&self) -> &rayon::ThreadPool {
+        self.pool
+            .as_deref()
+            .filter(|pool| pool.current_num_threads() > 1)
+            .unwrap_or(serial_pool())
+    }
+
     /// `(eps, delta)` of the dynamic pivot rule, when enabled: a Cholesky
     /// pivot at or below `eps` is replaced by `delta`, as in the sparse LDL.
     fn pivot_rule(&self) -> Option<(f64, f64)> {
@@ -573,6 +582,101 @@ fn tiled_potrf(a: &mut [f64], n: usize, pool: &rayon::ThreadPool, rule: Option<(
     })
 }
 
+/// Rows (backward) or columns (transposed) one triangular-solve task updates.
+const SOLVE_PANEL: usize = 2 * TILE;
+
+/// `U'x = b` (`transpose`) or `Ux = b` for the upper factor `a` (n x n,
+/// leading dimension n), overwriting `x`: TILE blocks in order, each solved
+/// and then subtracted from the unsolved part in fixed SOLVE_PANEL ranges on
+/// `pool`. The BLAS calls do not depend on the worker count, so neither does
+/// the solution.
+fn tiled_trsv(a: &[f64], n: usize, x: &mut [f64], transpose: bool, pool: &rayon::ThreadPool) {
+    let ld = n as i32;
+    if n < 2 * TILE {
+        let trans = if transpose { b'T' } else { b'N' };
+        unsafe { blas::dtrsv(b'U', trans, b'N', ld, a, ld, x, 1) };
+        return;
+    }
+    let p = n.div_ceil(TILE);
+    pool.install(|| {
+        for step in 0..p {
+            let k = if transpose { step } else { p - 1 - step };
+            let (r0, w) = (k * TILE, TILE.min(n - k * TILE));
+            if transpose {
+                let (head, tail) = x.split_at_mut(r0 + w);
+                let xk = &mut head[r0..];
+                unsafe { blas::dtrsv(b'U', b'T', b'N', w as i32, &a[r0 * n + r0..], ld, xk, 1) };
+                let xk = &*xk;
+                // x[r0 + w..] -= U[r0..r0 + w, r0 + w..]' x_k
+                tail.par_chunks_mut(SOLVE_PANEL)
+                    .enumerate()
+                    .for_each(|(c, t)| unsafe {
+                        let col = r0 + w + c * SOLVE_PANEL;
+                        let len = t.len() as i32;
+                        blas::dgemv(b'T', w as i32, len, -1., &a[col * n + r0..], ld, xk, 1, 1., t, 1);
+                    });
+            } else {
+                let (head, tail) = x.split_at_mut(r0);
+                let xk = &mut tail[..w];
+                unsafe { blas::dtrsv(b'U', b'N', b'N', w as i32, &a[r0 * n + r0..], ld, xk, 1) };
+                let xk = &*xk;
+                // x[..r0] -= U[..r0, r0..r0 + w] x_k
+                head.par_chunks_mut(SOLVE_PANEL)
+                    .enumerate()
+                    .for_each(|(c, t)| unsafe {
+                        let row = c * SOLVE_PANEL;
+                        let len = t.len() as i32;
+                        blas::dgemv(b'N', len, w as i32, -1., &a[r0 * n + row..], ld, xk, 1, 1., t, 1);
+                    });
+            }
+        }
+    })
+}
+
+/// Columns of the packed leading block one residual task reads.
+const RESIDUAL_COLUMNS: usize = 1024;
+
+/// `out -= K x` for the packed upper leading block of `k` (order n), on
+/// `pool`. Fixed column chunks each add their columns (diagonal included)
+/// into a partial over the rows above and dot their strict upper parts with
+/// `x`; every row then subtracts its dot and the partials in chunk order, so
+/// the result does not depend on the worker count.
+fn packed_residual(k: &CscMatrix<f64>, n: usize, out: &mut [f64], x: &[f64], pool: &rayon::ThreadPool) {
+    let chunks = n.div_ceil(RESIDUAL_COLUMNS);
+    let parts: Vec<(Vec<f64>, Vec<f64>)> = pool.install(|| {
+        (0..chunks)
+            .into_par_iter()
+            .map(|c| {
+                let (j0, j1) = (c * RESIDUAL_COLUMNS, n.min((c + 1) * RESIDUAL_COLUMNS));
+                let mut column_sums = vec![0.; j1];
+                let mut dots = vec![0.; j1 - j0];
+                for j in j0..j1 {
+                    let column = &k.nzval[k.colptr[j]..][..=j];
+                    unsafe {
+                        blas::daxpy(j as i32 + 1, x[j], column, 1, &mut column_sums, 1);
+                        dots[j - j0] = blas::ddot(j as i32, column, 1, x, 1);
+                    }
+                }
+                (column_sums, dots)
+            })
+            .collect()
+    });
+    pool.install(|| {
+        out.par_chunks_mut(RESIDUAL_COLUMNS)
+            .enumerate()
+            .for_each(|(b, rows)| {
+                for (r, row) in rows.iter_mut().enumerate() {
+                    let i = b * RESIDUAL_COLUMNS + r;
+                    let mut sum = parts[b].1[r];
+                    for (column_sums, _) in &parts[b..] {
+                        sum += column_sums[i];
+                    }
+                    *row -= sum;
+                }
+            })
+    });
+}
+
 impl HasLinearSolverInfo for DenseBlockSolver {
     fn linear_solver_info(&self) -> LinearSolverInfo {
         if !self.use_dense {
@@ -621,19 +725,7 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
         let timer = crate::receipt::start();
         out.copy_from_slice(rhs);
         let n = self.n;
-        unsafe {
-            blas::dspmv(
-                b'U',
-                n as i32,
-                -1.,
-                &k.nzval[..k.colptr[n]],
-                &point[..n],
-                1,
-                1.,
-                &mut out[..n],
-                1,
-            );
-        }
+        packed_residual(k, n, &mut out[..n], &point[..n], self.blocked_pool());
         for col in n..k.n {
             for p in k.colptr[col]..k.colptr[col + 1] {
                 let row = k.rowval[p];
@@ -672,8 +764,9 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
             .pool
             .as_deref()
             .filter(|p| p.current_num_threads() > 1 && self.y.len() >= 1 << 20);
+        let blocked = self.blocked_pool();
+        tiled_trsv(&self.h, self.n, u, true, blocked);
         unsafe {
-            blas::dtrsv(b'U', b'T', b'N', n, &self.h, n, u, 1);
             if m > 0 {
                 if let Some(pool) = pool {
                     pool.install(|| {
@@ -686,8 +779,8 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
                 } else {
                     blas::dgemv(b'T', n, m, 1., &self.y, n, u, 1, -1., v, 1);
                 }
-                blas::dtrsv(b'U', b'T', b'N', m, &self.s, m, v, 1);
-                blas::dtrsv(b'U', b'N', b'N', m, &self.s, m, v, 1);
+                tiled_trsv(&self.s, self.m, v, true, blocked);
+                tiled_trsv(&self.s, self.m, v, false, blocked);
                 if let Some(pool) = pool {
                     pool.install(|| {
                         u.par_chunks_mut(TILE).enumerate().for_each(|(i, u)| {
@@ -710,8 +803,8 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
                     blas::dgemv(b'N', n, m, -1., &self.y, n, v, 1, 1., u, 1);
                 }
             }
-            blas::dtrsv(b'U', b'N', b'N', n, &self.h, n, u, 1);
         }
+        tiled_trsv(&self.h, self.n, u, false, blocked);
         crate::receipt::finish("dense.solve", timer);
     }
 }
@@ -845,6 +938,75 @@ mod tests {
             assert_eq!(bits(&h1), bits(&h));
             assert_eq!(bits(&y1), bits(&y));
             assert_eq!(bits(&s1), bits(&s));
+        }
+    }
+
+    #[test]
+    fn dense_block_solve_and_residual_are_thread_invariant() {
+        // Leading block and border above the tiled thresholds of the
+        // triangular solves (2 TILE) and residual chunks (RESIDUAL_COLUMNS).
+        let (n, m) = (RESIDUAL_COLUMNS + 2 * TILE + 5, 2 * TILE + 3);
+        let total = n + m;
+        let mut seed = 0x853c49e6748fea9bu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+        for j in 0..total {
+            for i in 0..=j {
+                let v = match (i == j, j < n) {
+                    (true, true) => n as f64,
+                    (true, false) => -(m as f64),
+                    _ if j < n || i < n => next() * 0.1,
+                    _ => 0.,
+                };
+                rows.push(i);
+                cols.push(j);
+                vals.push(v);
+            }
+        }
+        let k = CscMatrix::new_from_triplets(total, total, rows, cols, vals);
+        let signs: Vec<i8> = (0..total).map(|i| if i < n { 1 } else { -1 }).collect();
+        let rhs: Vec<f64> = (0..total).map(|_| next()).collect();
+        let run = |threads: usize| {
+            let mut s = DenseBlockSolver::new(&k, &signs, &CoreSettings::default(), n);
+            if threads > 1 {
+                s.set_pool(Some(Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap(),
+                )));
+            }
+            assert!(s.refactor(&k));
+            let (mut x, mut b) = (vec![0.; total], rhs.clone());
+            s.solve(&k, &mut x, &mut b);
+            let mut r = vec![0.; total];
+            let norm = s.residual(&k, &mut r, &rhs, &x).unwrap();
+            (x, r, norm)
+        };
+        let (x1, r1, norm) = run(1);
+        assert!(norm < 1e-10, "residual {norm}");
+        // The residual matches a direct evaluation of rhs - Kx.
+        let mut direct = rhs.clone();
+        for j in 0..total {
+            for p in k.colptr[j]..k.colptr[j + 1] {
+                let (i, v) = (k.rowval[p], k.nzval[p]);
+                direct[i] -= v * x1[j];
+                if i != j {
+                    direct[j] -= v * x1[i];
+                }
+            }
+        }
+        assert!(direct.iter().zip(&r1).all(|(a, b)| (a - b).abs() < 1e-12));
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for threads in [2, 5] {
+            let (x, r, _) = run(threads);
+            assert_eq!(bits(&x1), bits(&x));
+            assert_eq!(bits(&r1), bits(&r));
         }
     }
 
