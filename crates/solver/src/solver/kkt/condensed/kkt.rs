@@ -1152,6 +1152,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 (Scaling::Dense3(h), SupportedCone::ExponentialCone(_))
                 | (Scaling::Dense3(h), SupportedCone::PowerCone(_)) => cone.get_Hs(h),
                 (Scaling::Ore(o), SupportedCone::OpRelEntropyCone(c)) => o.as_mut().clone_from(c),
+                (Scaling::OreElim(o), SupportedCone::OpRelEntropyCone(c)) => o.cone.clone_from(c),
                 (Scaling::OreLimit(o), SupportedCone::OpRelEntropyLimitCone(c)) => {
                     o.as_mut().clone_from(c)
                 }

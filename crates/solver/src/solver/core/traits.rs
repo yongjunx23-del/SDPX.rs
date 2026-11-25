@@ -31,6 +31,13 @@ pub trait ConeCollection<T: FloatT> {
     fn barrier_backtrack(&self) -> bool {
         !self.all_symmetric()
     }
+    /// Whether some member is a matrix-free operator relative entropy cone,
+    /// whose combined step is retried without its third-order corrector.
+    fn has_free_ore(&self) -> bool {
+        false
+    }
+    /// Turns that corrector on or off.
+    fn ore_corrector(&mut self, _on: bool) {}
     /// Whether primal-dual scaling is supported by all members.
     fn supports_primal_dual(&self) -> bool;
     /// Set identity scaling before the symmetric initializer.
@@ -53,6 +60,19 @@ impl<T: FloatT> ConeCollection<T> for crate::solver::cones::CompositeCone<T> {
     }
     fn barrier_backtrack(&self) -> bool {
         self.iter().any(|c| !c.is_symmetric() && !c.is_ore())
+    }
+    fn has_free_ore(&self) -> bool {
+        use crate::solver::cones::SupportedCone;
+        self.iter()
+            .any(|c| matches!(c, SupportedCone::OpRelEntropyCone(c) if c.matrix_free()))
+    }
+    fn ore_corrector(&mut self, on: bool) {
+        use crate::solver::cones::SupportedCone;
+        for c in self.iter_mut() {
+            if let SupportedCone::OpRelEntropyCone(c) = c {
+                c.set_corrector(on);
+            }
+        }
     }
     fn supports_primal_dual(&self) -> bool {
         self.allows_primal_dual_scaling()

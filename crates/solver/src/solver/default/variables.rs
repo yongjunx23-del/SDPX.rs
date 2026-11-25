@@ -732,7 +732,19 @@ impl<T: FloatT> DefaultVariables<T> {
         let mut α = T::min(αz, αs);
 
         if step_direction == StepDirection::Combined {
-            α *= settings.core().max_step_fraction;
+            if crate::solver::core::traits::ConeCollection::has_free_ore(cones) {
+                α = cones.certify_ore_step(
+                    &step.z,
+                    &step.s,
+                    &self.z,
+                    &self.s,
+                    settings.core(),
+                    α,
+                    kkt,
+                );
+            } else {
+                α *= settings.core().max_step_fraction;
+            }
         }
 
         α

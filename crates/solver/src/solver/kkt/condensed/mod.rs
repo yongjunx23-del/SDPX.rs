@@ -199,6 +199,7 @@ fn sparse_schur_pattern<T: FloatT>(
                 union.dedup();
                 cliques.push(union);
             }
+            Scaling::OreElim(o) => cliques.push(o.columns.clone()),
             _ => {}
         }
     }
@@ -1169,6 +1170,8 @@ enum Scaling<T> {
     /// A retained operator relative entropy cone: a copy of its factored
     /// scaling for products with Hs (the reduced solver reads the cone).
     Ore(Box<OpRelEntropyCone<T>>),
+    /// A matrix-free operator relative entropy cone, eliminated (`OreElim`).
+    OreElim(Box<OreElim<T>>),
     OreLimit(Box<OpRelEntropyLimitCone<T>>),
     GenPower {
         p: Vec<T>,
@@ -1179,6 +1182,83 @@ enum Scaling<T> {
         mu: T,
     },
 }
+/// A matrix-free operator relative entropy cone (`matrix_free`), whose
+/// dense Hs cannot be stored: its rows leave the reduced system through
+/// Hs⁻¹ = μ∇²f(s), applied by Hessian products. The Schur term AₖᵀHs⁻¹Aₖ
+/// over the columns touching the cone takes one product per column.
+/// Its KKT rows Aₖx − Hs zₖ = bₖ recover zₖ = Hs⁻¹(Aₖx − bₖ), the
+/// difference formed before the product; refinement takes them as exact
+/// and corrects x alone. Nothing needs Hs itself, an S₀ solve.
+struct OreElim<T> {
+    cone: OpRelEntropyCone<T>,
+    columns: Vec<usize>,
+    /// Entries of Aₖ by column slot: `(local row, A position)`, slot `k`
+    /// in `entries[starts[k]..starts[k + 1]]`.
+    entries: Vec<(usize, usize)>,
+    starts: Vec<usize>,
+    /// Schur positions of the slot pairs (i ≤ j, by column), on first use.
+    positions: Vec<usize>,
+}
+
+impl<T: FloatT> OreElim<T> {
+    /// Adds AₖᵀHs⁻¹Aₖ: U = Hs⁻¹V for the dense columns V of Aₖ (one
+    /// Hessian product each, in parallel), then G = VᵀU from Aₖ's entries.
+    /// Each product and entry is formed alone, so the sum does not depend
+    /// on the pool. G is symmetric up to rounding; its two halves are
+    /// averaged.
+    fn add_schur(
+        &mut self,
+        nzval: &[T],
+        dim: usize,
+        values: &mut [T],
+        position: impl Fn(usize, usize) -> usize,
+        pool: Option<&rayon::ThreadPool>,
+    ) {
+        let c = self.columns.len();
+        if self.positions.is_empty() {
+            for j in 0..c {
+                for i in 0..=j {
+                    self.positions
+                        .push(position(self.columns[i], self.columns[j]));
+                }
+            }
+        }
+        let (entries, starts, cone) = (&self.entries, &self.starts, &self.cone);
+        let mut u = vec![T::zero(); dim * c];
+        let mut g = vec![T::zero(); c * c];
+        let mut run = || {
+            u.par_chunks_mut(dim).enumerate().for_each(|(k, u)| {
+                let mut v = vec![T::zero(); dim];
+                for &(r, p) in &entries[starts[k]..starts[k + 1]] {
+                    v[r] = nzval[p];
+                }
+                cone.hess_mul(u, &v);
+            });
+            g.par_chunks_mut(c)
+                .zip(u.par_chunks(dim))
+                .for_each(|(g, u)| {
+                    for (i, g) in g.iter_mut().enumerate() {
+                        *g = entries[starts[i]..starts[i + 1]]
+                            .iter()
+                            .fold(T::zero(), |acc, &(r, p)| acc + nzval[p] * u[r]);
+                    }
+                });
+        };
+        match pool {
+            Some(pool) => pool.install(run),
+            None => run(),
+        }
+        let half: T = (0.5).as_T();
+        let mut k = 0;
+        for j in 0..c {
+            for i in 0..=j {
+                values[self.positions[k]] += half * (g[i + j * c] + g[j + i * c]);
+                k += 1;
+            }
+        }
+    }
+}
+
 struct Block<T> {
     rows: Range<usize>,
     scaling: Scaling<T>,
@@ -1367,6 +1447,10 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let mut row_soc = vec![u32::MAX; m];
         let mut soc_starts: Vec<usize> = Vec::new();
         let mut soc_entries: Vec<Vec<Vec<(usize, usize)>>> = Vec::new();
+        // Matrix-free ORE cones: `(column, local row, position)` per entry.
+        let mut row_ore = vec![u32::MAX; m];
+        let mut ore_starts: Vec<usize> = Vec::new();
+        let mut ore_entries: Vec<Vec<(usize, usize, usize)>> = Vec::new();
         // Pass 1: classify cones and publish row ownership.
         for (ci, (cone, rows)) in cones.iter().zip(&cones.rng_cones).enumerate() {
             match cone {
@@ -1399,6 +1483,11 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     soc_entries.push(vec![Vec::new(); rows.len()]);
                 }
                 SupportedCone::ZeroCone(_) if !keep_equalities => {}
+                SupportedCone::OpRelEntropyCone(c) if c.matrix_free() => {
+                    row_ore[rows.clone()].fill(ore_starts.len() as u32);
+                    ore_starts.push(rows.start);
+                    ore_entries.push(Vec::new());
+                }
                 _ => {
                     retained_indices.push(ci);
                     retained_types.push(types[ci].clone());
@@ -1462,6 +1551,11 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     let soc = soc as usize;
                     soc_entries[soc][row - soc_starts[soc]].push((col, position));
                 }
+                let ore = row_ore[row];
+                if ore != u32::MAX {
+                    let ore = ore as usize;
+                    ore_entries[ore].push((col, row - ore_starts[ore], position));
+                }
             }
             compact_colptr.push(compact_rowval.len());
         }
@@ -1469,6 +1563,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let mut psd_taken = psd_columns.into_iter().zip(psd_numels);
         let mut orthant_taken = orthant_entries.into_iter();
         let mut soc_taken = soc_entries.into_iter();
+        let mut ore_taken = ore_entries.into_iter();
         for (ci, cone) in cones.iter().enumerate() {
             let scaling = match cone {
                 SupportedCone::PSDTriangleCone(c) => {
@@ -1494,6 +1589,25 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 },
                 SupportedCone::ExponentialCone(_) | SupportedCone::PowerCone(_) => {
                     Scaling::Dense3([T::zero(); 6])
+                }
+                SupportedCone::OpRelEntropyCone(c) if c.matrix_free() => {
+                    // Pass 2 scans by column, so entries arrive by column.
+                    let found = ore_taken.next().expect("one entry set per ORE cone");
+                    let (mut columns, mut starts) = (Vec::new(), Vec::new());
+                    for (k, &(col, _, _)) in found.iter().enumerate() {
+                        if columns.last() != Some(&col) {
+                            columns.push(col);
+                            starts.push(k);
+                        }
+                    }
+                    starts.push(found.len());
+                    Scaling::OreElim(Box::new(OreElim {
+                        cone: c.clone(),
+                        columns,
+                        entries: found.into_iter().map(|(_, r, p)| (r, p)).collect(),
+                        starts,
+                        positions: Vec::new(),
+                    }))
                 }
                 SupportedCone::OpRelEntropyCone(c) => Scaling::Ore(Box::new(c.clone())),
                 SupportedCone::OpRelEntropyLimitCone(c) => Scaling::OreLimit(Box::new(c.clone())),
@@ -2010,6 +2124,26 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             pool.as_deref(),
         );
         crate::receipt::finish("assemble.elim", timer);
+        let timer = crate::receipt::start();
+        let (colptr, rowval) = (&schur.colptr, &schur.rowval);
+        for block in &mut self.blocks {
+            if let Scaling::OreElim(o) = &mut block.scaling {
+                o.add_schur(
+                    &self.A.nzval,
+                    block.rows.len(),
+                    &mut schur.nzval,
+                    |i, j| {
+                        if dense {
+                            colptr[j] + i
+                        } else {
+                            colptr[j] + rowval[colptr[j]..colptr[j + 1]].partition_point(|&r| r < i)
+                        }
+                    },
+                    pool.as_deref(),
+                );
+            }
+        }
+        crate::receipt::finish("assemble.ore", timer);
         schur.nzval[..self.schur_nnz].is_finite()
     }
 
@@ -2716,6 +2850,15 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             }
         }
         crate::algebra::add_assign(ez, &self.workh);
+        // ORE rows hold by construction: recovery defines zₖ = Hs⁻¹(Aₖx − bₖ).
+        // Measured scaled, their residual is the rounding of that product,
+        // eps·|Hs⁻¹|·|Aₖx − bₖ|, which a correction would carry back into x
+        // amplified by the Schur inverse; refinement corrects x alone.
+        for block in &self.blocks {
+            if let Scaling::OreElim(_) = block.scaling {
+                ez[block.rows.clone()].fill(T::zero());
+            }
+        }
         if let (Some(w), Some(((y0, y1), ranges))) = (aligned, rows) {
             let local = ez[y0..y1].to_vec();
             w.gather_slice(crate::mpi::SITE_SCALING, &local, &ranges, ez);
