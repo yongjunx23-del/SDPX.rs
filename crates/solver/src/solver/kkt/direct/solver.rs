@@ -333,7 +333,6 @@ where
         ldlsolver.set_pool(cones.thread_pool());
 
         let packed_residual = ldlsolver.linear_solver_info().name == "dense_block"
-            && KKT.colptr[n] <= i32::MAX as usize
             && KKT.colptr[n] == triangular_number(n);
         let residual_runs = if T::precision_bits() <= 64 {
             crate::algebra::SymvRuns::new(&KKT)

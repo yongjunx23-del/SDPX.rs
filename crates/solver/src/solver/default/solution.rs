@@ -206,7 +206,7 @@ where
         self.status = SolverStatus::Solved;
         self.reconstruct(data, &mut scratch, settings, false);
         self.status = status;
-        operator.dual_jump(q, &self.z)
+        operator.dual_jump(q, &self.z, settings.tol_feas)
     }
 
     fn finalize(&mut self, info: &DefaultInfo<T>) {

@@ -17,7 +17,7 @@ fn cholesky<T: FloatT>(a: &mut [T], n: usize) -> bool {
         for k in 0..j {
             d -= a[j * n + k] * a[j * n + k];
         }
-        if !(d > T::zero()) {
+        if !d.is_finite() || d <= T::zero() {
             return false;
         }
         let d = d.sqrt();
@@ -53,10 +53,44 @@ fn unpack<T: FloatT>(svec: &[T], side: usize) -> Vec<T> {
 }
 
 impl<T: FloatT> SampledOperator<T> {
+    /// The projection below covers free equality multipliers and complete sampled
+    /// PSD blocks. Each variable belongs to exactly one group of parities.
+    pub(crate) fn covers_dual_jump(&self, cones: &[crate::solver::SupportedConeT<T>]) -> bool {
+        use crate::solver::SupportedConeT::{PSDTriangleConeT, ZeroConeT};
+        if self.blocks.is_empty()
+            || !cones
+                .iter()
+                .all(|c| matches!(c, ZeroConeT(_) | PSDTriangleConeT(_)))
+            || !self.covers_all_psd(cones)
+        {
+            return false;
+        }
+        let mut column = 0;
+        for group in self
+            .blocks
+            .chunk_by(|a, b| a.column_start == b.column_start)
+        {
+            let first = &group[0];
+            if first.column_start != column
+                || first.basis_cols == 0
+                || first.weights.iter().any(|&w| w == T::zero())
+                || !group.iter().all(|b| {
+                    b.dim == first.dim
+                        && b.basis_cols == first.basis_cols
+                        && b.weights == first.weights
+                })
+            {
+                return false;
+            }
+            column += first.column_count();
+        }
+        column == self.linear.n
+    }
+
     /// Whether original-coordinate `z` passes the jump test for the input
     /// objective `q`. Blocks sharing a column range are the parities of one
     /// polynomial matrix block.
-    pub(crate) fn dual_jump(&self, q: &[T], z: &[T]) -> bool {
+    pub(crate) fn dual_jump(&self, q: &[T], z: &[T], tolerance: T) -> bool {
         // t_p = -(q_p + (linear' z)_p) / weight_p: the value <Q_p, Y> must take.
         let lin = &self.linear;
         let column = |p: usize| {
@@ -72,6 +106,7 @@ impl<T: FloatT> SampledOperator<T> {
                     .iter()
                     .take_while(|b| b.column_start == first.column_start)
                     .count();
+            let projection = &self.constants[start].jump_projection;
             let parts = &self.blocks[start..end];
             start = end;
             let (dim, np) = (first.dim, first.basis_cols);
@@ -108,6 +143,20 @@ impl<T: FloatT> SampledOperator<T> {
                 }
                 total
             };
+            let value = |grams: &[(usize, usize, Vec<T>)], r, s, k| {
+                parts
+                    .iter()
+                    .zip(grams)
+                    .fold(T::zero(), |acc, (b, (_, side, y))| {
+                        let upper = form(b, y, *side, r, s, k);
+                        let lower = if r == s {
+                            upper
+                        } else {
+                            form(b, y, *side, s, r, k)
+                        };
+                        acc + (upper + lower) * half
+                    })
+            };
             let mut pair = 0;
             for s in 0..dim {
                 for r in 0..=s {
@@ -116,32 +165,27 @@ impl<T: FloatT> SampledOperator<T> {
                         .map(|k| {
                             let p = pair * np + k;
                             let target = -column(first.column_start + p) / first.weights[p];
-                            let value = parts.iter().zip(&grams).fold(
-                                T::zero(),
-                                |acc, (b, (_, side, y))| {
-                                    acc + (form(b, y, *side, r, s, k) + form(b, y, *side, s, r, k))
-                                        * half
-                                },
-                            );
-                            target - value
+                            target - value(&grams, r, s, k)
                         })
                         .collect();
-                    let mut g = vec![T::zero(); np * np];
-                    for b in parts {
-                        let h = b.basis_rows;
-                        for k in 0..np {
-                            for l in 0..=k {
-                                let d = b.basis[k * h..(k + 1) * h]
-                                    .iter()
-                                    .zip(&b.basis[l * h..(l + 1) * h])
-                                    .fold(T::zero(), |acc, (&x, &y)| acc + x * y);
-                                g[k * np + l] += factor * d * d;
+                    let Some(g) = projection[usize::from(r != s)].get_or_init(|| {
+                        let mut g = vec![T::zero(); np * np];
+                        for b in parts {
+                            let h = b.basis_rows;
+                            for k in 0..np {
+                                for l in 0..=k {
+                                    let d = b.basis[k * h..(k + 1) * h]
+                                        .iter()
+                                        .zip(&b.basis[l * h..(l + 1) * h])
+                                        .fold(T::zero(), |acc, (&x, &y)| acc + x * y);
+                                    g[k * np + l] += factor * d * d;
+                                }
                             }
                         }
-                    }
-                    if !cholesky(&mut g, np) {
+                        cholesky(&mut g, np).then_some(g)
+                    }) else {
                         return false;
-                    }
+                    };
                     for i in 0..np {
                         for k in 0..i {
                             let v = g[i * np + k] * residual[k];
@@ -159,15 +203,27 @@ impl<T: FloatT> SampledOperator<T> {
                     for (b, (h, side, y)) in parts.iter().zip(grams.iter_mut()) {
                         let (h, side) = (*h, *side);
                         for a in 0..h {
-                            for c in 0..h {
+                            let columns = if r == s { a + 1 } else { h };
+                            for c in 0..columns {
                                 let d = (0..np).fold(T::zero(), |acc, k| {
                                     acc + residual[k] * b.basis[k * h + a] * b.basis[k * h + c]
                                 }) * factor;
                                 y[(r * h + a) * side + s * h + c] += d;
-                                if r != s {
-                                    y[(s * h + a) * side + r * h + c] += d;
+                                if r != s || a != c {
+                                    y[(s * h + c) * side + r * h + a] += d;
                                 }
                             }
+                        }
+                    }
+                    // Check the corrected equations at working precision. A positive
+                    // Gram alone does not bound error from an ill-conditioned projection.
+                    for k in 0..np {
+                        let p = pair * np + k;
+                        let wanted = column(first.column_start + p);
+                        let error = (wanted + first.weights[p] * value(&grams, r, s, k)).abs();
+                        if !error.is_finite() || error > tolerance * T::max(T::one(), wanted.abs())
+                        {
+                            return false;
                         }
                     }
                     pair += 1;

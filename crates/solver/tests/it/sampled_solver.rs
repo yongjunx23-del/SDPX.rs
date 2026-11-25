@@ -251,3 +251,73 @@ fn sampled_presolve_256() {
 fn sampled_presolve_512() {
     sampled_presolve::<sdpx_arithmetic::Bits512>();
 }
+
+#[test]
+fn jump_uses_current_objective_and_requires_complete_coverage() {
+    // min q*x, x >= 1. Dual feasibility is exactly q >= 0.
+    let p = CscMatrix::zeros((1, 1));
+    let a = CscMatrix::zeros((1, 1));
+    let block = SampledBlock {
+        row_start: 0,
+        column_start: 0,
+        dim: 1,
+        basis_rows: 1,
+        basis_cols: 1,
+        basis: vec![1.0],
+        weights: vec![-1.0],
+    };
+    let mut settings = DefaultSettings::<f64>::default();
+    settings.verbose = false;
+    settings.find_dual_feasible = true;
+    settings.presolve_enable = false;
+    settings.max_threads = 1;
+    settings.tol_feas = 1e-8;
+    settings.tol_gap_abs = 1e-12;
+    settings.tol_gap_rel = 1e-12;
+    for (initial, q) in [(-1.0, 1.0), (1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+        let mut s = DefaultSolver::new_sampled(
+            &p,
+            &[initial],
+            &a,
+            &[-1.0],
+            &[PSDTriangleConeT(1)],
+            vec![block.clone()],
+            settings.clone(),
+        )
+        .unwrap();
+        if q != initial {
+            if initial < 0. {
+                s.update_q(&vec![q]).unwrap();
+            } else {
+                s.update_q(&(vec![0usize], vec![q])).unwrap();
+            }
+        }
+        s.solve();
+        assert_eq!(
+            s.solution.status,
+            if q > 0. {
+                SolverStatus::DualFeasible
+            } else {
+                SolverStatus::DualInfeasible
+            }
+        );
+    }
+    // min x1 - x2, x1 >= 1 (sampled), x2 >= 1 (ordinary). No dual feasible point exists.
+    let a = CscMatrix::new(2, 2, vec![0, 0, 1], vec![1], vec![-1.0]);
+    for enabled in [false, true] {
+        let mut opts = settings.clone();
+        opts.find_dual_feasible = enabled;
+        let mut s = DefaultSolver::new_sampled(
+            &CscMatrix::zeros((2, 2)),
+            &[1.0, -1.0],
+            &a,
+            &[-1.0, -1.0],
+            &[PSDTriangleConeT(1), NonnegativeConeT(1)],
+            vec![block.clone()],
+            opts,
+        )
+        .unwrap();
+        s.solve();
+        assert_eq!(s.solution.status, SolverStatus::DualInfeasible);
+    }
+}

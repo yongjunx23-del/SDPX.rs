@@ -1075,3 +1075,33 @@ fn exact_div_matches_mpfr_bitwise() {
         check_exact_div::<16>(spread);
     }
 }
+
+#[test]
+fn external_exponents_do_not_wrap() {
+    type F = MpFloat<2>;
+    let exponent = i64::from(i32::MAX) + 1;
+    let one = F::one();
+    let (kind, ordinary, limbs) = one.exact_encode();
+    let limbs = *limbs;
+    assert_eq!(F::try_exact_decode(kind, ordinary, limbs), Some(F::one()));
+    assert!(F::try_exact_decode(kind, exponent, limbs).is_none());
+    assert!(F::try_exact_decode(kind, -exponent - 1, limbs).is_none());
+
+    // Temporary exponent settings are thread local in the solver build.
+    if unsafe { mpfr::buildopt_tls_p() == 0 || (mpfr::get_emax_max() as i64) < exponent } {
+        return;
+    }
+    let mut value = Temp::new(F::PRECISION_BITS);
+    let (imported, parsed) = unsafe {
+        let old = mpfr::get_emax();
+        assert_eq!(mpfr::set_emax(exponent as _), 0);
+        mpfr::set_ui_2exp(&mut value.0, 1, (exponent - 1) as _, ROUND);
+        let imported = F::try_from_mpfr_descriptor(&value.0);
+        let parsed = F::parse_radix("1@2147483647", 2);
+        mpfr::set_emax(old);
+        (imported, parsed)
+    };
+    assert_eq!(unsafe { mpfr::custom_get_exp(&value.0) } as i64, exponent);
+    assert!(imported.is_none());
+    assert!(parsed.is_err());
+}

@@ -446,6 +446,9 @@ impl<const N: usize> MpFloat<N> {
         }
     }
     fn output(f: impl FnOnce(*mut mpfr::mpfr_t)) -> Self {
+        Self::try_output(f).expect("MPFR exponent range wider than i32")
+    }
+    fn try_output(f: impl FnOnce(*mut mpfr::mpfr_t)) -> Option<Self> {
         let mut result = Self::default();
         // Construct from the mutable borrow, never write through a shared reference.
         Self::check_precision();
@@ -463,23 +466,40 @@ impl<const N: usize> MpFloat<N> {
             f(&mut d);
             result.kind = mpfr::custom_get_kind(&d);
             if result.kind.abs() == mpfr::REGULAR_KIND {
-                result.exponent = i32::try_from(mpfr::custom_get_exp(&d))
-                    .expect("MPFR exponent range wider than i32");
+                result.exponent = i32::try_from(mpfr::custom_get_exp(&d)).ok()?;
             }
         }
-        result
+        Some(result)
     }
     /// Adopt the value held by a native descriptor at this precision.
     ///
     /// Rounded to this precision; exact when the source is representable.
     ///
+    /// # Panics
+    /// If the source or rounded result has an exponent outside the compact i32 range.
+    ///
     /// # Safety
     /// `desc` must be an initialized MPFR value with valid limb storage that
     /// remains readable and is not mutated for the duration of this call.
     pub unsafe fn from_mpfr_descriptor(desc: &mpfr::mpfr_t) -> Self {
-        Self::output(|r| unsafe {
-            mpfr::set(r, desc, ROUND);
-        })
+        unsafe { Self::try_from_mpfr_descriptor(desc) }.expect("MPFR exponent range wider than i32")
+    }
+
+    /// Import a native value with the same rounding as [`Self::from_mpfr_descriptor`].
+    /// Returns `None` when the source or rounded result has an exponent outside the i32 range.
+    ///
+    /// # Safety
+    /// `desc` must be an initialized MPFR value with valid limb storage that
+    /// remains readable and is not mutated for the duration of this call.
+    pub unsafe fn try_from_mpfr_descriptor(desc: &mpfr::mpfr_t) -> Option<Self> {
+        unsafe {
+            if mpfr::regular_p(desc) != 0 && i32::try_from(mpfr::custom_get_exp(desc)).is_err() {
+                return None;
+            }
+            Self::try_output(|r| {
+                mpfr::set(r, desc, ROUND);
+            })
+        }
     }
 
     /// Lossless encoding: `(kind, exponent, limbs)`. Round-trips
@@ -490,14 +510,23 @@ impl<const N: usize> MpFloat<N> {
         (self.kind, self.exponent as i64, &self.limbs)
     }
     /// Inverse of [`Self::exact_encode`]. The caller must supply a triple produced
-    /// at the same precision; no validation beyond a precision check is done.
+    /// at the same precision.
+    ///
+    /// # Panics
+    /// If the exponent is outside the compact i32 range.
     pub fn exact_decode(kind: i32, exponent: i64, limbs: [u64; N]) -> Self {
+        Self::try_exact_decode(kind, exponent, limbs).expect("MPFR exponent range wider than i32")
+    }
+
+    /// Decode a triple produced at this precision. Rejects exponents outside
+    /// the compact i32 range, including those from older wide-exponent builds.
+    pub fn try_exact_decode(kind: i32, exponent: i64, limbs: [u64; N]) -> Option<Self> {
         Self::check_precision();
-        Self {
+        Some(Self {
             limbs,
             kind,
-            exponent: exponent as i32,
-        }
+            exponent: i32::try_from(exponent).ok()?,
+        })
     }
 
     /// Dot product accumulated exactly and rounded once at this precision
@@ -1387,13 +1416,13 @@ impl<const N: usize> MpFloat<N> {
         }
         let s = CString::new(s).map_err(|_| error("embedded NUL in number"))?;
         let mut status = 0;
-        let value = Self::output(|r| unsafe {
+        let value = Self::try_output(|r| unsafe {
             status = mpfr::set_str(r, s.as_ptr(), radix as _, ROUND);
         });
         if status != 0 {
             Err(error("invalid number"))
         } else {
-            Ok(value)
+            value.ok_or_else(|| error("exponent outside the i32 range"))
         }
     }
     /// Decimal scientific notation; absent digit count guarantees binary round-trip.

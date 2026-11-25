@@ -120,6 +120,7 @@ pub(crate) fn block_row_span<T>(blocks: &[SampledBlock<T>]) -> (usize, usize) {
 /// read-only and can be borrowed by every workspace using this operator.
 #[derive(Debug)]
 struct SampledBlockConstants<T> {
+    jump_projection: [OnceLock<Option<Vec<T>>>; 2],
     wdiag: OnceLock<Vec<T>>,
     basis_residues: [ResidueCache; 2],
 }
@@ -137,6 +138,7 @@ impl<T> SampledBlockConstants<T> {
         };
         Self {
             wdiag: OnceLock::new(),
+            jump_projection: Default::default(),
             basis_residues: [forward, adjoint],
         }
     }

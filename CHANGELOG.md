@@ -5,6 +5,17 @@ All notable changes to SDPX are recorded here. Versions follow
 iteration-limited runs and diagnostics; evidence is in
 [docs/JOURNAL.md](docs/JOURNAL.md).
 
+## Unreleased
+
+- Sampled dual-feasibility detection uses the updated objective and verifies
+  the corrected dual equations and Gram matrices.
+- Matrix-free operator relative entropy cones handle constant constraints
+  after presolve. Shared-memory partitions use the same shifted Newton
+  equations and combined-step certification.
+- Compact MPFR scalars reject out-of-range exponents at raw input boundaries.
+- Dense Float64 KKT refinement can use the pooled packed residual when the
+  triangle contains more than 2³¹ − 1 entries.
+
 ## [0.9.5] - 2026-11-05
 
 ### Release highlights

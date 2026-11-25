@@ -215,8 +215,7 @@ const GEMM_TILE: usize = 32;
 fn gemm_jobs<T: FloatT>(n: usize, jobs: &mut [(bool, bool, &[T], &[T], &mut [T])]) {
     let work = jobs.len() * n * n * n;
     let ways = if T::precision_bits() <= 53 {
-        tasks::<T>(work, jobs.len() * n.div_ceil(GEMM_TILE))
-            .min(2 * rayon::current_num_threads())
+        tasks::<T>(work, jobs.len() * n.div_ceil(GEMM_TILE)).min(2 * rayon::current_num_threads())
     } else {
         1
     };
@@ -237,7 +236,21 @@ fn gemm_jobs<T: FloatT>(n: usize, jobs: &mut [(bool, bool, &[T], &[T], &mut [T])
             unsafe { std::slice::from_raw_parts_mut(outs[item / tiles].0.add(c0 * n), cols * n) };
         // columns c0.. of op(b): b's columns, or its rows for bᵀ
         let b = &b[if tb { c0 } else { c0 * n }..];
-        T::xgemm(t(ta), t(tb), ni, cols as i32, ni, T::one(), a, ni, b, ni, T::zero(), out, ni);
+        T::xgemm(
+            t(ta),
+            t(tb),
+            ni,
+            cols as i32,
+            ni,
+            T::one(),
+            a,
+            ni,
+            b,
+            ni,
+            T::zero(),
+            out,
+            ni,
+        );
     };
     if tiles == 1 {
         (0..jobs.len()).for_each(product);
@@ -777,7 +790,7 @@ fn divided1<T: FloatT>(a: T, b: T, la: T, lb: T) -> T {
 #[inline]
 fn d2_col(n: usize, p: usize, q: usize) -> usize {
     let tet = |k: usize| k * (k + 1) * (k + 2) / 6;
-    tet(n) - tet(n - p) + (q - p) * n - (q - p) * (q + p - 1) / 2
+    tet(n) - tet(n - p) + (q - p) * (2 * n - q - p + 1) / 2
 }
 
 /// Second divided difference of g = −log at (a, b, c), given g⁽¹⁾ values.
@@ -1111,12 +1124,20 @@ impl<T: FloatT> Oracle<T> {
         ws.resize(8 * nn, T::zero());
         let ef = self.ef();
         let (ph, pk) = p.split_at(m);
-        let (hp, kp, wp) = (Out(h.as_mut_ptr()), Out(k.as_mut_ptr()), Out(ws.as_mut_ptr()));
+        let (hp, kp, wp) = (
+            Out(h.as_mut_ptr()),
+            Out(k.as_mut_ptr()),
+            Out(ws.as_mut_ptr()),
+        );
         items::<T>(n, 4 * nn, |j| {
             let (hp, kp, wp) = (&hp, &kp, &wp);
             for i in 0..n {
                 let t = if i < j { tri(i, j) } else { tri(j, i) };
-                let (hv, kv) = if i == j { (ph[t], pk[t]) } else { (ph[t] * r, pk[t] * r) };
+                let (hv, kv) = if i == j {
+                    (ph[t], pk[t])
+                } else {
+                    (ph[t] * r, pk[t] * r)
+                };
                 let (e, f) = ef(i, j, hv, kv);
                 let ij = i + j * n;
                 // SAFETY: column j of H, K, E1 and F1 belongs to item j alone.
@@ -1132,7 +1153,11 @@ impl<T: FloatT> Oracle<T> {
             let base = &base;
             for i in j..n {
                 let (a, b) = entry(i, j);
-                let (a, b) = if i == j { (a, b) } else { ((a + a) * r, (b + b) * r) };
+                let (a, b) = if i == j {
+                    (a, b)
+                } else {
+                    ((a + a) * r, (b + b) * r)
+                };
                 // SAFETY: entries tri(j, ·) of both halves belong to item j alone.
                 unsafe { (*base.0.add(tri(j, i)), *base.0.add(m + tri(j, i))) = (a, b) };
             }
@@ -1200,36 +1225,57 @@ impl<T: FloatT> Oracle<T> {
                 // half again the average.
                 let (e1, f1) = (&*e1, &*f1);
                 let gp = Out(gam.as_mut_ptr());
-                let gamma = || items::<T>(n, 3 * n * nn / 2, |k| {
-                    let (gp, a) = (&gp, if k % 2 == 0 { k / 2 } else { n - 1 - k / 2 });
-                    // SAFETY: column a belongs to item k alone.
-                    let acc = unsafe { std::slice::from_raw_parts_mut(gp.0.add(a + a * n), n - a) };
-                    acc.fill(T::zero());
-                    for c in 0..n {
-                        let (wca, eca) = (w[c + a * n], e1[c + a * n]);
-                        if c < a {
-                            let col = d2_col(n, c, a);
-                            let (g, wc, ec) = (&d2[col..col + n - a], &w[a + c * n..(c + 1) * n], &e1[a + c * n..(c + 1) * n]);
-                            for (((acc, &g), &wcb), &ecb) in acc.iter_mut().zip(g).zip(wc).zip(ec) {
-                                *acc += g * (wca * ecb + eca * wcb);
+                let gamma = || {
+                    items::<T>(n, 3 * n * nn / 2, |k| {
+                        let (gp, a) = (&gp, if k % 2 == 0 { k / 2 } else { n - 1 - k / 2 });
+                        // SAFETY: column a belongs to item k alone.
+                        let acc =
+                            unsafe { std::slice::from_raw_parts_mut(gp.0.add(a + a * n), n - a) };
+                        acc.fill(T::zero());
+                        for c in 0..n {
+                            let (wca, eca) = (w[c + a * n], e1[c + a * n]);
+                            if c < a {
+                                let col = d2_col(n, c, a);
+                                let (g, wc, ec) = (
+                                    &d2[col..col + n - a],
+                                    &w[a + c * n..(c + 1) * n],
+                                    &e1[a + c * n..(c + 1) * n],
+                                );
+                                for (((acc, &g), &wcb), &ecb) in
+                                    acc.iter_mut().zip(g).zip(wc).zip(ec)
+                                {
+                                    *acc += g * (wca * ecb + eca * wcb);
+                                }
+                                continue;
                             }
-                            continue;
+                            let col = d2_col(n, a, c);
+                            let (g, wc, ec) = (
+                                &d2[col..col + n - c],
+                                &w[c + c * n..(c + 1) * n],
+                                &e1[c + c * n..(c + 1) * n],
+                            );
+                            let (wa, ea) = (
+                                &w[c + 1 + a * n..(a + 1) * n],
+                                &e1[c + 1 + a * n..(a + 1) * n],
+                            );
+                            let (first, rest) = acc[c - a..].split_first_mut().unwrap();
+                            *first += g[0] * (wca * ec[0] + eca * wc[0]);
+                            let mut s = *first;
+                            for (((((acc, &g), &wcb), &ecb), &wra), &era) in rest
+                                .iter_mut()
+                                .zip(&g[1..])
+                                .zip(&wc[1..])
+                                .zip(&ec[1..])
+                                .zip(wa)
+                                .zip(ea)
+                            {
+                                *acc += g * (wca * ecb + eca * wcb);
+                                s += g * (wra * ecb + era * wcb);
+                            }
+                            *first = s;
                         }
-                        let col = d2_col(n, a, c);
-                        let (g, wc, ec) = (&d2[col..col + n - c], &w[c + c * n..(c + 1) * n], &e1[c + c * n..(c + 1) * n]);
-                        let (wa, ea) = (&w[c + 1 + a * n..(a + 1) * n], &e1[c + 1 + a * n..(a + 1) * n]);
-                        let (first, rest) = acc[c - a..].split_first_mut().unwrap();
-                        *first += g[0] * (wca * ec[0] + eca * wc[0]);
-                        let mut s = *first;
-                        for (((((acc, &g), &wcb), &ecb), &wra), &era) in
-                            rest.iter_mut().zip(&g[1..]).zip(&wc[1..]).zip(&ec[1..]).zip(wa).zip(ea)
-                        {
-                            *acc += g * (wca * ecb + eca * wcb);
-                            s += g * (wra * ecb + era * wcb);
-                        }
-                        *first = s;
-                    }
-                });
+                    })
+                };
                 // V H, W H, K V, C H and W F1. The inner-parallel gate and
                 // split hint are per thread: a worker that steals this half
                 // takes them along, or it ran the five products serially
@@ -1275,20 +1321,24 @@ impl<T: FloatT> Oracle<T> {
                 mul_unit(n, w, f1, (p, q), true, m5);
             }
         }
-        let (gam, m1, m2, m3, m4, m5): (&[T], &[T], &[T], &[T], &[T], &[T]) = (gam, m1, m2, m3, m4, m5);
+        let (gam, m1, m2, m3, m4, m5): (&[T], &[T], &[T], &[T], &[T], &[T]) =
+            (gam, m1, m2, m3, m4, m5);
         move |i: usize, j: usize| {
             let (ij, ji) = (i + j * n, j + i * n);
             let (li, lj, gi, gj) = (lam[i], lam[j], g[i], g[j]);
             // the full product keeps Γ's lower triangle only
-            let gij = if unit.is_none() && i < j { gam[ji] } else { gam[ij] };
+            let gij = if unit.is_none() && i < j {
+                gam[ji]
+            } else {
+                gam[ij]
+            };
             let dj = d1[ij] * half * (m2[ij] + m2[ji]); // g⁽¹⁾∘J, J = (WH + HW)/2
-            let dhq = -half * (m3[ij] + m3[ji])
-                + (m4[ij] + m4[ji])
-                + q14 * (lj * m1[ij] + li * m1[ji])
-                - half * (li + lj) * gij
-                + half * (m5[ij] + m5[ji])
-                - half * (li + lj) * dj
-                + q14 * (gj * m2[ij] + gi * m2[ji]);
+            let dhq =
+                -half * (m3[ij] + m3[ji]) + (m4[ij] + m4[ji]) + q14 * (lj * m1[ij] + li * m1[ji])
+                    - half * (li + lj) * gij
+                    + half * (m5[ij] + m5[ji])
+                    - half * (li + lj) * dj
+                    + q14 * (gj * m2[ij] + gi * m2[ji]);
             let dkq = -half * (m1[ij] + m1[ji]) + gij + dj;
             (h[ij] + dhq, k[ij] / (li * lj) + dkq)
         }
@@ -2122,15 +2172,15 @@ impl<T: FloatT> OpRelEntropyCone<T> {
         for ((o, &z), &s) in shift.iter_mut().zip(&self.data.z).zip(s) {
             *o = z - c * *o - s;
         }
+        if !self.data.corrector {
+            return;
+        }
         let w: Vec<T> = step_s.iter().zip(s).map(|(&d, &s)| -mu * (d + s)).collect();
         let paired = sdpx_arithmetic::inner_parallel::paired();
         let mut at_s = self.data.at_s.take();
         let points = self.mixed_points(at_s.as_mut(), step_s, paired);
         self.data.at_s = at_s;
-        if let Some(v) = points
-            .filter(|_| self.data.corrector)
-            .and_then(|p| self.third_mixed_at(p, &w, paired))
-        {
+        if let Some(v) = points.and_then(|p| self.third_mixed_at(p, &w, paired)) {
             let σ = (σμ / mu).max(T::zero()).min(T::one());
             let half: T = (0.5).as_T();
             let weight = half * (T::one() - σ.cbrt());

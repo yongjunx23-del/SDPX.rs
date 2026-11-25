@@ -51,3 +51,68 @@ fn limit_cone_solves_in_both_kkt_forms() {
         );
     }
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn matrix_free_ore_constant_and_partitioned() {
+    // Diagonal T, X = 2I, Y = I decouple into scalar entropy inequalities
+    // Tⱼⱼ >= 2 ln 2. The orthant x >= 1 is independent of the ORE block.
+    let order = 64;
+    let triangle = order * (order + 1) / 2;
+    let m = 3 * triangle + 1;
+    let diagonal = (0..order).map(|j| (j + 1) * (j + 2) / 2 - 1);
+    let problem = |coupled: bool, presolve_enable: bool, t: f64| {
+        let n = if coupled { 2 } else { 1 };
+        let mut b = vec![0.0; m];
+        for i in diagonal.clone() {
+            b[i] = t;
+            b[triangle + i] = 2.0;
+            b[2 * triangle + i] = 1.0;
+        }
+        b[m - 1] = -1.0;
+        let mut rows: Vec<_> = if coupled {
+            diagonal.clone().collect()
+        } else {
+            Vec::new()
+        };
+        rows.push(m - 1);
+        let column_starts = if coupled {
+            vec![0, order, order + 1]
+        } else {
+            vec![0, 1]
+        };
+        let values = vec![-1.0; rows.len()];
+        JsonProblem {
+            P: CscMatrix::zeros((n, n)),
+            q: vec![1.0; n],
+            A: CscMatrix::new(m, n, column_starts, rows, values),
+            b,
+            cones: vec![OpRelEntropyConeT(order), NonnegativeConeT(1)],
+            settings: DefaultSettings {
+                verbose: false,
+                presolve_enable,
+                chordal_decomposition_enable: false,
+                tol_original: Some(1e-6),
+                ..DefaultSettings::default()
+            },
+            sampled: Vec::new(),
+        }
+    };
+    for presolve in [false, true] {
+        let mut solver = problem(false, presolve, 4.0).into_solver().unwrap();
+        solver.solve();
+        assert_eq!(solver.solution.status, SolverStatus::Solved);
+        assert!((solver.solution.x[0] - 1.0).abs() < 1e-6);
+    }
+    let mut infeasible = problem(false, true, -1.0).into_solver().unwrap();
+    infeasible.solve();
+    assert_eq!(infeasible.solution.status, SolverStatus::PrimalInfeasible);
+
+    let mut solver = problem(true, false, 0.0)
+        .into_partitioned_solver(2)
+        .unwrap();
+    solver.solve();
+    assert_eq!(solver.solution().status, SolverStatus::Solved);
+    assert!((solver.solution().x[0] - 2.0 * f64::ln(2.0)).abs() < 1e-6);
+    assert!((solver.solution().x[1] - 1.0).abs() < 1e-6);
+}
