@@ -452,11 +452,20 @@ where
         // nonsymmetric cones modify their internal state when
         // computing the ds_shift
 
+        // As in `step_length`: an operator relative entropy shift (Hessian
+        // products, mixed points) splits its kernels on the idle pool.
+        let idle = (self.threading.as_ref()).filter(|t| t.pool.current_num_threads() > 1);
         for (cone, rng) in zip(&mut self.cones, &self.rng_cones) {
             let shifti = &mut shift[rng.clone()];
             let step_zi = &mut step_z[rng.clone()];
             let step_si = &mut step_s[rng.clone()];
-            Self::shift_one(cone, shifti, step_zi, step_si, σμ, prepared);
+            match idle.filter(|_| cone.is_ore()) {
+                Some(t) => t.pool.install(|| {
+                    let _inner = sdpx_arithmetic::inner_parallel::Guard::enter();
+                    Self::shift_one(cone, shifti, step_zi, step_si, σμ, prepared)
+                }),
+                None => Self::shift_one(cone, shifti, step_zi, step_si, σμ, prepared),
+            }
         }
     }
 
@@ -598,9 +607,75 @@ where
     ) -> (T, T) {
         let on = T::precision_bits() > 53 && self.mpi_world().is_none();
         self.use_offsets(on);
+        self.free_ore_kkt(Some(settings.max_step_fraction));
         let out = self.step_length(dz, ds, z, s, settings, αmax);
+        self.free_ore_kkt(None);
         self.use_offsets(false);
         out
+    }
+
+    fn free_ore_kkt(&mut self, fraction: Option<T>) {
+        for cone in self.cones.iter_mut() {
+            if let SupportedCone::OpRelEntropyCone(c) = cone {
+                if c.matrix_free() {
+                    c.set_kkt(fraction);
+                }
+            }
+        }
+    }
+
+    /// The combined step from the cones' bound `α`: its fraction, or `α`
+    /// itself where a matrix-free operator relative entropy cone's combined
+    /// search (`kkt`) certified that exact pair, backtracked by `step` until
+    /// every matrix-free cone certifies the same pair; 0 below `αmin`.
+    pub(crate) fn certify_ore_step(
+        &mut self,
+        dz: &[T],
+        ds: &[T],
+        z: &[T],
+        s: &[T],
+        settings: &CoreSettings<T>,
+        α: T,
+        kkt: bool,
+    ) -> T {
+        let certified: Vec<T> = (self.cones.iter_mut())
+            .map(|cone| match cone {
+                SupportedCone::OpRelEntropyCone(c) if c.matrix_free() => c.take_certified(),
+                _ => T::zero(),
+            })
+            .collect();
+        let mut α = if kkt && α > T::zero() && certified.contains(&α) {
+            α
+        } else {
+            α * settings.max_step_fraction
+        };
+        // as in `step_length`: each test splits its kernels on the idle pool
+        let idle = (self.threading.as_ref()).filter(|t| t.pool.current_num_threads() > 1);
+        'trial: while α > settings.min_terminate_step_length {
+            for (i, (cone, r)) in self.cones.iter().zip(&self.rng_cones).enumerate() {
+                let SupportedCone::OpRelEntropyCone(c) = cone else {
+                    continue;
+                };
+                if !c.matrix_free() || certified[i] == α {
+                    continue;
+                }
+                let r = r.clone();
+                let test = || c.certifies(&dz[r.clone()], &ds[r.clone()], &z[r.clone()], &s[r.clone()], α);
+                let ok = match idle {
+                    Some(t) => t.pool.install(|| {
+                        let _inner = sdpx_arithmetic::inner_parallel::Guard::enter();
+                        test()
+                    }),
+                    None => test(),
+                };
+                if !ok {
+                    α *= settings.linesearch_backtrack_step;
+                    continue 'trial;
+                }
+            }
+            return α;
+        }
+        T::zero()
     }
 
     /// W·Δz = p1 + τ·p2 of the direction the KKT system just solved, on the

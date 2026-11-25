@@ -154,6 +154,22 @@ pub(super) fn apply_block<T: FloatT>(
                     y.scale(*eta * *eta);
                 }
             }
+            // Hs⁻¹ = μ∇²f by a Hessian product; Hs (an S₀ solve) is never
+            // formed: the residual measures these rows scaled (`OreElim`).
+            Scaling::OreElim(o) => {
+                if inverse {
+                    // its kernels split on the pool, as in the cone's own phases
+                    match gemm {
+                        Some((pool, _)) => pool.install(|| {
+                            let _inner = sdpx_arithmetic::inner_parallel::Guard::enter();
+                            o.cone.hess_mul(y, x)
+                        }),
+                        None => o.cone.hess_mul(y, x),
+                    }
+                } else {
+                    y.fill(T::zero());
+                }
+            }
             _ if inverse => {} // Retained rows are never inverted.
             Scaling::Soc { w, eta } => {
                 let two: T = (2.).as_T();
@@ -580,7 +596,7 @@ pub(super) fn scaling_jobs<'a, T: FloatT>(
         let xs = &x[block.rows.start - offset..block.rows.end - offset];
         let alone = matches!(
             block.scaling,
-            Scaling::Psd(_) | Scaling::Ore(_) | Scaling::OreLimit(_)
+            Scaling::Psd(_) | Scaling::Ore(_) | Scaling::OreElim(_) | Scaling::OreLimit(_)
         );
         if alone {
             flush(&mut group, &mut jobs);

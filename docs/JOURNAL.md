@@ -8,6 +8,166 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-25 — Matrix-free ORE kernels and threading (kept, worktree opre-20261123)
+
+Hypothesis: after mf6, the n = 256 cone's dual-test CG dominates the thermal
+solves. Each CG step is one S₀ product: Γ (a g⁽²⁾ contraction) plus five n×n
+GEMMs, then n² passes. At 32 threads the n² passes and the serial CG vector
+work cost about as much as the n³ work.
+
+Change (bitwise equal to the previous build unless noted):
+- Binary64 ORE cones are matrix-free from n = 64 (was n ≥ 108 by the 1 GiB
+  storage bound).
+- The Schur operands A = ΛV + VΛ and A2 = GW + WG merge into C = ⅜A − ⅛A2,
+  and F1 = g⁽¹⁾∘E1 becomes a product operand: five products instead of
+  seven. Rounding changes (mf6 → v5 hash e0abfe → b884d5).
+- The CG product's GEMMs run as ≥ 32-column tiles of every job, one set of
+  pool items (`gemm_jobs`); BLAS keeps one thread.
+- Γ is formed in one triangle, and reads each g⁽²⁾ column (a, c), c ≥ a,
+  once: n³/3 instead of n³/2 entries per product. Its items pair column a
+  with n − 1 − a, since column a costs (n² − a²)/2.
+- g⁽²⁾ is packed (n³/6) with its first touch spread over the pool: 134 →
+  22 MB per oracle at n = 256.
+- Γ and the five products run as a paired join. The inner-parallel gate and
+  split hint are per thread, so the stolen half takes them along (v8/v9 lost
+  them: 7.0 ms per CG step instead of 3.0 at 32 threads).
+- s0_mul unpacks H, K, E1 and F1 in one pass and writes its output straight
+  into svec. `hess_prod_ready` and `congruence_parts` batch their three
+  parts' congruences. The CG update r ← r − γS₀p, z = Br, ρ = r·z is one
+  pass (same operations, same order).
+- The CG loop runs under a runtime FMA dispatch on x86-64 (the condensed PSD
+  pattern). The cluster build sets no target CPU, so binary64 `mul_add` was a
+  libm `fma` call (checked in x86-64 assembly): two serial chains of n(n+1)
+  per step. Same rounding.
+- The combined shift, the certification tests and `OreElim`'s RHS products
+  split their kernels on the idle pool.
+
+Evidence: thermal N=5 lower, first 35 iterations (MaxIterations), release,
+EPYC 7742 whole idle nodes, pinned cores, OpenBLAS one thread. Solve seconds;
+runs in one row of a table share a node.
+- Threshold (v5): n = 64 dense 372.2 s, matrix-free 165.2 s at t32 (2.25×),
+  RSS 3.6 → 2.6 GB. mf6 (n = 64 dense) took 587.2 s at t8.
+- v5 → v6 → v7 at t8/t32/t64: 175.8/165.2/177.6 → 147.8/120.1/131.6 →
+  97.8/84.4/95.5.
+- tm10 (one node), v7 → v10 (join gate fixed, one-pass Γ, fused passes):
+  t8 109.5 → 91.1, t32 86.3 → 67.5 (repeat 71.0), t64 96.5 → 68.6.
+- tm11, v11 fused CG update vs unfused: t32 62.1/63.7 vs 65.3/66.5, t64
+  67.7 vs 71.0, t8 81.9 vs 82.6.
+- tm16 (one node, ABBA at t32): v11 62.7/66.0, Γ balance 60.2/61.6, plus FMA
+  dispatch 57.6/59.7 (−9% from v11); a global `+fma` build 58.7/59.3.
+  CG step 4.00 → 3.64–3.82 ms at t32 (Γ ‖ products 2.6–2.7 ms, serial
+  vector work 0.46 → 0.29 ms). v15 at t8/t64: 85.2/61.5 s.
+- Every build from v5 through v17 gives hash b884d5a2edd1 at 32 and 64
+  threads. At 8 threads v11 matched it and later builds give 81de17; at 16,
+  v11 and v14 both give 3e1982. Tile widths in `gemm_jobs` follow the thread
+  count; the FMA dispatch and Γ pairing are not the cause (v14 = v14+fma =
+  v15 at t8). Thread-count invariance never held at every count.
+
+Rejected (tm10/tm16):
+- eight interleaved accumulators for the CG reductions: 59.0/59.2 s vs
+  57.6/59.7 (no gain) and a rounding change;
+- one trial lane at n = 256: 62.8 s vs 57.6–59.7; four lanes: 67.7 (t32),
+  63.7 (t64);
+- serial n² passes: 69.3 s; Γ before the products instead of joined: equal
+  at t32, 74.5 vs 68.6 at t64;
+- earlier: CG caps, transported S₀⁻¹, block-diagonal preconditioner.
+
+Decision: kept. Full N=5/N=6 runs with this build at 32 threads: see below
+when they finish.
+
+## 2026-11-24 — Matrix-free ORE cones for the thermal coarse-grained bootstrap (kept, worktree opre-20261123)
+
+Hypothesis: the full N=6 thermal export (g=β=1, ORE blocks [4,16,64,256,256])
+failed at 0a79d95 because dense KKT scaling needs about 291 GiB. Order-256
+cones only need Hessian products, so a matrix-free cone fits in 216 GiB.
+
+Change:
+- An ORE cone with (n(n+1))²·8 B > 1 GiB (n ≥ 108 in binary64) never forms
+  S₀. The condensed KKT eliminates its rows as `OreElim`: Schur term AᵀHA from
+  one Hessian product per touching column, recovery z = H(Ax − b) (difference
+  first). Its rows keep the unscaled right-hand side. Refinement treats them
+  as exact and corrects x alone; their scaled residual is rounding noise
+  amplified by the Schur inverse. The combined step's Δs constant is known
+  only scaled, so the solve is for z + c.
+- The dual test runs CG on S₀ preconditioned by B = diag(1, λᵢλⱼ), with
+  Gauss/Gauss–Radau bounds (2000-step cap; an open test fails).
+- `schur_apply`'s Γ loop reads g⁽²⁾ along c, which is contiguous because the
+  operands are exactly symmetric. Points are bitwise equal; the pilot drops
+  from 32.7 to 19.7 s, and full N=6 `assemble.ore` from 60 to 8 s per
+  iteration.
+- The core takes 0.99 of the certified step, which left the next pair
+  uncertified (step 0 from N=6 iteration 9). Matrix-free cones now certify the
+  taken pair and backtrack until every one passes (`certify_ore_step`).
+- Iterates sit at r ≈ 1, so a certified α does not certify 0.99α. In one N=5
+  case 0.8 passed while every trial from 0.792 down to 0.1 failed, about ten
+  rejected tests per iteration. A matrix-free cone's combined search now tests
+  exact pairs below 0.99 of its cap, and its certified step is taken as is.
+  The other cones keep their 1% margin.
+- A combined step below 0.5 is re-solved without the matrix-free cone's
+  third-order corrector, on the same factorization, and kept when longer
+  (`retry_without_corrector`). On N=5 the corrector overshoots: affine αz
+  0.24–0.30, combined 7e-3, then 0. The retry must rebuild the affine RHS
+  first, because `combined_step_rhs` adds onto it. Before that fix every
+  retry returned α = 0.
+- Rejected:
+  - an η² ≤ 0.5 neighbourhood for the combined step (steps capped near 0.41);
+  - dropping the corrector everywhere (70 iterations to gap 4.9e-3);
+  - σ from the uncertified primal step (InsufficientProgress).
+
+Evidence:
+- N=6 lower, mf3 before the step fixes (cluster, 8 pinned cores): peak RSS
+  5.0 GB against about 291 GiB for the dense path. It ended InsufficientProgress
+  at iteration 9.
+- N=5 lower, Mac fast profile, 8 threads, tol 1e-8:
+  - with certification alone, gap 4.1e-4 at iteration 44, then α = 2.4e-3 and
+    MaxTime;
+  - with the retry, steady steps; the retry lifts 0.085–0.21 to 0.41–0.51.
+    47 iterations take 1763 s (gap 3.41e-4);
+  - with exact-pair searches, 47 iterations take 1211 s (−31%), gap 2.65e-4,
+    peak 4.0 GB.
+- Rejected: an 8-way trial budget for matrix-free searches (4 GiB instead of
+  512 MiB; one 268 MB trial runs at a time). Cluster jobs average 3.8–4.6 of 8
+  cores. Same points, but 1329 s against 1211 s and 5.5 GB peak on the Mac.
+- Late iterations are dominated by dual tests: 20–30 per iteration at about
+  1000 CG steps each, 2–5 min per iteration.
+- A true-residual check (lower bound t + 2wᵀx − xᵀS₀x and upper bound
+  low + rᵀBr at each decision) found no wrong accept or reject in iterations
+  1–43. Each trial's form sits within a few percent of its threshold, so the
+  iterates ride the Dikin boundary. This is the same affine cap as BFSS
+  ORE-DIAG.
+- Z2: the spin-flip symmetry of H does not carry to the D=2 VUMPS tensor
+  (best orthogonal-gauge residual ≥ 0.17, general gauge ≥ 0.025). The
+  commutant has dimension 1 and parity finds no odd variables, so the export
+  has no exact Z2 block split.
+
+Decision: kept. Points of problems without matrix-free cones are unchanged:
+the retry, certification and corrector switch act only when
+`has_free_ore`.
+
+Comparison: same exports, whole idle nodes, 8 pinned cores, 216 GiB
+address-space limit, tolerance 1e-8 (PBS 239268–239316). Snapshot at
+2026-11-24 09:15:
+- SDPX native (mf6, release):
+  - N=5 lower: iteration 60, 2.6 h, gap 9.7e-5, pres 7.3e-8, dres 2.4e-8,
+    RSS 4.0 GB;
+  - N=5 upper: iteration 71, gap 1.9e-4, 4.1 GB;
+  - N=6 lower: iteration 71, gap 2.3e-4, 8.3 GB;
+  - N=6 upper: iteration 65, gap 4.0e-4, 8.5 GB.
+  Late iterations take 5–9 min, so 1e-8 needs more than the 12 h limit.
+- QICS 1.1.3 (log cone, `use_invhess=False`):
+  - N=5 lower: near_optimal at the 300-iteration cap, 14447 s, objective
+    −0.5521154, 3.4 GB;
+  - N=5 upper: near_optimal, slow_progress at iteration 281, 13097 s;
+  - its script's own audit rejects both points (affine 0.969, also on
+    238990 N=6), and the N=5 values lie 1e-4–3.5e-4 outside SDPX's
+    primal–dual bracket;
+  - N=6: still running at iterations 163/185, 12.3 GB; upper dual
+    feasibility is rising (2.7e-3).
+- SDPX `--cone sdp --order 4`:
+  - N=6 fails allocation after 7 min (peak 190 GiB; dense KKT 286 GiB);
+  - N=5 holds 156 GiB and had not finished its first iteration after 76 min
+    (dense LDL n = 70547, 3.5e14 flops); cancelled.
+
 ## 2026-11-18 — Dense KKT storage and numerical factors on square4 and square5
 
 - Square4 at 108 physical cores, release A/B/B/A on node92 (PBS 237455). The Float64 lower/upper median solver times fell from 63.97/107.22 to 59.45/97.46 s. Median process peak RSS fell from 5.65/5.61 to 5.43/5.37 GiB. Both builds returned AlmostSolved in 24/30 iterations at a requested 1e-11. Their directed original corrected gaps were 3.28e-8 and 9.54e-6. At MPFR128 and 1e-13 the lower median fell from 506.51 to 493.25 s and from 10.90 to 10.73 GiB, with Solved in 32 iterations and a 1.76e-8 corrected gap. All twelve points passed the 1e-5 physical gate. The three original-coordinate vectors matched bitwise between builds for each bound and precision.

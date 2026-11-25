@@ -47,12 +47,18 @@ fn tasks<T: FloatT>(mul_adds: usize, items: usize) -> usize {
 /// else on the pool. Who runs an item never changes it.
 fn items<T: FloatT>(count: usize, mul_adds: usize, f: impl Fn(usize) + Sync) {
     use sdpx_arithmetic::inner_parallel::board;
-    if tasks::<T>(mul_adds, count) <= 1 {
+    let tasks = tasks::<T>(mul_adds, count);
+    if tasks <= 1 {
         (0..count).for_each(f);
     } else if board::offered() {
         board::run(count, &f);
     } else {
-        (0..count).into_par_iter().for_each(&f);
+        // at most `tasks` pieces: an n² pass split by items at n = 256 woke
+        // every worker for 50 µs of work (0.6 ms per CG step at 32 threads)
+        (0..count)
+            .into_par_iter()
+            .with_min_len(count.div_ceil(tasks))
+            .for_each(&f);
     }
 }
 
@@ -133,6 +139,23 @@ pub(super) fn heavy<T: FloatT>(n: usize) -> bool {
     n.pow(3) as u128 * ip::weight(T::precision_bits() as usize) >= ip::grain()
 }
 
+/// Whether an order-`n` cone never forms S₀ (order n(n+1)): binary64 from
+/// n = 64, wider types once its dense storage would exceed 1 GiB. At
+/// n = 256, S₀ alone is 35 GB and its factor 10¹⁴ multiply-adds. Such a
+/// cone uses only Hessian products Hs⁻¹ = μ∇²f (O(n³)): the condensed KKT
+/// eliminates it with its rows scaled by Hs⁻¹ (`hess_mul`), its combined
+/// shift is returned so scaled, and its dual test brackets the exact form
+/// by conjugate gradients on S₀ (`Oracle::dual_ok`) without a factor. The
+/// binary64 bound is measured (journal 2026-11-25): the thermal N = 5 lower
+/// bound's first 35 iterations took 2.25× longer with its n = 64 cone dense.
+pub(crate) fn matrix_free<T: FloatT>(n: usize) -> bool {
+    let m2 = (n * (n + 1)) as u128;
+    (T::precision_bits() <= 53 && n >= 64) || m2 * m2 * std::mem::size_of::<T>() as u128 > 1 << 30
+}
+
+/// Conjugate-gradient step cap of a matrix-free cone's dual test.
+const CG_STEPS: usize = 2000;
+
 /// Scalar central point (t, x, y) of the relative entropy cone, s = −∇f(s);
 /// refined to the working precision by `central_point`.
 const CENTRAL: [f64; 3] = [0.8278383990656786, 0.8051020015847954, 1.290927709856958];
@@ -177,24 +200,55 @@ pub(super) fn tri(i: usize, j: usize) -> usize {
     j * (j + 1) / 2 + i
 }
 
+/// Narrowest column tile of [`gemm_jobs`]: narrower tiles are
+/// matrix-vector products that reread `a` (n = 256: 22 ms per S₀ product
+/// with one-column tiles at 8 to 64 threads).
+const GEMM_TILE: usize = 32;
+
+/// `c = op(a)·op(b)` (n × n) for each job `(ta, tb, a, b, c)`. Binary64 runs
+/// the jobs' column tiles, at least [`GEMM_TILE`] wide and about two per
+/// worker, as one set of pool items when [`tasks`] grants a split: BLAS
+/// keeps one thread, and the matrix-free cone's products are otherwise
+/// serial calls. Tile widths follow the thread count, so points can differ
+/// between thread counts (thermal N=5, 35 iterations: equal at 32 and 64
+/// threads, not at 8 or 16).
+fn gemm_jobs<T: FloatT>(n: usize, jobs: &mut [(bool, bool, &[T], &[T], &mut [T])]) {
+    let work = jobs.len() * n * n * n;
+    let ways = if T::precision_bits() <= 53 {
+        tasks::<T>(work, jobs.len() * n.div_ceil(GEMM_TILE))
+            .min(2 * rayon::current_num_threads())
+    } else {
+        1
+    };
+    let len = if ways <= 1 {
+        n
+    } else {
+        n.div_ceil(ways.div_ceil(jobs.len())).max(GEMM_TILE).min(n)
+    };
+    let tiles = n.div_ceil(len);
+    let outs: Vec<Out<T>> = jobs.iter_mut().map(|j| Out(j.4.as_mut_ptr())).collect();
+    let ins: Vec<(bool, bool, &[T], &[T])> = jobs.iter().map(|j| (j.0, j.1, j.2, j.3)).collect();
+    let product = |item: usize| {
+        let ((ta, tb, a, b), c0) = (ins[item / tiles], item % tiles * len);
+        let cols = len.min(n - c0);
+        let (ni, t) = (n as i32, |x: bool| if x { b'T' } else { b'N' });
+        // SAFETY: this item alone owns columns [c0, c0 + cols) of its output.
+        let out =
+            unsafe { std::slice::from_raw_parts_mut(outs[item / tiles].0.add(c0 * n), cols * n) };
+        // columns c0.. of op(b): b's columns, or its rows for bᵀ
+        let b = &b[if tb { c0 } else { c0 * n }..];
+        T::xgemm(t(ta), t(tb), ni, cols as i32, ni, T::one(), a, ni, b, ni, T::zero(), out, ni);
+    };
+    if tiles == 1 {
+        (0..jobs.len()).for_each(product);
+    } else {
+        items::<T>(jobs.len() * tiles, work, product);
+    }
+}
+
+/// `c = op(a)·op(b)` (order n), as [`gemm_jobs`].
 pub(super) fn gemm<T: FloatT>(ta: bool, tb: bool, n: usize, a: &[T], b: &[T], c: &mut [T]) {
-    let ni = n as i32;
-    let t = |x: bool| if x { b'T' } else { b'N' };
-    T::xgemm(
-        t(ta),
-        t(tb),
-        ni,
-        ni,
-        ni,
-        T::one(),
-        a,
-        ni,
-        b,
-        ni,
-        T::zero(),
-        c,
-        ni,
-    );
+    gemm_jobs(n, &mut [(ta, tb, a, b, c)]);
 }
 
 /// Lower Cholesky factor in place (upper triangle zeroed); false unless ≻ 0.
@@ -594,26 +648,34 @@ pub(super) fn sym_eig<T: FloatT>(n: usize, a: &mut [T], w: &mut [T], u: &mut [T]
     info == 0 && m == ni
 }
 
+/// By columns, as [`pieces`]: a conjugate-gradient step at n = 256 converts
+/// four of these (65536 entries each).
 pub(super) fn smat<T: FloatT>(n: usize, x: &[T], out: &mut [T]) {
     let r = T::FRAC_1_SQRT_2();
-    for j in 0..n {
-        for i in 0..j {
-            let v = x[tri(i, j)] * r;
-            out[i + j * n] = v;
-            out[j + i * n] = v;
+    pieces::<T>(&mut out[..n * n], n, n * n, |j, col| {
+        for (i, o) in col.iter_mut().enumerate() {
+            *o = match i.cmp(&j) {
+                std::cmp::Ordering::Less => x[tri(i, j)] * r,
+                std::cmp::Ordering::Equal => x[tri(j, j)],
+                std::cmp::Ordering::Greater => x[tri(j, i)] * r,
+            };
         }
-        out[j + j * n] = x[tri(j, j)];
-    }
+    });
 }
 
+/// By columns, as [`items`] (see [`smat`]).
 pub(super) fn svec<T: FloatT>(n: usize, a: &[T], out: &mut [T]) {
     let r = T::FRAC_1_SQRT_2();
-    for j in 0..n {
+    let base = Out(out[..n * (n + 1) / 2].as_mut_ptr());
+    items::<T>(n, n * n, |j| {
+        let base = &base;
         for i in 0..j {
-            out[tri(i, j)] = (a[i + j * n] + a[j + i * n]) * r;
+            // SAFETY: the entries tri(·, j) of column j belong to item j alone.
+            unsafe { *base.0.add(tri(i, j)) = (a[i + j * n] + a[j + i * n]) * r };
         }
-        out[tri(j, j)] = a[j + j * n];
-    }
+        // SAFETY: as above.
+        unsafe { *base.0.add(tri(j, j)) = a[j + j * n] };
+    });
 }
 
 /// `out = Bᵀ·M·B` (`left_t`) or `B·M·Bᵀ`, through `tmp`.
@@ -625,14 +687,29 @@ pub(super) fn congruence<T: FloatT>(
     tmp: &mut [T],
     out: &mut [T],
 ) {
-    if left_t {
-        gemm(false, false, n, m, b, tmp); // M B
-        gemm(true, false, n, b, tmp, out); // Bᵀ M B
-    } else {
-        gemm(false, true, n, m, b, tmp); // M Bᵀ
-        gemm(false, false, n, b, tmp, out); // B M Bᵀ
+    let nn = n * n;
+    congruences(n, b, &m[..nn], left_t, &mut tmp[..nn], &mut out[..nn]);
+}
+
+/// [`congruence`] of each n×n matrix stacked in `m`, the products of all as
+/// one set of [`gemm_jobs`] per side.
+fn congruences<T: FloatT>(n: usize, b: &[T], m: &[T], left_t: bool, tmp: &mut [T], out: &mut [T]) {
+    let nn = n * n;
+    let mut jobs: Vec<_> = m
+        .chunks_exact(nn)
+        .zip(tmp.chunks_exact_mut(nn))
+        .map(|(m, t)| (false, !left_t, m, b, t)) // M B or M Bᵀ
+        .collect();
+    gemm_jobs(n, &mut jobs);
+    let mut jobs: Vec<_> = tmp
+        .chunks_exact(nn)
+        .zip(out.chunks_exact_mut(nn))
+        .map(|(t, o)| (left_t, false, b, t, o)) // Bᵀ M B or B M Bᵀ
+        .collect();
+    gemm_jobs(n, &mut jobs);
+    for o in out.chunks_exact_mut(nn) {
+        symmetrize(n, o);
     }
-    symmetrize(n, out);
 }
 
 /// `out = X·S` (`right`) or `S·X` for a symmetric S whose nonzeros lie at
@@ -692,6 +769,15 @@ fn divided1<T: FloatT>(a: T, b: T, la: T, lb: T) -> T {
     } else {
         -(la - lb) / (a - b)
     }
+}
+
+/// Start of column (p, q), p ≤ q, of the packed g⁽²⁾: its entries (p, q, r),
+/// r = q..n, follow one another, columns q = p..n make slab p, and the slabs
+/// follow in p (n(n+1)(n+2)/6 entries in all).
+#[inline]
+fn d2_col(n: usize, p: usize, q: usize) -> usize {
+    let tet = |k: usize| k * (k + 1) * (k + 2) / 6;
+    tet(n) - tet(n - p) + (q - p) * n - (q - p) * (q + p - 1) / 2
 }
 
 /// Second divided difference of g = −log at (a, b, c), given g⁽¹⁾ values.
@@ -765,9 +851,9 @@ pub(crate) struct Oracle<T> {
     /// g⁽¹⁾ (n×n) and c = (gᵢ+gⱼ)/2 − g⁽¹⁾ᵢⱼ(λᵢ+λⱼ)/2, the X-part of DD.
     pub(super) d1: Vec<T>,
     pub(super) c: Vec<T>,
-    /// g⁽²⁾ (n×n×n), built on demand for Hessian products, with the
-    /// point's constant Schur operands V = g⁽¹⁾∘W, A = ΛV + VΛ and
-    /// A2 = GW + WG (n×n each).
+    /// g⁽²⁾ at the sorted triples (packed, `d2_col`), built on demand for
+    /// Hessian products, with the point's constant Schur operands
+    /// V = g⁽¹⁾∘W and C = ⅜(ΛV + VΛ) − ⅛(GW + WG) (n×n each).
     d2: Vec<T>,
     vaa: Vec<T>,
     zh: Vec<T>,
@@ -883,40 +969,37 @@ impl<T: FloatT> Oracle<T> {
             return;
         }
         let (d1, lam) = (&self.d1, &self.lam);
-        let ids: Vec<[usize; 3]> = (0..n)
-            .flat_map(|a| (a..n).flat_map(move |b| (b..n).map(move |c| [a, b, c])))
-            .collect();
-        let mut x = vec![T::zero(); ids.len()];
-        pieces::<T>(&mut x, n, 64 * ids.len(), |k, p| {
-            for (x, &ids) in p.iter_mut().zip(&ids[k * n..]) {
-                *x = divided2(ids.map(|i| lam[i]), |p, q| d1[ids[p] + ids[q] * n]);
+        // g⁽²⁾ at each sorted triple a ≤ b ≤ c, by columns (a, b) on the
+        // pool, which also spreads the first touch over the workers' NUMA
+        // nodes. A dense n³ array, filled serially, held six copies of each
+        // value on one node (n = 256: 134 MB per oracle).
+        let pairs: Vec<(usize, usize)> = (0..n).flat_map(|a| (a..n).map(move |b| (a, b))).collect();
+        let len = d2_col(n, n - 1, n - 1) + 1;
+        let mut d2: Vec<T> = Vec::with_capacity(len);
+        let base = Out(d2.as_mut_ptr());
+        items::<T>(pairs.len(), 64 * len, |k| {
+            let (base, (a, b)) = (&base, pairs[k]);
+            let col = d2_col(n, a, b);
+            for c in b..n {
+                let ids = [a, b, c];
+                let x = divided2(ids.map(|i| lam[i]), |p, q| d1[ids[p] + ids[q] * n]);
+                // SAFETY: column (a, b) belongs to this item alone.
+                unsafe { base.0.add(col + c - b).write(x) };
             }
         });
-        let mut d2 = vec![T::zero(); n * n * n];
-        for (&[a, b, c], &x) in ids.iter().zip(&x) {
-            for (i, j, k) in [
-                (a, b, c),
-                (a, c, b),
-                (b, a, c),
-                (b, c, a),
-                (c, a, b),
-                (c, b, a),
-            ] {
-                d2[i + n * (j + n * k)] = x;
-            }
-        }
+        // SAFETY: the columns tile the packed array, written above.
+        unsafe { d2.set_len(len) };
         self.d2 = d2;
         let nn = n * n;
-        let mut vaa = vec![T::zero(); 3 * nn];
-        let (v, rest) = vaa.split_at_mut(nn);
-        let (a, a2) = rest.split_at_mut(nn);
+        let mut vaa = vec![T::zero(); 2 * nn];
+        let (v, cm) = vaa.split_at_mut(nn);
         let (lam, g, w) = (&self.lam, &self.g, &self.w);
+        let (q38, q18): (T, T) = ((0.375).as_T(), (0.125).as_T());
         for j in 0..n {
             for i in 0..n {
                 let ij = i + j * n;
                 v[ij] = self.d1[ij] * w[ij];
-                a[ij] = (lam[i] + lam[j]) * v[ij];
-                a2[ij] = (g[i] + g[j]) * w[ij];
+                cm[ij] = q38 * (lam[i] + lam[j]) * v[ij] - q18 * (g[i] + g[j]) * w[ij];
             }
         }
         self.vaa = vaa;
@@ -967,143 +1050,290 @@ impl<T: FloatT> Oracle<T> {
         unit: Option<(usize, usize)>,
     ) {
         let n = self.n;
+        // entries (i, j) of a unit's terms that can be nonzero
+        let support: Vec<(usize, usize)> = match unit {
+            Some((p, q)) => (0..n)
+                .flat_map(|j| (0..n).map(move |i| (i, j)))
+                .filter(|&(i, j)| i == p || i == q || j == p || j == q)
+                .collect(),
+            None => Vec::new(),
+        };
+        if unit.is_none() {
+            // E1 and F1 by columns on the pool
+            let (nn, ef) = (n * n, self.ef());
+            ws.resize(8 * nn, T::zero());
+            let (e1, rest) = ws.split_at_mut(nn);
+            let f1p = Out(rest[nn..].as_mut_ptr());
+            pieces::<T>(e1, n, 2 * nn, |j, col| {
+                let f1p = &f1p;
+                for (i, e) in col.iter_mut().enumerate() {
+                    let (ev, fv) = ef(i, j, h[i + j * n], k[i + j * n]);
+                    *e = ev;
+                    // SAFETY: column j of F1 belongs to this item alone.
+                    unsafe { *f1p.0.add(i + j * n) = fv };
+                }
+            });
+        }
+        let entry = self.schur_terms(h, k, ws, unit, &support);
+        // Each term commutes under i ↔ j (g⁽¹⁾, Γ, H and K are exactly
+        // symmetric), so both outputs are: one triangle, mirrored.
+        if unit.is_none() {
+            let (ohp, okp) = (Out(out_h.as_mut_ptr()), Out(out_k.as_mut_ptr()));
+            items::<T>(n, 15 * n * n, |j| {
+                let (ohp, okp) = (&ohp, &okp);
+                for i in j..n {
+                    let (a, b) = entry(i, j);
+                    // SAFETY: (i, j) and (j, i), i ≥ j, belong to item j alone.
+                    unsafe {
+                        (*ohp.0.add(i + j * n), *ohp.0.add(j + i * n)) = (a, a);
+                        (*okp.0.add(i + j * n), *okp.0.add(j + i * n)) = (b, b);
+                    }
+                }
+            });
+        } else {
+            out_h.fill(T::zero());
+            out_k.fill(T::zero());
+            for &(i, j) in &support {
+                (out_h[i + j * n], out_k[i + j * n]) = entry(i, j);
+            }
+        }
+    }
+
+    /// S₀p for svec p (both halves) into `sp`, through the n×n scratch `h`,
+    /// `k`: the conjugate gradients' product. Each output entry is the one
+    /// `svec` of [`Self::schur_apply`]'s exactly symmetric outputs rounds,
+    /// (a + a)/√2 off the diagonal, written once.
+    fn s0_mul(&self, p: &[T], sp: &mut [T], (h, k): (&mut [T], &mut [T]), ws: &mut Vec<T>) {
+        let n = self.n;
+        let (m, nn) = (n * (n + 1) / 2, n * n);
+        let r = T::FRAC_1_SQRT_2();
+        // H and K (`smat` of both halves), E1 and F1 in one pass by columns
+        ws.resize(8 * nn, T::zero());
+        let ef = self.ef();
+        let (ph, pk) = p.split_at(m);
+        let (hp, kp, wp) = (Out(h.as_mut_ptr()), Out(k.as_mut_ptr()), Out(ws.as_mut_ptr()));
+        items::<T>(n, 4 * nn, |j| {
+            let (hp, kp, wp) = (&hp, &kp, &wp);
+            for i in 0..n {
+                let t = if i < j { tri(i, j) } else { tri(j, i) };
+                let (hv, kv) = if i == j { (ph[t], pk[t]) } else { (ph[t] * r, pk[t] * r) };
+                let (e, f) = ef(i, j, hv, kv);
+                let ij = i + j * n;
+                // SAFETY: column j of H, K, E1 and F1 belongs to item j alone.
+                unsafe {
+                    (*hp.0.add(ij), *kp.0.add(ij)) = (hv, kv);
+                    (*wp.0.add(ij), *wp.0.add(2 * nn + ij)) = (e, f);
+                }
+            }
+        });
+        let entry = self.schur_terms(h, k, ws, None, &[]);
+        let base = Out(sp.as_mut_ptr());
+        items::<T>(n, 15 * nn, |j| {
+            let base = &base;
+            for i in j..n {
+                let (a, b) = entry(i, j);
+                let (a, b) = if i == j { (a, b) } else { ((a + a) * r, (b + b) * r) };
+                // SAFETY: entries tri(j, ·) of both halves belong to item j alone.
+                unsafe { (*base.0.add(tri(j, i)), *base.0.add(m + tri(j, i))) = (a, b) };
+            }
+        });
+    }
+
+    /// E1 = K − (λᵢ+λⱼ)H/2 and F1 = g⁽¹⁾∘E1 at (i, j), from H and K there.
+    fn ef(&self) -> impl Fn(usize, usize, T, T) -> (T, T) + Sync + '_ {
+        let (n, lam, d1) = (self.n, &self.lam, &self.d1);
+        let half: T = (0.5).as_T();
+        move |i, j, h, k| {
+            let e = k - half * (lam[i] + lam[j]) * h;
+            (e, d1[i + j * n] * e)
+        }
+    }
+
+    /// The terms of [`Self::schur_apply`]: entry (i, j) of both outputs, for
+    /// i ≥ j (Γ keeps its lower triangle), or on a unit's `support`.
+    fn schur_terms<'a>(
+        &'a self,
+        h: &'a [T],
+        k: &'a [T],
+        ws: &'a mut Vec<T>,
+        unit: Option<(usize, usize)>,
+        support: &[(usize, usize)],
+    ) -> impl Fn(usize, usize) -> (T, T) + Sync + 'a {
+        let n = self.n;
         let nn = n * n;
-        ws.resize(10 * nn, T::zero());
+        ws.resize(8 * nn, T::zero());
         let (e1, rest) = ws.split_at_mut(nn);
         let (gam, rest) = rest.split_at_mut(nn);
         let (f1, rest) = rest.split_at_mut(nn);
-        let (dj, rest) = rest.split_at_mut(nn);
         let (m1, rest) = rest.split_at_mut(nn);
         let (m2, rest) = rest.split_at_mut(nn);
         let (m3, rest) = rest.split_at_mut(nn);
         let (m4, rest) = rest.split_at_mut(nn);
-        let (m5, rest) = rest.split_at_mut(nn);
-        let (m6, _) = rest.split_at_mut(nn);
+        let (m5, _) = rest.split_at_mut(nn);
         let (lam, g, d1, w) = (&self.lam, &self.g, &self.d1, &self.w);
-        let (v, rest) = self.vaa.split_at(nn);
-        let (aw, a2) = rest.split_at(nn);
-        // entries (i, j) that can be nonzero
-        let support: Vec<(usize, usize)> = (0..n)
-            .flat_map(|j| (0..n).map(move |i| (i, j)))
-            .filter(|&(i, j)| unit.is_none_or(|(p, q)| i == p || i == q || j == p || j == q))
-            .collect();
-        let half: T = (0.5).as_T();
-        for &(i, j) in &support {
-            let ij = i + j * n;
-            e1[ij] = k[ij] - half * (lam[i] + lam[j]) * h[ij];
-            f1[ij] = d1[ij] * e1[ij];
-        }
-        // X·S (`right`) or S·X
-        let prod = |x: &[T], s: &[T], right: bool, out: &mut [T]| match unit {
-            Some(pq) => mul_unit(n, x, s, pq, right, out),
-            None if right => gemm(false, false, n, x, s, out),
-            None => gemm(false, false, n, s, x, out),
-        };
+        let (v, cm) = self.vaa.split_at(nn);
+        let (half, q14): (T, T) = ((0.5).as_T(), (0.25).as_T());
         // Γ_ab = Σ_c g⁽²⁾[a,b,c](W_ac E1_cb + E1_ac W_cb); E1 is zero outside
-        // rows and columns p, q for a unit
-        let cs: Vec<usize> = match unit {
-            Some((p, q)) if p == q => vec![p],
-            Some((p, q)) => vec![p.min(q), p.max(q)],
-            None => (0..n).collect(),
-        };
+        // rows and columns p, q for a unit. g⁽²⁾, W and E1 are exactly
+        // symmetric: each term reads whichever copy is contiguous.
         let d2 = &self.d2;
-        if unit.is_none() && tasks::<T>(3 * n * nn, n) > 1 {
-            // by columns: each entry sums in the same order
-            let e1 = &*e1;
-            pieces::<T>(gam, n, 3 * n * nn, |b, col| {
-                for (a, g) in col.iter_mut().enumerate() {
-                    let mut acc = T::zero();
+        let g2 = |a: usize, b: usize, c: usize| {
+            let mut v = [a, b, c];
+            v.sort_unstable();
+            d2[d2_col(n, v[0], v[1]) + v[2] - v[1]]
+        };
+        let term = |a: usize, b: usize, c: usize, e1: &[T]| {
+            let t = w[c + a * n] * e1[c + b * n] + e1[c + a * n] * w[c + b * n];
+            g2(a, b, c) * t
+        };
+        match unit {
+            None => {
+                // (the caller formed E1 and F1)
+                // Γ is exactly symmetric (each term commutes under a ↔ b): its
+                // lower triangle by columns a, each entry Γ_ab (b ≥ a) summed
+                // over c in order. Column a reads g⁽²⁾ in contiguous runs:
+                // c < a from columns (c, a); for c ≥ a, one pass over column
+                // (a, c) adds term c to Γ_ab, b ≥ c, and completes Γ_ac with
+                // its terms c' > c (two passes streamed it twice). Column a
+                // costs (n² − a²)/2: items pair the heavy columns with the
+                // light ones (a, n − 1 − a), or the first pieces took
+                // half again the average.
+                let (e1, f1) = (&*e1, &*f1);
+                let gp = Out(gam.as_mut_ptr());
+                let gamma = || items::<T>(n, 3 * n * nn / 2, |k| {
+                    let (gp, a) = (&gp, if k % 2 == 0 { k / 2 } else { n - 1 - k / 2 });
+                    // SAFETY: column a belongs to item k alone.
+                    let acc = unsafe { std::slice::from_raw_parts_mut(gp.0.add(a + a * n), n - a) };
+                    acc.fill(T::zero());
                     for c in 0..n {
-                        let t = w[a + c * n] * e1[c + b * n] + e1[a + c * n] * w[c + b * n];
-                        acc += d2[a + n * (b + n * c)] * t;
+                        let (wca, eca) = (w[c + a * n], e1[c + a * n]);
+                        if c < a {
+                            let col = d2_col(n, c, a);
+                            let (g, wc, ec) = (&d2[col..col + n - a], &w[a + c * n..(c + 1) * n], &e1[a + c * n..(c + 1) * n]);
+                            for (((acc, &g), &wcb), &ecb) in acc.iter_mut().zip(g).zip(wc).zip(ec) {
+                                *acc += g * (wca * ecb + eca * wcb);
+                            }
+                            continue;
+                        }
+                        let col = d2_col(n, a, c);
+                        let (g, wc, ec) = (&d2[col..col + n - c], &w[c + c * n..(c + 1) * n], &e1[c + c * n..(c + 1) * n]);
+                        let (wa, ea) = (&w[c + 1 + a * n..(a + 1) * n], &e1[c + 1 + a * n..(a + 1) * n]);
+                        let (first, rest) = acc[c - a..].split_first_mut().unwrap();
+                        *first += g[0] * (wca * ec[0] + eca * wc[0]);
+                        let mut s = *first;
+                        for (((((acc, &g), &wcb), &ecb), &wra), &era) in
+                            rest.iter_mut().zip(&g[1..]).zip(&wc[1..]).zip(&ec[1..]).zip(wa).zip(ea)
+                        {
+                            *acc += g * (wca * ecb + eca * wcb);
+                            s += g * (wra * ecb + era * wcb);
+                        }
+                        *first = s;
                     }
-                    *g = acc;
+                });
+                // V H, W H, K V, C H and W F1. The inner-parallel gate and
+                // split hint are per thread: a worker that steals this half
+                // takes them along, or it ran the five products serially
+                // (n = 256, 32 threads: 7.0 ms per conjugate-gradient step,
+                // against 3.0 ms after Γ in sequence).
+                use sdpx_arithmetic::inner_parallel as ip;
+                let grant = (ip::active(), ip::paired(), crate::algebra::split_hint());
+                let products = || {
+                    let _gate = ip::Guard::enter_levels(grant.0, grant.1);
+                    crate::algebra::with_split_hint(grant.2, || {
+                        gemm_jobs(
+                            n,
+                            &mut [
+                                (false, false, v, h, &mut *m1),
+                                (false, false, w, h, &mut *m2),
+                                (false, false, k, v, &mut *m3),
+                                (false, false, cm, h, &mut *m4),
+                                (false, false, w, f1, &mut *m5),
+                            ],
+                        )
+                    })
+                };
+                // Γ streams g⁽²⁾ from memory while the products compute
+                join_if(grant.1, gamma, products);
+            }
+            Some((p, q)) => {
+                let ef = self.ef();
+                for &(i, j) in support {
+                    (e1[i + j * n], f1[i + j * n]) = ef(i, j, h[i + j * n], k[i + j * n]);
                 }
-            });
-        } else {
-            for &(a, b) in &support {
-                let mut acc = T::zero();
-                for &c in &cs {
-                    let t = w[a + c * n] * e1[c + b * n] + e1[a + c * n] * w[c + b * n];
-                    acc += d2[a + n * (b + n * c)] * t;
+                let cs = &[p.min(q), p.max(q)][..1 + (p != q) as usize];
+                for &(a, b) in support {
+                    let mut acc = T::zero();
+                    for &c in cs {
+                        acc += term(a, b, c, e1);
+                    }
+                    gam[a + b * n] = acc;
                 }
-                gam[a + b * n] = acc;
+                mul_unit(n, v, h, (p, q), true, m1);
+                mul_unit(n, w, h, (p, q), true, m2);
+                mul_unit(n, v, k, (p, q), false, m3);
+                mul_unit(n, cm, h, (p, q), true, m4);
+                mul_unit(n, w, f1, (p, q), true, m5);
             }
         }
-        prod(v, h, true, m1); // V H
-        prod(w, h, true, m2); // W H
-        prod(v, k, false, m3); // K V
-        for &(i, j) in &support {
-            let (ij, ji) = (i + j * n, j + i * n);
-            dj[ij] = d1[ij] * half * (m2[ij] + m2[ji]); // g⁽¹⁾∘J, J = (WH + HW)/2
-        }
-        prod(aw, h, true, m4); // A H, A = ΛV + VΛ
-        prod(w, f1, true, m5); // W F1
-        prod(a2, h, true, m6); // A2 H, A2 = GW + WG
-        let (q38, q14, q18): (T, T, T) = ((0.375).as_T(), (0.25).as_T(), (0.125).as_T());
-        if unit.is_some() {
-            out_h.fill(T::zero());
-            out_k.fill(T::zero());
-        }
-        for &(i, j) in &support {
+        let (gam, m1, m2, m3, m4, m5): (&[T], &[T], &[T], &[T], &[T], &[T]) = (gam, m1, m2, m3, m4, m5);
+        move |i: usize, j: usize| {
             let (ij, ji) = (i + j * n, j + i * n);
             let (li, lj, gi, gj) = (lam[i], lam[j], g[i], g[j]);
+            // the full product keeps Γ's lower triangle only
+            let gij = if unit.is_none() && i < j { gam[ji] } else { gam[ij] };
+            let dj = d1[ij] * half * (m2[ij] + m2[ji]); // g⁽¹⁾∘J, J = (WH + HW)/2
             let dhq = -half * (m3[ij] + m3[ji])
-                + q38 * (m4[ij] + m4[ji])
+                + (m4[ij] + m4[ji])
                 + q14 * (lj * m1[ij] + li * m1[ji])
-                - half * (li + lj) * gam[ij]
+                - half * (li + lj) * gij
                 + half * (m5[ij] + m5[ji])
-                - half * (li + lj) * dj[ij]
-                + q14 * (gj * m2[ij] + gi * m2[ji])
-                - q18 * (m6[ij] + m6[ji]);
-            let dkq = -half * (m1[ij] + m1[ji]) + gam[ij] + dj[ij];
-            out_h[ij] = h[ij] + dhq;
-            out_k[ij] = k[ij] / (li * lj) + dkq;
+                - half * (li + lj) * dj
+                + q14 * (gj * m2[ij] + gi * m2[ji]);
+            let dkq = -half * (m1[ij] + m1[ji]) + gij + dj;
+            (h[ij] + dhq, k[ij] / (li * lj) + dkq)
         }
-        symmetrize(n, out_h);
-        symmetrize(n, out_k);
     }
 
     /// Hessian product ∇²f(s)[d] (svec in, svec out).
     pub(crate) fn hess_prod(&mut self, d: &[T], out: &mut [T]) {
         self.ensure_d2();
+        self.hess_prod_ready(d, out);
+    }
+
+    /// [`Self::hess_prod`] once g⁽²⁾ is built.
+    pub(crate) fn hess_prod_ready(&self, d: &[T], out: &mut [T]) {
+        debug_assert!(!self.d2.is_empty());
         let n = self.n;
         let m = n * (n + 1) / 2;
         let nn = n * n;
+        // the three parts' congruences as one set of products per side
         let mut mats = vec![T::zero(); 3 * nn];
-        let mut tmp = vec![T::zero(); nn];
-        let mut x = vec![T::zero(); nn];
-        for part in 0..3 {
-            smat(n, &d[part * m..(part + 1) * m], &mut x);
-            congruence(
-                n,
-                &self.q,
-                &x,
-                true,
-                &mut tmp,
-                &mut mats[part * nn..(part + 1) * nn],
-            );
+        let mut tmp = vec![T::zero(); 3 * nn];
+        let mut x = vec![T::zero(); 3 * nn];
+        for (part, x) in x.chunks_exact_mut(nn).enumerate() {
+            smat(n, &d[part * m..(part + 1) * m], x);
         }
+        congruences(n, &self.q, &x, true, &mut tmp, &mut mats);
         let (s, hk) = mats.split_at(nn);
         let (h, k) = hk.split_at(nn);
-        let mut oh = vec![T::zero(); nn];
-        let mut ok = vec![T::zero(); nn];
+        // outputs (R, S₀h − DDᵀR) stacked in x
+        let (r, ohk) = x.split_at_mut(nn);
+        let (oh, ok) = ohk.split_at_mut(nn);
         let mut ws = Vec::new();
-        self.schur_apply(h, k, &mut oh, &mut ok, &mut ws, None);
-        // R = W(S − DD[H,K])W; outputs (R, S₀h − DDᵀR).
+        self.schur_apply(h, k, oh, ok, &mut ws, None);
+        // R = W(S − DD[H,K])W
         let mut dd = vec![T::zero(); nn];
         for ij in 0..nn {
             dd[ij] = s[ij] - (self.c[ij] * h[ij] + self.d1[ij] * k[ij]);
         }
-        let mut r = vec![T::zero(); nn];
-        congruence(n, &self.w, &dd, false, &mut tmp, &mut r);
+        congruence(n, &self.w, &dd, false, &mut tmp, r);
         for ij in 0..nn {
             oh[ij] -= self.c[ij] * r[ij];
             ok[ij] -= self.d1[ij] * r[ij];
         }
-        for (part, mat) in [(0usize, &r), (1, &oh), (2, &ok)] {
-            congruence(n, &self.q, mat, false, &mut tmp, &mut x);
-            svec(n, &x, &mut out[part * m..(part + 1) * m]);
+        congruences(n, &self.q, &x, false, &mut tmp, &mut mats);
+        for (part, mat) in mats.chunks_exact(nn).enumerate() {
+            svec(n, mat, &mut out[part * m..(part + 1) * m]);
         }
     }
 
@@ -1288,6 +1518,9 @@ impl<T: FloatT> Oracle<T> {
         if !ok(t) {
             return false;
         }
+        if s0i.is_empty() {
+            return self.dual_ok_free(t, &w, &b, ok);
+        }
         if budget == 0 || self.s0l.is_some() {
             return self.schur_norm(w).is_some_and(|q| ok(t + q));
         }
@@ -1335,14 +1568,9 @@ impl<T: FloatT> Oracle<T> {
         let mut rho = r.dot(&br);
         let mut sp = vec![T::zero(); m2];
         let (mut h, mut k) = (vec![T::zero(); nn], vec![T::zero(); nn]);
-        let (mut oh, mut ok_) = (vec![T::zero(); nn], vec![T::zero(); nn]);
         let mut ws = Vec::new();
         for step in 0..budget {
-            smat(n, &p[..m], &mut h);
-            smat(n, &p[m..], &mut k);
-            self.schur_apply(&h, &k, &mut oh, &mut ok_, &mut ws, None);
-            svec(n, &oh, &mut sp[..m]);
-            svec(n, &ok_, &mut sp[m..]);
+            self.s0_mul(&p, &mut sp, (&mut h, &mut k), &mut ws);
             let psp = p.dot(&sp);
             if !(psp > T::zero()) {
                 break;
@@ -1350,11 +1578,7 @@ impl<T: FloatT> Oracle<T> {
             let alpha = rho / psp;
             x.axpby(alpha, &p, T::one());
             // Bounds need r = w − S₀x, not CG's recursively rounded residual.
-            smat(n, &x[..m], &mut h);
-            smat(n, &x[m..], &mut k);
-            self.schur_apply(&h, &k, &mut oh, &mut ok_, &mut ws, None);
-            svec(n, &oh, &mut sp[..m]);
-            svec(n, &ok_, &mut sp[m..]);
+            self.s0_mul(&x, &mut sp, (&mut h, &mut k), &mut ws);
             r.waxpby(T::one(), &w, -T::one(), &sp);
             let wx = w.dot(&x);
             let low = t + wx + wx - x.dot(&sp);
@@ -1383,6 +1607,91 @@ impl<T: FloatT> Oracle<T> {
         *cg += 1;
         self.schur_norm(w).is_some_and(|q| ok(t + q))
     }
+}
+
+impl<T: FloatT> Oracle<T> {
+    /// `ok(t + wᵀS₀⁻¹w)` for a matrix-free cone, which never factors S₀:
+    /// conjugate gradients on S₀x = w preconditioned by B, with Gauss
+    /// (lower) and Gauss–Radau (upper) quadrature bounds of wᵀS₀⁻¹w
+    /// (Meurant & Tichý, CGQ). S₀ ⪰ B⁻¹ puts BS₀'s spectrum at or above 1,
+    /// the prescribed node; the bounds take one S₀ product per step and
+    /// start from the B bound. A test still open after `CG_STEPS` fails: a
+    /// shorter step is certified instead.
+    fn dual_ok_free(&mut self, t: T, w: &[T], b: &[T], ok: impl Fn(T) -> bool) -> bool {
+        // Binary64 `mul_add` is a libm call on x86-64 without the FMA target
+        // feature: the steps' two serial chains take the instruction where
+        // the CPU has it (the same rounding).
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("fma") {
+            // SAFETY: the feature was detected above.
+            return unsafe { self.cg_fma(t, w, b, ok) };
+        }
+        self.cg(t, w, b, ok)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "fma")]
+    unsafe fn cg_fma(&mut self, t: T, w: &[T], b: &[T], ok: impl Fn(T) -> bool) -> bool {
+        self.cg(t, w, b, ok)
+    }
+
+    /// [`Self::dual_ok_free`]'s conjugate gradients.
+    #[inline(always)]
+    fn cg(&mut self, t: T, w: &[T], b: &[T], ok: impl Fn(T) -> bool) -> bool {
+        self.ensure_d2();
+        let (n, m2) = (self.n, w.len());
+        let nn = n * n;
+        let mut r = w.to_vec();
+        let mut z: Vec<T> = r.iter().zip(b).map(|(&r, &b)| r * b).collect();
+        let mut p = z.clone();
+        let mut sp = vec![T::zero(); m2];
+        let (mut h, mut k) = (vec![T::zero(); nn], vec![T::zero(); nn]);
+        let mut ws = Vec::new();
+        let mut rho = chain(&r, &z);
+        let (mut low, mut radau) = (t, T::one());
+        for _ in 0..CG_STEPS {
+            self.s0_mul(&p, &mut sp, (&mut h, &mut k), &mut ws);
+            let psp = chain(&p, &sp);
+            if !(psp > T::zero()) {
+                break;
+            }
+            let gamma = rho / psp;
+            low += gamma * rho;
+            // r ← r − γ·S₀p, z = B r and rho1 = r·z in one pass (the
+            // operations and order of `axpby`, then `dot`)
+            let mut rho1 = T::zero();
+            for (((r, z), &s), &b) in r.iter_mut().zip(z.iter_mut()).zip(&sp).zip(b) {
+                *r = -gamma * s + *r;
+                *z = *r * b;
+                rho1 = r.mul_add(*z, rho1);
+            }
+            let delta = rho1 / rho;
+            let d = (radau - gamma).max(T::zero());
+            radau = d / (d + delta);
+            if ok(low + radau * rho1) {
+                return true;
+            }
+            if !ok(low) {
+                return false;
+            }
+            for (p, &z) in p.iter_mut().zip(&z) {
+                *p = z + delta * *p;
+            }
+            rho = rho1;
+        }
+        false
+    }
+}
+
+/// `x·y` rounded as `dot` (one `mul_add` chain), inlined into its caller's
+/// target features.
+#[inline(always)]
+fn chain<T: FloatT>(x: &[T], y: &[T]) -> T {
+    let mut acc = T::zero();
+    for (&x, &y) in x.iter().zip(y) {
+        acc = x.mul_add(y, acc);
+    }
+    acc
 }
 
 /// Largest α ≤ αmax, backtracking by `step`, with `ok(α)`; 0 below αmin.
@@ -1539,13 +1848,15 @@ impl<T: FloatT> OpRelEntropyRows<T> {
 fn congruence_parts<T: FloatT>(n: usize, b: &[T], v: &mut [T], left_t: bool) {
     let m = n * (n + 1) / 2;
     let nn = n * n;
-    let mut x = vec![T::zero(); nn];
-    let mut tmp = vec![T::zero(); nn];
-    let mut out = vec![T::zero(); nn];
-    for part in v.chunks_exact_mut(m) {
-        smat(n, part, &mut x);
-        congruence(n, b, &x, left_t, &mut tmp, &mut out);
-        svec(n, &out, part);
+    let mut x = vec![T::zero(); 3 * nn];
+    let mut tmp = vec![T::zero(); 3 * nn];
+    let mut out = vec![T::zero(); 3 * nn];
+    for (part, x) in v.chunks_exact(m).zip(x.chunks_exact_mut(nn)) {
+        smat(n, part, x);
+    }
+    congruences(n, b, &x, left_t, &mut tmp, &mut out);
+    for (part, out) in v.chunks_exact_mut(m).zip(out.chunks_exact(nn)) {
+        svec(n, out, part);
     }
 }
 
@@ -1602,6 +1913,13 @@ pub struct OpRelEntropyConeData<T> {
     cg: u32,
     /// The scaling's oracle at s (g⁽²⁾ built), for the corrector's ∇²f(s).
     at_s: Option<Oracle<T>>,
+    /// Whether a matrix-free combined shift takes the third-order corrector
+    /// (`CompositeCone::ore_corrector`).
+    corrector: bool,
+    /// The combined search's step fraction (`CompositeCone::kkt_step_length`)
+    /// and the step whose exact pair it certified (0 if none).
+    kkt: Option<T>,
+    certified: T,
 }
 
 #[derive(Clone)]
@@ -1626,6 +1944,9 @@ impl<T: FloatT> OpRelEntropyCone<T> {
                 work: vec![T::zero(); d],
                 cg: 0,
                 at_s: None,
+                corrector: true,
+                kkt: None,
+                certified: T::zero(),
             }),
         }
     }
@@ -1765,6 +2086,7 @@ impl<T: FloatT> OpRelEntropyCone<T> {
         // S₀⁻¹v in row pieces: each entry sums its columns in order, so
         // the split does not change it.
         let (vs, s0i) = (&v[m..3 * m], &data.s0i);
+        debug_assert!(!s0i.is_empty(), "a matrix-free cone has no Hs product");
         pieces::<T>(&mut y[m..3 * m], n, m2 * m2, |piece, rows| {
             let i0 = piece * n;
             rows.fill(T::zero());
@@ -1786,6 +2108,52 @@ impl<T: FloatT> OpRelEntropyCone<T> {
         &self.data.rows
     }
 
+    /// `combined_ds_shift` of a matrix-free cone, so that the caller's
+    /// ds = s + shift is the combined ds scaled by Hs⁻¹ = μ∇²f(s) (the rows
+    /// the condensed KKT takes, `OreElim`):
+    /// Hs⁻¹ds = z − (σμ/μ)Hs⁻¹s − ½(1 − σ^⅓)∇³f(s)[Δs, μHsΔz].
+    /// The affine solve satisfies Δs + HsΔz = −s on these rows, so
+    /// μHsΔz = −μ(Δs + s) needs no inverse.
+    fn combined_ds_shift_free(&mut self, shift: &mut [T], step_s: &[T], σμ: T) {
+        let mu = self.data.μ;
+        let s = &self.data.s;
+        self.hess_mul(shift, s);
+        let c = σμ / mu;
+        for ((o, &z), &s) in shift.iter_mut().zip(&self.data.z).zip(s) {
+            *o = z - c * *o - s;
+        }
+        let w: Vec<T> = step_s.iter().zip(s).map(|(&d, &s)| -mu * (d + s)).collect();
+        let paired = sdpx_arithmetic::inner_parallel::paired();
+        let mut at_s = self.data.at_s.take();
+        let points = self.mixed_points(at_s.as_mut(), step_s, paired);
+        self.data.at_s = at_s;
+        if let Some(v) = points
+            .filter(|_| self.data.corrector)
+            .and_then(|p| self.third_mixed_at(p, &w, paired))
+        {
+            let σ = (σμ / mu).max(T::zero()).min(T::one());
+            let half: T = (0.5).as_T();
+            let weight = half * (T::one() - σ.cbrt());
+            shift
+                .iter_mut()
+                .zip(&v)
+                .for_each(|(o, &v)| *o -= weight * v);
+        }
+    }
+
+    /// Whether this cone never forms S₀ (`matrix_free`).
+    pub(crate) fn matrix_free(&self) -> bool {
+        matrix_free::<T>(self.n)
+    }
+
+    /// y = Hs⁻¹x = μ∇²f(s)x, from the scaling's oracle (g⁽²⁾ built).
+    pub(crate) fn hess_mul(&self, y: &mut [T], x: &[T]) {
+        let oracle = self.data.at_s.as_ref().expect("scaling oracle");
+        oracle.hess_prod_ready(x, y);
+        let mu = self.data.μ;
+        y.iter_mut().for_each(|v| *v *= mu);
+    }
+
     /// z passes the Dikin test at the primal point s of `oracle`:
     /// r = (ν−1)⟨z, ∇²f(s)⁻¹z⟩/⟨s,z⟩² < 1 certifies z ∈ int K* (r₀ =
     /// (ν−1)/ν on the central path). The O(n³) bound first, then the exact
@@ -1797,8 +2165,37 @@ impl<T: FloatT> OpRelEntropyCone<T> {
         if !(sz > T::zero()) || !z.iter().all(|v| v.is_finite()) {
             return false;
         }
-        let nu1 = self.nu() - T::one();
-        oracle.dual_ok(z, |q| nu1 * q < sz * sz, cg, (&self.data.p, &self.data.s0i))
+        let nub = self.nu() - T::one();
+        oracle.dual_ok(z, |q| nub * q < sz * sz, cg, (&self.data.p, &self.data.s0i))
+    }
+
+    pub(crate) fn set_corrector(&mut self, on: bool) {
+        self.data.corrector = on;
+    }
+
+    /// A matrix-free cone's combined search tests exact pairs below
+    /// `fraction` of its cap, so the step it certifies can be taken as is:
+    /// the core's fraction of a certified step need not certify, since the
+    /// iterates sit at r ≈ 1 (thermal N=5: 0.8 certified, 0.792 down to 0.1
+    /// rejected), while the cap keeps the other cones' margin.
+    pub(crate) fn set_kkt(&mut self, fraction: Option<T>) {
+        self.data.kkt = fraction;
+    }
+
+    /// The step of the last combined search's certified exact pair, cleared.
+    pub(crate) fn take_certified(&mut self) -> T {
+        std::mem::replace(&mut self.data.certified, T::zero())
+    }
+
+    /// Whether the pair at step α is certified (r < 1): the step the core
+    /// takes, f·min over the cones, is not the trial each cone tested.
+    pub(crate) fn certifies(&self, dz: &[T], ds: &[T], z: &[T], s: &[T], α: T) -> bool {
+        let mut p = vec![T::zero(); s.len()];
+        p.waxpby(T::one(), s, α, ds);
+        let mut q = vec![T::zero(); z.len()];
+        q.waxpby(T::one(), z, α, dz);
+        let mut cg = self.data.cg;
+        Oracle::new(self.n, &p).is_some_and(|mut o| self.dual_ok(&mut o, &p, &q, &mut cg))
     }
 }
 
@@ -1874,8 +2271,14 @@ where
         let Some(mut oracle) = Oracle::new(self.n, s) else {
             return false;
         };
-        let Some(s0i) = oracle.schur_inverse() else {
-            return false;
+        let s0i = if self.matrix_free() {
+            oracle.ensure_d2();
+            Vec::new()
+        } else {
+            let Some(s0i) = oracle.schur_inverse() else {
+                return false;
+            };
+            s0i
         };
         let n = self.n;
         let m = triangular_number(n);
@@ -1908,6 +2311,10 @@ where
     }
 
     fn get_Hs(&self, Hsblock: &mut [T]) {
+        debug_assert!(
+            !self.matrix_free(),
+            "a matrix-free operator relative entropy cone needs the condensed KKT"
+        );
         // D in the KKT's eigen row coordinates (`OpRelEntropyRows`)
         let n = self.n;
         let m = triangular_number(n);
@@ -1962,6 +2369,9 @@ where
         // the difference points are independent; a spare worker takes the
         // second of each pair.
         let paired = sdpx_arithmetic::inner_parallel::paired();
+        if self.matrix_free() {
+            return self.combined_ds_shift_free(shift, step_s, σμ);
+        }
         let mut hz = std::mem::take(&mut self.data.work);
         let mut at_s = self.data.at_s.take();
         let (this, len, step_z) = (&*self, shift.len(), &*step_z);
@@ -2016,6 +2426,8 @@ where
         let step = settings.linesearch_backtrack_step;
         let αmin = settings.min_terminate_step_length;
         let n = self.n;
+        let kkt = self.data.kkt;
+        let αmax = kkt.map_or(αmax, |f| f * αmax);
         let mut work = std::mem::take(&mut self.data.work);
         let mut wz = vec![T::zero(); work.len()];
         // primal: s + α ds interior; the oracle at αs serves the dual test
@@ -2044,11 +2456,19 @@ where
         // factor storage, with headroom for its construction and scratch;
         // a single larger trial still runs, sharing its work with idle lanes.
         let m2 = n * (n + 1);
-        let trial_bytes = 2 * m2 * m2 * std::mem::size_of::<T>();
+        // a matrix-free trial holds an oracle instead (g⁽²⁾ packed, n³/6);
+        // charging it 2n³ keeps n = 256 at two lanes, faster than one or
+        // four at 32 threads (journal 2026-11-25)
+        let trial_bytes = if self.matrix_free() {
+            2 * n.pow(3) * std::mem::size_of::<T>()
+        } else {
+            2 * m2 * m2 * std::mem::size_of::<T>()
+        };
         let ways = ways.min(((512 << 20) / trial_bytes).max(1));
         let split = heavy::<T>(n);
         let this = &*self;
-        let mut α = αmax;
+        // exact pairs (`set_kkt`) start at αs
+        let mut α = if kkt.is_some() { αs } else { αmax };
         let mut αz = T::zero();
         while α > αmin {
             if α >= αs || ways == 1 {
@@ -2099,6 +2519,9 @@ where
         }
         self.data.work = work;
         self.data.cg = cg;
+        if kkt.is_some() {
+            self.data.certified = αz;
+        }
         (αz, αs)
     }
 

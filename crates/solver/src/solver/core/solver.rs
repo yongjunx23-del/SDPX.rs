@@ -556,6 +556,9 @@ struct CurveSearch<V> {
     /// Corrected direction of the Gondzio centrality correctors (symmetric
     /// cones with orthant or second-order rows, any precision).
     corrected: Option<V>,
+    /// Raw affine direction and a spare, for the corrector-free retry of a
+    /// matrix-free operator relative entropy cone (`retry_without_corrector`).
+    ore: Option<(V, V)>,
 }
 
 impl<V> CurveSearch<V> {
@@ -568,6 +571,9 @@ impl<V> CurveSearch<V> {
             affine: enabled.then(|| like.new_like()),
             trial: enabled.then(|| like.new_like()),
             corrected: (cones.all_symmetric() && cones.has_correctable()).then(|| like.new_like()),
+            ore: cones
+                .has_free_ore()
+                .then(|| (like.new_like(), like.new_like())),
         }
     }
 }
@@ -609,6 +615,12 @@ mod internal {
 
         /// Gondzio multiple centrality correctors on the combined direction.
         fn centrality_correctors(&mut self, state: &mut IterationState<T>, corrected: &mut V);
+        fn retry_without_corrector(
+            &mut self,
+            state: &mut IterationState<T>,
+            affine: &V,
+            spare: &mut V,
+        );
 
         /// Status refinement and solution extraction after the main loop.
         fn finish(&mut self, timers: &Timers);
@@ -873,6 +885,9 @@ mod internal {
                 if let Some(affine) = &mut curve.affine {
                     affine.copy_from(&self.step_lhs);
                 }
+                if let Some((affine, _)) = &mut curve.ore {
+                    affine.copy_from(&self.step_lhs);
+                }
                 let iter = state.iter;
                 timeit! {"affine step len"; {
                 state.α = if iter > 1 {
@@ -944,6 +959,11 @@ mod internal {
             if let Some(corrected) = &mut curve.corrected {
                 self.centrality_correctors(state, corrected);
             }
+            if let Some((affine, spare)) = &mut curve.ore {
+                if crate::mpi::agreed_branch(state.iter > 1 && state.α < (0.5).as_T()) {
+                    self.retry_without_corrector(state, affine, spare);
+                }
+            }
             let (α, σ) = (state.α, state.σ);
             if crate::mpi::agreed_branch(curve.affine.is_some() && α > T::zero() && α < (0.9).as_T()) {
                 let affine = curve.affine.as_ref().unwrap();
@@ -989,6 +1009,57 @@ mod internal {
             };
             }}
             flow
+        }
+
+        /// A short combined step on order-256 operator relative entropy cones
+        /// comes from the third-order corrector overshooting (thermal N=5:
+        /// affine αz 0.24–0.30, combined 7e-3, then none), as in QICS's
+        /// line search fallback. The direction without it reuses the
+        /// factorization (one more solve) and is kept when its step is longer.
+        fn retry_without_corrector(
+            &mut self,
+            state: &mut IterationState<T>,
+            affine: &V,
+            spare: &mut V,
+        ) {
+            spare.copy_from(&self.step_lhs);
+            self.step_lhs.copy_from(affine);
+            // the combined right-hand side builds on the affine one
+            self.step_rhs
+                .affine_step_rhs(&self.residuals, &self.variables, &self.cones);
+            self.cones.ore_corrector(false);
+            self.step_rhs.combined_step_rhs(
+                &self.residuals,
+                &self.variables,
+                &mut self.cones,
+                &mut self.step_lhs,
+                state.σ,
+                state.μ,
+                T::one(),
+            );
+            self.cones.ore_corrector(true);
+            let ok = self.kktsystem.solve(
+                &mut self.step_lhs,
+                &self.step_rhs,
+                &self.data,
+                &self.variables,
+                &mut self.cones,
+                StepDirection::Combined,
+                &self.settings,
+            );
+            let α = if crate::mpi::all_succeeded(ok) {
+                self.get_step_length(StepDirection::Combined, state.scaling)
+            } else {
+                T::zero()
+            };
+            if crate::solver::core::dbg_stepcone() {
+                eprintln!("stepretry {} α {:.3e} -> {:.3e}", state.iter, state.α, α);
+            }
+            if α > state.α {
+                state.α = α;
+            } else {
+                self.step_lhs.copy_from(spare);
+            }
         }
 
         fn centrality_correctors(&mut self, state: &mut IterationState<T>, corrected: &mut V) {
