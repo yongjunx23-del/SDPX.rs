@@ -161,7 +161,7 @@ fn dot_mpfr<'a, const N: usize>(
         .filter(|(a, b)| !zero_product(a, b))
         .map(|(a, b)| {
             let mut limbs = vec![0u64; 2 * N];
-            let mut exponent = a.exponent + b.exponent;
+            let mut exponent = a.exponent as mpfr::exp_t + b.exponent as mpfr::exp_t;
             let kind = if (a.kind < 0) != (b.kind < 0) {
                 -mpfr::REGULAR_KIND
             } else {

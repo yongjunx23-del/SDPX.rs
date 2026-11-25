@@ -25,8 +25,6 @@ pub(super) struct DenseBlockSolver {
     packed_leading: bool,
     large: bool,
     pool: Option<Arc<rayon::ThreadPool>>,
-    // Pooled factorization tiles, kept across refactors (fully overwritten).
-    tiles: Vec<Vec<Vec<f64>>>,
 }
 
 impl DenseBlockSolver {
@@ -45,10 +43,9 @@ impl DenseBlockSolver {
         let large = large_factor(n, m);
         if large {
             // Large packed primal systems can exploit level-3 BLAS, provided
-            // the factor, border and one set of Cholesky tiles fit this rank.
+            // the factor and border fit this rank.
             let (h, s) = (n as u128, m as u128);
-            let max = h.max(s);
-            let workspace = 8 * (h * h + h * s + s * s + max * (max + TILE as u128) / 2);
+            let workspace = 8 * (h * h + h * s + s * s);
             if k.colptr[n] as u128 != h * (h + 1) / 2
                 || crate::solver::core::worker_budget(settings.max_threads as usize) < 2
                 || super::super::condensed::effective_memory_bytes()
@@ -92,7 +89,6 @@ impl DenseBlockSolver {
             packed_leading: k.colptr[n] == n * (n + 1) / 2,
             large: large_factor(n, m),
             pool: None,
-            tiles: Vec::new(),
         }
     }
 
@@ -151,9 +147,10 @@ impl DenseBlockSolver {
             return false;
         }
         let rule = self.pivot_rule();
-        if !factor_block(&mut self.h, n, blocked, &mut self.tiles, rule)
-            || !self.valid_factor(&self.h, n)
-        {
+        let timer = crate::receipt::start();
+        let factored = factor_block(&mut self.h, n, blocked, rule);
+        crate::receipt::finish("dense.factor_h", timer);
+        if !factored || !self.valid_factor(&self.h, n, blocked) {
             return false;
         }
         if m == 0 {
@@ -161,6 +158,7 @@ impl DenseBlockSolver {
         }
         // Columns of Y are independent right-hand sides, solved in fixed
         // TILE-column chunks (split across the pool when there is one).
+        let timer = crate::receipt::start();
         let h = &self.h;
         let trsm = |y: &mut [f64]| unsafe {
             blas::dtrsm(
@@ -181,6 +179,8 @@ impl DenseBlockSolver {
             Some(pool) => pool.install(|| self.y.par_chunks_mut(TILE * n).for_each(trsm)),
             None => self.y.chunks_mut(TILE * n).for_each(trsm),
         }
+        crate::receipt::finish("dense.solve_y", timer);
+        let timer = crate::receipt::start();
         // S += Y'Y: upper column blocks of S are independent.
         if m >= 2 * TILE {
             let y = &self.y;
@@ -212,10 +212,24 @@ impl DenseBlockSolver {
                 );
             }
         }
-        if !factor_block(&mut self.s, m, blocked, &mut self.tiles, rule) {
+        crate::receipt::finish("dense.syrk_s", timer);
+        let timer = crate::receipt::start();
+        let factored = factor_block(&mut self.s, m, blocked, rule);
+        crate::receipt::finish("dense.factor_s", timer);
+        if !factored {
             return false;
         }
-        self.y.iter().all(|v| v.is_finite()) && self.valid_factor(&self.s, m)
+        blocked.install(|| self.y.par_chunks(n).all(|y| y.iter().all(|v| v.is_finite())))
+            && self.valid_factor(&self.s, m, blocked)
+    }
+
+    /// The pool for blocked kernels: one worker without a pool, so every
+    /// worker count runs the same blocks.
+    fn blocked_pool(&self) -> &rayon::ThreadPool {
+        self.pool
+            .as_deref()
+            .filter(|pool| pool.current_num_threads() > 1)
+            .unwrap_or(serial_pool())
     }
 
     /// `(eps, delta)` of the dynamic pivot rule, when enabled: a Cholesky
@@ -227,14 +241,18 @@ impl DenseBlockSolver {
         ))
     }
 
-    fn valid_factor(&self, a: &[f64], n: usize) -> bool {
-        a.iter().all(|v| v.is_finite())
-            && (0..n).all(|i| {
-                let d = a[i + i * n];
-                d > 0.
+    /// The factor's upper triangle (the factorization reads and writes only
+    /// that) is finite, with a positive diagonal outside the pivot rule.
+    fn valid_factor(&self, a: &[f64], n: usize, pool: &rayon::ThreadPool) -> bool {
+        pool.install(|| {
+            a.par_chunks(n).enumerate().all(|(j, column)| {
+                let d = column[j];
+                column[..=j].iter().all(|v| v.is_finite())
+                    && d > 0.
                     && (!self.settings.dynamic_regularization_enable
                         || d * d > self.settings.dynamic_regularization_eps)
             })
+        })
     }
 
     fn factor_fallback(&mut self, k: &CscMatrix<f64>) -> bool {
@@ -274,11 +292,10 @@ fn factor_block(
     a: &mut [f64],
     n: usize,
     pool: &rayon::ThreadPool,
-    tiles: &mut Vec<Vec<Vec<f64>>>,
     rule: Option<(f64, f64)>,
 ) -> bool {
     if n >= 2 * TILE {
-        return tiled_potrf(a, n, pool, tiles, rule);
+        return tiled_potrf(a, n, pool, rule);
     }
     let saved = rule.map(|_| a.to_vec());
     let mut info = 0;
@@ -289,7 +306,7 @@ fn factor_block(
     match saved {
         Some(saved) if rejected => {
             a.copy_from_slice(&saved);
-            tiled_potrf(a, n, serial_pool(), tiles, rule)
+            tiled_potrf(a, n, serial_pool(), rule)
         }
         _ => info == 0,
     }
@@ -344,36 +361,24 @@ fn potrf_dynamic(
     true
 }
 
-/// Factor one diagonal tile: LAPACK, then the dynamic rule on a rejected
-/// pivot. Without the rule a failed or nonpositive pivot fails the tile.
-fn potrf_tile(t: &mut [f64], n: usize, rule: Option<(f64, f64)>, diag: &[f64]) -> bool {
-    let saved = rule.map(|_| t.to_vec());
+/// Factor one diagonal tile (leading dimension `ld`): LAPACK, then the
+/// dynamic rule on a rejected pivot. Without the rule a failed or nonpositive
+/// pivot fails the tile.
+fn potrf_tile(t: &mut [f64], n: usize, ld: usize, rule: Option<(f64, f64)>, diag: &[f64]) -> bool {
+    let saved: Option<Vec<f64>> =
+        rule.map(|_| (0..n).flat_map(|c| t[c * ld..][..n].iter().copied()).collect());
     let mut info = 0;
-    unsafe { lapack::dpotrf(b'U', n as i32, t, n as i32, &mut info) };
+    unsafe { lapack::dpotrf(b'U', n as i32, t, ld as i32, &mut info) };
     let Some((eps, delta)) = rule else {
         return info == 0;
     };
-    if info == 0 && (0..n).all(|i| t[i + i * n] * t[i + i * n] > eps) {
+    if info == 0 && (0..n).all(|i| t[i + i * ld] * t[i + i * ld] > eps) {
         return true;
     }
-    t.copy_from_slice(&saved.unwrap());
-    potrf_dynamic(t, n, n, (eps, delta), diag)
-}
-
-/// `C(m x n) -= A' B` with `A` (k x m) and `B` (k x n) column-major.
-#[allow(clippy::too_many_arguments)]
-fn tile_gemm_sub(
-    m: usize,
-    n: usize,
-    k: usize,
-    a: &[f64],
-    lda: usize,
-    b: &[f64],
-    ldb: usize,
-    c: &mut [f64],
-    ldc: usize,
-) {
-    tile_product(m, n, k, a, lda, b, ldb, c, ldc, -1.)
+    for (c, column) in saved.unwrap().chunks(n).enumerate() {
+        t[c * ld..][..n].copy_from_slice(column);
+    }
+    potrf_dynamic(t, n, ld, (eps, delta), diag)
 }
 
 /// `C(m x n) += A' B` (border update `S += Y'Y`, off-diagonal part).
@@ -434,109 +439,242 @@ fn tile_product(
     }
 }
 
-/// Right-looking tiled Cholesky `A = U'U` of the upper triangle of the
-/// column-major `a` (n x n), run on `pool`. Tiles are packed into separate
-/// buffers so lanes borrow disjoint storage. Returns false on a failed pivot.
-fn tiled_potrf(
-    a: &mut [f64],
-    n: usize,
-    pool: &rayon::ThreadPool,
-    tiles: &mut Vec<Vec<Vec<f64>>>,
-    rule: Option<(f64, f64)>,
-) -> bool {
-    let p = n.div_ceil(TILE);
-    let size = |b: usize| TILE.min(n - b * TILE);
-    let diag: Vec<f64> = (0..n).map(|i| a[i + i * n]).collect();
-    // tiles[j][i], i <= j: rows of block i, columns of block j, ld = size(i).
-    // Buffers are reused across calls; packing overwrites every element.
-    if tiles.len() < p {
-        tiles.resize_with(p, Vec::new);
+/// Fortran BLAS entry points (as blas-sys declares them) for tile tasks on
+/// disjoint parts of one column-major matrix: raw pointers, so concurrent
+/// tasks never hold overlapping slices.
+mod ffi {
+    use std::os::raw::{c_char, c_int};
+    extern "C" {
+        pub fn dgemm_(
+            transa: *const c_char,
+            transb: *const c_char,
+            m: *const c_int,
+            n: *const c_int,
+            k: *const c_int,
+            alpha: *const f64,
+            a: *const f64,
+            lda: *const c_int,
+            b: *const f64,
+            ldb: *const c_int,
+            beta: *const f64,
+            c: *mut f64,
+            ldc: *const c_int,
+        );
+        pub fn dsyrk_(
+            uplo: *const c_char,
+            trans: *const c_char,
+            n: *const c_int,
+            k: *const c_int,
+            alpha: *const f64,
+            a: *const f64,
+            lda: *const c_int,
+            beta: *const f64,
+            c: *mut f64,
+            ldc: *const c_int,
+        );
+        pub fn dtrsm_(
+            side: *const c_char,
+            uplo: *const c_char,
+            transa: *const c_char,
+            diag: *const c_char,
+            m: *const c_int,
+            n: *const c_int,
+            alpha: *const f64,
+            a: *const f64,
+            lda: *const c_int,
+            b: *mut f64,
+            ldb: *const c_int,
+        );
     }
-    let tiles = &mut tiles[..p];
+}
+
+/// A column-major matrix whose tiles concurrent tasks update in place:
+/// every task writes one tile that no other running task reads or writes.
+#[derive(Clone, Copy)]
+struct TileMatrix(*mut f64, i32);
+unsafe impl Send for TileMatrix {}
+unsafe impl Sync for TileMatrix {}
+impl TileMatrix {
+    /// First element of tile (i, j): rows of block i, columns of block j.
+    fn tile(self, i: usize, j: usize) -> *mut f64 {
+        // SAFETY (callers): i, j index tiles of the matrix.
+        unsafe { self.0.add((j * self.1 as usize + i) * TILE) }
+    }
+}
+
+/// Right-looking tiled Cholesky `A = U'U` of the upper triangle of the
+/// column-major `a` (n x n), run on `pool` in place. Each tile operation is
+/// one BLAS call on the tile's elements, as on packed copies, so the factor
+/// does not depend on the worker count. Returns false on a failed pivot.
+fn tiled_potrf(a: &mut [f64], n: usize, pool: &rayon::ThreadPool, rule: Option<(f64, f64)>) -> bool {
+    let p = n.div_ceil(TILE);
+    let size = |b: usize| TILE.min(n - b * TILE) as i32;
+    let diag: Vec<f64> = (0..n).map(|i| a[i + i * n]).collect();
+    let m = TileMatrix(a.as_mut_ptr(), n as i32);
+    let ld = &m.1;
+    let (one, minus) = (1f64, -1f64);
+    let ch = |c: u8| c as std::os::raw::c_char;
     pool.install(|| {
-        tiles.par_iter_mut().enumerate().for_each(|(j, column)| {
-            column.resize_with(j + 1, Vec::new);
-            for (i, t) in column.iter_mut().enumerate() {
-                let (ri, cj) = (size(i), size(j));
-                t.resize(ri * cj, 0.);
-                for c in 0..cj {
-                    let src = (j * TILE + c) * n + i * TILE;
-                    t[c * ri..][..ri].copy_from_slice(&a[src..src + ri]);
-                }
-            }
-        })
-    });
-    let ok = pool.install(|| {
         for k in 0..p {
-            let kk = size(k) as i32;
-            if !potrf_tile(&mut tiles[k][k], kk as usize, rule, &diag[k * TILE..]) {
+            let kk = size(k);
+            // SAFETY: no task runs here; the slice ends at the tile's last
+            // element, inside `a`.
+            let t = unsafe {
+                std::slice::from_raw_parts_mut(m.tile(k, k), (kk as usize - 1) * n + kk as usize)
+            };
+            if !potrf_tile(t, kk as usize, n, rule, &diag[k * TILE..]) {
                 return false;
             }
             // Panel row k: U_kk' X = A_kj for every later block column.
-            let (done, rest) = tiles.split_at_mut(k + 1);
-            let diag = &done[k][k];
-            rest.par_iter_mut().enumerate().for_each(|(r, column)| {
-                let cj = size(k + 1 + r) as i32;
-                unsafe {
-                    blas::dtrsm(
-                        b'L',
-                        b'U',
-                        b'T',
-                        b'N',
-                        kk,
-                        cj,
-                        1.,
-                        diag,
-                        kk,
-                        &mut column[k],
-                        kk,
-                    )
-                };
+            (k + 1..p).into_par_iter().for_each(|j| unsafe {
+                ffi::dtrsm_(
+                    &ch(b'L'),
+                    &ch(b'U'),
+                    &ch(b'T'),
+                    &ch(b'N'),
+                    &kk,
+                    &size(j),
+                    &one,
+                    m.tile(k, k),
+                    ld,
+                    m.tile(k, j),
+                    ld,
+                )
             });
             // Trailing update A_ij -= A_ki' A_kj, k < i <= j.
-            let panel: Vec<Vec<f64>> = rest.iter_mut().map(|c| std::mem::take(&mut c[k])).collect();
-            rest.par_iter_mut().enumerate().for_each(|(r, column)| {
-                let j = k + 1 + r;
-                let cj = size(j) as i32;
-                let akj = &panel[r];
-                column[k + 1..=j]
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(s, tile)| {
-                        let i = k + 1 + s;
-                        let ri = size(i) as i32;
-                        if i == j {
-                            unsafe { blas::dsyrk(b'U', b'T', cj, kk, -1., akj, kk, 1., tile, cj) };
-                        } else {
-                            let (ri, cj, kk) = (ri as usize, cj as usize, kk as usize);
-                            tile_gemm_sub(ri, cj, kk, &panel[s], kk, akj, kk, tile, ri);
-                        }
-                    });
+            (k + 1..p).into_par_iter().for_each(|j| {
+                let cj = size(j);
+                (k + 1..=j).into_par_iter().for_each(|i| unsafe {
+                    if i == j {
+                        ffi::dsyrk_(
+                            &ch(b'U'),
+                            &ch(b'T'),
+                            &cj,
+                            &kk,
+                            &minus,
+                            m.tile(k, j),
+                            ld,
+                            &one,
+                            m.tile(j, j),
+                            ld,
+                        );
+                    } else {
+                        ffi::dgemm_(
+                            &ch(b'T'),
+                            &ch(b'N'),
+                            &size(i),
+                            &cj,
+                            &kk,
+                            &minus,
+                            m.tile(k, i),
+                            ld,
+                            m.tile(k, j),
+                            ld,
+                            &one,
+                            m.tile(i, j),
+                            ld,
+                        );
+                    }
+                })
             });
-            for (column, tile) in rest.iter_mut().zip(panel) {
-                column[k] = tile;
-            }
         }
         true
-    });
-    if !ok {
-        return false;
+    })
+}
+
+/// Rows (backward) or columns (transposed) one triangular-solve task updates.
+const SOLVE_PANEL: usize = 2 * TILE;
+
+/// `U'x = b` (`transpose`) or `Ux = b` for the upper factor `a` (n x n,
+/// leading dimension n), overwriting `x`: TILE blocks in order, each solved
+/// and then subtracted from the unsolved part in fixed SOLVE_PANEL ranges on
+/// `pool`. The BLAS calls do not depend on the worker count, so neither does
+/// the solution.
+fn tiled_trsv(a: &[f64], n: usize, x: &mut [f64], transpose: bool, pool: &rayon::ThreadPool) {
+    let ld = n as i32;
+    if n < 2 * TILE {
+        let trans = if transpose { b'T' } else { b'N' };
+        unsafe { blas::dtrsv(b'U', trans, b'N', ld, a, ld, x, 1) };
+        return;
     }
+    let p = n.div_ceil(TILE);
     pool.install(|| {
-        a.par_chunks_mut(TILE * n)
-            .zip(tiles.par_iter())
-            .enumerate()
-            .for_each(|(j, (slab, column))| {
-                for (i, t) in column.iter().enumerate() {
-                    let (ri, cj) = (size(i), size(j));
-                    for c in 0..cj {
-                        let dst = c * n + i * TILE;
-                        slab[dst..dst + ri].copy_from_slice(&t[c * ri..][..ri]);
+        for step in 0..p {
+            let k = if transpose { step } else { p - 1 - step };
+            let (r0, w) = (k * TILE, TILE.min(n - k * TILE));
+            if transpose {
+                let (head, tail) = x.split_at_mut(r0 + w);
+                let xk = &mut head[r0..];
+                unsafe { blas::dtrsv(b'U', b'T', b'N', w as i32, &a[r0 * n + r0..], ld, xk, 1) };
+                let xk = &*xk;
+                // x[r0 + w..] -= U[r0..r0 + w, r0 + w..]' x_k
+                tail.par_chunks_mut(SOLVE_PANEL)
+                    .enumerate()
+                    .for_each(|(c, t)| unsafe {
+                        let col = r0 + w + c * SOLVE_PANEL;
+                        let len = t.len() as i32;
+                        blas::dgemv(b'T', w as i32, len, -1., &a[col * n + r0..], ld, xk, 1, 1., t, 1);
+                    });
+            } else {
+                let (head, tail) = x.split_at_mut(r0);
+                let xk = &mut tail[..w];
+                unsafe { blas::dtrsv(b'U', b'N', b'N', w as i32, &a[r0 * n + r0..], ld, xk, 1) };
+                let xk = &*xk;
+                // x[..r0] -= U[..r0, r0..r0 + w] x_k
+                head.par_chunks_mut(SOLVE_PANEL)
+                    .enumerate()
+                    .for_each(|(c, t)| unsafe {
+                        let row = c * SOLVE_PANEL;
+                        let len = t.len() as i32;
+                        blas::dgemv(b'N', len, w as i32, -1., &a[r0 * n + row..], ld, xk, 1, 1., t, 1);
+                    });
+            }
+        }
+    })
+}
+
+/// Columns of the packed leading block one residual task reads.
+const RESIDUAL_COLUMNS: usize = 1024;
+
+/// `out -= K x` for the packed upper leading block of `k` (order n), on
+/// `pool`. Fixed column chunks each add their columns (diagonal included)
+/// into a partial over the rows above and dot their strict upper parts with
+/// `x`; every row then subtracts its dot and the partials in chunk order, so
+/// the result does not depend on the worker count.
+fn packed_residual(k: &CscMatrix<f64>, n: usize, out: &mut [f64], x: &[f64], pool: &rayon::ThreadPool) {
+    let chunks = n.div_ceil(RESIDUAL_COLUMNS);
+    let parts: Vec<(Vec<f64>, Vec<f64>)> = pool.install(|| {
+        (0..chunks)
+            .into_par_iter()
+            .map(|c| {
+                let (j0, j1) = (c * RESIDUAL_COLUMNS, n.min((c + 1) * RESIDUAL_COLUMNS));
+                let mut column_sums = vec![0.; j1];
+                let mut dots = vec![0.; j1 - j0];
+                for j in j0..j1 {
+                    let column = &k.nzval[k.colptr[j]..][..=j];
+                    unsafe {
+                        blas::daxpy(j as i32 + 1, x[j], column, 1, &mut column_sums, 1);
+                        dots[j - j0] = blas::ddot(j as i32, column, 1, x, 1);
                     }
+                }
+                (column_sums, dots)
+            })
+            .collect()
+    });
+    pool.install(|| {
+        out.par_chunks_mut(RESIDUAL_COLUMNS)
+            .enumerate()
+            .for_each(|(b, rows)| {
+                for (r, row) in rows.iter_mut().enumerate() {
+                    let i = b * RESIDUAL_COLUMNS + r;
+                    let mut sum = parts[b].1[r];
+                    for (column_sums, _) in &parts[b..] {
+                        sum += column_sums[i];
+                    }
+                    *row -= sum;
                 }
             })
     });
-    true
 }
 
 impl HasLinearSolverInfo for DenseBlockSolver {
@@ -584,21 +722,10 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
         if !self.packed_leading || k.colptr[self.n] > i32::MAX as usize {
             return None;
         }
+        let timer = crate::receipt::start();
         out.copy_from_slice(rhs);
         let n = self.n;
-        unsafe {
-            blas::dspmv(
-                b'U',
-                n as i32,
-                -1.,
-                &k.nzval[..k.colptr[n]],
-                &point[..n],
-                1,
-                1.,
-                &mut out[..n],
-                1,
-            );
-        }
+        packed_residual(k, n, &mut out[..n], &point[..n], self.blocked_pool());
         for col in n..k.n {
             for p in k.colptr[col]..k.colptr[col + 1] {
                 let row = k.rowval[p];
@@ -609,6 +736,7 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
                 }
             }
         }
+        crate::receipt::finish("dense.residual", timer);
         Some(out.norm_inf())
     }
 
@@ -620,7 +748,6 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
             self.h = Vec::new();
             self.y = Vec::new();
             self.s = Vec::new();
-            self.tiles = Vec::new();
         }
         self.use_dense || self.factor_fallback(k)
     }
@@ -629,6 +756,7 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
             self.fallback.as_mut().unwrap().solve(k, x, b);
             return;
         }
+        let timer = crate::receipt::start();
         x.copy_from_slice(b);
         let (u, v) = x.split_at_mut(self.n);
         let (n, m) = (self.n as i32, self.m as i32);
@@ -636,8 +764,9 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
             .pool
             .as_deref()
             .filter(|p| p.current_num_threads() > 1 && self.y.len() >= 1 << 20);
+        let blocked = self.blocked_pool();
+        tiled_trsv(&self.h, self.n, u, true, blocked);
         unsafe {
-            blas::dtrsv(b'U', b'T', b'N', n, &self.h, n, u, 1);
             if m > 0 {
                 if let Some(pool) = pool {
                     pool.install(|| {
@@ -650,8 +779,8 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
                 } else {
                     blas::dgemv(b'T', n, m, 1., &self.y, n, u, 1, -1., v, 1);
                 }
-                blas::dtrsv(b'U', b'T', b'N', m, &self.s, m, v, 1);
-                blas::dtrsv(b'U', b'N', b'N', m, &self.s, m, v, 1);
+                tiled_trsv(&self.s, self.m, v, true, blocked);
+                tiled_trsv(&self.s, self.m, v, false, blocked);
                 if let Some(pool) = pool {
                     pool.install(|| {
                         u.par_chunks_mut(TILE).enumerate().for_each(|(i, u)| {
@@ -674,8 +803,9 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
                     blas::dgemv(b'N', n, m, -1., &self.y, n, v, 1, 1., u, 1);
                 }
             }
-            blas::dtrsv(b'U', b'N', b'N', n, &self.h, n, u, 1);
         }
+        tiled_trsv(&self.h, self.n, u, false, blocked);
+        crate::receipt::finish("dense.solve", timer);
     }
 }
 
@@ -812,6 +942,75 @@ mod tests {
     }
 
     #[test]
+    fn dense_block_solve_and_residual_are_thread_invariant() {
+        // Leading block and border above the tiled thresholds of the
+        // triangular solves (2 TILE) and residual chunks (RESIDUAL_COLUMNS).
+        let (n, m) = (RESIDUAL_COLUMNS + 2 * TILE + 5, 2 * TILE + 3);
+        let total = n + m;
+        let mut seed = 0x853c49e6748fea9bu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+        for j in 0..total {
+            for i in 0..=j {
+                let v = match (i == j, j < n) {
+                    (true, true) => n as f64,
+                    (true, false) => -(m as f64),
+                    _ if j < n || i < n => next() * 0.1,
+                    _ => 0.,
+                };
+                rows.push(i);
+                cols.push(j);
+                vals.push(v);
+            }
+        }
+        let k = CscMatrix::new_from_triplets(total, total, rows, cols, vals);
+        let signs: Vec<i8> = (0..total).map(|i| if i < n { 1 } else { -1 }).collect();
+        let rhs: Vec<f64> = (0..total).map(|_| next()).collect();
+        let run = |threads: usize| {
+            let mut s = DenseBlockSolver::new(&k, &signs, &CoreSettings::default(), n);
+            if threads > 1 {
+                s.set_pool(Some(Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap(),
+                )));
+            }
+            assert!(s.refactor(&k));
+            let (mut x, mut b) = (vec![0.; total], rhs.clone());
+            s.solve(&k, &mut x, &mut b);
+            let mut r = vec![0.; total];
+            let norm = s.residual(&k, &mut r, &rhs, &x).unwrap();
+            (x, r, norm)
+        };
+        let (x1, r1, norm) = run(1);
+        assert!(norm < 1e-10, "residual {norm}");
+        // The residual matches a direct evaluation of rhs - Kx.
+        let mut direct = rhs.clone();
+        for j in 0..total {
+            for p in k.colptr[j]..k.colptr[j + 1] {
+                let (i, v) = (k.rowval[p], k.nzval[p]);
+                direct[i] -= v * x1[j];
+                if i != j {
+                    direct[j] -= v * x1[i];
+                }
+            }
+        }
+        assert!(direct.iter().zip(&r1).all(|(a, b)| (a - b).abs() < 1e-12));
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for threads in [2, 5] {
+            let (x, r, _) = run(threads);
+            assert_eq!(bits(&x1), bits(&x));
+            assert_eq!(bits(&r1), bits(&r));
+        }
+    }
+
+    #[test]
     fn tiled_potrf_matches_lapack_and_is_thread_invariant() {
         let n = 2 * TILE + 45;
         let mut seed = 0x9e3779b97f4a7c15u64;
@@ -839,7 +1038,7 @@ mod tests {
                 .build()
                 .unwrap();
             let mut u = a.clone();
-            assert!(tiled_potrf(&mut u, n, &pool, &mut Vec::new(), None));
+            assert!(tiled_potrf(&mut u, n, &pool, None));
             u
         };
         let (two, five) = (factor(2), factor(5));
@@ -862,13 +1061,7 @@ mod tests {
             .num_threads(3)
             .build()
             .unwrap();
-        assert!(!tiled_potrf(
-            &mut indefinite,
-            n,
-            &pool,
-            &mut Vec::new(),
-            None
-        ));
+        assert!(!tiled_potrf(&mut indefinite, n, &pool, None));
     }
     #[test]
     fn dense_block_replaces_tiny_pivot() {
@@ -908,9 +1101,9 @@ mod tests {
             .build()
             .unwrap();
         let mut a = h.clone();
-        assert!(tiled_potrf(&mut a, n, &pool, &mut Vec::new(), rule));
+        assert!(tiled_potrf(&mut a, n, &pool, rule));
         let mut b = h.clone();
-        assert!(tiled_potrf(&mut b, n, serial_pool(), &mut Vec::new(), rule));
+        assert!(tiled_potrf(&mut b, n, serial_pool(), rule));
         assert_eq!(a, b);
         assert!((0..n).all(|i| a[i + i * n] > 0.));
     }

@@ -8,6 +8,16 @@ format: hypothesis → change → E2E result (case, arm, api s, audit) → decis
 Do not rewrite old entries; the plan (`REVIEW_AND_PLAN.md`) holds only current
 status and next actions.
 
+## 2026-11-25 — Square lattice memory and Float64 dense KKT kernels (worktree isq-20261124)
+
+Cluster directory `~/projects/isq-lattice-20261124`. Release arms were built from frozen archives (`incoming/MANIFEST.txt`) with dynamic OpenBLAS and `faer-sparse`. Runs used 108 physical cores with pages interleaved across their NUMA domains. Square4 ran A/B/B/A on node92 and was audited by the 237455 original-coordinate scripts. Square5 ran one Newton step per arm on node76, after node40 turned out to host another user's 22 long-running processes.
+
+- 24-byte MPFR128 values: `MpFloat` now stores its exponent as `i32`, which covers MPFR's default exponent range. Square4 MPFR128 lower, main `3aaf6cb` vs the change (PBS 239695): median peak RSS fell from 12.01 to 10.23 GiB (−14.8%) and the native median from 408.36 to 399.32 s (−2.2%). All four points matched bitwise, reaching Solved in 32 iterations with a 1.76e-8 corrected gap. Kept.
+- In-place Float64 dense Cholesky: the pooled tiled factor now works on the KKT block directly, with no shared tile copy, and receipts report `dense.*` phases. Square5 one Newton step (PBS 239697): peak RSS fell from 170.60 to 158.26 GiB (−12.3 GiB) with a bitwise identical checkpoint, step 0.887 and identical original relative residuals 0.2855/0.9988. Native time rose from 1,575.13 to 1,677.64 s (+6.5%, one run each). Square4 points were bitwise equal and medians rose 3.2%/3.3% (lower 63.94 → 66.00 s, upper 102.26 → 105.60 s). Kept for memory. On square5 the factors (`dense.factor_h` + `dense.factor_s`, 506.8 s for two factorizations) run at about 0.74 TFLOP/s against 2.4 TFLOP/s for `dense.solve_y`.
+- Pooled dense solves and packed residual: triangular solves step through 128-wide blocks with panel products on the pool, and the packed leading residual uses fixed column chunks. Both are invariant to the thread count. Square5 one step: 1,677.64 → 1,605.56 s (−4.3%) against the in-place arm, peak 159.38 GiB, checkpoint within 2.6e-7 (z) and residuals 0.28550/0.99881. Square4 against the in-place arm (PBS 239695): upper 108.94 → 98.51 s (−9.6%), corrected gap 9.54e-6 → 2.04e-7. Lower 68.69 → 73.95 s (+7.7%), because the changed rounding raised linear solves from 383 to 476 (outer refinements 94 → 137), corrected gap 3.28e-8 → 8.34e-8. All points passed the 1e-5 gate. Kept: the three cases together fell 4.2%.
+- Rejected: forming the sparse border residual on the pool and narrowing solve panels to 32 (PBS 239732, against the 24-byte arm). Upper improved 9.6%, but lower slowed 24% with 560 linear solves and a 3.46e-6 corrected gap.
+- Rejected: 256-wide tiles throughout (PBS 239754). Solves ran 2.4× faster per call (19 vs 46 ms) and upper improved 17%, but the square4 lower missed the gate with a 1.099e-5 corrected gap after 26 iterations. The square4 lower endgame is sensitive to solve rounding: every rounding change so far has altered its refinement count and final gap.
+
 ## 2026-11-25 — Matrix-free ORE kernels and threading (kept, worktree opre-20261123)
 
 Hypothesis: after mf6, the n = 256 cone's dual-test CG dominates the thermal

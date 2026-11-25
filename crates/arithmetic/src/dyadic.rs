@@ -91,7 +91,7 @@ impl<const N: usize> MpFloat<N> {
             kind: DyadicKind::Finite {
                 negative: self.is_sign_negative(),
             },
-            exponent: self.exponent,
+            exponent: self.exponent as mpfr::exp_t,
             mantissa_bits: Self::PRECISION_BITS,
         }
     }

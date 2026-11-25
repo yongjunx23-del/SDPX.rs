@@ -88,7 +88,7 @@ fn valid_regular<const N: usize>(kind: i32, exponent: i64, limbs: &[u64; N]) -> 
     if exponent <= floor
         || exponent < emin_min
         || exponent > emax_max
-        || mpfr::exp_t::try_from(exponent).is_err()
+        || i32::try_from(exponent).is_err()
     {
         return false;
     }

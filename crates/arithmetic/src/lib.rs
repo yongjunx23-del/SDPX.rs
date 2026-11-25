@@ -333,9 +333,13 @@ const _: () = assert!(gmp::NUMB_BITS == 64 && std::mem::size_of::<gmp::limb_t>()
 pub struct MpFloat<const N: usize> {
     pub(crate) limbs: [u64; N],
     pub(crate) kind: i32,
-    pub(crate) exponent: mpfr::exp_t,
+    /// MPFR exponent of a regular value (0 otherwise). MPFR's default range
+    /// ±(2^30 - 1), which nothing here widens, fits `i32`, so a value takes
+    /// 8N + 8 bytes (24 instead of 32 at 128 bits).
+    pub(crate) exponent: i32,
 }
 pub type Bits128 = MpFloat<2>;
+const _: () = assert!(std::mem::size_of::<Bits128>() == 24);
 pub type Bits256 = MpFloat<4>;
 pub type Bits512 = MpFloat<8>;
 pub type Bits768 = MpFloat<12>;
@@ -434,7 +438,7 @@ impl<const N: usize> MpFloat<N> {
             mpfr::custom_init_set(
                 d.as_mut_ptr(),
                 self.kind,
-                self.exponent,
+                self.exponent as mpfr::exp_t,
                 Self::PRECISION_BITS as _,
                 self.limbs.as_ptr().cast_mut().cast(),
             );
@@ -458,7 +462,10 @@ impl<const N: usize> MpFloat<N> {
             let mut d = d.assume_init();
             f(&mut d);
             result.kind = mpfr::custom_get_kind(&d);
-            result.exponent = mpfr::custom_get_exp(&d);
+            if result.kind.abs() == mpfr::REGULAR_KIND {
+                result.exponent = i32::try_from(mpfr::custom_get_exp(&d))
+                    .expect("MPFR exponent range wider than i32");
+            }
         }
         result
     }
@@ -489,7 +496,7 @@ impl<const N: usize> MpFloat<N> {
         Self {
             limbs,
             kind,
-            exponent: exponent as mpfr::exp_t,
+            exponent: exponent as i32,
         }
     }
 
@@ -667,7 +674,7 @@ impl<const N: usize> MpFloat<N> {
                 } else {
                     mpfr::REGULAR_KIND
                 },
-                exponent: exponent as mpfr::exp_t,
+                exponent: exponent as i32,
                 ..*other
             });
         }
@@ -711,7 +718,9 @@ impl<const N: usize> MpFloat<N> {
                 _ => {}
             }
         }
-        unsafe { mpfr::get_emin() as i64 <= e && e <= mpfr::get_emax() as i64 }
+        // A stored exponent is an i32 (see `MpFloat`).
+        i32::try_from(e).is_ok()
+            && unsafe { mpfr::get_emin() as i64 <= e && e <= mpfr::get_emax() as i64 }
     }
     /// Normalize and round an exact `2N`-limb product to nearest-even.
     #[inline(always)]
@@ -757,7 +766,7 @@ impl<const N: usize> MpFloat<N> {
             } else {
                 mpfr::REGULAR_KIND
             },
-            exponent: e as mpfr::exp_t,
+            exponent: e as i32,
         })
     }
     /// One exact product plus an exact addend in a bounded limb window.
@@ -1346,7 +1355,7 @@ impl<const N: usize> MpFloat<N> {
         Some(Self {
             limbs,
             kind: regular(negative),
-            exponent: e as mpfr::exp_t,
+            exponent: e as i32,
         })
     }
     fn binary(
@@ -1683,7 +1692,7 @@ impl<const N: usize> Scalar for MpFloat<N> {
         crate::wire::mp_tag(Self::PRECISION_BITS)
     }
     fn write_wire(self, out: &mut [u8]) -> bool {
-        crate::wire::write_mp(self.kind, self.exponent, &self.limbs, out)
+        crate::wire::write_mp(self.kind, self.exponent as mpfr::exp_t, &self.limbs, out)
     }
     fn read_wire(bytes: &[u8]) -> Option<Self> {
         let (kind, exponent, limbs) = crate::wire::read_mp::<N>(bytes)?;
