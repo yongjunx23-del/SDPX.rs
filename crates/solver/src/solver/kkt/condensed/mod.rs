@@ -1215,6 +1215,9 @@ impl<T: FloatT> OreElim<T> {
         pool: Option<&rayon::ThreadPool>,
     ) {
         let c = self.columns.len();
+        if c == 0 {
+            return;
+        }
         if self.positions.is_empty() {
             for j in 0..c {
                 for i in 0..=j {
@@ -1418,10 +1421,6 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             "local KKT requires local cone policy"
         );
         let (n, m) = (A.n, A.m);
-        assert!(
-            n > 0 || !keep_equalities,
-            "condensed KKT requires primal variables"
-        );
         assert_eq!(P.size(), (n, n));
         assert_eq!(cones.numel(), m);
         assert_eq!(types.len(), cones.len());

@@ -171,6 +171,10 @@ where
             data.update_vector(&mut o.q, &one, None)?;
         }
 
+        if let Some((q, _)) = &mut self.data.jump {
+            let one = vec![T::one(); q.len()];
+            data.update_vector(q, &one, None)?;
+        }
         // flush unscaled norm. Will be recalculated during solve
         self.data.clear_normq();
 

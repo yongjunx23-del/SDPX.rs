@@ -62,9 +62,7 @@ impl<T: FloatT> ConeCollection<T> for crate::solver::cones::CompositeCone<T> {
         self.iter().any(|c| !c.is_symmetric() && !c.is_ore())
     }
     fn has_free_ore(&self) -> bool {
-        use crate::solver::cones::SupportedCone;
-        self.iter()
-            .any(|c| matches!(c, SupportedCone::OpRelEntropyCone(c) if c.matrix_free()))
+        self.free_ore_ranges().next().is_some()
     }
     fn ore_corrector(&mut self, on: bool) {
         use crate::solver::cones::SupportedCone;

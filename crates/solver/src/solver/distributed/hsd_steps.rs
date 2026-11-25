@@ -78,6 +78,67 @@ impl<T: FloatT> OwnedVariables<T> {
             .map_or(T::zero(), |value| if finite { -value } else { T::zero() })
     }
 
+    fn step_length_in(
+        &self,
+        step: &Self,
+        cones: &mut OwnedCones<T>,
+        settings: &DefaultSettings<T>,
+        direction: StepDirection,
+        kkt: bool,
+    ) -> T {
+        let cap = self.scalar_bound(step);
+        if let Some(mut alpha) = cones.parallel_symmetric_bounds(cap, |o, cone, cap| {
+            let v = &self.blocks[o];
+            let d = &step.blocks[o];
+            cone.step_length(&d.z, &d.s, &v.z, &v.s, settings.core(), cap)
+        }) {
+            if direction == StepDirection::Combined {
+                alpha *= settings.core().max_step_fraction;
+            }
+            return self.global_min_step(alpha, 500);
+        }
+        let free_ore = direction == StepDirection::Combined && cones.has_free_ore();
+        if free_ore && kkt {
+            for block in &mut cones.blocks {
+                block.free_ore_kkt(Some(settings.max_step_fraction));
+            }
+        }
+        let mut alpha = cones.fold_bounds(cap, |o, cone, r, cap| {
+            let v = &self.blocks[o];
+            let d = &step.blocks[o];
+            cone.step_length(
+                &d.z[r.clone()],
+                &d.s[r.clone()],
+                &v.z[r.clone()],
+                &v.s[r],
+                settings.core(),
+                cap,
+            )
+        });
+        if free_ore {
+            if kkt {
+                for block in &mut cones.blocks {
+                    block.free_ore_kkt(None);
+                }
+            }
+            let steps = self
+                .blocks
+                .iter()
+                .zip(&step.blocks)
+                .map(|(v, d)| [&d.z[..], &d.s, &v.z, &v.s]);
+            alpha = CompositeCone::certify_ore_step(
+                cones.blocks.iter_mut().zip(steps),
+                settings.core(),
+                alpha,
+                kkt,
+                cones.pool.as_deref(),
+            );
+        } else if direction == StepDirection::Combined {
+            alpha *= settings.max_step_fraction;
+        }
+        self.global_min_step(alpha, 501)
+    }
+
     fn refresh_border_from_owner_zero(&mut self) {
         if let Some(local_owner) = self.owner_ids.iter().position(|&owner| owner == 0) {
             self.border_s.fill(T::zero());
@@ -117,6 +178,14 @@ impl<T: FloatT> ConeCollection<T> for OwnedCones<T> {
     fn has_correctable(&self) -> bool {
         let local = self.blocks.iter().all(|c| !c.has_correctable());
         !self.collective.all_true(709, local).unwrap_or(true)
+    }
+    fn has_free_ore(&self) -> bool {
+        self.blocks.iter().any(ConeCollection::has_free_ore)
+    }
+    fn ore_corrector(&mut self, on: bool) {
+        for block in &mut self.blocks {
+            block.ore_corrector(on);
+        }
     }
     fn supports_primal_dual(&self) -> bool {
         let local = self.blocks.iter().all(|c| c.allows_primal_dual_scaling());
@@ -339,33 +408,10 @@ impl<T: FloatT> Variables<T> for OwnedVariables<T> {
         settings: &Self::SE,
         direction: StepDirection,
     ) -> T {
-        let cap = self.scalar_bound(step);
-        if let Some(mut alpha) = cones.parallel_symmetric_bounds(cap, |o, cone, cap| {
-            let v = &self.blocks[o];
-            let d = &step.blocks[o];
-            cone.step_length(&d.z, &d.s, &v.z, &v.s, settings.core(), cap)
-        }) {
-            if direction == StepDirection::Combined {
-                alpha *= settings.core().max_step_fraction;
-            }
-            return self.global_min_step(alpha, 500);
-        }
-        let mut alpha = cones.fold_bounds(self.scalar_bound(step), |o, cone, r, cap| {
-            let v = &self.blocks[o];
-            let d = &step.blocks[o];
-            cone.step_length(
-                &d.z[r.clone()],
-                &d.s[r.clone()],
-                &v.z[r.clone()],
-                &v.s[r],
-                settings.core(),
-                cap,
-            )
-        });
-        if direction == StepDirection::Combined {
-            alpha *= settings.core().max_step_fraction;
-        }
-        self.global_min_step(alpha, 501)
+        self.step_length_in(step, cones, settings, direction, false)
+    }
+    fn calc_kkt_step_length(&self, step: &Self, cones: &mut Self::C, settings: &Self::SE) -> T {
+        self.step_length_in(step, cones, settings, StepDirection::Combined, true)
     }
     fn prepare_affine_step_length(
         &self,

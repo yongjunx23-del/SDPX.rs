@@ -614,7 +614,7 @@ where
         out
     }
 
-    fn free_ore_kkt(&mut self, fraction: Option<T>) {
+    pub(crate) fn free_ore_kkt(&mut self, fraction: Option<T>) {
         for cone in self.cones.iter_mut() {
             if let SupportedCone::OpRelEntropyCone(c) = cone {
                 if c.matrix_free() {
@@ -624,56 +624,76 @@ where
         }
     }
 
-    /// The combined step from the cones' bound `α`: its fraction, or `α`
-    /// itself where a matrix-free operator relative entropy cone's combined
-    /// search (`kkt`) certified that exact pair, backtracked by `step` until
-    /// every matrix-free cone certifies the same pair; 0 below `αmin`.
-    pub(crate) fn certify_ore_step(
-        &mut self,
-        dz: &[T],
-        ds: &[T],
-        z: &[T],
-        s: &[T],
-        settings: &CoreSettings<T>,
-        α: T,
-        kkt: bool,
-    ) -> T {
-        let certified: Vec<T> = (self.cones.iter_mut())
-            .map(|cone| match cone {
-                SupportedCone::OpRelEntropyCone(c) if c.matrix_free() => c.take_certified(),
-                _ => T::zero(),
+    pub(crate) fn free_ore_ranges(&self) -> impl Iterator<Item = &Range<usize>> {
+        self.cones
+            .iter()
+            .zip(&self.rng_cones)
+            .filter_map(|(cone, rows)| {
+                matches!(cone, SupportedCone::OpRelEntropyCone(c) if c.matrix_free())
+                    .then_some(rows)
             })
-            .collect();
-        let mut α = if kkt && α > T::zero() && certified.contains(&α) {
-            α
-        } else {
-            α * settings.max_step_fraction
-        };
-        // as in `step_length`: each test splits its kernels on the idle pool
-        let idle = (self.threading.as_ref()).filter(|t| t.pool.current_num_threads() > 1);
-        'trial: while α > settings.min_terminate_step_length {
-            for (i, (cone, r)) in self.cones.iter().zip(&self.rng_cones).enumerate() {
-                let SupportedCone::OpRelEntropyCone(c) = cone else {
-                    continue;
-                };
-                if !c.matrix_free() || certified[i] == α {
-                    continue;
+    }
+
+    /// Apply Hs on the rows that need it. ORE direction recovery uses the
+    /// linear primal equation, including matrix-free cones with no Hs.
+    pub(crate) fn mul_hs_for_direction(&mut self, y: &mut [T], x: &[T], work: &mut [T]) {
+        if self.free_ore_ranges().next().is_none() {
+            self.mul_Hs(y, x, work);
+            return;
+        }
+        for (cone, rows) in self.cones.iter_mut().zip(&self.rng_cones) {
+            if !cone.is_ore() {
+                cone.mul_Hs(
+                    &mut y[rows.clone()],
+                    &x[rows.clone()],
+                    &mut work[rows.clone()],
+                );
+            }
+        }
+    }
+
+    /// Choose one combined step certified on every matrix-free ORE block.
+    /// An exact step already tested by a combined KKT search can be reused.
+    pub(crate) fn certify_ore_step<'a>(
+        blocks: impl IntoIterator<Item = (&'a mut Self, [&'a [T]; 4])>,
+        settings: &CoreSettings<T>,
+        mut alpha: T,
+        kkt: bool,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> T {
+        let mut trials = Vec::new();
+        for (block, [dz, ds, z, s]) in blocks {
+            for (cone, rows) in block.cones.iter_mut().zip(&block.rng_cones) {
+                if let SupportedCone::OpRelEntropyCone(c) = cone {
+                    if c.matrix_free() {
+                        let accepted = c.take_certified();
+                        let values = [dz, ds, z, s].map(|v| &v[rows.clone()]);
+                        trials.push((&*c, accepted, values));
+                    }
                 }
-                let r = r.clone();
-                let test = || c.certifies(&dz[r.clone()], &ds[r.clone()], &z[r.clone()], &s[r.clone()], α);
-                let ok = match idle {
-                    Some(t) => t.pool.install(|| {
+            }
+        }
+        if !(kkt && alpha > T::zero() && trials.iter().any(|(_, a, _)| *a == alpha)) {
+            alpha *= settings.max_step_fraction;
+        }
+        let pool = pool.filter(|p| p.current_num_threads() > 1);
+        while alpha > settings.min_terminate_step_length {
+            if trials.iter().all(|(cone, accepted, [dz, ds, z, s])| {
+                if *accepted == alpha {
+                    return true;
+                }
+                let test = || cone.certifies(dz, ds, z, s, alpha);
+                match pool {
+                    Some(pool) => pool.install(|| {
                         let _inner = sdpx_arithmetic::inner_parallel::Guard::enter();
                         test()
                     }),
                     None => test(),
-                };
-                if !ok {
-                    α *= settings.linesearch_backtrack_step;
-                    continue 'trial;
                 }
+            }) {
+                return alpha;
             }
-            return α;
+            alpha *= settings.linesearch_backtrack_step;
         }
         T::zero()
     }

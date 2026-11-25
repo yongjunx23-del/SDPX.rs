@@ -219,8 +219,11 @@ impl DenseBlockSolver {
         if !factored {
             return false;
         }
-        blocked.install(|| self.y.par_chunks(n).all(|y| y.iter().all(|v| v.is_finite())))
-            && self.valid_factor(&self.s, m, blocked)
+        blocked.install(|| {
+            self.y
+                .par_chunks(n)
+                .all(|y| y.iter().all(|v| v.is_finite()))
+        }) && self.valid_factor(&self.s, m, blocked)
     }
 
     /// The pool for blocked kernels: one worker without a pool, so every
@@ -365,8 +368,11 @@ fn potrf_dynamic(
 /// dynamic rule on a rejected pivot. Without the rule a failed or nonpositive
 /// pivot fails the tile.
 fn potrf_tile(t: &mut [f64], n: usize, ld: usize, rule: Option<(f64, f64)>, diag: &[f64]) -> bool {
-    let saved: Option<Vec<f64>> =
-        rule.map(|_| (0..n).flat_map(|c| t[c * ld..][..n].iter().copied()).collect());
+    let saved: Option<Vec<f64>> = rule.map(|_| {
+        (0..n)
+            .flat_map(|c| t[c * ld..][..n].iter().copied())
+            .collect()
+    });
     let mut info = 0;
     unsafe { lapack::dpotrf(b'U', n as i32, t, ld as i32, &mut info) };
     let Some((eps, delta)) = rule else {
@@ -506,7 +512,12 @@ impl TileMatrix {
 /// column-major `a` (n x n), run on `pool` in place. Each tile operation is
 /// one BLAS call on the tile's elements, as on packed copies, so the factor
 /// does not depend on the worker count. Returns false on a failed pivot.
-fn tiled_potrf(a: &mut [f64], n: usize, pool: &rayon::ThreadPool, rule: Option<(f64, f64)>) -> bool {
+fn tiled_potrf(
+    a: &mut [f64],
+    n: usize,
+    pool: &rayon::ThreadPool,
+    rule: Option<(f64, f64)>,
+) -> bool {
     let p = n.div_ceil(TILE);
     let size = |b: usize| TILE.min(n - b * TILE) as i32;
     let diag: Vec<f64> = (0..n).map(|i| a[i + i * n]).collect();
@@ -613,7 +624,19 @@ fn tiled_trsv(a: &[f64], n: usize, x: &mut [f64], transpose: bool, pool: &rayon:
                     .for_each(|(c, t)| unsafe {
                         let col = r0 + w + c * SOLVE_PANEL;
                         let len = t.len() as i32;
-                        blas::dgemv(b'T', w as i32, len, -1., &a[col * n + r0..], ld, xk, 1, 1., t, 1);
+                        blas::dgemv(
+                            b'T',
+                            w as i32,
+                            len,
+                            -1.,
+                            &a[col * n + r0..],
+                            ld,
+                            xk,
+                            1,
+                            1.,
+                            t,
+                            1,
+                        );
                     });
             } else {
                 let (head, tail) = x.split_at_mut(r0);
@@ -626,7 +649,19 @@ fn tiled_trsv(a: &[f64], n: usize, x: &mut [f64], transpose: bool, pool: &rayon:
                     .for_each(|(c, t)| unsafe {
                         let row = c * SOLVE_PANEL;
                         let len = t.len() as i32;
-                        blas::dgemv(b'N', len, w as i32, -1., &a[r0 * n + row..], ld, xk, 1, 1., t, 1);
+                        blas::dgemv(
+                            b'N',
+                            len,
+                            w as i32,
+                            -1.,
+                            &a[r0 * n + row..],
+                            ld,
+                            xk,
+                            1,
+                            1.,
+                            t,
+                            1,
+                        );
                     });
             }
         }
@@ -641,7 +676,13 @@ const RESIDUAL_COLUMNS: usize = 1024;
 /// into a partial over the rows above and dot their strict upper parts with
 /// `x`; every row then subtracts its dot and the partials in chunk order, so
 /// the result does not depend on the worker count.
-fn packed_residual(k: &CscMatrix<f64>, n: usize, out: &mut [f64], x: &[f64], pool: &rayon::ThreadPool) {
+fn packed_residual(
+    k: &CscMatrix<f64>,
+    n: usize,
+    out: &mut [f64],
+    x: &[f64],
+    pool: &rayon::ThreadPool,
+) {
     let chunks = n.div_ceil(RESIDUAL_COLUMNS);
     let parts: Vec<(Vec<f64>, Vec<f64>)> = pool.install(|| {
         (0..chunks)
@@ -719,7 +760,7 @@ impl DirectLDLSolver<f64> for DenseBlockSolver {
         rhs: &[f64],
         point: &[f64],
     ) -> Option<f64> {
-        if !self.packed_leading || k.colptr[self.n] > i32::MAX as usize {
+        if !self.packed_leading {
             return None;
         }
         let timer = crate::receipt::start();

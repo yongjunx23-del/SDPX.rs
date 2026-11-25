@@ -1,6 +1,6 @@
 use super::*;
 use crate::solver::{
-    cones::{CompositeCone, Cone, SupportedCone},
+    cones::{CompositeCone, Cone},
     core::{
         traits::{KKTSystem, Settings},
         StepDirection,
@@ -54,8 +54,8 @@ where
         settings: &DefaultSettings<T>,
     ) -> bool {
         // A matrix-free ORE cone has no dense Hs for the augmented form.
-        if cones.iter().any(matrix_free_ore) {
-            return data.n > 0;
+        if cones.free_ore_ranges().next().is_some() {
+            return true;
         }
         match settings.kkt_form.as_str() {
             "condensed" => data.n > 0,
@@ -309,20 +309,16 @@ where
         // c − z: the ±1 products are exact, so this rounds as the
         // subtraction does.
         workz.waxpby(T::one(), Δs_const_term, -T::one(), &rhs.z);
-        // A matrix-free ORE cone has its combined Δs constant only scaled,
-        // c = Hs⁻¹Δs (`combined_ds_shift`): solve for z + c, whose row has
-        // right-hand side −r_z, with Aₖᵀc moved into the x rows.
-        let free_ore =
-            matches!(step_direction, StepDirection::Combined) && cones.iter().any(matrix_free_ore);
-        if free_ore {
-            let mut c = vec![T::zero(); data.m];
-            for (cone, rng) in cones.iter().zip(&cones.rng_cones) {
-                if matrix_free_ore(cone) {
-                    c[rng.clone()].copy_from(&Δs_const_term[rng.clone()]);
-                    workz[rng.clone()].axpby(-T::one(), &rhs.z[rng.clone()], T::zero());
-                }
-            }
-            data.A.t().gemv(workx, &c, T::one(), T::one());
+        if step_direction == StepDirection::Combined {
+            shift_ore_rhs(
+                &data.A,
+                cones,
+                Δs_const_term,
+                &rhs.z,
+                workx,
+                workz,
+                &mut lhs.z,
+            );
         }
 
         // ---------------------------------------------------
@@ -340,12 +336,8 @@ where
         if !all_succeeded(is_success) {
             return false;
         }
-        if free_ore {
-            for (cone, rng) in cones.iter().zip(&cones.rng_cones) {
-                if matrix_free_ore(cone) {
-                    z1[rng.clone()].axpby(-T::one(), &Δs_const_term[rng.clone()], T::one());
-                }
-            }
+        if step_direction == StepDirection::Combined {
+            unshift_ore_duals(cones, Δs_const_term, z1);
         }
 
         // One shared homogeneous scalar formula, independent of storage layout.
@@ -403,21 +395,8 @@ where
             // Linearity: reuse original-operator products from the two accepted
             // KKT solutions. No product from a rejected refinement is reused.
             lhs.s.waxpby(T::one(), hs1, lhs.τ, &self.hs2);
-        } else if cones.iter().any(matrix_free_ore) {
-            // Every ORE row takes Δs from AΔx below; a matrix-free cone's
-            // Hs·Δz would cost S₀ solves.
-            let ranges = cones.rng_cones.clone();
-            for (cone, rng) in cones.iter_mut().zip(ranges) {
-                if !cone.is_ore() {
-                    cone.mul_Hs(
-                        &mut lhs.s[rng.clone()],
-                        &lhs.z[rng.clone()],
-                        &mut workz[rng],
-                    );
-                }
-            }
         } else {
-            cones.mul_Hs(&mut lhs.s, &lhs.z, workz);
+            cones.mul_hs_for_direction(&mut lhs.s, &lhs.z, workz);
         }
         lhs.s.axpby(-T::one(), Δs_const_term, -T::one()); // lhs.s = -(lhs.s+Δs_const_term);
 
@@ -1040,6 +1019,31 @@ mod tests {
     }
 }
 
-fn matrix_free_ore<T: FloatT>(cone: &SupportedCone<T>) -> bool {
-    matches!(cone, SupportedCone::OpRelEntropyCone(c) if c.matrix_free())
+/// Free ORE's combined offset is in dual coordinates, c = Hs⁻¹Δs.
+/// Solve for z + c on those rows by moving Aᵀc into the primal RHS.
+pub(crate) fn shift_ore_rhs<T: FloatT>(
+    a: &CscMatrix<T>,
+    cones: &CompositeCone<T>,
+    offset: &[T],
+    rz: &[T],
+    x: &mut [T],
+    z: &mut [T],
+    scratch: &mut [T],
+) {
+    let mut ranges = cones.free_ore_ranges().peekable();
+    if ranges.peek().is_none() {
+        return;
+    }
+    scratch.fill(T::zero());
+    for rows in ranges {
+        scratch[rows.clone()].copy_from_slice(&offset[rows.clone()]);
+        z[rows.clone()].axpby(-T::one(), &rz[rows.clone()], T::zero());
+    }
+    a.t().gemv(x, scratch, T::one(), T::one());
+}
+
+pub(crate) fn unshift_ore_duals<T: FloatT>(cones: &CompositeCone<T>, offset: &[T], z: &mut [T]) {
+    for rows in cones.free_ore_ranges() {
+        z[rows.clone()].axpby(-T::one(), &offset[rows.clone()], T::one());
+    }
 }

@@ -189,7 +189,11 @@ where
                 }
             };
         let jump = sampled
-            .filter(|_| settings.find_dual_feasible)
+            .filter(|op| {
+                settings.find_dual_feasible
+                    && P.nzval.is_empty()
+                    && op.covers_dual_jump(input_cones)
+            })
             .map(|op| (q.to_vec(), std::sync::Arc::new(op.clone())));
         let mut original = if preserve_cones && settings.tol_original.is_some() {
             Some(copy_original(&P, &q, &A, &b, input_cones))

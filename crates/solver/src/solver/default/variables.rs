@@ -733,14 +733,13 @@ impl<T: FloatT> DefaultVariables<T> {
 
         if step_direction == StepDirection::Combined {
             if crate::solver::core::traits::ConeCollection::has_free_ore(cones) {
-                α = cones.certify_ore_step(
-                    &step.z,
-                    &step.s,
-                    &self.z,
-                    &self.s,
+                let pool = cones.thread_pool();
+                α = CompositeCone::certify_ore_step(
+                    [(cones, [&step.z[..], &step.s, &self.z, &self.s])],
                     settings.core(),
                     α,
                     kkt,
+                    pool.as_deref(),
                 );
             } else {
                 α *= settings.core().max_step_fraction;

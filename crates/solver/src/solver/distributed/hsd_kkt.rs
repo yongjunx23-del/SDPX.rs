@@ -1,10 +1,15 @@
 //! Embedding direction assembly for local storage; scalar formulas and matrix
 //! operations are shared with the default KKT implementation.
 use super::*;
-use crate::solver::default::{hsd_tau, hsd_terms, refine_predictor};
+use crate::solver::default::{
+    hsd_tau, hsd_terms, refine_predictor, shift_ore_rhs, unshift_ore_duals,
+};
 use crate::solver::distributed::OwnedKkt;
 use crate::solver::{
-    core::{traits::KKTSystem, StepDirection},
+    core::{
+        traits::{ConeCollection, KKTSystem},
+        StepDirection,
+    },
     kkt::{HasLinearSolverInfo, LinearSolverInfo, SolveCounters},
 };
 
@@ -441,16 +446,39 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
             }
             self.work.sync_border();
         }
+        let shift_ore = direction == StepDirection::Combined && cones.has_free_ore();
         if direction == StepDirection::Combined {
-            let subtract = |(w, c): (&mut DefaultVariables<T>, &DefaultVariables<T>)| {
-                for (v, &c) in w.z.iter_mut().zip(&c.s) {
-                    *v = c - *v;
-                }
-            };
             for_blocks!(
                 cones.pool.as_ref(),
-                (&mut self.work.blocks, &self.constant_work.blocks),
-                subtract
+                (
+                    0..owners,
+                    &mut self.work.blocks,
+                    &self.constant_work.blocks,
+                    &cones.blocks,
+                    &mut lhs.blocks,
+                ),
+                |(i, w, c, cone, lhs): (
+                    usize,
+                    &mut DefaultVariables<T>,
+                    &DefaultVariables<T>,
+                    &CompositeCone<T>,
+                    &mut DefaultVariables<T>,
+                )| {
+                    for (v, &c) in w.z.iter_mut().zip(&c.s) {
+                        *v = c - *v;
+                    }
+                    if shift_ore {
+                        shift_ore_rhs(
+                            &data.blocks[i].A,
+                            cone,
+                            &c.s,
+                            &rhs.blocks[i].z,
+                            &mut w.x,
+                            &mut w.z,
+                            &mut lhs.z,
+                        );
+                    }
+                }
             );
         }
         let prepared = if direction == StepDirection::Affine {
@@ -477,6 +505,16 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
                 .border_z
                 .copy_from_slice(self.kernel.last_border());
             self.varying.sync_border();
+        }
+        if shift_ore {
+            for ((cone, c), v) in cones
+                .blocks
+                .iter()
+                .zip(&self.constant_work.blocks)
+                .zip(&mut self.varying.blocks)
+            {
+                unshift_ore_duals(cone, &c.s, &mut v.z);
+            }
         }
         let fixed = variables.fixed_tau;
         let (dtau, dkappa) = if fixed {
@@ -509,7 +547,7 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
                 if hs_varying[i].len() == d.m {
                     l.s.copy_from_slice(&hs_varying[i]);
                 } else {
-                    cone.mul_Hs(&mut l.s, &l.z, &mut work.z);
+                    cone.mul_hs_for_direction(&mut l.s, &l.z, &mut work.z);
                 }
             } else {
                 l.x.waxpby(T::one(), &first.x, dtau, &second.x);
@@ -517,7 +555,7 @@ impl<T: FloatT> KKTSystem<T> for OwnedKktSystem<T> {
                 if hs_constant[i].len() == d.m && hs_varying[i].len() == d.m {
                     l.s.waxpby(T::one(), &hs_varying[i], dtau, &hs_constant[i]);
                 } else {
-                    cone.mul_Hs(&mut l.s, &l.z, &mut work.z);
+                    cone.mul_hs_for_direction(&mut l.s, &l.z, &mut work.z);
                 }
             }
             l.s.axpby(-T::one(), &offset[i].s, -T::one());
